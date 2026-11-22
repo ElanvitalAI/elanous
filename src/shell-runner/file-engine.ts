@@ -33,10 +33,10 @@ import { requirePosixShell } from '../platform/default-shell.js';
 import { shellChildEnv } from './child-env.js';
 import { terminateTree } from '../shell-primitive/terminate-tree.js';
 import {
-  spawn as nodeSpawn,
   type ChildProcessWithoutNullStreams,
   type SpawnOptions,
 } from 'node:child_process';
+import { spawnGateway, type SpawnFunction } from '../shell-primitive/spawn-gateway.js';
 import { mkdtempSync, createWriteStream, type WriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -67,7 +67,7 @@ const CIRCULAR_LINE_LIMIT = 1000;
 export interface FileEngineOpts {
   now?: () => number;
   /** Override child_process.spawn for tests. */
-  spawnFn?: typeof nodeSpawn;
+  spawnFn?: SpawnFunction;
   /** Per-stream in-memory cap before disk spill. */
   maxMemoryBytes?: number;
   /** tmp dir factory — tests can inject a deterministic path. */
@@ -84,7 +84,7 @@ export function createFileCaptureEngine(opts: FileEngineOpts = {}): CaptureEngin
 }
 
 function startRun(req: ShellRequest, ctx: RunCtx, opts: FileEngineOpts): ShellHandle {
-  const spawnFn = opts.spawnFn ?? nodeSpawn;
+  const spawnFn = opts.spawnFn ?? undefined;
   const now = opts.now ?? Date.now;
   const maxMemory = opts.maxMemoryBytes ?? DEFAULT_MAX_MEMORY_BYTES;
   const tmpDir = opts.tmpDir ?? (() => tmpdir());
@@ -401,24 +401,26 @@ function capString(s: string, maxBytes: number): StreamOutput {
 
 function spawnChild(
   req: ShellRequest,
-  spawnFn: typeof nodeSpawn,
+  spawnFn: SpawnFunction | undefined,
 ): ChildProcessWithoutNullStreams {
   const spawnOpts: SpawnOptions = {
-    cwd: req.cwd,
+    cwd: req.cwd ?? process.cwd(),
     env: shellChildEnv(process.env, req.env) as NodeJS.ProcessEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
     // own process group → terminateTree can kill the whole tree (and only it).
     detached: process.platform !== 'win32',
   };
   if (typeof req.command === 'string') {
-    return spawnFn(
+    return spawnGateway(
       requirePosixShell('/bin/bash'),
       ['-lc', req.command],
       spawnOpts,
+      spawnFn,
+      req.runShellGrant,
     ) as ChildProcessWithoutNullStreams;
   }
   const [argv0, ...rest] = req.command as readonly string[];
-  return spawnFn(argv0 ?? '', rest, spawnOpts) as ChildProcessWithoutNullStreams;
+  return spawnGateway(argv0 ?? '', rest, spawnOpts, spawnFn, req.runShellGrant) as ChildProcessWithoutNullStreams;
 }
 
 function resolveMode(mode: ShellMode | undefined): Exclude<ShellMode, 'auto'> {

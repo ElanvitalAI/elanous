@@ -24,7 +24,7 @@ test('three occurrences of one hand step are a candidate, two are not', () => {
     clock.at = '2026-10-26T10:00:00Z';
     ledger.record({ actor: 'MK', kind: 'hand-step', signature: 'restart the flaky ledger gate', ref: 'PR#3' });
     expect(ledger.candidates()).toEqual([{ kind: 'hand-step', signature: 'restart the flaky ledger gate', count: 3,
-      firstAt: '2026-10-26T09:00:00.000Z', lastAt: '2026-10-26T10:00:00.000Z', refs: ['PR#1', 'PR#2', 'PR#3'] }]);
+      firstAt: '2026-10-26T09:00:00.000Z', lastAt: '2026-10-26T10:00:00.000Z', note: '', refs: ['PR#1', 'PR#2', 'PR#3'] }]); // r17b — note 노출
     expect(ledger.candidates(4)).toEqual([]);
     ledger.record({ actor: 'ceo', kind: 'ceo-correction', signature: 'restart the flaky ledger gate', ref: 'channel/9' });
     expect(ledger.candidates().map(row => [row.kind, row.count])).toEqual([['hand-step', 3]]);
@@ -44,7 +44,7 @@ test('signatures that differ only in case or whitespace fold into one candidate'
     ledger.record({ actor: 'person', kind: 'repeat-question', signature: 'install redis', ref: 'msg/2' });
     ledger.record({ actor: 'OP', kind: 'repeat-question', signature: '  INSTALL\tredis ', ref: 'msg/3' });
     expect(ledger.candidates(3)).toEqual([{ kind: 'repeat-question', signature: 'install redis', count: 3,
-      firstAt: '2026-10-26T11:00:00.000Z', lastAt: '2026-10-26T11:00:00.000Z', refs: ['msg/1', 'msg/2', 'msg/3'] }]);
+      firstAt: '2026-10-26T11:00:00.000Z', lastAt: '2026-10-26T11:00:00.000Z', note: '', refs: ['msg/1', 'msg/2', 'msg/3'] }]); // r17b — note 노출
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 });
 
@@ -102,6 +102,6 @@ test('the production lesson recur command feeds the friction ledger', async () =
     expect(new LessonLedger({ stateDir, now }).get('L1').occurrence_count).toBe(4);
     expect(new FrictionLedger({ stateDir, now }).candidates()).toEqual([{ kind: 'hand-step',
       signature: 'worktree state changed unexpectedly', count: 3, firstAt: '2026-10-26T13:02:00.000Z',
-      lastAt: '2026-10-26T13:04:00.000Z', refs: ['PR#2', 'PR#3', 'PR#4'] }]);
+      lastAt: '2026-10-26T13:04:00.000Z', note: 'again', refs: ['PR#2', 'PR#3', 'PR#4'] }]); // r17c — recur 가 전달한 note('again')가 후보에 그대로 노출된다
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 });

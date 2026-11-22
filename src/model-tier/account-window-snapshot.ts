@@ -80,3 +80,16 @@ export function readAccountWindowSnapshot(provider: string, deps: AccountWindowS
     ...(oldestFresh === undefined ? {} : { observedAtMs: oldestFresh }),
   };
 }
+
+/** Local-only reads for the mixed router. A failed Codex read has a distinct
+ * marker so callers can stop the premium effect; stale data routes through
+ * the selector's normal refusal. */
+export function readRouterMixSnapshot(provider: string, deps: AccountWindowSnapshotDeps = {}): AccountState | undefined {
+  let enabled = false;
+  try { enabled = !deps.forceShadow && (deps.config ?? getUserConfig)().harness?.routerMix === 'on'; } catch { /* no silent activation */ }
+  if (!enabled || (provider !== 'openrouter' && provider !== 'openai-codex')) return readAccountWindowSnapshot(provider, deps);
+  const base = readAccountWindowSnapshot(provider, deps);
+  const codex = provider === 'openai-codex' ? base : readAccountWindowSnapshot('openai-codex', deps);
+  return { ...(base ?? { candidates: [], active: { provider, account: null } }), selection: 'on',
+    routerMix: { codex, ...(codex === undefined ? { codexReadFailed: true } : {}) } };
+}

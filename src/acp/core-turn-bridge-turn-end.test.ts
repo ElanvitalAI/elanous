@@ -10,11 +10,19 @@ import type { AcpTurnContext } from './server.js';
 import { bridgeCoreTurnToAcp, extractLastAssistantText } from './core-turn-bridge.js';
 import { AUTH_REJECTED_NOTICE, CoreTurnAuthRejectedError } from '../core-turn/auth-rejected-notice.js';
 
-afterEach(() => mock.restore());
+// CHAT-GOAL-LOOP-DEFAULT-OFF — the bridge goal loop is armed only for the harness executor (explicit goal), so a
+// goal-loop setup drives that role instead of the deleted `llm.goalLoop.enabled` switch.
+const savedHarnessRole = process.env.ELANOUS_HARNESS_ROLE;
+afterEach(() => {
+  mock.restore();
+  if (savedHarnessRole === undefined) delete process.env.ELANOUS_HARNESS_ROLE;
+  else process.env.ELANOUS_HARNESS_ROLE = savedHarnessRole;
+});
 
 const SUPPLEMENT = '변경 파일: /tmp/a.ts\n검증 최신성 상태: 미지 — 재검증이 필요합니다.\n루프 마감 상태: 최근 수정 이후 재검증이 아직 필요하므로 close-out보다 검증 재실행이 맞습니다.';
 
 function setup(opts: { goalLoop?: boolean } = {}) {
+  if (opts.goalLoop === true) process.env.ELANOUS_HARNESS_ROLE = 'executor';
   const pushes: string[] = [];
   const persisted: LLMMessage[][] = [];
   const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
@@ -27,7 +35,7 @@ function setup(opts: { goalLoop?: boolean } = {}) {
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
     ...base,
-    llm: { ...base.llm, provider: 'openai', model: 'gpt-5.6', fallbackChain: [], goalLoop: { enabled: opts.goalLoop === true } },
+    llm: { ...base.llm, provider: 'openai', model: 'gpt-5.6', fallbackChain: [] },
     chat: { ...base.chat, autoCompact: { ...base.chat.autoCompact, enabled: false } },
     tools: { ...base.tools, deferred: { ...base.tools.deferred, mode: 'off' } },
   });

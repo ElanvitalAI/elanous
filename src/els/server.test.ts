@@ -112,11 +112,11 @@ test('JUD #39053 ⓒ1 E2E: direct-socket and env-spoofed writes are denied at th
   // ② ELANOUS_SEAT=OP 위장: env 문자열을 토큰으로 제출해도 원장없는 토큰은 outsider.
   const spoof = await askRaw(root, { op: 'do', pane: made.pane, action: 'text', text: 'ls' }, { op: 'auth', token: 'OP', pid: 1 });
   expect(spoof.exitCode).toBe(1);
-  expect(spoof.message).toBe('els: invalid credential');
+  expect(spoof.message).toBe('auth: invalid credential');
   const fakeCredential = 'test-invalid-credential-never-audit';
   const fakeAuth = await askRaw(root, { op: 'do', pane: made.pane, action: 'text', text: 'ls' }, { op: 'auth', token: fakeCredential, pid: 1 });
   expect(fakeAuth.exitCode).toBe(1);
-  expect(fakeAuth.message).toBe('els: invalid credential');
+  expect(fakeAuth.message).toBe('auth: invalid credential');
   // Each refusal must have its own audit record, including authentication rejection.
   const auditText = readFileSync(join(root, 'els', 'control-audit.jsonl'), 'utf8');
   const audit = auditText.trim().split('\n').map((l) => JSON.parse(l) as { action: string; result: string; reason: string; peerPid?: number });

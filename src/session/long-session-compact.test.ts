@@ -71,7 +71,7 @@ const recorder = (name: string) => {
 const turn = (provider: LLMProvider, sessionId: string, userText: string, config?: ChatAutoCompactConfig, extra: object = {}) => runTurn({
   userConfig: {
     chat: config ? { autoCompact: config } : {},
-    llm: { provider: provider.name, model: provider.defaultModel, goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } },
+    llm: { provider: provider.name, model: provider.defaultModel, memoryJudge: { enabled: false, crossRecall: false } },
   } as never,
   sessionId, userText, systemPrompt: SYSTEM_PROMPT, skipMemoryInjection: true, provider, compactProvider: summarizer, ...extra,
 });
@@ -433,7 +433,7 @@ describe('O4 core — the request is re-measured after compaction (r2 mf2)', () 
     const log = spyOn(debug, 'log');
     try {
       await expect(runTurn({
-        userConfig: { chat: { autoCompact: SMALL }, llm: { provider: provider.name, model: MODEL, goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } } } as never,
+        userConfig: { chat: { autoCompact: SMALL }, llm: { provider: provider.name, model: MODEL, memoryJudge: { enabled: false, crossRecall: false } } } as never,
         sessionId: session.id, userText: 'current request', systemPrompt: SYSTEM_PROMPT, skipMemoryInjection: true, provider,
         compactProvider: hooked(() => {}, hugeSummary), onStatusLine: line => statusLines.push(line),
       })).rejects.toThrow('✗');

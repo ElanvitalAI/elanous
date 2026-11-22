@@ -1,4 +1,5 @@
 import { textOnly } from '../llm/stream-text.js';
+import { streamChatLedgered } from '../llm/ledgered-call.js';
 // ── 온톨로지 LLM 인과 추출 (후속2 · R5/R9 정성 · 2026-07-08) ──────────────
 //
 // dig_reports/breaking 텍스트 → 엔티티 간 causes/affects 엣지 추출. deterministic
@@ -58,7 +59,7 @@ export async function defaultChat(messages: LLMMessage[]): Promise<string> {
   const provider = getProviderForConfig(getUserConfig());
   if (!provider.streamChat) return '';
   let out = '';
-  try { for await (const d of textOnly(provider.streamChat(messages, { temperature: 0, maxTokens: 500 }))) out += d; } catch { return ''; }
+  try { for await (const d of textOnly(streamChatLedgered(provider, messages, { temperature: 0, maxTokens: 500 }, { site: 'domain-kg-extract', jobKind: 'domain-report' }))) out += d; } catch { return ''; }
   return out.trim();
 }
 

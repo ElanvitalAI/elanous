@@ -59,7 +59,7 @@ import { childToolProfile } from '../agent/tool-profile.js';
 import { escalationAllowedForProvider } from './rework-policy.js';
 import { getUserConfig, resolveActiveProvider, resolveRoleLlm } from '../user-config.js';
 import { planWorkRoute, recordLaunchRoute, resolveWorkRouteMode, windowAccountLaunch, type WindowAccountLaunch, type WorkRoutePlan } from './work-route.js';
-import { readAccountWindowSnapshot } from '../model-tier/account-window-snapshot.js';
+import { readAccountWindowSnapshot, readRouterMixSnapshot } from '../model-tier/account-window-snapshot.js';
 import type { AccountState, CoreMode } from '../model-tier/orchestration-core.js';
 import type { RunLedgerEntry } from './run-ledger.js';
 import { childNestEnv } from '../agent/nest-depth.js';
@@ -1225,7 +1225,7 @@ function baselineImplementRole(): { role: ReturnType<typeof resolveRoleLlm>; con
   } catch { return undefined; }
 }
 
-export function pickImplementRoleWithRoute(document: string, readAccountWindows: (provider: string) => AccountState | undefined = (provider) => readAccountWindowSnapshot(provider)): { role: ReturnType<typeof resolveRoleLlm> | undefined; route?: ImplementRouteOutcome } {
+export function pickImplementRoleWithRoute(document: string, readAccountWindows: (provider: string) => AccountState | undefined = (provider) => readRouterMixSnapshot(provider)): { role: ReturnType<typeof resolveRoleLlm> | undefined; route?: ImplementRouteOutcome } {
   const base = baselineImplementRole();
   if (!base) return { role: undefined };
   const { config } = base;
@@ -1235,11 +1235,16 @@ export function pickImplementRoleWithRoute(document: string, readAccountWindows:
     const mode = resolveWorkRouteMode(config);
     const plan = planWorkRoute(document, role.provider, readAccountWindows(role.provider));
     const { decision } = plan;
-    // 코어가 다른 provider(창 인지 계정 선택)를 고르면 이 PR 은 적용하지 않는다 — 역할 provider 안에서만 바꾼다.
+    // 교차 provider 는 명시 routerMix 에서만 허용한다. 그 외에는 기존 역할 provider 를 지킨다.
+    const crossProvider = decision.provider !== role.provider;
+    const mixAllowed = config.harness?.routerMix === 'on' &&
+      (role.provider === 'openrouter' || role.provider === 'openai-codex') &&
+      (decision.provider === 'openrouter' || decision.provider === 'openai-codex');
     const skip = decision.model === null ? 'no-tier-ladder' : mode !== 'on' ? 'shadow' : role.source !== 'default' ? 'non-default-role'
-      : decision.provider !== role.provider ? 'cross-provider' : null;
+      : plan.input.accounts?.routerMix?.codexReadFailed ? 'account-window-read-failed'
+      : crossProvider && !mixAllowed ? 'cross-provider' : null;
     if (skip !== null || decision.model === null) return { role, route: { plan, mode, applied: false, skip: skip ?? 'no-tier-ladder' } };
-    return { role: { ...role, model: decision.model, tier: decision.cell }, route: { plan, mode, applied: true, skip: null } };
+    return { role: { ...role, provider: decision.provider as typeof role.provider, model: decision.model, tier: decision.cell }, route: { plan, mode, applied: true, skip: null } };
   } catch { return { role }; }
 }
 

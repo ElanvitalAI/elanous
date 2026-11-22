@@ -1,0 +1,36 @@
+{
+  "id": "router-cost-fake-providers",
+  "name": "Router cost fake providers",
+  "audience": "internal",
+  "checklistCells": ["LLM-CALL-COST-LEDGER", "ROUTER-OR-CODEX-MIX-CHOKEPOINT"],
+  "implementation": [
+    "src/ux-sim/sim-world/router-cost/scenarios.ts",
+    "src/ux-sim/sim-world/router-cost/mix-scenarios.ts",
+    "src/model-tier/router-mix-selector.ts",
+    "src/llm.ts"
+  ],
+  "tests": [
+    "src/llm-usage-attribution.test.ts",
+    "src/model-tier/router-mix-selector.test.ts"
+  ],
+  "target": "One llm.usage row per completed or failed text stream attempt in an isolated router world",
+  "inputs": [
+    "measured fake provider",
+    "provider with no usage frame",
+    "concurrent calls and new provider after restart",
+    "unresponsive provider with a bounded deadline",
+    "SQLite lock holder killed before a new writer connection"
+  ],
+  "observations": [
+    "Measured provider/model/token attribution remains intact",
+    "Missing usage and failed calls keep unknown token and cost fields",
+    "Silent provider times out and leaves an explicit failure row",
+    "Persisted usage calls survive SQLite lock holder death and writer reopening"
+  ],
+  "entryCommands": [
+    "eln --test sim world run router-cost --seed 33"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

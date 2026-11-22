@@ -55,7 +55,7 @@ test('Next PTY snapshot retains a finished turn marker after the next prompt', a
   const root = mkdtempSync(join(tmpdir(), 'next-turn-end-marker-'));
   try {
     writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true },
-      errorReports: { enabled: false }, llm: { goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } } }));
+      errorReports: { enabled: false }, llm: { memoryJudge: { enabled: false, crossRecall: false } } }));
     const turnPrompts = ['first marker prompt', 'second marker prompt'];
     const evidence = await mockSeatPtySequence({
       runId: 'next-turn-end-marker', executable: process.execPath,

@@ -175,7 +175,7 @@ describe('sim world replay of a run recorded before a world was added', () => {
 
 describe('sim world registration ↔ pack files', () => {
   test('every registered world has a pack yaml on disk whose `world:` matches (literal list, not the product constant)', () => {
-    const worlds = ['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel'];
+    const worlds = ['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel', 'router-cost', 'toolbatch', 'els', 'els-remote', 'member-journey', 'machine-infra'];
     const registered: string[] = [...SIM_WORLD_IDS];
     expect(registered).toEqual(worlds);
     for (const world of worlds) {
@@ -188,13 +188,13 @@ describe('sim world registration ↔ pack files', () => {
 describe('sim world run all — full run (slow: capsule-events ~92s on node-b)', () => {
   // The full `all` run cannot exit 0 on main today (capsule-events C1/C2/C5 wrong-reason-red + C6 regression → ok:false, rc 1).
   // Asserted instead: invariants true either way. TODO(MAIN-RED capsule-events): once those are green, tighten to rc 0 / ok true.
-    test('`sim world run all --seed 1` (full) covers all 9 registered worlds and exits 0 iff summary.ok, else 1', async () => {
+    test('`sim world run all --seed 1` (full) covers every registered world and exits 0 iff summary.ok, else 1', async () => {
     const root = stateRoot();
     const result = await simCli(['sim', 'world', 'run', 'all', '--seed', '1', '--run-id', 'full'], {
       mode: 'spawn', stateRoot: root, allowPaths: RUN, timeoutMs: 280_000 });
     const summary = JSON.parse(readFileSync(join(root, 'sim-world', 'full', 'summary.json'), 'utf8'));
-    expect(summary.worlds).toEqual(['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel']);
-    expect(Object.keys(summary.worldWallMs).sort()).toEqual(['capsule-events', 'graph', 'memory', 'op-channel', 'seat-mail', 'seat-mail-roundtrip', 'supervisors', 'ta', 'worker']);
+    expect(summary.worlds).toEqual(['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel', 'router-cost', 'toolbatch', 'els', 'els-remote', 'member-journey', 'machine-infra']);
+    expect(Object.keys(summary.worldWallMs).sort()).toEqual(['capsule-events', 'els', 'els-remote', 'graph', 'machine-infra', 'member-journey', 'memory', 'op-channel', 'router-cost', 'seat-mail', 'seat-mail-roundtrip', 'supervisors', 'ta', 'toolbatch', 'worker']);
     expect(summary.events.filter((event: { kind: string }) => event.kind === 'pack-empty').map((event: { world: string }) => event.world))
       .toEqual(['ta', 'supervisors', 'seat-mail']);
     expect(JSON.parse(result.stdout.trim().split('\n').at(-1)!).ok).toBe(summary.ok);

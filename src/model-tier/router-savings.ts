@@ -43,6 +43,18 @@ export interface SavingsReceiptRow {
   readonly premium: boolean;
 }
 
+/** 일일 재계산 한 행 — UTC 일(YYYY-MM-DD) 버킷의 호출·고급 비중·절감 비율. ⛔ 가격 비공개 — 비율만. */
+export interface SavingsDayRow {
+  /** UTC 일자(YYYY-MM-DD). 시각을 못 매긴 행은 '시각 미측정' 버킷. */
+  readonly day: string;
+  readonly totalCalls: number;
+  readonly premiumCalls: number;
+  readonly premiumShare: number;
+  /** 1 − 실측값/강단독값(그 일 버킷 안에서). 매긴 호출이 없으면 null. */
+  readonly savingsPct: number | null;
+  readonly unpricedCalls: number;
+}
+
 export interface SavingsReceipt {
   readonly totalCalls: number;
   readonly premiumCalls: number;
@@ -50,6 +62,8 @@ export interface SavingsReceipt {
   /** 1 − 실측값/강단독값. 매긴 호출이 없거나 분모가 0 이하면 null. */
   readonly savingsPct: number | null;
   readonly unpricedCalls: number;
+  /** 일일 재계산 표(--daily) — UTC 일 버킷별 요약(jud-39614 필수 3). */
+  readonly daily?: readonly SavingsDayRow[];
 }
 
 export interface SummarizeSavingsInput {

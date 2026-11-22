@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "policy": "deny-unlisted-and-unresolved",
+  "pricingStatus": "undecided",
+  "tiers": ["free", "pro", "advanced"],
+  "features": [
+    {
+      "key": "router.basic_auto_routing",
+      "description": "강·중·약 자동 라우팅 기본 정책(HARNESS-DIFFICULTY-ROUTER · 공급자 키 1개)",
+      "grant": { "free": true, "pro": true, "advanced": true }
+    },
+    {
+      "key": "router.savings_receipt",
+      "description": "오늘·이번 주 절감액 영수(SMART-ROUTER-DEMO-SAVINGS)",
+      "grant": { "free": true, "pro": true, "advanced": true }
+    },
+    {
+      "key": "router.strong_final_check",
+      "description": "완료 직전 강 모델 판정 1회(HARNESS-ADVISOR-CHECKPOINTS ③)",
+      "grant": { "free": true, "pro": true, "advanced": true }
+    },
+    {
+      "key": "router.strong_three_moments",
+      "description": "강 모델 세 순간 개입 — 계획 직전·같은 오류 2회·완료 직전(HARNESS-ADVISOR-CHECKPOINTS ①②③)",
+      "grant": { "free": false, "pro": true, "advanced": true }
+    },
+    {
+      "key": "router.subscription_window_aware",
+      "description": "구독 창 인식 라우팅 — 곧 리셋 먼저·버틸 창 상한(COST-OPTIMIZER-WINDOW-AWARE)",
+      "grant": { "free": false, "pro": true, "advanced": true }
+    },
+    {
+      "key": "router.policy_yaml_custom",
+      "description": "정책 YAML 사용자 정의",
+      "grant": { "free": false, "pro": true, "advanced": true }
+    },
+    {
+      "key": "router.budget_alerts",
+      "description": "예산 경보",
+      "grant": { "free": false, "pro": true, "advanced": true }
+    },
+    {
+      "key": "router.subscription_advisor_monthly",
+      "description": "구독 조언자 월 보고(SUBSCRIPTION-ADVISOR-PROACTIVE)",
+      "grant": { "free": false, "pro": true, "advanced": true }
+    },
+    {
+      "key": "router.team_shared_pool",
+      "description": "팀 공유 풀·여러 호스트 합산",
+      "grant": { "free": false, "pro": false, "advanced": true }
+    },
+    {
+      "key": "router.per_project_budget",
+      "description": "프로젝트·사람별 예산",
+      "grant": { "free": false, "pro": false, "advanced": true }
+    },
+    {
+      "key": "router.policy_inheritance",
+      "description": "정책 상속",
+      "grant": { "free": false, "pro": false, "advanced": true }
+    },
+    {
+      "key": "router.failure_oracle_gen",
+      "description": "판정기 자동 생성 — 실패 상황 시험·이웃 전수(HARNESS-FAILURE-ORACLE-GEN)",
+      "grant": { "free": false, "pro": false, "advanced": true }
+    },
+    {
+      "key": "router.neighbor_sweep",
+      "description": "이웃 전수 스윕 품질 가드(HARNESS-NEIGHBOR-SWEEP)",
+      "grant": { "free": false, "pro": false, "advanced": true }
+    },
+    {
+      "key": "router.external_proxy_sdk",
+      "description": "프록시/SDK — 외부 에이전트(Claude Code·Codex 등)도 라우터를 거침",
+      "grant": { "free": false, "pro": false, "advanced": true }
+    },
+    {
+      "key": "router.unlimited_history",
+      "description": "무제한 절감 기록·내보내기",
+      "grant": { "free": false, "pro": false, "advanced": true }
+    },
+    {
+      "key": "router.roi_audit_export",
+      "description": "강 단독 대비 ROI 감사 보고·내보내기",
+      "grant": { "free": false, "pro": false, "advanced": true }
+    }
+  ]
+}

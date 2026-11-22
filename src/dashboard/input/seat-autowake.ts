@@ -30,6 +30,7 @@ import { readUnreadSummary } from '../../msg/msg-store.js';
 import { lastHumanKeyAt as tuiLastHumanKeyAt } from '../../tui.js';
 import { detectSeatTui, type SeatDetection } from '../seat-boot-preamble.js';
 import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from './internal-turn.js';
+import { readSeatBudgetUsage, type SeatUsageBucket } from './seat-autowake-budget.js';
 
 export const SEAT_AUTOWAKE_FILE = 'autowake';
 export const DEFAULT_AUTOWAKE_CONSECUTIVE_CAP = 5;
@@ -213,6 +214,8 @@ export interface SeatAutowakeDeps {
   tokenBudget?: () => number | null;
   /** 오늘 이미 쓴 토큰(입·출력 합). null = 모름 → 제한 안 함. */
   tokensUsed?: () => number | null;
+  /** Test seam for today's seat-attributed usage; null means unavailable. */
+  readBudgetUsage?: (sinceDay: string) => readonly SeatUsageBucket[] | null;
   /** 상한 도달 때 화면 한 줄(«사람 확인 필요»). */
   notify?: (line: string) => void;
   /** 입력칸이 마운트된 뒤 판정을 미루는 자리(기본 setTimeout 0 · unref). 시험은 즉시 실행을 넘긴다. */
@@ -267,11 +270,11 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
   const log = deps.log ?? ((c, e, d) => debug.log(c, e, d));
   const defer = deps.defer ?? defaultDefer;
   const quietMs = deps.humanQuietMs ?? DEFAULT_AUTOWAKE_HUMAN_QUIET_MS;
-  // 칸 3 토큰 예산: 판정 게이트는 있으나 «기본 소스»는 없다(기본 off — deps 주입이 있을 때만 켠다).
-  // 자리 기준 사용량 배선(예산 파일·원장 읽기)은 후속 칸 ELN-SEAT-AUTOWAKE-BUDGET 이 가져간다
-  // (D-38013-SPLIT-1117 §2·§3 — r6 mustFix 2·3·4 쪼개기).
-  const readBudget = deps.tokenBudget ?? ((): number | null => null);
-  const readTokensUsed = deps.tokensUsed ?? ((): number | null => null);
+  const readUsage = deps.readBudgetUsage ?? ((day: string) => {
+    const { readUsageDaily } = require('../../budget/usage-daily-store.js') as typeof import('../../budget/usage-daily-store.js');
+    const usage = readUsageDaily(undefined, day);
+    return usage && usage.unclassifiedRows === 0 ? usage.rows : null;
+  });
 
   let turnEnded = false;
   let lastFingerprint: string | null = null;
@@ -310,13 +313,16 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
     const unread = readUnread(seat);
     const queue = parseSeatQueue(readText(join(seatStateDir!, 'queue.md')));
     const t = now();
+    const budget = seat && enabled && turnEnded && !deps.tokenBudget && !deps.tokensUsed
+      ? readSeatBudgetUsage({ seat, budgetText: readText(join(seatStateDir!, 'autowake-budget')), now: new Date(t), readUsage })
+      : { budget: deps.tokenBudget?.() ?? null, used: deps.tokensUsed?.() ?? null };
     const decision = decideSeatAutowake({
       seat, enabled, turnEnded, unread, queue, now: t, lastHumanKeyAt: humanAt,
       humanQuietMs: quietMs, lastFingerprint, consecutive, consecutiveCap: deps.consecutiveCap,
       minGapMs: deps.minGapMs === undefined ? DEFAULT_AUTOWAKE_MIN_GAP_MS : deps.minGapMs,
       lastAutoTurnEndAt,
-      tokenBudget: readBudget(),
-      tokensUsed: readTokensUsed(),
+      tokenBudget: budget.budget,
+      tokensUsed: budget.used,
     });
     if (terminalCallId && activeSessionId) {
       turnEnded = false;
@@ -361,9 +367,7 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
         if (!budgetNotified) {
           budgetNotified = true;
           log('tui.autowake', 'budget', { ...base });
-          const used = readTokensUsed();
-          const budget = readBudget();
-          deps.notify?.(`⏸ 하루 토큰 예산 도달(${used ?? '?'}/${budget ?? '?'}) — 사람 확인 필요 · 키 하나면 다시 이어간다`);
+          deps.notify?.(`⏸ 하루 토큰 예산 도달(${budget.used ?? '?'}/${budget.budget ?? '?'}) — 사람 확인 필요 · 키 하나면 다시 이어간다`);
         }
         log('tui.autowake', 'decided', { ...base, rejected: true, reason: 'token-budget' });
         return decision;

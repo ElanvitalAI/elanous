@@ -32,7 +32,7 @@ import { DEFAULT_CODEX_ACCOUNT, codexStoreKey, isValidAccountName, effectiveCode
 import { importCodexAccountFromHome, resolveCodexAccountForRun } from './codex-account-store.js';
 import { decodeJWTPayload } from './jwt.js';
 import { authStorePath, isUnderTestRunner } from './store.js';
-import { codexAccountReadStorePath, codexOwnerMirrorAuthPath, shouldPreferHostCodexMirror, shouldUseCodexOwnerMirror, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
+import { codexAccountReadStorePath, codexOwnerMirrorAuthPath, explicitlySelectedUniverse, shouldPreferHostCodexMirror, shouldUseCodexOwnerMirror, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
 import { resolveCodexCredentialOwnerHost } from '../nexus/config/secrets/cred-owner.js';
 import { codexHealthCredential, recordCodexUnauthorized } from './codex-account-health.js';
 import { getUserConfig } from '../user-config.js';
@@ -483,7 +483,14 @@ export function readCodexOwnerMirrorForRun(ownerMirrorPath?: string): { state: P
   // On a fleet nonowner, an isolated store can contain an expired credential
   // with refresh authority. Select the host access mirror before reading it.
   if (!ownerMirrorPath && !shouldPreferHostCodexMirror()) {
-    for (const [source, path] of [['config-dir', authStorePath()], ['default-root', join(prodInstanceRoot(), 'auth.json')]] as const) {
+    // ⛔⭐ `codexAccountReadStorePath` 와 같은 계약 — 명시적으로 선택된 비운영 우주는
+    //   default-root 사다리로 호스트 스토어를 밟지 않는다(2026-11-22 · #126554 실측:
+    //   호스트 auth.json 에 실제 `openai-codex:third` 항목이 있어 격리 fixture 를 이겼다).
+    const explicitUniverse = explicitlySelectedUniverse();
+    for (const [source, path] of [
+      ['config-dir', authStorePath()],
+      ...(explicitUniverse ? [] : [['default-root', join(prodInstanceRoot(), 'auth.json')]] as const),
+    ] as const) {
       try {
         const stat = lstatSync(path);
         if (!stat.isFile() || stat.isSymbolicLink() || (process.getuid && stat.uid !== process.getuid())) continue;
@@ -545,13 +552,19 @@ export async function loadFreshCodexAuthState(
   const stored = loadTokens(account.storeKey);
   // HQ-VAULT V2 mirror lease: an access-only entry with lease metadata. Use it before expiry; at/after expiry (or once
   // revoked) the guard throws a typed «expired» error and logs `secret.lease.expired`. Never refresh, never fall back.
-  const leased = stored ?? loadTokens('openai-codex');
+  const leased = stored;
   if (leased && isCodexLeaseEntry(leased)) {
     assertCodexLeaseUsable(leased, { storeKey: account.storeKey });
     observeCodexAuth('fresh', { storeKey: account.storeKey, source: 'lease', remainingSeconds: remainingSeconds(leased), refreshed: false });
     return leased;
   }
-  if (!stored && authStorePath() !== join(prodInstanceRoot(), 'auth.json')) {
+  // ⛔⭐ 기본 루트 낙하는 «기본 계정»만의 사다리다 — 이름 계정이 이 우주 밖 스토어의
+  //   같은 키 사본을 주워 오면 아래 미러 바인딩(allowlist 계약)과 어긋나, 실행이
+  //   발견이 고르지 않은 사본에 묶인다. 이름 계정의 정본은 선택된 우주 스토어 아니면 소유자 미러다.
+  //   ⊕ 명시적으로 선택된 비운영 우주(시험·격리)는 이 사다리로 호스트 스토어를 밟지 않는다
+  //   (`codexAccountReadStorePath` · `readCodexOwnerMirrorForRun` 과 같은 계약 · #126554).
+  if (!stored && account.storeKey === 'openai-codex' && !explicitlySelectedUniverse()
+    && authStorePath() !== join(prodInstanceRoot(), 'auth.json')) {
     const defaultPath = join(prodInstanceRoot(), 'auth.json');
     try {
       const stat = lstatSync(defaultPath);
@@ -569,6 +582,28 @@ export async function loadFreshCodexAuthState(
     } catch { /* continue to owner mirror or local Codex CLI */ }
   }
   if (stored?.source === 'mirror') return readCodexOwnerAccessMirror(account.storeKey, { path: authStorePath() });
+  // Discovery can select the owner snapshot; execution must bind the same key.
+  // ⛔ The selected account can live in a DIFFERENT store than the one the candidate
+  //   builder ranked first — rotation picks the account, the read path only decides
+  //   where its entry is. Bind the owner mirror whenever it carries the selected key
+  //   (allowlist contract), regardless of which store won the freshness contest.
+  if (!stored) {
+    const mirrorPathForRun = codexOwnerMirrorAuthPath();
+    if (loadTokens(account.storeKey, mirrorPathForRun)) {
+      // ⛔ 미러에 «그 계정의» 항목이 있는데 못 쓰면(만료·불량) null 로 끝낸다 — 다른 스토어의
+      //   다른 계정 자격으로 조용히 넘어가는 것이 이 파일이 막아 온 누출의 정확한 형태다.
+      let bound: ProviderAuthState;
+      try {
+        bound = readCodexOwnerAccessMirror(account.storeKey, { path: mirrorPathForRun });
+      } catch {
+        observeCodexAuth('no-credential', { storeKey: account.storeKey, mirrorPath: mirrorPathForRun, reason: 'owner-mirror-bind' });
+        return null;
+      }
+      observeCodexAuth('fresh', { storeKey: account.storeKey, source: 'owner-mirror-bind', remainingSeconds: remainingSeconds(bound), refreshed: false });
+      opts.onSelectedAccount?.(account.storeKey, mirrorPathForRun);
+      return bound;
+    }
+  }
   // ⛔⭐⭐⭐ 읽기(reconcile) 방향도 «그 계정의 홈»으로만 본다(2R must-fix).
   //   종전엔 기본 미러 경로를 봐서, 이름 계정이 «계정 A 의 미러»를 읽어 정본을 오염시킬 수 있었다.
   //   ⇒ 쓰기만 고치고 읽기를 안 고치면 같은 사고가 «반대 방향»으로 난다.

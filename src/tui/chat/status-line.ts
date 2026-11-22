@@ -10,6 +10,8 @@ export interface NextTuiStatusLineInput {
   readonly steering?: number;
   readonly backgroundTasks: number;
   readonly width: number;
+  /** SEAT-HUMAN-GOAL-PIN (OP #128939) — 고정 목표(사람 줄). 살아 있으면 상태줄에 «📌 목표» 절로 보인다. */
+  readonly pinnedGoal?: string;
   readonly elapsedMs?: number;
   readonly measuredUsage?: { readonly inputTokens?: number; readonly outputTokens?: number };
   readonly estimatedOutputTokens?: number;
@@ -426,7 +428,27 @@ export function formatNextTuiStatusLine(input: NextTuiStatusLineInput): string {
   const stateHead = state.split(' · ')[0] ?? '';
   const { failed, cancelled } = turnOutcome(state);
   const metricState = failed ? 'fail' : cancelled ? 'cancel' : shortState;
+  // SEAT-HUMAN-GOAL-PIN — 고정 목표 절(넓을 때 전문 · 좁으면 📌). 핀이 없으면 종전 그대로(회귀 0).
+  const pinnedClause = input.pinnedGoal !== undefined && input.pinnedGoal.trim().length > 0
+    ? `📌 ${takeCells(input.pinnedGoal.replace(/\s+/g, ' ').trim(), Math.max(8, Math.floor(width / 2)))}`
+    : '';
+  // GOAL-PIN-2 ③ (OP #130409/#130443) — 좁은 폭에서도 📌 표지는 소실되지 않는다:
+  // 넓은 두 줄이 안 맞으면 목표 원문을 접고 표지(📌)만이라도 상태·카운터와 함께 남긴다.
+  const pinBadge = pinnedClause ? '📌' : '';
+  const pinCompact = pinBadge
+    ? [
+        `${pinBadge} ${shortState} · ${queueShort} · B${backgroundTasks}`,
+        `${pinBadge}·${metricState}·${queueShort}·B${backgroundTasks}`,
+        `${pinBadge}·${shortState}·${queueShort}`,
+        `${pinBadge}·${shortState}`,
+      ]
+    : [];
   const candidates = [
+    ...(pinnedClause ? [
+      `${pinnedClause} · Turn ${shortState} · ${shortTelemetry} · ${queueShort} · B${backgroundTasks}`,
+      `${pinnedClause} · ${shortState} · ${queueShort} · B${backgroundTasks}`,
+    ] : []),
+    ...pinCompact,
     ...(telemetry ? [
       `Turn ${shortState} · Model ${model} · ${telemetry} · ${queueLong} · Bg ${backgroundTasks}`,
       `Turn ${shortState} · ${shortModel} · ${telemetry} · ${queueShort} · B${backgroundTasks}`,

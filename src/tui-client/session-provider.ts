@@ -1,5 +1,6 @@
 import { PROVIDER_DEFAULT_MODEL } from '../user-config.js';
 import { resolveProviderCredentialAsync } from '../llm/provider-credentials.js';
+import { extractSessionProviderTurnConfig } from '../repl/session-provider-turn.js';
 import type { UserConfig } from '../user-config/types.js';
 
 /** Process-local selection. Credentials are resolved for each turn, never stored here.
@@ -42,19 +43,19 @@ export async function configForSessionProviderTurn(
   selection: SessionProviderSelection | undefined,
 ): Promise<UserConfig> {
   if (!selection) return cfg;
-  const provider = selection.provider;
-  const changed = provider !== cfg.llm.provider;
+  const changed = selection.provider !== cfg.llm.provider;
   const credential = changed
     ? await resolveProviderCredentialAsync({
-      provider, baseProvider: cfg.llm.provider, baseApiKey: cfg.llm.apiKey, rotation: cfg.llm.rotation,
+      provider: selection.provider, baseProvider: cfg.llm.provider, baseApiKey: cfg.llm.apiKey, rotation: cfg.llm.rotation,
     })
     : undefined;
+  // Single-sourced merge shape (TUI-NEXT-PROVIDER-FLAG-IGNORED): the pure
+  // helper owns provider/model selection; this wrapper only adds credentials.
+  const merged = extractSessionProviderTurnConfig(cfg, selection, true);
   return {
-    ...cfg,
+    ...merged,
     llm: {
-      ...cfg.llm,
-      provider,
-      model: selection.model ?? (changed ? PROVIDER_DEFAULT_MODEL[provider] : cfg.llm.model),
+      ...merged.llm,
       ...(changed ? { apiKey: credential?.apiKey, baseUrl: credential?.baseUrl } : {}),
     },
   };

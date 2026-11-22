@@ -1,9 +1,84 @@
 import { afterEach, expect, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { simCli } from '../ux-sim/in-process-cli.js';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { registerReleaseRunStatusCommand } from './release-run-status-cli.js';
+
+test('release status reads immutable counts and reports missing or incompatible ledgers unknown', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-snapshot-')); roots.push(root);
+  const ledger = join(root, 'ledger');
+  const app = new Command();
+  registerReleaseRunStatusCommand(app.command('release'), { ledgerRoot: () => ledger, debugDir: () => join(root, 'logs') });
+  const lines: string[] = [];
+  const original = console.log; console.log = (line?: unknown) => { lines.push(String(line ?? '')); };
+  const run = async () => { lines.length = 0; await app.parseAsync(['node', 'test', 'release', 'status', '0.3.7']); return lines.join('\n'); };
+  try {
+    const missing = await run();
+    expect(missing).toContain('🟢unknown'); expect(missing).toContain('complete=false');
+    expect(existsSync(ledger)).toBe(false);
+    mkdirSync(join(ledger, 'release'), { recursive: true });
+    const path = join(ledger, 'release', 'features.sqlite');
+    const db = new Database(path);
+    db.exec('CREATE TABLE imported_versions (version TEXT, json_hash TEXT); CREATE TABLE assignments (version TEXT, status TEXT);');
+    db.exec("INSERT INTO imported_versions VALUES ('0.3.7', NULL); INSERT INTO assignments VALUES ('0.3.7','green'), ('0.3.7','yellow'), ('0.3.7','yellow'), ('0.3.7','red'), ('0.3.7','done');"); db.close();
+    const known = await run();
+    expect(known).toContain('🟢1 🟡2 🔴1 ✅1'); expect(known).toContain('snapshot 읽기');
+    const invalidDb = new Database(path); invalidDb.exec('DROP TABLE assignments'); invalidDb.close();
+    const invalid = await run(); expect(invalid).toContain('🟢unknown'); expect(invalid).toContain('complete=false');
+    expect(existsSync(`${path}-wal`)).toBe(false); expect(existsSync(`${path}-shm`)).toBe(false);
+  } finally { console.log = original; }
+});
+
+test('actual release status does not import legacy JSON, create a ledger or migrate an old SQLite ledger', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-status-legacy-')); roots.push(root);
+  const release = join(root, 'release');
+  const versionDir = join(release, '0.3.7');
+  mkdirSync(versionDir, { recursive: true });
+  const legacy = join(versionDir, 'checklist.json');
+  writeFileSync(legacy, JSON.stringify({ version: '0.3.7', items: [{ id: 'LEGACY', title: 'legacy item', status: 'green', updatedAt: '2026-01-01', updatedBy: 'fixture' }], history: [] }));
+  const ledger = join(release, 'features.sqlite');
+  const file = (path: string) => ({ bytes: readFileSync(path).toString('base64'), mtime: statSync(path).mtimeMs });
+  const run = () => simCli([`--test=${root}`, 'release', 'status', '0.3.7'], {
+    mode: 'spawn', stateRoot: root, allowPaths: [['release', 'status']], timeoutMs: 60_000,
+    env: { HOME: root, ELANOUS_STATE_DIR: root },
+  });
+  const legacyBefore = file(legacy);
+  const missing = await run();
+  expect(missing.exitCode, missing.stderr).toBe(0);
+  expect(missing.stdout).toContain('🟢unknown');
+  expect(missing.stdout).toContain('complete=false');
+  expect(existsSync(ledger)).toBe(false);
+  expect(readdirSync(release).sort()).toEqual(['0.3.7']);
+  expect(file(legacy)).toEqual(legacyBefore);
+
+  // Old schema has real rows but lacks the current imported_versions table: a writable
+  // initializer would create/migrate tables and could import the legacy checklist.
+  const db = new Database(ledger);
+  db.exec("CREATE TABLE features (id TEXT PRIMARY KEY, title TEXT); INSERT INTO features VALUES ('OLD', 'existing'); CREATE TABLE assignments (feature_id TEXT, version TEXT, status TEXT); INSERT INTO assignments VALUES ('OLD', '0.3.7', 'yellow');");
+  db.close();
+  const rows = () => {
+    const reader = new Database(ledger, { readonly: true });
+    try { return { schema: reader.query("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").all(), features: reader.query('SELECT COUNT(*) AS n FROM features').get(), assignments: reader.query('SELECT COUNT(*) AS n FROM assignments').get() }; }
+    finally { reader.close(); }
+  };
+  const beforeRows = rows();
+  expect(beforeRows.features).toEqual({ n: 1 });
+  expect(beforeRows.assignments).toEqual({ n: 1 });
+  const beforeDb = file(ledger);
+  const beforeFiles = readdirSync(release).sort();
+  const result = await run();
+  expect(result.exitCode, result.stderr).toBe(0);
+  expect(result.stdout).toContain('🟢unknown');
+  expect(result.stdout).toContain('complete=false');
+  expect(file(legacy)).toEqual(legacyBefore);
+  expect(file(ledger)).toEqual(beforeDb);
+  expect(readdirSync(release).sort()).toEqual(beforeFiles);
+  expect(rows()).toEqual(beforeRows);
+}, 180_000);
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });

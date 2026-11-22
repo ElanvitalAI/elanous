@@ -162,12 +162,12 @@ test('ids are checked against every id in the journal; a colliding candidate is 
 test('restart: panes of the previous server lose their pty id, keep cwd and scrollback; send is refused', async () => {
   const first = owner();
   first.core.start();
-  const pane = paneOf(first.core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
+  const pane = paneOf(first.core.newPane({ ws: 'HQ', cwd: '/', command: ['sh'] }));
   await first.core.read(pane);
   const second = owner(first.stored());
   expect(second.core.start()).toBeUndefined();
   const row = second.stored().panes[0]!;
-  expect([row.ptyId, row.state, row.cwd, row.scrollback]).toEqual(['', 'idle', '/work', 'pty_1 ready\n']);
+  expect([row.ptyId, row.state, row.cwd, row.scrollback]).toEqual(['', 'idle', '/', 'pty_1 ready\n']);
   expect((await second.core.read(pane)).message).toBe('pty_1 ready\n');
   expect((await second.core.send(pane, 'x')).exitCode).toBe(1);
 });

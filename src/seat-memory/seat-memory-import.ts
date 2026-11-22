@@ -14,8 +14,11 @@ import {
 } from './seat-memory.js';
 
 export type SeatMemoryImportAction = 'create' | 'update' | 'same';
-export type SeatMemoryImportSkip = 'secret-pattern' | 'unparsable' | 'not-regular-file';
-const SUPPLEMENTAL_MARKER = '<!-- elanous seat memory import: unindexed -->';
+/** 'superseded-by-generated-name'(op-memory-seed 전용) — claude 원본 중 생성 이름(ops-rule-*·op-decision-*·landing-knowhow) 기억:
+ *  생성 기억이 그 이름 공간을 소유해 이식에서 제외된다. 대상에 동일 파일이 살아 있으면 그 파일이 유지·색인되고,
+ *  없으면 미이식·미색인으로 남는다(원본은 읽기 전용 원본 폴더에 유지). */
+export type SeatMemoryImportSkip = 'secret-pattern' | 'unparsable' | 'not-regular-file' | 'source-outside-allowed-roots' | 'superseded-by-generated-name';
+export const SUPPLEMENTAL_MARKER = '<!-- elanous seat memory import: unindexed -->';
 
 export interface SeatMemoryImportPlan {
   from: string;
@@ -64,7 +67,8 @@ function pathOccupied(path: string): boolean {
   }
 }
 
-function supplementalFileName(from: string, to: string): string {
+/** 보조 색인 파일 이름 고르기 — 원본 폴더와 겹치지 않고, 대상의 옛 보조 색인이면 이어 쓴다(op-memory-seed 시딩 재사용). */
+export function supplementalFileName(from: string, to: string): string {
   for (let suffix = 0; suffix < 100; suffix++) {
     const name = suffix ? `MEMORY-UNINDEXED-${suffix + 1}.md` : 'MEMORY-UNINDEXED.md';
     if (pathOccupied(join(from, name))) continue;

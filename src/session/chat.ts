@@ -49,14 +49,15 @@ import {
 // chat 툴루프를 canonical 엔진(runGoalLoop→runCoreTurn→streamLLMWithTools)으로 라우팅.
 // ACP bridge(core-turn-bridge.ts)·dashboard(runGoalLoopHook)와 동일 엔진 재사용(재발명 제거).
 import { runCoreTurn } from '../core-turn/run-core-turn.js';
-import { drainPendingUserInput } from './pending-input.js';
+import { drainPendingInterjections } from './pending-input.js';
 import { runGoalLoop } from '../core-turn/run-goal-loop.js';
 import { coreAdvisorForGoalLoop } from '../core-turn/core-advisor-wiring.js';
 import { assertTurnNotSilentFailure } from './turn-silent-failure.js';
 import type { CoreTurnCallbacks, CoreTurnContext, CoreTurnDispatchTool } from '../core-turn/types.js';
 import { SEAT_TURN_CAP_DEFAULTS } from '../core-turn/seat-turn-cap.js';
 import { postSeatCapResumeNotice } from '../core-turn/seat-cap-resume-notice.js';
-import { classifyTuiChatIntent } from '../core-turn/short-question.js';
+import { resolvePinnedObjective, releasePinnedGoal, sessionGoalPinStore } from '../core-turn/human-goal-pin.js';
+import { shouldReleasePinForGoalLoop } from '../tui-client/local-chat-turn-goalpin-wire.js';
 import { composeChildContext, type ChildContextProfile } from '../self-implement/child-context-composition.js';
 import { getHarnessSpace } from '../harness/harness-space.js';
 import { isResearchAgentIntent } from '../tool-hints/signals.js';
@@ -103,6 +104,8 @@ export interface RunTurnOpts {
   onResearchPlanSettled?: (info: { outcome: string; elapsedMs: number }) => void;
   /** MSG-SOURCE-HIERARCHY: who sent this turn's text (persisted on the user message; absent = human). */
   from?: import('./index.js').MessageSource;
+  /** SEAT-HUMAN-GOAL-PIN ④ — 부모(TUI)가 소유한 핀 목표(payload · local-chat-turn). 이 프로세스 저장소보다 우선 — child 교체/재기동 뒤 복구. */
+  parentPinnedGoal?: string;
   /** Multimodal image blocks to prepend before the user text (e.g.
    *  photos received via Telegram). When non-empty, the LLMMessage
    *  content is sent as ContentBlock[] instead of a plain string, and
@@ -187,10 +190,10 @@ export interface RunTurnOpts {
   /** Durable mission correlation for a turn executed by run-mission. Surface
    * adapters use it only when delegating through ACP; normal chat has none. */
   missionContext?: { missionId: string; phaseId: string; onOverload?: (info: { turn: number; consecutiveFailures: number; reason: string }) => void };
-  /** ⭐ substrate 통합 — goal-loop 아밍(명시). true 면 tool-loop 을 `runGoalLoop` 으로
-   *  감싸 목표 완료(GOAL-COMPLETE 증거게이트)까지 across-turn 반복 자기수정한다. config
-   *  `llm.goalLoop.enabled` 로도 아밍(ACP bridge 와 동일 SSOT). `tools` 비어있으면 무효
-   *  (goal-loop 은 tool-loop 위에서만 의미). 미아밍이면 기존 single-turn 경로 그대로. */
+  /** ⭐ substrate 통합 — goal-loop 아밍(명시 전용). true 면 tool-loop 을 `runGoalLoop` 으로
+   *  감싸 목표 완료(GOAL-COMPLETE 증거게이트)까지 across-turn 반복 자기수정한다. 이 값이
+   *  유일한 아밍 경로다(CHAT-GOAL-LOOP-DEFAULT-OFF — config 스위치·TUI 문장 분류 아밍 삭제).
+   *  `tools` 비어있으면 무효. 미아밍이면 기존 single-turn 경로 그대로. */
   goalLoop?: boolean;
   /** goal-loop 반복 상한 override. 생략 시 config `llm.goalLoop.maxIterations`. */
   goalLoopMaxIterations?: number;
@@ -214,6 +217,8 @@ export interface RunTurnResult {
   goalComplete?: boolean;
   /** Terminal reason from the armed goal loop, used by the TUI to explain a seat cap. */
   goalStopReason?: string;
+  /** SEAT-HUMAN-GOAL-PIN ④ — 골 루프 완료 경로(via 원문): update_goal 만이 핀 해제 선언이다(OP #131052). */
+  goalCompletionVia?: string;
 }
 
 export interface CreateRunTurnSessionOpts extends Partial<CreateSessionOpts> {
@@ -657,6 +662,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   let text = '';
   let goalComplete = false;
   let goalStopReason: string | undefined;
+  let goalCompletionVia: string | undefined;
   let turnFailed = false;
   // OPENROUTER-CLAUDE(11-17) — 조용한 실패 판정 재료(턴 끝 assertTurnNotSilentFailure).
   let toolCallsSeen = 0;
@@ -694,6 +700,18 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     const guardedTurnLlmOpts = requestSizeGuard
       ? { ...(turnLlmOpts ?? {}), requestSizeGuard: turnLlmOpts?.requestSizeGuard ?? requestSizeGuard }
       : turnLlmOpts;
+    // SEAT-GOAL-PIN-OUTSIDE-GOAL-LOOP (OP #132075) — 핀 판정은 armGoalLoop 아밍과 무관하게
+    //   runTurn 공통 진입점(여기)에서 턴당 1회. 사람 줄이면 핀이 서고(일반 TUI 턴 포함),
+    //   핀이 살아 있으면 다음 세 경로 모두 같은 objective 를 본다: 골 루프(:objective)·
+    //   코어 턴(kept 주입)·일반 단일 턴(kept 주입). 주입은 알림 턴(noticeTurn)에만 —
+    //   사람 줄 자체가 지시이므로 첫 턴에 자기 지시를 다시 붙이지 않는다.
+    // SEAT-GOAL-PIN-OUTSIDE-GOAL-LOOP(OP #132075): 핀 판정은 골 루프 분기가 아니라 이 공통 진입점에서
+    //   한 번만 끝난다(알림 턴도 같은 판정·주입을 받는다). parentPinnedGoal 회복(#39634 ④ 배선)도 여기 포함.
+    const goalPin = resolvePinnedObjective({ sessionId: opts.sessionId, from: opts.from, turnText: opts.userText,
+      ...(opts.parentPinnedGoal !== undefined ? { parentPinnedGoal: opts.parentPinnedGoal } : {}) }, sessionGoalPinStore());
+    if (goalPin.noticeTurn && goalPin.objective !== undefined) {
+      effectiveSystemPrompt = `${effectiveSystemPrompt}\n\n[📌 고정 목표(사람 지시)] ${goalPin.objective}\n이 턴을 연 줄(알림·자동)은 이 목표를 대체하지 못한다. 목표가 완료됐을 때만 update_goal(status:"complete") 로 선언한다.`;
+    }
     ({ kept, dropped, used } = assembleTurnMessages(effectiveSystemPrompt));
     // Durable tool telemetry (추적성) — pair each call's args (onToolCall) with its
     // result (onToolResult) and persist a role:'tool' message so later "어떤 도구
@@ -702,14 +720,11 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     const toolCallArgs = new Map<string, unknown>();
     // ⭐ substrate 통합 — goal-loop 아밍 시 canonical 엔진(runGoalLoop→runCoreTurn→
     // streamLLMWithTools)으로 라우팅. 미아밍이면 아래 기존 single-turn 경로 그대로(회귀 0).
+    // CHAT-GOAL-LOOP-DEFAULT-OFF(0.3.33 · 대표 «골 루프가 해롭다») — 골 루프는 «명시 골» 호출자만 켠다
+    //   (`opts.goalLoop === true`: chat --goal-loop · dev --implement 자식 · PWA :agent goalLoop).
+    //   보통 대화·TUI·자리 턴·알림 턴은 config(`llm.goalLoop.enabled` 삭제)나 문장 분류로 켜지지 않는다.
     const goalLoopCfg = opts.userConfig.llm.goalLoop;
-    const cwdSeat = /(?:^|\/)seats\/([A-Za-z][A-Za-z0-9_-]{0,63})(?:\/|$)/u.exec(process.cwd())?.[1];
-    const envSeat = process.env.COORD_ID?.trim();
-    const seat = opts.utteranceSurface === 'tui' ? (cwdSeat ?? envSeat)?.toUpperCase() : undefined;
-    const tuiIntent = opts.utteranceSurface === 'tui'
-      ? classifyTuiChatIntent(opts.userText, { seat: seat !== undefined })
-      : undefined;
-    const armGoalLoop = opts.goalLoop === true || goalLoopCfg?.enabled === true || tuiIntent?.goalLoop === true;
+    const armGoalLoop = opts.goalLoop === true;
     const armResearchTurn = turnTools.length > 0 && (opts.coreTurn === true
       || ((opts.utteranceSurface === 'tui' || opts.utteranceSurface === 'ask') && isResearchAgentIntent(opts.userText)));
     if (armGoalLoop || armResearchTurn) {
@@ -789,11 +804,17 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         const cwdSeat = /(?:^|\/)seats\/([A-Za-z][A-Za-z0-9_-]{0,63})(?:\/|$)/u.exec(process.cwd())?.[1];
         const envSeat = process.env.COORD_ID?.trim();
         const seat = opts.utteranceSurface === 'tui' ? (cwdSeat ?? envSeat)?.toUpperCase() : undefined;
+        // SEAT-HUMAN-GOAL-PIN (OP #128939) — 핀 판정은 위 공통 진입점(OUTSIDE-GOAL-LOOP)에서
+        //   이미 끝났다(people 줄 핀 세팅 포함). 여기선 그 objective 를 골 루프 목표로 쓴다.
+        //   ① fail-closed(OP #130461): opts.from 미전달은 사람 아님 — from 을 그대로 흘려보낸다.
+        //   goalPin 자체는 위 공통 진입점 계산(OUTSIDE-GOAL-LOOP · parentPinnedGoal 포함)을 그대로 쓴다 —
+        //   분기 안의 중복 계산은 폐지.
         // SEAT-TURN-CAP-DEFAULT-15M — chat.seatTurnCap 옵션 삭제: 상한은 기본값 한 벌.
         const seatTurnCap = seat ? { ...SEAT_TURN_CAP_DEFAULTS, seat } : undefined;
         // HARNESS-ADVISOR-CHECKPOINTS — 하니스 런에서만 코어 ADVISOR(그림자 기본).
         const advisor = coreAdvisorForGoalLoop({ userText: coreCtx.userText ?? '', signal: coreCtx.signal });
         const gl = await runGoalLoop(coreCtx, {
+          ...(goalPin.objective !== undefined ? { objective: goalPin.objective } : {}),
           ...(maxIterations !== undefined ? { maxIterations } : {}),
           ...(advisor ? { advisor } : {}),
           ...(seatTurnCap ? { seatTurnCap } : {}),
@@ -802,7 +823,13 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         });
         text = gl.finalText;
         goalComplete = gl.goalComplete;
+        // SEAT-HUMAN-GOAL-PIN ②(OP #131052): 핀 해제는 목표 완료 선언(update_goal complete)만.
+        //   골 루프가 goalComplete=true 로 닫는 다른 경로(structured-final·상태질문·빈 우편 종결)는 핀을 풀지 않는다.
+        if (shouldReleasePinForGoalLoop({ stopReason: gl.stopReason, completionVia: gl.completionVia })) {
+          releasePinnedGoal(opts.sessionId, sessionGoalPinStore());
+        }
         goalStopReason = gl.stopReason;
+        goalCompletionVia = gl.completionVia;
         turnFailed = gl.stopReason === 'aborted' || gl.stopReason === 'error' || gl.stopReason === 'auth_rejected';
         turnStopReason = gl.stopReason;
         turnErrorMessage = gl.errorMessage;
@@ -862,7 +889,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         // the next model request, the same boundary `runCoreTurn` wires (run-core-turn.ts). Without it a
         // steer typed during a Next TUI tool turn sat in the registry until the turn ended and left again
         // as a separate turn.
-        drainPendingUserInput: guardedTurnLlmOpts?.drainPendingUserInput ?? (() => drainPendingUserInput(opts.sessionId)),
+        drainPendingUserInput: guardedTurnLlmOpts?.drainPendingUserInput ?? (() => drainPendingInterjections(opts.sessionId)),
         // O4 — session-derived cache affinity (codex prompt_cache_key · OpenRouter sticky routing) and
         // the llm.usage row's session join. The core-turn path already threads ctx.sessionId.
         sessionId: guardedTurnLlmOpts?.sessionId ?? opts.sessionId,
@@ -958,6 +985,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     memoryIds,
     ...(goalComplete ? { goalComplete: true } : {}),
     ...(goalStopReason ? { goalStopReason } : {}),
+    ...(goalCompletionVia ? { goalCompletionVia } : {}),
   };
 }
 

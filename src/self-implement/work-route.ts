@@ -56,14 +56,18 @@ export function windowAccountLaunch(plan: WorkRoutePlan, launchedProvider: strin
   const { decision } = plan;
   // 선택기가 이미 이벤트를 낸 갈래(shadow · 거절 · 같은 계정)는 여기서 다시 내지 않는다.
   if (accounts?.selection !== 'on' || !accounts.active || accounts.explicit === true) return NO_SWITCH;
-  if (decision.account === null || decision.account === accounts.active.account) return NO_SWITCH;
+  const codex = accounts.routerMix?.codex;
+  const actualActive = decision.provider === 'openai-codex' && codex ? codex.active?.account : accounts.active.account;
+  if (decision.account === null || decision.account === actualActive) return NO_SWITCH;
   const skip = (reason: string): WindowAccountLaunch => {
     try { emit(WINDOW_ACCOUNT_EVENT, 'apply-skip', { reason, provider: decision.provider, launchedProvider: launchedProvider ?? null }); } catch { /* fail-soft */ }
     return NO_SWITCH;
   };
-  if (decision.provider !== accounts.active.provider || launchedProvider !== decision.provider) return skip('provider-mismatch');
+  if (launchedProvider !== decision.provider ||
+      (decision.provider !== accounts.active.provider && !(accounts.routerMix && decision.provider === 'openai-codex')))
+    return skip('provider-mismatch');
   if (decision.provider !== 'openai-codex' && decision.provider !== 'codex') return skip('provider-not-switchable');
-  const kind = accounts.candidates.find((c) => c.provider === decision.provider && c.account === decision.account)?.billing ?? 'unknown';
+  const kind = (codex?.candidates ?? accounts.candidates).find((c) => c.provider === decision.provider && c.account === decision.account)?.billing ?? 'unknown';
   return { env: { ELANOUS_CODEX_ACCOUNT: decision.account }, applied: { kind, account: decision.account } };
 }
 

@@ -213,20 +213,20 @@ describe('새 TUI REPL 시스템 프롬프트 — 자리 부트 카드(TUI-SESSI
 
   /** 홈에 자리(seat-state/OP ⊕ seats/OP/AGENTS.local.md)와 OP 앞 미읽은 우편 1통을 세운다.
    *  cwd 는 «자리가 아닌» 임시 디렉터리 — 자리 판정은 COORD_ID 로만 선다(그래서 두 호출의 base 가 같다). */
-  function seatFixture(): { home: string; cwd: string; msgPath: string; store: MsgStore } {
+  function seatFixture(seat = 'OP'): { home: string; cwd: string; msgPath: string; store: MsgStore } {
     const home = mkdtempSync(join(tmpdir(), 'repl-seatboot-'));
     const cwd = mkdtempSync(join(tmpdir(), 'repl-turn-'));
-    mkdirSync(join(home, 'elanous-hq', 'seat-state', 'OP'), { recursive: true });
-    const seatDir = join(home, 'elanous-hq', 'seats', 'OP');
+    mkdirSync(join(home, 'elanous-hq', 'seat-state', seat), { recursive: true });
+    const seatDir = join(home, 'elanous-hq', 'seats', seat);
     mkdirSync(seatDir, { recursive: true });
     writeFileSync(join(seatDir, 'AGENTS.local.md'), '역할 = 판정 제안 담당\n');
     const msgPath = join(home, 'state', 'msg', 'messages.db');
     const store = new MsgStore(msgPath);
-    store.post({ from: 'TC', to: 'OP', body: 'repl-zero-guidance-mail' });
+    store.post({ from: seat === 'TC' ? 'OP' : 'TC', to: seat, body: 'repl-zero-guidance-mail' });
     return { home, cwd, msgPath, store };
   }
 
-  const seatDeps = (home: string, msgPath: string) => ({ home, msgPath, env: { COORD_ID: 'OP' } });
+  const seatDeps = (home: string, msgPath: string, seat = 'OP') => ({ home, msgPath, env: { COORD_ID: seat } });
   const plainDeps = (home: string, msgPath: string) => ({ home, msgPath, env: {} });
 
   test('the same mock research request exposes the same three skill choices in classic and Next TUI', () => {
@@ -347,8 +347,10 @@ describe('새 TUI REPL 시스템 프롬프트 — 자리 부트 카드(TUI-SESSI
     }
   });
 
+  // 손 자리(TC)로 잰다 — 조율 자리(OP)는 범용 preamble 자체가 조율자 프로필로 바뀐다(SEAT-COORDINATOR-PROMPT-PROFILE ·
+  // coordinator-prompt-profile.test.ts). 이 시험의 계약(카드는 preamble 뒤에 붙는다)은 자리 성격과 무관하다.
   test('자리 카드는 앞선 범용 preamble 을 밀어내지 않고 뒤에 붙는다', () => {
-    const f = seatFixture();
+    const f = seatFixture('TC');
     try {
       resetSeatBootCacheForTest();
       const plain = buildReplSystemPrompt({
@@ -364,14 +366,14 @@ describe('새 TUI REPL 시스템 프롬프트 — 자리 부트 카드(TUI-SESSI
         enabledToolNames: undefined,
         cwd: f.cwd,
         sessionId: 'repl-compose-session',
-        seatBootDeps: seatDeps(f.home, f.msgPath),
+        seatBootDeps: seatDeps(f.home, f.msgPath, 'TC'),
       });
       const seated = buildReplSystemPrompt({
         cfg: fakeConfig,
         enabledToolNames: [],
         cwd: f.cwd,
         sessionId: 'repl-compose-session',
-        seatBootDeps: seatDeps(f.home, f.msgPath),
+        seatBootDeps: seatDeps(f.home, f.msgPath, 'TC'),
       });
 
       expect(cardOnly).toBeDefined();

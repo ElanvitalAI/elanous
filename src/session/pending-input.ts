@@ -15,11 +15,17 @@
 
 import { randomUUID } from 'node:crypto';
 import { debug } from '../debug/log.js';
+import type { PendingInterjection } from '../chat/interjection.js';
+
+/** Provenance of a pending item that is seat mail (untrusted data), not operator input. */
+export interface PendingSeatMailSource { readonly msgId: number; readonly from: string; readonly intent?: string | null }
 
 /** 레지스트리 항목 — ⭐ id 는 «원본 큐»가 배수·되꺼내기·턴 종료 승격을 짝지을 때 쓴다(10-14 중복 수리). */
 export interface PendingUserInputItem {
   id: string;
   text: string;
+  /** Present only for seat mail — rendered as an untrusted-data block, never as a <user_query>. */
+  seatMail?: PendingSeatMailSource;
 }
 
 export type PendingUserInputDrained = (drained: readonly string[], items: readonly PendingUserInputItem[]) => void;
@@ -44,13 +50,14 @@ export function enqueuePendingUserInput(
   sessionId: string,
   text: string,
   onDrained?: PendingUserInputDrained,
+  seatMail?: PendingSeatMailSource,
 ): string | null {
   const trimmed = text.trim();
   if (!sessionId || trimmed.length === 0) return null;
   const bucket = buckets.get(sessionId) ?? { items: [] };
   nextPendingId += 1;
   const id = `pending-${pendingIdPrefix}-${nextPendingId}`;
-  bucket.items.push({ id, text: trimmed });
+  bucket.items.push({ id, text: trimmed, ...(seatMail ? { seatMail } : {}) });
   if (onDrained) bucket.onDrained = onDrained;
   buckets.set(sessionId, bucket);
   debug.log('llm.interjection', 'enqueued', { sessionId, id, queued: bucket.items.length });
@@ -61,16 +68,27 @@ export function enqueuePendingUserInput(
  * ★ 쌓인 발화를 «비우면서» 낸다. 루프 경계에서 불린다.
  * ⛔ 비우는 것이 계약이다 — 안 비우면 매 바퀴 같은 발화가 다시 들어간다.
  */
-export function drainPendingUserInput(sessionId: string): string[] {
+export function drainPendingInterjections(sessionId: string): PendingInterjection[] {
   const bucket = buckets.get(sessionId);
   if (!bucket || bucket.items.length === 0) return [];
   const items = bucket.items;
   bucket.items = [];
   const drained = items.map(item => item.text);
+  const interjections: PendingInterjection[] = items.map((item) => (item.seatMail
+    ? { kind: 'seat-mail', msgId: item.seatMail.msgId, from: item.seatMail.from, intent: item.seatMail.intent ?? null, text: item.text }
+    : item.text));
   // ⭐ 주입 횟수의 정본 관측 — 이 id 들이 지금 루프 경계로 넘어간다(RFC v2 P1 ⓑ · 내용은 남기지 않는다).
   debug.log('llm.interjection', 'drained', { sessionId, ids: items.map(item => item.id) });
   try { bucket.onDrained?.(drained, items); } catch { /* 통지 실패가 배수를 막지 않는다 */ }
-  return drained;
+  return interjections;
+}
+
+/**
+ * Text-only drain kept for callers that predate provenance. Production request builders use
+ * {@link drainPendingInterjections} so seat mail is rendered as untrusted data, never as operator input.
+ */
+export function drainPendingUserInput(sessionId: string): string[] {
+  return drainPendingInterjections(sessionId).map((item) => (typeof item === 'string' ? item : item.text));
 }
 
 /**

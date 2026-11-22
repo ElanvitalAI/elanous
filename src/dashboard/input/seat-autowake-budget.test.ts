@@ -1,5 +1,27 @@
 import { expect, test } from 'bun:test';
 import { readSeatBudgetUsage } from './seat-autowake-budget.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { LogStore } from '../../mss/logging/log-store.js';
+import { readUsageDaily } from '../../budget/usage-daily-store.js';
+
+test('real isolated usage ledger counts only the target seat and UTC day', () => {
+  const root = mkdtempSync(join(tmpdir(), 'autowake-usage-'));
+  const path = join(root, 'logs.db');
+  const store = new LogStore(path);
+  try {
+    for (const [seat, ts, inputTokens] of [
+      ['OPT', '2026-11-19T09:00:00Z', 60], ['TC', '2026-11-19T09:00:00Z', 300],
+      ['OPT', '2026-11-18T09:00:00Z', 200],
+    ] as const) store.insertBatch([{ rec: { ts, category: 'llm.usage', event: 'usage',
+      data: { seat, role: 'agent', site: 'agent-turn', inputTokens, outputTokens: 0 } }, surface: 'harness' }]);
+    const result = readSeatBudgetUsage({ seat: 'OPT', budgetText: '100', now: new Date('2026-11-19T10:00:00Z'),
+      readUsage: day => readUsageDaily(path, day)?.rows ?? null });
+    // 출처: #38935 격리 원장의 OPT 당일 입력 60과 예산 파일 값 100.
+    expect(result).toEqual({ budget: 100, used: 60 });
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
 
 test('no valid budget means no ledger read', () => {
   for (const budget of [null, '', '0', '-1', '1.5', '1x']) {

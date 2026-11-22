@@ -76,7 +76,10 @@ spawnElanous: () => {
 `);
     writeFileSync(join(dir, 'recipes.yaml'), stringify({
       'steward-resync': { ...recipes['steward-resync'], command: `bun --preload ${JSON.stringify(resyncPreload)} ${recipes['steward-resync']!.command.slice(4)}` },
-      'steward-rejudge': { ...recipes['steward-rejudge'], command: `bun --preload ${JSON.stringify(rejudgePreload)} ${recipes['steward-rejudge']!.command.slice(4)}` }, ...Object.fromEntries(stages.map(name => [
+      'steward-rejudge': { ...recipes['steward-rejudge'], command: `bun --preload ${JSON.stringify(rejudgePreload)} ${recipes['steward-rejudge']!.command.slice(4)}` },
+      // TA-SWEEP-PERIODIC — same offline preload; the isolated config leaves sweepEveryMinutes unset,
+      // so the ta-sweep node only records its `disabled` decision and never touches a real ledger.
+      'steward-ta-sweep': { ...recipes['steward-ta-sweep'], command: `bun --preload ${JSON.stringify(preload)} ${recipes['steward-ta-sweep']!.command.slice(4)}` }, ...Object.fromEntries(stages.map(name => [
       `steward-${name}`, { ...recipes[`steward-${name}`], command: `bun --preload ${JSON.stringify(preload)} ${recipes[`steward-${name}`]!.command.slice(4)}` },
     ])) }));
     const isolated = join(root, '.elanous-test');
@@ -96,7 +99,7 @@ spawnElanous: () => {
     expect(run.code, `${run.stderr}\n${run.stdout}`).toBe(0);
     const result = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { status: string; path: string[] };
     expect(result.status).toBe('done');
-    expect(result.path).toEqual(['resync', 'rejudge', 'sync', 'triage', 'schedule', 'report', 'done']);
+    expect(result.path).toEqual(['resync', 'rejudge', 'ta-sweep', 'sync', 'triage', 'schedule', 'report', 'done']);
     expect(existsSync(join(isolated, 'logs', 'logs.db')), run.stdout).toBe(true);
     const resyncLookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'loop.steward', '--event', 'resync-tick', '--since', startedAt, '--json', '--json-data', '--limit', '20'], root);
     expect(resyncLookup.code, `${resyncLookup.stderr}\n${resyncLookup.stdout}`).toBe(0);

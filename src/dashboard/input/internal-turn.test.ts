@@ -73,6 +73,16 @@ describe('noteTurnStarted — 매 실제 턴은 고유한 id (SCHEDULE-WAKEUP-TU
 });
 
 describe('startTurnIfIdle — 내부 턴 문 판정', () => {
+  test('구조화 작업 참조를 내부 턴에 전달하고 다음 턴에는 남기지 않는다', () => {
+    const h = harness();
+    h.mount();
+    const workReferences = [{ kind: 'cell' as const, id: 'CELL-X', version: '0.3.33' }];
+    expect(h.gate.startTurnIfIdle('조사', { origin: 'self-pull', workReferences }).opened).toBe(true);
+    expect(h.gate.takePending()?.workReferences).toEqual(workReferences);
+    h.gate.noteTurnSettled();
+    expect(h.gate.startTurnIfIdle('다음', { origin: 'scheduled' }).opened).toBe(true);
+    expect(h.gate.takePending()?.workReferences).toBeUndefined();
+  });
   test('MSG-SOURCE: agent from 은 요청에 실리고 사람·system from 은 싣지 않는다(구조 칸만)', () => {
     const h = harness();
     h.mount();

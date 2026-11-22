@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -93,6 +93,32 @@ test('revocation marker ENOSPC retires the signed seal and stays refused after r
   expect(createAppBuildRunAuthority(opts).resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
 });
 
+test('same app reconnect rebinds the seal and a different app still revokes the run', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'app-build-authority-'))); roots.push(root);
+  const sessionPath = join(root, 'member-session.json');
+  const first = { nexusUrl: 'https://api.elanous.ai', appSlug: 'synthetic-app', sessionToken: 'aps_first' };
+  writeFileSync(sessionPath, JSON.stringify(first), { mode: 0o600 });
+  const read = () => {
+    try { return JSON.parse(readFileSync(sessionPath, 'utf8')) as typeof first; } catch { return undefined; }
+  };
+  const authority = createAppBuildRunAuthority({ root: join(root, 'authority'), hostKey: 'c'.repeat(64),
+    retainedSession: read, relayKeyFingerprint: () => sha('emk-synthetic') });
+  const grant = { ownerId: 'synthetic-owner', userSlug: 'syntheticowner', runId: 'run-1',
+    appSlug: 'synthetic-app', sourceHead: 'f'.repeat(40), issuerExpiresAt: '2099-01-01T00:00:00Z' };
+  authority.issue(grant, first);
+  const replacement = { ...first, sessionToken: 'aps_replacement' };
+  writeFileSync(sessionPath, JSON.stringify(replacement), { mode: 0o600 });
+  expect(authority.resolve(grant.runId, grant.appSlug, grant.sourceHead)).toEqual({
+    memberId: grant.ownerId, userSlug: grant.userSlug });
+  expect(readFileSync(join(root, 'authority', 'run-1.json'), 'utf8')).not.toContain(replacement.sessionToken);
+  expect(createAppBuildRunAuthority({ root: join(root, 'authority'), hostKey: 'c'.repeat(64),
+    retainedSession: read, relayKeyFingerprint: () => sha('emk-synthetic') })
+    .resolve(grant.runId, grant.appSlug, grant.sourceHead)?.memberId).toBe(grant.ownerId);
+  writeFileSync(sessionPath, JSON.stringify({ ...replacement, appSlug: 'other-app' }), { mode: 0o600 });
+  expect(authority.resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
+  expect(readFileSync(join(root, 'authority', 'run-1.json.revoked'), 'utf8')).toBe('revoked\n');
+});
+
 test('run authority expires within two hours even if C approval lasts longer', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'app-build-authority-'))); roots.push(root);
   let time = Date.parse('2026-11-15T20:50:00Z');
@@ -104,6 +130,219 @@ test('run authority expires within two hours even if C approval lasts longer', (
   authority.issue(grant, session);
   time += 2 * 60 * 60 * 1_000;
   expect(authority.resolve('run-1', 'synthetic-app', grant.sourceHead)).toBeNull();
+});
+
+test('relay null plus a replacement session keeps the new session hash when the key binds', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'app-build-authority-'))); roots.push(root);
+  const sessionPath = join(root, 'member-session.json');
+  const first = { nexusUrl: 'https://api.elanous.ai', appSlug: 'synthetic-app', sessionToken: 'aps_first' };
+  writeFileSync(sessionPath, JSON.stringify(first), { mode: 0o600 });
+  const read = () => JSON.parse(readFileSync(sessionPath, 'utf8')) as typeof first;
+  let key: string | undefined;
+  const authority = createAppBuildRunAuthority({ root: join(root, 'authority'), hostKey: 'e'.repeat(64),
+    retainedSession: read, relayKeyFingerprint: () => key });
+  const grant = { ownerId: 'synthetic-owner', userSlug: 'syntheticowner', runId: 'run-1',
+    appSlug: 'synthetic-app', sourceHead: 'f'.repeat(40), issuerExpiresAt: '2099-01-01T00:00:00Z' };
+  authority.issue(grant, first);
+  const replacement = { ...first, sessionToken: 'aps_replacement' };
+  writeFileSync(sessionPath, JSON.stringify(replacement), { mode: 0o600 });
+  key = sha('operator-connected-emk');
+  expect(authority.resolve(grant.runId, grant.appSlug, grant.sourceHead)?.memberId).toBe(grant.ownerId);
+  const bound = JSON.parse(readFileSync(join(root, 'authority', 'run-1.json'), 'utf8')) as {
+    sessionHash: string; relayKeyHash: string };
+  expect(bound.sessionHash).toBe(sha('https://api.elanous.ai\0synthetic-app\0aps_replacement'));
+  expect(bound.relayKeyHash).toBe(key);
+  expect(createAppBuildRunAuthority({ root: join(root, 'authority'), hostKey: 'e'.repeat(64),
+    retainedSession: () => first, relayKeyFingerprint: () => key })
+    .resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
+});
+
+test('every retired session generation stays refused across A→B→C→A and restarts', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'app-build-authority-'))); roots.push(root);
+  const sessionPath = join(root, 'member-session.json');
+  const first = { nexusUrl: 'https://api.elanous.ai', appSlug: 'synthetic-app', sessionToken: 'aps_first' };
+  writeFileSync(sessionPath, JSON.stringify(first), { mode: 0o600 });
+  const read = () => {
+    try { return JSON.parse(readFileSync(sessionPath, 'utf8')) as typeof first; } catch { return undefined; }
+  };
+  // A fresh authority per resolve stands in for a restart: nothing in-process survives.
+  const make = () => createAppBuildRunAuthority({ root: join(root, 'authority'), hostKey: 'f'.repeat(64),
+    retainedSession: read, relayKeyFingerprint: () => sha('emk-synthetic') });
+  const grant = { ownerId: 'synthetic-owner', userSlug: 'syntheticowner', runId: 'run-1',
+    appSlug: 'synthetic-app', sourceHead: 'f'.repeat(40), issuerExpiresAt: '2099-01-01T00:00:00Z' };
+  make().issue(grant, first);
+  for (const token of ['aps_second', 'aps_third']) {
+    writeFileSync(sessionPath, JSON.stringify({ ...first, sessionToken: token }), { mode: 0o600 });
+    expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)?.memberId).toBe(grant.ownerId);
+  }
+  writeFileSync(sessionPath, JSON.stringify(first), { mode: 0o600 });
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
+  expect(readFileSync(join(root, 'authority', 'run-1.json.revoked'), 'utf8')).toBe('revoked\n');
+});
+
+test('a corrupted sidecar ledger refuses the rebinding instead of laundering an empty history', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'app-build-authority-'))); roots.push(root);
+  const sessionPath = join(root, 'member-session.json');
+  const first = { nexusUrl: 'https://api.elanous.ai', appSlug: 'synthetic-app', sessionToken: 'aps_first' };
+  writeFileSync(sessionPath, JSON.stringify(first), { mode: 0o600 });
+  const read = () => {
+    try { return JSON.parse(readFileSync(sessionPath, 'utf8')) as typeof first; } catch { return undefined; }
+  };
+  // A fresh authority per resolve stands in for a restart: nothing in-process survives.
+  const make = () => createAppBuildRunAuthority({ root: join(root, 'authority'), hostKey: 'f'.repeat(64),
+    retainedSession: read, relayKeyFingerprint: () => sha('emk-synthetic') });
+  const grant = { ownerId: 'synthetic-owner', userSlug: 'syntheticowner', runId: 'run-1',
+    appSlug: 'synthetic-app', sourceHead: 'f'.repeat(40), issuerExpiresAt: '2099-01-01T00:00:00Z' };
+  make().issue(grant, first);
+  writeFileSync(sessionPath, JSON.stringify({ ...first, sessionToken: 'aps_second' }), { mode: 0o600 });
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)?.memberId).toBe(grant.ownerId);
+  const ledger = join(root, 'authority', 'run-1.json.sessions');
+  const sealPath = join(root, 'authority', 'run-1.json');
+  const sealed = readFileSync(sealPath, 'utf8');
+  // Corrupt the retired-generation sidecar past the 4096-byte verification bound:
+  // the rebind is refused — never continued as an empty history — seal untouched.
+  writeFileSync(ledger, 'x'.repeat(4097));
+  writeFileSync(sessionPath, JSON.stringify({ ...first, sessionToken: 'aps_third' }), { mode: 0o600 });
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
+  expect(readFileSync(sealPath, 'utf8')).toBe(sealed);
+  // A restart keeps refusing: the unreadable history never launders into a rebind.
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
+  expect(readFileSync(sealPath, 'utf8')).toBe(sealed);
+});
+
+test('a single malformed sidecar history row refuses the rebinding instead of being filtered away', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'app-build-authority-'))); roots.push(root);
+  const sessionPath = join(root, 'member-session.json');
+  const first = { nexusUrl: 'https://api.elanous.ai', appSlug: 'synthetic-app', sessionToken: 'aps_first' };
+  writeFileSync(sessionPath, JSON.stringify(first), { mode: 0o600 });
+  const read = () => {
+    try { return JSON.parse(readFileSync(sessionPath, 'utf8')) as typeof first; } catch { return undefined; }
+  };
+  const make = () => createAppBuildRunAuthority({ root: join(root, 'authority'), hostKey: 'f'.repeat(64),
+    retainedSession: read, relayKeyFingerprint: () => sha('emk-synthetic') });
+  const grant = { ownerId: 'synthetic-owner', userSlug: 'syntheticowner', runId: 'run-1',
+    appSlug: 'synthetic-app', sourceHead: 'f'.repeat(40), issuerExpiresAt: '2099-01-01T00:00:00Z' };
+  make().issue(grant, first);
+  const ledger = join(root, 'authority', 'run-1.json.sessions');
+  const sealPath = join(root, 'authority', 'run-1.json');
+  // A→B retires A into the ledger.
+  writeFileSync(sessionPath, JSON.stringify({ ...first, sessionToken: 'aps_second' }), { mode: 0o600 });
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)?.memberId).toBe(grant.ownerId);
+  const retiredA = sha('https://api.elanous.ai\0synthetic-app\0aps_first');
+  const sealed = readFileSync(sealPath, 'utf8');
+  // One corrupted row amid valid ones: the whole history is unprovable, so the
+  // B→C rebind is refused — never continued past the bad row with the good ones.
+  writeFileSync(ledger, 'not-a-hash\n' + retiredA + '\n');
+  writeFileSync(sessionPath, JSON.stringify({ ...first, sessionToken: 'aps_third' }), { mode: 0o600 });
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
+  expect(readFileSync(sealPath, 'utf8')).toBe(sealed);
+  // A restart keeps refusing while the corrupted row stays.
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
+  expect(readFileSync(sealPath, 'utf8')).toBe(sealed);
+  // The row is repaired: the rebind proceeds — the refusal was the corruption alone.
+  writeFileSync(ledger, retiredA + '\n');
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)?.memberId).toBe(grant.ownerId);
+  expect(readFileSync(ledger, 'utf8')).toBe(retiredA + '\n'
+    + sha('https://api.elanous.ai\0synthetic-app\0aps_second') + '\n');
+});
+
+test('a seal with a retired generation refuses the rebinding while the sidecar ledger is absent', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'app-build-authority-'))); roots.push(root);
+  const sessionPath = join(root, 'member-session.json');
+  const first = { nexusUrl: 'https://api.elanous.ai', appSlug: 'synthetic-app', sessionToken: 'aps_first' };
+  writeFileSync(sessionPath, JSON.stringify(first), { mode: 0o600 });
+  const read = () => {
+    try { return JSON.parse(readFileSync(sessionPath, 'utf8')) as typeof first; } catch { return undefined; }
+  };
+  const make = () => createAppBuildRunAuthority({ root: join(root, 'authority'), hostKey: 'f'.repeat(64),
+    retainedSession: read, relayKeyFingerprint: () => sha('emk-synthetic') });
+  const grant = { ownerId: 'synthetic-owner', userSlug: 'syntheticowner', runId: 'run-1',
+    appSlug: 'synthetic-app', sourceHead: 'f'.repeat(40), issuerExpiresAt: '2099-01-01T00:00:00Z' };
+  make().issue(grant, first);
+  const ledger = join(root, 'authority', 'run-1.json.sessions');
+  const sealPath = join(root, 'authority', 'run-1.json');
+  // A→B retires A: the seal now itself proves a retired generation exists.
+  writeFileSync(sessionPath, JSON.stringify({ ...first, sessionToken: 'aps_second' }), { mode: 0o600 });
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)?.memberId).toBe(grant.ownerId);
+  const sealed = readFileSync(sealPath, 'utf8');
+  // The sidecar is lost: the seal's own previousSessionHash proves history
+  // exists, so the absent ledger is an unverifiable history — never an empty
+  // one. Neither a new session nor the retired A launders back in.
+  rmSync(ledger);
+  writeFileSync(sessionPath, JSON.stringify({ ...first, sessionToken: 'aps_third' }), { mode: 0o600 });
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
+  writeFileSync(sessionPath, JSON.stringify(first), { mode: 0o600 });
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
+  expect(readFileSync(sealPath, 'utf8')).toBe(sealed);
+  // A restart keeps the refusal while the sidecar stays absent.
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
+  expect(readFileSync(sealPath, 'utf8')).toBe(sealed);
+  // The ledger returns with the retired generation: the rebind proceeds again.
+  writeFileSync(ledger, sha('https://api.elanous.ai\0synthetic-app\0aps_first') + '\n', { mode: 0o600 });
+  writeFileSync(sessionPath, JSON.stringify({ ...first, sessionToken: 'aps_third' }), { mode: 0o600 });
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)?.memberId).toBe(grant.ownerId);
+});
+
+test('a failed retirement append refuses the rebinding and leaves the seal unchanged', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'app-build-authority-'))); roots.push(root);
+  const sessionPath = join(root, 'member-session.json');
+  const first = { nexusUrl: 'https://api.elanous.ai', appSlug: 'synthetic-app', sessionToken: 'aps_first' };
+  writeFileSync(sessionPath, JSON.stringify(first), { mode: 0o600 });
+  const read = () => {
+    try { return JSON.parse(readFileSync(sessionPath, 'utf8')) as typeof first; } catch { return undefined; }
+  };
+  const make = () => createAppBuildRunAuthority({ root: join(root, 'authority'), hostKey: 'f'.repeat(64),
+    retainedSession: read, relayKeyFingerprint: () => sha('emk-synthetic') });
+  const grant = { ownerId: 'synthetic-owner', userSlug: 'syntheticowner', runId: 'run-1',
+    appSlug: 'synthetic-app', sourceHead: 'f'.repeat(40), issuerExpiresAt: '2099-01-01T00:00:00Z' };
+  make().issue(grant, first);
+  const ledger = join(root, 'authority', 'run-1.json.sessions');
+  const sealPath = join(root, 'authority', 'run-1.json');
+  // A→B: the first retirement lands in the ledger.
+  writeFileSync(sessionPath, JSON.stringify({ ...first, sessionToken: 'aps_second' }), { mode: 0o600 });
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)?.memberId).toBe(grant.ownerId);
+  expect(readFileSync(ledger, 'utf8')).toBe(sha('https://api.elanous.ai\0synthetic-app\0aps_first') + '\n');
+  const sealed = readFileSync(sealPath, 'utf8');
+  // B→C against a read-only ledger: the append fails, the rebind is refused,
+  // and the seal keeps B — the unpersisted retirement never launders forward.
+  chmodSync(ledger, 0o400);
+  writeFileSync(sessionPath, JSON.stringify({ ...first, sessionToken: 'aps_third' }), { mode: 0o600 });
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
+  expect(readFileSync(sealPath, 'utf8')).toBe(sealed);
+  // A restart keeps the refusal while persistence stays broken.
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
+  expect(readFileSync(sealPath, 'utf8')).toBe(sealed);
+  // Persistence restored: C binds, and A and B stay refused afterwards.
+  chmodSync(ledger, 0o600);
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)?.memberId).toBe(grant.ownerId);
+  expect(readFileSync(ledger, 'utf8')).toContain(sha('https://api.elanous.ai\0synthetic-app\0aps_second'));
+  writeFileSync(sessionPath, JSON.stringify(first), { mode: 0o600 });
+  expect(make().resolve(grant.runId, grant.appSlug, grant.sourceHead)).toBeNull();
+  expect(readFileSync(join(root, 'authority', 'run-1.json.revoked'), 'utf8')).toBe('revoked\n');
+});
+
+test('a base-issued 11-field v1 seal keeps resolving after the upgrade', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'app-build-authority-'))); roots.push(root);
+  const first = { nexusUrl: 'https://api.elanous.ai', appSlug: 'synthetic-app', sessionToken: 'aps_first' };
+  const grant = { ownerId: 'synthetic-owner', userSlug: 'syntheticowner', runId: 'run-1',
+    appSlug: 'synthetic-app', sourceHead: 'f'.repeat(40), issuerExpiresAt: '2099-01-01T00:00:00Z' };
+  const opts = { root: join(root, 'authority'), hostKey: 'a'.repeat(64),
+    retainedSession: () => first, relayKeyFingerprint: () => sha('emk-synthetic') };
+  createAppBuildRunAuthority(opts).issue(grant, first);
+  // Downgrade to the exact bytes a base binary would have stored: the 11-field
+  // v1 shape, signed over the base payload (no previousSessionHash key at all).
+  const sealPath = join(root, 'authority', 'run-1.json');
+  const issued = JSON.parse(readFileSync(sealPath, 'utf8')) as Record<string, unknown>;
+  const { previousSessionHash: _retired, ...baseSeal } = issued;
+  baseSeal.signature = createHmac('sha256', 'a'.repeat(64))
+    .update('elanous-app-build-run-authority-v1\0')
+    .update(JSON.stringify({ version: baseSeal.version, ownerId: baseSeal.ownerId,
+      userSlug: baseSeal.userSlug, runId: baseSeal.runId, appSlug: baseSeal.appSlug,
+      sourceHead: baseSeal.sourceHead, issuedAt: baseSeal.issuedAt, expiresAt: baseSeal.expiresAt,
+      sessionHash: baseSeal.sessionHash, relayKeyHash: baseSeal.relayKeyHash })).digest('hex');
+  writeFileSync(sealPath, JSON.stringify(baseSeal) + '\n', { mode: 0o600 });
+  expect(createAppBuildRunAuthority(opts).resolve(grant.runId, grant.appSlug, grant.sourceHead))
+    .toEqual({ memberId: grant.ownerId, userSlug: grant.userSlug });
 });
 
 test('reserve can precede relay connection; first C check binds the key and retirement revokes it', () => {

@@ -25,7 +25,7 @@ function turn(meta?: Record<string, unknown>): AcpTurnContext {
 test('a fresh turn forgets the previous turn\'s resolved provider before ② picks the next one', async () => {
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
-    ...base, llm: { ...base.llm, provider: 'openai-codex', model: 'gpt-cfg', goalLoop: { enabled: false } },
+    ...base, llm: { ...base.llm, provider: 'openai-codex', model: 'gpt-cfg' },
   });
   // 새 턴의 시도들은 공급자 해석 신호를 내기 «전에» 400 으로 끝난다(null = 신호 없음).
   const answered: Array<string | null> = ['grok', null, null];

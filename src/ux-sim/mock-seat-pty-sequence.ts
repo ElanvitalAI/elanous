@@ -22,8 +22,10 @@ export interface SeatPtyStep {
   /** Typed text; with `enter` (default true) a separate '\r' follows after a short gap, like a person. */
   text?: string | (() => string);
   enter?: boolean;
-  /** Raw chunks written in order with `gapMs` between them (for «type while busy»). */
-  chunks?: string[];
+  /** Raw chunks written in order with `gapMs` between them (for «type while busy»).
+   *  A `Uint8Array` chunk is written byte-faithful (partial UTF-8 sequence injection,
+   *  e.g. one byte of a 3-byte Hangul syllable) — requires Bun's native PTY; throws otherwise. */
+  chunks?: (string | Uint8Array)[];
   gapMs?: number;
   until: ScreenUntil;
   timeoutMs?: number;
@@ -191,8 +193,16 @@ export async function mockSeatPtySequence(spec: SeatPtySequenceSpec): Promise<Se
         }
         for (const [i, chunk] of (step.chunks ?? []).entries()) {
           if (i > 0 && step.gapMs) await sleep(step.gapMs);
-          activePty.write(chunk);
-          input += chunk;
+          if (chunk instanceof Uint8Array) {
+            // Byte-faithful path: drive the native Bun terminal directly so the child
+            // receives exactly these bytes (a partial UTF-8 sequence stays partial).
+            if (!bunNativePtyAvailable()) throw new Error('N03 byte chunks require Bun native PTY');
+            activePty.write(chunk);
+            input += `\u00AB${chunk.length}B\u00BB`;
+          } else {
+            activePty.write(chunk);
+            input += chunk;
+          }
         }
         await capture(step.label, input, step.until, step.timeoutMs ?? 60_000);
       }

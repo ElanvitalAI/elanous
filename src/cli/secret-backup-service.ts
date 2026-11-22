@@ -230,7 +230,7 @@ async function pushSecretBackupLocked(options: SecretBackupOptions, deps: Secret
     }
     const generation = (current?.backup.generation ?? 0) + 1;
     const envelope = await encryptMemberBackup(plaintext, keys(identity).recovery.publicKey, keys(identity).sender,
-      { id: identity.id, generation });
+      { id: identity.id, generation, dataKind: 'secrets' });
     assertHeld();
     const response = await call(current ? `${endpoint}/${identity.id}` : endpoint, {
       method: current ? 'PUT' : 'POST',

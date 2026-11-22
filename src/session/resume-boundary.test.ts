@@ -36,7 +36,7 @@ function recorder() {
   return { requests, provider };
 }
 const run = (provider: LLMProvider, sessionId: string, userText: string) => runTurn({
-  userConfig: { chat: {}, llm: { provider: provider.name, model: provider.defaultModel, goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } } } as never,
+  userConfig: { chat: {}, llm: { provider: provider.name, model: provider.defaultModel, memoryJudge: { enabled: false, crossRecall: false } } } as never,
   sessionId, userText, systemPrompt: 'seat system prompt', skipMemoryInjection: true, provider,
 });
 const text = (messages: LLMMessage[]): string => messages.map(m => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join('\n');

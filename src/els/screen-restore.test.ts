@@ -171,7 +171,11 @@ test('screen restore 6 (real wiring): a hard-killed holder leaves its meta behin
   process.kill(holderPid, 'SIGKILL');
   process.kill(meta!.pid, 'SIGKILL');
   await until('holder and child gone', () => !pidAlive(holderPid) && !pidAlive(meta!.pid), 10_000);
-  expect(existsSync(metaPath)).toBe(true); // 독립 리터럴: SIGKILL 은 meta 를 지우지 못한다(이 시험의 전제)
+  // ELS-ORPHAN-SERVE-REAP(OP #131393③) M2: 죽음을 관측한 스폰 쪽 exit 이벤트가 SIGKILL 이 못 지운 meta·소켓을
+  // 곧바로 회수한다 — 스냅샷은 남는다(이 시험이 검증하는 D1b 복원의 원천). reattachHolder 가 죽은 meta 를
+  // 스스로 지우는 경로는 아래 시험 7(스폰 없는 낡은 meta)이 계속 커버한다.
+  expect(existsSync(metaPath)).toBe(false); // 독립 리터럴: 관측된 죽음의 이벤트 회수가 meta 를 지웠다
+  expect(loadScreenSnapshot(snapPath)?.screen.includes('REAL_WIRING_MARKER_7Q')).toBe(true); // 스냅샷 보존(D1b)
   // 두 번째 서버: 실제 reattach/restore/consume 배선.
   let saved: SpaceJournal | undefined;
   const second = createElsCore({

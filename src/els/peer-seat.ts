@@ -50,6 +50,26 @@ export function processIdentity(pid: number | undefined): ProcessIdentity | unde
   } catch { return; }
 }
 
+/** 보안 HOLD 수리(OP #129232): 데몬(제어 tty 없는 els 서버·홀더)의 시작 시각만 돌려준다 —
+ *  processIdentity 의 tty/session 조건 없이 proc_pidinfo 의 시작 시각(sec:usec)을 그대로 쓴다.
+ *  입양 신뢰 기록(홀더가 기록한 서버 pid+시작시각)의 시작시각 원천이다. */
+export function processStartStamp(pid: number | undefined): string | undefined {
+  if (process.platform !== 'darwin' || !Number.isSafeInteger(pid) || !pid || pid < 1) return;
+  try {
+    const { dlopen, FFIType, ptr } = require('bun:ffi') as typeof import('bun:ffi');
+    const lib = dlopen('/usr/lib/libSystem.B.dylib', {
+      proc_pidinfo: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+    });
+    try {
+      const b = Buffer.alloc(136);
+      if (lib.symbols.proc_pidinfo(pid, 3, 0, ptr(b), b.length) !== b.length || b.readUInt32LE(12) !== pid) return;
+      const sec = b.readBigUInt64LE(120), usec = b.readBigUInt64LE(128);
+      if (!sec) return;
+      return `${sec}:${usec}`;
+    } finally { lib.close(); }
+  } catch { return; }
+}
+
 type Seat = { pane: string; seat: string };
 
 /** Server-owned live pane generation; start must be captured when its PTY identity is bound. */

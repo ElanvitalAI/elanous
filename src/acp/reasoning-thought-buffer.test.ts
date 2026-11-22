@@ -43,7 +43,7 @@ test('다리 배선 — 추론 요약이 도구 호출 «전»에 agent_thought_
   const events: string[] = [];
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
-    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: false } },
+    ...base, llm: { ...base.llm, model: 'gpt-4o-mini' },
   });
   spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
     const cb = ctx.callbacks!;
@@ -85,7 +85,7 @@ test('턴이 오류로 끝나도 마지막 추론 문단은 나간다 (FU-1)', a
   const thoughts: string[] = [];
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
-    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: false } },
+    ...base, llm: { ...base.llm, model: 'gpt-4o-mini' },
   });
   spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
     ctx.callbacks!.onReasoning?.({ kind: 'summary_delta', delta: 'Half-finished thought', summaryIndex: 0 });
@@ -117,7 +117,7 @@ test('정상 종료는 문단을 «한 번만» 낸다 — onTurnComplete flush 
   const thoughts: string[] = [];
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
-    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: false } },
+    ...base, llm: { ...base.llm, model: 'gpt-4o-mini' },
   });
   spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
     ctx.callbacks!.onReasoning?.({ kind: 'summary_delta', delta: 'Only once', summaryIndex: 0 });

@@ -958,6 +958,14 @@ export async function handlePromptPost(
   opts: MetaApiOpts,
 ): Promise<Response> {
   if (!checkAuth(req, opts)) return authFailureResponse(req, opts);
+  // CONTEXT-OWNER-ISOLATION-AUDIT #9 · ②″(UX) — 회원(웹채팅) 턴은 이 라우트에서
+  // 거부된다. 이 엔드포인트는 운영자 daemon history(opts.history) 위에서 도는
+  // 소유자 전용 턴이므로, 회원 신원이 도달하는 어떤 미래 갈래(인증 확장)도
+  // 타인/운영자 맥락 위에서 턴을 돌리지 못하게 심층 방어로 폐쇄한다.
+  // 회원의 정당한 채팅 경로는 /v1/prompt/stream 과 /v1/chat/events 뿐이다.
+  if (relayHostWebChatMember(req, opts) !== undefined) {
+    return jsonResponse({ error: 'member-forbidden-prompt' }, 403);
+  }
   if (!opts.history) return jsonResponse({ error: RUNTIME_NOT_WIRED }, 503);
   let rawBody: unknown;
   try {

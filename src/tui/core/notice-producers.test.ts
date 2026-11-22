@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import { createNextTuiQueue } from './queue.js';
+import { createQueueIdleWatchdog } from './queue-idle-watchdog.js';
 import {
   createChildNoticeProducers,
   eventWatchNotice,
@@ -41,6 +42,82 @@ test('같은 사건이 아직 대기 중이면 두 번 넣지 않고, 내용이 
   expect(queue.count).toBe(firstCount);
   producers.seatMailArrived({ seat: 'OP', unread: 2 + 1 });
   expect(queue.count).toBe(firstCount + 1);
+});
+
+test('137 capsule completions occupy one pending summary, keep failures, and yield to a person', () => {
+  const queue = quietQueue();
+  const producers = createChildNoticeProducers(queue);
+  let wakes = 0;
+  for (let i = 0; i < 137; i++) {
+    const event = { capsuleId: `cap-${i}`, kind: 'agent', status: i < 3 ? 'failed' : 'ok', summary: `job ${i}` };
+    if (producers.capsuleDone(event, i)) wakes++;
+  }
+  expect(wakes).toBe(1);
+  expect(queue.count).toBe(1);
+  expect(queue.autoDispatchCount).toBe(0);
+  expect(queue.items[0]).toMatchObject({ source: 'capsule-done', capsuleCount: 137, capsuleFailed: 3 });
+  expect(queue.items[0]!.text).toContain('137건');
+  queue.enqueue('사람 중지 요청');
+  expect(queue.autoDispatchCount).toBe(1);
+  expect(queue.dequeue()).toMatchObject({ itemKind: 'user', text: '사람 중지 요청' });
+  expect(queue.consumeCapsuleDoneSummary()).toBe(true);
+  expect(queue.count).toBe(0);
+  expect(producers.capsuleDone({ capsuleId: 'later', kind: 'agent', status: 'ok', summary: 'later' })).not.toBeNull();
+  expect(queue.count).toBe(1);
+});
+
+test('ordinary notices dispatch before a pending capsule summary; a real turn consumes its summary', () => {
+  const queue = quietQueue();
+  const producers = createChildNoticeProducers(queue);
+  producers.capsuleDone({ capsuleId: 'old', kind: 'agent', status: 'ok', summary: 'old' });
+  queue.enqueueNotice('new mail', 'seat-mail');
+  expect(queue.dequeueActionable()).toMatchObject({ source: 'seat-mail' });
+  expect(queue.consumeCapsuleDoneSummary()).toBe(true);
+  expect(queue.count).toBe(0);
+});
+
+test('result-only summary stays visible but cannot wake the idle turn door', () => {
+  const queue = quietQueue();
+  createChildNoticeProducers(queue).capsuleDone({ capsuleId: 'done', kind: 'shell', status: 'ok', summary: 'done' });
+  let now = 0;
+  let wakes = 0;
+  const watchdog = createQueueIdleWatchdog({ now: () => now, idle: () => true,
+    queued: () => queue.autoDispatchCount, wake: () => { wakes++; return true; }, log: () => {}, stallMs: 5_000 });
+  expect(watchdog.kick('boot')).toBe(false);
+  now = 60_000;
+  expect(watchdog.tick().kind).toBe('clear');
+  expect(wakes).toBe(0);
+  expect(queue.count).toBe(1);
+  queue.enqueue('person input');
+  expect(watchdog.kick('person')).toBe(true);
+  expect(wakes).toBe(1);
+});
+
+test('side tab and harness results wait with capsules until another real turn', () => {
+  const queue = quietQueue();
+  const notices = createChildNoticeProducers(queue);
+  notices.sidetabResult({ mission: 'm1', status: 'done' });
+  notices.harnessChildFinished({ goal: 'h1', outcome: 'done' });
+  notices.capsuleDone({ capsuleId: 'c1', kind: 'agent', status: 'ok', summary: 'done' });
+  expect(queue.count).toBe(3);
+  expect(queue.autoDispatchCount).toBe(0);
+  queue.enqueueNotice('new mail', 'seat-mail');
+  expect(queue.dequeueActionable()).toMatchObject({ source: 'seat-mail' });
+  expect(queue.consumePassiveResultNotices(queue.passiveResultNotices(3))).toBe(3);
+  expect(queue.count).toBe(0);
+});
+
+test('mid-turn carried completions are removed from the summary without dropping later results', () => {
+  const queue = quietQueue();
+  const producers = createChildNoticeProducers(queue);
+  for (const id of ['a', 'b', 'c']) producers.capsuleDone({ capsuleId: id, kind: 'agent', status: 'ok', summary: id });
+  expect(queue.removeCapsuleDoneNotice('b')).toBe(true);
+  expect(queue.items[0]).toMatchObject({ capsuleCount: 2 });
+  expect(queue.removeCapsuleDoneNotice('a')).toBe(true);
+  expect(queue.items[0]).toMatchObject({ capsuleCount: 1 });
+  expect(queue.removeCapsuleDoneNotice('c')).toBe(true);
+  expect(queue.count).toBe(0);
+  expect(queue.removeCapsuleDoneNotice('c')).toBe(false);
 });
 
 test('감시 줄 — 빈 줄은 버리고, 긴 줄은 자르고, 같은 줄은 한 번만', () => {

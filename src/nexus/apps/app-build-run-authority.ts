@@ -14,15 +14,20 @@ const TTL_MS = 2 * 60 * 60 * 1_000;
 type Grant = { ownerId: string; userSlug: string; runId: string; appSlug: string;
   issuerExpiresAt: string; sourceHead: string };
 type Seal = { version: 1; ownerId: string; userSlug: string; runId: string; appSlug: string;
-  sourceHead: string; issuedAt: number; expiresAt: number; sessionHash: string; relayKeyHash: string | null };
+  sourceHead: string; issuedAt: number; expiresAt: number; sessionHash: string;
+  previousSessionHash: string | null; relayKeyHash: string | null };
+/** Stored seals either carry the full 12-field shape or the base 11-field v1 shape. */
+type SealLike = Omit<Seal, 'previousSessionHash'> & { previousSessionHash?: string | null };
+/** A verified session-retirement ledger: absent (nothing retired yet) stays distinct from unreadable. */
+type SessionLedger = { present: boolean; hashes: string[] };
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
 const sessionHash = (session: TuiMemberSession) => sha(session.nexusUrl + '\0' + (session.appSlug ?? '')
   + '\0' + session.sessionToken);
 function refuse(): never { throw new Error('BUILD_RUN_AUTHORITY_REFUSED'); }
-const payload = (value: Seal) => JSON.stringify({ version: value.version, ownerId: value.ownerId,
+const payload = (value: SealLike) => JSON.stringify({ version: value.version, ownerId: value.ownerId,
   userSlug: value.userSlug, runId: value.runId, appSlug: value.appSlug, sourceHead: value.sourceHead,
   issuedAt: value.issuedAt, expiresAt: value.expiresAt, sessionHash: value.sessionHash,
-  relayKeyHash: value.relayKeyHash });
+  previousSessionHash: value.previousSessionHash, relayKeyHash: value.relayKeyHash });
 
 /** A removed or replaced local EMK invalidates every seal tied to it. */
 export function relayMemberKeyFingerprint(configDir: string): string | undefined {
@@ -62,7 +67,7 @@ export function createAppBuildRunAuthority(options: {
   const now = options.now ?? Date.now;
   const revokedInProcess = new Set<string>();
   if (!options.root.startsWith('/') || options.hostKey.length < 32) refuse();
-  const signature = (value: Seal) => createHmac('sha256', options.hostKey)
+  const signature = (value: SealLike) => createHmac('sha256', options.hostKey)
     .update('elanous-app-build-run-authority-v1\0').update(payload(value)).digest('hex');
   const pathFor = (runId: string) => { if (!RUN.test(runId)) refuse(); return join(options.root, runId + '.json'); };
   const revokedFor = (runId: string) => pathFor(runId) + '.revoked';
@@ -84,6 +89,36 @@ export function createAppBuildRunAuthority(options: {
     try { renameSync(pathFor(runId), marker); return; }
     catch { try { rmSync(pathFor(runId)); } catch { /* in-process tombstone still refuses */ } }
   };
+  // APP-BUILD-SESSION-OUTLIVES-BUILD: every superseded session generation stays
+  // refused across restarts and later rebinds. The seal file only remembers its
+  // own two hashes, so each retired generation is also appended to a monotonic
+  // sidecar ledger next to it. A ledger that cannot be verified — read failure,
+  // abnormal file, over 4096 bytes, one malformed history row — refuses the
+  // rebinding instead of silently continuing past that row (fail-closed). A
+  // seal that itself records a retired generation never accepts an absent
+  // sidecar: that is an unverifiable history, not an empty one.
+  const ledgerFor = (runId: string) => pathFor(runId) + '.sessions';
+  const readLedger = (runId: string): SessionLedger | null => {
+    try {
+      const stat = lstatSync(ledgerFor(runId));
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0
+        || stat.size > 4096 || process.getuid && stat.uid !== process.getuid()) return null;
+      const lines = readFileSync(ledgerFor(runId), 'utf8').split('\n');
+      if (lines[lines.length - 1] === '') lines.pop(); // the trailing newline of the last append
+      // One malformed history row corrupts the whole history: it is never
+      // filtered into silence — a single bad row refuses the rebinding.
+      for (const line of lines) if (!/^[a-f0-9]{64}$/u.test(line)) return null;
+      return { present: true, hashes: lines };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { present: false, hashes: [] }; // absent: nothing retired yet
+      return null; // unreadable or torn: verification failure — refuse the rebinding
+    }
+  };
+  const appendLedger = (runId: string, retiredHash: string): boolean => {
+    if (!/^[a-f0-9]{64}$/u.test(retiredHash)) return false;
+    try { writeFileSync(ledgerFor(runId), retiredHash + '\n', { flag: 'a', mode: 0o600 }); return true; }
+    catch { return false; } // persistence failure (ENOSPC): the caller refuses the rebinding
+  };
   const privateRoot = () => {
     mkdirSync(options.root, { recursive: true, mode: 0o700 });
     const stat = lstatSync(options.root);
@@ -104,7 +139,7 @@ export function createAppBuildRunAuthority(options: {
       if (!Number.isSafeInteger(issuedAt) || !Number.isSafeInteger(expiresAt) || expiresAt <= issuedAt) refuse();
       const seal: Seal = { version: 1, ownerId: grant.ownerId, userSlug: grant.userSlug,
         runId: grant.runId, appSlug: grant.appSlug, sourceHead: grant.sourceHead, issuedAt, expiresAt,
-        sessionHash: sessionHash(liveSession), relayKeyHash };
+        sessionHash: sessionHash(liveSession), previousSessionHash: null, relayKeyHash };
       privateRoot();
       if (isRevoked(grant.runId)) refuse();
       writeFileSync(pathFor(grant.runId), JSON.stringify({ ...seal, signature: signature(seal) }) + '\n',
@@ -118,37 +153,71 @@ export function createAppBuildRunAuthority(options: {
         const path = pathFor(runId); const stat = lstatSync(path);
         if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0
           || stat.size > 2048 || process.getuid && stat.uid !== process.getuid() || realpathSync(path) !== path) return null;
-        const item = JSON.parse(readFileSync(path, 'utf8')) as Seal & { signature?: string };
-        if (!item || typeof item !== 'object' || Object.keys(item).sort().join(',') !==
-          'appSlug,expiresAt,issuedAt,ownerId,relayKeyHash,runId,sessionHash,signature,sourceHead,userSlug,version'
+        const item = JSON.parse(readFileSync(path, 'utf8')) as SealLike & { signature?: string };
+        if (!item || typeof item !== 'object' || !['appSlug,expiresAt,issuedAt,ownerId,previousSessionHash,relayKeyHash,runId,sessionHash,signature,sourceHead,userSlug,version',
+          'appSlug,expiresAt,issuedAt,ownerId,relayKeyHash,runId,sessionHash,signature,sourceHead,userSlug,version'].includes(Object.keys(item).sort().join(','))
           || item.version !== 1 || item.runId !== runId || item.appSlug !== appSlug || item.sourceHead !== sourceHead
           || typeof item.ownerId !== 'string' || !item.ownerId || typeof item.userSlug !== 'string' || !item.userSlug
           || !Number.isSafeInteger(item.issuedAt) || !Number.isSafeInteger(item.expiresAt)
           || item.expiresAt <= now() || item.expiresAt > item.issuedAt + TTL_MS
-          || typeof item.sessionHash !== 'string' || item.relayKeyHash !== null
+          || typeof item.sessionHash !== 'string'
+          || item.previousSessionHash !== undefined && item.previousSessionHash !== null
+            && (typeof item.previousSessionHash !== 'string'
+              || !/^[a-f0-9]{64}$/u.test(item.previousSessionHash) || item.previousSessionHash === item.sessionHash)
+          || item.relayKeyHash !== null
             && (typeof item.relayKeyHash !== 'string' || !/^[a-f0-9]{64}$/u.test(item.relayKeyHash))
           || typeof item.signature !== 'string' || !/^[a-f0-9]{64}$/u.test(item.signature)) return null;
         const expected = Buffer.from(signature(item), 'hex'); const actual = Buffer.from(item.signature, 'hex');
         if (!timingSafeEqual(expected, actual)) return null;
         const retained = options.retainedSession();
-        if (!retained || retained.nexusUrl !== 'https://api.elanous.ai' || retained.appSlug !== appSlug
-          || sessionHash(retained) !== item.sessionHash) { revoke(runId); return null; }
+        if (!retained || retained.nexusUrl !== 'https://api.elanous.ai' || retained.appSlug !== appSlug) {
+          revoke(runId); return null;
+        }
+        // APP-BUILD-SESSION-OUTLIVES-BUILD: the same app's replacement session keeps this run.
+        // A missing session, a different app, or a different nexus still revokes it above.
         const currentKeyHash = options.relayKeyFingerprint();
+        const nextSessionHash = sessionHash(retained);
+        const ledger = readLedger(runId);
+        // History verification failure (unreadable/abnormal/oversized sidecar,
+        // or a single malformed history row) refuses the rebinding: an
+        // unprovable history must never pass.
+        if (ledger === null) return null;
+        const refusedSessionHashes = ledger.hashes;
+        if (item.previousSessionHash !== null && item.previousSessionHash !== undefined) {
+          // The seal's own retired generation proves history exists, so an
+          // absent sidecar is an unverifiable history — never an empty one —
+          // and a present ledger without that required row is corrupted.
+          if (!ledger.present || !refusedSessionHashes.includes(item.previousSessionHash)) return null;
+          refusedSessionHashes.push(item.previousSessionHash);
+        }
+        if (refusedSessionHashes.includes(nextSessionHash)) { revoke(runId); return null; }
+        const sessionChanged = nextSessionHash !== item.sessionHash;
         if (!currentKeyHash || !/^[a-f0-9]{64}$/u.test(currentKeyHash)) {
           if (item.relayKeyHash !== null) revoke(runId);
           return null;
         }
-        if (item.relayKeyHash === null) {
-          // The operator may connect the relay after reserve. Bind the first
-          // observed private key before any C claim; later loss/rotation revokes.
-          const bound: Seal = { ...item, relayKeyHash: currentKeyHash };
+        if (item.relayKeyHash !== null && item.relayKeyHash !== currentKeyHash) { revoke(runId); return null; }
+        if (sessionChanged || item.relayKeyHash === null) {
+          // One write keeps a rebound sessionHash. A second write from the old
+          // item used to drop it. A null relay binds the first observed key here.
+          // Every replaced generation is retired into the monotonic sidecar
+          // ledger so A→B→C→A can never re-approve A, across restarts too.
+          // A failed retirement append refuses the rebinding and leaves the seal
+          // untouched: an unpersisted history must never launder into a new seal.
+          if (sessionChanged && !appendLedger(runId, item.sessionHash)) return null;
+          const bound: Seal = {
+            ...item,
+            sessionHash: nextSessionHash,
+            previousSessionHash: sessionChanged ? item.sessionHash : item.previousSessionHash ?? null,
+            relayKeyHash: item.relayKeyHash === null ? currentKeyHash : item.relayKeyHash,
+          };
           const temporary = path + '.' + randomUUID() + '.tmp';
           try {
             writeFileSync(temporary, JSON.stringify({ ...bound, signature: signature(bound) }) + '\n',
               { flag: 'wx', mode: 0o600 });
             renameSync(temporary, path);
           } finally { rmSync(temporary, { force: true }); }
-        } else if (item.relayKeyHash !== currentKeyHash) { revoke(runId); return null; }
+        }
         if (isRevoked(runId)) return null;
         return { memberId: item.ownerId, userSlug: item.userSlug };
       } catch { return null; }

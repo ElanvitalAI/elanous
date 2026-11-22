@@ -33,6 +33,9 @@ export interface CeoMailWatchOpts {
   /** Bounded scan progress across forged candidates; the daemon keeps this map between polls. */
   readonly replyCursor?: Map<number, number>;
   readonly pendingReplySince?: Map<number, number>;
+  /** OP #127688 — parent mail row ids this daemon already answered. A settled row never
+   * reclassifies as open on a later re-scan: the open window is the unanswered-parent set. */
+  readonly answeredParents?: Set<number>;
   readonly log?: (event: string, data: Record<string, unknown>) => void;
 }
 
@@ -67,13 +70,18 @@ export const chatIdFromRefs = (refsJson: string | null): string | null => {
 
 /** One scan: every CEO → OP mail row past the cursor → ✅ only on an authenticated turn reply. Returns the
  * action count alongside the advanced cursor (the daemon carries the cursor between scans). */
-export async function scanCeoMail(opts: CeoMailWatchOpts & { cursor: number }): Promise<{ acted: number; cursor: number }> {
+export async function scanCeoMail(opts: CeoMailWatchOpts & { cursor: number }): Promise<{ acted: number; cursor: number; openSince: number }> {
   const channel = opts.channel;
   const mail = opts.mail;
   const seat = opts.seat ?? 'OP';
   const log = opts.log ?? defaultLog;
   let cursor = opts.cursor;
   let acted = 0;
+  // OP #127483/#127688 — the oldest correlatable row still without a trusted answer; 0 = none
+  // open (the open window is the unanswered-parent set, not a min-id cursor). The daemon resumes
+  // its next scan from openSince - 1 so a late CEO reply is never missed, while settled and
+  // foreign rows stay behind the cursor instead of being re-read every second.
+  let openSince: number | null = null;
   for (const row of mail.ceoRows(cursor)) {
     if (row.id > cursor) cursor = row.id;
     const messageId = messageIdFromRefs(row.refsJson);
@@ -84,6 +92,7 @@ export async function scanCeoMail(opts: CeoMailWatchOpts & { cursor: number }): 
     if (!chatId) { log('no-chat-ref', { mailId: row.id, messageId }); continue; }
     const key = { source: 'telegram' as const, chatId, messageId };
     let after = opts.replyCursor?.get(row.id) ?? 0;
+    let settled = false;
     // A forged first reply cannot hide a later legitimate one. Cap each poll and resume next time.
     for (let examined = 0; examined < 256; examined += 1) {
       const reply = mail.firstReplyAfter(row.id, seat, after);
@@ -106,10 +115,13 @@ export async function scanCeoMail(opts: CeoMailWatchOpts & { cursor: number }): 
       const sent = await channel.markAnswered(key, reply.body, verdict);
       log(sent ? 'answered' : 'answer-pending-send', { messageId, chatId, mailId: row.id, replyId: reply.id });
       acted += 1;
+      settled = true;
+      opts.answeredParents?.add(row.id);
       break;
     }
+    if (!settled && !opts.answeredParents?.has(row.id) && (openSince === null || row.id < openSince)) openSince = row.id;
   }
-  return { acted, cursor };
+  return { acted, cursor, openSince: openSince ?? 0 };
 }
 
 /** bun:sqlite read-only projection of the mail ledger (the real db the els state owns). */

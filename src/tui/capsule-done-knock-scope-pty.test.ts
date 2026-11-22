@@ -40,16 +40,17 @@ afterEach(() => {
   Object.assign(process.env, saved);
 });
 
+// Rows are ordered by (ts_ms, id) — a stable total order; comparisons below are non-strict so a same-millisecond tie never flips them.
 // Rows are ordered by their own timestamp: row ids follow insertion order, and the TUI and its chat child flush separately.
-interface Row { at: number; category: string; event: string; data: Record<string, unknown> }
+interface Row { at: number; id: number; category: string; event: string; data: Record<string, unknown> }
 
 function runRows(root: string, runId: string): Row[] {
   const store = LogStore.openReadOnly(join(root, 'logs', 'logs.db'));
   try {
     return store.query({ limit: 20_000 })
-      .map((row) => ({ at: row.ts_ms, category: row.category, event: row.event, data: row.data ? JSON.parse(row.data) as Record<string, unknown> : {} }))
+      .map((row) => ({ at: row.ts_ms, id: row.id, category: row.category, event: row.event, data: row.data ? JSON.parse(row.data) as Record<string, unknown> : {} }))
       .filter((row) => row.data.runId === runId)
-      .sort((a, b) => a.at - b.at);
+      .sort((a, b) => a.at - b.at || a.id - b.id);
   } finally { store.close(); }
 }
 
@@ -108,22 +109,50 @@ test('internal fanout completion opens no automatic turn; a direct background Ag
     // The fanout really ran in turn 1: three research workers finished (awaited) on the fixed provider, before turn 2 began.
     const turn2 = human[1]!.at;
     expect(human).toHaveLength(2);
-    expect(workers.filter((row) => row.at < turn2).map((row) => row.data.agent).sort())
+    expect(workers.filter((row) => row.at <= turn2).map((row) => row.data.agent).sort())
       .toEqual(['research-counterevidence', 'research-news-filings', 'research-primary-data']);
-    expect(workers.filter((row) => row.at < turn2).every((row) => row.data.taskState === 'done')).toBe(true);
+    expect(workers.filter((row) => row.at <= turn2).every((row) => row.data.taskState === 'done')).toBe(true);
     expect(served.filter((row) => row.data.provider === 'exa' && Number(row.data.hits) > 0).length).toBeGreaterThan(0);
     // No real model was reachable: every provider resolution of the run is the fake one.
     const resolved = rows.filter((row) => row.category === 'research.turn' && row.event === 'provider-resolved');
     expect(resolved.length).toBeGreaterThan(0);
     expect(resolved.every((row) => row.data.provider === 'test-fake-llm')).toBe(true);
     // Internal fanout: no automatic turn between its completion and the next human turn, and no capsule frame for its workers.
-    expect(automatic.filter((row) => row.at < turn2)).toHaveLength(0);
+    expect(automatic.filter((row) => row.at <= turn2)).toHaveLength(0);
     // Positive control: the direct background Agent is the ONE capsule frame, one knock, one automatic turn, after its own turn.
     expect(emitted).toHaveLength(1);
     expect(knocks).toHaveLength(1);
     expect(knocks[0]!.data.capsuleId).toBe(emitted[0]!.data.capsuleId);
+    // Attribution: the capsule and the knock belong to the DIRECT Agent call the test asked for — the one background spawn
+    // (its task id, logged at start) whose dispatch was the 'bg probe' request, and that same task is what finished.
+    const dispatched = rows.filter((row) => row.category === 'agent.spawn' && row.event === 'dispatch' && row.data.description === 'bg probe');
+    const bgStarts = rows.filter((row) => row.category === 'agent.spawn' && row.event === 'background');
+    const bgDone = rows.filter((row) => row.category === 'agent.done' && row.event === 'background-finish');
+    expect(dispatched).toHaveLength(1);
+    expect(bgStarts).toHaveLength(1);
+    expect(bgStarts[0]!.data.cid).toBe(dispatched[0]!.data.cid);
+    const directTaskId = String(bgStarts[0]!.data.taskId);
+    expect(directTaskId.length).toBeGreaterThan(0);
+    expect(emitted[0]!.data.capsuleId).toBe(directTaskId);
+    expect(knocks[0]!.data.capsuleId).toBe(directTaskId);
+    expect(bgDone.map((row) => row.data.taskId)).toEqual([directTaskId]);
+    expect(bgDone[0]!.data.taskState).toBe('done');
+    // Negative control: the three research workers (by agent id) have no capsule frame and no knock; the only capsule is the direct one.
+    const workerIds = ['research-counterevidence', 'research-news-filings', 'research-primary-data'];
+    const workerSpawns = rows.filter((row) => row.category === 'agent.spawn' && row.event === 'dispatch' && workerIds.includes(String(row.data.resolvedAgent)));
+    expect([...new Set(workerSpawns.map((row) => row.data.resolvedAgent))].sort()).toEqual(workerIds);
+    const workerCids = new Set(workerSpawns.map((row) => row.data.cid));
+    for (const id of workerIds) {
+      expect(emitted.filter((row) => row.data.agent === id || row.data.label === id)).toHaveLength(0);
+      expect(workers.filter((row) => row.data.agent === id && row.data.taskState === 'done').length).toBeGreaterThan(0);
+    }
+    expect(rows.filter((row) => row.category === 'agent.spawn' && row.event === 'background' && workerCids.has(row.data.cid))).toHaveLength(0);
+    expect(emitted.filter((row) => row.at <= turn2)).toHaveLength(0);
+    expect(knocks.filter((row) => row.at <= turn2)).toHaveLength(0);
+    expect(emitted.map((row) => row.data.capsuleId)).toEqual([directTaskId]);
     expect(automatic).toHaveLength(1);
-    expect(automatic[0]!.at).toBeGreaterThan(turn2);
+    expect(automatic[0]!.at).toBeGreaterThanOrEqual(turn2);
+    expect(automatic[0]!.id).toBeGreaterThan(human[1]!.id);
     expect(marks.fanout).not.toContain('REPLY-KNOCK');
     expect(marks.knock).toContain('REPLY-KNOCK');
   } finally { rmSync(root, { recursive: true, force: true }); }

@@ -10,6 +10,11 @@ import { buildAge, desiredSha, gitAncestor } from './build-badge.js';
 //   - ids are random and checked against every id already in the journal.
 
 import { randomBytes } from 'node:crypto';
+import { stat } from 'node:fs/promises';
+import { statSync } from 'node:fs';
+import { osc7CwdParser } from './osc7-cwd.js';
+import { createProcCwdReader } from './proc-cwd.js';
+import { isAbsolute } from 'node:path';
 import { addPane, addTab, findPane, findWorkspace, journalIds, patchPane, upsertWorkspace } from './journal.js';
 import { emptyJournal, paneAddress, type Pane, type PaneState, type SpaceJournal, type Tab, type Workspace } from './space.js';
 import { paneStatus } from './pane-status.js';
@@ -17,13 +22,17 @@ import { tabBadge } from './tab-badge.js';
 import type { Foreground } from './foreground.js';
 import type { SpawnParent } from './server-auth.js';
 import { grepScreens, type GrepHit } from './pane-grep.js';
-import { readUnreadMailBadges } from '../msg/msg-store.js';
+import { readUnreadMailBadges, type UnreadMailBadge } from '../msg/msg-store.js';
 
 export type QueueAudit = (result: 'queued' | 'delivering' | 'delivered' | 'delivery-failed' | 'discarded', reason?: string) => boolean;
 
 export interface ElsResult {
   readonly exitCode: 0 | 1 | 2;
   readonly message: string;
+  /** 보안 HOLD 수리(OP #129232): adopt-verify 답 전용 — challenge-HMAC 증명과 답하는 서버의 pid+시작시각(홀더가 검증). */
+  readonly proof?: string;
+  readonly serverPid?: number;
+  readonly serverStart?: string;
   /** Client-observed transport status; answered does not imply the operation succeeded or was side-effect free. */
   readonly transport?:
     | { readonly outcome: 'answered' }
@@ -45,6 +54,8 @@ export interface ElsPty {
   onExit(cb: () => void): void;
   /** PTY 출력 구독 — 등록부 어댑터 경유 (src/els/server.ts registryPty). */
   onOutput?(cb: (data: string) => void): { dispose(): void };
+  /** Holder handshake has verified the process and supplied its PID. */
+  onCwdReady?(cb: () => void): { dispose(): void };
   kill(): void;
   /** D1a: the PTY lives in an outside holder — release the connection without killing the child (a server stop keeps panes alive). */
   detach?(): void;
@@ -56,6 +67,9 @@ export interface ElsPty {
   readonly pid?: number;
   /** OS identity captured when the holder's PTY generation was bound. */
   readonly processBinding?: { readonly pid: number; readonly generation: string; readonly start: string };
+  /** OP #128343(OP 승인 #128469): the surviving holder's proof of the pane token it carried into its child —
+   *  adoption re-registration asks the holder over its 0700 socket; absent = no holder proof, no re-registration. */
+  readonly credential?: (nonce: string) => Promise<string | undefined>;
 }
 
 export interface ElsCoreDeps {
@@ -65,6 +79,8 @@ export interface ElsCoreDeps {
   readonly spawn: (command: readonly string[], cwd: string, title: string, env: Readonly<Record<string, string>>, parent?: SpawnParent) => ElsPty;
   /** D1a: adopt a pane whose PTY an outside holder still owns after a restart; undefined = it is gone. */
   readonly reattach?: (pane: Pane) => ElsPty | undefined;
+  /** OP #128343(OP 승인 #128469): a closed pane's server-minted credential is revoked — the server forgets its pane token. */
+  readonly onPaneClosed?: (paneId: string) => void;
   /** D1b: read (non-destructively) a reboot-orphaned pane's saved screen snapshot (holder's <paneId>.snap.json);
    *  returns the restored screen, or undefined when none remains. */
   readonly restoreScreen?: (paneId: string) => string | undefined;
@@ -76,6 +92,17 @@ export interface ElsCoreDeps {
   readonly now?: () => number;
   /** Durable screen and identity archive; throws to leave the exited pane in the journal. */
   readonly archiveExited?: (pane: Pane) => void;
+  /**
+   * Unread mail badges for the listed seats. ELS-SERVER-EVENT-HUB-NO-DB-POLL (OP #127680): listing badges come
+   * from the injected memory-first state (the server wires the event-hub-backed one); the direct ledger read
+   * stays the default so a bare core keeps working (absent = one synchronous read per listing).
+   */
+  readonly mailBadges?: (seats: readonly string[]) => ReadonlyMap<string, UnreadMailBadge | null>;
+  /** JUD #39484 ③ — fired when a pane's live shell binding is dropped (exit, release or replacement). */
+  readonly onPaneRelease?: (paneId: string) => void;
+  readonly isCwdDirectory?: (path: string) => Promise<boolean>;
+  /** Asynchronous shell PID fallback; injectable for deterministic race tests. */
+  readonly procCwdReader?: { read(pid: number): Promise<string | undefined>; dispose(): void };
 }
 
 export interface ElsNewInput {
@@ -138,6 +165,16 @@ export function createElsCore(deps: ElsCoreDeps) {
   const randomId = deps.randomId ?? ((prefix: string) => `${prefix}${randomBytes(4).toString('hex')}`);
   let journal: SpaceJournal = emptyJournal();
   const ptys = new Map<string, ElsPty>();
+  // Recomputed only at restore, never on the input or listing paths.
+  const unavailableCwds = new Map<string, string>();
+  const unavailableScreen = (pane: Pane): string => {
+    const reason = unavailableCwds.get(pane.id);
+    return reason ? `${reason}\n${pane.scrollback}` : pane.scrollback;
+  };
+  const cwdSubscriptions = new Map<string, { dispose(): void; end(): void; checkpoint(): void; foregroundChanged(): void }>();
+  // Foreground cwd is ephemeral: the saved shell/OSC cwd remains the restore authority.
+  const foregroundCwds = new Map<string, string>();
+  const procCwdReader = deps.procCwdReader ?? createProcCwdReader();
   const builds = new Map<string, { sha: string; seen: number; version?: string; stamp?: string }>();
   const now = deps.now ?? Date.now;
   /** ELS-PANE-AGENT-DETECT: what each live pane runs in its foreground now (refreshed by the server). */
@@ -208,9 +245,39 @@ export function createElsCore(deps: ElsCoreDeps) {
   const changeListeners = new Set<() => void>();
   const notifyChange = (): void => { for (const listener of [...changeListeners]) { try { listener(); } catch { /* a listener never breaks a mutation */ } } };
 
+  let journalDirty = false;
+  let journalRetry: ReturnType<typeof setTimeout> | undefined;
+  let journalRetryDelay = 250;
+  const flushJournal = (): string | undefined => {
+    if (!journalDirty) return undefined;
+    try { deps.save(journal); journalDirty = false; journalRetryDelay = 250; return undefined; }
+    catch (error) { return message(error); }
+  };
+  const retryJournal = (): void => {
+    if (!journalDirty || journalRetry) return;
+    journalRetry = setTimeout(() => {
+      journalRetry = undefined;
+      if (flushJournal()) { journalRetryDelay = Math.min(journalRetryDelay * 2, 5_000); retryJournal(); }
+    }, journalRetryDelay);
+    journalRetry.unref?.();
+  };
+
+  // Immediate failures restart the timer without increasing backoff; only timed retries back off.
+  const flushJournalNow = (): string | undefined => {
+    if (journalRetry) clearTimeout(journalRetry);
+    journalRetry = undefined;
+    const error = flushJournal();
+    if (error) retryJournal();
+    return error;
+  };
+
   /** Save `next`, then make it the truth. A failed save leaves memory and the file as they were (used by `new`). */
   const commit = (next: SpaceJournal): void => {
     deps.save(next);
+    if (journalRetry) clearTimeout(journalRetry);
+    journalRetry = undefined;
+    journalRetryDelay = 250;
+    journalDirty = false;
     journal = next;
     notifyChange();
   };
@@ -218,7 +285,8 @@ export function createElsCore(deps: ElsCoreDeps) {
   const persist = (next: SpaceJournal): string | undefined => {
     journal = next;
     notifyChange();
-    try { deps.save(next); return undefined; } catch (error) { return message(error); }
+    journalDirty = true;
+    return flushJournalNow();
   };
 
   const freshId = (prefix: string, taken: Set<string>): string => {
@@ -236,6 +304,158 @@ export function createElsCore(deps: ElsCoreDeps) {
     return persist(patchPane(journal, paneId, patch));
   };
 
+  // Output schedules bounded, single-flight observations; OSC wins over a concurrent lookup.
+  const watchCwd = (paneId: string, pty: ElsPty): void => {
+    cwdSubscriptions.get(paneId)?.dispose();
+    let version = 0;
+    let hasOsc = journal.panes.find(row => row.id === paneId)?.cwdOsc7 === true;
+    let oscBusy = false;
+    const oscQueue: string[] = [...(journal.panes.find(row => row.id === paneId)?.cwdOscPending ?? [])];
+    let validatingCwd: string | undefined;
+    let oscSaturated = false;
+    let exiting = false;
+    let validationGeneration = 0;
+    let validationTimer: ReturnType<typeof setTimeout> | undefined;
+    let active = true;
+    let inFlight = false;
+    let needsRead = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const apply = (cwd: string, osc = false) => {
+      const pane = journal.panes.find((row) => row.id === paneId);
+      if (!active || !pane) return;
+      if (pane.cwd === cwd && (!osc || (pane.cwdOsc7 && !pane.cwdOscPending))) {
+        // A repeated observation is also an opportunity to persist a previously failed save.
+        // It does not change the journal or send a duplicate change notification.
+        if (journalDirty) flushJournalNow();
+        return;
+      }
+      const patch = { cwd, ...(osc ? { cwdOsc7: true as const, ...(oscQueue.length === 0 ? { cwdOscPending: undefined } : {}) } : {}) };
+      if (exiting) {
+        // Only this watch's already-observed OSC may update the tombstone, never its state/screen.
+        if (pane.state === 'exited' && !ptys.has(paneId)) persist(patchPane(journal, paneId, patch));
+      } else if (livePty(pane) === pty) patchLive(paneId, pty.id, patch);
+    };
+    const schedule = () => {
+      if (!pty.pid || !active || exiting || hasOsc) return;
+      needsRead = true;
+      if (timer || inFlight || oscBusy) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        if (!active || oscBusy) return;
+        needsRead = false;
+        inFlight = true;
+        const observedVersion = version;
+        void procCwdReader.read(pty.pid!).then(cwd => {
+          if (active && !hasOsc && !oscBusy && version === observedVersion && cwd && isAbsolute(cwd) && !cwd.includes('\0')) apply(cwd);
+        }).catch(() => { /* process disappeared or observation failed */ }).finally(() => {
+          inFlight = false;
+          if (needsRead) schedule();
+        });
+      }, 100);
+      timer.unref?.();
+    };
+    const validateOsc = () => {
+      if (!active || oscBusy || oscQueue.length === 0) return;
+      const cwd = oscQueue.shift()!;
+      validatingCwd = cwd;
+      oscBusy = true;
+      const generation = ++validationGeneration;
+      const finish = (valid: boolean) => {
+        if (!active || generation !== validationGeneration) return;
+        validationGeneration++;
+        if (validationTimer) clearTimeout(validationTimer);
+        validationTimer = undefined;
+        oscBusy = false;
+        validatingCwd = undefined;
+        if (valid) {
+          // Authority is established only after validation, before publishing its cwd.
+          if (!hasOsc && !exiting) patchLive(paneId, pty.id, { cwdOsc7: true, cwdOscPending: [cwd] });
+          hasOsc = true; needsRead = false; apply(cwd, true);
+        }
+        else needsRead = true;
+        if (oscQueue.length) validateOsc();
+        else {
+          const saturated = oscSaturated;
+          oscSaturated = false;
+          const pane = journal.panes.find(row => row.id === paneId);
+          if (pane?.cwdOscPending) persist(patchPane(journal, paneId, { cwdOscPending: undefined }));
+          if (exiting) unwatchCwd(paneId);
+          // OP #129939: a saturated batch with no valid candidate retains the prior cwd.
+          else if (needsRead && !saturated) schedule();
+        }
+      };
+      validationTimer = setTimeout(() => finish(false), 1000);
+      validationTimer.unref?.();
+      const validate = deps.isCwdDirectory ?? (async (path: string) => (await stat(path)).isDirectory());
+      try { void Promise.resolve(validate(cwd)).then(finish, () => finish(false)); }
+      catch { finish(false); }
+    };
+    const reportOsc = (cwd: string) => {
+      version++;
+      // A syntactically valid report is not authoritative until its directory is verified.
+      // Bound pending work while retaining the most recent candidates in order.
+      // An invalid newest report must not overwrite the preceding candidate.
+      if (oscQueue.length >= 64) {
+        oscQueue.shift();
+        if (!oscSaturated) {
+          oscSaturated = true;
+          process.stderr.write(`els: ${paneId} osc-saturated\n`);
+        }
+      }
+      oscQueue.push(cwd);
+      if (timer) { clearTimeout(timer); timer = undefined; }
+      validateOsc();
+    };
+    let foregroundGeneration = 0;
+    const foregroundChanged = () => {
+      const fg = foregrounds.get(paneId);
+      const generation = ++foregroundGeneration;
+      if (!fg || fg.kind === 'shell' || fg.pid === pty.pid || fg.pid <= 0) {
+        if (foregroundCwds.delete(paneId)) notifyChange();
+        return;
+      }
+      // Only the foreground group leader, never an arbitrary descendant/helper.
+      void procCwdReader.read(fg.pid).then(cwd => {
+        if (!active || exiting || generation !== foregroundGeneration || foregrounds.get(paneId)?.pid !== fg.pid) return;
+        if (!cwd || !isAbsolute(cwd) || cwd.includes('\0')) return;
+        if (foregroundCwds.get(paneId) !== cwd) { foregroundCwds.set(paneId, cwd); notifyChange(); }
+      }).catch(() => { /* preserve the last observation until the foreground changes */ });
+    };
+    const parse = osc7CwdParser(reportOsc);
+    try {
+      const subscription = pty.onOutput?.(chunk => {
+        // Every output can indicate a cwd change, not only a complete OSC report.
+        // Only an OSC report invalidates an in-flight proc observation.
+        const before = version;
+        parse(chunk);
+        if (version === before) schedule();
+      });
+      const readySubscription = pty.onCwdReady?.(() => schedule());
+      cwdSubscriptions.set(paneId, {
+        foregroundChanged,
+        checkpoint: () => {
+          const pending = [...(validatingCwd === undefined ? [] : [validatingCwd]), ...oscQueue];
+          if (pending.length) persist(patchPane(journal, paneId, { cwdOscPending: pending }));
+        },
+        end: () => {
+          exiting = true;
+          if (timer) clearTimeout(timer);
+          subscription?.dispose();
+          readySubscription?.dispose();
+          if (!oscBusy && oscQueue.length === 0) unwatchCwd(paneId);
+        },
+        dispose: () => { active = false; if (timer) clearTimeout(timer); if (validationTimer) clearTimeout(validationTimer); validationGeneration++; oscQueue.length = 0; subscription?.dispose(); readySubscription?.dispose(); },
+      });
+      if (oscQueue.length) validateOsc();
+      else schedule();
+    } catch (error) { active = false; process.stderr.write(`els: cwd subscription of ${paneId} failed: ${message(error)}\n`); }
+  };
+  const unwatchCwd = (paneId: string): void => {
+    cwdSubscriptions.get(paneId)?.dispose();
+    cwdSubscriptions.delete(paneId);
+    foregroundCwds.delete(paneId);
+  };
+
   const discardQueue = (paneId: string, reason: string): void => {
     const queue = queues.get(paneId);
     queues.delete(paneId);
@@ -243,7 +463,9 @@ export function createElsCore(deps: ElsCoreDeps) {
   };
 
   /** The pane's PTY ended: record `exited` now (once). Returns false when this exit is not the pane's live PTY. */
-  const recordExit = (paneId: string, ptyId: string): boolean => {
+  const recordExit = (paneId: string, ptyId: string, pty: ElsPty): boolean => {
+    if (ptys.get(paneId) !== pty) return false;
+    cwdSubscriptions.get(paneId)?.end();
     ptys.delete(paneId);
     builds.delete(paneId);
     discardQueue(paneId, 'pane exited');
@@ -347,6 +569,13 @@ export function createElsCore(deps: ElsCoreDeps) {
     } finally { draining.delete(paneId); }
   };
 
+  // A seat path is stronger evidence than the user-editable workspace name.
+  // Name-only OP remains a legacy fallback when no seat-root workspace exists.
+  const coordinatorOf = (): Workspace | undefined =>
+    journal.workspaces.find(ws => ws.role === 'coordinator')
+    ?? journal.workspaces.find(ws => /(?:^|\/)seats\/OP\/?$/.test(ws.rootCwd))
+    ?? journal.workspaces.find(ws => ws.name === 'OP');
+
   return {
     /**
      * Load the journal once. A pane whose PTY an outside holder still owns is adopted as it is (D1a); the panes
@@ -399,7 +628,8 @@ export function createElsCore(deps: ElsCoreDeps) {
         ptys.set(pane.id, adopted);
         const adoptedId = adopted.id;
         adopted.onExit(() => {
-          if (!recordExit(pane.id, adoptedId)) return;
+          if (!recordExit(pane.id, adoptedId, adopted)) return;
+          try { deps.onPaneRelease?.(pane.id); } catch { /* release hook must not break exit recording */ }
           void adopted.renderScreen().then((screen) => recordFinalScreen(pane.id, screen), () => { /* keep the saved scrollback */ });
         });
         return { ...pane, ptyId: adoptedId, state: pane.state };
@@ -410,8 +640,21 @@ export function createElsCore(deps: ElsCoreDeps) {
         if (gone.size > 0 || aged.panes.some((pane, index) => pane !== kept.panes[index])) commit(aged);
         else journal = aged;
       } catch (error) {
+        for (const [paneId, pty] of ptys) { unwatchCwd(paneId); try { pty.detach?.(); } catch { /* already gone */ } }
+        ptys.clear();
         return { exitCode: 1, message: `els serve: cannot save the journal: ${message(error)}` };
       }
+      unavailableCwds.clear();
+      for (const pane of journal.panes) {
+        // A running holder remains authoritative even if its directory was subsequently removed.
+        if (pane.kind !== 'pty' || pane.restore !== 'cwd' || pane.state === 'exited' || ptys.has(pane.id)) continue;
+        try {
+          if (!statSync(pane.cwd).isDirectory()) unavailableCwds.set(pane.id, `Pane unavailable: cwd is not a directory: ${pane.cwd}`);
+        } catch (error) {
+          unavailableCwds.set(pane.id, `Pane unavailable: cannot access cwd ${pane.cwd}: ${message(error)}`);
+        }
+      }
+      for (const [paneId, pty] of ptys) watchCwd(paneId, pty);
       // D1b: the journal holds the screens — only now are the snapshot files consumed.
       for (const paneId of consumable) {
         try { deps.consumeScreenSnapshot?.(paneId); } catch { /* a leftover file is harmless; the pane is exited */ }
@@ -471,9 +714,11 @@ export function createElsCore(deps: ElsCoreDeps) {
         return { exitCode: 1, message: `els new: ${message(error)}` };
       }
       ptys.set(paneId, pty);
+      watchCwd(paneId, pty);
       const ptyId = pty.id;
       pty.onExit(() => {
-        if (!recordExit(paneId, ptyId)) return;
+        if (!recordExit(paneId, ptyId, pty)) return;
+        try { deps.onPaneRelease?.(paneId); } catch { /* release hook must not break exit recording */ }
         void pty.renderScreen().then((screen) => recordFinalScreen(paneId, screen), () => { /* keep the saved scrollback */ });
       });
       return { exitCode: 0, message: JSON.stringify({ address, pane: paneId, ptyId, cwd: input.cwd }) };
@@ -494,17 +739,40 @@ export function createElsCore(deps: ElsCoreDeps) {
       return { dispose: () => { changeListeners.delete(listener); } };
     },
 
+    /** Atomically assign one coordinator; a failed journal write leaves the previous assignment intact. */
+    setCoordinator(ref: string, peerPid?: number): ElsResult {
+      if (typeof ref !== 'string' || !ref.trim()) return { exitCode: 2, message: 'els ws coordinator: workspace required' };
+      const target = findWorkspace(journal, ref);
+      if (!target) return { exitCode: 1, message: `els ws coordinator: unknown workspace ${ref}` };
+      const previous = coordinatorOf();
+      const workspaces = journal.workspaces.map(ws => {
+        const { role: _role, ...rest } = ws;
+        return ws.id === target.id ? { ...rest, role: 'coordinator' as const } : rest;
+      });
+      const result = `els ws coordinator: ${previous?.id ?? 'none'} -> ${target.id}`;
+      const audit = { at: new Date(now()).toISOString(), op: 'coordinator' as const, result, ...(peerPid !== undefined ? { peerPid } : {}) };
+      try { commit({ ...journal, workspaces, coordinatorAudit: [...(journal.coordinatorAudit ?? []), audit] }); }
+      catch (error) { return { exitCode: 1, message: `els ws coordinator: not saved: ${message(error)}` }; }
+      return { exitCode: 0, message: result };
+    },
+
     list(): ElsResult {
+      // An explicit role wins; otherwise select the first OP workspace, without writing on the listing path.
+      const coordinator = coordinatorOf();
+      const workspaces = journal.workspaces.map(ws => ws.id === coordinator?.id ? { ...ws, role: 'coordinator' as const } : ws)
+        .sort((a, b) => Number(b.id === coordinator?.id) - Number(a.id === coordinator?.id));
       // Panes come out in the order a person set: workspaces in journal order, tabs in journal order inside each, panes by
       // journal order inside a tab — so every client (els, the eln side tab) draws the same list from the same answer.
-      const wsAt = (id: string): number => journal.workspaces.findIndex((row) => row.id === id);
+      const wsAt = (id: string): number => workspaces.findIndex((row) => row.id === id);
       const tabAt = (id: string): number => journal.tabs.findIndex((row) => row.id === id);
       const ordered = journal.panes.map((pane, index) => ({ pane, index, tab: journal.tabs.find((row) => row.id === pane.tabId) }))
         .filter((row): row is { pane: Pane; index: number; tab: Tab } => row.tab !== undefined)
         .sort((a, b) => wsAt(a.tab.workspaceId) - wsAt(b.tab.workspaceId) || tabAt(a.tab.id) - tabAt(b.tab.id) || a.index - b.index);
       const desired = desiredSha();
       // JUD #39000 FU: the mail ledger is read once per listing for all seats (not once per pane), with a short wait.
-      const badges = mailBadgesOf(ordered.map(({ pane }) => seatOf(pane.cwd)).filter((seat): seat is string => seat !== null));
+      // ELS-SERVER-MAINLOOP-STARVATION: in the server this is the cached answer of the badge worker (no ledger read here).
+      const displayCwd = (pane: Pane) => livePty(pane) ? foregroundCwds.get(pane.id) ?? pane.cwd : pane.cwd;
+      const badges = (deps.mailBadges ?? mailBadgesOf)(ordered.map(({ pane }) => seatOf(displayCwd(pane))).filter((seat): seat is string => seat !== null));
       const panes = ordered.flatMap(({ pane, tab }) => {
         const ws = journal.workspaces.find((row) => row.id === tab.workspaceId);
         if (!ws) return [];
@@ -515,11 +783,13 @@ export function createElsCore(deps: ElsCoreDeps) {
           age: buildAge(sha, desired, gitAncestor),
           ...(sha && report?.version ? { version: report.version } : {}),
           ...(sha && report?.stamp ? { stamp: report.stamp } : {}) };
-        const seat = seatOf(pane.cwd);
+        const cwd = displayCwd(pane);
+        const seat = seatOf(cwd);
         const unreadMail = seat !== null ? badges.get(seat) ?? null : null;
         // ELS-TAB-STATE-BADGE: the badge is the contract state; a working pane with no output, `do` or first sight for the
         // stall window reads `stalled`. The server computes it (one clock), so every client — `els ls`, sidetab — shows the same.
-        const listedState = pane.state === 'exited' ? 'exited' : live ? pane.state : 'idle';
+        const unavailableReason = unavailableCwds.get(pane.id);
+        const listedState = pane.state === 'exited' ? 'exited' : live ? pane.state : unavailableReason ? 'blocked' : 'idle';
         if (!firstSeen.has(pane.id)) firstSeen.set(pane.id, now());
         // Last-event policy: the REAL last event wins — the PTY's own lastOutputAt (a reattached holder pane keeps the output
         // time it really had before this server restarted) or the last `do` delivered, whichever is later. firstSeen
@@ -529,11 +799,11 @@ export function createElsCore(deps: ElsCoreDeps) {
         const lastEventAtMs = realEventAtMs > 0 ? realEventAtMs : firstSeen.get(pane.id)!;
         const badge = tabBadge({ state: listedState, lastEventAtMs }, now());
         return [{ build, lastEventAtMs, badge: badge.state, badgeLabel: badge.label, stalled: badge.stalled, address: paneAddress(ws, tab, pane), workspace: ws.name, tab: tab.id, pane: pane.id, title: pane.title, kind: pane.kind,
-          cwd: pane.cwd, command: pane.command, state: pane.state === 'exited' ? 'exited' : live ? pane.state : 'idle',
+          cwd, command: pane.command, state: listedState, ...(unavailableReason ? { unavailableReason } : {}),
           ptyId: live ? pane.ptyId : '', ...(live?.pid ? { pid: live.pid } : {}), restore: pane.restore, seat, unreadMail,
           ...(live && foregrounds.has(pane.id) ? { kind: foregrounds.get(pane.id)!.kind, fgCommand: foregrounds.get(pane.id)!.command } : {}) }];
       });
-      return { exitCode: 0, message: JSON.stringify({ workspaces: journal.workspaces, tabs: journal.tabs, panes }, null, 2) };
+      return { exitCode: 0, message: JSON.stringify({ workspaces, tabs: journal.tabs, panes }, null, 2) };
     },
 
     /**
@@ -603,9 +873,12 @@ export function createElsCore(deps: ElsCoreDeps) {
       const panes = journal.panes.filter((row) => row.tabId === tab.id);
       for (const pane of panes) {
         const pty = ptys.get(pane.id);
+        unwatchCwd(pane.id);
+        unavailableCwds.delete(pane.id);
         ptys.delete(pane.id);
         queues.delete(pane.id);
         if (pty) { try { pty.kill(); } catch { /* already gone */ } }
+        deps.onPaneClosed?.(pane.id); // OP #128343: 발급 토큰 회수
       }
       const saveError = persist({ ...journal, tabs: journal.tabs.filter((row) => row.id !== tab.id),
         panes: journal.panes.filter((row) => row.tabId !== tab.id) });
@@ -648,7 +921,7 @@ export function createElsCore(deps: ElsCoreDeps) {
       const hit = resolve(ref);
       if (!hit) return { exitCode: 1, message: `els attach: unknown pane ${ref}` };
       const pty = livePty(hit.pane);
-      if (!pty) return { exitCode: 0, message: hit.pane.scrollback };
+      if (!pty) return { exitCode: 0, message: unavailableScreen(hit.pane) };
       try { return { exitCode: 0, message: await pty.renderScreen({ ansi: true, ...(scrollBack > 0 ? { scrollBack } : {}) }) }; }
       catch (error) { return { exitCode: 1, message: `els attach: cannot render ${hit.pane.id}: ${message(error)}` }; }
     },
@@ -686,7 +959,7 @@ export function createElsCore(deps: ElsCoreDeps) {
       const hit = resolve(ref);
       if (!hit) return { exitCode: 1, message: `els read: unknown pane ${ref}` };
       const pty = livePty(hit.pane);
-      if (!pty) return { exitCode: 0, message: hit.pane.scrollback };
+      if (!pty) return { exitCode: 0, message: unavailableScreen(hit.pane) };
       let screen: string;
       try { screen = await pty.renderScreen(); }
       catch (error) { return { exitCode: 1, message: `els read: cannot render ${hit.pane.id}: ${message(error)}` }; }
@@ -736,7 +1009,8 @@ export function createElsCore(deps: ElsCoreDeps) {
       const status = paneStatus({ pane: hit.pane.id, alive: pty !== undefined, exited: hit.pane.state === 'exited',
         screen, lastOutputAt: pty?.lastOutputAt?.(), now: now() });
       const fg = pty ? foregrounds.get(hit.pane.id) : undefined;
-      return { exitCode: 0, message: JSON.stringify(fg ? { ...status, kind: fg.kind, pid: fg.pid } : status) };
+      const reason = unavailableCwds.get(hit.pane.id);
+      return { exitCode: 0, message: JSON.stringify(fg ? { ...status, kind: fg.kind, pid: fg.pid } : reason ? { ...status, reason } : status) };
     },
 
     /** A live holder binding for the server-issued pane identity, never a client-supplied PID. */
@@ -759,8 +1033,13 @@ export function createElsCore(deps: ElsCoreDeps) {
     setForegrounds(next: ReadonlyMap<string, Foreground>): string[] {
       const changed = [...next].filter(([pane, fg]) => foregrounds.get(pane)?.kind !== fg.kind).map(([pane]) => pane);
       const forgotten = [...foregrounds.keys()].some((pane) => !next.has(pane));
+      const previous = new Map(foregrounds);
       foregrounds.clear();
       for (const [pane, fg] of next) foregrounds.set(pane, fg);
+      for (const pane of new Set([...previous.keys(), ...next.keys()])) {
+        if (previous.get(pane)?.pid !== next.get(pane)?.pid || previous.get(pane)?.kind !== next.get(pane)?.kind) foregroundCwds.delete(pane);
+        cwdSubscriptions.get(pane)?.foregroundChanged();
+      }
       if (changed.length > 0 || forgotten) notifyChange();
       return changed;
     },
@@ -836,6 +1115,30 @@ export function createElsCore(deps: ElsCoreDeps) {
         const saveError = patchLive(current.pane.id, pty.id, { state: 'working' });
         return { exitCode: 0, message: `els send: ${current.pane.id} ${text.length} chars${saveError ? ` (state not saved: ${saveError})` : ''}` };
       });
+    },
+
+    /**
+     * ELS-INPUT-FAST-PATH: one typed key from an authenticated attach reaches the PTY ahead of everything else the
+     * server may be doing for that pane. No screen render, no pane lock (it can never queue behind a `do` delivery),
+     * no synchronous disk write. The attach's door already verified the principal, and HITL protection lives in
+     * `machineInput`'s guarded lane: the caller routes approval letters and control bytes back there, so this lane
+     * is a write for everything else. Ordering is preserved by the write itself.
+     */
+    machineFastInput(ref: string, bytes: string): ElsResult | { redirectToGuard: true } {
+      if (typeof bytes !== 'string') return { exitCode: 2, message: 'els input: bytes must be a string' };
+      if (Buffer.byteLength(bytes, 'utf8') > MAX_INPUT_BYTES) return { exitCode: 2, message: `els input: more than ${MAX_INPUT_BYTES} bytes at once` };
+      if (!bytes) return { exitCode: 0, message: '' };
+      // An approval letter or a control byte always takes the guarded machine lane (HITL protection).
+      const plain = /[\r\n]$/.test(bytes) ? bytes.slice(0, -1) : bytes;
+      if (SEND_TEXT_CONTROL.test(plain) || /[yY]/.test(plain)) return { redirectToGuard: true };
+      const hit = resolve(ref);
+      if (!hit) return { exitCode: 1, message: `els input: unknown pane ${ref}` };
+      const pty = livePty(hit.pane);
+      if (!pty) return { exitCode: 1, message: `els input: ${hit.pane.id} is not running` };
+      try { pty.write(bytes); } catch (error) { return { exitCode: 1, message: `els input: ${message(error)}` }; }
+      rawInputVersion.set(hit.pane.id, (rawInputVersion.get(hit.pane.id) ?? 0) + 1);
+      lastDelivery.set(hit.pane.id, now());
+      return { exitCode: 0, message: '' };
     },
 
     /** One-shot socket input is machine input. Only the authenticated attach stream calls raw input(). */
@@ -1039,9 +1342,12 @@ export function createElsCore(deps: ElsCoreDeps) {
       if (!hit) return { exitCode: 1, message: `els close: unknown pane ${ref}` };
       const paneId = hit.pane.id;
       const pty = ptys.get(paneId);
+      unwatchCwd(paneId);
+      unavailableCwds.delete(paneId);
       ptys.delete(paneId);
       discardQueue(paneId, 'pane closed');
       if (pty) { try { pty.kill(); } catch { /* already gone */ } }
+      deps.onPaneClosed?.(paneId); // OP #128343: 발급 토큰 회수
       const panes = journal.panes.filter((row) => row.id !== paneId);
       const tabs = panes.some((row) => row.tabId === hit.tab.id) ? journal.tabs : journal.tabs.filter((row) => row.id !== hit.tab.id);
       const saveError = persist({ ...journal, panes, tabs });
@@ -1056,9 +1362,12 @@ export function createElsCore(deps: ElsCoreDeps) {
       const doomed = journal.panes.filter((pane) => tabIds.has(pane.tabId));
       for (const pane of doomed) {
         const pty = ptys.get(pane.id);
+        unwatchCwd(pane.id);
+        unavailableCwds.delete(pane.id);
         ptys.delete(pane.id);
         discardQueue(pane.id, 'workspace closed');
         if (pty) { try { pty.kill(); } catch { /* already gone */ } }
+        deps.onPaneClosed?.(pane.id); // OP #128343: 발급 토큰 회수
       }
       const saveError = persist({ ...journal, workspaces: journal.workspaces.filter((row) => row.id !== ws.id),
         tabs: journal.tabs.filter((tab) => tab.workspaceId !== ws.id), panes: journal.panes.filter((pane) => !tabIds.has(pane.tabId)) });
@@ -1121,6 +1430,13 @@ export function createElsCore(deps: ElsCoreDeps) {
      *  re-attaches to the holder, the pane survives the restart); a PTY in this process still dies. The journal keeps the panes. */
     stopAll(): void {
       for (const paneId of queues.keys()) discardQueue(paneId, 'server shutdown');
+      for (const watch of cwdSubscriptions.values()) watch.checkpoint();
+      for (const paneId of cwdSubscriptions.keys()) unwatchCwd(paneId);
+      procCwdReader.dispose();
+      if (journalRetry) clearTimeout(journalRetry);
+      journalRetry = undefined;
+      const saveError = flushJournal();
+      if (saveError) process.stderr.write(`els: shutdown journal not saved: ${saveError}\n`);
       for (const pty of ptys.values()) {
         if (typeof pty.detach === 'function') { try { pty.detach(); } catch { /* already gone */ } }
         else { try { pty.kill(); } catch { /* already gone */ } }

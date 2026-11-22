@@ -162,32 +162,40 @@ export function openSurfaceEventsDb(path: string = surfaceEventsDbPath()): Datab
   // A stray merge can commit and update its marker before the signal transaction fails.
   // Check for remaining rows on every open so the next process can finish that migration.
   const pendingSignalRows = Boolean(db.prepare(`SELECT 1 FROM events WHERE ${LOW_SIGNAL_SQL} LIMIT 1`).get());
-  if (mergedStrayEvents || pendingSignalRows || !db.prepare('SELECT version FROM signal_migrations WHERE version=1').get()) {
-    db.transaction(() => {
-      db.run(`INSERT OR IGNORE INTO signals (id, ts, surface, direction, kind, session_id, thread_id, text, summary, importance, tags, refs, category, domain)
-        SELECT id, ts, surface, direction, kind, session_id, thread_id, text, summary, importance, tags, refs, category, domain
-        FROM events WHERE ${LOW_SIGNAL_SQL}`);
-      db.run(`DELETE FROM events_fts WHERE id IN (SELECT id FROM events WHERE ${LOW_SIGNAL_SQL})`);
-      db.run(`DELETE FROM events WHERE ${LOW_SIGNAL_SQL}`);
-      db.run('INSERT OR IGNORE INTO signal_migrations(version) VALUES (1)');
-    })();
-  }
   // Release-graph delivery can be replayed after the seven-day signal window.
   // Keep only its stable receipt key and event id after the raw signal expires.
+  const needsSignalMigration = mergedStrayEvents || pendingSignalRows
+    || !db.prepare('SELECT version FROM signal_migrations WHERE version=1').get();
   const hasDeliveryReceipts = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_delivery_receipts'").get());
-  if (!hasDeliveryReceipts) {
-    const safeRefs = "CASE WHEN json_valid(refs) THEN refs ELSE '{}' END";
-    const eventId = `json_extract(${safeRefs}, '$.eventId')`;
-    const subscriberId = `json_extract(${safeRefs}, '$.subscriberId')`;
+  const safeRefs = "CASE WHEN json_valid(e.refs) THEN e.refs ELSE '{}' END";
+  const eventId = `json_extract(${safeRefs}, '$.eventId')`;
+  const subscriberId = `json_extract(${safeRefs}, '$.subscriberId')`;
+  // A stray merge writes its marker before this later transaction. An existing receipt table and
+  // non-low-signal row can otherwise hide a rolled-back backfill on every subsequent open.
+  const hasMissingReceipt = () => ['events', 'signals'].some(table => Boolean(db.prepare(`
+    SELECT 1 FROM ${table} AS e WHERE e.surface='context:external'
+      AND typeof(${eventId})='text' AND typeof(${subscriberId})='text'
+      AND NOT EXISTS (SELECT 1 FROM external_delivery_receipts AS r
+        WHERE r.event_id=${eventId} AND r.subscriber_id=${subscriberId})
+    LIMIT 1`).get()));
+  if (needsSignalMigration || !hasDeliveryReceipts || hasMissingReceipt()) {
     db.transaction(() => {
+      if (needsSignalMigration) {
+        db.run(`INSERT OR IGNORE INTO signals (id, ts, surface, direction, kind, session_id, thread_id, text, summary, importance, tags, refs, category, domain)
+          SELECT id, ts, surface, direction, kind, session_id, thread_id, text, summary, importance, tags, refs, category, domain
+          FROM events WHERE ${LOW_SIGNAL_SQL}`);
+        db.run(`DELETE FROM events_fts WHERE id IN (SELECT id FROM events WHERE ${LOW_SIGNAL_SQL})`);
+        db.run(`DELETE FROM events WHERE ${LOW_SIGNAL_SQL}`);
+        db.run('INSERT OR IGNORE INTO signal_migrations(version) VALUES (1)');
+      }
       db.run(`CREATE TABLE IF NOT EXISTS external_delivery_receipts(
         event_id TEXT NOT NULL, subscriber_id TEXT NOT NULL, surface_event_id TEXT NOT NULL,
         PRIMARY KEY(event_id, subscriber_id)
       )`);
       for (const table of ['events', 'signals']) {
         db.run(`INSERT OR IGNORE INTO external_delivery_receipts(event_id, subscriber_id, surface_event_id)
-          SELECT ${eventId}, ${subscriberId}, id FROM ${table}
-          WHERE surface='context:external' AND typeof(${eventId})='text' AND typeof(${subscriberId})='text'`);
+          SELECT ${eventId}, ${subscriberId}, e.id FROM ${table} AS e
+          WHERE e.surface='context:external' AND typeof(${eventId})='text' AND typeof(${subscriberId})='text'`);
       }
     })();
   }

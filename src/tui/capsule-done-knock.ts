@@ -24,7 +24,7 @@ export interface CapsuleDoneKnockDeps {
   readonly busy?: () => boolean;
   readonly enqueueMidTurn?: (event: { kind: string; id: string; text: string }, onDrained?: () => void) => boolean;
   /** OP #106762 ⓐ — 배수된 사건의 대기 큐 노티스를 지운다(fail-open · 지운 건수를 돌려준다). */
-  readonly removeQueuedNotice?: (match: { source: string; msgId?: number; text?: string }) => number;
+  readonly removeQueuedNotice?: (match: { source: string; msgId?: number; text?: string; capsuleId?: string }) => number;
 }
 
 /** Returns the unsubscribe. */
@@ -40,9 +40,10 @@ export function wireCapsuleDoneKnock(deps: CapsuleDoneKnockDeps): () => void {
       const text = capsuleDoneNotice(event);
       deps.enqueueMidTurn(
         { kind: 'capsule-done', id: `capsule:${event.capsuleId}`, text },
-        deps.removeQueuedNotice === undefined ? undefined : () => { deps.removeQueuedNotice?.({ source: 'capsule-done', text }); },
+        deps.removeQueuedNotice === undefined ? undefined : () => { deps.removeQueuedNotice?.({ source: 'capsule-done', text, capsuleId: event.capsuleId }); },
       );
     }
-    if (queued) deps.knock();
+    // OPS-RULES token cost: result-only notifications wait for a person or another actual event turn.
+    // The task notification drain carries the result into that turn; this frame never opens one.
   });
 }

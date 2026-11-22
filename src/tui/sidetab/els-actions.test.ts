@@ -40,10 +40,12 @@ test('send: delivered and queued only when the owner said so; a missing answer i
   expect(await sendToElsRow(deps(new Error('socket closed')).actions, 'Mac:w1/t2/p3', 'hi')).toEqual({ ok: false, outcome: 'refused', message: 'els do: socket closed' });
 });
 
-test('read: the pane screen on success, undefined on a refusal or a throw', async () => {
+test('read: the pane screen on success, and an explicit error on refusal or transport failure', async () => {
   const ok = deps({ exitCode: 0, message: '' });
   expect(await readElsRow(ok.actions, 'Mac:w1/t2/p3')).toBe('SCREEN');
   expect(ok.calls).toEqual(['read Mac:w1/t2/p3']);
-  expect(await readElsRow(deps({ exitCode: 0, message: '' }, { exitCode: 1, message: 'unknown pane' }).actions, 'x')).toBeUndefined();
-  expect(await readElsRow(deps({ exitCode: 0, message: '' }, new Error('down')).actions, 'x')).toBeUndefined();
+  await expect(readElsRow(deps({ exitCode: 0, message: '' }, { exitCode: 1, message: 'unknown pane' }).actions, 'x'))
+    .rejects.toThrow('unknown pane');
+  await expect(readElsRow(deps({ exitCode: 0, message: '' }, new Error('down')).actions, 'x'))
+    .rejects.toThrow('down');
 });

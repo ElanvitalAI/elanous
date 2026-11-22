@@ -26,15 +26,15 @@ function harness() {
   return { queue, listeners, stop, knocks: () => knocks, unsubscribed: () => unsubscribed };
 }
 
-describe('B1 TUI wiring — capsule-done → one notice + one knock (always on)', () => {
+describe('B1 TUI wiring — capsule-done waits in one notice without a result-only wake', () => {
 
-  test('stage on: done → notice queued with source capsule-done and the capsule id · one knock · turn-life logged', () => {
+  test('done → notice queued with source capsule-done and the capsule id · no result-only knock · turn-life logged', () => {
     const log = spyOn(debug, 'log');
     const h = harness();
     h.listeners[0]!(DONE);
     const life = log.mock.calls.filter((call) => call[0] === 'turn-life' && call[1] === 'turn-life:capsule-done-knock');
     log.mockRestore();
-    expect(h.knocks()).toBe(1);
+    expect(h.knocks()).toBe(0);
     expect(h.queue.items.map((item) => item.kind === 'notice' ? [item.source, item.text] : null)).toEqual([
       ['capsule-done', capsuleDoneNotice(DONE)],
     ]);
@@ -48,10 +48,12 @@ describe('B1 TUI wiring — capsule-done → one notice + one knock (always on)'
     h.listeners[0]!(DONE);
     h.listeners[0]!(DONE);
     h.listeners[0]!({ type: 'capsule-progress', capsuleId: 'c-8', kind: 'agent', sessionId: 's-1', at: 1, line: 'x' });
-    expect(h.knocks()).toBe(1);
+    expect(h.knocks()).toBe(0);
     expect(h.queue.items.length).toBe(1);
     h.listeners[0]!({ ...DONE, capsuleId: 'c-9' });
-    expect(h.knocks()).toBe(2);
+    expect(h.knocks()).toBe(0);
+    // 출처: #126740 이 fixture 는 c-7 과 c-9 두 고유 완료 프레임을 보냈다.
+    expect(h.queue.items[0]).toMatchObject({ capsuleCount: 2 });
     h.stop!();
     expect(h.unsubscribed()).toBe(1);
   });
@@ -66,7 +68,7 @@ describe('④ mid-turn adapter — busy turn sees the capsule, idle still knocks
     const notices = createChildNoticeProducers(queue);
     const listeners: Array<(event: CapsuleEvent) => void> = [];
     let knocks = 0;
-    const removals: Array<{ source: string; msgId?: number; text?: string }> = [];
+    const removals: Array<{ source: string; msgId?: number; text?: string; capsuleId?: string }> = [];
     wireCapsuleDoneKnock({
       sessionId: session,
       subscribe: (_sessionId, listener) => { listeners.push(listener); return () => {}; },
@@ -76,6 +78,7 @@ describe('④ mid-turn adapter — busy turn sees the capsule, idle still knocks
       enqueueMidTurn: (event, onDrained) => enqueueMidTurnEvent(session, event, onDrained),
       removeQueuedNotice: (match) => {
         removals.push(match);
+        if (match.capsuleId) return Number(queue.removeCapsuleDoneNotice(match.capsuleId));
         const wanted = queue.items.filter((item) => item.kind === 'notice' && item.source === match.source && item.text === match.text);
         let removed = 0;
         for (const item of wanted) { try { queue.cancel(item.id, 'mid-turn-carried'); removed += 1; } catch { /* fail-open */ } }
@@ -91,13 +94,13 @@ describe('④ mid-turn adapter — busy turn sees the capsule, idle still knocks
     const h = busyHarness(session);
     h.listeners[0]!(DONE);
     expect(midTurnEventCount(session)).toBe(1);
-    expect(h.knocks()).toBe(1);
+    expect(h.knocks()).toBe(0);
     const drained = drainMidTurnEvents(session);
     expect(drained).toHaveLength(1);
     expect(drained[0]!.kind).toBe('capsule-done');
     expect(drained[0]!.id).toBe('capsule:c-7');
     expect(drained[0]!.text).toBe(capsuleDoneNotice(DONE)); // 실제 노티스 문면(캡슐 완료: … — 문면 일치)
-    expect(h.removals).toEqual([{ source: 'capsule-done', text: capsuleDoneNotice(DONE) }]); // 제거 1회
+    expect(h.removals).toEqual([{ source: 'capsule-done', text: capsuleDoneNotice(DONE), capsuleId: DONE.capsuleId }]); // 제거 1회
     expect(h.queue.items.filter((item) => item.source === 'capsule-done')).toHaveLength(0); // 큐는 비었다
     h.listeners[0]!(DONE); // 재전파 — 세션 1회(OP #106762 ⓐ)
     expect(midTurnEventCount(session)).toBe(0); // 리플레이 이벤트 0건
@@ -113,14 +116,14 @@ describe('④ mid-turn adapter — busy turn sees the capsule, idle still knocks
     expect(midTurnEventCount(session)).toBe(1);
     h.listeners[0]!(DONE); // 재전파(대기 중) — 중복 0(예전 Date.now id 와 달리 같은 id 로 막힌다)
     expect(midTurnEventCount(session)).toBe(1);
-    expect(h.knocks()).toBe(1); // 재전파 노크 없음 — 턴 경계 보증은 턴 상태가 담당
+    expect(h.knocks()).toBe(0); // 결과 알림만으로 새 턴을 열지 않는다
     const drained = drainMidTurnEvents(session);
     expect(drained).toHaveLength(1);
     expect(drained[0]!.id).toBe('capsule:c-7');
     clearMidTurnEvents(session);
   });
 
-  test('idle: mid-turn deps wired but busy=false → no mid-turn event, knock only', () => {
+  test('idle: mid-turn deps wired but busy=false → no mid-turn event or result-only knock', () => {
     const session = 'midturn-capsule-idle';
     clearMidTurnEvents(session);
     const queue = createNextTuiQueue();
@@ -136,7 +139,7 @@ describe('④ mid-turn adapter — busy turn sees the capsule, idle still knocks
       enqueueMidTurn: (event) => enqueueMidTurnEvent(session, event),
     });
     listeners[0]!(DONE);
-    expect(knocks).toBe(1);
+    expect(knocks).toBe(0);
     expect(midTurnEventCount(session)).toBe(0);
     clearMidTurnEvents(session);
   });

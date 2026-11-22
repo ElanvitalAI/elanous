@@ -2,7 +2,9 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ElsResult } from './core.js';
+import type { ElsCore, ElsResult } from './core.js';
+import { parseRemoteRows } from './attach-view.js';
+import { routeElsHttp } from './http.js';
 import { createFederation } from './federation.js';
 import { createServer, type Server } from 'node:http';
 import { elsHostsPath, fetchHostJson, isTailnetOrLoopback, loadHostRegistry, type FederatedHost, type HostRegistry } from './hosts.js';
@@ -45,6 +47,36 @@ test('ls merges this host and the answering hosts; a host that fails or answers 
   expect(body.hosts.map((host) => [host.name, host.reach])).toEqual([['mshq', 'local'], ['host-a', 'up'], ['host-b', 'down'], ['odd', 'down']]);
   expect(body.hosts.find((host) => host.name === 'odd')?.reason).toBe('malformed answer');
   expect(body.panes.map((pane) => [pane.address, pane.reach])).toEqual([['mshq:w1/t1/p1', 'local'], ['host-a:w9/t9/p9', 'up']]);
+});
+
+test('origin workspace role travels through HTTP and federation to remote rows, scoped to each host', async () => {
+  const origin = { list: () => ({ exitCode: 0, message: JSON.stringify({
+    workspaces: [{ id: 'a' }, { id: 'b', role: 'coordinator' }],
+    panes: [
+      { address: 'a/t/a1', tab: 't', pane: 'a1', title: 'OP', state: 'idle' },
+      { address: 'b/t/b1', tab: 't', pane: 'b1', title: 'one', state: 'idle' },
+      { address: 'b/t/b2', tab: 't', pane: 'b2', title: 'two', state: 'idle' },
+    ],
+  }) }) } as unknown as ElsCore;
+  const response = await routeElsHttp(origin, 'host-a', 'GET', '/els/ls');
+  expect(response.status).toBe(200);
+  const originBody = JSON.parse(response.body) as { panes: { role?: string }[] };
+  expect(originBody.panes.map((row) => row.role)).toEqual([undefined, 'coordinator', 'coordinator']);
+  const { fed } = federation({ hosts: [hostA, hostB], remote: {
+    'host-a': () => ({ status: 200, body: originBody }),
+    'host-b': () => ({ status: 200, body: { host: 'host-b', panes: [
+      { ws: 'b', tab: 't', pane: 'legacy', title: 'OP' },
+      { ws: 'x', tab: 't', pane: 'invalid', role: 'other' },
+    ] } }),
+  } });
+  const result = await fed.list();
+  expect(result.exitCode).toBe(0);
+  const rows = parseRemoteRows(result.message);
+  expect(rows.map((row) => [row.wsId, row.role])).toEqual([
+    ['host-a:b', 'coordinator'], ['host-a:b', 'coordinator'], ['host-a:a', undefined],
+    ['host-b:b', undefined], ['host-b:x', undefined],
+  ]);
+  expect(rows.map((row) => row.pane)).toEqual(['host-a:b/t/b1', 'host-a:b/t/b2', 'host-a:a/t/a1', 'host-b:b/t/legacy', 'host-b:x/t/invalid']);
 });
 
 test('ls without a local server: with hosts the local host is down and the hosts are still listed; without hosts it is the stage-1 answer', async () => {

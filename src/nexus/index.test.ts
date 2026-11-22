@@ -3,7 +3,7 @@
 // when assembling wsBridgeOpts (same shape as src/boot/acp-server.ts).
 
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -27,6 +27,7 @@ import { deleteAppSecretValue, fileBackend, setAppSecretValue } from './config/s
 import { setCredentialSlotAsync } from './config/secrets/cred-slots.js';
 import type { StartOpts } from '../pty-shell/registry.js';
 import { setTestStateRoot } from './paths.js';
+import { WorkerRegistryStore } from './worker-registry/store.js';
 import { __resetIdentityForTests, __setIdentityFileForTests } from '../mss/identity-store.js';
 import type { NexusFunnelEvent } from './apps/funnel-observe.js';
 import type { PwaShareDeps, PwaShareResult } from '../cli/pwa-share.js';
@@ -37,6 +38,100 @@ const CONFIGURED_TOKEN = 'configured-token-xxxxxxxxxxxxxxxxxxxx';
 /** ⛔ 이 파일이 만든 임시 디렉토리를 걷는다 — 반복 실행에서 /tmp 가 샌다. */
 const tempDirs: string[] = [];
 afterAll(() => { for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true }); });
+
+test('real Nexus boot binds its worker_hosts WAL to the owner-only ELS metadata route', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'nexus-worker-hosts-boot-')));
+  const previousEdgeOrigin = process.env.ELANOUS_NEXUS_TLS_EDGE_ORIGIN;
+  const previousEdgeSecretFile = process.env.ELANOUS_NEXUS_TLS_EDGE_SECRET_FILE;
+  let nexus: Awaited<ReturnType<typeof runNexus>> | undefined;
+  let writer: WorkerRegistryStore | undefined;
+  try {
+    setElanousConfigDir(root);
+    setTestStateRoot(root);
+    writeFileSync(join(root, 'acp-token'), `${CONFIGURED_TOKEN}\n`);
+    const edgeSecret = 'synthetic-edge-secret-xxxxxxxxxxxxxxxxxxxxxxxx';
+    const edgeSecretFile = join(root, 'edge-secret');
+    writeFileSync(edgeSecretFile, edgeSecret, { mode: 0o600 });
+    process.env.ELANOUS_NEXUS_TLS_EDGE_ORIGIN = 'https://nexus.test.invalid';
+    process.env.ELANOUS_NEXUS_TLS_EDGE_SECRET_FILE = edgeSecretFile;
+    nexus = await runNexus({
+      detachForTesting: true, skipHttpServer: false, skipRuntimeApi: false,
+      skipSupervisor: true, mcpEnabled: false, skipEnvMigration: true,
+      skipRestoreFromPending: true, registerDaemonTab: false, registerSettingsTab: false,
+      skipPushcutChannel: true, skipPwaChannel: true, skipTelegramChannel: true,
+      skipDiscordChannel: true, skipTerminalChannel: true, skipIntentPrediction: true,
+      cleanGhostTailscaleServeFn: async () => {}, toolCwd: root,
+      httpStartPort: 51000 + Math.floor(Math.random() * 1000),
+    });
+    if (!nexus?.httpServer) throw new Error('Nexus did not bind');
+    const dbPath = join(root, 'nexus', 'worker-registry.sqlite');
+    expect(existsSync(dbPath)).toBe(true);
+    writer = new WorkerRegistryStore(dbPath);
+    writer.upsertHost({ name: 'minim5', principal: 'machine-A', elsEndpoint: 'http://100.64.0.2:8790', heartbeatTtlMs: 60_000 });
+    const url = `${nexus.httpServer.url}/v1/els/remote-hosts`;
+    expect((await fetch(url, { headers: { authorization: `Bearer ${CONFIGURED_TOKEN}` } })).status).toBe(403);
+    const edgeHeaders = { 'x-forwarded-proto': 'https', 'x-forwarded-host': 'nexus.test.invalid',
+      'x-elanous-tls-edge-secret': edgeSecret };
+    expect((await fetch(url, { headers: edgeHeaders })).status).toBe(401);
+    const response = await fetch(url, { headers: { ...edgeHeaders, authorization: `Bearer ${CONFIGURED_TOKEN}` } });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ hosts: [{ name: 'minim5', state: 'registered', generation: 1 }] });
+  } finally {
+    writer?.close();
+    nexus?.release();
+    resetElanousConfigDir();
+    setTestStateRoot(null);
+    if (previousEdgeOrigin === undefined) delete process.env.ELANOUS_NEXUS_TLS_EDGE_ORIGIN;
+    else process.env.ELANOUS_NEXUS_TLS_EDGE_ORIGIN = previousEdgeOrigin;
+    if (previousEdgeSecretFile === undefined) delete process.env.ELANOUS_NEXUS_TLS_EDGE_SECRET_FILE;
+    else process.env.ELANOUS_NEXUS_TLS_EDGE_SECRET_FILE = previousEdgeSecretFile;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test('real Nexus boot keeps the owner ELS metadata route unavailable when its WAL cannot open', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'nexus-worker-hosts-open-failure-')));
+  const previousEdgeOrigin = process.env.ELANOUS_NEXUS_TLS_EDGE_ORIGIN;
+  const previousEdgeSecretFile = process.env.ELANOUS_NEXUS_TLS_EDGE_SECRET_FILE;
+  let nexus: Awaited<ReturnType<typeof runNexus>> | undefined;
+  try {
+    setElanousConfigDir(root);
+    setTestStateRoot(root);
+    writeFileSync(join(root, 'acp-token'), `${CONFIGURED_TOKEN}\n`);
+    const edgeSecret = 'synthetic-edge-secret-xxxxxxxxxxxxxxxxxxxxxxxx';
+    const edgeSecretFile = join(root, 'edge-secret');
+    writeFileSync(edgeSecretFile, edgeSecret, { mode: 0o600 });
+    process.env.ELANOUS_NEXUS_TLS_EDGE_ORIGIN = 'https://nexus.test.invalid';
+    process.env.ELANOUS_NEXUS_TLS_EDGE_SECRET_FILE = edgeSecretFile;
+    mkdirSync(join(root, 'nexus', 'worker-registry.sqlite'), { recursive: true });
+    nexus = await runNexus({
+      detachForTesting: true, skipHttpServer: false, skipRuntimeApi: false,
+      skipSupervisor: true, mcpEnabled: false, skipEnvMigration: true,
+      skipRestoreFromPending: true, registerDaemonTab: false, registerSettingsTab: false,
+      skipPushcutChannel: true, skipPwaChannel: true, skipTelegramChannel: true,
+      skipDiscordChannel: true, skipTerminalChannel: true, skipIntentPrediction: true,
+      cleanGhostTailscaleServeFn: async () => {}, toolCwd: root,
+      httpStartPort: 51000 + Math.floor(Math.random() * 1000),
+    });
+    if (!nexus?.httpServer) throw new Error('Nexus did not bind');
+    const url = `${nexus.httpServer.url}/v1/els/remote-hosts`;
+    expect((await fetch(url, { headers: { authorization: `Bearer ${CONFIGURED_TOKEN}` } })).status).toBe(403);
+    const response = await fetch(url, { headers: { authorization: `Bearer ${CONFIGURED_TOKEN}`,
+      'x-forwarded-proto': 'https', 'x-forwarded-host': 'nexus.test.invalid',
+      'x-elanous-tls-edge-secret': edgeSecret } });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'worker-registry-unavailable' });
+  } finally {
+    nexus?.release();
+    resetElanousConfigDir();
+    setTestStateRoot(null);
+    if (previousEdgeOrigin === undefined) delete process.env.ELANOUS_NEXUS_TLS_EDGE_ORIGIN;
+    else process.env.ELANOUS_NEXUS_TLS_EDGE_ORIGIN = previousEdgeOrigin;
+    if (previousEdgeSecretFile === undefined) delete process.env.ELANOUS_NEXUS_TLS_EDGE_SECRET_FILE;
+    else process.env.ELANOUS_NEXUS_TLS_EDGE_SECRET_FILE = previousEdgeSecretFile;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 20_000);
 
 test('NEXUS boot starts a webterm tab in the associated conversation project folder', async () => {
   const root = mkdtempSync(join(tmpdir(), 'nexus-webterm-project-'));

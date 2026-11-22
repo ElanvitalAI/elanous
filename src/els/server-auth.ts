@@ -50,6 +50,8 @@ export const isServerOwnerRole = (role: ServerRole): boolean => ownerRoles.has(r
 export class PaneRegistry {
   private readonly byToken = new Map<string, PaneRegistration>();
   private readonly spawnBindings = new Map<string, { read: () => PaneProcessBinding | undefined; pinned?: PaneProcessBinding; invalid?: boolean }>();
+  /** OP #128343(OP 승인 #128469) — 회수된 토큰(닫힌 pane · 스폰 실패)은 입양 재등록이 다시 쓰지 못한다. */
+  private readonly revokedTokens = new Set<string>();
   private ownerToken: string | undefined;
   private ownerRegistered = false;
   private counter = 0;
@@ -109,7 +111,28 @@ export class PaneRegistry {
   }
 
   /** OP #104178 ① — a spawn whose PTY call throws leaves no orphan token in the ledger. */
-  forget(token: string): void { this.byToken.delete(token); this.spawnBindings.delete(token); }
+  forget(token: string): void { this.revokedTokens.add(token); this.byToken.delete(token); this.spawnBindings.delete(token); }
+
+  /** OP #128343(OP 승인 #128469) — 닫힌 pane 의 발급 토큰 회수: 남아 있는 자손도 그 자격을 다시 쓰지 못한다(미지 토큰으로 돌아간다). */
+  forgetPane(pane: string): void {
+    for (const [token, row] of this.byToken) if (row.pane === pane) this.forget(token);
+  }
+
+  /**
+   * OP #128343(OP 승인 #128469) — 재기동 입양 재등록: 서버를 재기동하면 이 원장은 비어 있고, 살아남은 홀더의
+   * pane 자식은 자기 env 의 서버발급 토큰으로 «els: invalid credential» 로 거부된다. 입양 시 홀더가 증명한
+   * 토큰만 원장에 되돌아온다 — 자리·workspace 는 저널 ownerSeat·tabId 에서 복원하고, 회수됐거나 이번
+   * 기수에 이미 있는 토큰·pane 과의 충돌은 거부한다. 재등록은 읽기 전용, 발급은 spawn 뿐.
+   */
+  registerAdopted(entry: { readonly token: string; readonly pane: string; readonly workspace: string; readonly role: PaneRegistration['role']; readonly seat: string | undefined },
+    read: () => PaneProcessBinding | undefined): boolean {
+    if (!/^[0-9a-f]{48}$/.test(entry.token) || entry.pane === '') return false; // 서버발급 토큰 형태만
+    if (this.byToken.has(entry.token) || this.revokedTokens.has(entry.token)) return false; // 충돌 · 회수
+    if ([...this.byToken.values()].some((row) => row.pane === entry.pane)) return false; // 같은 pane 의 두 번째 토큰 금지
+    this.byToken.set(entry.token, { pane: entry.pane, workspace: entry.workspace, role: entry.role, seat: entry.seat, token: entry.token });
+    this.spawnBindings.set(entry.token, { read });
+    return true;
+  }
 
   /** A claim is judged ONLY by the ledger — env seat strings are irrelevant by construction. */
   classify(claim: { token?: unknown; pid?: unknown } | undefined): ServerRole {
@@ -186,6 +209,12 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
     return ownerRoles.has(role) || (role.kind === 'op' && request.seat === 'OP' && request.runtime != null)
       ? { allow: true }
       : { allow: false, reason: `els: seat-set denied — only the server owner may register the OP seat (${role.kind === 'hand' ? `hand seat ${role.seat}` : role.kind === 'peer' ? `peer seat ${role.seat}` : role.kind === 'op' ? `OP pane ${role.pane}` : role.note})` };
+  }
+  // Coordinator assignment is global, never delegated by a workspace allow-list.
+  if (request.op === 'coordinator' || request.op === 'coordinator-unset') {
+    return role.kind === 'op' || (role.kind === 'peer' && role.seat === 'OP')
+      ? { allow: true }
+      : { allow: false, reason: `els: ${request.op} denied — OP authority required` };
   }
   if (!isMutating(request)) return { allow: true };
   // `new` stays open to any same-uid caller (main #39060 behavior): spawning a pane is not typing

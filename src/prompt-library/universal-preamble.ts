@@ -27,7 +27,8 @@ import type { LLMMessage } from '../llm.js';
 import type { ModelFamily } from '../models/prompts.js';
 import { debug } from '../debug/log.js';
 import { buildCodexFamilyAddendum } from './codex-family-addendum.js';
-import { buildGpt6FamilyAddendum } from './gpt6-family-addendum.js';
+import { buildGpt6CoordinatorAddendum, buildGpt6FamilyAddendum } from './gpt6-family-addendum.js';
+import type { SeatRole } from '../seat/seat-role.js';
 import { buildGeminiFamilyAddendum } from './gemini-family-addendum.js';
 import { buildAnthropicFamilyAddendum } from './anthropic-family-addendum.js';
 import { buildGrokFamilyAddendum } from './grok-family-addendum.js';
@@ -167,6 +168,23 @@ export function buildCodingLifecycleAddendum(): LLMMessage[] {
   return [{ role: 'system', content: CODING_AGENT_LIFECYCLE }];
 }
 
+// SEAT-COORDINATOR-PROMPT-PROFILE (대표 11-22) — 조율 자리(OP)는 코딩 손이 아니다. 진단(seat-state/OP/DIAG-ELN-OP-
+// COORDINATOR-1122.md §1): OP 시스템 프롬프트가 «코딩 lifecycle(`bun test` 검증) ⊕ 앱 빌더 ⊕ 트리 ⊕ GPT-6 persist» 로
+// 채워져 폴링·3단 보고·직접 구현 쪽으로 기울었다. 조율 자리면 그 블록 대신 이 짧은 프로필을 싣는다.
+const COORDINATOR_PROFILE = `## 조율자 프로필 (이 자리 = 조율 자리)
+
+- 너는 구현 손이 아니라 조율자다. 코드·문서를 직접 고치거나 시험·빌드를 돌리지 않는다 — 맡을 자리(손 자리·하니스·서브에이전트)에 위임한다.
+- 판정·착지는 지정된 자리와 경로(리뷰·판정·착지 줄)로만 한다. 이미 주인이 있는 일은 주인에게 먼저 묻는다.
+- 보고는 결론 먼저, 짧은 사실로 쓴다. 확인하지 않은 것을 확인했다고 쓰지 않는다.
+- «한 것·남은 것·증거» 3단 틀은 사람이 그 형식을 요청했을 때만 쓴다.
+- 외부 결과(자식 완료·판정·착지)를 기다릴 때는 같은 조회를 반복하지 말고 턴을 닫는다 — 완료 이벤트가 다음 턴을 연다.
+- 돈·보안·되돌릴 수 없는 일과 확신 없는 결정은 대표에게 먼저 묻는다.`;
+
+/** 조율 자리 프로필 한 장(코딩 lifecycle 자리를 대신한다). */
+export function buildCoordinatorProfileAddendum(): LLMMessage[] {
+  return [{ role: 'system', content: COORDINATOR_PROFILE }];
+}
+
 /** ★ 자기인지 하니스 공간 addendum(2026-07-21 대표 co-design) — 이 프로세스가 격리 self-dev-harness 공간
  *  안이면(ENV 마커·getHarnessSpace) elanous 이 "나는 격리 빌드 샌드박스의 elanous"임을 **자기인지**하고 그에 따라
  *  판단하게 하는 system 메시지. 공간 밖(운영/일반)이면 [](무주입=기존 동작). harness-space 장치의 첫 소비자.
@@ -205,6 +223,9 @@ export interface UniversalPreambleContext {
    *  session guidance section appears. Family-agnostic — all providers
    *  benefit. */
   enabledTools?: readonly string[];
+  /** SEAT-COORDINATOR-PROMPT-PROFILE — 호출부가 자리 원장(`seat/seat-role.ts`)으로 정한 자리 성격.
+   *  `coordinator` 면 트리·코딩 lifecycle·GPT-6 persist/허락 덧말 대신 조율자 프로필을 싣는다. 생략·`hand` = 종전 그대로. */
+  seatRole?: SeatRole;
 }
 
 export interface ProjectAnchorMeta {
@@ -995,7 +1016,10 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
   // tests). Lands AFTER the anchor (architecture prose first, then
   // concrete on-disk shape) and BEFORE the lifecycle so the model sees
   // the layout when planning which pipeline stage to use.
-  const tree = loadProjectTree(ctx.cwd);
+  const coordinator = ctx.seatRole === 'coordinator';
+  const tree: ProjectTreeResult = coordinator
+    ? { content: null, totalChars: 0, truncated: false, topLevelCount: 0 }
+    : loadProjectTree(ctx.cwd);
   if (tree.content) {
     out.push({
       role: 'system',
@@ -1012,7 +1036,7 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
   // Keep the established message order/count for callers that splice this
   // preamble into a larger conversation; Environment is its own section.
   const environment = environmentContext(ctx.cwd);
-  out.push(...buildCodingLifecycleAddendum().map(message => ({
+  out.push(...(coordinator ? buildCoordinatorProfileAddendum() : buildCodingLifecycleAddendum()).map(message => ({
     ...message,
     content: `${String(message.content)}\n\n${environment}`,
   })));
@@ -1034,7 +1058,7 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
   //    ⇒ 공식 GPT-6 가이드의 문면을 «옮겨» 채운다 — 출처·사각은 `gpt6-family-addendum.ts`.
   //    ⛔ 이것은 계열 판정기 수리가 «아니다»(그 23곳은 별개 축).
   if (ctx.modelFamily === 'gpt') {
-    out.push(...buildGpt6FamilyAddendum());
+    out.push(...(coordinator ? buildGpt6CoordinatorAddendum() : buildGpt6FamilyAddendum()));
   }
   if (ctx.modelFamily === 'gemini') {
     out.push(...buildGeminiFamilyAddendum());
@@ -1076,6 +1100,7 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
     debug.log('chat.universal-preamble', 'built', {
       cwd: ctx.cwd,
       modelFamily: ctx.modelFamily ?? null,
+      seatRole: ctx.seatRole ?? null,
       hasProjectAnchor: result.content !== null,
       anchorChars: result.totalChars,
       anchorFiles: result.files.map(f => f.filename),

@@ -24,6 +24,7 @@ import { buildImporterTestIndex, importerTestsNotInRunSet, isTestPath, type Impo
 import { isCommentOnlySourceChange } from './comment-only-source.js';
 import { buildRouteConsumerTestIndex } from './route-consumer-test-index.js';
 import { gitChangedFiles, observeGateBaselineLocation } from './seams.js';
+import { formatGoalDoneLines, goalDoneLinesForChangedFiles } from './goal-scoped-verdict.js';
 import {
   collectBaseLandingCommits,
   overlapWithCurrentChanges,
@@ -468,6 +469,8 @@ interface GateOutput {
 export interface SelfGateCliResult {
   exitCode: number;
   lines: string[];
+  /** JUDGE-SCOPE-FROM-GOAL — 바뀐 골 문서의 완료선 id(판정 파일 goalLines 와 같은 id). */
+  goalDoneLines?: { path: string; ids: string[] }[];
   changedFiles: string[];
   testFiles: string[];
   unverified: readonly string[];
@@ -1094,6 +1097,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   if (requiresRemoteTrainLedger(options) && !capture.hqLedgerVerified) throw new Error('remote train self-gate refused: HQ shard ledger was not verified');
   persistGateReceipt(cwd, capture, deps);
   if (options.artifactDir !== undefined) emitGateArtifacts(cwd, options.artifactDir, result, capture, deps, trainGate);
+  attachGoalDoneLines(cwd, result);
   return result;
 }
 
@@ -1105,7 +1109,18 @@ export async function runSelfGateCliAsync(cwd: string, options: SelfGateCliOptio
   if (requiresRemoteTrainLedger(options) && !capture.hqLedgerVerified) throw new Error('remote train self-gate refused: HQ shard ledger was not verified');
   persistGateReceipt(cwd, capture, deps);
   if (options.artifactDir !== undefined) emitGateArtifacts(cwd, options.artifactDir, result, capture, deps, trainGate);
+  attachGoalDoneLines(cwd, result);
   return result;
+}
+
+/** JUDGE-SCOPE-FROM-GOAL — 연결된 골(바뀐 `내부 문서 `*``)의 완료선 id 를 판정과 같은 자로 읽어 보인다(판정·exit 불변). */
+function attachGoalDoneLines(cwd: string, result: SelfGateCliResult): void {
+  try {
+    const linked = goalDoneLinesForChangedFiles(cwd, result.changedFiles ?? []);
+    if (linked.length === 0) return;
+    result.goalDoneLines = linked;
+    result.lines.push(...formatGoalDoneLines(linked));
+  } catch { /* 관측 줄 — 판정을 바꾸지 않는다 */ }
 }
 
 /** 쓰기 실패는 «경고 한 줄»로만 접는다 — 판정·exit 코드는 그대로다. */

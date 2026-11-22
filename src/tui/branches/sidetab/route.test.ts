@@ -93,3 +93,26 @@ test('/side send words each els outcome as itself: delivered, queued, unknown (n
     'Agent PTY input failed · check selection/run state',
   ]);
 });
+
+test('/side read reports a failed remote snapshot separately from no selected pane', async () => {
+  const statuses: string[] = [];
+  const host = {
+    readSelectedAgent: async () => { throw new Error('els read: minim5 ? timeout'); },
+    setStatus: (message: string) => { statuses.push(message); },
+    addHelp: () => { throw new Error('a failed read must not paint a screen'); },
+  } as unknown as SidetabRouteHost;
+  await runNextTuiBranchRoute('/side read', host);
+  expect(statuses).toEqual(['Selected agent PTY read failed · timeout']);
+});
+
+test('/side read never paints untrusted remote error text, credentials, paths or terminal controls', async () => {
+  const statuses: string[] = [];
+  const untrusted = 'els read: minim5 ? /Users/owner/.cache/secret XAI_API_KEY=private\u001b[31m' + 'x'.repeat(1000);
+  const host = {
+    readSelectedAgent: async () => { throw new Error(untrusted); },
+    setStatus: (message: string) => { statuses.push(message); },
+    addHelp: () => { throw new Error('failed read painted a screen'); },
+  } as unknown as SidetabRouteHost;
+  await runNextTuiBranchRoute('/side read', host);
+  expect(statuses).toEqual(['Selected agent PTY read failed · unavailable']);
+});

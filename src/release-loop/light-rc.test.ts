@@ -283,7 +283,7 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
   test('explicit remote reaches judgeGate host recipe and carries rehearsal TUI through the gate runner', async () => {
     const explicitLedger = tempRepo();
     const defaultLedger = tempRepo();
-    const ids = ['boot', 'prompt', 'status-bar', 'help-opens', 'help-closes', 'no-error-text'];
+    const ids = ['boot', 'prompt', 'status-bar', 'help-opens', 'help-closes', 'esc-alive', 'no-error-text'];
     const gateRepo = tempRepo();
     mkdirSync(join(gateRepo, 'src'), { recursive: true });
     mkdirSync(join(gateRepo, 'release'), { recursive: true });

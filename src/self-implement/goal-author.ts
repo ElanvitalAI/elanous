@@ -1,5 +1,6 @@
 import { canonicalTracedPathToken, classifyTracedPathToken, extractVerbatimOriginalAsk, isTracedPathExclusionDescription, isTracedPathsEvidenceUnavailable, ORIGINAL_ASK_MARKER, stripInlineCode, tracedPathListItem, tracedPathReferences, verbatimOriginalAsk, type TracedPathReference, type TracedPathTokenClassification, type TracedPathTokenKind, type VerbatimOriginalAsk, TRACED_PATH_DESCRIPTION_DELIMITER, TRACED_PATH_LEADING_LIST_MARKERS, TRACED_PATH_LINE, TRACED_PATH_READ_ANNOTATION, TRACED_PATHS_EVIDENCE_UNAVAILABLE, TRACED_PATHS_PERSISTENT_CHANNEL_UNAVAILABLE } from './goal-author-text.js';
 export { canonicalTracedPathToken, classifyTracedPathToken, extractVerbatimOriginalAsk, ORIGINAL_ASK_MARKER, tracedPathReferences, verbatimOriginalAsk, type TracedPathReference, type TracedPathTokenClassification, type TracedPathTokenKind, type VerbatimOriginalAsk } from './goal-author-text.js';
+import { GOAL_CONTRACT_SECTION, withDefaultGoalContract } from './goal-contract-fields.js';
 import { classifyObservation } from '../design/behaviour-signal.js';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, type Dirent } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
@@ -7505,7 +7506,7 @@ async function goalSlug(goal: string, slugFn: (goal: string) => Promise<string>)
  *  ***조건이 조용히 거짓이 되어 `## 메타데이터` 경계가 사라졌다***(실측으로 잡았다).
  *  ⇒ 🔑 「마지막 절이 무엇인가」를 목록으로 물어야 한다 — 절을 더할 때마다 여기가 늙지 않게. */
 function artifactLaunchTailBoundary(document: string): string {
-  const tailTitles = [ARTIFACT_LAUNCH_SECTION, ...TEST_SCENARIO_SECTION_TITLES.map((title) => title.replace(/^##\s+/, ''))];
+  const tailTitles = [ARTIFACT_LAUNCH_SECTION, ...TEST_SCENARIO_SECTION_TITLES.map((title) => title.replace(/^##\s+/, '')), GOAL_CONTRACT_SECTION];
   for (const title of tailTitles) {
     const section = markdownSection(document, title);
     if (section !== null && document.trimEnd().endsWith(section.trimEnd())) return '## 메타데이터\n\n';
@@ -7609,7 +7610,9 @@ export async function writeAuthoredGoal(
         ? resolvedDeps.reviewerPrecheck(document, authored.authorRunId, context)
         : runGoalAuthorReviewerPrecheck(document, { reviewContext: context, mockScenarioCatalog: resolvedDeps.mockScenarioCatalog })),
     );
-    authored.document = dialog.document;
+    // HARNESS-GOAL-INTAKE-LINT — say·TUI·self author 가 쓴 골은 다섯 칸 계약을 기본값으로 갖고 나간다.
+    //   완료선 기본 = 한 줄 요청(RootIntent 머리 칸 · 여러 줄 ask-file 이면 그 한 줄).
+    authored.document = withDefaultGoalContract(dialog.document, parseRootIntent(dialog.document) ?? ask);
     if (dialog.result) {
       authored.reviewerPrecheck = dialog.result;
     }

@@ -15,6 +15,7 @@ import {
 import { ENV_CEO_INGRESS_AUTH, ENV_CEO_INGRESS_SOCKET, wireCeoIngressEntry } from '../agent-events/ceo-ingress-entry.js';
 import { type CeoClock } from '../agent-events/ceo-ingress.js';
 import { readCeoSideAlert } from './ceo-side-alert.js';
+import { ceoMessageRef } from './ceo-channel-mail-watch.js';
 
 const CHANNEL_MESSAGE = '대표 글 — 지금 착지 몇 개?';
 const oneTelegramUpdate = (): Array<Record<string, unknown>> => [{
@@ -202,6 +203,51 @@ describe('CEO channel ingress wiring (JUD hold #121400 mustFix · OP #121505)', 
         expect(await waitFor(() => w.ingress.status('telegram', '555', '9') === 'seen')).toBe(true);
         expect(w.ingress.status('telegram', '555', '9')).toBe('seen'); // 👀 exactly once
       } finally { await listener!.close(); }
+    } finally { w.stop(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('OP #127483 — scanMail 지속 cursor: 재조회는 열린 창 기준(0 아님) · CEO 답 늦게 와도 누락 0', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ceo-w-'));
+    const rows = [
+      { id: 501, refsJson: JSON.stringify([ceoMessageRef('m1'), 'telegram-chat:100']), createdAt: '2026-11-22T05:00:00.000Z' },
+      { id: 502, refsJson: JSON.stringify([ceoMessageRef('m2'), 'telegram-chat:100']), createdAt: '2026-11-22T05:01:00.000Z' },
+      { id: 503, refsJson: null, createdAt: '2026-11-22T05:02:00.000Z' },
+      { id: 504, refsJson: JSON.stringify([ceoMessageRef('m4')]), createdAt: '2026-11-22T05:03:00.000Z' },
+    ];
+    const replies = new Map<number, { id: number; sender: string; body: string; refsJson: string | null }>();
+    const ceoRowsCalls: number[] = [];
+    const untrusted: Array<{ mailId: unknown; replyId: unknown }> = [];
+    const mail = {
+      ceoRows: (after: number) => { ceoRowsCalls.push(after); return rows.filter((row) => row.id > after); },
+      firstReplyAfter: (messageId: number, _seat: string, afterId: number) => {
+        const reply = replies.get(messageId);
+        return reply && reply.id > afterId ? reply : null;
+      },
+    };
+    const wiring = startCeoChannelWiring({
+      env: { [ENV_CEO_TELEGRAM_TOKEN]: 'test-token-1', [ENV_CEO_ALLOW_CHAT]: '555', [ENV_CEO_ALLOW_SENDER]: '777' },
+      stateDir: dir, sideStateRoot: dir, ws: 'test-ws', post: () => {}, mailDb: () => mail,
+      fetchImpl: fakeTelegramFetch([]), sleep: async () => {},
+      log: (event: string, data: Record<string, unknown>) => {
+        if (event === 'untrusted-reply-ignored') untrusted.push({ mailId: data.mailId, replyId: data.replyId });
+      },
+    });
+    expect(wiring).toBeDefined();
+    const w: CeoChannelWiring = wiring!;
+    try {
+      await w.scanMail(); // scan 1 — 첫 스캔은 0부터: 501/502 상관 가능, 아직 답 없음
+      expect(ceoRowsCalls).toEqual([0]);
+      await w.scanMail(); // scan 2 — 0 금지: 열린 창 기준(가장 오래된 열린 행 501 → 500)
+      expect(ceoRowsCalls[1]).toBe(500);
+      // CEO 답 회귀 — cursor가 행들을 지나친 뒤에 답이 도착한다
+      replies.set(502, { id: 601, sender: 'OP', body: '여기 있습니다', refsJson: null });
+      replies.set(501, { id: 600, sender: 'OP', body: '보냈습니다', refsJson: null });
+      await w.scanMail(); // scan 3 — 두 행 모두 창 안 → 답 심사됨(누락 0); 미서명이라 무시 로그
+      expect(ceoRowsCalls[2]).toBe(500);
+      expect(untrusted).toEqual([{ mailId: 501, replyId: 600 }, { mailId: 502, replyId: 601 }]);
+      await w.scanMail(); // scan 4 — replyCursor 유지: 600/601 재심사 없음; 미신뢰 행은 이후 정당 답을 위해 계속 열림
+      expect(ceoRowsCalls[3]).toBe(500);
+      expect(untrusted.length).toBe(2);
     } finally { w.stop(); rmSync(dir, { recursive: true, force: true }); }
   });
 });

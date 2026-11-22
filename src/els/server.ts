@@ -11,21 +11,27 @@
 import { appendFileSync, chmodSync, mkdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { hostname } from 'node:os';
-import { randomBytes } from 'node:crypto';
-import { dirname, join } from 'node:path';
+import { createHmac, randomBytes } from 'node:crypto';
+import { dirname, basename, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { stateDirSourceForChild } from '../agent/identity-env.js';
 import { openMsgStore } from '../msg/msg-store.js';
+import { ledgerEventsPath } from '../msg/ledger-events.js';
+import { createMailEventHub } from './mail-event-hub.js';
+import { createMailBadgeState } from './mail-badge-state.js';
+import type { MailBadgeCompute } from './mail-badge-cache.js';
 import { startCeoChannelWiring, type CeoChannelWiring } from './ceo-ingress-wiring.js';
 import type { CeoClock } from '../agent-events/ceo-ingress.js';
 import { createChildTabs, type ChildSource, type ChildTabs } from './child-tabs.js';
 import { readCeoSideAlert } from './ceo-side-alert.js';
+import { ActorBindings } from './actor-binding.js';
 import { createElsCore, type ElsCore, type ElsPty, type ElsResult } from './core.js';
 import { elsJournalPath, loadJournal, saveJournal } from './journal.js';
 import { warmLoginEnv } from './login-env-handoff.js';
-import { holderPty, consumeScreenSnapshot, reattachHolder, restoreScreenFromSnapshot } from './holder.js';
+import { holderPty, consumeScreenSnapshot, reattachHolder, restoreScreenFromSnapshot, sweepOrphanHolderResidue } from './holder.js';
 import { doPolicy, startElsHttp, type ElsHttpBind } from './http.js';
 import { startStallAlert, type StallAlert, type StallAlertDeps } from './stall-alert.js';
+import { startMailWakeWatcher, type MailWakeDeps, type MailWakeWatcher } from './mail-wake-watcher.js';
 import { startElsHttpV1 } from './http-v1.js';
 import { appendSendAudit, type ControlExecute } from './control.js';
 import { createLineDecoder } from './wire.js';
@@ -35,7 +41,7 @@ import { authorize, createControl, inputExplicitlyDenied, pinAllowList } from '.
 import { journalControl } from './control-cli.js';
 import { peerUid } from './peer-uid.js';
 import { runtimeProcessIdentity, SeatRuntimeRegistry, type RuntimeProcess, type RuntimeClaim } from './seat-runtime.js';
-import { peerPid, processIdentity, baselineBeforePidLookup, resolvePeerSeatWithAnchor, resolveElsPeerSeat, resolveAncestorPane, inspectReadAncestry, verifyPanePeer, type ProcessIdentity } from './peer-seat.js';
+import { peerPid, processIdentity, processStartStamp, baselineBeforePidLookup, resolvePeerSeatWithAnchor, resolveElsPeerSeat, resolveAncestorPane, inspectReadAncestry, verifyPanePeer, type ProcessIdentity } from './peer-seat.js';
 type PeerSeat = { pane: string; seat: string; anchor?: ProcessIdentity; runtimeLive?: () => boolean };
 type SeatLookup = (pid: number | undefined, baseline?: ProcessIdentity) => Promise<PeerSeat | undefined> | PeerSeat | undefined;
 const sameSeatGeneration = (a: PeerSeat, b: PeerSeat): boolean => {
@@ -74,6 +80,9 @@ export function elsSocketPathProblem(socketPath: string): string | undefined {
 export type ElsRequest =
   | { readonly op: 'ping' }
   | { readonly op: 'auth'; readonly token?: string; readonly runtimeToken?: string; readonly pid?: number }
+  /** OP #128880: a holder verifies a credential-request nonce against this server process (kernel peer pid +
+   *  holder generation start + the memory-only generation nonce) before its pane token ever leaves the holder. */
+  | { readonly op: 'adopt-verify'; readonly pane: string; readonly holderPid: number; readonly holderStart?: string; readonly nonce: string; readonly challenge?: string }
   | { readonly op: 'build'; readonly pane: string; readonly sha: string; readonly version?: string; readonly stamp?: string }
   | { readonly op: 'ls' }
   | { readonly op: 'subscribe' }
@@ -83,13 +92,14 @@ export type ElsRequest =
   | { readonly op: 'send'; readonly pane: string; readonly text: string }
   | { readonly op: 'status'; readonly pane: string }
   | { readonly op: 'send-verified'; readonly pane: string; readonly text: string; readonly requireEmpty?: boolean }
-  | { readonly op: 'attach'; readonly pane: string; readonly cols?: number; readonly rows?: number }
+  | { readonly op: 'attach'; readonly pane: string; readonly cols?: number; readonly rows?: number; readonly diff?: boolean }
   // #38608 REVIEW must ② — `input` is the raw person path (attach keystrokes, `els pane run`/`send-keys`):
   // control bytes stay raw by design. A top-level input names its pane; an attach stream supplies the attached pane.
   | { readonly op: 'input'; readonly bytes: string; readonly pane?: string }
   | { readonly op: 'resize'; readonly cols: number; readonly rows: number }
   /** Attach connection only: move this view `lines` up (positive) or down into the pane's scrollback; any typed input returns to the bottom. */
   | { readonly op: 'scroll'; readonly lines: number }
+  | { readonly op: 'coordinator'; readonly ws: string }
   | { readonly op: 'reorder'; readonly kind: string; readonly id: string; readonly before?: string }
   | { readonly op: 'rename'; readonly kind: string; readonly id: string; readonly name: string }
   /** `confirmed`: the person said yes (the view's y / button) — the control door refuses close without it (#39143). */
@@ -102,6 +112,7 @@ export type ElsRequest =
   | { readonly op: 'input-line'; readonly pane: string; readonly text: string; readonly from: string; readonly at?: { readonly ws: string; readonly tab: string } }
   | { readonly op: 'interrupt'; readonly pane: string }
   | { readonly op: 'seat-set'; readonly seat: string; readonly runtime?: RuntimeClaim }
+  | { readonly op: 'seat-bind'; readonly seat: string; readonly pane: string }
   | { readonly op: 'child'; readonly action: 'start' | 'progress' | 'status' | 'end' | 'pin' | 'unpin' | 'dismiss' | 'tree' | 'summary';
       readonly id?: string; readonly ws?: string; readonly cwd?: string; readonly source?: ChildSource; readonly label?: string;
       readonly parent?: string; readonly line?: string; readonly state?: 'working' | 'blocked' | 'idle'; readonly ok?: boolean; readonly summary?: string };
@@ -209,8 +220,15 @@ function writeArtifact(stateRoot: string, kind: string, paneId: string, ext: str
   return path;
 }
 
-async function dispatch(core: ElsCore, request: ElsRequest, parent: SpawnParent | undefined, stateRoot: string, uid: number | undefined, pid: number | undefined, seatLookup: SeatLookup, baseline: ProcessIdentity | undefined, firstSeat: (() => Promise<PeerSeat | undefined>) | undefined, sendAuditDir: string, toolDoor: boolean, toolDo = false, paneSeat?: string, callerPane?: string, auditDenial?: (request: ElsRequest, reason: string) => void, claimedPid?: number): Promise<ElsResult> {
-  if ((paneSeat !== undefined && !['ping', 'ls', 'new'].includes(request.op)) ||
+async function dispatch(core: ElsCore, request: ElsRequest, parent: SpawnParent | undefined, stateRoot: string, uid: number | undefined, pid: number | undefined, seatLookup: SeatLookup, baseline: ProcessIdentity | undefined, firstSeat: (() => Promise<PeerSeat | undefined>) | undefined, sendAuditDir: string, toolDoor: boolean, toolDo = false, paneSeat?: string, callerPane?: string, auditDenial?: (request: ElsRequest, reason: string) => void, claimedPid?: number, actorCurrent?: () => boolean): Promise<ElsResult> {
+  // JUD #39484 ② — a tool-door actor is re-verified on EVERY message, never once per connection.
+  if (toolDoor && actorCurrent && !actorCurrent()) {
+    return { exitCode: 1, message: 'els: denied — actor binding is stale' };
+  }
+  // Coordinator is a global OP action, not a workspace-owned operation; tool callers
+  // still go through the tool door below and are denied.
+  const opCoordinator = paneSeat === 'OP' && request.op === 'coordinator';
+  if ((paneSeat !== undefined && !opCoordinator && !['ping', 'ls', 'new'].includes(request.op)) ||
       (toolDoor && !['ping', 'ls', 'new', 'do', 'input-line', 'interrupt'].includes(request.op))) {
     const seat = paneSeat !== undefined ? { seat: paneSeat } : await firstSeat?.();
     const journal = loadJournal(elsJournalPath(stateRoot));
@@ -269,13 +287,15 @@ async function dispatch(core: ElsCore, request: ElsRequest, parent: SpawnParent 
     } else if (request.op === 'close-workspace') allowed = ownWorkspace(request.ws);
     else if (request.op === 'close-tab') allowed = ownTab(request.tab);
     if (!allowed) {
-      if (request.op === 'do') auditDenial?.(request, 'target is not owned by caller seat');
+      if (request.op === 'do' || request.op === 'coordinator') auditDenial?.(request, 'target is not owned by caller seat');
       return { exitCode: 1, message: `els: ${request.op} denied — target is not owned by caller seat${request.op === 'record' && typeof request.pane === 'string' ? ` (${JSON.stringify(request.pane)})` : ''}` };
     }
   }
   switch (request.op) {
     case 'build': return typeof request.pane === 'string' && typeof request.sha === 'string' ? core.reportBuild(request.pane, request.sha, request.version, request.stamp) : { exitCode: 2, message: 'els build: pane and sha required' };
     case 'ping': return { exitCode: 0, message: `els server pid ${process.pid}` };
+    case 'coordinator': return typeof request.ws === 'string' && request.ws.trim()
+      ? core.setCoordinator(request.ws, pid) : { exitCode: 2, message: 'els ws coordinator: workspace required' };
     case 'rename': return typeof request.kind === 'string' && typeof request.id === 'string' && typeof request.name === 'string'
       ? core.rename({ kind: request.kind, id: request.id, name: request.name })
       : { exitCode: 2, message: 'els rename: kind, id and name are required' };
@@ -529,7 +549,60 @@ function serveAttach(core: ElsCore, socket: Socket, request: Extract<ElsRequest,
   let back = 0;                  // how far this view is scrolled above the live bottom
   let busy = false;
   let closed = false;
+  // ELS-ATTACH-FRAME-DIFF (OP #127484 ③ — herdr protocol/render_ansi.rs pattern): an opted-in client gets only the
+  // rows that changed since the frame it last received. `lastRows` is that frame's body; a full frame (the first
+  // one, and any size/scroll-back change, where rows are not comparable) resets it and is what `lastKey` still keys on.
+  const wantsDiff = request.diff === true;
+  let lastRows: readonly string[] | undefined;
   const send = (value: object): void => { if (!closed && !socket.destroyed) socket.write(`${JSON.stringify(value)}\n`); };
+  // ELS-INPUT-FAST-PATH (b): a per-key audit write is not part of typing. Accepted keys buffer here
+  // and flush together — one disk write per burst (the first key starts a 500 ms unref'd timer; the
+  // attach ending flushes the rest). A REFUSED input is a security event (ELS-SECURITY-AUDIT-IMMEDIATE,
+  // OP #130745): it bypasses this buffer and lands in the ledger the moment the refusal happens —
+  // never delayed, never dropped by a close race.
+  const inputAudit: { op: 'input'; pane: string; text: string; exitCode: 0 | 1 | 2 }[] = [];
+  let inputAuditTimer: ReturnType<typeof setTimeout> | undefined;
+  const flushInputAudit = (): void => {
+    if (inputAuditTimer !== undefined) { clearTimeout(inputAuditTimer); inputAuditTimer = undefined; }
+    for (const record of inputAudit.splice(0)) appendSendAudit(auditDir, record);
+  };
+  const auditInputOutcome = (text: string, exitCode: 0 | 1 | 2): void => {
+    if (exitCode === 0) {
+      inputAudit.push({ op: 'input', pane: paneId, text, exitCode: 0 });
+      if (inputAuditTimer === undefined) {
+        inputAuditTimer = setTimeout(flushInputAudit, 500);
+        inputAuditTimer.unref?.();
+      }
+    } else {
+      appendSendAudit(auditDir, { op: 'input', pane: paneId, text, exitCode });
+    }
+  };
+  // ELS-INPUT-FAST-PATH (OP #129755 / JUD-B #129747): a guarded delivery is async — its inspection
+  // renders the screen — so a key typed behind it would overtake it on the PTY and in the audit
+  // ledger. This attach chains its input lines in typed order while a guarded delivery is in
+  // flight; with the chain empty a fast key stays fully synchronous (the latency budget lane).
+  let inputFlight: Promise<void> | undefined;
+  const settleInputFlight = (flight: Promise<void>): void => {
+    const clear = (): void => { if (inputFlight === flight) inputFlight = undefined; };
+    void flight.then(clear, clear);
+  };
+  const deliverGuarded = (text: string, raw: string): Promise<void> =>
+    core.machineInput(paneId, raw).then(
+      (done) => {
+        auditInputOutcome(text, done.exitCode === 0 ? 0 : done.exitCode === 2 ? 2 : 1);
+        if (done.exitCode !== 0) send({ type: 'error', message: done.message });
+      },
+      () => send({ type: 'error', message: 'els attach: input inspection failed; not sent' }),
+    );
+  const runInputLine = (text: string, raw: string): Promise<void> => {
+    const fast = core.machineFastInput(paneId, raw);
+      if (!('redirectToGuard' in fast)) {
+        if (fast.exitCode !== 0) { send({ type: 'error', message: fast.message }); auditInputOutcome(text, fast.exitCode === 2 ? 2 : 1); }
+        else auditInputOutcome(text, 0);
+        return Promise.resolve();
+      }
+    return deliverGuarded(text, raw);
+  };
   const tick = async (): Promise<void> => {
     if (busy || closed || socket.writableLength > ATTACH_MAX_QUEUED_BYTES) return;
     busy = true;
@@ -546,7 +619,19 @@ function serveAttach(core: ElsCore, socket: Socket, request: Extract<ElsRequest,
       const key = `${size.cols}x${size.rows}\n${screen.message}`;
       if (key !== lastKey) {
         lastKey = key;
-        send({ type: 'frame', pane: paneId, seq: ++seq, cols: size.cols, rows: size.rows, back: shown, screen: screen.message });
+        const body = screen.message.replace(/^\[screen \d+x\d+ scrolled-back=\d+\]\n/, '').split('\n');
+        let sentDiff = false;
+        if (wantsDiff && lastRows !== undefined && lastRows.length === body.length && shown === 0) {
+          const changed: { i: number; t: string }[] = [];
+          for (let i = 0; i < body.length; i++) if (body[i] !== lastRows[i]) changed.push({ i: i + 1, t: body[i]! });
+          // A rewrite of most of the screen pays more in JSON per row than one full frame — send the full frame instead.
+          if (changed.length > 0 && changed.length <= Math.ceil(body.length * 0.6)) {
+            send({ type: 'frame-diff', pane: paneId, seq: ++seq, cols: size.cols, rows: size.rows, back: shown, count: body.length, lines: changed });
+            sentDiff = true;
+          }
+        }
+        if (!sentDiff) send({ type: 'frame', pane: paneId, seq: ++seq, cols: size.cols, rows: size.rows, back: shown, screen: screen.message });
+        lastRows = body;
       }
       if (attachState.stopping) { send({ type: 'end', exitCode: 1, message: 'the server is stopping' }); socket.end(); return; }
       if (!core.paneIsLive(paneId)) { send({ type: 'end', exitCode: 0, message: 'pane exited' }); socket.end(); }
@@ -564,7 +649,14 @@ function serveAttach(core: ElsCore, socket: Socket, request: Extract<ElsRequest,
   };
   const timer = sub ? setInterval(liveness, ATTACH_LIVENESS_MS) : setInterval(poke, ATTACH_POLL_MS);
   timer.unref?.();
-  const stop = (): void => { closed = true; clearInterval(timer); sub?.dispose(); attachState.sockets.delete(socket); };
+  const stop = (): void => {
+    closed = true;
+    clearInterval(timer);
+    sub?.dispose();
+    attachState.sockets.delete(socket);
+    // The close flush waits for an in-flight guarded delivery: every input line leaves exactly one row.
+    void (inputFlight ?? Promise.resolve()).then(flushInputAudit);
+  };
   socket.on('close', stop);
   socket.on('error', stop);
   poke();
@@ -581,16 +673,36 @@ function serveAttach(core: ElsCore, socket: Socket, request: Extract<ElsRequest,
       if (Number.isInteger(message.lines)) { back = Math.max(0, back + message.lines); poke(); }
     } else if (message.op === 'input') {
       if (back > 0) { back = 0; poke(); }                   // typing returns to the live bottom
-      // A pane-token attach is a seat tool, not proof of a human. During HITL it takes the
-      // same guarded machine lane; only the server-minted owner credential may type a decision key.
+      // ELS-INPUT-FAST-PATH (OP #128948 1순위): a typed key is latency itself — the door already authenticated this
+      // attach line, so an ordinary key goes straight to the PTY: no screen render, no pane lock (never queues behind
+      // a `do`), no synchronous audit write. Approval letters and control bytes keep the guarded machine lane, and
+      // only the server-minted owner credential may type a decision key (humanApprovalKeys above).
       if (humanApprovalKeys) {
         const done = core.input(paneId, message.bytes);
+        // ELS-SECURITY-AUDIT-IMMEDIATE (JUD-B #132138 / OP #132151): a decision key typed on the
+        // owner credential is a security event — its row lands in the ledger the moment it is
+        // typed. The 500 ms burst buffer belongs to ordinary typing, not to approvals/risk keys.
+        appendSendAudit(auditDir, { op: 'input', pane: paneId, text: typeof message.bytes === 'string' ? message.bytes : '', exitCode: done.exitCode === 0 ? 0 : done.exitCode === 2 ? 2 : 1 });
         if (done.exitCode !== 0) send({ type: 'error', message: done.message });
       } else {
-        void core.machineInput(paneId, message.bytes).then(done => {
-          appendSendAudit(auditDir, { op: 'input', pane: paneId, text: typeof message.bytes === 'string' ? message.bytes : '', exitCode: done.exitCode });
-          if (done.exitCode !== 0) send({ type: 'error', message: done.message });
-        }).catch(() => send({ type: 'error', message: 'els attach: input inspection failed; not sent' }));
+        const text = typeof message.bytes === 'string' ? message.bytes : '';
+        if (inputFlight === undefined) {
+          // The chain is empty: a fast key takes no async hop (the latency budget); a guarded key starts now.
+          const fast = core.machineFastInput(paneId, message.bytes);
+          if (!('redirectToGuard' in fast)) {
+            if (fast.exitCode !== 0) { send({ type: 'error', message: fast.message }); auditInputOutcome(text, fast.exitCode === 2 ? 2 : 1); }
+            else auditInputOutcome(text, 0);
+          } else {
+            const flight = deliverGuarded(text, message.bytes);
+            inputFlight = flight;
+            settleInputFlight(flight);
+          }
+        } else {
+          // A guarded delivery is in flight: this key waits behind it, in typed order.
+          const flight = inputFlight.then(() => runInputLine(text, message.bytes));
+          inputFlight = flight;
+          settleInputFlight(flight);
+        }
       }
     } else if (message.op === 'resize') {
       const done = core.resize(paneId, message.cols, message.rows);
@@ -635,7 +747,33 @@ export function registerSeatRuntime(request: { op: 'seat-set'; seat: string; run
   return guard.seatSet(request);
 }
 
-export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Socket, stateRoot: string, externalLookup: SeatLookup, guardRef: { current: RequestGuard | undefined }, sendAuditDir: string = dirname(elsSocketPath(stateRoot)), attachState: AttachState = { sockets: new Set<Socket>(), stopping: false }, toolDoor = false, runtimeRegistry?: SeatRuntimeRegistry, injectedSeatLookup = false): void {
+/** JUD #39484 — owner-issued actor binding. The client names only a pane; PID and generation come from this server's live holder ledger. */
+export function handleSeatBind(request: { op: 'seat-bind'; seat: string; pane: string }, role: ServerRole,
+  core: Pick<ElsCore, 'seatBindings' | 'paneProcessBinding'>,
+  bindings: { issue(seat: string, paneId: string, primaryPid: number, generation: string,
+    approvedChild?: number | { pid: number; start: string }): boolean },
+  requesterPid?: number): ElsResult {
+  if (request.seat !== 'OP') return { exitCode: 2, message: 'els seat bind: only OP is supported' };
+  if (!isServerOwnerRole(role)) return { exitCode: 1, message: 'els seat bind: server owner credential required' };
+  const seats = core.seatBindings().filter(row => row.pane === request.pane);
+  if (seats.some(row => row.seat !== 'OP') || seats.length > 1)
+    return { exitCode: 1, message: 'els seat bind: pane belongs to another seat' };
+  const current = core.paneProcessBinding(request.pane);
+  if (!current) return { exitCode: 1, message: 'els seat bind: live holder required' };
+  const seat = seats[0];
+  if (seat && (current.pid !== seat.pid || current.start !== seat.start || current.generation !== seat.generation))
+    return { exitCode: 1, message: 'els seat bind: pane generation changed' };
+  // JUD #128532: bind the requesting peer — the pane holder itself, or exactly the direct child
+  // it approves — at issuance. A same-shell sibling never becomes the authority subject.
+  try {
+    if (!bindings.issue('OP', request.pane, current.pid, current.generation,
+      requesterPid !== undefined && requesterPid !== current.pid ? requesterPid : undefined))
+      return { exitCode: 1, message: 'els seat bind: actor binding refused' };
+  } catch { return { exitCode: 1, message: 'els seat bind: actor binding refused' }; }
+  return { exitCode: 0, message: `els seat: OP actor bound to ${request.pane}` };
+}
+
+export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Socket, stateRoot: string, externalLookup: SeatLookup, guardRef: { current: RequestGuard | undefined }, sendAuditDir: string = dirname(elsSocketPath(stateRoot)), attachState: AttachState = { sockets: new Set<Socket>(), stopping: false }, toolDoor = false, runtimeRegistry?: SeatRuntimeRegistry, injectedSeatLookup = false, actorBindings?: ActorBindings, adoptNonce?: () => string | undefined, adoptSecret?: (pane: string) => string | undefined, serverIdentity?: { readonly pid: number; readonly start: string }): void {
   // Capture before any credential syscall; sampling afterward permits a newly reused PID.
   const beforePidLookup = Date.now();
   const uid = peerUid(socket);
@@ -648,6 +786,13 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
   let runtimeToken: string | undefined;
   const seatLookup: SeatLookup = async (lookupPid, lookupBaseline) => {
     const external = await externalLookup(lookupPid, lookupBaseline);
+    // JUD #39484 — an owner-issued actor binding wins only when it matches the external
+    // lookup; disagreement is ambiguity, never a choice by precedence.
+    const issued = verifiedActor(lookupPid, lookupBaseline);
+    if (issued) {
+      if (external && external.seat !== 'unknown' && (external.pane !== issued.role.pane || external.seat !== issued.role.seat)) return undefined;
+      return { pane: issued.role.pane, seat: issued.role.seat, anchor: lookupBaseline, runtimeLive: issued.current };
+    }
     const key = lookupPid === pid && runtimeRegistry?.matches(pid, uid, runtimeBaseline, runtimeToken) ? runtimeRegistry.key() : undefined;
     const descendant = runtimeRegistry?.isDescendant(pid, uid, runtimeBaseline) === true;
     if (!key) return (toolDoor || descendant) && !injectedSeatLookup && external?.seat === 'OP' ? undefined : external;
@@ -680,6 +825,16 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
       return minted && live && minted.pid === live.pid && minted.start === live.start && minted.generation === live.generation ? minted : undefined;
     }, () => core.shellPids());
   };
+  /** JUD #39484 — capture the exact issuance once, then re-verify that same capture per message. */
+  function verifiedActor(lookupPid: number | undefined, lookupBaseline: ProcessIdentity | undefined):
+    { role: Extract<ServerRole, { kind: 'peer' }>; current: () => boolean } | undefined {
+    if (!actorBindings || uid === undefined || lookupPid === undefined || lookupPid !== pid || !lookupBaseline
+      || (role.kind !== 'op' && role.kind !== 'hand') || !paneRoleValid()) return undefined;
+    const captured = actorBindings.capture(lookupPid, lookupBaseline);
+    if (!captured || captured.pane !== role.pane || captured.seat !== 'OP' || !actorBindings.isCurrent(captured)) return undefined;
+    return { role: { kind: 'peer', pid: lookupPid, pane: captured.pane, seat: captured.seat, uid },
+      current: () => actorBindings.isCurrent(captured) };
+  }
   let doorSeat: Promise<PeerSeat | undefined> | undefined;
   const firstSeat = () => (doorSeat ??= (async () => { try { return await seatLookup(pid, baseline); } catch { return undefined; } })());
   /** Once the first line was `attach`: where later lines go. Until the owner is ready they are kept, then replayed in order. */
@@ -699,15 +854,24 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
     earlyLines.push(line);
   };
   /** Post-door handling: seat-set, then spawn-parent capture, attach, or dispatch (JUD #39096 ⓑ restructure). */
-  const serveTail = (request: ElsRequest, guard: RequestGuard | undefined): void => {
+  const serveTail = (request: ElsRequest, guard: RequestGuard | undefined,
+    authorizedActor?: ReturnType<typeof verifiedActor>): void => {
     if (closed || ending || socket.destroyed) return;
     if (!paneRoleValid()) {
       answer({ exitCode: 1, message: 'els: pane credential denied — socket peer is not a live descendant of that pane' });
       return;
     }
+    // JUD #39484 ②③ — the captured actor is re-checked at execution, not only at the door.
+    const issued = authorizedActor ?? verifiedActor(pid, baseline);
+    if (issued && !issued.current()) {
+      answer({ exitCode: 1, message: 'els: denied — actor binding is stale' });
+      return;
+    }
+    const effectiveRole = issued?.role ?? role;
     // Registered runtime descendants follow tool policy even through the human socket.
     // Classify by OS ancestry, not the optional token, which only grants authority.
-    const effectiveToolDoor = toolDoor || (request.op !== 'seat-set' && runtimeRegistry?.isDescendant(pid, uid, runtimeBaseline) === true);
+    const effectiveToolDoor = toolDoor || issued !== undefined
+      || (request.op !== 'seat-set' && runtimeRegistry?.isDescendant(pid, uid, runtimeBaseline) === true);
     if (effectiveToolDoor && (request.op === 'input' || request.op === 'attach' || request.op === 'send' || request.op === 'send-verified')) {
       answer({ exitCode: 2, message: 'els: raw input, send and attach are unavailable on the tool socket' });
       return;
@@ -768,7 +932,7 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
       return;
     }
     void ready
-      .then((core) => core ? dispatch(core, request, spawnParent, stateRoot, uid, pid, seatLookup, baseline, firstSeat, sendAuditDir, effectiveToolDoor, false, paneSeat, role.kind === 'hand' || (role.kind === 'op' && !isServerOwnerRole(role)) ? role.pane : undefined, (denied, reason) => guard?.audit(denied, role, reason, pid, claimedPid), claimedPid) : { exitCode: 1, message: 'els: the server is stopping' } as ElsResult)
+      .then((core) => core ? dispatch(core, request, spawnParent, stateRoot, uid, pid, seatLookup, baseline, firstSeat, sendAuditDir, effectiveToolDoor, false, paneSeat, role.kind === 'hand' || (role.kind === 'op' && !isServerOwnerRole(role)) ? role.pane : undefined, (denied, reason) => guard?.audit(denied, effectiveRole, reason, pid, claimedPid), claimedPid, issued?.current) : { exitCode: 1, message: 'els: the server is stopping' } as ElsResult)
       .catch((error: unknown): ElsResult => ({ exitCode: 1, message: `els: ${error instanceof Error ? error.message : String(error)}` }))
       .then(answer);
   };
@@ -794,6 +958,33 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
     // Valid JSON that is not an object (null, 7, "x", [..]) has no `.op`: refuse this connection, never throw in the owner.
     if (!isRequestObject(request)) { handled = true; answer({ exitCode: 2, message: 'els: malformed request' }); return; }
     const guard = guardRef.current;
+    // OP #128880: holder-side nonce confirmation — pre-door by design (a holder holds no els role),
+    // fail-closed without the live server's memory-only nonce. The peer pid is kernel-provided and the
+    // holder start string binds the asker to the live holder generation (pid reuse fails closed).
+    if (request.op === 'adopt-verify') {
+      handled = true;
+      const identity = processIdentity(pid);
+      const pidOk = typeof request.holderPid === 'number' && request.holderPid === pid;
+      const startOk = request.holderStart === undefined || (identity !== undefined && identity.pid === pid && identity.start === request.holderStart);
+      const nonce = typeof request.nonce === 'string' ? request.nonce : '';
+      // 보안 HOLD 수리(OP #129232): exitCode 단독 신뢰 폐지 — 매 요청 새 challenge 에 대한 per-pane 입양
+      // 비밀의 HMAC-SHA256 증명과 이 서버의 pid+시작시각을 함께 실어 담는다. 비밀을 모르는 가짜
+      // els.sock 리스너(unlink+bind, 같은 UID)는 증명을 낼 수 없다 — 홀더가 답변자를 검증한다.
+      const pane = typeof request.pane === 'string' ? request.pane : '';
+      const challenge = typeof request.challenge === 'string' ? request.challenge : '';
+      const secret = adoptSecret !== undefined && pane !== '' ? adoptSecret(pane) : undefined;
+      const proof = secret !== undefined && challenge !== '' && nonce !== ''
+        ? createHmac('sha256', secret).update(challenge + nonce + pane).digest('hex') : undefined;
+      const ok = pidOk && startOk && pane !== '' && nonce !== '' && (adoptNonce?.() ?? '') === nonce && proof !== undefined;
+      if (!ok) guard?.audit({ op: 'adopt-verify', pane, holderPid: typeof request.holderPid === 'number' ? request.holderPid : -1, nonce }, role, 'adopt-verify denied', pid, claimedPid);
+      // proof 는 승인(ok)일 때만 실린다 — 거부 답에 증명을 실으면, 비밀을 아는 진짜 서버가 위조 nonce 를
+      // 거부(exitCode 1)한 답에서조차 홀더가 증명을 맞춰버린다(이 파일 RED 196: 'f'×48 위조에 실 토큰).
+      // 홀더는 exitCode:0 + proof 일치 + 커널 peer + 자기신고 정체를 모두 요구한다(holder.ts).
+      answer({ exitCode: ok ? 0 : 1, message: ok ? 'adopt-verify: ok' : 'adopt-verify: denied',
+        ...(ok && proof !== undefined ? { proof } : {}),
+        ...(serverIdentity !== undefined ? { serverPid: serverIdentity.pid, serverStart: serverIdentity.start } : {}) });
+      return;
+    }
     // First line of a CLI connection: present the pane token inherited from the pane's env.
     if (request.op === 'auth') {
       if (authSeen) { handled = true; answer({ exitCode: 1, message: 'els: repeated auth denied' }); return; }
@@ -807,7 +998,10 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
         handled = true;
         // Audit only a fixed auth event, never the untrusted credential or other auth fields.
         guard?.audit({ op: 'auth' }, role, 'invalid credential', pid, claimedPid);
-        answer({ exitCode: 1, message: 'els: invalid credential' });
+        // The answer travels on a connection whose client is awaiting the auth ack: it must keep
+        // the `auth: ` ack shape (client.ts rejects any other first answer as malformed — the
+        // 2026-11-22 «malformed answer from the els server» wake failures).
+        answer({ exitCode: 1, message: 'auth: invalid credential' });
         return;
       }
       authPending = true;
@@ -854,6 +1048,24 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
       }).catch(() => answer({ exitCode: 1, message: 'els: 신원 확인 불가 — 사람 화면은 els 사이드에서·자리는 자격 경로로' }));
       return;
     }
+    // JUD #39484 — this op issues authority: never peer promotion, never the mutating door.
+    if (request.op === 'seat-bind') {
+      handled = true;
+      void Promise.all([roleReady, ready]).then(([, core]) => {
+        if (closed || ending || socket.destroyed) return;
+        if (!guard || !core || !actorBindings || toolDoor || runtimeRegistry?.isDescendant(pid, uid, runtimeBaseline) === true || !isServerOwnerRole(role)) {
+          guard?.audit(request, role, 'seat-bind requires server owner', pid, claimedPid);
+          answer({ exitCode: 1, message: 'els seat bind: server owner credential required' });
+          return;
+        }
+        if (typeof request.pane !== 'string' || !request.pane.trim() || typeof request.seat !== 'string') {
+          answer({ exitCode: 2, message: 'els seat bind: seat and pane required' });
+          return;
+        }
+        answer(handleSeatBind(request, role, core, actorBindings, pid));
+      }).catch(() => answer({ exitCode: 1, message: 'els seat bind: unable to verify owner' }));
+      return;
+    }
     // Central server-side door: every mutating op of every client is judged here.
     if (isMutating(request)) {
       // JUD must ⓒ2-② (OP #104711): fail-closed — a mutating request that arrives before the guard
@@ -898,13 +1110,20 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
           answer({ exitCode: 1, message: 'els: input-line denied — present the owner token' });
           return;
         }
-        const verdict = guard.authorize(role, request);
+        const issued = verifiedActor(pid, baseline);
+        const authorizationRole = issued?.role ?? role;
+        if (issued && !issued.current()) {
+          guard.audit(request, authorizationRole, 'els: denied — actor binding is stale', pid, claimedPid);
+          answer({ exitCode: 1, message: 'els: denied — actor binding is stale' });
+          return;
+        }
+        const verdict = guard.authorize(authorizationRole, request);
         if (!verdict.allow) {
-          guard.audit(request, role, verdict.reason ?? 'denied', pid, claimedPid);
+          guard.audit(request, authorizationRole, verdict.reason ?? 'denied', pid, claimedPid);
           answer({ exitCode: 1, message: verdict.reason ?? 'els: denied' });
           return;
         }
-        serveTail(verdict.verifiedRequest ?? request, guard);
+        serveTail(verdict.verifiedRequest ?? request, guard, issued);
       });
       return;
     }
@@ -983,14 +1202,34 @@ export interface ElsServerOptions {
   readonly ps?: () => Promise<string>;
   /** Watch busy panes for stalls (mail + receipt). Overrides of the poller's own defaults for tests; `false` disables. */
   readonly stall?: StallAlertDeps | false;
+  /** ELS-CODEX-SEAT-MAIL-WAKE: knock a non-eln seat pane when its mail goes unread (receipt per knock); `false` disables. */
+  readonly mailWake?: MailWakeDeps | false;
   /** Clock seam for tests (ELS-TAB-STATE-BADGE: stalled is a time rule); the server uses Date.now. */
   readonly now?: () => number;
   /** Isolated test clock cadence; production reaps once a minute. */
   readonly reapIntervalMs?: number;
+  /** ELS-SERVE-ORPHAN-EXIT: how often the bound sockets are checked to still exist (test seam; production 1s). */
+  readonly socketGuardIntervalMs?: number;
+  /** ELS-SERVER-EVENT-HUB-NO-DB-POLL — badge ledger path override for isolated tests; default is the server's own stateRoot ledger. */
+  readonly mailBadgeLedgerPath?: string;
+  /** JUD-B #132880 mustFix ① — badge compute seam: off-thread by default (base #39546 worker); tests inject a double. */
+  readonly mailBadgeCompute?: MailBadgeCompute;
 }
 
-/** Become the owner, then load the journal. Resolves to the running server, or to a refusal. */
-export async function startElsServer(options: ElsServerOptions = {}): Promise<{ server: Server; core: ElsCore; close: () => Promise<void>; httpV1?: Server } | ElsResult> {
+/** OP #128343(OP 승인 #128469): 입양 pane 의 workspace 이름 — 저널 tabId → workspaceId → name(재기동 전 서버가 적은 값). */
+function adoptedWorkspaceName(journalPath: string, tabId: string): string {
+  try {
+    const journal = loadJournal(journalPath);
+    const workspaceId = journal.tabs.find((tab) => tab.id === tabId)?.workspaceId;
+    return journal.workspaces.find((ws) => ws.id === workspaceId)?.name ?? '';
+  } catch { return ''; }
+}
+
+/** Become the owner, then load the journal. Resolves to the running server, or to a refusal.
+ *  `lost` resolves (after this owner has closed itself) when a bound socket disappears at runtime —
+ *  a Unix socket file can be removed without any event reaching this process, so without the guard
+ *  a serve that lost its socket lingered forever with every pane holder still attached. */
+export async function startElsServer(options: ElsServerOptions = {}): Promise<{ server: Server; core: ElsCore; close: () => Promise<void>; lost: Promise<string>; httpV1?: Server } | ElsResult> {
   const stateRoot = options.stateRoot ?? elanousStateRoot();
   const socketPath = elsSocketPath(stateRoot);
   const toolSocketPath = elsToolSocketPath(stateRoot);
@@ -1021,12 +1260,46 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
     return external ?? internal;
   });
   const runtimeRegistry = new SeatRuntimeRegistry();
-  const server = createServer((socket) => serveConnection(ready, socket, stateRoot, lookup, guardRef, dirname(socketPath), attachState, false, runtimeRegistry));
+  let actorBindings: ActorBindings;
+  // OP #128880: this serve generation's adoption nonce — memory only (never a file, never env): a holder
+  // returns its pane token only when this process confirms the nonce back over els.sock.
+  const generationNonce = randomBytes(24).toString('hex');
+  // 보안 HOLD 수리(OP #129232): 이 세대의 per-pane 입양 비밀 원장(메모리만 — 재기동하면 잊는다)과
+  // 이 서버 자신의 pid+시작시각(홀더가 adopt-verify 답변자를 검증할 기록값). 비밀은 오직 spawn env(신뢰
+  // 경로 — PANE_TOKEN 을 실어 나르는 그 환경)과 재결속 핸드셰이크(adopt-renew, JUD #128534 신뢰 경로)
+  // 로만 홀더에게 나간다 — 디스크·els.sock 경로로는 절대 못 나간다.
+  const adoptionSecrets = new Map<string, string>();
+  const serverStartStamp = processStartStamp(process.pid);
+  const serverIdentity = serverStartStamp !== undefined ? { pid: process.pid, start: serverStartStamp } : undefined;
+  const server = createServer((socket) => serveConnection(ready, socket, stateRoot, lookup, guardRef, dirname(socketPath), attachState, false, runtimeRegistry, false, actorBindings, () => generationNonce, (pane) => adoptionSecrets.get(pane), serverIdentity));
   // Explicit seatLookup is an in-process test dependency, never provided by a socket request.
-  const toolServer = createServer((socket) => serveConnection(ready, socket, stateRoot, lookup, guardRef, dirname(socketPath), attachState, true, runtimeRegistry, options.seatLookup !== undefined));
+  const toolServer = createServer((socket) => serveConnection(ready, socket, stateRoot, lookup, guardRef, dirname(socketPath), attachState, true, runtimeRegistry, options.seatLookup !== undefined, actorBindings, () => generationNonce, (pane) => adoptionSecrets.get(pane), serverIdentity));
+  // ELS-SERVE-EXIT-NOW (JUD-B #127564 ② · OP #127681): every open connection is remembered so a loss can
+  // cut the ones that would otherwise hold `close()` forever — an idle client must not delay the end.
+  const liveSockets = new Set<Socket>();
+  const trackSockets = (listener: Server): void => { listener.on('connection', (socket: Socket) => { liveSockets.add(socket); socket.once('close', () => liveSockets.delete(socket)); }); };
+  trackSockets(server);
+  trackSockets(toolServer);
 
-  // 2. Owner now: load the journal (requests that arrived meanwhile wait for this).
-  const core = createElsCore({ ...(options.now ? { now: options.now } : {}), load: () => loadJournal(journalPath), save: (journal) => saveJournal(journalPath, journal),
+  // ELS-SERVER-EVENT-HUB-NO-DB-POLL (OP #127680 2단계): 배지 상태의 정본은 메모리 — 재계산은 원장 옆 이벤트
+  // 파일의 완전한 새 줄이 올 때만(주기 DB 조회 0). JUD-B #132880 mustFix ①: compute 는 base #39546 Worker
+  // (오프스레드)를 기본으로 — 이벤트 구동 갱신도 서버 스레드 위에서 돌지 않는다. judb-39675 ①: 허브의 유실 마커
+  // 사건이 사이드카 유실을 후속 우편 0통·주기 타이머 0으로 회복한다(② 계산 중 이벤트는 dirty 보존).
+  const mailBadgeLedgerPath = options.mailBadgeLedgerPath ?? join(stateRoot, 'msg', 'messages.db');
+  const mailHub = createMailEventHub({ eventsPath: ledgerEventsPath(mailBadgeLedgerPath) });
+  const mailBadgeState = createMailBadgeState({
+    dbPath: mailBadgeLedgerPath,
+    ...(options.mailBadgeCompute ? { compute: options.mailBadgeCompute } : {}),
+  });
+  mailBadgeState.attach(mailHub);
+  mailHub.start();
+
+  // ELS-SERVER-MAINLOOP-STARVATION (이 가지 한정): 배지 공급은 이제 이벤트형 상태(mailBadgeState)가
+  // 단일 소스다 — 첫 착석 1회 계산 후 메모리, 재계산은 원장 옆 사이드카 줄이 올 때만. main의 Worker
+  // 스냅샷 캐시(mailBadgeCache — 스냅샷마다 원장 읽기 예약)는 이벤트 허브가 대체하므로 여기서 뺀다.
+  // JUD #39484 ③ — every pane release/replacement revokes its actor binding at once.
+  const releaseHook = { onPaneRelease: (pane: string) => actorBindings?.revoke(pane) };
+  const core = createElsCore({ ...releaseHook, ...(options.now ? { now: options.now } : {}), load: () => loadJournal(journalPath), save: (journal) => saveJournal(journalPath, journal),
     archiveExited: (pane) => { archiveExitedPane(stateRoot, pane); },
     // D1a: pane PTYs live in outside holders — the default, no option flag. A restart adopts them back (reattachHolder).
     // JUD #39096/#39053: registerSpawn 발급 pane 토큰·부모 역할 기록을 홀더 스폰 위에 얹는다.
@@ -1042,19 +1315,56 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
         ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(stateRoot,
           { ...process.env, ...env, NODE_ENV: process.env.NODE_ENV ?? 'production' }),
         ...(opTab ? ceoWiring?.envFor('OP') : {}) }, cwd, parent);
+      // 보안 HOLD 수리(OP #129232): 이 판의 입양 비밀을 스폰 시 뽑아 원장(메모리)에 두고, 홀더 스폰
+      // env(신뢰 경로 — PANE_TOKEN 과 같은 길)로만 내려 보낸다. 주입된 options.spawn 테스트 경로에는
+      // 실리지 않는다(pane 자식 env 로 비밀이 샐 수 있는 길). 스폰 실패 시 비밀도 회수한다.
+      const adoptionPane = spawnEnv['ELANOUS_ELS_PANE'];
+      const adoptionSecret = adoptionPane !== undefined && serverStartStamp !== undefined ? randomBytes(32).toString('hex') : undefined;
+      if (adoptionPane !== undefined && adoptionSecret !== undefined) adoptionSecrets.set(adoptionPane, adoptionSecret);
       try {
-        const pty = (options.spawn ?? holderPty(stateRoot))(command, cwd, title, spawnEnv);
+        const pty = options.spawn !== undefined
+          ? options.spawn(command, cwd, title, spawnEnv)
+          : holderPty(stateRoot)(command, cwd, title, {
+            ...spawnEnv,
+            ...(adoptionSecret !== undefined && serverStartStamp !== undefined ? {
+              ELANOUS_ELS_ADOPTION_SECRET: adoptionSecret,
+              ELANOUS_ELS_SERVER_PID: String(process.pid),
+              ELANOUS_ELS_SERVER_START: serverStartStamp } : {}) });
         paneRegistry.bindSpawn(spawnEnv[AUTH_PANE_TOKEN_ENV], () => pty.processBinding);
         return pty;
       } catch (error) {
         paneRegistry.forget(spawnEnv[AUTH_PANE_TOKEN_ENV]);
+        if (adoptionPane !== undefined && adoptionSecret !== undefined) adoptionSecrets.delete(adoptionPane);
         throw error;
       }
     },
-    reattach: (pane) => reattachHolder(stateRoot, pane.id),
+    reattach: (pane) => {
+      // 보안 HOLD 수리(OP #129232): 재기동 세대는 이 판의 입양 비밀을 새로 뽑아 재결속 핸드셰이크
+      // (adopt-renew — proof 는 이 홀더의 세대 nonce, JUD #128534 신뢰 경로)로 설치한다.
+      const renewAdoptionSecret = serverStartStamp !== undefined ? randomBytes(32).toString('hex') : undefined;
+      if (renewAdoptionSecret !== undefined) adoptionSecrets.set(pane.id, renewAdoptionSecret);
+      const adopted = reattachHolder(stateRoot, pane.id, renewAdoptionSecret);
+      if (!adopted) return undefined;
+      // OP #128343(승인 #128469) P0 — 재기동 입양: 살아남은 홀더가 증명한 pane 토큰을 원장에 재등록한다.
+      // 토큰은 홀더의 credential 답만(registerAdopted 가 회수·충돌 거부), 자리·workspace 는 저널
+      // ownerSeat·tabId 로 복원한다. 비동기 — 입양은 즉시, 재등록은 홀더 응답 착지 때(시험은 until 로 기다린다).
+      const workspace = adoptedWorkspaceName(journalPath, pane.tabId);
+      void Promise.resolve(adopted.credential?.(generationNonce))
+        .then((token) => { if (token) paneRegistry.registerAdopted(
+          { token, pane: pane.id, workspace, role: pane.ownerSeat === 'OP' ? 'op' : 'hand', seat: pane.ownerSeat },
+          () => adopted.processBinding); })
+        .catch(() => { /* 홀더가 답하지 못하면 입양만 유지되고 재등록은 없다 */ });
+      return adopted;
+    },
+    // OP #128343(승인 #128469): 닫힌 pane 의 발급 토큰은 회수한다 — 남은 자손도 그 자격을 다시 쓰지 못한다.
+    // OP #128343(승인 #128469) + 보안 HOLD 수리(OP #129232): 닫힌 판의 입양 비밀도 원장(메모리)에서 회수한다.
+    onPaneClosed: (paneId) => { paneRegistry.forgetPane(paneId); adoptionSecrets.delete(paneId); },
     // D1b: a reboot-ended pane shows its saved screen instead of clearing to idle.
     restoreScreen: (paneId) => restoreScreenFromSnapshot(stateRoot, paneId),
-    consumeScreenSnapshot: (paneId) => consumeScreenSnapshot(stateRoot, paneId) });
+    consumeScreenSnapshot: (paneId) => consumeScreenSnapshot(stateRoot, paneId),
+    // ELS-SERVER-EVENT-HUB-NO-DB-POLL — 목록 배지는 메모리 상태만 읽는다(재계산은 허브 이벤트 때만).
+    mailBadges: (seats) => mailBadgeState.badges(seats) });
+  actorBindings = new ActorBindings(pane => core.paneProcessBinding(pane), processIdentity, () => core.shellPids());
   const resultsPath = join(dirname(socketPath), 'child-results.jsonl');
   const notifyParent = options.notifyParent ?? ((ws: string, line: string) => {
     // Bounded: past 256 KiB the file becomes `.1` (one older generation), so unread results cannot grow without limit.
@@ -1126,6 +1436,45 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
     return { exitCode: 1, message: `els serve: cannot listen on ${toolSocketPath}: ${toolFailed.message}` };
   }
   chmodSync(toolSocketPath, 0o600);
+  // ELS-SERVE-ORPHAN-EXIT (OP 11-22): ownership is the bound socket, yet removing the socket file
+  // fires no event in Node — a serve that lost els.sock or ctl.sock used to stay alive forever with
+  // every pane holder still attached (23 orphans). The guard: while both files sit exactly as bound
+  // nothing happens; the first disappearance or replacement ends this owner — `lost` resolves only
+  // after the self-close has finished, so the CLI's exit races nothing.
+  let markLost: (reason: string) => void = () => {};
+  const lost = new Promise<string>((resolve) => { markLost = resolve; });
+  // JUD-B #127595 (startup race): a loss that fires while startup still awaits its HTTP listeners must stop
+  // the boot — `lostReason` is what the tail of this function checks before markReady.
+  let lostReason: string | undefined;
+  const triggerLost = (reason: string): void => {
+    if (attachState.stopping) return; // a deliberate close is not a loss
+    lostReason ??= reason;
+    clearInterval(socketGuardTimer);
+    void close().then(() => markLost(reason), () => markLost(reason));
+  };
+  const boundSockets = new Map<string, { ino: number; dev: number }>(
+    [socketPath, toolSocketPath].map((p) => {
+      const st = statSync(p);
+      return [p, { ino: st.ino, dev: st.dev }] as const;
+    }));
+  const socketGuardTimer = setInterval(() => {
+    for (const p of [socketPath, toolSocketPath]) {
+      const bound = boundSockets.get(p)!;
+      let held = false;
+      try {
+        const st = statSync(p);
+        held = !st.isSymbolicLink() && st.ino === bound.ino && st.dev === bound.dev;
+      } catch { held = false; }
+      if (!held) {
+        triggerLost(`els serve: the bound socket ${basename(p)} disappeared — this owner ended itself`);
+        return;
+      }
+    }
+  }, options.socketGuardIntervalMs ?? 1_000);
+  socketGuardTimer.unref();
+  // A runtime listener error used to become an unhandled 'error' crash; it is a loss of the same kind.
+  server.on('error', (error) => triggerLost(`els serve: els.sock listener failed: ${error instanceof Error ? error.message : String(error)}`));
+  toolServer.on('error', (error) => triggerLost(`els serve: ctl.sock listener failed: ${error instanceof Error ? error.message : String(error)}`));
   // JUD #39057 ⓒ1③ — the person's explicit `els seat set OP` needs the owner credential outside this process env. Written only
   // once this run owns the socket (right after the bind, before any client can re-read it): a start refused above («already answers») must not overwrite the live server's token file.
   writeFileSync(join(dirname(journalPath), 'owner-token'), owner.token, { mode: 0o600 });
@@ -1136,6 +1485,8 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
   let httpServer: Server | undefined;
   // The busy-pane stall watcher: started once the core owns the journal, stopped in close().
   let stallAlert: StallAlert | undefined;
+  // ELS-CODEX-SEAT-MAIL-WAKE: the unread-mail knock watcher, same lifetime as the stall watcher.
+  let mailWakeWatcher: MailWakeWatcher | undefined;
   let httpV1Server: Server | undefined;
   // Queued `do` lines go out once a pane's turn is no longer running.
   const drainTimer = setInterval(() => { void core.drain(); }, 1_000);
@@ -1147,9 +1498,12 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
   reapTimer.unref();
   const close = async (): Promise<void> => {
     ceoWiring?.stop();
+    mailHub.stop(); // ELS-SERVER-EVENT-HUB-NO-DB-POLL — the watcher dies with its server; the badge state keeps its memory.
+    mailBadgeState.dispose(); // JUD-B #132880 — frees the resync timer and the off-thread compute worker.
     // D1a must-1(JUD-B #107693): attach 연결을 stopAll() «앞에» 서버 떠남으로 끝낸다 — 이 뒤 pane 들은 홀더에서 살아
     // 있고 새 서버가 입양한다. 이 경로에서 «pane exited» 를 보내면 클라가 자식이 죽은 줄로 뷰를 끊는다.
     attachState.stopping = true;
+    const attachSockets = new Set(attachState.sockets);
     for (const attach of attachState.sockets) {
       try { attach.end(SERVER_STOPPING_END); } catch { /* already gone */ }
       // A peer that neither reads nor closes its end must not hold the shutdown: the end line is already queued for it, so after
@@ -1161,14 +1515,39 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
     clearInterval(drainTimer);
     clearInterval(foregroundTimer);
     clearInterval(reapTimer);
+    clearInterval(socketGuardTimer);
     stallAlert?.stop();
+    mailWakeWatcher?.stop();
     core.stopAll();
+    // ELS-SERVE-EXIT-NOW (JUD-B #127564 ② · OP #127681): an idle client holds `close()` forever (idle 연결이
+    // 소켓 삭제 뒤 3.5s 생존) — every remaining open connection is cut now; attach sockets keep the queued
+    // stop line + grace above, so the end is immediate without breaking the pane handoff.
+    for (const socket of liveSockets) {
+      if (attachSockets.has(socket)) continue;
+      try { socket.destroy(); } catch { /* already gone */ }
+    }
+    liveSockets.clear();
     if (httpV1Server) await new Promise<void>((resolve) => httpV1Server!.close(() => resolve()));
     disposeRecordings(core); // every `els record` tap dies with its server; `--stop` disposed its own earlier.
     if (httpServer) await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
-    await Promise.all([server, toolServer].map((listener) => new Promise<void>((resolve) => listener.close(() => resolve()))));
-    try { unlinkSync(socketPath); } catch { /* already gone */ }
-    try { unlinkSync(toolSocketPath); } catch { /* already gone */ }
+    // OP #129648 (JUD security HOLD on #39569): bun's `listener.close()` unlinks the bound PATH
+    // unconditionally — it never checks the inode (probed: evidence-bun-close-unlink-1122). The old
+    // pin-and-relink shield still had a check-then-act window: a file swapped onto the path after
+    // the pin stage's stat was deleted by the listener close, then the stale pin was relinked —
+    // a takeover during the exit could be severed by the exit itself. Prescription: a listener is
+    // closed ONLY while the path still holds this process's own bound inode — that close removes
+    // our own file and nothing else. A socket this serve no longer owns (lost or replaced) is
+    // never closed here at all: the fd dies with the process exit, and the exit never unlinks,
+    // links or otherwise touches a path it does not own.
+    const closeListenerIfOwned = (listener: Server, p: string): Promise<void> => {
+      const bound = boundSockets.get(p)!;
+      try {
+        const st = statSync(p);
+        if (st.isSymbolicLink() || st.ino !== bound.ino || st.dev !== bound.dev) return Promise.resolve(); // not ours — untouched
+      } catch { return Promise.resolve(); } // absent — nothing to remove; the fd dies with the process
+      return new Promise<void>((resolve) => listener.close(() => resolve()));
+    };
+    await Promise.all([closeListenerIfOwned(server, socketPath), closeListenerIfOwned(toolServer, toolSocketPath)]);
   };
   const refused = core.start();
   if (refused) {
@@ -1177,6 +1556,15 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
     return refused;
   }
   core.reapExited();
+  // ELS-ORPHAN-SERVE-REAP (OP #131393③ · 골 #132048③): a stateRoot can keep holder residue nobody owns —
+  // a SIGKILL'd holder never runs its cleanup, and a SIGKILL'd serve leaves live detached holders no server
+  // will ever adopt (reattach only ever looks at journal panes). Now that the journal load has judged the
+  // claimed panes, the boot sweeps the rest: dead residue is unlinked, and a live orphan holder's PTY child
+  // is ended so its own exit path finishes the cleanup. A journal that cannot be read fails closed — no reap.
+  try {
+    const claimedPanes = new Set(loadJournal(journalPath).panes.map((pane) => pane.id));
+    sweepOrphanHolderResidue(stateRoot, (paneId) => claimedPanes.has(paneId));
+  } catch { /* fail-closed: an unreadable journal owns everything — nothing is reaped */ }
   // ELS owns the channel and the same durable mail ledger as its OP tab. A restart scans
   // pending rows before polling Telegram, even when the remote offset already advanced.
   const ceoMailPath = join(stateRoot, 'msg', 'messages.db');
@@ -1199,9 +1587,14 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
   // 2.5. Busy panes that produce no new output for STALL_MS alert the owner (mail + receipt);
   // `stall: false` or ELANOUS_ELS_STALL_MS=0 disables the watcher outright.
   if (options.stall !== false) stallAlert = startStallAlert(core, { stateRoot, ...(options.stall ?? {}) });
+  // 2.6. ELS-CODEX-SEAT-MAIL-WAKE: a non-eln seat pane (codex CLI 등) that cannot watch its own inbox
+  // gets one «우편 확인» knock when the mail ledger records a change — event subscription(fs.watch),
+  // 주기 폴링·env 스위치 없음(OP #132156) · idle pane only · one per episode · receipt.
+  // `mailWake: false`(시험 솔기) disables the watcher outright.
+  if (options.mailWake !== false) mailWakeWatcher = startMailWakeWatcher(core, { receiptsPath: join(dirname(socketPath), 'mail-wake.jsonl'), ...(options.mailWake ?? {}) });
   // 3. The read window for federated hosts, when asked for: it answers from this owner's journal in memory.
   if (options.http) {
-    try { httpServer = await startElsHttp(core, options.hostName ?? elsHostName(), options.http, doPolicy(stateRoot)); }
+    try { httpServer = await startElsHttp(core, options.hostName ?? elsHostName(), options.http, doPolicy(stateRoot)); trackSockets(httpServer); }
     catch (error) {
       markReady(undefined);
       await close();
@@ -1242,12 +1635,21 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
         nonces: new Map(),
         ...(options.httpV1.rateLimitPerMinute !== undefined ? { rateLimitPerMinute: options.httpV1.rateLimitPerMinute } : {}),
       }, options.httpV1.bind);
+      trackSockets(httpV1Server);
     } catch (error) {
       markReady(undefined);
       await close();
       return { exitCode: 1, message: `els serve: cannot open the v1 API on ${options.httpV1.bind.host}:${options.httpV1.bind.port}: ${error instanceof Error ? error.message : String(error)}` };
     }
   }
+  // JUD-B #127595 (static risk, unreproduced): a loss that fired while startup awaited its HTTP listeners
+  // used to fall through to markReady — this owner has already ended; it must not come back ready.
+  if (lostReason !== undefined) {
+    markReady(undefined);
+    if (httpV1Server) await new Promise<void>((resolve) => httpV1Server!.close(() => resolve()));
+    if (httpServer) await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
+    return { exitCode: 1, message: lostReason };
+  }
   markReady(core);
-  return { server, core, close, ...(httpV1Server ? { httpV1: httpV1Server } : {}) };
+  return { server, core, close, lost, ...(httpV1Server ? { httpV1: httpV1Server } : {}) };
 }

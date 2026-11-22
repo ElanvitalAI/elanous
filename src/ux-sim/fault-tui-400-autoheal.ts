@@ -159,7 +159,7 @@ export async function simTui400Autoheal(
       ...config,
       llm: {
         ...config.llm, provider: 'openai-codex', apiKey: 'fake-codex-test-only',
-        fallbackChain: ['codex-rotate', 'zai'], goalLoop: { ...(config.llm.goalLoop ?? {}), enabled: false },
+        fallbackChain: ['codex-rotate', 'zai'],
       },
     }));
     globalThis.fetch = Object.assign(

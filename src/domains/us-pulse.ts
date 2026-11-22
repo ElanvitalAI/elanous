@@ -1,4 +1,5 @@
 import { textOnly } from '../llm/stream-text.js';
+import { streamChatLedgered } from '../llm/ledgered-call.js';
 // ── US 머니무브 펄스 (2026-07-06 대표 지시) ─────────────────────────────
 //
 // "팔란티어가 6일째 오르고 있는데 … 미국장 머니무브·섹터 순환 체크가 원활하게
@@ -308,7 +309,7 @@ export async function interpretPulse(structured: string): Promise<string> {
       { role: 'user', content: structured.slice(0, 8_000) },
     ];
     let out = '';
-    for await (const d of textOnly(provider.streamChat(messages, { temperature: 0.3, maxTokens: 600 }))) out += d;
+    for await (const d of textOnly(streamChatLedgered(provider, messages, { temperature: 0.3, maxTokens: 600 }, { site: 'domain-us-pulse', jobKind: 'domain-report' }))) out += d;
     return out.trim();
   } catch { return ''; }
 }

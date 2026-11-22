@@ -29,6 +29,7 @@ import { assessReviewEngineValidity } from './review-engine-validity.js';
 import { debug } from '../debug/log.js';
 import { ACP_BACKENDS, canonicalizeBackendId } from '../acp/backend-registry.js';
 import { buildManualReviewIntent, intentFromPr, prIntentSectionCoverage, reviewIntentTruncationFromPr, reviewIntentTruncationObservation } from './review-intent.js';
+import { emitReviewMustFixSignal, type TurnSignalAsyncOptions } from '../lessons/lesson-turn-signals.js';
 import { buildReviewScopeContractContext } from '../cli/review-carry.js';
 import { NO_VERDICT_LINE_REASON, budgetReviewerContext, isNoneSentinelFinding, reviewDiffBudgetObservation, splitDiffByFile, type ReviewImage, type ReviewInput, type ReviewerContextItem, type ReviewResult } from './pr-reviewer.js';
 import type { ReferencedFileReader } from '../self-implement/goal-file-reader.js';
@@ -184,6 +185,11 @@ export interface SelfReviewCliDeps {
   listRunLedgers?: () => RunLedgerLookup;
   /** Optional fail-soft PR-goal 판정 신호 lookup. Default = `lookupPrGoalAcceptance`. */
   lookupPrGoalAcceptance?: (prNumber: number) => PrGoalAcceptanceLookup;
+  /**
+   * POST-TURN-LESSON-REVIEW r17 — JUD-C #128647: 리뷰 저장 → 원장 신호(lesson) 옵션 주입 대역.
+   * 없으면 제품 기본값(기본 원장 위치·값싼 모델). 격리 시험은 여기로 stateDir·요약자 캡처를 넣는다.
+   */
+  lessonOptions?: TurnSignalAsyncOptions;
 }
 
 export interface SelfReviewCliOutcome {
@@ -2065,6 +2071,37 @@ export function selfReviewJsonLine(results: readonly unknown[]): string {
   return JSON.stringify(results.length === 1 ? results[0] : results) + '\n';
 }
 
+/**
+ * POST-TURN-LESSON-REVIEW r16 — Terra r15b ①: 리뷰 결과 저장 직후 must-fix ≥1 이면
+ * 원장 신호 1건을 발화한다(서명 review:<pr>:<head10>). 값싼 모델 1회 요약·하루 상한은
+ * scanTurnSignalsAsync 안에서. fail-soft: 발화 실패가 리뷰 저장을 되돌리지 않는다.
+ * 저장 블록이 헬퍼로 분리돼 «실제 리뷰 진입점 → 원장 행» 통합 시험이 가능하다.
+ */
+export async function persistReviewedResult(input: {
+  enriched: Record<string, unknown>; pinnedHead: string; pr: string | number; canonicalResultPath: string;
+  normalized: { result: Record<string, unknown>; count: number };
+  /** r16 — Terra r15b ①: 원장 상태 디렉터리 주입(없으면 제품 기본값) — 통합 시험 격리용 seam. */
+  lessonOptions?: TurnSignalAsyncOptions;
+  /** r22 — JUD-C #128865/OP #128881: false 이면 must-fix 신호를 발화하지 않는다 — 믹스 lane 자식의
+   *  --save 저장처럼 같은 head 의 발화 주체가 다른 경로(믹스 집계)에 있을 때 이중 발화를 막는다. */
+  lessonSignal?: boolean;
+}): Promise<void> {
+  const { enriched, pinnedHead, pr, canonicalResultPath, normalized, lessonOptions, lessonSignal = true } = input;
+  mkdirSync(dirname(canonicalResultPath), { recursive: true });
+  if (enriched.headCommit !== pinnedHead || enriched.stale === true
+    || enriched.currentHeadCommit !== pinnedHead) {
+    throw new Error('review result is not pinned to the confirmed current PR head');
+  }
+  writeFileSync(canonicalResultPath, selfReviewJsonLine([normalized.result]));
+  try {
+    // r17 — JUD-C #128647: must-fix 개수만 세지 않고 실제 항목(문자열만)을 요약자 입력에 전달한다.
+    if (lessonSignal && Array.isArray(normalized.result.mustFix) && normalized.result.mustFix.length > 0) {
+      const mustFix = normalized.result.mustFix.filter((finding): finding is string => typeof finding === 'string');
+      await emitReviewMustFixSignal(lessonOptions ?? {}, pr, pinnedHead, mustFix);
+    }
+  } catch { /* lesson emission cannot break review persistence */ }
+}
+
 function normalizeSavedReviewMustFix(result: Record<string, unknown>): { result: Record<string, unknown>; count: number } {
   if (!Array.isArray(result.mustFix)) return { result, count: 0 };
   const noFindingNotes = result.mustFix.filter((finding): finding is string =>
@@ -2193,13 +2230,12 @@ export async function runSelfReviewCliCommand(
           results.push(enriched);
           if (completed && completed.reviewed === true) {
             try {
-              mkdirSync(dirname(canonicalResultPath), { recursive: true });
               const normalized = normalizeSavedReviewMustFix(enriched);
-              if (enriched.headCommit !== pinnedHead || enriched.stale === true
-                || enriched.currentHeadCommit !== pinnedHead) {
-                throw new Error('review result is not pinned to the confirmed current PR head');
-              }
-              writeFileSync(canonicalResultPath, selfReviewJsonLine([normalized.result]));
+              // r22 — JUD-C #128865/OP #128881: 믹스 집계가 이 head 의 유일한 canonical 저장·발화
+              // 주체다 — lane 자식(r21 이후 persistReviewedResult 진입)은 reviewerMixPrimaryLane
+              // 플래그로 canonical 저장을 건너뛰므로 여기가 정확히 1회만 저장·발화한다.
+              await persistReviewedResult({ enriched, pinnedHead, pr, canonicalResultPath, normalized,
+                ...(deps.lessonOptions ? { lessonOptions: deps.lessonOptions } : {}) });
             } catch (error) {
               failed += 1;
               deps.error(`PR ${pr}: 리뷰 결과 저장 실패 (${canonicalResultPath}): ${error instanceof Error ? error.message : String(error)}`);
@@ -3485,16 +3521,20 @@ async function runSelfReviewCliCommandPinned(
     if (opts.json || opts.save !== undefined || shouldPersistCapResult) results.push(resultOutput);
     // REVIEW-NO-SILENT-GLM-FALLBACK — an invalid verdict never becomes the canonical same-head result
     //   (it stays in `--json`/`--save` output, which the land reader refuses).
-    if (!shouldPersistCapResult && !reviewInvalid
+    if (!shouldPersistCapResult && !opts.reviewerMixPrimaryLane
+      && !reviewInvalid
       && landingGateAdmitted && review.reviewed === true && diffRead.headCommitState === 'known'
       && diffRead.currentHeadCommitState === 'known' && diffRead.currentHeadCommit === diffRead.headCommit
       && !diffRead.stale && COMMIT_OID.test(diffRead.headCommit)) {
       const path = canonicalResultPath ?? join(effectiveInstanceRoot(), 'review-results', `pr-${pr}-${diffRead.headCommit.slice(0, 12)}.json`);
       const normalized = normalizeSavedReviewMustFix(resultOutput);
       try {
-        mkdirSync(dirname(path), { recursive: true });
+        // r21 — JUD-C #128820/OP #128823: 단일 리뷰 저장 경로(믹스 밖)도 persistReviewedResult seam 을
+        // 탄다 — 저장 → must-fix 신호 → 요약자 → 원장 후보가 이 경로에서도 이어진다(fail-soft 발화).
         // A successful review replaces an earlier error artifact for the same PR head.
-        writeFileSync(path, selfReviewJsonLine([normalized.result]));
+        await persistReviewedResult({ enriched: resultOutput, pinnedHead: diffRead.headCommit, pr,
+          canonicalResultPath: path, normalized,
+          ...(deps.lessonOptions ? { lessonOptions: deps.lessonOptions } : {}) });
         if (normalized.count > 0 && opts.save === undefined) deps.log('mustfix-normalized', { pr, head: diffRead.headCommit, count: normalized.count });
       } catch (error) {
         deps.error(`PR ${pr}: 리뷰 결과 저장 실패 (${path}): ${error instanceof Error ? error.message : String(error)}`);
@@ -3517,13 +3557,18 @@ async function runSelfReviewCliCommandPinned(
       } else {
         const path = join(effectiveInstanceRoot(), 'review-results', `${opts.save}-${pr}-${diffRead.headCommit.slice(0, 12)}.json`);
         const rawResult = results.at(-1);
+        // r25 — JUD-C #129044: 이 거짓 갈래는 도달 즉시 throw되는 가드 뒤라 normalized 는 버려진다 —
+        // result 에 rawResult(Record|undefined)를 그대로 담으면 undefined 유니온이 persistReviewedResult 파라미터를 깬다.
         const normalized = rawResult && typeof rawResult === 'object'
           ? normalizeSavedReviewMustFix(rawResult)
-          : { result: rawResult, count: 0 };
-        const result = normalized.result;
+          : { result: {}, count: 0 };
         try {
-          mkdirSync(dirname(path), { recursive: true });
-          writeFileSync(path, selfReviewJsonLine([result]));
+          if (!rawResult || typeof rawResult !== 'object') throw new Error('--save 저장할 리뷰 결과 원본이 없습니다');
+          // r22 — JUD-C #128865/OP #128881: 믹스 lane 자식의 --save 저장은 발화하지 않는다 —
+          // 이 head 의 must-fix 신호는 믹스 집계 저장(persistReviewedResult)이 유일하게 발화한다.
+          await persistReviewedResult({ enriched: rawResult, pinnedHead: diffRead.headCommit, pr,
+            canonicalResultPath: path, normalized, lessonSignal: !opts.reviewerMixPrimaryLane,
+            ...(deps.lessonOptions ? { lessonOptions: deps.lessonOptions } : {}) });
           if (normalized.count > 0) deps.log('mustfix-normalized', { pr, head: diffRead.headCommit, count: normalized.count });
         } catch (error) {
           failed += 1;
@@ -3539,12 +3584,16 @@ async function runSelfReviewCliCommandPinned(
         deps.error(`PR ${pr}: 상한 예외 리뷰 결과가 저장 가능한 상태가 아니어서 승인 사용 기록을 되돌렸습니다.`);
       } else {
         const rawResult = results.at(-1);
+        // r25 — JUD-C #129044: 상한 예외 경로의 같은 패턴 — 가드 뒤 버려지는 폴백은 빈 객체로 타입을 맞춘다.
         const normalized = rawResult && typeof rawResult === 'object'
           ? normalizeSavedReviewMustFix(rawResult)
-          : { result: rawResult, count: 0 };
+          : { result: {}, count: 0 };
         try {
-          mkdirSync(dirname(canonicalResultPath), { recursive: true });
-          writeFileSync(canonicalResultPath, selfReviewJsonLine([normalized.result]));
+          if (!rawResult || typeof rawResult !== 'object') throw new Error('상한 예외 리뷰 결과 원본이 없습니다');
+          // r21 — JUD-C #128820/OP #128823: 상한 예외 저장 경로도 같은 seam 에서 must-fix 신호를 발화한다.
+          await persistReviewedResult({ enriched: rawResult, pinnedHead: diffRead.headCommit, pr,
+            canonicalResultPath, normalized,
+            ...(deps.lessonOptions ? { lessonOptions: deps.lessonOptions } : {}) });
           if (normalized.count > 0) deps.log('mustfix-normalized', { pr, head: diffRead.headCommit, count: normalized.count });
         } catch (error) {
           releaseCapClaim();

@@ -1,0 +1,9 @@
+# ELS-UPDATE-ALL-GRACEFUL 0.3.33 — registered remote TUI turn and timeout injection.
+schema: 1
+world: els
+scenarios:
+  - { id: E-REMOTE-LIVE-TURN, module: src/ux-sim/sim-world/els/remote-live.ts }
+  - { id: E-REMOTE-TIMEOUT, module: src/ux-sim/sim-world/els/remote-live.ts }
+  - { id: E-HOST-SNAPSHOT-BOUND, module: src/ux-sim/sim-world/els/host-snapshot.ts }
+  - { id: E-SEAT-STEER-BUSY-SHELL, module: src/ux-sim/sim-world/els/steer-preempt.ts }
+  - { id: E-LIVE-CWD-OSC7, module: src/ux-sim/sim-world/els/live-cwd.ts }

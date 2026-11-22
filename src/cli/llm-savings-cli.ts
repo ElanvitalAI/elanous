@@ -13,6 +13,7 @@ import {
   renderSavingsReceiptMd,
   summarizeRouterSavings,
   type SavingsCallRow,
+  type SavingsDayRow,
   type SavingsPriceOf,
   type SavingsReceipt,
 } from '../model-tier/router-savings.js';
@@ -77,6 +78,34 @@ export function savingsCallsFromLedger(rows: readonly SavingsLedgerRow[], opts: 
   return out;
 }
 
+/** 일일 재계산 — 호출을 UTC 일(YYYY-MM-DD) 버킷으로 나눠 각 일을 summarizeRouterSavings 로 다시 요약한다(jud-39614 필수 3).
+ *  ⛔ 가격 비공개 — savingsPct 는 주입 단가로 «내부» 계산한 비율뿐. 시각을 못 매긴 행은 '시각 미측정' 버킷(렌더 방어 관습). */
+export function summarizeDailySavings(
+  calls: readonly SavingsCallRow[],
+  opts: { readonly premiumModel: string; readonly priceOf: SavingsPriceOf },
+): readonly SavingsDayRow[] {
+  const buckets = new Map<string, SavingsCallRow[]>();
+  for (const call of calls) {
+    const day = Number.isFinite(call.at) ? new Date(call.at).toISOString().slice(0, 10) : '시각 미측정';
+    const list = buckets.get(day);
+    if (list) list.push(call);
+    else buckets.set(day, [call]);
+  }
+  return [...buckets.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([day, dayCalls]) => {
+      const receipt = summarizeRouterSavings({ calls: dayCalls, premiumModel: opts.premiumModel, priceOf: opts.priceOf });
+      return {
+        day,
+        totalCalls: receipt.totalCalls,
+        premiumCalls: receipt.premiumCalls,
+        premiumShare: receipt.totalCalls === 0 ? 0 : receipt.premiumCalls / receipt.totalCalls,
+        savingsPct: receipt.savingsPct,
+        unpricedCalls: receipt.unpricedCalls,
+      } satisfies SavingsDayRow;
+    });
+}
+
 export interface LlmSavingsOpts {
   /** «강 단독» 기준 모델 id — 필수. */
   readonly premiumModel?: string;
@@ -86,6 +115,8 @@ export interface LlmSavingsOpts {
   readonly runId?: string;
   /** JSON 영수 출력. */
   readonly json?: boolean;
+  /** 일일 재계산 표도 영수에 실린다(UTC 일 버킷별 — jud-39614 필수 3). */
+  readonly daily?: boolean;
 }
 
 export interface LlmSavingsDeps {
@@ -143,12 +174,16 @@ export async function runLlmSavings(opts: LlmSavingsOpts, deps: LlmSavingsDeps =
     : savingsCallsFromLedger(readLedgerWindow(), { now, sinceMs: minutes * 60_000, runId: opts.runId });
   const priceOf = deps.priceOf ?? defaultPriceOf;
   const receipt = summarizeRouterSavings({ calls, premiumModel: opts.premiumModel, priceOf });
+  // 일일 재계산(--daily): UTC 일 버킷 표를 영수에 함께 실는다 — 가격은 비공개(비율만).
+  const json = opts.daily
+    ? { ...receipt, daily: summarizeDailySavings(calls, { premiumModel: opts.premiumModel, priceOf }) }
+    : receipt;
   const out = deps.out ?? ((line: string) => console.log(line));
   if (opts.json) {
     // 데모 계약(--json): 한 줄 JSON 영수도 이 모듈이 낸다 — 액션이 반환값을 버려도 영수가 찍힌다.
-    out(JSON.stringify(receipt));
-    return { json: receipt };
+    out(JSON.stringify(json));
+    return { json };
   }
-  out(renderSavingsReceiptMd(receipt, { title: 'SMART-ROUTER-DEMO-SAVINGS', at: new Date(now).toISOString(), premiumModel: opts.premiumModel }));
+  out(renderSavingsReceiptMd(json, { title: 'SMART-ROUTER-DEMO-SAVINGS', at: new Date(now).toISOString(), premiumModel: opts.premiumModel }));
   return {};
 }

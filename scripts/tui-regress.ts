@@ -38,11 +38,12 @@ async function runCheck(check: TuiCheck, runId: string, verificationCommand: str
   const dir = mkdtempSync(join(tmpdir(), `tui-regress-${check.id}-`));
   const cli = join(import.meta.dir, '..', 'bin', 'elanous.mjs');
   if (check.role && check.role !== 'owner') {
-    // A config written from scratch has onboarding unfinished → bare entry would take the first-run (web-first) path,
-    // not the TUI. Mark onboarding done so the check sees the same TUI as an existing user.
     spawnSync(process.execPath, [cli, '--config-dir', dir, 'config', 'set', 'tui.role', check.role], { stdio: 'ignore' });
-    spawnSync(process.execPath, [cli, '--config-dir', dir, 'config', 'set', 'onboarding.completed', 'true'], { stdio: 'ignore' });
   }
+  // A config written from scratch has onboarding unfinished → bare entry would take the first-run path and stall on
+  // the "Choose setup: Terminal (recommended) / Web (browser)" prompt (#37923) — for owner too, not just non-owner
+  // roles. Mark onboarding done for every role so each check sees the same TUI as an existing user.
+  spawnSync(process.execPath, [cli, '--config-dir', dir, 'config', 'set', 'onboarding.completed', 'true'], { stdio: 'ignore' });
   const handle = startPty({
     cmd: process.execPath, args: [cli, '--config-dir', dir, '--test-state-dir', dir],
     cols: COLS, rows: ROWS, workdir: join(import.meta.dir, '..'),

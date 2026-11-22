@@ -22,7 +22,7 @@
 
 import { buildLedgerCitationRule, RESEARCH_SYNTHESIS_EVIDENCE_BUDGET_CHARS } from '../auto-research/synthesis-evidence-budget.js';
 import { isAuthRejectionError, streamLLMWithTools } from '../llm.js';
-import { drainPendingUserInput } from '../session/pending-input.js';
+import { drainPendingInterjections } from '../session/pending-input.js';
 import { drainMidTurnEvents } from '../session/mid-turn-events.js';
 import type { LLMMessage, StreamWithToolsHandlers } from '../llm.js';
 import { debug, redactSecretText, withAmbientSessionScope } from '../debug/log.js';
@@ -1191,7 +1191,9 @@ export async function runCoreTurn(
       ...(ctx.terminalToolNames !== undefined ? { terminalToolNames: ctx.terminalToolNames } : {}),
       ...(ctx.terminalPriorAnswerVisible !== undefined ? { terminalPriorAnswerVisible: ctx.terminalPriorAnswerVisible } : {}),
       ...(ctx.terminalCompletionAccepted !== undefined ? { terminalCompletionAccepted: ctx.terminalCompletionAccepted } : {}),
-      ...(ctx.sessionId !== undefined ? { drainPendingUserInput: () => [...drainPendingUserInput(ctx.sessionId!), ...drainMidTurnEvents(ctx.sessionId!).map((event) => event.text)] } : {}),
+      ...(ctx.sessionId !== undefined ? { drainPendingUserInput: () => [...drainPendingInterjections(ctx.sessionId!), ...drainMidTurnEvents(ctx.sessionId!).map((event) => (event.kind === 'seat-mail' && Number.isSafeInteger(Number(event.id))
+        ? { kind: 'seat-mail' as const, msgId: Number(event.id), from: event.from ?? '?', intent: event.intent ?? null, text: event.text }
+        : event.text))] } : {}),
       ...(ctx.streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs: ctx.streamIdleTimeoutMs } : {}),
     });
 

@@ -276,6 +276,18 @@ test('JUD #39096 ⓑ — ledger-verified peer seat is a role-door principal; sea
   expect(authorizeRequest(peer, { op: 'seat-set' }, undefined, undefined).allow).toBe(false);
 });
 
+test('coordinator mutations require OP pane or verified OP peer, never an allow-listed non-OP', () => {
+  const opPeer: ServerRole = { kind: 'peer', pid: PEER_PID, pane: PEER_PANE, seat: 'OP', uid: PEER_UID };
+  const roles: ServerRole[] = [opPeer, { kind: 'op', pane: 'op' },
+    { ...opPeer, seat: 'HAND' }, { kind: 'hand', pane: 'p', seat: 'OP', workspaces: ['w'] },
+    { kind: 'outsider', note: 'no credential' }, { kind: 'owner', note: 'unregistered' }];
+  for (const op of ['coordinator', 'coordinator-unset']) {
+    for (const [index, role] of roles.entries()) {
+      expect(authorizeRequest(role, { op }, 'w', PEER_INPUT_RULES).allow).toBe(index < 2);
+    }
+  }
+});
+
 test('JUD #39096 ⓑ — no-token outsider keeps spawn (main behavior) but cannot type into panes', () => {
   const OUTSIDER: ServerRole = { kind: 'outsider', note: 'no pane credential' };
   expect(authorizeRequest(OUTSIDER, { op: 'new' }, undefined, undefined).allow).toBe(true);

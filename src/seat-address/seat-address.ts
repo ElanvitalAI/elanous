@@ -4,6 +4,8 @@ export type SeatEntry = {
   id: string;
   title?: string;
   alias?: string;
+  /** 자리 성격 — `coordinator` = 조율 자리(OP). 없으면 손 자리(`seat/seat-role.ts`). */
+  role?: string;
 };
 
 export type SeatAddress = { seats: string[]; body: string };

@@ -13,9 +13,14 @@ import { dirname, join } from 'node:path';
 import type { Command } from 'commander';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { createAttachApp, type AttachAppDeps } from '../els/attach-app.js';
-import { attachEls, isServerAway, noteAfterFrame, RECONNECT_NOTE } from '../els/attach-client.js';
+import { attachEls, isServerAway, noteAfterFrame, RECONNECT_NOTE, type AttachHandlers } from '../els/attach-client.js';
+import { attachElsOverSsh, resolveSshAttach } from '../els/attach-ssh.js';
+import { runSshReadBridge } from '../els/attach-ssh-read-bridge.js';
+import { parseAddress } from '../els/address.js';
+import type { FederatedHost } from '../els/hosts.js';
+import { createLineDecoder } from '../els/wire.js';
 import { guardLeave, realProcess } from '../els/attach-leave.js';
-import { buildBadge, createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from '../els/attach-view.js';
+import { buildBadge, changedRowsPaint, createAppFrameWriter, createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, fitCells, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from '../els/attach-view.js';
 import { requestEls } from '../els/client.js';
 import { readPipedStdin } from './piped-stdin.js';
 import { grepScreens, type GrepHit, type GrepScreen } from '../els/pane-grep.js';
@@ -44,6 +49,7 @@ import { keysToBytes } from '../els/keys.js';
 import { elsHostsPath, fetchHostJson, loadHostRegistry, registeredHostAtExecution, type HostRegistry } from '../els/hosts.js';
 import { parseHttpBind } from '../els/http.js';
 import { humanOwnerToken } from '../els/human-terminal-auth.js';
+import { AUTH_OWNER_TOKEN_ENV, AUTH_PANE_TOKEN_ENV } from '../els/server-auth.js';
 import { insideElsPane, NESTED_ELS_MESSAGE } from '../els/nesting.js';
 import { createControlledBackend, createSocketBackend, serveElsMcpStdio } from '../els/mcp-serve.js';
 import { serveElsAcpStdio } from '../acp/els-acp-serve.js';
@@ -187,6 +193,16 @@ export function paneListLines(listJson: string, nowMs: number): string[] {
     : listed.panes.map((row) => `${row.address}  ${row.state.padEnd(7)} ${row.badgeLabel ?? tabBadge({ state: row.state as PaneState, ...(row.lastEventAtMs === undefined ? {} : { lastEventAtMs: row.lastEventAtMs }) }, nowMs).label} ${row.title} ${buildBadge(row.build, '[자체보고·미인증:unknown unknown]')}  ${row.cwd}`);
 }
 
+type CoordinatorRequest = { readonly op: 'coordinator'; readonly ws: string };
+
+/** Register coordinator assignment; the client does not write the journal. */
+export function registerCoordinatorCommands(workspace: Command, send: (request: CoordinatorRequest) => Promise<void>): void {
+  workspace.command('coordinator <workspace>')
+    .description('Assign the local coordinator workspace by name or id')
+    .allowExcessArguments(false)
+    .action((ws: string) => send({ op: 'coordinator', ws }));
+}
+
 export function registerElsCommands(program: Command): void {
   const side = program.command('side').description('Elanous Side (els) — workspaces, tabs and panes in one screen; the command is `els`. In a terminal, bare `els` opens the whole screen.');
   // `els` with no arguments: make sure a server answers (supervisor, installed on first use), then show the spaces.
@@ -242,6 +258,8 @@ export function registerElsCommands(program: Command): void {
       const stop = (): void => { void started.close().then(() => process.exit(0)); };
       process.once('SIGTERM', stop);
       process.once('SIGINT', stop);
+      // ELS-SERVE-ORPHAN-EXIT (OP 11-22): a serve whose bound socket vanished ends itself — no orphan holders.
+      void started.lost.then((reason) => { process.stderr.write(`${reason}\n`); process.exit(1); });
     });
   side.command('mcp').description('els as an MCP server').command('serve')
     .description('Serve els over stdio MCP (line-delimited JSON-RPC): tools els_ls·els_read·els_do·els_new·els_status, resources els://pane/<address>/screen|events')
@@ -416,7 +434,11 @@ export function registerElsCommands(program: Command): void {
     return answer.exitCode === 0 ? { listed: JSON.parse(answer.message) } : { failed: answer };
   };
   const printJson = (value: object): void => emit({ exitCode: 0, message: JSON.stringify(value, null, 2) });
-  const workspace = side.command('workspace').description('Workspaces (herdr words): list · create · close · move');
+  const workspace = side.command('workspace').alias('ws').description('Workspaces: list · create · close · move · coordinator');
+  registerCoordinatorCommands(workspace, async (request) => {
+    adoptOwnerCredential();
+    await ask(request);
+  });
   workspace.command('list').description('Workspaces as JSON').action(async () => {
     const { failed, listed } = await listJson(); if (failed) emit(failed); else printJson(herdrWorkspaces(listed!));
   });
@@ -444,16 +466,32 @@ export function registerElsCommands(program: Command): void {
     .option('--before <tab>', 'the tab it goes in front of')
     .action((id: string, opts: { before?: string }) => ask({ op: 'reorder', kind: 'tab', id, ...(opts.before ? { before: opts.before } : {}) }));
   side.command('attach <pane>')
-    .description('Show one pane live in this terminal and type into it (ctrl+b q detaches; the pane keeps running)')
+    .description('Show a local pane or registered host:ws/tab/pane live (ctrl+b q detaches)')
     .action(async (ref: string) => {
       if (!process.stdin.isTTY || !process.stdout.isTTY) {
         process.stderr.write('els attach: needs a terminal (use `els pane read` / `els pane send-text` from scripts)\n');
         process.exitCode = 2;
         return;
       }
-      adoptOwnerCredential();
-      const code = await runAttachView(ref);
+      let remote: FederatedHost | undefined;
+      if (ref.includes(':') && !parseAddress(ref)?.host) {
+        process.stderr.write('els attach: invalid remote address\n'); process.exitCode = 2; return;
+      }
+      if (parseAddress(ref)?.host) {
+        try { remote = resolveSshAttach(loadHostRegistry(elsHostsPath(elanousStateRoot())), ref).host; }
+        catch (error) { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 2; return; }
+      } else adoptOwnerCredential();
+      const code = await runAttachView(ref, remote);
       process.exitCode = code;
+    });
+  side.command('attach-stdio <pane> <cols> <rows> [base-url] [ws] [tab]')
+    .description('SSH bridge (ELS-SSH-ATTACH-ANYWHERE): carry the attach wire on stdio, so a pane of this host can be attached from anywhere')
+    .action(async (ref: string, cols: string, rows: string, baseUrl?: string, ws?: string, tab?: string) => {
+      if (baseUrl && ws && tab) {
+        clearInheritedElsCredentials();
+        process.exitCode = await runSshReadBridge(ref, Number(cols) || 80, Number(rows) || 24, baseUrl, ws, tab);
+      }
+      else process.exitCode = await runAttachStdioBridge(ref, cols, rows);
     });
   const pane = side.command('pane').description('Panes (herdr words): list · read · send-text · send-keys · run · close');
   pane.command('list').option('--workspace <id>', 'only this workspace').description('Panes (all registered hosts) as JSON')
@@ -489,23 +527,92 @@ function adoptOwnerCredential(): void {
   if (token) process.env.ELANOUS_ELS_OWNER_TOKEN = token;
 }
 
+function clearInheritedElsCredentials(): void {
+  delete process.env[AUTH_OWNER_TOKEN_ENV];
+  delete process.env[AUTH_PANE_TOKEN_ENV];
+}
+
+/** The remote side of `els side attach-stdio` (ELS-SSH-ATTACH-ANYWHERE): ssh runs this on the
+ *  remote host. stdin carries the attach wire (attach/input{bytes}/resize in, frame/end/error back
+ *  out on stdout as JSON lines). The socket attach carries its own auth; an `auth` line off the wire is
+ *  ignored (no credential is ever taken from the ssh stream). The pane and the size come from the ssh argv. */
+function runAttachStdioBridge(pane: string, colsArg: string, rowsArg: string): Promise<number> {
+  // A pipe is view-only even if the remote process inherited a real ELS credential from its launcher.
+  if (!process.stdin.isTTY || !process.stdout.isTTY) clearInheritedElsCredentials();
+  else adoptOwnerCredential(); // only the person's terminal may acquire the remote owner credential
+  return new Promise((resolve) => {
+    const cols = Number.parseInt(colsArg, 10) || 80;
+    const rows = Number.parseInt(rowsArg, 10) || 24;
+    const out = (payload: unknown): void => { process.stdout.write(`${JSON.stringify(payload)}\n`); };
+    let attached: ReturnType<typeof attachEls> | undefined;
+    let finished = false;
+    const finish = (code: number): void => {
+      if (finished) return;
+      finished = true;
+      attached?.detach();
+      resolve(code);
+    };
+    const lines = createLineDecoder((line) => {
+      if (!line) return;
+      let parsed: Record<string, unknown>;
+      try { parsed = JSON.parse(line) as Record<string, unknown>; } catch { return; /* not our wire */ }
+      const op = parsed.op;
+      if (op === 'auth') return;                                        // never trusts a credential off the wire: the socket attach authenticates itself
+      if (op === 'attach') {
+        if (attached) return;                                           // one attach per bridge
+        attached = attachEls(elsSocketPath(), pane, { cols, rows }, {
+          onFrame: (frame) => out({ op: 'frame', ...frame }),
+          onEnd: (code, reason) => { out({ op: 'end', code: code ?? 0, reason }); finish(code === 0 ? 0 : 1); },
+          onError: (message) => out({ op: 'error', message }),
+        });
+        return;
+      }
+      if (op === 'input' && typeof parsed.bytes === 'string') { attached?.input(parsed.bytes); return; }
+      if (op === 'resize') { attached?.resize(Number(parsed.cols) || cols, Number(parsed.rows) || rows); return; }
+      if (op === 'end') { finish(0); return; }                          // the ssh side hung up
+    });
+    process.stdin.on('data', (chunk: Buffer) => lines.push(chunk));
+    process.stdin.on('end', () => finish(0));
+    process.stdin.resume();
+  });
+}
+
 /** The terminal side of `els attach`: raw keys → `input`, frames → one repaint, window size → `resize`. Returns the exit code. */
 function ownBuildLabel(): string {
   const build = cliBuildIdentity();
   return versionLabel(build, buildCommitTime(build)).label;
 }
 
-function runAttachView(ref: string): Promise<number> {
+function runAttachView(ref: string, remote?: FederatedHost): Promise<number> {
   const label = ownBuildLabel();
   return new Promise((resolve) => {
     const size = () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 });
     const prefix = createPrefixFilter();
     const decodeKeys = createKeyDecoder();
     let last = '';
+    let lastBody: string[] | undefined;
+    let lastNote = '';
     let note = '';
     const paint = (screen: string): void => {
       last = screen;
       const { cols, rows } = size();
+      const body = screen.replace(/^\[screen \d+x\d+ cursor=[^\]]*\]\n/, '').replace(/^\[screen \d+x\d+ scrolled-back=\d+\]\n/, '').replace(/\n+$/, '').split('\n');
+      // ELS-ATTACH-FRAME-DIFF (OP #127484 ③): when only some rows changed since the paint before, write those rows
+      // cursor-addressed (herdr render_ansi pattern) instead of serialising the whole screen again; anything else —
+      // the first paint, a resize, a scroll-back, a note change — is one full repaint as before.
+      if (lastBody !== undefined && lastBody.length === body.length && note === lastNote) {
+        const step = changedRowsPaint(lastBody, body, cols);
+        if (step.changed.length > 0 && step.changed.length < body.length) {
+          lastBody = body;
+          // Cursor-address each changed row, then put the status line where drawView puts it: the last terminal row,
+          // addressed there explicitly — the last changed row may sit anywhere, the status never rides its cursor.
+          const last = step.changed[step.changed.length - 1] + 1;
+          process.stdout.write(`${step.paint}\u001b[${rows};1H\u001b[7m${fitCells(statusLine(ref, [note, label].filter(Boolean).join(' · ')), cols)}\u001b[0m\u001b[${last};1H`);
+          return;
+        }
+      }
+      lastBody = body;
+      lastNote = note;
       process.stdout.write(drawView({ screen, cols, rows, status: statusLine(ref, [note, label].filter(Boolean).join(' · ')) }));
     };
     let finished = false;
@@ -531,19 +638,25 @@ function runAttachView(ref: string): Promise<number> {
     // screen stays, the note says so, and the view re-attaches once a second until the server answers again (every
     // attach starts with the pane's current screen, so the pane comes back as it was).
     let everFramed = false;
-    let attached: ReturnType<typeof attachEls> | undefined;
+    let attached: ReturnType<typeof attachEls> | ReturnType<typeof attachElsOverSsh> | undefined;
     let retry: ReturnType<typeof setTimeout> | undefined;
     const open = (): void => {
-      attached = attachEls(elsSocketPath(), ref, paneSize(), {
+      const handlers: AttachHandlers = {
         onFrame: (frame) => { everFramed = true; note = noteAfterFrame(note); paint(frame.screen); },   // the first recovered frame ends the «다시 붙는 중» note
         // A pane that exits under the view is not a detach: say so and exit 1 (detach is the only 0).
         onEnd: (exitCode, reason) => {
           if (finished) return;
-          if (everFramed && isServerAway(reason)) { note = RECONNECT_NOTE; paint(last); retry = setTimeout(open, 1_000); retry.unref?.(); return; }
+          if (!remote && everFramed && isServerAway(reason)) { note = RECONNECT_NOTE; paint(last); retry = setTimeout(open, 1_000); retry.unref?.(); return; }
           finish(1, reason === 'pane exited' ? 'els attach: the pane exited' : (exitCode === 0 ? `els attach: ${reason || 'the stream ended'}` : reason), reason === 'pane exited');
         },
         onError: (problem) => { note = problem; paint(last); },
-      });
+      };
+      if (remote) {
+        const address = parseAddress(ref)!;
+        // ELS-ATTACH-FRAME-DIFF: `diff:true` rides `attachEls` only — the ssh half (attachElsOverSsh →
+        // `side attach-stdio` argv) carries no such flag on its wire, so the remote keeps full frames by contract.
+        attached = attachElsOverSsh(remote, address.pane, paneSize(), handlers, undefined, address);
+      } else attached = attachEls(elsSocketPath(), ref, paneSize(), handlers, { diff: true });   // ELS-ATTACH-FRAME-DIFF: rows-only frames, assembled in the client
     };
     open();
     const onKey = (chunk: Buffer): void => {
@@ -571,8 +684,9 @@ function runAppView(sidebar: boolean | undefined): Promise<number> {
     remote: { list: () => hosts.list(), read: (address) => hosts.read(address) },
     request: (request) => requestEls(elsSocketPath(), request),
     attach: (pane, size, handlers) => attachEls(elsSocketPath(), pane, size, handlers),
-    // ELS-FIRST-RUN-FU3 ②: the list poll repaints too — an unchanged screen is not written to the terminal again.
-    write: (() => { let last: string | undefined; return (text: string) => { if (text === last) return; last = text; process.stdout.write(text); }; })(),
+    // ELS-FIRST-RUN-FU3 ② · ELS-APP-RENDER-SINGLE-FRAME: an unchanged screen writes nothing; otherwise only the changed
+    // rows, as one write inside a DEC 2026 synchronized update.
+    write: createAppFrameWriter((text) => { process.stdout.write(text); }),
     size: () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 }),
     cwd: process.cwd(),
     buildLabel: ownBuildLabel(),

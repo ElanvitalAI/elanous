@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Command } from 'commander';
 import { Database } from 'bun:sqlite';
 import { formatMessage, registerMsgListCommand } from './msg-list-cli.js';
+import { readUnreadCount } from '../msg/msg-store.js';
 import { registerMsgWaitForCommands } from './msg-wait-for-cli.js';
 import { registerMsgReceiptsCommands } from './msg-receipts-cli.js';
 import { existsSync, mkdirSync } from 'node:fs';
@@ -10,6 +11,7 @@ import { dirname, join } from 'node:path';
 import { ensureAuthToken } from '../auth/acp-token.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { canonicalMessageAddress, canonicalSeatId, defaultMsgStorePath, openMsgStore, openMsgStoreReadOnly, type Message, type MessageEnvelope, type MsgStore } from '../msg/msg-store.js';
+import { archiveDeliveredRows, defaultArchivePath, MSG_ARCHIVE_DEFAULT_DAYS } from '../msg/msg-archive.js';
 import { buildMsgHookOutput, seatFromCwd, type MsgHookEvent, type MsgHookFormat } from '../msg/msg-hook.js';
 import { SEAT_AGENT_RUNTIMES, type SeatAgentRuntime } from '../loops/seat-registry.js';
 import { MAIL_FALLBACK_MS, runMailFallback, spawnMailFallback } from '../msg/msg-mail-fallback.js';
@@ -224,8 +226,8 @@ function recordHandSeen(store: MsgStore, to: string, id: number): void {
 
 /** Register the durable, recipient-addressed CLI. Reading never advances the acknowledgement cursor. */
 export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): void {
-  const open = deps.openStore ?? (() => openMsgStore());
-  const openRead = deps.openReadStore ?? (() => openMsgStoreReadOnly());
+  const open = deps.openStore ?? (() => openMsgStore(undefined, { archivePath: defaultArchivePath() }));
+  const openRead = deps.openReadStore ?? (() => openMsgStoreReadOnly(undefined, { archivePath: defaultArchivePath() }));
   const out = deps.out ?? console;
   // [JUD-B #106365 must 1] 기본 stdin 읽기는 취소 가능 reader — 상한 race 에서 져도 fd0 를 즉시 반납한다
   // (취소 없으면 진행 중 Bun.stdin.text() 읽기가 fd0 을 붙잡은 채 프로세스가 종료하지 않는다).
@@ -804,6 +806,19 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       emit(opts.through === undefined ? { recipient: to, cursor: acknowledged } : { recipient: to, through: acknowledged }, opts.json, () => out.log(`${to} acknowledged through #${acknowledged}`));
     })());
 
+  msg.command('count').description('Read one recipient’s unread count as JSON without reading message bodies')
+    .option('--to <seat>').option('--json')
+    .action((opts: { to?: string }) => run(() => {
+      const to = messageRecipient(opts.to, '--to');
+      let count: number | null = null;
+      try {
+        // A readable ledger alone does not establish that an inbox was declared.
+        const registry = registrySnapshot(deps.wakeDeps ?? {}).routed;
+        if (registry.status === 'ready' && registry.registry.seats.some(entry => entry.address === to)) count = readUnreadCount(to);
+      } catch { /* An unavailable declaration or ledger is unknown, not zero. */ }
+      out.log(JSON.stringify({ status: count === null ? 'unknown' : 'ok', count }));
+    })());
+
   msg.command('unread').description('Show recipients with unacknowledged messages')
     .option('--to <seat>').option('--json')
     .action((opts: CommonOptions & { to?: string }) => run(() => {
@@ -826,6 +841,19 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         if (!rows.length) out.log('No unread messages.');
         for (const row of rows) out.log(`${row.recipient}: ${row.count} unread`);
       });
+    })());
+
+  // MSG-LEDGER-RETENTION-INDEX ①③ — 7일 지난 배달·ack 끝난 직통 행을 보관 원장으로(원장 보존·커서 정리).
+  msg.command('archive').description('Move delivered-and-acked direct rows older than --days into the archive ledger')
+    .option('--archive <path>', 'archive ledger path (default: messages-archive.db beside the ledger)')
+    .option('--days <n>', 'retention window in days', String(MSG_ARCHIVE_DEFAULT_DAYS))
+    .option('--json')
+    .action((opts: CommonOptions & { archive?: string; days?: string }) => run(() => {
+      const days = integer(opts.days, '--days', MSG_ARCHIVE_DEFAULT_DAYS, 1, 3650);
+      const archive = opts.archive ?? defaultArchivePath();
+      const outcome = withStore(store => archiveDeliveredRows(store, archive, { days }));
+      emit({ ...outcome, archive, days }, opts.json,
+        () => out.log(`archived ${outcome.archived} row(s) to ${archive} (cutoff ${outcome.cutoffIso}; cursors ${JSON.stringify(outcome.cursors)})`));
     })());
 
   msg.command('watch').description('Watch durable messages; SSE accelerates delivery and polling covers outages')

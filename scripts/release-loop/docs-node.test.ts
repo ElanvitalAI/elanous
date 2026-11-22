@@ -474,10 +474,10 @@ test('GATE-NODES-PARALLEL: a staged prefetch is what the late tui and docs nodes
     }
     return '';
   };
-  const first = '─┤ ChatLog ├──\n❯ /command, or type a question\n 📁 elan/monad-agent  │ ⌥ main │ some-model │ ctx 0 │ 🖥 mbp';
-  const help = `┌── Dashboard help ──\n│Commands\n│/help  Show help overlay\n${first}`;
+  const first = '❯ /command, or type a question\nTurn idle · Model some-model · Queue 0 · Bg 0 · …/T/tui-node-1Dc7mS/tree · 9.9.9-dev.0 · dev · 261122_1209';
+  const help = 'Commands\n/help · /help next — Command and key guide\nKeys\nEsc returns to input\n❯\nTurn idle · Model some-model · Queue 0 · Bg 0 · …/T/tui-node-1Dc7mS/tree · 9.9.9-dev.0 · dev · 261122_1209';
   let tuiRuns = 0;
-  const tui = (at: string) => { tuiRuns++; return tuiNodeOutput(at, [{ checks: tuiChecks({ readyMs: 9000, first, help, afterEsc: first }) }], { unmeasured: 'fixture' }); };
+  const tui = (at: string) => { tuiRuns++; return tuiNodeOutput(at, [{ checks: tuiChecks({ readyMs: 9000, first, help, afterEsc: first, marker: 'esc-alive-docs-fixture', afterMarker: first.replace('❯', '❯ esc-alive-docs-fixture') }) }], { unmeasured: 'fixture' }); };
 
   const staged = stagePrefetch(context, env, root, run, { stateRoot: state, tui });
   expect(staged).toMatchObject({ version: '9.9.9', commit, main });
@@ -521,8 +521,9 @@ test('GATE-NODES-PARALLEL: a staged prefetch is what the late tui and docs nodes
 });
 
 // Real `bun scripts/release-loop/tui-sim-node.ts --commit <cut> --json` stdout (node-b shadow rehearsal 2026-10-10, 0.2.23 cut).
+// esc-alive entry spliced in (#39559 — the 0.2.23 capture predates the check).
 // It has NO `outcome` — node-verdict.ts tui adds that. The prefetch reuses THIS shape, so the reuse test must feed it.
-const TUI_SIM_RAW_STDOUT = "{\"verdict\": \"pass\", \"commit\": \"4a8b340ca05e8e110a770563bd93c651146405e4\", \"attempts\": 1, \"checks\": [{\"id\": \"boot\", \"pass\": true, \"detail\": \"ready in 13430ms\"}, {\"id\": \"prompt\", \"pass\": true, \"detail\": \"input line (❯) on the first screen\"}, {\"id\": \"status-bar\", \"pass\": true, \"detail\": \"status bar with model and ctx\"}, {\"id\": \"help-opens\", \"pass\": true, \"detail\": \"/help shows the help overlay\"}, {\"id\": \"help-closes\", \"pass\": true, \"detail\": \"Esc closes the overlay\"}, {\"id\": \"no-error-text\", \"pass\": true, \"detail\": \"no error text on any screen\"}], \"png\": \"/var/folders/6w/lwcnwd3146s1sd01fxn67ggr0000gn/T/tui-node-2yTEFm/snap-001-release-check.png\", \"regress\": {\"results\": [{\"id\": \"R1\", \"title\": \"첫 화면 — 입력칸 · «Step 1» 0 (ONB1)\", \"ok\": true, \"reason\": \"입력칸이 보이고 «Step 1» 이 없다\"}, {\"id\": \"R2\", \"title\": \"빈 입력 Ctrl+C → 안내 → 2초 뒤 사라짐 (U1a · #22868)\", \"ok\": true, \"reason\": \"안내가 떴다가 2초 뒤 사라졌다\"}, {\"id\": \"R3\", \"title\": \"글 친 뒤 Ctrl+C → 입력 지움 · 안내 없음 (U1a)\", \"ok\": true, \"reason\": \"글이 지워지고 안내는 없다\"}, {\"id\": \"R4\", \"title\": \"owner 팔레트 — /directive · /help 보임 (MAT1c)\", \"ok\": true, \"reason\": \"/directive 보임 · /help 보임\"}, {\"id\": \"R5\", \"title\": \"general 팔레트 — /directive 숨김 · /help 보임 (MAT1c)\", \"ok\": true, \"reason\": \"/directive 숨김 · /help 보임\"}, {\"id\": \"R6\", \"title\": \"/help 가 그려지고 입력칸이 남는다 (U1b · #22802)\", \"ok\": true, \"reason\": \"도움말이 그려졌다(명령 줄 32 · Keys 절 · 입력칸 유지)\"}, {\"id\": \"R7\", \"title\": \"답 오는 중 쳐 둔 두 줄이 내 말로 차례로 (U1c2 · #23026 · 실제 LLM 턴)\", \"ok\": true, \"reason\": \"내 말2 → 답2 → 내 말3 → 답3\"}], \"pass\": 7, \"fail\": 0}}";
+const TUI_SIM_RAW_STDOUT = "{\"verdict\": \"pass\", \"commit\": \"4a8b340ca05e8e110a770563bd93c651146405e4\", \"attempts\": 1, \"checks\": [{\"id\": \"boot\", \"pass\": true, \"detail\": \"ready in 13430ms\"}, {\"id\": \"prompt\", \"pass\": true, \"detail\": \"input line (❯) on the first screen\"}, {\"id\": \"status-bar\", \"pass\": true, \"detail\": \"status bar with model and ctx\"}, {\"id\": \"help-opens\", \"pass\": true, \"detail\": \"/help shows the help overlay\"}, {\"id\": \"help-closes\", \"pass\": true, \"detail\": \"Esc closes the overlay\"}, {\"id\": \"esc-alive\", \"pass\": true, \"detail\": \"Esc-alive marker echoed on the input line\"}, {\"id\": \"no-error-text\", \"pass\": true, \"detail\": \"no error text on any screen\"}], \"png\": \"/var/folders/6w/lwcnwd3146s1sd01fxn67ggr0000gn/T/tui-node-2yTEFm/snap-001-release-check.png\", \"regress\": {\"results\": [{\"id\": \"R1\", \"title\": \"첫 화면 — 입력칸 · «Step 1» 0 (ONB1)\", \"ok\": true, \"reason\": \"입력칸이 보이고 «Step 1» 이 없다\"}, {\"id\": \"R2\", \"title\": \"빈 입력 Ctrl+C → 안내 → 2초 뒤 사라짐 (U1a · #22868)\", \"ok\": true, \"reason\": \"안내가 떴다가 2초 뒤 사라졌다\"}, {\"id\": \"R3\", \"title\": \"글 친 뒤 Ctrl+C → 입력 지움 · 안내 없음 (U1a)\", \"ok\": true, \"reason\": \"글이 지워지고 안내는 없다\"}, {\"id\": \"R4\", \"title\": \"owner 팔레트 — /directive · /help 보임 (MAT1c)\", \"ok\": true, \"reason\": \"/directive 보임 · /help 보임\"}, {\"id\": \"R5\", \"title\": \"general 팔레트 — /directive 숨김 · /help 보임 (MAT1c)\", \"ok\": true, \"reason\": \"/directive 숨김 · /help 보임\"}, {\"id\": \"R6\", \"title\": \"/help 가 그려지고 입력칸이 남는다 (U1b · #22802)\", \"ok\": true, \"reason\": \"도움말이 그려졌다(명령 줄 32 · Keys 절 · 입력칸 유지)\"}, {\"id\": \"R7\", \"title\": \"답 오는 중 쳐 둔 두 줄이 내 말로 차례로 (U1c2 · #23026 · 실제 LLM 턴)\", \"ok\": true, \"reason\": \"내 말2 → 답2 → 내 말3 → 답3\"}], \"pass\": 7, \"fail\": 0}}";
 
 test('GATE-NODES-PARALLEL: a prefetched raw tui-sim result (no outcome field) is reused by the late tui node — no rerun', async () => {
   const { stagePrefetch, joinTui, commandRunner } = await import('./docs-node.js');
@@ -791,9 +792,9 @@ test('GATE-NODES-PARALLEL: failed worktree add removes only its own tree, preser
   expect(calls).toContain(`git worktree remove --force ${tree}`);
   expect(readdirSync(join(contexts, 'docs-prefetch')).filter((name) => name.endsWith('.json') || name === 'claim')).toHaveLength(0);
   // The run can now be retried: the tree path is free again.
-  const first = '─┤ ChatLog ├──\n❯ /command, or type a question\n 📁 elan/monad-agent  │ ⌥ main │ some-model │ ctx 0 │ 🖥 mbp';
-  const help = `┌── Dashboard help ──\n│Commands\n│/help  Show help overlay\n${first}`;
-  const tui = () => tuiNodeOutput(commit, [{ checks: tuiChecks({ readyMs: 9000, first, help, afterEsc: first }) }], { unmeasured: 'fixture' });
+  const first = '❯ /command, or type a question\nTurn idle · Model some-model · Queue 0 · Bg 0 · …/T/tui-node-1Dc7mS/tree · 9.9.9-dev.0 · dev · 261122_1209';
+  const help = 'Commands\n/help · /help next — Command and key guide\nKeys\nEsc returns to input\n❯\nTurn idle · Model some-model · Queue 0 · Bg 0 · …/T/tui-node-1Dc7mS/tree · 9.9.9-dev.0 · dev · 261122_1209';
+  const tui = () => tuiNodeOutput(commit, [{ checks: tuiChecks({ readyMs: 9000, first, help, afterEsc: first, marker: 'esc-alive-docs-fixture', afterMarker: first.replace('❯', '❯ esc-alive-docs-fixture') }) }], { unmeasured: 'fixture' });
   const retry = (command: string, args: string[], cwd?: string, timeout?: number, childEnv?: NodeJS.ProcessEnv) => {
     if (command === 'git' && args[0] === 'rev-parse') return 'b'.repeat(40);
     if (command === 'git' && args[0] === 'worktree' && args[1] === 'add') {
@@ -839,10 +840,10 @@ test('GATE-NODES-PARALLEL: a failed docs stage does not discard the finished tui
     if (command === process.execPath) return commandRunner(command, [args[0], '--version', '8.8.8', '--base', cwd ?? root, '--json'], cwd, timeout, childEnv);
     return '';
   };
-  const first = '─┤ ChatLog ├──\n❯ /command, or type a question\n 📁 elan/monad-agent  │ ⌥ main │ some-model │ ctx 0 │ 🖥 mbp';
-  const help = `┌── Dashboard help ──\n│Commands\n│/help  Show help overlay\n${first}`;
+  const first = '❯ /command, or type a question\nTurn idle · Model some-model · Queue 0 · Bg 0 · …/T/tui-node-1Dc7mS/tree · 9.9.9-dev.0 · dev · 261122_1209';
+  const help = 'Commands\n/help · /help next — Command and key guide\nKeys\nEsc returns to input\n❯\nTurn idle · Model some-model · Queue 0 · Bg 0 · …/T/tui-node-1Dc7mS/tree · 9.9.9-dev.0 · dev · 261122_1209';
   let tuiRuns = 0;
-  const tui = () => { tuiRuns++; return tuiNodeOutput(commit, [{ checks: tuiChecks({ readyMs: 9000, first, help, afterEsc: first }) }], { unmeasured: 'fixture' }); };
+  const tui = () => { tuiRuns++; return tuiNodeOutput(commit, [{ checks: tuiChecks({ readyMs: 9000, first, help, afterEsc: first, marker: 'esc-alive-docs-fixture', afterMarker: first.replace('❯', '❯ esc-alive-docs-fixture') }) }], { unmeasured: 'fixture' }); };
   expect(() => stagePrefetch(context, env, root, run, { stateRoot: state, tui })).toThrow(/failed/);
   expect(tuiRuns).toBe(1);
   const dir = join(contexts, 'docs-prefetch');

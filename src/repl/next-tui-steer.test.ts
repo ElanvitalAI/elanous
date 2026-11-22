@@ -114,7 +114,7 @@ describe('A200 mid-turn steer — through runTurn (the REPL child path)', () => 
       const inbox = createNextTuiSteerInbox(meta.id, (ids) => applied.push(ids));
       await runTurn({
         userConfig: { chat: {}, llm: { provider: provider.name, model: provider.defaultModel,
-          memoryJudge: { enabled: false, crossRecall: false }, goalLoop: { enabled: false } } } as never,
+          memoryJudge: { enabled: false, crossRecall: false } } } as never,
         sessionId: meta.id,
         userText: 'original run-turn prompt',
         systemPrompt: 'base prompt',

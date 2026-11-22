@@ -40,7 +40,7 @@ function attachAuth(socketPath: string): string | undefined {
   catch { return owner; }
 }
 
-export function attachEls(socketPath: string, pane: string, size: { cols: number; rows: number }, handlers: AttachHandlers): Attached {
+export function attachEls(socketPath: string, pane: string, size: { cols: number; rows: number }, handlers: AttachHandlers, opts?: { diff?: boolean }): Attached {
   let ended = false;
   const tooLong = elsSocketPathProblem(socketPath);
   // JUD-B must #107737: end 는 socket 선언 뒤에 정의한다 — tooLong 조기 반환 경로에는 socket 이 없어서, end 가
@@ -59,16 +59,35 @@ export function attachEls(socketPath: string, pane: string, size: { cols: number
   if (auth) write({ op: 'auth', token: auth, pid: process.pid });
   // The attach line is queued right behind the auth line (Node buffers writes in order until the socket connects),
   // so an `input`/`resize` called before `connect` can only follow it, never overtake it.
-  write({ op: 'attach', pane, cols: size.cols, rows: size.rows });
+  // ELS-ATTACH-FRAME-DIFF (OP #127484 ③): `diff:true` asks the server for row diffs; the assembler below rebuilds the
+  // full screen before the handlers see it, so the AttachHandlers contract (a full frame) never changes.
+  write({ op: 'attach', pane, cols: size.cols, rows: size.rows, ...(opts?.diff ? { diff: true } : {}) });
+  // The row-diff assembler: the last full screen this attach assembled. A `frame` (always full) resets it; a
+  // `frame-diff` patches the changed rows. Cleared on end — a re-attach starts from a server full frame again.
+  let assembled: string[] | undefined;
   const lines = createLineDecoder((line) => {
-    let value: { type?: string; exitCode?: 0 | 1 | 2; message?: string } & Partial<AttachFrame>;
+    let value: { type?: string; exitCode?: 0 | 1 | 2; message?: string } & Partial<AttachFrame> & { count?: unknown; lines?: unknown };
     try { value = JSON.parse(line) as typeof value; } catch { end(1, 'els: malformed frame from the els server'); return; }
     // The door answers a refused attach with a plain result line (no `type`) and closes: that refusal is the end, with its own
     // words — left to the socket close it would read as «the server closed the connection», the signal views retry on.
     // (The auth ack is also a plain result line, but with exitCode 0.)
     if (value && value.type === undefined && typeof value.exitCode === 'number' && value.exitCode !== 0) { end(value.exitCode, value.message ?? 'refused'); return; }
     if (value.type === 'frame' && typeof value.screen === 'string') {
+      // The assembler baseline is the same body the server diffs against — renderScreen's scroll header stripped —
+      // so a diff row index after a scroll → live return addresses the row the server means (JUD #127758).
+      assembled = value.screen.replace(/^\[screen \d+x\d+ scrolled-back=\d+\]\n/, '').split('\n');
       handlers.onFrame({ pane: String(value.pane), seq: Number(value.seq), cols: Number(value.cols), rows: Number(value.rows), back: Number(value.back ?? 0), screen: value.screen });
+    } else if (value.type === 'frame-diff') {
+      const count = Number(value.count);
+      const rows = Array.isArray(value.lines) ? value.lines : [];
+      if (!assembled || !Number.isFinite(count) || count < 0) return;   // a diff before any full frame, or malformed: ignore, the next full frame repairs it
+      for (const row of rows) {
+        if (!row || typeof row !== 'object') continue;
+        const i = Number((row as { i?: unknown }).i);
+        const t = (row as { t?: unknown }).t;
+        if (Number.isInteger(i) && i >= 1 && i <= count && typeof t === 'string') assembled[i - 1] = t;
+      }
+      handlers.onFrame({ pane: String(value.pane), seq: Number(value.seq), cols: Number(value.cols), rows: Number(value.rows), back: Number(value.back ?? 0), screen: assembled.join('\n') });
     } else if (value.type === 'end') end(value.exitCode ?? 0, value.message ?? '');
     else if (value.type === 'error') handlers.onError?.(value.message ?? 'refused');
   });

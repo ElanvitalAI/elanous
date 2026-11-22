@@ -41,7 +41,7 @@ import * as features from '../release-loop/feature-store.js';
 import { evidencePlan, fetchMergedChecklistPrs, landedButYellow, type MergedPrRunner } from '../release-loop/landed-but-yellow.js';
 import { formatSchedule, getSchedule, listSchedules, planIncrementalSweepTick, setSchedule } from '../release-loop/release-schedule.js';
 import { readSweepCertificate } from '../../scripts/release-loop/sweep-cert.js';
-import { mergedPrsLast24h, placeCell, planPullForward, pullForwardPlacementConfig, rebalance, seatMove, type PlacementPriority } from '../release-loop/placement.js';
+import { mergedPrsLast24h, placeCell, planPullForward, pullForwardPlacementConfig, rebalance, seatMove, seatMoveMany, type PlacementPriority } from '../release-loop/placement.js';
 import { readTrafficSignal } from '../seat-loop/traffic-signal.js';
 import { parseRubric, parseRubricS, readRubricItems, rubricGrade, rubricScore } from '../release-loop/rubric.js';
 import { writeStdoutJson } from './stdout-json.js';
@@ -1162,9 +1162,9 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       const data = seedFromRoadmap(version, readFileSync(opts.from, 'utf8'));
       if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${version} ${data.items.length}칸`);
     });
-  withContext(checklist.command('move <id>').description('칸을 한 트랜잭션으로 다른 판에 옮긴다'))
+  withContext(checklist.command('move <ids...>').description('칸(여럿 가능)을 한 트랜잭션으로 다른 판에 옮긴다 · 하나라도 틀리면 아무것도 안 옮긴다'))
     .requiredOption('--from <v>', '현재 판').requiredOption('--to <v>', '새 판').option('--reason <reason>', '이동 사유')
-    .action((id: string, opts: { from: string; to: string; reason?: string }, cmd: Command) => {
+    .action((ids: string[], opts: { from: string; to: string; reason?: string }, cmd: Command) => {
       const { codenames, json } = context(cmd);
       const from = checklistVersion(opts.from, codenames), to = checklistVersion(opts.to, codenames);
       if (!opts.reason?.trim()) throw new CliUserError('이동 이유가 필요하다');
@@ -1172,11 +1172,18 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       if (actor() === 'cli') {
         // No seat identity (ELANOUS_TRACK unset): keep the plain move so seat sessions without the variable still work, but say so.
         console.error('⚠ 자리 신원 없음(ELANOUS_TRACK 미설정) — 자리 규칙(자기 칸 · 다음 판 · 용량) 검사 없이 옮긴다');
-        debug.log('release.placement', 'anonymous-move', { id, from, to });
-        features.move(id, from, to, actor(), undefined, undefined, opts.reason);
-      } else if (actor() !== 'OP') seatMove(id, from, to, actor(), opts.reason, { schedules: listSchedules(scheduleLedgerRoot()) });
-      else features.move(id, from, to, actor(), undefined, undefined, opts.reason);
-      if (json) console.log(JSON.stringify(listChecklist(to))); else console.log(`✅ ${id} ${from} → ${to}`);
+        debug.log('release.placement', 'anonymous-move', ids.length === 1 ? { id: ids[0], from, to } : { ids, from, to });
+        features.moveMany(ids, from, to, actor(), undefined, undefined, opts.reason);
+      } else if (actor() !== 'OP') {
+        const schedules = listSchedules(scheduleLedgerRoot());
+        if (ids.length === 1) seatMove(ids[0]!, from, to, actor(), opts.reason, { schedules });
+        else seatMoveMany(ids, from, to, actor(), opts.reason, { schedules });
+      } else features.moveMany(ids, from, to, actor(), undefined, undefined, opts.reason);
+      if (json) console.log(JSON.stringify(listChecklist(to)));
+      else {
+        for (const id of ids) console.log(`✅ ${id} ${from} → ${to}`);
+        if (ids.length > 1) console.log(`✅ 합계 ${ids.length}칸 ${from} → ${to}`);
+      }
     });
   withContext(checklist.command('retitle <id> <title>').description('칸 제목 수정')).option('--strict', '대상 경로·완료 경계 경고가 있으면 저장 전 거부').action(async (id: string, title: string, opts: { strict?: boolean }, cmd: Command) => {
     const { version, json } = context(cmd);

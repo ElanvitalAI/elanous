@@ -90,6 +90,59 @@ export function afterJudgement(step: EscalationStep): WorkTierClass {
   return step.from;
 }
 
+// ── 상시 하향 계기(ROUTER-STEP-UP-DOWN r1 · OP #127661) ──────────────────────
+// 칸 본문: «고급(terra/sol)은 checkpoint(계획·최종 검토·보안)와 «실패 신호» 때 1턴만 올렸다가 바로 내림» —
+// 그 역변으로, 쉬운 일에 성공이 쌓이면 «상시»로 한 단계씩 내려 가벼운 모델 장기 점유로 돌아간다.
+// 올림(escalateOnce·afterJudgement)과 달리 하향은 판정 하나 뒤가 아니라 계기가 살아 있는 동안 계속 적용된다.
+// 런타임 신호(연속 성공 턴·쉬운 일 분류·순간)는 HARNESS-ADVISOR-CHECKPOINTS 칸이 `stepDownOnce` 에 넣는다(escalateOnce 와 같은 배선).
+
+/** 하향 계기: 연속 성공 턴 수 — «성공 N턴». 쉬운 일 분류와 함께 충족되어야 한다.
+ *  NUMGUARD: 출처 = OP #127661 «상시 하향 계기 — N은 이 PR 튜닝 상수»(ROUTER-STEP-UP-DOWN r1). 실측 재튜닝은 #39502 원장. */
+export const WORK_STEPDOWN_SUCCESS_TURNS = 3;
+
+/** 하향 금지 순간 — 칸 본문 checkpoint(계획·최종 검토·보안). advisor 순간 어휘(plan·pre-complete)와 정합. */
+export const STEPDOWN_CHECKPOINT_MOMENTS: readonly string[] = ['plan', 'pre-complete', 'security'];
+
+/** 하향 계기 이름 — 코어 `advisor:${순간}` 어휘의 부분집합이라 원장의 WorkTierTrigger 칸에 그대로 실린다. */
+export type StepDownTrigger = 'advisor:step-down';
+
+/** ADVISOR 칸이 채울 런타임 하향 신호(이 PR 에서는 관측하지 않는다 — escalateOnce 와 같은 배선). */
+export interface StepDownSignals {
+  /** 지금 과제에서 연속 성공(녹색 판정·완결)한 턴 수. */
+  readonly successTurns?: number;
+  /** 과제가 쉬운 일로 분류되었는가(라우터 budget/cheap 분류). */
+  readonly easyTask?: boolean;
+  /** 지금 순간의 checkpoint 이름 — STEPDOWN_CHECKPOINT_MOMENTS 안이면 고급이 필요한 순간이라 내리지 않는다. */
+  readonly checkpointMoment?: string;
+  /** 올림 계기(실패 신호) — 살아 있으면 올림이 우선이라 내리지 않는다. */
+  readonly escalating?: EscalationSignals;
+}
+
+export interface StepDownStep {
+  readonly from: WorkTierClass;
+  readonly to: WorkTierClass;
+  readonly trigger: StepDownTrigger;
+}
+
+function oneStepDown(tier: WorkTierClass): WorkTierClass | null {
+  const index = WORK_TIER_CLASSES.indexOf(tier);
+  return index > 0 ? WORK_TIER_CLASSES[index - 1] ?? null : null;
+}
+
+/** 순수: «성공 N턴 + 쉬운 일 분류» 상시 계기가 살아 있으면 «한 단계만» 아래.
+ *  checkpoint 순간 · 살아 있는 올림 계기 · 최하등급(weak)이면 null(내리지 않는다). */
+export function stepDownOnce(current: WorkTierClass, signals: StepDownSignals): StepDownStep | null {
+  if (signals.checkpointMoment !== undefined && STEPDOWN_CHECKPOINT_MOMENTS.includes(signals.checkpointMoment)) return null;
+  if (escalationTrigger(signals.escalating ?? {})) return null;
+  if (signals.easyTask !== true) return null;
+  // terra r1 mustFix(유한 턴 수만 허용): NaN·Infinity 는 «성공 N턴 확인됨»이 아니므로 내리지 않는다.
+  // 결함: NaN < N 은 거짓이라 (successTurns ?? 0) < N 가드를 통과해 3턴 미확인인데도 하향했다.
+  const successTurns = signals.successTurns;
+  if (typeof successTurns !== 'number' || !Number.isFinite(successTurns) || successTurns < WORK_STEPDOWN_SUCCESS_TURNS) return null;
+  const to = oneStepDown(current);
+  return to === null ? null : { from: current, to, trigger: 'advisor:step-down' };
+}
+
 /** 등급의 출력 상한(강만). 호출측은 이 값을 요청 max_tokens 로 쓴다. */
 export function outputCapForClass(tier: WorkTierClass): number | undefined {
   return tier === 'strong' ? STRONG_OUTPUT_MAX_TOKENS : undefined;

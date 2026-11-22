@@ -1,4 +1,4 @@
-// els client · ELS-ONE-SPACE (대표 11-18 «사이드탭 제품 분리»: the side panel is els's, not eln's) — herdr's layout as two
+// els client · ELS-ONE-SPACE (decision 11-18 «사이드탭 제품 분리»: the side panel is els's, not eln's) — herdr's layout as two
 // pure parts the attach app draws:
 //   • the folded space list (left): a «spaces» head, one line per workspace — the most urgent status dot inside it and the
 //     UPPERCASE name (the selected one reverse video, its path on the line under it) — and «new · menu» last; no pane
@@ -46,7 +46,7 @@ export function withCommands(rows: readonly PaneRow[], listJson: string): SpaceT
 }
 
 const AGENT_KINDS = new Set(['eln', 'codex', 'claude', 'grok']);
-// 대표 11-18 emoji set: 💬 chat ⌨️ shell 🤖 agent 🛠 harness 📦 pod 🌐 remote.
+// decision 11-18 emoji set: 💬 chat ⌨️ shell 🤖 agent 🛠 harness 📦 pod 🌐 remote.
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'fish', 'nu', 'pwsh']);
 const AGENTS = new Set(['claude', 'codex', 'grok', 'gemini', 'opencode', 'aider']);
 const CHATS = new Set(['eln', 'elanous', 'elanous.mjs']);
@@ -114,6 +114,7 @@ export interface SpaceListLayout {
   /** One per visible space name row: `y` = screen row (1-based; the first list line is row 1), `pane` = the space's first pane. */
   readonly spaces: readonly { readonly y: number; readonly ws: string; readonly pane: string }[];
   /** The words «new» and «menu» in the last line (columns zero-based, end exclusive); absent when the list is too short to show it. */
+  readonly emptySpaces: readonly { readonly y: number; readonly ws: string }[];
   readonly newBox?: SidebarBox;
   readonly menuBox?: SidebarBox;
 }
@@ -136,15 +137,20 @@ const headCells = (text: string, width: number): string => Bun.stringWidth(text)
 const homePath = (cwd: string, home: string | undefined): string => home && (cwd === home || cwd.startsWith(`${home}/`)) ? `~${cwd.slice(home.length)}` : cwd;
 
 /**
- * ELS-SIDEBAR-HERDR-CLEAN (대표 11-21 «워크스페이스 쪽이 왜 이리 지저분하죠»): herdr's list — a «spaces» head, one line per
+ * ELS-SIDEBAR-HERDR-CLEAN (decision 11-21 «워크스페이스 쪽이 왜 이리 지저분하죠»): herdr's list — a «spaces» head, one line per
  * workspace «● NAME» (the name UPPERCASE for display only, one status dot = the most urgent state inside it), the selected
  * space's path on one dim line under it (home as «~», cut by cells), «new · menu» pinned to the last line. No pane count.
  */
-export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: string | undefined, width: number, height: number, home?: string, ceoPendingRed = 0): SpaceListLayout {
-  const chosen = selectedSpace(rows, selectedPane);
+export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: string | undefined, width: number, height: number, home?: string, ceoPendingRed = 0, emptyCoordinators: readonly { wsId: string; name: string; remote?: string; stale?: boolean }[] = [], selectedEmpty?: string): SpaceListLayout {
+  const chosen = selectedEmpty ?? selectedSpace(rows, selectedPane);
   type Item = { readonly text: string; readonly ws?: string; readonly pane?: string; readonly mode?: 'focus' | 'dim' };
-  const nameOf = (space: Space): string => `${markOf(space.panes)} ${space.name.toLocaleUpperCase()}`;
+  const nameOf = (space: Space): string => `${markOf(space.panes)} ${space.panes.some((row) => row.role === 'coordinator') ? '🎼 ' : ''}${space.name.toLocaleUpperCase()}`;
   const items: Item[] = [];
+  const pendingEmpty = emptyCoordinators.filter((space) => !rows.some((row) => row.wsId === space.wsId));
+  const addEmpty = (space: typeof pendingEmpty[number]): void => {
+    items.push({ text: headCells(` ${space.stale ? UNREACHABLE_MARK : STATUS.done.mark} 🎼 ${space.name.toLocaleUpperCase()}`, width), ws: space.wsId, ...(chosen === space.wsId ? { mode: 'focus' as const } : {}) });
+  };
+  for (const space of pendingEmpty.filter((space) => !space.remote)) addEmpty(space);
   const spaceLine = (space: Space, indent: string): void => {
     const selected = space.wsId === chosen;
     items.push({ text: headCells(` ${indent}${nameOf(space)}`, width), ws: space.wsId, pane: space.panes[0]!.pane, ...(selected ? { mode: 'focus' as const } : {}) });
@@ -153,14 +159,25 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
   };
   // ELS-FIRST-RUN-FU3 ③: herdr's seat panes are one bundle under a «herdr» head, folded unless one of its spaces is selected.
   const all = spacesOf(rows);
-  const mine = all.filter((space) => !space.wsId.startsWith(HERDR_WS_PREFIX));
-  const herdr = all.filter((space) => space.wsId.startsWith(HERDR_WS_PREFIX));
+  // A HERDR coordinator must remain visible and ahead of ordinary spaces even
+  // when the HERDR bundle is folded. Do not render it again in the bundle.
+  const pinned = all.filter((space) => space.wsId.startsWith(HERDR_WS_PREFIX) && space.panes.some((row) => row.role === 'coordinator'));
+  const visible = all.filter((space) => !space.wsId.startsWith(HERDR_WS_PREFIX) || pinned.includes(space));
+  const herdr = all.filter((space) => space.wsId.startsWith(HERDR_WS_PREFIX) && !pinned.includes(space));
   const herdrOpen = herdr.some((space) => space.wsId === chosen);
-  for (const space of mine) spaceLine(space, '');
+  const shownEmptyHosts = new Set<string>();
+  const addHostEmpty = (host: string | undefined): void => {
+    if (!host || shownEmptyHosts.has(host)) return;
+    shownEmptyHosts.add(host);
+    for (const space of pendingEmpty.filter((entry) => entry.remote === host)) addEmpty(space);
+  };
+  for (const space of visible) { addHostEmpty(space.panes[0]?.remote); spaceLine(space, ''); }
+  addHostEmpty(herdr[0]?.panes[0]?.remote);
   if (herdr.length > 0) {
     items.push({ text: `${herdrOpen ? ' ⊟' : ' ⊞'} HERDR · ${herdr.length}` });
     if (herdrOpen) for (const space of herdr) spaceLine(space, '  ');
   }
+  for (const space of pendingEmpty) addHostEmpty(space.remote);
   const head = height >= 3;
   const foot = height >= 2;
   const room = height - (head ? 1 : 0) - (foot ? 1 : 0);
@@ -169,11 +186,15 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
   const start = items.length <= room ? 0 : Math.min(at, Math.max(Math.min(Math.max(0, at - Math.floor(room / 2)), items.length - room), at + tail + 1 - room));
   const lines: string[] = [];
   const spaces: { y: number; ws: string; pane: string }[] = [];
+  const emptySpaces: { y: number; ws: string }[] = [];
   if (head) lines.push(ceoPendingRed !== 0
     ? `\u001b[31m${fitCells(ceoPendingRed < 0 ? ' 🔴 대표 대기 글 확인 불가' : ` 🔴 대표 대기 글 ${ceoPendingRed}`, width)}\u001b[39m`
     : `\u001b[2m${fitCells(SPACE_LIST_HEAD, width)}\u001b[22m`);
   for (const item of items.slice(start, start + room)) {
-    if (item.ws !== undefined) spaces.push({ y: lines.length + 1, ws: item.ws, pane: item.pane! });
+    if (item.ws !== undefined) {
+      if (item.pane !== undefined) spaces.push({ y: lines.length + 1, ws: item.ws, pane: item.pane });
+      else emptySpaces.push({ y: lines.length + 1, ws: item.ws });
+    }
     const text = fitCells(item.text, width);
     lines.push(item.mode === 'focus' ? `${FOCUS_ON}${text}${FOCUS_OFF}` : item.mode === 'dim' ? `\u001b[2m${text}\u001b[22m` : text);
   }
@@ -186,7 +207,7 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
     menuBox = { y: lines.length + 1, from: SPACE_LIST_END.indexOf('menu'), to: SPACE_LIST_END.indexOf('menu') + 4 };
     lines.push(fitCells(SPACE_LIST_END, width));
   }
-  return { lines, spaces, ...(newBox ? { newBox, menuBox: menuBox! } : {}) };
+  return { lines, spaces, emptySpaces, ...(newBox ? { newBox, menuBox: menuBox! } : {}) };
 }
 
 /** The folded space list: exactly `height` lines of `width` cells (see layoutSpaceList for the hit boxes). */
@@ -204,7 +225,7 @@ export interface TabRow {
 
 // ELS-FIRST-RUN-FU3 (OP #101592 · #101606): the tab row reads like herdr's — «emoji name» per tab, two spaces between,
 // «+» (new tab) last. No command path (a path keeps its last name), no build badge, no status dot, no ▸.
-// ELS-TAB-STYLE-HERDR (대표 11-21): herdr's look — names UPPERCASE (display only; the stored title is untouched), each tab a padded
+// ELS-TAB-STYLE-HERDR (decision 11-21): herdr's look — names UPPERCASE (display only; the stored title is untouched), each tab a padded
 // block: the focused one on a blue background (SGR 44;37), every other one on a gray background (SGR 100;37). Basic 16-colour SGR.
 const TAB_SEP = ' ';
 const TAB_PAD = ' ';
@@ -245,14 +266,26 @@ export function focusCells(line: string, from: number, to: number): string {
 const DIM_ON = '\u001b[2m';
 const DIM_OFF = '\u001b[22m';
 
+/**
+ * ELS-TAB-NAME-LABEL-FIRST: the tab reads the seat/tab name (its title) first; the agent kind (eln · codex · claude · grok)
+ * names it only when the title is empty or just a default command name (a shell, an agent or chat CLI, a runtime wrapper).
+ * The kind stays visible as the 💬/🤖 emoji. 출처: #39040 put the kind over every title («JUD-B» read «ELN»).
+ */
+const DEFAULT_COMMAND_NAMES = new Set([...SHELLS, ...AGENTS, ...CHATS, ...WRAPPERS, ...AGENT_KINDS]);
+const labelName = (row: SpaceTabRow): string => {
+  const name = tabName(row.title);
+  if (!row.agent) return name;
+  return name === '' || DEFAULT_COMMAND_NAMES.has(name.replace(/^-/, '').toLowerCase()) ? row.agent : name;
+};
+
 /** «emoji [⇄host ]name»: a pane of another host carries ⇄host in its tab title (the local host has no mark). */
 const remoteLabel = (row: SpaceTabRow, upper = false): string => {
-  const name = row.agent ?? tabName(row.title);
+  const name = labelName(row);
   // Keyboard emoji presentation has terminal-dependent width (xterm renders ⌨️ as one cell while Bun counts two).
   // Force its text presentation and explicitly pad it to two cells, keeping drawing and hitboxes aligned.
   const icon = paneEmoji(row);
   const emoji = icon === '⌨️' ? '⌨︎ ' : icon;
-  return `${emoji} ${row.remote ? `⇄${row.remote} ` : ''}${upper ? name.toUpperCase() : name}`;   // ELS-TAB-STYLE-HERDR: UPPERCASE name only (host and emoji as they are)
+  return `${row.role === 'coordinator' ? '🎼 ' : ''}${emoji} ${row.remote ? `⇄${row.remote} ` : ''}${upper ? name.toUpperCase() : name}`;   // ELS-TAB-STYLE-HERDR: UPPERCASE name only (host and emoji as they are)
 };
 
 /** The selected workspace's panes as tabs; the focused one in reverse video. Overflow keeps the focused tab and shows ‹ / ›. */
@@ -306,31 +339,56 @@ export function buildTabRow(rows: readonly SpaceTabRow[], selectedPane: string |
 /** The panes in the order the dropdown lists them (spaces in first-seen order, each space's tabs together). */
 export const dropdownOrder = (rows: readonly SpaceTabRow[]): string[] => spacesOf(rows).flatMap((space) => space.panes.map((row) => row.pane));
 
+export type DropdownTarget = { readonly pane: string } | { readonly ws: string };
+type EmptyDropdownSpace = { readonly wsId: string; readonly name: string; readonly remote?: string; readonly stale?: boolean };
+const sameTarget = (a: DropdownTarget | undefined, b: DropdownTarget | undefined): boolean =>
+  !!a && !!b && ('pane' in a ? 'pane' in b && a.pane === b.pane : 'ws' in b && a.ws === b.ws);
+
+/** Empty coordinator workspaces are targets in their own right, not synthetic panes. */
+function dropdownLines(rows: readonly SpaceTabRow[], empty: readonly EmptyDropdownSpace[]): { text: string; target?: DropdownTarget }[] {
+  const lines: { text: string; target?: DropdownTarget }[] = [];
+  const pending = empty.filter((space) => !rows.some((row) => row.wsId === space.wsId));
+  const hosts = new Set<string>();
+  const addEmpty = (space: EmptyDropdownSpace): void => {
+    lines.push({ text: `  🎼 ${space.name}${space.stale ? ` ${UNREACHABLE_MARK}` : ''}`, target: { ws: space.wsId } });
+  };
+  for (const space of pending.filter((space) => !space.remote)) addEmpty(space);
+  const addHost = (host: string | undefined): void => {
+    if (!host || hosts.has(host)) return;
+    hosts.add(host);
+    for (const space of pending.filter((entry) => entry.remote === host)) addEmpty(space);
+  };
+  for (const space of spacesOf(rows)) {
+    addHost(space.panes[0]?.remote);
+    lines.push({ text: `${DIM_ON} ${space.panes.some((row) => row.role === 'coordinator') ? '🎼 ' : ''}${space.name}${DIM_OFF}` });
+    for (const row of space.panes) lines.push({ text: `  ${remoteLabel(row)} ${markOf([row])}`, target: { pane: row.pane } });
+  }
+  for (const space of pending) addHost(space.remote);
+  return lines;
+}
+export const dropdownTargets = (rows: readonly SpaceTabRow[], empty: readonly EmptyDropdownSpace[]): DropdownTarget[] =>
+  dropdownLines(rows, empty).flatMap((line) => line.target ? [line.target] : []);
+
 export interface TabDropdown {
-  /** The folded top row: «emoji current-tab-name ▾». */
   readonly line: string;
-  /** The open list: a dim space heading, then its tabs «emoji name mark» (status mark = the same one as the space list); the cursor tab in reverse video. */
   readonly list: readonly string[];
-  /** Click targets: the screen row (1-based; the list starts under the top row) of each tab line. */
-  readonly hits: readonly { readonly y: number; readonly pane: string }[];
+  readonly hits: readonly ({ readonly y: number } & DropdownTarget)[];
 }
 
-/** ELS-NARROW-TAB-DROPDOWN: the narrow screen's replacement for the side list + tab row. `maxLines` windows the list around the cursor. */
-export function buildTabDropdown(rows: readonly SpaceTabRow[], selectedPane: string | undefined, cursor: string | undefined, width: number, maxLines: number): TabDropdown {
-  const label = remoteLabel;
-  const upper = (row: SpaceTabRow): string => `${TAB_PAD}${remoteLabel(row, true)}${TAB_PAD}`;
+/** ELS-NARROW-TAB-DROPDOWN: window the list around the selected pane or empty workspace. */
+export function buildTabDropdown(rows: readonly SpaceTabRow[], selectedPane: string | undefined, cursor: string | undefined, width: number, maxLines: number,
+  empty: readonly EmptyDropdownSpace[] = [], selectedEmpty?: string, emptyCursor?: string): TabDropdown {
   const now = rows.find((row) => row.pane === selectedPane) ?? rows[0];
-  const lines: { text: string; pane?: string }[] = [];
-  for (const space of spacesOf(rows)) {
-    lines.push({ text: `${DIM_ON} ${space.name}${DIM_OFF}` });
-    for (const row of space.panes) lines.push({ text: `  ${label(row)} ${markOf([row])}`, pane: row.pane });
-  }
-  const at = Math.max(0, lines.findIndex((line) => line.pane === cursor));
+  const currentEmpty = empty.find((space) => space.wsId === selectedEmpty);
+  const target: DropdownTarget | undefined = emptyCursor !== undefined ? { ws: emptyCursor } : cursor !== undefined ? { pane: cursor } : undefined;
+  const lines = dropdownLines(rows, empty);
+  const at = Math.max(0, lines.findIndex((line) => sameTarget(line.target, target)));
   const start = lines.length <= maxLines ? 0 : Math.max(0, Math.min(at - Math.floor(maxLines / 2), lines.length - maxLines));
   const shown = lines.slice(start, start + maxLines);
+  const upper = currentEmpty ? ` 🎼 ${currentEmpty.name} ` : now ? ` ${remoteLabel(now, true)} ` : '';
   return {
-    line: now ? markCells(fitCells(`${upper(now)} ▾`, width), [{ at: 0, text: TAB_ACTIVE_ON }, { at: Bun.stringWidth(upper(now)), text: TAB_OFF }]) : fitCells('▾', width),
-    list: shown.map((line) => line.pane !== undefined && line.pane === cursor ? `${FOCUS_ON}${fitCells(line.text, width)}${FOCUS_OFF}` : fitCells(line.text, width)),
-    hits: shown.flatMap((line, index) => line.pane !== undefined ? [{ y: index + 2, pane: line.pane }] : []),
+    line: upper ? markCells(fitCells(`${upper} ▾`, width), [{ at: 0, text: TAB_ACTIVE_ON }, { at: Bun.stringWidth(clipCells(upper, width)), text: TAB_OFF }]) : fitCells('▾', width),
+    list: shown.map((line) => sameTarget(line.target, target) ? `${FOCUS_ON}${fitCells(line.text, width)}${FOCUS_OFF}` : fitCells(line.text, width)),
+    hits: shown.flatMap((line, index) => line.target ? [{ y: index + 2, ...line.target }] : []),
   };
 }

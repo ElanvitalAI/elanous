@@ -1,0 +1,12 @@
+schema: 1
+world: toolbatch
+scenarios:
+  - { id: RUNSHELL-SCRIPT-7TASK, module: src/ux-sim/sim-world/toolbatch/scenarios.ts }
+  - { id: RUNSHELL-GIT-GH-READ, module: src/ux-sim/sim-world/toolbatch/scenarios.ts }
+  - { id: RUNSHELL-RECIPE-SIGNED, module: src/ux-sim/sim-world/toolbatch/scenarios.ts }
+  - { id: RUNSHELL-ELN-KUBE-HOST-READ, module: src/ux-sim/sim-world/toolbatch/scenarios.ts }
+  - { id: RUNSHELL-GRAPH-READ, module: src/ux-sim/sim-world/toolbatch/graph-proof.ts }
+  - { id: RUNSHELL-RECIPE-INPUT-LIMITS, module: src/ux-sim/sim-world/toolbatch/scenarios.ts }
+  - { id: RUNSHELL-PR1-READ-PRESERVATION, module: src/ux-sim/sim-world/toolbatch/runshell-pr1-preservation.ts }
+  - { id: RUNSHELL-PR2-UNAPPROVED-INGRESS, module: src/ux-sim/sim-world/toolbatch/runshell-pr2-ingress-prep.ts }
+  - { id: RUNSHELL-DEFAULT-OP-30M, module: src/ux-sim/sim-world/toolbatch/default-checks.ts }

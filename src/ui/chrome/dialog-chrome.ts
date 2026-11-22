@@ -1,4 +1,5 @@
 import type { WidgetChromeSpec } from '../declarative/spec.js';
+import type { ThemeTokens } from '../../theme/tokens.js';
 
 export interface DialogChromeSpec {
   title: string;
@@ -41,4 +42,14 @@ export function resolveEmbeddedDialogChromeSpec(
     chromeSpec,
     ...(titleAlign ? { defaultTitleAlign: titleAlign } : {}),
   });
+}
+
+/** The yes/no confirm popup's chrome (approval-modal): theme tokens, the static modalChrome rail and the centred
+ *  modal-dialog chromeSpec (double frame, ✕ close). Any boxed popup that should look like it spreads this into Dialog. */
+export function confirmPopupDialogChrome(title: string, theme: ThemeTokens | undefined): {
+  theme: ThemeTokens | undefined;
+  chrome: 'static' | 'legacy';
+  chromeSpec: WidgetChromeSpec;
+} {
+  return { theme, chrome: theme ? 'static' : 'legacy', chromeSpec: resolveModalDialogChromeSpec(title, undefined, 'center') };
 }

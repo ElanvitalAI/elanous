@@ -51,8 +51,11 @@ export function validJournal(raw: unknown): SpaceJournal {
   const bad = (what: string, index: number): Error => new Error(`${what}[${index}] is malformed`);
   const workspaces = raw.workspaces.map((ws, index): Workspace => {
     if (!isRecord(ws) || ![ws.id, ws.name, ws.rootCwd, ws.purpose, ws.host].every(isString) || !ws.id) throw bad('workspaces', index);
-    return { id: ws.id as string, name: ws.name as string, rootCwd: ws.rootCwd as string, purpose: ws.purpose as string, host: ws.host as string };
+    if (ws.role !== undefined && ws.role !== 'coordinator') throw bad('workspaces', index);
+    return { id: ws.id as string, name: ws.name as string, rootCwd: ws.rootCwd as string, purpose: ws.purpose as string, host: ws.host as string,
+      ...(ws.role === 'coordinator' ? { role: 'coordinator' as const } : {}) };
   });
+  if (workspaces.filter(ws => ws.role === 'coordinator').length > 1) throw new Error('journal has multiple coordinators');
   const tabs = raw.tabs.map((tab, index): Tab => {
     if (!isRecord(tab) || ![tab.id, tab.workspaceId, tab.label, tab.focusPaneId].every(isString) || !tab.id) throw bad('tabs', index);
     return { id: tab.id as string, workspaceId: tab.workspaceId as string, label: tab.label as string, focusPaneId: tab.focusPaneId as string };
@@ -62,6 +65,9 @@ export function validJournal(raw: unknown): SpaceJournal {
       || !Array.isArray(pane.command) || !pane.command.every(isString)
       || (pane.exitedAt !== undefined && (!Number.isSafeInteger(pane.exitedAt) || (pane.exitedAt as number) < 0))
       || (pane.ownerSeat !== undefined && (typeof pane.ownerSeat !== 'string' || !pane.ownerSeat.trim()))
+      || (pane.cwdOsc7 !== undefined && pane.cwdOsc7 !== true)
+      || (pane.cwdOscPending !== undefined && (!Array.isArray(pane.cwdOscPending) || pane.cwdOscPending.length > 65
+        || !pane.cwdOscPending.every((path: unknown) => isString(path) && path.startsWith('/') && !path.includes('\0') && path.length <= 8192)))
       || !PANE_STATES.has(pane.state as string) || !PANE_KINDS.has(pane.kind as string) || !RESTORE_POLICIES.has(pane.restore as string)) {
       throw bad('panes', index);
     }
@@ -69,6 +75,8 @@ export function validJournal(raw: unknown): SpaceJournal {
       cwd: pane.cwd as string, command: pane.command as string[], state: pane.state as Pane['state'], restore: pane.restore as Pane['restore'],
       ptyId: pane.ptyId as string, scrollback: pane.scrollback as string,
       ...(pane.exitedAt !== undefined ? { exitedAt: pane.exitedAt as number } : {}),
+      ...(pane.cwdOsc7 === true ? { cwdOsc7: true as const } : {}),
+      ...(Array.isArray(pane.cwdOscPending) ? { cwdOscPending: pane.cwdOscPending as string[] } : {}),
       ...(typeof pane.ownerSeat === 'string' ? { ownerSeat: pane.ownerSeat } : {}) };
   });
   const ids = [...workspaces, ...tabs, ...panes].map((row) => row.id);
@@ -77,7 +85,13 @@ export function validJournal(raw: unknown): SpaceJournal {
   const tabIds = new Set(tabs.map((tab) => tab.id));
   tabs.forEach((tab, index) => { if (!workspaceIds.has(tab.workspaceId)) throw new Error(`tabs[${index}] points at a missing workspace`); });
   panes.forEach((pane, index) => { if (!tabIds.has(pane.tabId)) throw new Error(`panes[${index}] points at a missing tab`); });
-  return { version: 1, workspaces, tabs, panes };
+  if (raw.coordinatorAudit !== undefined && (!Array.isArray(raw.coordinatorAudit) || !raw.coordinatorAudit.every(row =>
+    isRecord(row) && isString(row.at) && (row.op === 'coordinator' || row.op === 'coordinator-unset') && isString(row.result)
+      && (row.peerPid === undefined || (Number.isSafeInteger(row.peerPid) && (row.peerPid as number) > 0))))) {
+    throw new Error('coordinator audit is malformed');
+  }
+  const coordinatorAudit = raw.coordinatorAudit as SpaceJournal['coordinatorAudit'];
+  return { version: 1, workspaces, tabs, panes, ...(coordinatorAudit !== undefined ? { coordinatorAudit } : {}) };
 }
 
 let saveSequence = 0;

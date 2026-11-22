@@ -18,12 +18,15 @@ import type {
   CoreModules,
   EscalateRule,
   ModelOrchestrationCore,
+  TierGateModule,
   WorkMoment,
   WorkTierClass,
 } from './orchestration-core.js';
 import { isRiskyLevel } from './work-risk-router.js';
 import { ADVISOR_ESCALATE_RULE } from './advisor-checkpoints.js';
 import { WINDOW_AWARE_ACCOUNT_SELECTOR, accountIdHash } from './window-account-selector.js';
+import { ROUTER_MIX_ACCOUNT_SELECTOR } from './router-mix-selector.js';
+import { createSmartRouterTierGate, authorizeRouterFeature, envMembershipResolver } from '../plugins/smart-router/consumer.js';
 import {
   STRONG_OUTPUT_MAX_TOKENS,
   WORK_TIER_CLASSES,
@@ -90,13 +93,40 @@ export function createModelOrchestrationCore(modules: CoreModules = {}): ModelOr
         reason.push(`escalate:${rule.name}:${proposal.trigger}:${base}->${tier}`);
         break; // 첫 제안 하나만 — 여러 계기가 겹쳐도 한 번
       }
-      const cell = WORK_TIER_LADDER_CELL[tier];
-      let picked: ReturnType<AccountSelector['select']>;
-      try { picked = selector.select({ input, tier, cell }); } catch {
-        picked = ACTIVE_ACCOUNT_SELECTOR.select({ input, tier, cell });
-        reason.push(`account-selector-failed:${selector.name}`);
+      // SMART-ROUTER-PLUGIN-TIERS 등급 게이트 — 올림 결과가 회원 등급 표를 통과 못 하면 «올림만» 되돌린다(호출 차단 아님).
+      // jud-39528 mustFix ①: base 가 이미 strong(risky design/judge)이어도 ADVISOR 유료 상담 «계기»는 심사 대상 —
+      // 게이트는 trigger 를 본다(올림이 없는 계기도 심사). 거부 시 계기만 되돌린다(일반 strong 라우팅은 유지).
+      if (modules.gate && (trigger !== 'base' || tier !== base)) {
+        let verdict: ReturnType<TierGateModule['review']> | null = null;
+        try { verdict = modules.gate.review({ trigger, checkpoint: input.checkpoint, tier }); } catch { reason.push(`gate-failed:${modules.gate.name}`); }
+        if (verdict && !verdict.allowed) {
+          reason.push(`gate-blocked:${modules.gate.name}:${verdict.reason ?? 'denied'}:${base}`);
+          if (tier !== base) tier = base;
+          trigger = 'base';
+        }
       }
-      reason.push(`account:${selector.name}:${picked.reason}`);
+      const cell = WORK_TIER_LADDER_CELL[tier];
+      // jud-39528 mustFix ②(r13 — JUD-2 HOLD 8929e2809624 · OP #132044): 구독 창 인식 계정 전환은 router.subscription_window_aware(프로+).
+      // 거부 시 창 인식 선택기 «자체»를 건너뛴다 — ROUTER_MIX 만 막으면 기본 WINDOW_AWARE_ACCOUNT_SELECTOR 가
+      // selection=on 에서 계정을 전환한다. 거부 = 창 인식 없는 선택기(활성 계정 고정 · 전환 0).
+      const windowAware = selector === WINDOW_AWARE_ACCOUNT_SELECTOR;
+      let accountSelector: AccountSelector = selector;
+      if (windowAware) {
+        // MembershipReader(함수)·MembershipResolver(객체) 양쪽 정규화(r12d — TS2322 수리)
+        const windowGrant = authorizeRouterFeature('router.subscription_window_aware', { currentTier: typeof modules.membership === 'function' ? modules.membership : envMembershipResolver().currentTier });
+        if (!windowGrant.allowed) {
+          reason.push(`${input.accounts?.routerMix ? 'router-mix' : 'window-aware'}:denied:router.subscription_window_aware:${windowGrant.reason}`);
+          accountSelector = ACTIVE_ACCOUNT_SELECTOR;
+        } else if (input.accounts?.routerMix) {
+          accountSelector = ROUTER_MIX_ACCOUNT_SELECTOR;
+        }
+      }
+      let picked: ReturnType<AccountSelector['select']>;
+      try { picked = accountSelector.select({ input, tier, cell }); } catch {
+        picked = ACTIVE_ACCOUNT_SELECTOR.select({ input, tier, cell });
+        reason.push(`account-selector-failed:${accountSelector.name}`);
+      }
+      reason.push(`account:${accountSelector.name}:${picked.reason}`);
       // OP #38337 ②: 측정 원천이 없어 «모름 = 뒤»로 정렬된 신호 칸 — 이유 줄과 구조 칸 둘 다에 남긴다.
       if (picked.unmeasured?.length) reason.push(`unmeasured:${picked.unmeasured.join('+')}`);
       const ladder = ladderOf(picked.provider);
@@ -131,7 +161,11 @@ let defaultCore: ModelOrchestrationCore | null = null;
 
 /** 기본 모듈 — ADVISOR 올림 규칙(세 순간 → 강) · 계정 = 창 인지 선택기(COST-OPTIMIZER-WINDOW-AWARE · 스냅숏의
  *  `selection` 이 `on` 일 때만 계정을 바꾼다 · 그 밖은 활성 계정 그대로 + 고를 계정은 이유 칸에 해시로). */
-export const DEFAULT_CORE_MODULES: CoreModules = { escalate: [ADVISOR_ESCALATE_RULE], accounts: WINDOW_AWARE_ACCOUNT_SELECTOR };
+export const DEFAULT_CORE_MODULES: CoreModules = {
+  escalate: [ADVISOR_ESCALATE_RULE], accounts: WINDOW_AWARE_ACCOUNT_SELECTOR,
+  // SMART-ROUTER-PLUGIN-TIERS — 등급은 신뢰 호스트 seam(env ELANOUS_ROUTER_TIER · 없으면 free, fail-closed).
+  gate: createSmartRouterTierGate(envMembershipResolver()),
+};
 
 let installedModules: CoreModules = DEFAULT_CORE_MODULES;
 

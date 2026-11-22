@@ -123,8 +123,9 @@ export function createCoreAdvisor(options: CoreAdvisorOptions): CoreAdvisor {
     };
     const decision = options.core.decide(input);
     if (decision.trigger !== `advisor:${moment}`) return undefined; // 규칙이 상담을 안 고른 순간(L1~3 의 ①·③)
-    const call = options.mode === 'on' && options.client !== undefined && decision.model !== null;
-    const skip = options.mode !== 'on' ? 'shadow' : !options.client ? 'no-advisor-client' : decision.model === null ? 'no-tier-ladder' : null;
+    const readFailed = input.accounts?.routerMix?.codexReadFailed === true;
+    const call = options.mode === 'on' && options.client !== undefined && decision.model !== null && !readFailed;
+    const skip = options.mode !== 'on' ? 'shadow' : !options.client ? 'no-advisor-client' : readFailed ? 'account-window-read-failed' : decision.model === null ? 'no-tier-ladder' : null;
     try {
       options.record?.(options.core.decisionRecord(decision, input, {
         mode: options.mode, applied: call, skip, launched: { provider: decision.provider, model: call ? decision.model : null },

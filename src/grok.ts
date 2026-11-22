@@ -15,7 +15,7 @@ import type { GrokAnalysis, DiffResult, EnvDelta } from './types.js';
 import * as ui from './ui.js';
 import { getUserConfig } from './user-config/reader.js';
 import { getProviderForConfig, anyProviderAvailable, logAgentTurnUsage, type LLMMessage } from './llm.js';
-import type { LLMUsage } from './prompt-cache/types.js';
+import { streamChatLedgered } from './llm/ledgered-call.js';
 
 /** True when any provider (env OR user-config, including Codex OAuth)
  *  can answer. Thin wrapper around llm.anyProviderAvailable() kept
@@ -37,11 +37,10 @@ async function callAnalyzer(prompt: string, systemPrompt?: string): Promise<stri
 
   const llmOpts = { temperature: 0.1, maxTokens: 1024 };
   let text = '';
-  let usage: LLMUsage = {};
   if (provider.streamChat) {
-    for await (const ev of provider.streamChat(messages, llmOpts)) {
+    // LLM-CALL-COST-LEDGER — streamChatLedgered 가 원장 1행을 남긴다.
+    for await (const ev of streamChatLedgered(provider, messages, llmOpts, { site: 'grok-analyzer' })) {
       if (ev.type === 'text' && ev.delta) text += ev.delta;
-      else if (ev.type === 'usage') usage = { ...usage, ...ev.usage };
     }
   } else {
     // Fallback to text-only chat (shouldn't happen — every provider
@@ -49,10 +48,11 @@ async function callAnalyzer(prompt: string, systemPrompt?: string): Promise<stri
     for await (const chunk of provider.chat(messages, llmOpts)) {
       text += chunk;
     }
+    // LLM-CALL-COST-LEDGER — chat 폴백 경로도 행 1개 보장.
+    try {
+      logAgentTurnUsage(provider.defaultModel, {}, { providerName: provider.name, site: 'grok-analyzer' });
+    } catch { /* best-effort observation */ }
   }
-  try {
-    logAgentTurnUsage(provider.defaultModel, usage, { providerName: provider.name, site: 'grok.direct' });
-  } catch { /* best-effort observation */ }
   return text;
 }
 

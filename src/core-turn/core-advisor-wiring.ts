@@ -2,7 +2,7 @@
 // 하니스 런(ELANOUS_RUN_ID 가 있는 자식)에서만 켠다. 사람 TUI·일반 채팅은 종전 그대로(상담·기록 0).
 // 모드는 `harness.difficultyRouter` 하나를 따른다: shadow(기본) = 상담했을 순간만 원장에 · on = 실제 강 모델 호출.
 
-import { streamLLM } from '../llm.js';
+import { PROVIDERS, streamLLM } from '../llm.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
 import { getUserConfig, resolveActiveProvider } from '../user-config.js';
 import { debug } from '../debug/log.js';
@@ -11,7 +11,7 @@ import { classifyWorkRisk, workRiskInputFromFields } from '../model-tier/work-ri
 import { createCoreAdvisor, type CoreAdvisor } from '../model-tier/advisor-checkpoints.js';
 import type { AdvisorClient, AdvisorMoment } from '../model-tier/orchestration-core.js';
 import { recordWorkRouteDecision, resolveWorkRouteMode } from '../self-implement/work-route-ledger.js';
-import { readAccountWindowSnapshot } from '../model-tier/account-window-snapshot.js';
+import { readAccountWindowSnapshot, readRouterMixSnapshot } from '../model-tier/account-window-snapshot.js';
 
 /** 조언 한 번의 전체 시간 상한 — 느린 조언은 기다리지 않고 건너뛴다(출처: 54f1174c89 advisor-checkpoints-llm 의 같은 값). */
 const ADVISOR_TOTAL_TIMEOUT_MS = 90_000;
@@ -30,6 +30,8 @@ const SYSTEM_BY_MOMENT: Readonly<Record<AdvisorMoment, string>> = {
 export function streamLlmAdvisorClient(signal?: AbortSignal): AdvisorClient {
   return {
     async advise(request) {
+      const provider = PROVIDERS[request.provider];
+      if (!provider) throw new Error('advisor selected an unavailable provider');
       let usage: LLMUsage | undefined;
       const prompt = [
         SYSTEM_BY_MOMENT[request.moment],
@@ -37,6 +39,7 @@ export function streamLlmAdvisorClient(signal?: AbortSignal): AdvisorClient {
         ...(request.prompt.detail ? [`${request.moment === 'pre-complete' ? '완료 증거' : '반복된 오류'}:\n${request.prompt.detail.slice(0, 4000)}`] : []),
       ].join('\n\n');
       const advice = await streamLLM([{ role: 'user', content: prompt }], () => undefined, {
+        provider,
         model: request.model,
         maxTokens: request.maxOutputTokens,
         maxTokensExplicit: true,
@@ -55,7 +58,8 @@ export function streamLlmAdvisorClient(signal?: AbortSignal): AdvisorClient {
   };
 }
 
-export function coreAdvisorForGoalLoop(input: { readonly userText: string; readonly signal?: AbortSignal; readonly env?: NodeJS.ProcessEnv }): CoreAdvisor | undefined {
+export function coreAdvisorForGoalLoop(input: { readonly userText: string; readonly signal?: AbortSignal; readonly env?: NodeJS.ProcessEnv;
+  readonly readAccounts?: (provider: string) => ReturnType<typeof readAccountWindowSnapshot> }): CoreAdvisor | undefined {
   const runId = (input.env ?? process.env).ELANOUS_RUN_ID?.trim();
   if (!runId) return undefined;
   try {
@@ -68,11 +72,14 @@ export function coreAdvisorForGoalLoop(input: { readonly userText: string; reado
       provider,
       work: classifyWorkRisk(workRiskInputFromFields(input.userText)),
       mode,
-      // COST-OPTIMIZER-WINDOW-AWARE 대칭 — 상담도 발사와 같은 창 선택기를 거친다. 상담 호출은 이 프로세스의 계정(발사가 정한 계정)으로
-      // 나가므로 여기서는 계정을 바꿀 수 없다 ⇒ shadow 고정(고를 계정은 원장 이유에만).
-      // 런마다 한 번 읽는다(상담 순간마다 다시 읽어 같은 건너뜀 이벤트를 되풀이하지 않게 · 리뷰 sf5).
-      accounts: (() => { let read = false; let cached: ReturnType<typeof readAccountWindowSnapshot>;
-        return () => { if (!read) { read = true; cached = readAccountWindowSnapshot(provider, { forceShadow: true }); } return cached; }; })(),
+      // 상담은 이 프로세스의 계정으로 나간다. 혼합이 켜진 경우 현재 Codex 계정의 신선한 창만 적용하고,
+      // 일반 창 계정 선택은 기존대로 shadow 에 둔다.
+      // 혼합은 매 상담마다 읽는다. 창 TTL·최초 부재 뒤 관측 회복은 런 중에도 바뀐다.
+      // 일반 계정 관측은 종전대로 런당 한 번 shadow 로 읽는다.
+      accounts: config.harness?.routerMix === 'on'
+        ? () => (input.readAccounts ?? readRouterMixSnapshot)(provider)
+        : (() => { let read = false; let cached: ReturnType<typeof readAccountWindowSnapshot>;
+          return () => { if (!read) { read = true; cached = readAccountWindowSnapshot(provider, { forceShadow: true }); } return cached; }; })(),
       ...(mode === 'on' ? { client: streamLlmAdvisorClient(input.signal) } : {}),
       record: (record) => { void recordWorkRouteDecision(record); },
       onError: (moment, error) => {

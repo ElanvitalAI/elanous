@@ -5,7 +5,7 @@ import type { MemberStore } from './member-store.js';
 import { createMemberCloudBackupApi } from './cloud-backup-e2e.js';
 
 export function createMemberCloudBackupRoute(options: {
-  memberStore: Pick<MemberStore, 'memberForSession'>;
+  memberStore: Pick<MemberStore, 'memberForSession' | 'memberPlanForMember'>;
   dbPath?: string;
   now?: () => Date;
 }) {

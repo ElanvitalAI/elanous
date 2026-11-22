@@ -1,6 +1,7 @@
 schema: 1
 world: capsule-events
 scenarios:
+  - { id: SEAT-STEER-PREEMPT-137, module: src/ux-sim/sim-world/capsule-events/steer-preempt.ts }
   - id: C1
     module: src/ux-sim/sim-world/capsule-events/scenarios.ts
   - id: C7
@@ -21,3 +22,5 @@ scenarios:
     module: src/ux-sim/sim-world/capsule-events/c4-agent-background.ts
   - id: C3-ESC
     module: src/ux-sim/sim-world/capsule-events/c3-esc-cancel.ts
+  - id: C1-HARNESS
+    module: src/ux-sim/sim-world/capsule-events/c1-harness.ts

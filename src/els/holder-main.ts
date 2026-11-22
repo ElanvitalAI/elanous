@@ -6,7 +6,7 @@
 // 그래서 서버가 holder env 로 싣고 온 pane 의 els 정체성(ELANOUS_ELS_WS/PANE/SOCKET/PANE_TOKEN)을 여기서 이름으로 집어 넘긴다.
 // 서버 owner 토큰(ELANOUS_ELS_OWNER_TOKEN)은 holder env 에 있어도 넘기지 않는다.
 
-import { adoptCapturedEnv } from '../shell-env-bootstrap.js';
+import { adoptCapturedEnv, capturedEnvAvailable, getCapturedEnv, loginEnvOptedOut } from '../shell-env-bootstrap.js';
 import { loginEnvKey, unpackLoginEnv } from './login-env-handoff.js';
 import { startHolder } from './holder.js';
 
@@ -22,7 +22,11 @@ const num = (name: string): number | undefined => {
   return Number.isInteger(value) ? value : undefined;
 };
 
-const PANE_ENV_KEYS = ['ELANOUS_ELS_WS', 'ELANOUS_ELS_PANE', 'ELANOUS_ELS_SOCKET', 'ELANOUS_ELS_PANE_TOKEN'] as const;
+// 보안 HOLD 수리(OP #129232): 입양 신뢰 물자(비밀·서버 pid·서버 시작시각)도 홀더 env 로 내려온다 —
+// startHolder 가 이들을 홀더 메모리에만 남기고 pane 자식 env 에서는 걷어낸다(비밀이 자식에게 내려가면
+// pane 안의 임의 코드가 입양 비밀을 읽는다).
+const PANE_ENV_KEYS = ['ELANOUS_ELS_WS', 'ELANOUS_ELS_PANE', 'ELANOUS_ELS_SOCKET', 'ELANOUS_ELS_PANE_TOKEN',
+  'ELANOUS_ELS_ADOPTION_SECRET', 'ELANOUS_ELS_SERVER_PID', 'ELANOUS_ELS_SERVER_START'] as const;
 const paneEnv = (): Record<string, string> => Object.fromEntries(PANE_ENV_KEYS.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key] as string]]));
 
 async function main(): Promise<void> {
@@ -34,6 +38,17 @@ async function main(): Promise<void> {
   clearTimeout(timer);
   const loginEnv = handed ? unpackLoginEnv(handed, loginEnvKey()) : undefined;
   if (loginEnv) adoptCapturedEnv(loginEnv);
+  else getCapturedEnv(); // stdin 인계가 없으면 자체 캡처를 지금 시도한다(startPty 안의 지연 캡처를 앞당김).
+  // JUD-2 보안 필수 1(OP #131438·#131445·#131658): 캡처가 없으면 getCapturedEnv() 가 홀더
+  // process.env 로 폴백하고 그 합성 환경이 PTY 자식에 그대로 전달되어 입양 비밀이 pane 에 샌다.
+  // 캡처 실패 = fail-closed: 그 pane 의 spawn 을 거부하고 명시 오류로 나간다(홀더 환경 대체 금지).
+  // 단 loginEnvOptedOut()(ELANOUS_SKIP_LOGIN_ENV=1 · TERM_PROGRAM=monad-agent-nested)은 «캡처를
+  // 시도하지 않는 정상 경로»다 — 게이트 호스트(node-b pregate)·중첩 에이전트가 여기에 해당하며 이때의
+  // process.env 기반은 설계상 경로지 폴백이 아니다(fc4 RED 원문: 옵아웃 환경에서 스폰 전면 거부).
+  if (!capturedEnvAvailable() && !loginEnvOptedOut()) {
+    process.stderr.write('holder-main: login-env capture unavailable — refusing to spawn the pane child (holder-env substitution would leak adoption secrets); fail-closed\n');
+    process.exit(1);
+  }
   const stateRoot = arg('--state-root');
   const paneId = arg('--pane');
   const dash = process.argv.indexOf('--');
@@ -46,7 +61,7 @@ async function main(): Promise<void> {
   const rows = num('--rows');
   const grace = num('--grace-ms');
   const holder = await startHolder({ stateRoot, paneId, cwd: arg('--cwd') ?? process.cwd(), command,
-    title: arg('--title') ?? command[0], env: paneEnv(),
+    title: arg('--title') ?? command[0], env: paneEnv(), generationNonce: arg('--generation-nonce'),
     ...(cols !== undefined ? { cols } : {}), ...(rows !== undefined ? { rows } : {}),
     ...(grace !== undefined ? { exitGraceMs: grace } : {}) });
   // 외부 신호 = 명시적 종료: 자식을 죽이고 원장·소켓을 정리한 뒤 나간다. 그 외의 경로(접속 끊김)는 무시한다.

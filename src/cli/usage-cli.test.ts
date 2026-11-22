@@ -19,6 +19,38 @@ async function run(args: string[], readRunLogs: NonNullable<Parameters<typeof re
   return lines;
 }
 
+describe('usage advisor membership gate (SMART-ROUTER entitlements · jud-39528 mustFix ③)', () => {
+  it('free 등급은 원장 읽기 «전»에 거부 — exit 1 · llm-usage 조회 0회', async () => {
+    let reads = 0;
+    const lines: string[] = [];
+    const command = new Command();
+    registerUsageCommand(command, {
+      readRunLogs: () => { reads++; return []; },
+      out: { log: (line) => lines.push(line) },
+      exit: (code) => { throw new Error(`exit ${code}`); },
+      advisorMembership: () => 'free',
+    });
+    await expect(command.parseAsync(['usage', 'advisor'], { from: 'user' })).rejects.toThrow('exit 1');
+    expect(reads).toBe(0);
+    expect(lines.some(line => line.includes('router.subscription_advisor_monthly'))).toBe(true);
+  });
+
+  it('pro 등급은 조언 보고를 낸다 — 원장 조회 후 요약 출력', async () => {
+    let reads = 0;
+    const lines: string[] = [];
+    const command = new Command();
+    registerUsageCommand(command, {
+      readRunLogs: () => { reads++; return [row({ runId: 'adv', model: 'm', inputTokens: 1 })]; },
+      out: { log: (line) => lines.push(line) },
+      exit: (code) => { throw new Error(`exit ${code}`); },
+      advisorMembership: () => 'pro',
+    });
+    await command.parseAsync(['usage', 'advisor'], { from: 'user' });
+    expect(reads).toBeGreaterThan(0);
+    expect(lines.length).toBeGreaterThan(0);
+  });
+});
+
 describe('usage runs', () => {
   it('counts a Pod Job rollup once on model, stage, and account axes while retaining raw-only Jobs', async () => {
     const read = () => [

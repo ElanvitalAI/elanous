@@ -4,8 +4,11 @@ import { readSeatMailSnapshot, type SeatMailSnapshot, type SeatMailWatchStatus }
 import { createChildNoticeProducers, type ChildNoticeQueue } from './core/notice-producers.js';
 import { headerFieldsOf } from '../msg/msg-context-header.js';
 import type { NextTuiQueueTransitionListener } from './core/queue.js';
+import { NEXT_TUI_NOTICE_CAP } from './core/queue.js';
 import type { SeatMailMessageRead, SeatReceiptWriter } from './seat-message-receipts.js';
 import type { TurnEventOutcome } from '../turn-capsule/contract.js';
+import type { MessageOrigin } from '../msg/msg-store.js';
+import { isDecisionMail } from './seat-mail-priority.js';
 import { createSeatMailAdapter, type SeatMailAdapter } from './turn-events/mail-adapter.js';
 
 /**
@@ -26,6 +29,17 @@ export const DEFAULT_SEAT_MAIL_POLL_MS = 15_000;
  * REL 8 and JUD 2, so an ordinary seat never meets the cap. `ELANOUS_SEAT_MAIL_QUEUE_CAP` (≥ 1) or the watcher option.
  */
 export const SEAT_MAIL_QUEUE_CAP = 20;
+
+/**
+ * SEAT-STEER-PREEMPT JUD-B MF — a decision mail (any sender) is never folded into the overflow summary. A decision
+ * admitted beyond the ordinary cap carries at most this many body characters; the full mail stays in the ledger.
+ */
+export const SEAT_MAIL_DECISION_OVER_CAP_BODY_MAX = 500;
+
+function boundDecisionBody<T extends { id: number; body: string }>(message: T, seat: string): T {
+  if (message.body.length <= SEAT_MAIL_DECISION_OVER_CAP_BODY_MAX) return message;
+  return { ...message, body: `${message.body.slice(0, SEAT_MAIL_DECISION_OVER_CAP_BODY_MAX)} … [본문 ${message.body.length}자 중 ${SEAT_MAIL_DECISION_OVER_CAP_BODY_MAX}자 · 전문: eln msg list --to ${seat}]` };
+}
 
 export function resolveSeatMailQueueCap(option?: number, env: NodeJS.ProcessEnv = process.env): number {
   if (option !== undefined && Number.isSafeInteger(option) && option >= 1) return option;
@@ -89,6 +103,11 @@ export interface SeatMailArrivalInfo {
   readonly seat: string;
   /** 보낸 자리. */
   readonly sender?: string;
+  /** Structured ledger fields; the rendered notice body is never parsed for priority. */
+  readonly origin?: MessageOrigin;
+  readonly intent?: string | null;
+  readonly crownDirective?: string | null;
+  readonly createdAt?: string;
 }
 
 export function createSeatMailArrivalWatcher(
@@ -200,18 +219,30 @@ export function createSeatMailArrivalWatcher(
     const claim = adapter.claim('notice', [...parked.keys()]);
     for (const id of claim.duplicate) parked.delete(id);
     let queued = 0;
+    let ordinaryQueued = 0;
     for (const id of claim.granted) {
       const mapped = parked.get(id)!;
-      if (queued >= room) { adapter.release('notice', [id]); continue; }
+      // A parked decision is never held back by the ordinary cap (JUD-B MF) — delivery only, no priority.
+      const decision = isDecisionMail(mapped.message);
+      if (!decision && ordinaryQueued >= room) { adapter.release('notice', [id]); continue; }
       parked.delete(id);
       const item = producers.seatMessageArrived(mapped.message);
       if (item === null) continue; // the same msgId is already queued
       noticeMessages.set(item.id, mapped);
       queued += 1;
+      if (!decision) ordinaryQueued += 1;
       log('seat-mail-requeued', { msgId: id, seat: mapped.seat, attempt: mapped.attempt });
     }
     return queued;
   };
+  /**
+   * OP #129667 ①(SEAT-NOTICE-BUNDLE-DRAIN 수리) — 큐 상한(NEXT_TUI_NOTICE_CAP)은 모든 대기 알림을
+   * 센다(자리 우편만이 아님). 이 값이 자리 우편이 실제 항목이 될 수 있는 남은 방이다: 방이 없으면
+   * 우편은 큐에 들가지 않고(가이드 항목이 우편 msgId 를 가로채는 일 없이) pending 으로 남아
+   * 다음 poll 이 다시 제공한다.
+   */
+  const queueNoticeRoom = (): number =>
+    Math.max(0, NEXT_TUI_NOTICE_CAP - queue.items.filter((item) => item.kind === 'notice').length);
   const noteTurnFinished = (responded: boolean, outcome?: TurnEventOutcome): void => {
     // Another running turn may have acknowledged a message after the watcher
     // queued it. Recheck the authoritative cursor at the idle boundary so that
@@ -257,7 +288,7 @@ export function createSeatMailArrivalWatcher(
     }
     // Cancelled / stopped: due now (no back-off) — back in the queue for the next turn. Failed: the next poll after retryAt.
     const waiting = queue.items.filter((item) => item.source === 'seat-mail' && typeof item.msgId === 'number').length;
-    if (reofferParked(Math.max(0, queueCap - waiting)) > 0) deps.onArrived?.();
+    if (reofferParked(Math.max(0, Math.min(queueCap - waiting, queueNoticeRoom()))) > 0) deps.onArrived?.();
   };
 
   const pollMessages = (src: SeatMessageSource): SeatMailPollOutcome => {
@@ -278,14 +309,15 @@ export function createSeatMailArrivalWatcher(
     if (read === null) return { kind: 'no-seat' };
     const first = lastMsgId === null;
     const floor = lastMsgId ?? 0;
-    // ELN-SEAT-MAIL-REPLAY: the next floor is the ledger's newest id, not the largest id of a 1000-row page — a page
-    // floor walked the whole history forward one page per poll (REL 04:25:16 → 04:26:02: 3641 notices).
-    lastMsgId = read.messages.reduce((max, m) => Math.max(max, m.id), Math.max(floor, read.latestId ?? 0));
+    // OP #129667 ②③ — floor 갱신은 taken 확정 뒤로 미뤘다(아래): 읽힌 최대 id(lastestId 포함)를
+    // 무조건 넘기면 상한 밖 pending 우편이 floor 너머로 밀려 다음 poll 이 다시 내놓지 못한다.
     if (first && ((read.cursor ?? 0) > 0 || (read.seenSkipped ?? 0) > 0)) {
       log('seat-mail-replay-skipped', { seat: read.seat, cursor: read.cursor ?? 0, seenSkipped: read.seenSkipped ?? 0, unacked: read.messages.length });
     }
     const queuedIds = new Set(queue.items.flatMap((item) => (item.source === 'seat-mail' && typeof item.msgId === 'number' ? [item.msgId] : [])));
-    const reoffered = reofferParked(Math.max(0, queueCap - queuedIds.size));
+    // OP #129667 ① — reoffer 전에 잰다: reoffered 는 이 방에서 나간다(큐 항목이 되니까).
+    const queueRoom = queueNoticeRoom();
+    const reoffered = reofferParked(Math.max(0, Math.min(queueCap - queuedIds.size, queueRoom)));
     const alreadyQueued = queuedIds.size + reoffered;
     const fresh: typeof read.messages = [];
     for (const message of [...read.messages].sort((a, b) => a.id - b.id)) {
@@ -310,8 +342,24 @@ export function createSeatMailArrivalWatcher(
     const newlyTruncated = truncated && Math.max(read.latestId ?? lastReturnedId, lastReturnedId) > summarizedThrough;
     if (reoffered > 0) deps.onArrived?.();
     if (fresh.length === 0 && !newlyTruncated) return first ? { kind: 'baseline', unread: read.unreadTotal ?? read.messages.length } : { kind: 'quiet', unread: read.unreadTotal ?? read.messages.length };
-    const room = Math.max(0, queueCap - alreadyQueued);
-    let taken = fresh.slice(0, room);
+    // OP #129667 ① — 자리 우편 상한(queueCap)과 큐 알림 상한(NEXT_TUI_NOTICE_CAP) 둘 다 지킨다:
+    // queueRoom 중 reoffered 가 이미 쓴 방을 빼면, 이번 poll 이 새로 넣을 수 있는 우편 수다.
+    // ② — truncated 안내 한 줄도 큐 방 하나를 쓴다: 그 방을 남겨둔다. 안내가 가이드로 접히면
+    // 읽기 한계 너머 꼬리(다시 닿을 수 없다)가 영영 조용해진다.
+    const room = Math.max(0, Math.min(queueCap - alreadyQueued, queueRoom - reoffered - (newlyTruncated ? 1 : 0)));
+    // JUD-B MF (OP rule · main 병합 보존): a decision mail (structured intent, ANY sender — the sender name is
+    // not authenticated) is never collapsed into the read-the-inbox summary — every one is queued in msgId order,
+    // so each body reaches the next actual turn. Decisions use ordinary room first; those beyond the cap carry a
+    // bounded body plus a ledger pointer. Only ordinary notices stay pending for the next poll (OP #129667 ②).
+    // This is a delivery guarantee, not a priority.
+    const decisions = fresh.filter((message) => isDecisionMail(message));
+    const decisionIds = new Set(decisions.map((message) => message.id));
+    const selectedDecisions = decisions.map((message, index) => (index < room ? message : boundDecisionBody(message, read.seat)));
+    const selectedOrdinary = fresh.filter((message) => !decisionIds.has(message.id))
+      .slice(0, Math.max(0, room - selectedDecisions.length));
+    let taken = [...selectedDecisions, ...selectedOrdinary].sort((a, b) => a.id - b.id);
+    const selectedIds = new Set(taken.map((message) => message.id));
+    const over = fresh.filter((message) => !selectedIds.has(message.id));
     if (taken.length > 0) {
       // CAPSULE-C3 D9: one owner per msgId — mail the plan already carries is not a second turn; mail behind an open
       // circuit waits parked (offered, so the next poll does not see it as new).
@@ -323,15 +371,20 @@ export function createSeatMailArrivalWatcher(
         if (claim.waiting.includes(message.id)) {
           parked.set(message.id, { msgId: message.id, seat: read.seat, attempt: 1, message: { id: message.id, sender: message.from,
             body: message.body, kind: message.kind ?? null, ...headerFieldsOf(message),
+            ...(message.origin ? { origin: message.origin } : {}),
             ...(read.unreadTotal === undefined ? {} : { unreadTotal: read.unreadTotal }),
             ...(message.createdAt === undefined ? {} : { createdAt: message.createdAt }) } });
         } else log('seat-mail-dedupe-hit', { seat: read.seat, msgId: message.id, owner: adapter.owner(message.id) });
       }
-      const over = fresh.slice(taken.length);
       taken = taken.filter((m) => granted.has(m.id));
       if (taken.length === 0 && over.length === 0 && !newlyTruncated) return { kind: 'messages', msgIds: [] };
     }
-    const over = fresh.slice(room);
+    // OP #129667 ②③ — floor 는 실제로 큐 항목이 된(granted) 우편만큼만 올라간다. 상한 밖
+    // pending 우편은 floor 너머로 밀리지 않는다 → 다음 poll 이 그대로 다시 제공한다(재시작 불요).
+    // truncated 읽기만 예외: 읽기 한계 너머 꼬리는 poll 이 다시 닿을 수 없으니 latestId 까지(아래 안내와 한 쌍).
+    lastMsgId = truncated
+      ? Math.max(floor, read.latestId ?? 0)
+      : taken.reduce((max, m) => Math.max(max, m.id), floor);
     const msgIds: number[] = [];
     const arrivals: SeatMailArrivalInfo[] = []; // OP #106762 ⓐ — onArrived 가 실 도착 정보(msgId·본문 문면·자리)를 싣는다
     for (const message of taken) {
@@ -341,6 +394,7 @@ export function createSeatMailArrivalWatcher(
         body: message.body,
         kind: message.kind ?? null,
         ...headerFieldsOf(message),
+        ...(message.origin ? { origin: message.origin } : {}),
         ...(read.unreadTotal === undefined ? {} : { unreadTotal: read.unreadTotal }),
         ...(message.createdAt === undefined ? {} : { createdAt: message.createdAt }),
       };
@@ -350,18 +404,24 @@ export function createSeatMailArrivalWatcher(
       try { turnLifeLog('turn-life:event-arrived', { source: 'seat-mail', eventId: message.id, msgId: message.id, itemId: item.id, arrivedAt: Date.now() }); } catch { /* observability is fail-open */ }
       offered.add(message.id);
       msgIds.push(message.id);
-      arrivals.push({ msgId: message.id, seat: read.seat, sender: message.from, text: item.text });
+      arrivals.push({ msgId: message.id, seat: read.seat, sender: message.from, text: item.text,
+        ...(message.origin ? { origin: message.origin } : {}),
+        ...(message.intent ? { intent: message.intent } : {}),
+        ...(message.crownDirective ? { crownDirective: message.crownDirective } : {}),
+        ...(message.createdAt ? { createdAt: message.createdAt } : {}) });
       noticeMessages.set(item.id, { msgId: message.id, seat: read.seat, message: input, attempt: 1 });
       src.receipts?.record({ messageId: message.id, recipient: read.seat, state: 'delivered', queueItemId: item.id });
     }
-    // Over the cap, or #38517 r2 MF2 a read that stopped at its limit (any cap, even ≥ the read limit): ONE summary for
-    // everything not queued one by one — the floor moves to the ledger's newest id, so without it that mail would be lost.
+    // OP #129667 ① — 상한 밖 우편(over)은 원장 안내 한 줄로 접는다(완료선: 넘치면 안내 한 줄 · main #39526 seat-mail-replay 계약 복원).
+    // ③ — 접힌 우편 자체는 pending: floor 는 granted(taken)만큼만 올라가(위 lastMsgId) 다음 poll 이 다시 제공한다(재시작 불요).
+    // ② — truncated 읽기(#38517 r2 MF2 — 읽기 한계 너머 꼬리)에도 안내는 반드시 한 줄: 위 room 계산이 방 1칸을 예약한다.
     if (over.length > 0 || newlyTruncated) {
       const firstId = over[0]?.id ?? lastReturnedId + 1;
       const lastId = truncated ? Math.max(read.latestId ?? lastReturnedId, over.at(-1)?.id ?? lastReturnedId) : over.at(-1)!.id;
       const pending = overflowItemId !== null && queue.items.some((item) => item.id === overflowItemId);
       if (!pending) {
-        const summary = queue.enqueueNotice(seatMailOverflowNotice(read.seat, over.length, firstId, lastId, truncated, read.unreadTotal), 'seat-mail');
+        // OP #130302/#130531 합의 — 안내는 «seat-mail-guide» 별도 종류(msgId 없음 · poll당 1줄 · 초과든 truncated든).
+        const summary = queue.enqueueNotice(seatMailOverflowNotice(read.seat, over.length, firstId, lastId, truncated, read.unreadTotal), 'seat-mail-guide');
         overflowItemId = summary.id;
       }
       summarizedThrough = Math.max(summarizedThrough, lastId);

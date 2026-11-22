@@ -1,0 +1,37 @@
+{
+  "id": "op-30m-fake-sources",
+  "name": "OP 30-minute check fake sources",
+  "audience": "internal",
+  "checklistCells": [
+    "RUNSHELL-SCRIPT-DEFAULT-CHECKS"
+  ],
+  "implementation": [
+    "src/ux-sim/sim-world/toolbatch/default-checks.ts",
+    "src/cli/ops-30m-check.ts"
+  ],
+  "tests": [
+    "src/cli/ops-30m-check.test.ts",
+    "src/skills/tools/run-shell-default-checks.test.ts"
+  ],
+  "target": "One OP observation from fixed raw main, checklist, train, review queue and landing poller inputs in an isolated universe",
+  "inputs": [
+    "eight fake main commits",
+    "checklist green delta",
+    "train tick",
+    "realistic mixed-format OP queue rows",
+    "empty landing log"
+  ],
+  "observations": [
+    "required inbox, op_check and cost steps present",
+    "mixed-format queue and empty landing log remain incomplete",
+    "clipped preview marks truncation and retains full output"
+  ],
+  "entryCommands": [
+    "eln --test=<isolated-root> sim world run toolbatch --seed 33"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [
+    "op-check-30m"
+  ],
+  "recentUse": null
+}

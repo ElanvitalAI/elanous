@@ -55,6 +55,7 @@
  */
 
 import { getGrokApiKey } from '../config.js';
+import { logUnmeteredRow } from '../llm/ledgered-call.js';
 import {
   GROK_RESPONSES_URL,
   GROK_SEARCH_MODEL,
@@ -144,6 +145,7 @@ export function buildGrokLiveSearchKeywordCallable(
     const onParentAbort = (): void => ctrl.abort();
     args.signal?.addEventListener('abort', onParentAbort);
 
+    let logged = false; // 요청당 정확히 1행 — 기록 후 catch 재기록 금지 (JUD-B mustFix)
     try {
       const res = await fetchFn(GROK_RESPONSES_URL, {
         method: 'POST',
@@ -167,6 +169,9 @@ export function buildGrokLiveSearchKeywordCallable(
         }),
         signal: ctrl.signal,
       });
+      // LLM-CALL-COST-LEDGER — 요청 실제 발사 뒤 1행. 조기 return(빈 키워드·키 없음)엔 행 없음.
+      logUnmeteredRow(model, { providerName: 'grok', site: 'keyword-crawl-grok' });
+      logged = true;
 
       if (!res.ok) {
         emitFail(bus, intent, keyword, `http-${res.status}`);
@@ -194,6 +199,7 @@ export function buildGrokLiveSearchKeywordCallable(
         : { summary };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (!logged) logUnmeteredRow(model, { providerName: 'grok', site: 'keyword-crawl-grok', missingReason: 'provider-call-failed' });
       emitFail(bus, intent, keyword, `threw:${message}`);
       return { summary: `grok live-search threw: ${message} — '${keyword}'` };
     } finally {

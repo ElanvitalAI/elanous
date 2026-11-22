@@ -1,4 +1,5 @@
 import { textOnly } from '../llm/stream-text.js';
+import { streamChatLedgered } from '../llm/ledgered-call.js';
 // ── DART 공시 다운로더 (2026-07-07 · 대표 지시 — OpenDART 직결) ────────
 //
 // 배경: firecrawl DART 모니터는 "변경 감지 1건"만 알리고 공시 내용이 없음
@@ -182,7 +183,7 @@ export async function summarizeDisclosure(title: string, text: string): Promise<
           { role: 'user', content: `공시명: ${title}\n\n${text.slice(0, 9000)}` },
         ];
         let out = '';
-        for await (const d of textOnly(provider.streamChat(messages, { temperature: 0.2, maxTokens: 400 }))) out += d;
+        for await (const d of textOnly(streamChatLedgered(provider, messages, { temperature: 0.2, maxTokens: 400 }, { site: 'domain-dart-disclosure', jobKind: 'domain-report' }))) out += d;
         out = out.trim();
         if (out) return parseJudgment(out);
       }

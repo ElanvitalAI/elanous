@@ -506,6 +506,8 @@ import { handleIntakePipelinePreviewPost } from "./intake-pipeline-preview.js";
 import { handleIntakePipelineCommitPost } from "./intake-pipeline-commit.js";
 import { handleIntakeRoutePost } from "./intake-route.js";
 import { corsPreflight, jsonResponse } from "./json-response.js";
+import { projectRemoteElsHosts } from "../worker-registry/els-projection.js";
+import type { WorkerRegistrySnapshot } from "../worker-registry/types.js";
 import { isPublicRoute } from "./public-routes.js";
 import { handleSchedulesActionPost } from "./schedules-action.js";
 import {
@@ -1873,6 +1875,8 @@ export function probeNexusHttpPort(
 export type NexusWsBridgeInit = Omit<WsBridgeOpts, "hostname" | "port">;
 
 export interface NexusHttpServerOpts {
+  /** Nexus-owned worker registry snapshot; never supplied by a TUI request. */
+  workerRegistrySnapshot?: () => WorkerRegistrySnapshot;
   /** Test seam for HQ's read-only release ledger; production reads this Nexus instance's checklist. */
   checklistReader?: (version: string) => Checklist;
   /** Grant metadata supplied by the host; without it credential health remains unmeasured. */
@@ -3268,6 +3272,25 @@ export async function routeRequest(
 
   // Warm-pool pool declarations are authoritative in the Nexus resource ledger.
   // Machine credentials can read only declarations that include their host; owner bearer can publish declarations.
+  if (pathname === "/v1/els/remote-hosts") {
+    // The normal /v1 gate accepts same-origin and some temporary credentials. This control-plane
+    // projection requires the owner bearer configured for this Nexus origin, even on loopback.
+    if (!opts.metaApi || bearerCredential(req, opts.metaApi) !== "bearer-match")
+      return jsonResponse({ error: "unauthorized" }, 401);
+    if (!isResourceLedgerTransportSecure(req, opts, server))
+      return jsonResponse({ error: "secure-transport-required" }, 403);
+    if (method !== "GET") return jsonResponse({ error: "method-not-allowed" }, 405);
+    if (!opts.workerRegistrySnapshot) return jsonResponse({ error: "worker-registry-unavailable" }, 503);
+    try {
+      const body = projectRemoteElsHosts(opts.workerRegistrySnapshot(), Date.now());
+      return new Response(JSON.stringify(body), { status: 200, headers: {
+        "content-type": "application/json; charset=utf-8", "cache-control": "no-store",
+      } });
+    } catch {
+      return jsonResponse({ error: "worker-registry-unavailable" }, 503);
+    }
+  }
+
   if (pathname === "/v1/resource-ledger/pools") {
     if (method === "GET") {
       if (!isResourceLedgerTransportSecure(req, opts, server)) {
@@ -6703,6 +6726,14 @@ export async function routeRequest(
         return jsonResponse({ error: "invalid_audience" }, 400);
       }
       const forced = getUserConfig().nexus?.demoMode === true;
+      // CONTEXT-OWNER-ISOLATION-AUDIT #9 · UX 감사 ① — 릴레이 신뢰채널 회원 턴은
+      // operator 문맥을 아예 열어주지 않는다(fail-closed). ?audience= 지정이
+      // 있어도 무시되며, 허용 목록 2경로(채팅 쌍 · 세션 저장소) 밖의 회원
+      // 요청은 checkAuth 단계에서 이미 401 로 닫혀 있다.
+      const memberTurn = relayHostWebChatMember(req, opts.metaApi) !== undefined;
+      if (memberTurn && !forced) {
+        return jsonResponse({ error: "member-forbidden-context-now" }, 403);
+      }
       const audience: ContextNowAudience = forced
         ? "public-demo"
         : (requested ?? "operator");

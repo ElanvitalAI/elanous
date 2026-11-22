@@ -1,0 +1,15 @@
+{
+  "id": "els-remote-ssh-transport",
+  "name": "ELS remote SSH attach refusal event injector",
+  "audience": "internal",
+  "checklistCells": ["ELS-SSH-ATTACH-EDGE-FU"],
+  "implementation": ["src/ux-sim/sim-world/els-remote/attach-refusal.ts"],
+  "tests": ["src/ux-sim/sim-world/els-remote/attach-refusal.test.ts"],
+  "target": "registered remote ELS pane attach over operator-pinned SSH",
+  "inputs": ["changed host key", "unregistered remote host", "SSH disconnect after a frame"],
+  "observations": ["strict host-key pin options on the product SSH argv", "zero frames on mismatch", "zero SSH calls on unregistered host", "one end on disconnect"],
+  "entryCommands": ["eln --test=<isolated-state> sim world run els-remote --seed 33 --engine legacy"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

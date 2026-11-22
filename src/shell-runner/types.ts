@@ -132,6 +132,8 @@ export interface ShellRequest {
   description?: string;
   /** Caller-supplied cancellation. */
   signal?: AbortSignal;
+  /** Signed grant for the final file-engine spawn; never a boolean authority. */
+  runShellGrant?: import('../shell-primitive/spawn-gateway.js').RunShellGatewayGrant;
 }
 
 // ── Handle ─────────────────────────────────────────────────────────

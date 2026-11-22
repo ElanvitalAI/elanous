@@ -1,0 +1,40 @@
+{
+  "id": "member-journey-fake-webchat",
+  "name": "Member journey fake webchat",
+  "audience": "internal",
+  "checklistCells": ["HANDLE-JOOSUNG-PERSONAL-SPACE-1121"],
+  "implementation": [
+    "src/ux-sim/fake-member-oidc-world.ts",
+    "src/ux-sim/sim-world/member-journey/scenarios.ts",
+    "src/ux-sim/sim-world/member-journey/restart-child.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-member-webchat-journey.test.ts"
+  ],
+  "target": "Fake member signup to the first webchat answer through production member and bare-host routes",
+  "inputs": [
+    "fake Google signup and isolated reserved handle owner pin",
+    "HMAC handoff token and relay pin ledger",
+    "fake LLM answer and unresponsive provider",
+    "Nexus restart, concurrent same-token exchange, and serving absent injections"
+  ],
+  "observations": [
+    "Home link only appears for a connected member with a serving pin",
+    "Bare origin exchanges one wch token once, while distinct handoffs retain distinct usable wcs bearers",
+    "First prompt reaches the product route with fake LLM output",
+    "Faults leave explicit finite outcomes and no false serving link"
+  ],
+  "entryCommands": [
+    "eln --test sim world run member-journey --seed 1"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": [
+    "member-journey:first-turn",
+    "member-journey:restart",
+    "member-journey:provider-unresponsive",
+    "member-journey:concurrent-handoff",
+    "member-journey:independent-handoffs",
+    "member-journey:no-serving"
+  ],
+  "recentUse": null
+}

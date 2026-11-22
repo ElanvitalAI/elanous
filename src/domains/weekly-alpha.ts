@@ -1,4 +1,5 @@
 import { textOnly } from '../llm/stream-text.js';
+import { streamChatLedgered } from '../llm/ledgered-call.js';
 // ── R1 · 주간 알파 추천 리포트 (2026-07-06 · ROADMAP-organic-signal-engine) ──
 //
 // 대표 지시: "주당 한번씩 머니무브먼트·펀더멘털·수급 변화를 가지고 매매 추천".
@@ -121,7 +122,7 @@ export async function buildWeeklyAlphaReport(): Promise<WeeklyAlphaResult> {
           { role: 'system', content: ALPHA_SYSTEM },
           { role: 'user', content: structured.slice(0, 14_000) },
         ];
-        for await (const delta of textOnly(provider.streamChat(messages, { temperature: 0.4, maxTokens: 1100 }))) {
+        for await (const delta of textOnly(streamChatLedgered(provider, messages, { temperature: 0.4, maxTokens: 1100 }, { site: 'domain-weekly-alpha', jobKind: 'domain-report' }))) {
           recommendation += delta;
         }
         recommendation = recommendation.trim();

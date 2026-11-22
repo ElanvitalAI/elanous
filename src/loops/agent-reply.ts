@@ -206,8 +206,7 @@ async function runRestrictedAgent(input: AgentReplyInput): Promise<string | unde
   if (!model || !provider) throw new Error(`${input.address} role LLM needs resolved provider and model`);
   if (!input.pack.trim()) throw new Error(`${input.address} role pack is empty`);
   mkdirSync(join(homedir(), 'elanous-hq', 'seat-state', input.address), { recursive: true, mode: 0o700 });
-  const configured = { ...cfg, llm: { ...cfg.llm, provider, model,
-    goalLoop: { ...cfg.llm.goalLoop, enabled: false } } };
+  const configured = { ...cfg, llm: { ...cfg.llm, provider, model } };
   const session = ensureCliSession(configured, undefined, { title: `${input.address} inbox #${input.request.id}` });
   const tools = buildL0AgentTools(input.address, process.cwd(), { store: input.store, root: input.observationRoot });
   const result = await runTurn({

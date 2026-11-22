@@ -12,7 +12,7 @@
 
 import { debug } from '../debug/log.js';
 import { getProvider, logAgentTurnUsage, resolveDefaultProvider, type LLMMessage, type LLMOpts } from '../llm.js';
-import type { LLMUsage } from '../prompt-cache/types.js';
+import { streamChatLedgered } from '../llm/ledgered-call.js';
 import type { GoalJudgeVerdict } from './types.js';
 
 export interface JudgeInput {
@@ -181,13 +181,13 @@ export async function judgeGoalTurn(
     });
 
     let text = '';
-    let usage: LLMUsage = {};
     try {
       const t0 = Date.now();
       if (provider.streamChat) {
-        for await (const ev of provider.streamChat(messages, llmOpts)) {
+        // LLM-CALL-COST-LEDGER — streamChatLedgered 가 소비 즉시 원장 1행을 남긴다
+        // (usage 이벤트가 오면 실측치, 아니면 unmeasured). 여기선 별도 usage 누적 불필요.
+        for await (const ev of streamChatLedgered(provider, messages, llmOpts, { site: 'goals-judge' })) {
           if (ev.type === 'text' && ev.delta) text += ev.delta;
-          else if (ev.type === 'usage') usage = { ...usage, ...ev.usage };
           if (opts.timeoutMs && Date.now() - t0 > opts.timeoutMs) {
             throw new Error(`judge timeout after ${opts.timeoutMs}ms`);
           }
@@ -199,10 +199,11 @@ export async function judgeGoalTurn(
             throw new Error(`judge timeout after ${opts.timeoutMs}ms`);
           }
         }
+        // LLM-CALL-COST-LEDGER — chat 폴백 경로도 행 1개 보장(try/finally 밖 수동 폴백 지점).
+        try {
+          logAgentTurnUsage(opts.model ?? provider.defaultModel, {}, { providerName: provider.name, site: 'goals-judge' });
+        } catch { /* best-effort observation */ }
       }
-      try {
-        logAgentTurnUsage(opts.model ?? provider.defaultModel, usage, { providerName: provider.name, site: 'goals.judge' });
-      } catch { /* best-effort observation */ }
     } catch (err) {
       debug.log('goal', 'judge.error', { attempt, message: (err as Error).message }, { level: 'error' });
       // On timeout / abort, return null so the loop can pause-ask

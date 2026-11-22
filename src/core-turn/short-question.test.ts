@@ -12,9 +12,9 @@ describe('TUI-H1-ROUTE-WRITEVERB-FP · «도구 쓰지 말고 답해: … 첫 �
     expect(verdict.goalLoop).toBe(false);
   });
 
-  test('a seat rides the goal loop but stays 읽기·분석', () => {
+  test('a seat stays 읽기·분석 and is not promoted to the goal loop (CHAT-GOAL-LOOP-DEFAULT-OFF)', () => {
     expect(classifyTuiChatIntent('도구 쓰지 말고 답해: … 첫 줄을 그대로 옮기고', { seat: true }).route).toBe('읽기·분석');
-    expect(classifyTuiChatIntent('도구 쓰지 말고 답해: … 첫 줄을 그대로 옮기고', { seat: true }).goalLoop).toBe(true);
+    expect(classifyTuiChatIntent('도구 쓰지 말고 답해: … 첫 줄을 그대로 옮기고', { seat: true }).goalLoop).toBe(false);
   });
 
   test('real write verbs still route to 코딩·구현', () => {

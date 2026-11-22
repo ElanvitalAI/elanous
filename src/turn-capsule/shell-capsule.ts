@@ -22,6 +22,7 @@ import { emitTurnLife } from '../debug/turn-life.js';
 import { createCapsulePolicy } from '../core-turn/capsule-policy.js';
 import { isSeatTurnCapAbort } from '../core-turn/seat-turn-cap.js';
 import { readUserConfigObject } from '../user-config/read.js';
+import { onUrgentSteer } from '../session/urgent-steer.js';
 import { userConfigPath } from '../user-config.js';
 import type { CapsuleDoneEvent, CapsuleEvent, CapsulePolicy, CapsuleStatus } from './contract.js';
 
@@ -117,7 +118,7 @@ export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellC
   const cap = decision.mode === 'detach' ? 0 : decision.syncCapMs;
   // Capability, not a switch: only a session with a sink gets the result back — anywhere else, inline.
   const at = sink;
-  if (!Number.isFinite(cap) || at === null) return call.start(call.turnSignal, () => {});
+  if (at === null) return call.start(call.turnSignal, () => {});
 
   const now = deps.now ?? Date.now;
   const setTimer = deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
@@ -129,18 +130,25 @@ export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellC
   const own = new AbortController();
   let timer: unknown;
   let arm = (): void => {};
-  let hit: (why: 'cap' | 'turn-cap') => void = () => {};
-  const capHit = new Promise<'cap' | 'turn-cap'>((resolve) => {
+  let hit: (why: 'cap' | 'turn-cap' | 'urgent') => void = () => {};
+  const capHit = new Promise<'cap' | 'turn-cap' | 'urgent'>((resolve) => {
     hit = resolve;
-    arm = () => { arm = () => {}; timer = setTimer(() => resolve('cap'), cap); };
+    arm = () => { arm = () => {}; if (Number.isFinite(cap)) timer = setTimer(() => resolve('cap'), cap); };
   });
   const turnSignal = call.turnSignal;
   // OP #121854 — the hit↔abort microtask race: once the seat turn cap hit, a spawned()
   // report that lands in the same flush never counts as `launched` (the abort wins the boundary).
   let capped = false;
+  let urgentBeforeLaunch = false;
   // JUD #39435: `launched` is the confirmed start — Bash's start call is itself the launch, RunShell's is the
   // `spawned()` report. Only a launched call may detach; a pre-launch cap cancels below.
   let launched = !call.clockFromSpawn;
+  // An approval continuation may already be queued. Abort its signal inside the urgent callback,
+  // before that microtask can observe a live signal and spawn a shell.
+  const offUrgent = onUrgentSteer(at.sessionId, () => {
+    if (!launched) { urgentBeforeLaunch = true; own.abort('urgent decision before shell spawn'); }
+    hit('urgent');
+  });
   // OP #122497 — a pre-start cap cancels the child signal synchronously, inside this handler: a queued approval
   // continuation (allow resolved before the cap in the same tick) must never observe a live signal and spawn
   // past the cap. A started call keeps the detach path untouched.
@@ -153,45 +161,50 @@ export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellC
   if (turnSignal?.aborted) forward();
   else turnSignal?.addEventListener('abort', forward, { once: true });
   const work = call.start(own.signal, () => {
-    if (capped) return; // OP #121854 — the cap hit first: this report is cancelled, not launched.
+    if (capped || urgentBeforeLaunch) return; // A pre-launch cap or decision cancels this report.
     launched = true; arm();
   });
   if (!call.clockFromSpawn) arm();
-  let raced: { value: R } | 'cap' | 'turn-cap';
+  let raced: { value: R } | 'cap' | 'turn-cap' | 'urgent';
   try {
     raced = await Promise.race([work.then((value) => ({ value })), capHit]);
   } catch (error) {
     clearTimer(timer);
     turnSignal?.removeEventListener('abort', forward);
+    offUrgent();
     throw error;
   }
-  if (raced === 'turn-cap' && !launched) {
+  if ((raced === 'turn-cap' || raced === 'urgent') && !launched) {
     // JUD #39435 must: the cap won before the process started — the pending approval/work is cancelled (no
     // capsule, no frame, no notification) and the cap reason goes back to the caller.
     clearTimer(timer);
     turnSignal?.removeEventListener('abort', forward);
+    offUrgent();
     work.then(() => {}, () => {}); // the cancelled wait's own outcome never surfaces — the cap is the answer
-    own.abort(turnSignal?.reason);
-    throw turnSignal?.reason;
+    own.abort(raced === 'urgent' ? 'urgent decision before shell spawn' : turnSignal?.reason);
+    throw raced === 'urgent' ? new Error('RunShell deferred before spawn for urgent decision') : turnSignal?.reason;
   }
-  if (raced !== 'cap' && raced !== 'turn-cap') {
+  if (raced !== 'cap' && raced !== 'turn-cap' && raced !== 'urgent') {
     clearTimer(timer);
     turnSignal?.removeEventListener('abort', forward);
+    offUrgent();
     return raced.value;
   }
 
   // Past the cap: the process now belongs to the session, not the turn.
   turnSignal?.removeEventListener('abort', forward);
+  offUrgent();
   const capsuleId = `shell-${startedAt.toString(36)}-${++nextId}`;
   const preview = shellCapsulePreview(call.command);
   const detachedAt = now();
   detached.set(capsuleId, { capsuleId, tool: call.tool, preview, startedAt, detachedAt, stop: own, ownerSessionId: at.sessionId });
   try {
-    log('turn-life:capsule-detached', { ...ids(capsuleId), tool: call.tool, kind: 'shell', syncCapMs: cap, reason: raced === 'turn-cap' ? 'seat-turn-cap' : decision.reason });
+    log('turn-life:capsule-detached', { ...ids(capsuleId), tool: call.tool, kind: 'shell', syncCapMs: cap,
+      reason: raced === 'turn-cap' ? 'seat-turn-cap' : raced === 'urgent' ? 'urgent-decision' : decision.reason });
   } catch { /* observability is fail-open */ }
   try {
     at?.write({ type: 'capsule-progress', capsuleId, kind: 'shell', sessionId: at.sessionId, at: detachedAt,
-      line: `${call.tool} ${preview} · detached after ${Math.round(cap / 1000)}s` });
+      line: `${call.tool} ${preview} · detached after ${Math.round((raced === 'urgent' ? detachedAt - startedAt : cap) / 1000)}s` });
   } catch { /* a frame failure never stops the capsule */ }
 
   const settle = (status: CapsuleStatus, output: string): void => {
@@ -224,7 +237,7 @@ export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellC
     },
     (error: unknown) => settle('failed', error instanceof Error ? error.message : String(error)),
   );
-  return call.started(capsuleId, cap);
+  return call.started(capsuleId, raced === 'urgent' ? detachedAt - startedAt : cap);
 }
 
 /** The A2 policy — the A1 capsule policy over the user's `turn` config (`turn.syncCapMs`, default 10s). No switch

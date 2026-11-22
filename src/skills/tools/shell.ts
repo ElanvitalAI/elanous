@@ -42,6 +42,12 @@ import { getUserConfig } from '../../user-config/reader.js';
 import type { CapsulePolicy, CapsuleStatus } from '../../turn-capsule/contract.js';
 import { runShellCapsule, shellCapsulePolicy, type ShellCapsuleDeps } from '../../turn-capsule/shell-capsule.js';
 import { triageShellIsolation } from '../../shell-runner/isolation-triage.js';
+import { prepareRunnerRunShell } from '../../shell-runner/prepare-runshell.js';
+import { resolve } from 'node:path';
+import { scriptCommandPolicy, runShellScript } from './run-shell-script.js';
+import { dispatchSignedRecipe } from './run-shell-recipe-dispatch.js';
+import { defaultCheckScript } from './run-shell-default-checks.js';
+export { scriptCommandPolicy } from './run-shell-script.js';
 import { SCHEDULE_WAKEUP_TOOL_NAME } from './schedule-wakeup.js';
 import {
   globalTaskNotificationQueue,
@@ -64,18 +70,40 @@ export function buildRunShellTool(): LLMToolSpec {
       'Execute an argv-style command (no shell interpretation). ' +
       'Prefer this over `Bash` when the command shape is known — no quoting pitfalls. ' +
       'Returns exit code, stdout, stderr, elapsed time, and an outcome tag. ' +
-      'Approval policy controls user-prompt behaviour: ' +
-      "'none' runs immediately, 'first-time' prompts once per (cwd,argv) then caches, 'always' prompts every call. " +
+      'Commands outside the local-read policy require a human-approved, single-use execution grant; ' +
+      "the approval parameter and previously cached decisions do not bypass that execution gate. " +
+      'Use script for up to eight ordered eln, git, gh, kubectl or host read CLI calls. Exact local read argv needs no prompt; network reads and unlisted eln argv require human approval. Unlisted git, gh, kubectl and host argv are refused. For the OP 30-minute check use check=30-minute with checkSeat, checkVersion and checkPreviousGreen. The model receives a bounded summary. ' +
       'Every invocation is written to ~/.monad-agent/audit/shell-YYYY-MM-DD.ndjson.',
     parameters: {
       type: 'object',
       properties: {
+        recipeId: {
+          type: 'string', pattern: '^[a-z][a-z0-9-]{0,63}$',
+          description: 'Execute an operator-installed, signed exact recipe; its epoch is checked immediately before spawn.',
+        },
         command: {
           type: 'array',
           items: { type: 'string' },
           description: 'argv array. [0] is the binary (or path), [1..] are flags and positional args. No shell metacharacters get interpreted.',
           minItems: 1,
         },
+        script: {
+          type: 'array', minItems: 1, maxItems: 8,
+          description: 'Ordered eln, git, gh, kubectl or host read CLI argv. Exact local reads need no prompt; network reads require human approval. Each id may be referenced later as $ref:id.field after selecting a JSON scalar.',
+          items: {
+            type: 'object', additionalProperties: false, required: ['id', 'command'],
+            properties: {
+              id: { type: 'string', pattern: '^[a-z][a-z0-9_-]{0,31}$' },
+              command: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 20 },
+              select: { type: 'array', items: { type: 'string' }, maxItems: 18 },
+              headLines: { type: 'integer', minimum: 0, maximum: 4 },
+            },
+          },
+        },
+        check: { type: 'string', enum: ['30-minute'], description: 'One RunShell script call for the standard seat check.' },
+        checkSeat: { type: 'string', enum: ['OP'] },
+        checkVersion: { type: 'string', description: 'Exact release version, such as 0.3.33.' },
+        checkPreviousGreen: { type: 'integer', minimum: 0, maximum: 9999, description: 'OP 30-minute check: green count from the preceding check.' },
         cwd: {
           type: 'string',
           description: 'Working directory. Defaults to the current session working directory.',
@@ -87,7 +115,7 @@ export function buildRunShellTool(): LLMToolSpec {
         approval: {
           type: 'string',
           enum: ['none', 'first-time', 'always'],
-          description: "Approval policy. Default 'none'.",
+          description: "Legacy approval policy. Default 'none'; it cannot bypass the single-use execution grant.",
         },
         sandbox: {
           type: 'string',
@@ -120,7 +148,7 @@ export function buildRunShellTool(): LLMToolSpec {
             "Requires mode='bg'. Enqueue one <task-notification> once this many complete output lines have been seen.",
         },
       },
-      required: ['command'],
+      oneOf: [{ required: ['command'] }, { required: ['script'] }, { required: ['recipeId'] }, { required: ['check', 'checkSeat', 'checkVersion', 'checkPreviousGreen'] }],
       additionalProperties: false,
     },
   };
@@ -705,8 +733,60 @@ export function enqueueShellCompletionNotice(
 
 export async function dispatchRunShell(
   rawArgs: Record<string, unknown>,
-  opts: { signal?: AbortSignal; availableToolNames?: readonly string[]; sessionId?: string; onSpawn?: () => void; priorHumanApproval?: boolean } = {},
+  opts: { signal?: AbortSignal; availableToolNames?: readonly string[]; sessionId?: string; onSpawn?: () => void; priorHumanApproval?: boolean; scriptGitRead?: boolean;
+    scriptApproval?: (command: string[], signal?: AbortSignal) => Promise<{ allowed: boolean; priorHumanApproval: boolean }>;
+    /** RSEM-RAW-RECEIPT (OP #126921 · MOB-1 #126930) — 내부 script-step 재귀 호출임을 표시.
+     * 마스킹 출구를 건너뛰어 runShellScript 가 원문 stdout로 지문·bytes·JSON.parse 하게 한다.
+     * 모델 경계 마스킹은 외측 script 결과 반환 시 단일 출구(script 결과 반환 직후)에서 1회. */
+    rawInternal?: boolean; tolerateCheckInboxFailure?: boolean } = {},
 ): Promise<RunShellDispatchResult> {
+  if (rawArgs.recipeId !== undefined) {
+    if (typeof rawArgs.recipeId !== 'string' || Object.keys(rawArgs).some(key => !['recipeId', 'timeoutMs'].includes(key)))
+      throw new Error('RunShell recipe accepts only recipeId and timeoutMs');
+    const timeoutMs = typeof rawArgs.timeoutMs === 'number' && Number.isFinite(rawArgs.timeoutMs)
+      ? clampShellTimeoutMs(rawArgs.timeoutMs) : DEFAULT_TIMEOUT_MS;
+    return maskRunShellEgress(await dispatchSignedRecipe(rawArgs.recipeId, timeoutMs, opts.signal, opts.sessionId));
+  }
+  if (rawArgs.check !== undefined) {
+    if (rawArgs.command !== undefined || rawArgs.script !== undefined) throw new Error('RunShell accepts one of command, script or check');
+    const result = await dispatchRunShell({ ...rawArgs, check: undefined, script: defaultCheckScript(rawArgs) }, { ...opts, tolerateCheckInboxFailure: true });
+    const summary = JSON.parse(result.stdout) as { steps?: Array<{ id: string; outcome: string; exitCode: number | null; selected?: Record<string, unknown> }> };
+    const receipt = summary.steps?.find((step) => step.id === 'inbox');
+    const selected = receipt?.selected;
+    const count = selected?.count;
+    const known = receipt?.outcome === 'exit' && receipt.exitCode === 0 && selected?.status === 'ok'
+      && typeof count === 'number' && Number.isSafeInteger(count) && count >= 0;
+    const inbox = known ? { status: 'ok', count, complete: true } : { status: 'unknown', count: null, complete: false };
+    return { ...result, stdout: JSON.stringify({ ...summary, inbox }) };
+  }
+  if (rawArgs.script !== undefined) {
+    if (rawArgs.command !== undefined) throw new Error('RunShell accepts command or script, not both');
+    const timeoutMs = typeof rawArgs.timeoutMs === 'number' && Number.isFinite(rawArgs.timeoutMs)
+      ? clampShellTimeoutMs(rawArgs.timeoutMs) : DEFAULT_TIMEOUT_MS;
+    // RSEM-RAW-RECEIPT — step 결과는 원문으로 전달(지문·bytes·parse 원문 기준), 모델 가는 최종 결과만 출구 마스킹.
+    const scriptResult = await runShellScript(rawArgs.script, opts.signal, timeoutMs, async (command, description, signal) => {
+      // A policy receipt may deny a step, but an allow boolean is not a
+      // signed spawn authorization for a non-local command.
+      const policyReceipt = opts.scriptApproval ? await opts.scriptApproval(command, signal) : null;
+      if (!policyReceipt?.allowed) return {
+        output: 'RunShell script step denied by the policy gate', exitCode: null, outcome: 'denied',
+        elapsedMs: 0, stdout: '', stderr: '', truncated: false, approvalKey: 'script:denied',
+        sandboxed: false, sandboxTool: 'none',
+      };
+      // Object-only Git reads can still invoke configured signature or textconv helpers.
+      // Worktree reads and ls-remote use the prior-human-approval path instead.
+      const guardedCommand = command[0] === 'git' && scriptCommandPolicy(command) === 'read-local'
+        ? ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+          '-c', 'diff.external=', '-c', 'core.pager=cat', '-c', 'log.showSignature=false',
+          command[1]!, ...(['log', 'show'].includes(command[1]!) ? ['--no-show-signature'] : []),
+          ...(command[1] === 'show' ? ['--no-ext-diff', '--no-textconv'] : []), ...command.slice(2)]
+        : command;
+      return dispatchRunShell({ command: guardedCommand, description, approval: rawArgs.approval, sandbox: rawArgs.sandbox,
+        network: rawArgs.network, timeoutMs: rawArgs.timeoutMs, cwd: rawArgs.cwd },
+      { ...opts, signal, priorHumanApproval: policyReceipt.priorHumanApproval, scriptGitRead: guardedCommand !== command, rawInternal: true });
+    }, opts.tolerateCheckInboxFailure === true);
+    return maskRunShellEgress(scriptResult);
+  }
   const command = asCommand(rawArgs.command);
   const cwd = typeof rawArgs.cwd === 'string' ? rawArgs.cwd : undefined;
   // A201 — every shell path shares one cap; the runner path used to pass the model's value unclamped.
@@ -762,25 +842,35 @@ export async function dispatchRunShell(
   }
   const bgAvailable = getShellRunnerDeps() !== null;
   if (mode && deps) {
-    const gate = await gateShellCommand({ command, cwd: effectiveCwd, approval, sandbox, network, signal: opts.signal }, opts.priorHumanApproval === true);
-    if (gate) {
-      logShellDispatch(`runner.${gate.outcome}`, { cwd: effectiveCwd, cwdSource }, argsTrace);
-      return {
-        output: formatSummary(gate), exitCode: gate.exitCode, outcome: gate.outcome,
-        elapsedMs: gate.elapsedMs, stdout: gate.stdout, stderr: gate.stderr,
-        truncated: gate.truncated, approvalKey: gate.approvalKey,
-        sandboxed: gate.sandboxed, sandboxTool: gate.sandboxTool,
+    let prepared: Awaited<ReturnType<typeof prepareRunnerRunShell>>;
+    try {
+      prepared = await prepareRunnerRunShell({ command, cwd: effectiveCwd, sessionId: opts.sessionId,
+        signal: opts.signal, sandbox, network });
+    } catch { prepared = null; }
+    if (!prepared) {
+      return { output: 'RunShell approval denied or unavailable', exitCode: null,
+        outcome: opts.signal?.aborted ? 'aborted' : 'denied', elapsedMs: 0, stdout: '', stderr: '',
+        truncated: false, approvalKey: 'runner:denied', sandboxed: false, sandboxTool: 'none' };
+    }
+    if (!prepared.grant) {
+      const gated = await gateShellCommand({ command, cwd, approval, network, signal: opts.signal }, opts.priorHumanApproval);
+      if (gated) return {
+        output: formatSummary(gated), exitCode: gated.exitCode, outcome: gated.outcome,
+        elapsedMs: gated.elapsedMs, stdout: gated.stdout, stderr: gated.stderr,
+        truncated: gated.truncated, approvalKey: gated.approvalKey,
+        sandboxed: gated.sandboxed, sandboxTool: gated.sandboxTool,
       };
     }
     const result = await dispatchViaRunner({
-      command, cwd, timeoutMs, mode, description,
-      ...(watch ? { watch } : {}),
-      signal: opts.signal,
-      ownerSessionId: opts.sessionId,
-      deps,
+      command: prepared.command, cwd: resolve(effectiveCwd), timeoutMs, mode, description,
+      grant: prepared.grant, sandboxed: prepared.sandboxed, sandboxTool: prepared.sandboxTool,
+      ...(watch ? { watch } : {}), signal: opts.signal, ownerSessionId: opts.sessionId,
+      deps, rawInternal: opts.rawInternal === true,
       ...(opts.onSpawn ? { onSpawn: opts.onSpawn } : {}),
     });
     logShellDispatch(`runner.${result.outcome}`, { cwd: effectiveCwd, cwdSource }, argsTrace);
+    // RSEM-RAW-RECEIPT — 내부 script-step 재귀는 원문 반환(외측 단일 출구에서 1회 마스킹).
+    if (opts.rawInternal) return result;
     return withLongSleepWarning(result, longSleep, bgAvailable, resumeHint);
   }
 
@@ -788,16 +878,21 @@ export async function dispatchRunShell(
     command,
     cwd,
     timeoutMs,
+    ...(opts.scriptGitRead ? { env: { GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' } } : {}),
     approval,
     sandbox,
     network,
+    envPolicy: 'allowlist',
     signal: opts.signal,
+    runShellSessionId: opts.sessionId,
     ...(opts.onSpawn ? { onSpawn: opts.onSpawn } : {}),
   }, opts.priorHumanApproval === true);
 
   logShellDispatch(`legacy.${result.outcome}`, { cwd: effectiveCwd, cwdSource }, argsTrace);
   const summary = result.watchdog ? `${result.watchdog.text}\n${formatSummary(result)}` : formatSummary(result);
-  return withLongSleepWarning({
+  // RUNSHELL-OUTPUT-EGRESS-MASK — 모델로 나가는 결과 텍스트의 단일 출구(legacy 경로).
+  // RSEM-RAW-RECEIPT — 내부 script-step 재귀 호출은 원문을 그대로 돌려준다(외측에서 1회 마스킹).
+  if (opts.rawInternal) return withLongSleepWarning({
     ...(result.watchdog ? { watchdog: result.watchdog } : {}),
     output: summary,
     exitCode: result.exitCode,
@@ -810,6 +905,100 @@ export async function dispatchRunShell(
     sandboxed: result.sandboxed,
     sandboxTool: result.sandboxTool,
   }, longSleep, bgAvailable, resumeHint);
+  return maskRunShellEgress(withLongSleepWarning({
+    ...(result.watchdog ? { watchdog: result.watchdog } : {}),
+    output: summary,
+    exitCode: result.exitCode,
+    outcome: result.outcome,
+    elapsedMs: result.elapsedMs,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    truncated: result.truncated,
+    approvalKey: result.approvalKey,
+    sandboxed: result.sandboxed,
+    sandboxTool: result.sandboxTool,
+  }, longSleep, bgAvailable, resumeHint));
+}
+
+/** RUNSHELL-OUTPUT-EGRESS-MASK (ROSTER-0333-60 · #39491과 같은 출구 원칙) — RunShell 결과의
+ * 모델 가는 텍스트(output 요약·stdout·stderr)에 기존 공용 redactSecretText
+ * (src/debug/secret-redaction.ts · gitleaks 이식 룰셋 · 새 정규식 0)를 1회 적용한다.
+ * 파일 저장(outputFilePath)·감사 로그·shell-primitive 원문은 무변경 — 어디까지나 egress 경계다.
+ *
+ * RSEM-JSONFIX — 값 클래스가 백슬래시를 삼켜 escaped-quote(`\"`)의 이스케이프를 벗겨
+ * JSON stdout 을 파손하는 회귀(redactSecretText 직접 적용 → parse fail). stdout 이
+ * JSON.parse 에 성공하면 구조 보존 경로로 바꾼다: parse 는 유효성 판정만 — 마스킹은
+ * 원문 텍스트 위 위치 기반 치환(maskJsonStringLiteralsInPlace · R2/R3). parse 실패 시(비-JSON stdout)는 기존 텍스트 축 폴백.
+ * stderr/output 요약은 텍스트 축 그대로(stdout 만 구조 보존 경로).
+ *
+ * RSEM-JSONFIX-R2 (OP #128225 · JUD-B #128222) — 1차의 parse→재직렬화 경로가
+ * `__proto__` own 키 삭제·2^53 초과 정수 변형을 일으켰다. 구조 재직렬화를 금지하고
+ * 원문 텍스트 위에서 비밀이 든 문자열 리터럴(«값»·«키» 모두)을 위치 기반 치환한다.
+ * RSEM-KEYFIX-R3 (jud-39537-6eb6a2057b8d · OP #128535) — 키도 같은 축으로 가린다:
+ * 비밀이 객체 키(중첩 포함)에 들어가면 값만 가릴 때 모델 출력에 그대로 남는다. */
+function redactSecretJsonText(value: string): string {
+  return redactSecretText(value);
+}
+
+/** RSEM-JSONFIX-R2 · KEYFIX-R3 — 위치 기반 문자열 리터럴 치환(값·키 모두).
+ * parse→객체 재구성→stringify 는 `__proto__` own 키를 지우고(out[k] = … 할당이
+ * 프로토타입 설정으로 바뀜) 2^53 초과 정수를 Number 로 변형한다. 구조 재직렬화 금지:
+ * 원문 stdout 을 그대로 두고 비밀 패턴이 든 문자열 리터럴(값·키 포함)의 그 위치 바이트를
+ * redact 된 값의 JSON 인코딩으로 교체한다 — 숫자·원문 이스케이프·키 순서는 불변. */
+function maskJsonStringLiteralsInPlace(stdout: string): string {
+  const n = stdout.length;
+  let out = '';
+  let segStart = 0;
+  let i = 0;
+  while (i < n) {
+    if (stdout.charCodeAt(i) !== 0x22 /* " */) { i++; continue; }
+    // 문자열 리터럴 스캔 — 백슬래시 이스케이프 존중
+    let j = i + 1;
+    let closed = -1;
+    while (j < n) {
+      const c = stdout[j]!;
+      if (c === '\\') { j += 2; continue; }
+      if (c === '"') { closed = j; break; }
+      j++;
+    }
+    if (closed < 0) return stdout; // 유효 JSON 에는 없는 짝 안 맞음 — 원문 그대로(fail-safe)
+    const literal = stdout.slice(i, closed + 1);
+    // KEYFIX-R3 — 키 리터럴도 값과 같은 축으로 가린다: 비밀이 키에 들어가면 값만
+    // 가릴 때 모델 출력에 남는다(jud-39537-6eb6a2057b8d mustFix). 위치 기반 치환이므로
+    // 키가 중복돼도(충돌) 출력은 그대로 유효 JSON — 비밀은 어느 쪽에도 없다.
+    let replacement: string | null = null;
+    try {
+      const decoded = JSON.parse(literal) as string;
+      const safe = redactSecretJsonText(decoded);
+      if (safe !== decoded) replacement = JSON.stringify(safe);
+    } catch { /* 리터럴 디코드 실패 — 원문 유지 */ }
+    if (replacement !== null) {
+      out += stdout.slice(segStart, i) + replacement;
+      segStart = closed + 1;
+    }
+    i = closed + 1;
+  }
+  return segStart === 0 ? stdout : out + stdout.slice(segStart);
+}
+
+function maskJsonStdoutPreservingStructure(stdout: string): string {
+  if (stdout.includes('"')) {
+    try {
+      JSON.parse(stdout); // 유효 JSON 판정만 — 재구성 없음
+      return maskJsonStringLiteralsInPlace(stdout);
+    } catch { /* 비-JSON stdout — 아래 텍스트 축 폴백 */ }
+  }
+  return redactSecretText(stdout); // 폴백: 리터럴 0·비-JSON 모두 텍스트 축 마스킹
+}
+
+export function maskRunShellEgress(result: RunShellDispatchResult, opts?: { rawInternal?: boolean }): RunShellDispatchResult {
+  if (opts?.rawInternal) return result;
+  return {
+    ...result,
+    output: redactSecretText(result.output),
+    stdout: maskJsonStdoutPreservingStructure(result.stdout),
+    stderr: redactSecretText(result.stderr),
+  };
 }
 
 /** Route a request through the file-backed shell-runner and project its
@@ -826,16 +1015,28 @@ async function dispatchViaRunner(args: {
   deps: NonNullable<ReturnType<typeof getShellRunnerDeps>>;
   ownerSessionId?: string;
   onSpawn?: () => void;
+  rawInternal?: boolean;
+  grant?: import('../../shell-primitive/spawn-gateway.js').RunShellGatewayGrant;
+  sandboxed: boolean;
+  sandboxTool: ShellResult['sandboxTool'];
 }): Promise<RunShellDispatchResult> {
   const req: Parameters<typeof runnerDispatch>[0] = {
     command: args.command,
     mode: args.mode,
+    ...(args.grant ? { runShellGrant: args.grant } : {}),
     ...(args.cwd !== undefined ? { cwd: args.cwd } : {}),
     ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
     ...(args.description !== undefined ? { description: args.description } : {}),
     ...(args.signal !== undefined ? { signal: args.signal } : {}),
   };
-  const handle = runnerDispatch(req, args.deps, { ownerSessionId: args.ownerSessionId });
+  let handle: ShellHandle;
+  try {
+    handle = runnerDispatch(req, args.deps, { ownerSessionId: args.ownerSessionId });
+  } catch (error) {
+    return { output: 'RunShell spawn failed', exitCode: null, outcome: 'spawn-error', elapsedMs: 0,
+      stdout: '', stderr: error instanceof Error ? error.message : String(error), truncated: false,
+      approvalKey: 'runner:spawn-error', sandboxed: args.sandboxed, sandboxTool: args.sandboxTool };
+  }
   try { args.onSpawn?.(); } catch { /* the capsule clock is advisory */ }
   if (args.mode === 'bg') {
     if (args.watch) {
@@ -891,12 +1092,13 @@ async function dispatchViaRunner(args: {
       stderr: '',
       truncated: false,
       approvalKey: `runner:${handle.id}`,
-      sandboxed: false,
-      sandboxTool: 'none',
+      sandboxed: args.sandboxed,
+      sandboxTool: args.sandboxTool,
     };
   }
   const result = await handle.result;
-  return runnerToLegacyResult(handle.id, result);
+  // RSEM-RAW-RECEIPT — 내부 script-step 재귀는 원문 반환(외측 단일 출구에서 1회 마스킹).
+  return maskRunShellEgress({ ...runnerToLegacyResult(handle.id, result), sandboxed: args.sandboxed, sandboxTool: args.sandboxTool }, { rawInternal: args.rawInternal === true });
 }
 
 function runnerToLegacyResult(
@@ -972,7 +1174,8 @@ export function runShellCapsuleStartedResult(capsuleId: string, syncCapMs: numbe
  *  and stays as is. The sync clock starts at spawn, so an approval wait never detaches a call. No switch (R3). */
 export function dispatchRunShellCapsule(
   rawArgs: Record<string, unknown>,
-  opts: { signal?: AbortSignal; availableToolNames?: readonly string[]; sessionId?: string; priorHumanApproval?: boolean } = {},
+  opts: { signal?: AbortSignal; availableToolNames?: readonly string[]; sessionId?: string; priorHumanApproval?: boolean;
+    scriptApproval?: (command: string[], signal?: AbortSignal) => Promise<{ allowed: boolean; priorHumanApproval: boolean }> } = {},
   deps: Omit<ShellCapsuleDeps, 'policy'> & { readonly policy?: CapsulePolicy } = {},
 ): Promise<RunShellDispatchResult> {
   if (rawArgs.mode === 'bg') return dispatchRunShell(rawArgs, opts);

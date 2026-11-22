@@ -17,6 +17,7 @@
 
 import { tierModel } from '../llm/model-defaults.js';
 import { llmNetworkFetch } from '../session-runtime/llm-call-gateway.js';
+import { logUnmeteredRow } from '../llm/ledgered-call.js';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -105,22 +106,29 @@ function parseClusterVerdict(text: string, n: number): ClusterVerdict | null {
 export async function llmOnce(prompt: string): Promise<string | null> {
   const xaiKey = process.env.XAI_API_KEY || skillEnv().XAI_API_KEY || '';
   if (xaiKey) {
+    const model = tierModel('budget', 'grok');
+    let logged = false; // 요청당 정확히 1행 — 기록 후 catch 재기록 금지 (JUD-B mustFix)
     try {
-      const model = tierModel('budget', 'grok');
       const res = await llmNetworkFetch('https://api.x.ai/v1/chat/completions', {
         method: 'POST',
         headers: { Authorization: `Bearer ${xaiKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, temperature: 0, messages: [{ role: 'user', content: prompt }] }),
         signal: AbortSignal.timeout(30_000),
       }, { provider: 'grok', model, role: 'aux', requestedBy: 'signal-dedup' });
+      logUnmeteredRow(model, { providerName: 'grok', site: 'signal-dedup', ...(res.ok ? {} : { missingReason: 'provider-call-failed' as const }) });
+      logged = true;
       if (res.ok) {
         const d = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
         const c = d?.choices?.[0]?.message?.content;
         if (c) return c;
       }
-    } catch { /* 폴백 */ }
+    } catch {
+      if (!logged) logUnmeteredRow(model, { providerName: 'grok', site: 'signal-dedup', missingReason: 'provider-call-failed' });
+    }
   }
   // LM Studio 폴백 (config llm.rotation local baseUrl)
+  let localModel: string | null = null; // 원장용 — 실제 chat 호출에 쓴 모델(요청 전 확정)
+  let localLogged = false; // 요청당 정확히 1행 — 기록 후 catch 재기록 금지 (JUD-B mustFix)
   try {
     let base = 'http://localhost:1234/v1';
     try {
@@ -132,16 +140,22 @@ export async function llmOnce(prompt: string): Promise<string | null> {
     const ids = (models?.data ?? []).map(m => m.id);
     if (!ids.length) return null;
     const model = ids.find(id => /gemma/i.test(id)) ?? ids[0];
+    localModel = model;
     const res = await llmNetworkFetch(`${base}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model, temperature: 0, messages: [{ role: 'user', content: prompt }] }),
       signal: AbortSignal.timeout(120_000),
     }, { provider: 'local', model, role: 'aux', requestedBy: 'signal-dedup', selectionSource: 'fallback' });
+    logUnmeteredRow(model, { providerName: 'local', site: 'signal-dedup', ...(res.ok ? {} : { missingReason: 'provider-call-failed' as const }) });
+    localLogged = true;
     if (!res.ok) return null;
     const d = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
     return d?.choices?.[0]?.message?.content ?? null;
-  } catch { return null; }
+  } catch {
+    if (localModel && !localLogged) logUnmeteredRow(localModel, { providerName: 'local', site: 'signal-dedup', missingReason: 'provider-call-failed' });
+    return null;
+  }
 }
 
 // ── 통합 진입점 ──

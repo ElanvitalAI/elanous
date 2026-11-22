@@ -5,6 +5,7 @@ import { join } from 'node:path';
 
 import { TaskNotificationQueue } from '../agent/task-notification.js';
 import { dispatchBashCapsule } from '../skills/tools/index.js';
+import { signalUrgentSteer } from '../session/urgent-steer.js';
 import type { CapsuleEvent, CapsulePolicy } from './contract.js';
 import { installShellCapsuleSink, listDetachedShellCapsules, runShellCapsule, stopDetachedShellCapsule } from './shell-capsule.js';
 
@@ -24,6 +25,54 @@ function manualTimer() {
 }
 
 describe('CAPSULE-A2 shell capsule', () => {
+  test('urgent decision cancels an approval continuation before RunShell spawn', async () => {
+    const frames: CapsuleEvent[] = [];
+    const sink = installShellCapsuleSink('urgent-approval', (event) => frames.push(event));
+    const q = queue();
+    let launches = 0;
+    let signalAtApproval: AbortSignal | undefined;
+    const pending = runShellCapsule({
+      tool: 'RunShell', command: 'rm -rf target', clockFromSpawn: true,
+      start: (signal, spawned) => {
+        signalAtApproval = signal;
+        return Promise.resolve().then(() => {
+          if (!signal?.aborted) { launches++; spawned(); }
+          return 'approval continuation settled';
+        });
+      },
+      describe: (value) => ({ status: 'ok', output: value }), started: (id) => `started ${id}`,
+    }, { policy: noCapPolicy, queue: q, log: () => {} });
+    signalUrgentSteer('urgent-approval');
+    expect(signalAtApproval?.aborted).toBe(true);
+    await expect(pending).rejects.toThrow('urgent decision');
+    sink.dispose();
+    expect(launches).toBe(0);
+    expect(frames).toEqual([]);
+    expect(q.size).toBe(0);
+  });
+  test('urgent decision detaches an already running RunShell even when the ordinary sync cap is disabled', async () => {
+    const frames: CapsuleEvent[] = [];
+    const sink = installShellCapsuleSink('urgent-shell', (event) => frames.push(event));
+    const q = queue();
+    let finish!: (value: string) => void;
+    let inner: AbortSignal | undefined;
+    const pending = runShellCapsule({
+      tool: 'RunShell', command: 'sleep 120', clockFromSpawn: true,
+      start: (signal, spawned) => { inner = signal; spawned(); return new Promise<string>((resolve) => { finish = resolve; }); },
+      describe: (value) => ({ status: 'ok', output: value }), started: (id) => `started ${id}`,
+    }, { policy: noCapPolicy, queue: q, log: () => {} });
+    signalUrgentSteer('urgent-shell');
+    const beforeCompletion = await Promise.race([pending.then(() => 'started'), new Promise<string>(resolve => setTimeout(() => resolve('still waiting'), 20))]);
+    finish('done once');
+    const result = await pending;
+    await tick();
+    sink.dispose();
+    expect(beforeCompletion).toBe('started');
+    expect(result).toMatch(/^started shell-/);
+    expect(inner?.aborted).toBe(false);
+    expect(frames.map(frame => frame.type)).toEqual(['capsule-progress', 'capsule-done']);
+    expect(q.drain()).toHaveLength(1);
+  });
   test('no cap (syncCapMs 0): start gets the turn signal itself, no timer, no frame, no notification', async () => {
     const turn = new AbortController();
     const seen: Array<AbortSignal | undefined> = [];

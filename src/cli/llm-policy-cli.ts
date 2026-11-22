@@ -14,6 +14,7 @@ import { LLM_SPEND_POLICY_ROLES } from '../nexus/llm-spend-policy/types.js';
 import { readAppliedSpendPolicy, type AppliedSpendPolicyView } from '../nexus/llm-spend-policy/store.js';
 import { resolveSpendRolePolicy } from '../nexus/llm-spend-policy/schema.js';
 import { mergeRowStates, readCreditRowStates, type CreditAdapterDeps } from '../nexus/llm-spend-policy/credit-adapter.js';
+import { managementLeasesForSpend } from '../oauth/llm-call-live-lease-source.js';
 import { readStoredSpendPolicy } from '../nexus/llm-spend-policy/store.js';
 import { appendSpendTransition } from '../nexus/llm-spend-policy/ledger.js';
 import {
@@ -190,7 +191,15 @@ function renderPolicyText(view: AppliedSpendPolicyView, roleCurrent: readonly Ro
 export async function runLlmPolicyView(opts: { json?: boolean } & LlmPolicyViewDeps = {}): Promise<void> {
   const base = await readAppliedSpendPolicy({ dir: opts.dir, states: opts.states });
   // 읽기 전용 어댑터(CC-1) → 조회 현황(잔액·자동 충전). 직접 주입된 상태가 어댑터 값을 덮는다.
-  const adapted = opts.readCredit === false ? [] : await readCreditRowStates(base.policy, opts.credit);
+  // #17 production 조달: 임대를 직접 주입하지 않은 호출(사용자가 치는 그대로)도 금고 static lease 사본에서
+  // 관리 키를 조달한다(값만 — 출력 0). 임대 없으면 빈 위임 → missing-management-lease 로 unmeasured(네트워크 0).
+  const injected = opts.credit;
+  const credit: CreditAdapterDeps = {
+    ...(injected?.fetchImpl !== undefined ? { fetchImpl: injected.fetchImpl } : {}),
+    ...(injected?.now !== undefined ? { now: injected.now } : {}),
+    leases: injected?.leases ?? managementLeasesForSpend(),
+  };
+  const adapted = opts.readCredit === false ? [] : await readCreditRowStates(base.policy, credit);
   // 실 관측(real · 합성 제외) 자동 충전은 «observed» 로 선언(declared)보다 우선한다. 잔액·창·지출은 여기서 섞지 않는다(어댑터·주입 몫).
   const observedTopUp: LlmSpendRowState[] = observationsToRowStates(
     withoutSyntheticObservations(await readSpendObservations(opts.dir)).filter((r) => r.kind === 'autoTopUp'),

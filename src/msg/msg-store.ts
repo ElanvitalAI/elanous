@@ -7,6 +7,7 @@ import { debug } from '../debug/log.js';
 import { validateProvenance, type Provenance } from '../provenance/provenance.js';
 import { hasReceiptTable, latestReceiptIdOn, legacyIntent, listReceiptsOn, MSG_RECEIPTS_SCHEMA, recordReceiptOn, type Receipt, type ReceiptInput, type ReceiptQuery, type ReceiptRecordOutcome, type ReceiptSource, type ReceiptState } from './msg-receipts.js';
 import { recordReceiptClock } from '../hq/msg-receipt-clock-sink.js';
+import { appendLedgerEvent } from './ledger-events.js';
 
 export interface MessageEnvelope {
   from: string;
@@ -280,6 +281,41 @@ function unreadWhereOn(db: Database, to: string, after?: number): { where: strin
 }
 
 /**
+ * MSG-LEDGER-RETENTION-INDEX ② — 미읽음 팔(direct · ALL 방송 · group:*): UNION SELECT 로 나눈다.
+ * 각 팔은 (recipient, id, sender, expires_at) 커버 색인을 타고 들어가 OR 절 전수 행 훑기가 없다.
+ * UNION 은 id 가 팔마다 배타적이라(수신자가 단일값) 중복 제거 비용 없이 legacy OR 술어와 동치다.
+ */
+export function unreadArmsOn(db: Database, to: string, after?: number): { sql: string; params: Array<string | number> } {
+  const recipient = canonicalMessageAddress(to);
+  if (recipient === 'ALL') throw new Error('ALL is a broadcast topic, not a recipient');
+  const hasAcks = hasMessageAckTable(db);
+  const hasMetadata = hasEnvelopeMetadata(db);
+  const hasGroups = hasGroupMembershipTable(db);
+  const expiry = hasMetadata ? "AND (m.expires_at IS NULL OR julianday(m.expires_at) > julianday('now'))" : '';
+  const ack = hasAcks ? 'AND NOT EXISTS (SELECT 1 FROM msg_message_acks a WHERE a.message_id = m.id AND a.recipient = ?)' : '';
+  const bound = after === undefined ? 'COALESCE((SELECT last_id FROM msg_cursors WHERE recipient = ?), 0)' : '?';
+  const boundParams: Array<string | number> = after === undefined ? [recipient] : [after];
+  const arms = [
+    `SELECT m.id AS id, m.created_at AS created_at FROM msg_messages m
+      WHERE m.id > ${bound} AND m.recipient = ? ${expiry} ${ack}`,
+    `SELECT m.id AS id, m.created_at AS created_at FROM msg_messages m
+      WHERE m.recipient = 'ALL' AND m.sender <> ? AND m.id > ${bound} ${expiry} ${ack}`,
+  ];
+  const params: Array<string | number> = [
+    ...boundParams, recipient, ...(hasAcks ? [recipient] : []),
+    recipient, ...boundParams, ...(hasAcks ? [recipient] : []),
+  ];
+  if (hasGroups) {
+    arms.push(`SELECT m.id AS id, m.created_at AS created_at FROM msg_messages m
+      JOIN msg_group_memberships gm ON gm.address = m.recipient AND gm.seat = ?
+      WHERE m.id > gm.joined_after_id AND (gm.left_after_id IS NULL OR m.id <= gm.left_after_id)
+        AND m.id > ${bound} ${expiry} ${ack}`);
+    params.push(recipient, ...boundParams, ...(hasAcks ? [recipient] : []));
+  }
+  return { sql: arms.join(' UNION '), params };
+}
+
+/**
  * Who the unread set came from, when that is one agent seat (ELN-SEAT-SAY · MSG-SOURCE-HIERARCHY): every unread row has
  * the same sender and its structural kind is `agent` (B1-A `from_kind`, or the §1b sender-shape rule for a v1 row).
  * Mixed senders, a non-agent sender, or no unread → null (the waker then says «system», never a guess).
@@ -315,27 +351,17 @@ function unreadSourceOn(db: Database, to: string): UnreadSource | null {
 
 /** Unread count ⊕ newest unread ID for one recipient (same predicate as `unreadCountOn`). */
 function unreadSummaryOn(db: Database, to: string): { count: number; maxId: number | null } {
-  const { where, params } = unreadWhereOn(db, to);
-  const row = db.query(`SELECT COUNT(*) AS count, MAX(m.id) AS max_id FROM msg_messages m WHERE ${where}`)
-    .get(...params) as { count: number; max_id: number | null };
+  // MSG-LEDGER-RETENTION-INDEX ② — 요약/badge 경로도 같은 UNION 팔 술어로 센다(커버 색인만 탄다).
+  const arms = unreadArmsOn(db, to);
+  const row = db.query(`SELECT COUNT(*) AS count, MAX(id) AS max_id FROM (${arms.sql})`)
+    .get(...arms.params) as { count: number; max_id: number | null };
   return { count: row.count, maxId: row.max_id ?? null };
 }
 
 function unreadCountOn(db: Database, to: string): number {
-  const hasAcks = hasMessageAckTable(db);
-  const hasMetadata = hasEnvelopeMetadata(db);
-  const ackClause = hasAcks ? 'AND NOT EXISTS (SELECT 1 FROM msg_message_acks a WHERE a.message_id=m.id AND a.recipient=?)' : '';
-  const expiryClause = hasMetadata ? "AND (m.expires_at IS NULL OR julianday(m.expires_at) > julianday('now'))" : '';
-  const groupClause = hasGroupMembershipTable(db) ? ` OR EXISTS (
-        SELECT 1 FROM msg_group_memberships gm WHERE gm.address = m.recipient AND gm.seat = ?
-          AND m.id > gm.joined_after_id AND (gm.left_after_id IS NULL OR m.id <= gm.left_after_id)
-      )` : '';
-  const params = [to, ...(hasAcks ? [to] : []), to, to, ...(hasGroupMembershipTable(db) ? [to] : [])];
-  return (db.query(`SELECT COUNT(*) AS count FROM msg_messages m
-    WHERE m.id > COALESCE((SELECT last_id FROM msg_cursors WHERE recipient = ?), 0)
-      ${expiryClause} ${ackClause}
-      AND (m.recipient = ? OR (m.recipient = 'ALL' AND m.sender <> ?)${groupClause})`)
-    .get(...params) as { count: number }).count;
+  // MSG-LEDGER-RETENTION-INDEX ② — UNION 팔로 센다(각 팔은 (recipient, id) 커버 색인만 탄다).
+  const arms = unreadArmsOn(db, to);
+  return (db.query(`SELECT COUNT(*) AS count FROM (${arms.sql})`).get(...arms.params) as { count: number }).count;
 }
 
 interface MessageRow {
@@ -430,11 +456,21 @@ function parseStoredProvenance(json: string | null | undefined): Provenance | un
 /** SQLite owns both append order and per-recipient acknowledgement progress. */
 export class MsgStore {
   readonly db: Database;
+  private readonly dbPath: string;
   private readonly clock: () => Date;
   private readonly dedupeWindowMs: number;
   /** posted-receipt events held until the outermost write transaction commits (dropped on rollback). */
   private pendingPostedEvents: Array<() => void> = [];
   private postedEventDepth = 0;
+  /** MSG-LEDGER-ARCHIVE-THREAD-READ-FU ③ — 읽기 폴백 보관 원장(옵션 · 지연 오픈 · 읽기 전용). */
+  private readonly archivePathOption: string | null = null;
+  private archiveDb: Database | null = null;
+
+  /** ELS-SERVER-EVENT-HUB-NO-DB-POLL — one best-effort sidecar line beside a COMMITTED ledger write; ':memory:' is exempt. */
+  private emitLedgerEvent(kind: 'post' | 'ack' | 'receipt' | 'group'): void {
+    if (this.dbPath === ':memory:') return;
+    appendLedgerEvent(this.dbPath, kind);   // never throws — the ledger write is the fact, this line is a courtesy
+  }
 
   /**
    * SEAT-INBOX B1-C (#38194 REVIEW-1 ①②): run one message write as a single immediate transaction so the message
@@ -501,9 +537,11 @@ export class MsgStore {
     return this.db.transaction(() => read(this.hasReplyTo, this.hasGroupMemberships, this.hasProvenance, this.hasFromKind)).deferred();
   }
 
-  constructor(path: string = defaultMsgStorePath(), options: { readOnly?: boolean; now?: () => Date; dedupeWindowMs?: number; busyTimeoutMs?: number } = {}) {
+  constructor(path: string = defaultMsgStorePath(), options: { readOnly?: boolean; now?: () => Date; dedupeWindowMs?: number; busyTimeoutMs?: number; archivePath?: string } = {}) {
     this.clock = options.now ?? (() => new Date());
+    this.dbPath = path;
     this.dedupeWindowMs = resolveDedupeWindowMs(options.dedupeWindowMs);
+    this.archivePathOption = options.archivePath ?? null;
     if (options.readOnly && (path === ':memory:' || !existsSync(path))) throw new Error('message ledger unavailable for read-only SSE service');
     if (!options.readOnly && path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = options.readOnly ? new Database(path, { readonly: true }) : new Database(path);
@@ -597,6 +635,13 @@ export class MsgStore {
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_reply_to ON msg_messages(reply_to, id)');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_dedupe ON msg_messages(sender, recipient, created_at)');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_post_attempt ON msg_messages(post_attempt)');
+      // OP #127483/#127509 — mail-watch firstReplyAfter point lookup (reply thread rows only).
+      // JUD-B #127659: NOT in the base schema above — a pre-reply_to legacy ledger would hit
+      // "no such column" before this block adds the column; the column comes first here.
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_reply_sender_id ON msg_messages(reply_to, sender, id)');
+      // MSG-LEDGER-RETENTION-INDEX ② — unread arm covering index: every arm (direct · ALL · group)
+      // searches (recipient, id) and filters sender/expiry inside the index — no row pread off the b-tree.
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_unread_cover ON msg_messages(recipient, id, sender, expires_at, created_at)');
     }).immediate();
   }
 
@@ -609,7 +654,7 @@ export class MsgStore {
     if (wanted.some(name => !columns.has(name))) return true;
     const indexes = new Set((this.db.query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'msg_messages'").all() as { name: string }[])
       .map(row => row.name));
-    return !indexes.has('idx_msg_messages_reply_to') || !indexes.has('idx_msg_messages_dedupe') || !indexes.has('idx_msg_messages_post_attempt');
+    return !indexes.has('idx_msg_messages_reply_to') || !indexes.has('idx_msg_messages_dedupe') || !indexes.has('idx_msg_messages_post_attempt') || !indexes.has('idx_msg_messages_reply_sender_id') || !indexes.has('idx_msg_messages_unread_cover');
   }
 
   /**
@@ -689,7 +734,9 @@ export class MsgStore {
 
   private insertMessage(input: MessageEnvelope, attemptToken?: string): Message {
     const msg = validateMessageEnvelope(input);
-    if (msg.replyTo !== undefined && this.db.query('SELECT 1 FROM msg_messages WHERE id = ?').get(msg.replyTo) === null) {
+    // ③ 이행된 원문에도 답장은 된다 — 운영 miss 일 때 보관 원장에 원문이 있으면 유효한 답장 대상이다.
+    if (msg.replyTo !== undefined && this.db.query('SELECT 1 FROM msg_messages WHERE id = ?').get(msg.replyTo) === null
+      && this.archivedMessagesWhere('id = ?', [msg.replyTo], 1).length === 0) {
       throw new Error(`reply target not found: #${msg.replyTo}`);
     }
     const createdAt = new Date().toISOString();
@@ -711,6 +758,9 @@ export class MsgStore {
     // SEAT-INBOX B1-C §4a — posted = 원장 커밋. 수신자 칸은 주소 그대로(ALL · group 포함).
     recordReceiptOn(this.db, { messageId: id, recipient: msg.to, state: 'posted', source: 'ledger' }, () => new Date(createdAt),
       { deferEvent: emit => { this.pendingPostedEvents.push(emit); } });
+    // ELS-SERVER-EVENT-HUB-NO-DB-POLL — the sidecar line waits with the posted receipts: emitted only past the
+    // outermost commit, dropped with a rollback (withPostedEvents drains this queue after the commit).
+    this.pendingPostedEvents.push(() => this.emitLedgerEvent('post'));
     return { id, ...msg, intent, needsAck, ...(origin ? { origin } : {}), schemaVersion: 2, createdAt };
   }
 
@@ -730,6 +780,9 @@ export class MsgStore {
     const receipt = recordReceiptOn(this.db, { ...input, recipient }, this.clock);
     if (input.state === 'seen' || input.state === 'done')
       recordReceiptClock(this.db, { messageId: input.messageId, recipient, event: input.state });
+    // ELS-SERVER-EVENT-HUB-NO-DB-POLL — emitted only past a committed write (inside a caller's transaction the
+    // caller's own completion point emits; any one complete line wakes the full recompute).
+    if (!this.db.inTransaction) this.emitLedgerEvent('receipt');
     return receipt;
   }
 
@@ -850,9 +903,12 @@ export class MsgStore {
     // failure — the reply is already stored.
     if (options.dedupe === true && message.replyTo !== undefined) {
       try {
-        const original = this.getMessage(message.replyTo);
+        // ③ 원문이 보관돼도 auto-ack 은 남는다 — 조회만 폴백(쓰기는 운영 원장).
+        const liveOriginal = this.getMessage(message.replyTo);
+        const original = liveOriginal ?? this.archivedMessagesWhere('id = ?', [message.replyTo], 1)[0] ?? null;
         if (original !== null && original.to === message.from) {
-          this.ackMessage(message.from, message.replyTo, 'acked');
+          if (liveOriginal !== null) this.ackMessage(message.from, message.replyTo, 'acked');
+          else this.ackArchivedOriginal(message.from, message.replyTo, 'acked');
           posted = { ...posted, autoAcked: message.replyTo };
         }
       } catch (error) {
@@ -899,18 +955,20 @@ export class MsgStore {
   createGroup(name: string, owner: string): string {
     const address = canonicalGroupAddress(name.startsWith('group:') ? name : `group:${name}`);
     const seat = canonicalSeatId(owner);
-    return this.db.transaction(() => {
+    const created = this.db.transaction(() => {
       this.db.query('INSERT INTO msg_groups(address) VALUES (?)').run(address);
       this.db.query('INSERT INTO msg_group_memberships(address, seat, joined_after_id) VALUES (?, ?, ?)')
         .run(address, seat, this.latestId());
       return address;
     }).immediate();
+    this.emitLedgerEvent('group');
+    return created;
   }
 
   joinGroup(group: string, member: string): boolean {
     const address = canonicalGroupAddress(group);
     const seat = canonicalSeatId(member);
-    return this.db.transaction(() => {
+    const joined = this.db.transaction(() => {
       if (!this.db.query('SELECT 1 FROM msg_groups WHERE address = ?').get(address)) throw new Error(`group not found: ${address}`);
       const existing = this.db.query('SELECT 1 FROM msg_group_memberships WHERE address = ? AND seat = ? AND left_after_id IS NULL')
         .get(address, seat);
@@ -919,17 +977,21 @@ export class MsgStore {
         .run(address, seat, this.latestId());
       return true;
     }).immediate();
+    if (joined) this.emitLedgerEvent('group');
+    return joined;
   }
 
   leaveGroup(group: string, member: string): boolean {
     const address = canonicalGroupAddress(group);
     const seat = canonicalSeatId(member);
-    return this.db.transaction(() => {
+    const left = this.db.transaction(() => {
       const result = this.db.query(`UPDATE msg_group_memberships SET left_after_id = ?
         WHERE id = (SELECT id FROM msg_group_memberships WHERE address = ? AND seat = ? AND left_after_id IS NULL ORDER BY id DESC LIMIT 1)`)
         .run(this.latestId(), address, seat);
       return result.changes > 0;
     }).immediate();
+    if (left) this.emitLedgerEvent('group');
+    return left;
   }
 
   listGroups(member: string): string[] {
@@ -1062,15 +1124,93 @@ export class MsgStore {
     return row.explicit_status ?? (messageId <= row.cursor_id ? 'acked' : 'delivered');
   }
 
+  // MSG-LEDGER-ARCHIVE-THREAD-READ-FU ③ — 보관 이행 뒤에도 원문에 답장하고 스레드를 온전히 읽는 읽기 폴백.
+  // 쓰기(답장 INSERT·영수·ack)는 운영 원장에만 둔다: 보관 원장은 읽기 전용이고, «이동 행은 운영 store 의
+  // getMessage → null» 이행 계약(#39606)은 그대로다. 폴백은 운영 원장이 대상을 못 찾은 읽기 경로에만 든다 —
+  // 보관 원장 부재·훼손은 빈 결과로 내려 운영 조회를 깨지 않는다(fail-soft).
+  private get archiveReader(): Database | null {
+    if (this.archivePathOption === null) return null;
+    if (this.archiveDb === null) {
+      if (!existsSync(this.archivePathOption)) return null;
+      // JUD-B #39635 mustFix: 보관 원장은 운영 조회의 보강 자료일 뿐 — 열기(busyTimeout PRAGMA 포함)가
+      // 실패하는 파일(훼손·권한·잠금)은 폴백 없음(null)로 내려 listReplies/listThread 를 깨지 않는다(fail-soft).
+      try {
+        this.archiveDb = new Database(this.archivePathOption, { readonly: true });
+        this.archiveDb.exec(`PRAGMA busy_timeout = ${MSG_BUSY_TIMEOUT_MS}`);
+      } catch {
+        this.archiveDb = null;
+        return null;
+      }
+    }
+    return this.archiveDb;
+  }
+
+  /** 보관 원장의 행 읽기 — 스키마 판정은 보관 원장 스스로에게 묻는다(운영과 열 구성이 다를 수 있다). */
+  private archivedMessagesWhere(where: string, params: Array<string | number>, limit: number): Message[] {
+    const db = this.archiveReader;
+    if (db === null) return [];
+    try {
+      if (db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'msg_messages'").get() === null) return [];
+      const metadata = hasEnvelopeMetadata(db) ? 'expires_at, priority, supersedes' : 'NULL AS expires_at, NULL AS priority, NULL AS supersedes';
+      const provenance = columnPresent(db, 'provenance_json') ? 'provenance_json' : 'NULL AS provenance_json';
+      const fromKind = columnPresent(db, 'from_kind') ? 'from_kind' : 'NULL AS from_kind';
+      const replyTo = columnPresent(db, 'reply_to') ? 'reply_to' : 'NULL AS reply_to';
+      const rows = db.query(`SELECT id, sender, recipient, body, kind, ${replyTo}, created_at, ${metadata}, ${provenance}, ${fromKind}, ${v2Select(db, false)}
+        FROM msg_messages WHERE ${where} ORDER BY id ASC LIMIT ?`).all(...params, limit) as MessageRow[];
+      return rows.map(fromRow);
+    } catch {
+      return [];
+    }
+  }
+
+  /** 스레드 끝점(id·reply_to)의 보관 원장 조회 — 운영 miss 시에만 불린다. */
+  private archivedThreadTarget(messageId: number): { id: number; reply_to: number | null } | null {
+    const db = this.archiveReader;
+    if (db === null) return null;
+    try {
+      if (!columnPresent(db, 'reply_to')) {
+        const bare = db.query('SELECT id FROM msg_messages WHERE id = ?').get(messageId) as { id: number } | null;
+        return bare === null ? null : { id: bare.id, reply_to: null };
+      }
+      return db.query('SELECT id, reply_to FROM msg_messages WHERE id = ?').get(messageId) as { id: number; reply_to: number | null } | null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 스레드 루트의 보관 행 — 루트와 답장 양쪽에서 보관 행을 모은다. */
+  private archivedThreadRows(rootId: number, after: number, limit: number): Message[] {
+    const db = this.archiveReader;
+    if (db === null) return [];
+    // JUD-B #39635 mustFix: 스키마 조회(columnPresent)도 보강 읽기의 일부 — 실패는 빈 결과로 내린다.
+    let hasReplyTo = false;
+    try { hasReplyTo = columnPresent(db, 'reply_to'); } catch { return []; }
+    return this.archivedMessagesWhere(
+      `id > ? AND (id = ? ${hasReplyTo ? 'OR reply_to = ?' : ''})`,
+      hasReplyTo ? [after, rootId, rootId] : [after, rootId], limit);
+  }
+
+  /** 운영 행이 우선인 id 오름차순 병합 — 같은 id 가 양쪽에 살면(충돌 잔존) 운영 행으로 읽는다. */
+  private static mergeById(live: Message[], archived: Message[], limit: number): Message[] {
+    if (archived.length === 0) return live;
+    const merged = new Map(live.map(message => [message.id, message]));
+    for (const message of archived) if (!merged.has(message.id)) merged.set(message.id, message);
+    return [...merged.values()].sort((a, b) => a.id - b.id).slice(0, limit);
+  }
+
   /** Replies pointing at the supplied message, ordered by durable insertion ID. */
   listReplies(messageId: number, limit: number = 100, afterId: number = 0): Message[] {
     if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
     validCursor(afterId);
-    return this.readWithSchema((hasReplyTo, _groups, hasProvenance, hasFromKind) => hasReplyTo
-      ? (this.db.query(`SELECT id, sender, recipient, body, kind, reply_to, created_at, ${envelopeMetaSql(this.db, false)}, ${hasProvenance ? 'provenance_json' : 'NULL AS provenance_json'}, ${hasFromKind ? 'from_kind' : 'NULL AS from_kind'}, ${v2Select(this.db, false)} FROM msg_messages
-        WHERE reply_to = ? AND id > ? ORDER BY id ASC LIMIT ?`).all(messageId, afterId, limit) as MessageRow[]).map(fromRow)
-      : []);
+    return this.readWithSchema((hasReplyTo, _groups, hasProvenance, hasFromKind) => {
+      const live = hasReplyTo
+        ? (this.db.query(`SELECT id, sender, recipient, body, kind, reply_to, created_at, ${envelopeMetaSql(this.db, false)}, ${hasProvenance ? 'provenance_json' : 'NULL AS provenance_json'}, ${hasFromKind ? 'from_kind' : 'NULL AS from_kind'}, ${v2Select(this.db, false)} FROM msg_messages
+          WHERE reply_to = ? AND id > ? ORDER BY id ASC LIMIT ?`).all(messageId, afterId, limit) as MessageRow[]).map(fromRow)
+        : [];
+      // ③ 답장까지 이행된 스레드도 같은 호출로 — 보관 행을 합친다(운영 행 우선 · id 오름차순).
+      return MsgStore.mergeById(live, this.archivedMessagesWhere('reply_to = ? AND id > ?', [messageId, afterId], limit), limit);
+    });
   }
 
   /** A request and its direct replies, in insertion order, independent of recipient cursors. */
@@ -1081,12 +1221,14 @@ export class MsgStore {
     return this.readWithSchema((hasReplyTo, _groups, hasProvenance, hasFromKind) => {
       const target = this.db.query(`SELECT id, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'} FROM msg_messages WHERE id = ?`)
         .get(messageId) as { id: number; reply_to: number | null } | null;
-      if (target === null) throw new Error(`message not found: #${messageId}`);
-      const rootId = target.reply_to ?? target.id;
-      const rows = this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at, ${envelopeMetaSql(this.db, false)}, ${hasProvenance ? 'provenance_json' : 'NULL AS provenance_json'}, ${hasFromKind ? 'from_kind' : 'NULL AS from_kind'}, ${v2Select(this.db, false)} FROM msg_messages
+      // ③ 운영에 없는 스레드 끝점은 보관 원장에서 본다 — 원문이 이행돼도 스레드는 예외 없이 온전하다.
+      const resolved = target ?? this.archivedThreadTarget(messageId);
+      if (resolved === null) throw new Error(`message not found: #${messageId}`);
+      const rootId = resolved.reply_to ?? resolved.id;
+      const live = (this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at, ${envelopeMetaSql(this.db, false)}, ${hasProvenance ? 'provenance_json' : 'NULL AS provenance_json'}, ${hasFromKind ? 'from_kind' : 'NULL AS from_kind'}, ${v2Select(this.db, false)} FROM msg_messages
         WHERE id > ? AND (id = ? ${hasReplyTo ? 'OR reply_to = ?' : ''}) ORDER BY id ASC LIMIT ?`)
-        .all(...(hasReplyTo ? [after, rootId, rootId, limit] : [after, rootId, limit])) as MessageRow[];
-      return rows.map(fromRow);
+        .all(...(hasReplyTo ? [after, rootId, rootId, limit] : [after, rootId, limit])) as MessageRow[]).map(fromRow);
+      return MsgStore.mergeById(live, this.archivedThreadRows(rootId, after, limit), limit);
     });
   }
 
@@ -1132,6 +1274,9 @@ export class MsgStore {
       ON CONFLICT(recipient) DO UPDATE SET last_id = MAX(msg_cursors.last_id, excluded.last_id)`)
       .run(to, cursor, cursor);
     if (result.changes === 0) throw new Error('cursor exceeds the latest message ID');
+    // ELS-SERVER-EVENT-HUB-NO-DB-POLL — emitted only past a committed write (inside a caller's transaction the
+    // caller's own completion point emits; any one complete line wakes the full recompute).
+    if (!this.db.inTransaction) this.emitLedgerEvent('ack');
     return this.getCursor(to);
   }
 
@@ -1146,7 +1291,7 @@ export class MsgStore {
    * changes the ack.
    */
   ackThroughSeen(recipient: string, through: number, source: Extract<ReceiptSource, 'cli-ack' | 'tool-ack'>): number {
-    return this.db.transaction(() => {
+    const moved = this.db.transaction(() => {
       // #122460 — a tool call is not processing: the agent's MsgAck advances the cursor and leaves the seen receipt to
       // the turn that answers the message.
       if (source !== 'cli-ack') return this.ack(recipient, through);
@@ -1167,11 +1312,22 @@ export class MsgStore {
       }
       return moved;
     }).immediate();
+    // ELS-SERVER-EVENT-HUB-NO-DB-POLL — the cursor move and the seen receipts are visible only now: one line wakes the recompute.
+    this.emitLedgerEvent('ack');
+    return moved;
+  }
+
+  /** ③ 보관된 원문에 대한 자리 한정 ack — 운영 원장에 ack 행만 남긴다(보관 원장은 읽기 전용). */
+  private ackArchivedOriginal(recipient: string, messageId: number, status: 'acked' | 'done'): void {
+    const to = canonicalMessageAddress(recipient);
+    if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
+    if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
+    this.db.query(`INSERT INTO msg_message_acks(message_id, recipient, status) VALUES (?, ?, ?)
+      ON CONFLICT(message_id,recipient) DO UPDATE SET status=excluded.status`).run(messageId, to, status);
   }
 
   /** Acknowledge exactly one delivered message for its recipient without moving past siblings. */
-  ackMessage(recipient: string, messageId: number, status: 'acked' | 'done' = 'acked'): boolean {
-    const to = canonicalMessageAddress(recipient);
+  ackMessage(recipient: string, messageId: number, status: 'acked' | 'done' = 'acked'): boolean {    const to = canonicalMessageAddress(recipient);
     if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
     if (status !== 'acked' && status !== 'done') throw new Error('status must be acked or done');
@@ -1182,6 +1338,7 @@ export class MsgStore {
       ON CONFLICT(message_id,recipient) DO UPDATE SET status=excluded.status`)
       .run(to, status, messageId, to, to, to);
     if (!result.changes) throw new Error(`message not found for ${to}: #${messageId}`);
+    if (!this.db.inTransaction) this.emitLedgerEvent('ack');
     return true;
   }
 
@@ -1196,8 +1353,9 @@ export class MsgStore {
     const to = canonicalMessageAddress(recipient);
     if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     validCursor(after);
-    const { where, params } = unreadWhereOn(this.db, to, after);
-    return (this.db.query(`SELECT COUNT(*) AS count FROM msg_messages m WHERE ${where}`).get(...params) as { count: number }).count;
+    // ③ UNION 팔(direct · ALL · group)을 탄다 — 기존 OR 술어(unreadWhereOn)는 커버 색인을 못 타고 전수 행을 훑는다.
+    const arms = unreadArmsOn(this.db, to, after);
+    return (this.db.query(`SELECT COUNT(*) AS count FROM (${arms.sql})`).get(...arms.params) as { count: number }).count;
   }
 
   unreadRecipients(): UnreadRecipient[] {
@@ -1228,7 +1386,11 @@ export class MsgStore {
 
   unread(): UnreadRecipient[] { return this.unreadRecipients(); }
 
-  close(): void { this.db.close(); }
+  close(): void {
+    this.archiveDb?.close();
+    this.archiveDb = null;
+    this.db.close();
+  }
 }
 
 /** SEAT-MAIL-ACK-SLA sent-alert ledger — additive table, created on the first alert (old binaries never read it). */
@@ -1237,8 +1399,8 @@ export const MSG_SLA_ALERTS_SCHEMA = `CREATE TABLE IF NOT EXISTS msg_sla_alerts 
   alert_id INTEGER NOT NULL, at TEXT NOT NULL, PRIMARY KEY (message_id, recipient, stage, target))`;
 
 export function defaultMsgStorePath(): string { return join(elanousStateRoot(), 'msg', 'messages.db'); }
-export function openMsgStore(path?: string): MsgStore { return new MsgStore(path); }
-export function openMsgStoreReadOnly(path?: string): MsgStore { return new MsgStore(path, { readOnly: true }); }
+export function openMsgStore(path?: string, options: { archivePath?: string } = {}): MsgStore { return new MsgStore(path, options); }
+export function openMsgStoreReadOnly(path?: string, options: { archivePath?: string } = {}): MsgStore { return new MsgStore(path, { ...options, readOnly: true }); }
 
 /** Observe one recipient without creating a store or advancing its acknowledgement. */
 export function readUnreadCount(recipient: string, path: string = defaultMsgStorePath()): number | null {
@@ -1299,28 +1461,43 @@ export function readUnreadMailBadges(
   busyTimeoutMs: number = UNREAD_BADGE_BUSY_TIMEOUT_MS,
 ): Map<string, UnreadMailBadge | null> {
   const seats = [...new Set(recipients)];
-  const out = new Map<string, UnreadMailBadge | null>(seats.map((seat) => [seat, null]));
-  if (seats.length === 0 || !existsSync(path)) return out;
+  const empty = new Map<string, UnreadMailBadge | null>(seats.map((seat) => [seat, null]));
+  if (seats.length === 0 || !existsSync(path)) return empty;
   let db: Database;
-  try { db = new Database(path, { readonly: true }); } catch { return out; }
+  try { db = new Database(path, { readonly: true }); } catch { return empty; }
   try {
     db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(busyTimeoutMs))}`);
-    for (const seat of seats) {
-      try {
-        const to = canonicalMessageAddress(seat);
-        if (to === 'ALL') continue;
-        const { where, params } = unreadWhereOn(db, to);
-        const row = db.query(`SELECT COUNT(*) AS count, MIN(m.created_at) AS oldest_created_at FROM msg_messages m WHERE ${where}`)
-          .get(...params) as { count: number; oldest_created_at: string | null };
-        out.set(seat, { count: row.count, oldestCreatedAt: row.oldest_created_at ?? null });
-      } catch (error) {
-        // This seat shows no badge this time (ls stays fast). A busy/locked ledger stays so for the rest of this
-        // listing — stop asking; a bad address only skips that seat.
-        if (/busy|locked/i.test(error instanceof Error ? error.message : String(error))) break;
-      }
+    return readUnreadMailBadgesOn(db, seats).badges;
+  } catch { return empty; /* pragma failed: badges stay null */ } finally { db.close(); }
+}
+
+/**
+ * The badge read on an already open ledger connection (ELS-SERVER-MAINLOOP-STARVATION: the els server's badge worker
+ * keeps one read-only connection and asks here). A seat that cannot be a recipient is skipped (null, not an error).
+ * `error` = a read failed: a busy/locked ledger stops the read at once; any other SQL error (an incomplete schema, a
+ * damaged page) skips that seat and is reported. Either way some seats are null for a reason that is not «no badge»,
+ * so a cache must keep its last badges for this answer (JUD-B #39546 must ②).
+ */
+export function readUnreadMailBadgesOn(db: Database, recipients: Iterable<string>): { badges: Map<string, UnreadMailBadge | null>; error: string | null } {
+  const seats = [...new Set(recipients)];
+  const out = new Map<string, UnreadMailBadge | null>(seats.map((seat) => [seat, null]));
+  let failure: string | null = null;
+  for (const seat of seats) {
+    let to: string;
+    try { to = canonicalMessageAddress(seat); } catch { continue; /* a bad address only skips that seat */ }
+    if (to === 'ALL') continue;
+    try {
+      const arms = unreadArmsOn(db, to);
+      const row = db.query(`SELECT COUNT(*) AS count, MIN(created_at) AS oldest_created_at FROM (${arms.sql})`)
+        .get(...arms.params) as { count: number; oldest_created_at: string | null };
+      out.set(seat, { count: row.count, oldestCreatedAt: row.oldest_created_at ?? null });
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+      // A busy/locked ledger stays so for the rest of this listing — stop asking (ls stays fast).
+      if (/busy|locked/i.test(failure)) return { badges: out, error: failure };
     }
-  } catch { /* pragma failed: badges stay null */ } finally { db.close(); }
-  return out;
+  }
+  return { badges: out, error: failure };
 }
 
 /** The single agent seat the unread set came from (see `UnreadSource`), or null. Read-only; absent ledger = null. */

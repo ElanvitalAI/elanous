@@ -14,7 +14,7 @@ test('Next PTY shows measured tokens at normal and narrow widths and clears them
     try {
       writeFileSync(join(root, 'config.json'), JSON.stringify({
         onboarding: { completed: true }, errorReports: { enabled: false },
-        llm: { goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } },
+        llm: { memoryJudge: { enabled: false, crossRecall: false } },
       }));
       const evidence = await mockSeatPtySequence({
         executable: process.execPath,
@@ -53,7 +53,7 @@ test('Next PTY clears prior measured tokens on failed and cancelled turns in the
   try {
     writeFileSync(join(root, 'config.json'), JSON.stringify({
       onboarding: { completed: true }, errorReports: { enabled: false },
-      llm: { goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } },
+      llm: { memoryJudge: { enabled: false, crossRecall: false } },
     }));
     const evidence = await mockSeatPtySequence({
       executable: process.execPath,

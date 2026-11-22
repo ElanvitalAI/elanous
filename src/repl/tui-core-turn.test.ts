@@ -198,7 +198,8 @@ function testConfig(overrides: { goalLoop?: boolean } = {}): UserConfig {
   const base = getUserConfig();
   return {
     ...base,
-    llm: { ...base.llm, goalLoop: { ...(base.llm.goalLoop ?? {}), enabled: overrides.goalLoop === true } },
+    // An old config may still carry the deleted `llm.goalLoop.enabled` key — the runtime must ignore it.
+    llm: { ...base.llm, goalLoop: { ...(base.llm.goalLoop ?? {}), ...(overrides.goalLoop === true ? { enabled: true } : {}) } as never },
     chat: { ...base.chat, toolDeny: [] },
   } as UserConfig;
 }
@@ -334,19 +335,18 @@ describe('Next TUI exclusions keep the old path (no coreTurn flag, no added WebS
     expect(routeRecords).toEqual([expect.objectContaining({ coreTurn: false, skipReason: 'harness-child', webSearch: false })]);
   });
 
-  test('goal-loop turn (coding request): the goal loop path, not the coreTurn flag', async () => {
+  test('CHAT-GOAL-LOOP-DEFAULT-OFF: a coding request is a core turn, never a goal-loop turn', async () => {
     const turn = await capturedTurn('이 버그 고쳐서 커밋해줘');
-    expect(turn.goalLoop).toBe(true);
-    expect(turn.coreTurn).toBeUndefined();
-    expect(toolNames(turn)).not.toContain('WebSearch');
-    expect(routeRecords).toEqual([expect.objectContaining({ coreTurn: false, skipReason: 'goal-loop' })]);
+    expect(turn.goalLoop).toBeUndefined();
+    expect(turn.coreTurn).toBe(true);
+    expect(routeRecords).toEqual([expect.objectContaining({ coreTurn: true })]);
   });
 
-  test('goal loop armed by config (llm.goalLoop.enabled): not the coreTurn flag', async () => {
+  test('CHAT-GOAL-LOOP-DEFAULT-OFF: an old config with llm.goalLoop.enabled=true does not arm the goal loop', async () => {
     const turn = await capturedTurn(DEMO_QUESTION, { goalLoop: true });
-    expect(turn.coreTurn).toBeUndefined();
-    expect(toolNames(turn)).not.toContain('WebSearch');
-    expect(routeRecords).toEqual([expect.objectContaining({ coreTurn: false, skipReason: 'goal-loop' })]);
+    expect(turn.goalLoop).toBeUndefined();
+    expect(turn.coreTurn).toBe(true);
+    expect(routeRecords).toEqual([expect.objectContaining({ coreTurn: true })]);
   });
 
   test('--no-tools: no tools, no coreTurn flag', async () => {
@@ -357,10 +357,9 @@ describe('Next TUI exclusions keep the old path (no coreTurn flag, no added WebS
   });
 
   test('decideTuiCoreTurn: exclusions in order, the rest is the core turn', () => {
-    expect(decideTuiCoreTurn({ hasTools: false, harnessChild: true, goalLoop: true })).toEqual({ coreTurn: false, reason: 'no-tools' });
-    expect(decideTuiCoreTurn({ hasTools: true, harnessChild: true, goalLoop: true })).toEqual({ coreTurn: false, reason: 'harness-child' });
-    expect(decideTuiCoreTurn({ hasTools: true, harnessChild: false, goalLoop: true })).toEqual({ coreTurn: false, reason: 'goal-loop' });
-    expect(decideTuiCoreTurn({ hasTools: true, harnessChild: false, goalLoop: false })).toEqual({ coreTurn: true });
+    expect(decideTuiCoreTurn({ hasTools: false, harnessChild: true })).toEqual({ coreTurn: false, reason: 'no-tools' });
+    expect(decideTuiCoreTurn({ hasTools: true, harnessChild: true })).toEqual({ coreTurn: false, reason: 'harness-child' });
+    expect(decideTuiCoreTurn({ hasTools: true, harnessChild: false })).toEqual({ coreTurn: true });
   });
 });
 

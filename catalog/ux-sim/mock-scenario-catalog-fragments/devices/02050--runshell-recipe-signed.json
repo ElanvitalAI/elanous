@@ -1,0 +1,18 @@
+{
+  "id": "runshell-recipe-signed",
+  "name": "Signed RunShell recipe foundation world",
+  "audience": "internal",
+  "checklistCells": ["RUNSHELL-RECIPE-SIGNED"],
+  "implementation": [
+    "src/skills/tools/run-shell-recipe-ledger.ts",
+    "src/ux-sim/sim-world/toolbatch/scenarios.ts"
+  ],
+  "tests": ["src/skills/tools/run-shell-recipe-ledger.test.ts"],
+  "target": "Only a trusted Ed25519 key authorizes an exact recipe hash; no execution is connected",
+  "inputs": ["fake JUD Ed25519 key", "missing trust", "forged signature", "changed recipe", "signed revoke"],
+  "observations": ["Four invalid grant paths deny and one exact grant verifies", "No command is dispatched"],
+  "entryCommands": ["eln --test sim world run toolbatch --seed 17"],
+  "logsRecorded": "no",
+  "eventNames": ["recipe-signature-foundation"],
+  "recentUse": null
+}

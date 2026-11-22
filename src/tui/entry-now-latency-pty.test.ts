@@ -14,7 +14,7 @@ test('next TUI acknowledges /now before the ledger answer arrives in a real PTY'
     writeFileSync(join(root, 'config.json'), JSON.stringify({
       onboarding: { completed: true },
       errorReports: { enabled: false },
-      llm: { goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } },
+      llm: { memoryJudge: { enabled: false, crossRecall: false } },
     }));
     const run = await mockSeatPtySequence({
       executable: process.execPath,

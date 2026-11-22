@@ -46,11 +46,12 @@ import { startChildLivenessHeartbeat } from './child-liveness-heartbeat.js';
 import {
   OWNER_APPROVAL_TOOL_NAMES, SEAT_CAP_APPROVAL_DEFER_MAX_MS, SEAT_CAP_DEFERRED_WRAPUP_MS,
   SEAT_IDLE_NO_WORK_NOTICE, SEAT_TURN_CAP_CONTINUE_PROMPT, SEAT_TURN_CAP_TOOL_NOTICE, SeatTurnCapAbort,
-  isEmptyMailListResult, isIdleWaitCall, type SeatTurnCapConfig,
+  isEmptyMailListResult, isIdleAgentOutputNotReady, isIdleWaitCall, type SeatTurnCapConfig,
 } from './seat-turn-cap.js';
 import type { TuiChatContext } from './short-question.js';
 import { parseCompletionVerdict } from '../model-tier/escalation-rules.js';
 import type { CoreAdvisor } from '../model-tier/advisor-checkpoints.js';
+import { isCoordinatorSeat } from '../seat/seat-role.js';
 
 export {
   CHILD_LIVENESS_HEARTBEAT_ENV,
@@ -147,15 +148,16 @@ export function buildUpdateGoalToolSpec(): LLMToolSpec {
       '(파일·명령 출력·테스트 결과·PR·런타임 동작)에서 증거로 확인됐을 때만 status="complete" 로 ' +
       '호출하고 그 증거를 evidence 에 구체적으로 적는다. 같은 장애가 반복되고 대안도 없어 진짜로 ' +
       '막혔을 때만 status="blocked" 로 호출한다. 의도·부분진전·이전 작업 기억·그럴듯한 답은 완료 ' +
-      '증거가 아니다. 예산 소진/그만두고 싶음을 이유로 complete 하지 마라. 완료도 차단도 아니면 이 ' +
-      '도구를 호출하지 말고 다음 최고가치 스텝을 바로 실행하라. 완료 신호는 이 도구 호출뿐이다.',
+      '증거가 아니다. 예산 소진/그만두고 싶음을 이유로 complete 하지 마라. 완료도 차단도 아니고 외부 ' +
+      '결과(자식 완료·판정·착지)를 기다리는 상태면 status="waiting" 으로 대기 선언 후 턴을 닫아라 — ' +
+      '같은 조회를 반복(폴링)하지 마라. 완료 이벤트가 다음 턴을 연다. 완료 신호는 이 도구 호출뿐이다.',
     parameters: {
       type: 'object',
       properties: {
         status: {
           type: 'string',
-          enum: ['complete', 'blocked'],
-          description: 'complete=모든 요구사항이 증거로 충족 · blocked=같은 장애 반복으로 막힘(대안 없음)',
+          enum: ['complete', 'blocked', 'waiting'],
+          description: 'complete=모든 요구사항이 증거로 충족 · blocked=같은 장애 반복으로 막힘(대안 없음) · waiting=외부 이벤트 대기(폴링 금지 · 완료 이벤트가 다음 턴을 엶)',
         },
         evidence: {
           type: 'string',
@@ -188,6 +190,15 @@ export const GOAL_INTERIM_REPLY_RULE =
 /** 마지막 반복 직전에 붙이는 한 줄 — 상한으로 끝나도 최종 보고가 «한 번»은 남게. */
 export const GOAL_FINAL_ITERATION_NOTE =
   '[last iteration] 이번이 이 목표의 마지막 반복이다. 이번에 끝내지 못하면 답 끝에 최종 보고를 한 번 써라: 한 것 · 남은 것 · 확인한 증거.';
+
+/** ELN-OP-CHARACTER (대표 11-22) — 조율 자리(자리 원장 role=coordinator · OP)의 목표 루프 답 규칙.
+ *  진단(DIAG-ELN-OP-COORDINATOR-1122 «캐릭터»): 3단 틀의 출처는 프롬프트가 아니라 이 루프 문면이었다 — 조율자는 결론 먼저 짧은 사실로. */
+export const GOAL_COORDINATOR_REPLY_RULE =
+  '- 이 자리는 조율 자리다. 답은 결론 먼저, 짧은 사실 보고로 쓴다(중간 답은 진행 한 줄). «한 것 · 남은 것 · 증거» 3단 틀은 사람이 그 형식을 요청했을 때만 쓴다.';
+
+/** 조율 자리의 마지막 반복 줄 — 끝내지 못해도 3단 틀을 강제하지 않는다. */
+export const GOAL_COORDINATOR_FINAL_ITERATION_NOTE =
+  '[last iteration] 이번이 이 목표의 마지막 반복이다. 이번에 끝내지 못하면 답 끝에 결론 먼저 짧은 사실 보고를 한 번 써라(«한 것 · 남은 것 · 증거» 3단 틀은 사람이 그 형식을 요청했을 때만).';
 
 /** 중간 답이 «최종 보고형»(미완 목록)인가 — 관측 전용(행동을 바꾸지 않는다). */
 const INTERIM_REPORT_SHAPED = /(?:보고할 수 없|하지\s?못했습니다|못\s?했습니다|완료되지 않았|검증되지 않았|확인하지 못했|not (?:yet )?(?:verified|completed)|cannot report)/i;
@@ -258,9 +269,13 @@ export const GOAL_SYSTEM_PREAMBLE = [
   '- 완료는 증거로 판정한다. 모든 요구사항/산출물/검증에 대해 실제 현재 상태에서 증거를 확인하라. 불확실하거나 간접적인 증거는 미달성으로 보고 계속하라.',
   `- 목표가 실제로 완전히 끝났고 증거로 확인됐을 때만 ${UPDATE_GOAL_TOOL_NAME} 도구를 status="complete" 로 호출하고 evidence 에 그 증거를 적어 종료하라. 완료 신호는 이 도구 호출뿐이다(텍스트 문장이 아니다).`,
   '- 아직 할 일이 남았으면 멈추거나 허락을 구하지 말고 다음 최고가치 스텝을 바로 실행하라.',
+  '- 외부 이벤트(자식 완료 노크·우편·깨움·판정)를 기다리는 차례면 폴링하지 말고 update_goal(status="waiting") 으로 대기 선언 후 턴을 닫아라 — 완료 이벤트가 다음 턴을 연다.',
   GOAL_INTERIM_REPLY_RULE,
   `- [continue]·[finalize]·[evidence required]·[evidence mismatch]·[tool call rejected] 같은 반려·재요청은 내부 지시다. 사용자에게 보이는 답에 «완료 주장이 거부됐다/어긋났다»·«죄송합니다» 같은 내부 사정을 쓰지 말고, ${UPDATE_GOAL_TOOL_NAME} 호출도 답에서 설명하지 마라.`,
 ].join('\n');
+
+/** 조율 자리의 목표 계약 — 중간·최종 보고 규칙 한 줄만 조율자 규칙으로 바꾼다(나머지 계약은 같다). */
+export const GOAL_COORDINATOR_SYSTEM_PREAMBLE = GOAL_SYSTEM_PREAMBLE.replace(GOAL_INTERIM_REPLY_RULE, GOAL_COORDINATOR_REPLY_RULE);
 
 /** 미완 판정 시 재주입하는 continuation 프롬프트(user turn). */
 export const GOAL_CONTINUATION_PROMPT = [
@@ -274,6 +289,7 @@ export const GOAL_CONTINUATION_PROMPT = [
   '예산이 곧 소진된다거나 그만두고 싶다는 이유로 완료를 선언하지 마라.',
   `진짜로 진행이 막혔고(같은 장애가 반복) 대안도 없을 때만 ${UPDATE_GOAL_TOOL_NAME} 도구를 status="blocked" 로 호출하고 무엇이 왜 막혔는지 evidence 에 적어라. 단지 어렵거나 느리거나 불확실하다는 이유로는 쓰지 마라.`,
   `모든 요구사항이 증거로 충족됐다면, ${UPDATE_GOAL_TOOL_NAME} 도구를 status="complete" + evidence 로 호출해 종료하라.`,
+  `외부 결과만 기다리는 상태면 ${UPDATE_GOAL_TOOL_NAME} 도구를 status="waiting" + evidence 로 대기 선언하고 턴을 닫아라 — 폴링 금지, 완료 이벤트가 다음 턴을 연다.`,
   GOAL_INTERNAL_NOTICE_RULE,
 ].join('\n');
 
@@ -445,7 +461,8 @@ export type GoalLoopStopReason =
   | 'soft_stop'               // 외부 inbox stop — 현재 iteration 완료 후 다음 iteration 미진입
   | 'max_iterations'          // 반복 하드캡 도달
   | 'no_progress'             // 연속 무진전 → HITL 필요
-  | 'context_pressure';       // 컨텍스트 오버플로 임박 → compact 후 재개 필요
+  | 'context_pressure'        // 컨텍스트 오버플로 임박 → compact 후 재개 필요
+  | 'waiting';                // ELN-WAIT-NOT-POLL — 외부 이벤트 대기 선언으로 종결(완료 아님 · 이벤트가 다음 턴을 엶)
 
 export interface GoalLoopResult {
   finalText: string;
@@ -453,6 +470,8 @@ export interface GoalLoopResult {
   stopReason: GoalLoopStopReason;
   /** 목표가 증거 기준 완료로 선언됐는지(update_goal(complete)+evidence 감지). */
   goalComplete: boolean;
+  /** SEAT-HUMAN-GOAL-PIN ②(OP #131052): goal_complete 종결의 완료 경로 — 핀 해제는 'update_goal' 만. */
+  completionVia?: 'update_goal' | 'structured-final-phase' | 'status-question-final-answer';
   /** `auth_rejected` 로 끝났을 때 — 마지막 코어 턴의 공급자 오류 원문(비밀값 가림). */
   errorMessage?: string;
 }
@@ -500,15 +519,15 @@ const KNOWN_ANSWER_RESEARCH_TOOLS: ReadonlySet<string> = new Set([
  *  반환한다. status 가 enum 밖이면 무시(null). evidence/reason 은 문자열만 수용. */
 function findGoalUpdate(
   newMessages: readonly LLMMessage[],
-): { status: 'complete' | 'blocked'; evidence: string; reason?: string } | null {
-  let found: { status: 'complete' | 'blocked'; evidence: string; reason?: string } | null = null;
+): { status: 'complete' | 'blocked' | 'waiting'; evidence: string; reason?: string } | null {
+  let found: { status: 'complete' | 'blocked' | 'waiting'; evidence: string; reason?: string } | null = null;
   for (const m of newMessages) {
     if (typeof m.content === 'string') continue;
     for (const b of m.content as ContentBlock[]) {
       const bb = b as { type?: string; name?: string; input?: Record<string, unknown> };
       if (bb.type !== 'tool_use' || bb.name !== UPDATE_GOAL_TOOL_NAME) continue;
       const inp = bb.input ?? {};
-      const status = inp.status === 'complete' ? 'complete' : inp.status === 'blocked' ? 'blocked' : null;
+      const status = inp.status === 'complete' ? 'complete' : inp.status === 'blocked' ? 'blocked' : inp.status === 'waiting' ? 'waiting' : null;
       if (!status) continue;
       found = {
         status,
@@ -624,12 +643,15 @@ export async function runGoalLoop(
   // HARNESS-ADVISOR-CHECKPOINTS — 턴 뒤 같은 오류 상담의 조언은 다음 재주입에 싣는다.
   let pendingAdvice: string | undefined;
   const pendingSameErrors: string[] = [];
+  // ELN-OP-CHARACTER — 자리 신원(seatTurnCap.seat)이 원장상 조율 자리면 보고 규칙만 조율자 문면으로.
+  const coordinatorSeat = isCoordinatorSeat(opts.seatTurnCap?.seat);
+  const finalIterationNote = coordinatorSeat ? GOAL_COORDINATOR_FINAL_ITERATION_NOTE : GOAL_FINAL_ITERATION_NOTE;
   if (opts.injectPreamble !== false) {
-    messages.unshift({ role: 'system', content: GOAL_SYSTEM_PREAMBLE });
+    messages.unshift({ role: 'system', content: coordinatorSeat ? GOAL_COORDINATOR_SYSTEM_PREAMBLE : GOAL_SYSTEM_PREAMBLE });
   }
   // TUI-GOAL-INTERIM-QUIET r2 — 반복이 한 번뿐이면 재주입이 없으니 «마지막 반복» 줄을 첫 turn 앞에 둔다.
   if (maxIterations <= 1) {
-    messages.splice(opts.injectPreamble !== false ? 1 : 0, 0, { role: 'system', content: GOAL_FINAL_ITERATION_NOTE });
+    messages.splice(opts.injectPreamble !== false ? 1 : 0, 0, { role: 'system', content: finalIterationNote });
   }
 
   // 종결 선언 도구를 모델 catalog 에 주입. dispatch 는 루프가 가로채 benign ack 를 준다.
@@ -650,6 +672,14 @@ export async function runGoalLoop(
   let lastInputTokens = 0;
   let delegateHinted = false;
   let toolCallsThisIteration = 0;
+  // ELN-WAIT-NOT-POLL ②' — 이번 반복의 도구 활동이 «살아 있는 백그라운드 자식 peek(AgentOutput
+  // not_ready)» 뿐인가: 폴링 대신 waiting 종결을 내리는 관측 플래그(dispatch·onToolResult 에서 갱신).
+  let iterationOnlyLiveChildPeeks = true;
+  // OP #128955/JUD-B #128953 — 혼합 대기 오완료 수리: 이 반복에서 살아 있는 자식 peek(AgentOutput
+  // not_ready)을 «하나라도» 관측했는지. only-peeks 플래그와 달리 다른 도구(MsgList·RunShell 등)가
+  // 섞여도 유지되며, idle-no-work 종결 시 goal_complete 가 아니라 waiting 을 내린다(자식 완료
+  // 이벤트가 같은 목표를 재개한다).
+  let iterationSawLiveChildPeek = false;
   // OH8 후속 PR-2 — 가장 최근에 관측된 `run_tests` 결과(구조체). complete 주장의 반증으로 쓴다.
   // 리셋 판단: iteration 경계에서 리셋하지 않고 "가장 최근 run_tests"를 last-wins 로 유지한다.
   //   근거(오완료 방지): 모델이 이전 턴에 테스트 실패를 보고도 이번 턴에 test 재실행 없이 complete 만
@@ -760,9 +790,18 @@ export async function runGoalLoop(
     messages.push({ role: 'user', content: [
       content,
       ...(advice ? [advice] : []),
-      ...(lastIteration ? [GOAL_FINAL_ITERATION_NOTE] : []),
+      ...(lastIteration ? [finalIterationNote] : []),
       ...(shouldAttachDelegateHint ? [DELEGATE_HINT] : []),
     ].join('\n') });
+  };
+  // ELN-WAIT-NOT-POLL ③' — read-only 중복 억제 캐시를 골 루프 단위로 상향(TUI-FACT-TOOL-REPEAT 턴 단위 계약 갱신):
+  //   같은 읽기 도구+같은 인자의 반복은 iteration 경계를 넘어도 실제 실행 1회로 억제된다(폴링 턴 재생 방지).
+  //   쓰기·외부 효과 dispatch 는 dispatchEffect 에서 캐시를 무효화한다 — 변경 뒤 읽기는 다시 실제 실행.
+  const readOnlyRepeatCache = new Map<string, ReadOnlyRepeatCacheEntry>();
+  let readOnlyRepeatGeneration = 0;
+  const invalidateReadOnlyRepeatCache = () => {
+    readOnlyRepeatGeneration += 1;
+    readOnlyRepeatCache.clear();
   };
   while (iterations < maxIterations) {
     // ⭐ 외부 soft-stop 은 **다음 iteration 진입 직전**에 본다(리뷰 must-fix · 2026-07-30).
@@ -876,14 +915,8 @@ export async function runGoalLoop(
     let turnNewMessages: LLMMessage[] = [];
     let dispatchCount = 0;
     toolCallsThisIteration = 0;
-    // TUI-FACT-TOOL-REPEAT — 이번 core 턴의 read-only 중복 억제 캐시. 턴 시작마다 새로 만든다
-    //   (캐시는 현재 턴 밖으로 유지하지 않는다 — 다음 반복은 새 턴이라 같은 조회도 다시 실제 실행된다).
-    const readOnlyRepeatCache = new Map<string, ReadOnlyRepeatCacheEntry>();
-    let readOnlyRepeatGeneration = 0;
-    const invalidateReadOnlyRepeatCache = () => {
-      readOnlyRepeatGeneration += 1;
-      readOnlyRepeatCache.clear();
-    };
+    iterationOnlyLiveChildPeeks = true;
+    iterationSawLiveChildPeek = false;
     const dispatchEffect = (
       name: string, args: Record<string, unknown>, dctx: Parameters<CoreTurnContext["dispatchTool"]>[2],
       ack?: () => Promise<unknown>,
@@ -990,7 +1023,9 @@ export async function runGoalLoop(
           }
         }
       }
-      if (isEmptyMailListResult(name, result)) {
+      if (isEmptyMailListResult(name, result) || isIdleAgentOutputNotReady(name, result)) {
+        // OP #128955/JUD-B #128953 — not_ready peek 을 섞인 대기 기록에 남긴다(아래 종결 판정에서 waiting 근거).
+        if (isIdleAgentOutputNotReady(name, result)) iterationSawLiveChildPeek = true;
         emptyMailStreak += 1;
         if (emptyMailStreak >= cap.idleEmptyMsgListLimit) {
           seatClosing = 'idle';
@@ -1068,7 +1103,8 @@ export async function runGoalLoop(
       terminalToolNames: [...(ctx.terminalToolNames ?? []), UPDATE_GOAL_TOOL_NAME],
       ...(opts.terminalCompletionShortcut !== false ? {
         terminalCompletionAccepted: (name: string, args: Record<string, unknown>) => name === UPDATE_GOAL_TOOL_NAME
-          && args.status === 'complete' && typeof args.evidence === 'string' && args.evidence.trim().length > 0,
+          && (args.status === 'complete' || args.status === 'waiting')
+          && typeof args.evidence === 'string' && args.evidence.trim().length > 0,
       } : {}),
       // The visible-answer hint also guards ACP's legacy empty-tail path; only
       // the validated completion shortcut is caller-scoped.
@@ -1080,6 +1116,8 @@ export async function runGoalLoop(
         });
         dispatchCount += 1;
         if (name !== UPDATE_GOAL_TOOL_NAME) toolCallsThisIteration += 1;
+        // ELN-WAIT-NOT-POLL ②' — AgentOutput peek 외의 도구가 하나라도 오면 이 반복은 «대기만 남은» 모양이 아니다.
+        if (name !== UPDATE_GOAL_TOOL_NAME && name !== 'AgentOutput') iterationOnlyLiveChildPeeks = false;
         try {
           debug.log('goal.loop', 'dispatch', {
             sessionId: ctx.sessionId, ...runAttribution,
@@ -1097,7 +1135,11 @@ export async function runGoalLoop(
           // 완료 신호(complete)는 상한 «뒤» 에도 받고 도구로 세지 않는다 — 상한 안내가 바로 «마감하라» 이고,
           // 종결 신호는 예산 거부를 받지 않는다(#28503 terminalToolNames 계약과 같은 방향). 그 밖의 진행 선언
           // (in_progress·blocked)은 도구 한 번으로 세고 상한 뒤엔 같은 안내로 거부한다(리뷰 r2 — 61번 넘게 불러도 안 막히던 구멍).
-          if ((args as { status?: unknown }).status === 'complete') return ack();
+          const declaredStatus = (args as { status?: unknown }).status;
+          const declaredEvidence = (args as { evidence?: unknown }).evidence;
+          // ELN-WAIT-NOT-POLL ①' — 대기 선언(waiting+evidence)도 종결 신호다: ack 로 받고 턴을 닫는다.
+          if (declaredStatus === 'complete'
+            || (declaredStatus === 'waiting' && typeof declaredEvidence === 'string' && declaredEvidence.trim().length > 0)) return ack();
           return dispatchEffect(name, args, dctx, ack);
         }
         // TUI-FACT-TOOL-REPEAT — update_goal 가로채기 판정 «뒤» read-only 실 실행 직전:
@@ -1166,6 +1208,14 @@ export async function runGoalLoop(
                 pass: typeof r.pass === 'number' ? r.pass : 0,
               };
             }
+          }
+          // ELN-WAIT-NOT-POLL ②' — AgentOutput 결과 분류: not_ready(살아 있는 자식)만 대기 모양을 유지.
+          if (call.name === 'AgentOutput' && !isIdleAgentOutputNotReady(call.name, call.result)) {
+            iterationOnlyLiveChildPeeks = false;
+          }
+          // OP #128955/JUD-B #128953 — 스트림 경로 도구 결과에서도 살아 있는 자식 peek 을 기록한다.
+          if (call.name === 'AgentOutput' && isIdleAgentOutputNotReady(call.name, call.result)) {
+            iterationSawLiveChildPeek = true;
           }
           if (call.result && typeof call.result === 'object'
             && (call.result as { code?: unknown }).code === 'VERIFIED_OWNER_REQUIRED'
@@ -1484,7 +1534,7 @@ export async function runGoalLoop(
         }
         return finish(
           // A209: progress 억제 후 합성 턴의 문단 구분자('\n\n') 잔류가 최종 답 앞에 남는 결함 가드.
-          { finalText: (duplicateAnswer ? previousFinalText : lastResult.finalText).replace(/^\n{1,2}(?=\S)/, ''), iterations, stopReason: 'goal_complete', goalComplete: true },
+          { finalText: (duplicateAnswer ? previousFinalText : lastResult.finalText).replace(/^\n{1,2}(?=\S)/, ''), iterations, stopReason: 'goal_complete', goalComplete: true, completionVia: 'update_goal' },
           { summary: completionSummary, changedFiles: completionChangedFiles },
         );
       }
@@ -1509,16 +1559,38 @@ export async function runGoalLoop(
       });
     }
 
-    // TUI-SEAT-TURN-CAP ⓑ — «할 일 0»(빈 우편 조회 연속): 이 반복을 완료로 보고 끝낸다(lenient · 대기는 H4/H5 몫).
+    // TUI-SEAT-TURN-CAP ⓑ — «할 일 0»(빈 우편 조회 연속): 이 반복을 닫는다(ELN-WAIT-NOT-POLL r4 ·
+    // OP #128843/JUD-B #128840 — 빈 우편 streak 에 AgentOutput not_ready 가 섞여 있으면 대기 중 자식이
+    // 있는 것이므로 «완료»가 아니다: waiting · goalComplete=false 로 닫고 자식 완료 이벤트가 같은 목표를 재개한다).
     if (seatIdleHit && seatCap) {
-      debug.log('goal.loop', 'idle-no-work', {
+      const hasLiveChild = (iterationOnlyLiveChildPeeks || iterationSawLiveChildPeek) && toolCallsThisIteration > 0;
+      debug.log('goal.loop', hasLiveChild ? 'idle-no-work-waiting' : 'idle-no-work', {
         sessionId: ctx.sessionId, ...runAttribution, seat: seatCap.seat, iteration: iterations,
         tools: seatTools, wallMs: now() - turnStartedAt, emptyMailStreak,
       }, { level: 'info' });
+      if (hasLiveChild) {
+        return finish(
+          { finalText: lastResult.finalText.replace(/^\n{1,2}(?=\S)/, ''), iterations, stopReason: 'waiting', goalComplete: false },
+          { summary: `idle-no-work-waiting — live child peeks among ${emptyMailStreak} consecutive empty checks (seat ${seatCap.seat}); child completion event reopens this goal`, changedFiles: [] },
+        );
+      }
       return finish(
         { finalText: lastResult.finalText.replace(/^\n{1,2}(?=\S)/, ''), iterations, stopReason: 'goal_complete', goalComplete: true },
         { summary: `idle-no-work — ${emptyMailStreak} consecutive empty mailbox checks (seat ${seatCap.seat})`, changedFiles: [] },
       );
+    }
+    // ①' ELN-WAIT-NOT-POLL — update_goal(status="waiting"): 대기 선언으로 across-turn 을 닫는다(완료
+    //    아님). 폴링 금지 — 완료 이벤트(캡슐 노크·우편·깨움)가 다음 턴을 연다(OP 진단
+    //    DIAG-ELN-OP-COORDINATOR-1122 · «도착했는지 확인하겠습니다» 폴링 원인 ①).
+    if (goalUpdate?.status === 'waiting') {
+      debug.log('goal.loop', 'waiting', { sessionId: ctx.sessionId, ...runAttribution, iterations, via: 'update_goal' }, { level: 'info' });
+      return finish({ finalText: lastResult.finalText, iterations, stopReason: 'waiting', goalComplete: false });
+    }
+    // ②' ELN-WAIT-NOT-POLL — 이번 반복의 도구 활동이 «살아 있는 백그라운드 자식 peek(AgentOutput
+    //    not_ready)» 뿐이면 폴링 대신 waiting 으로 닫는다(대기 선언을 못 한 경우의 자동 길 · 원인 ②).
+    if (toolCallsThisIteration > 0 && iterationOnlyLiveChildPeeks) {
+      debug.log('goal.loop', 'waiting-auto-close', { sessionId: ctx.sessionId, ...runAttribution, iterations }, { level: 'info' });
+      return finish({ finalText: lastResult.finalText, iterations, stopReason: 'waiting', goalComplete: false });
     }
     // Evidence-less completion is not authoritative; only retry after stop and terminal outcomes
     // from this same turn have received priority.
@@ -1549,7 +1621,7 @@ export async function runGoalLoop(
         finalChars: lastResult.finalText.length,
       }, { level: 'info' });
       return finish(
-        { finalText: lastResult.finalText, iterations, stopReason: 'goal_complete', goalComplete: true },
+        { finalText: lastResult.finalText, iterations, stopReason: 'goal_complete', goalComplete: true, completionVia: 'structured-final-phase' },
         { summary: 'Structured answer completed in the provider final phase.', changedFiles: [] },
       );
     }
@@ -1579,7 +1651,7 @@ export async function runGoalLoop(
         finalChars: lastResult.finalText.length,
       }, { level: 'info' });
       return finish(
-        { finalText: lastResult.finalText, iterations, stopReason: 'goal_complete', goalComplete: true },
+        { finalText: lastResult.finalText, iterations, stopReason: 'goal_complete', goalComplete: true, completionVia: 'status-question-final-answer' },
         { summary: '상태 질문 턴 완결 답 종결 — 추가 골 도구 0 (TUI-FINAL-ANSWER-COMPLETION S5)', changedFiles: [] },
       );
     }

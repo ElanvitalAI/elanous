@@ -25,6 +25,9 @@ import { defaultSshRunner, type SshRunner } from '../task-agent/parent-host.js';
 import { shellQuote } from '../task-agent/task-hand.js';
 import { listSshHosts } from '../ssh/ssh-hosts.js';
 import { formatMeasuredApiSpend, measuredApiSpend } from '../budget/measured-api-spend.js';
+import { adviseSubscriptions } from '../model-tier/subscription-advisor.js';
+import { subscriptionAdvisorLedgerInput } from '../model-tier/subscription-advisor-ledger.js';
+import { authorizeRouterFeature, envMembershipResolver } from '../plugins/smart-router/consumer.js';
 
 export interface UsageCliDeps {
   readonly collect?: typeof collectUnifiedUsage;
@@ -45,6 +48,10 @@ export interface UsageCliDeps {
   /** 런 원장 결과 표. 시험은 디렉터리를 주입한다. */
   readonly outcomes?: (sinceDays: number) => UsageOutcomesReport;
   readonly outcomeDeps?: UsageOutcomesDeps;
+  /** 구독 조언자 창 스냅숏 심 — 없으면 제품 제공자(readAccountWindowSnapshot)를 쓴다. 시험 종단(JUD-B #126547)용. */
+  readonly advisorReadSnapshot?: typeof import('../model-tier/account-window-snapshot.js').readAccountWindowSnapshot;
+  /** 구독 조언자 회원 등급 심(jud-39528 mustFix ③) — 원장·스냅숏을 읽기 전 Pro+ 인가를 본다. 기본 = env seam(free fail-closed). */
+  readonly advisorMembership?: () => string | null | undefined;
 }
 
 /** 계정 이름 → CODEX_HOME 기본 표.
@@ -669,6 +676,37 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
   const list = deps.list ?? listCodexResetCredits;
   const consume = deps.consume ?? consumeCodexResetCredits;
   const homes = deps.homes ?? defaultHomes();
+
+  // SUBSCRIPTION-ADVISOR-PROACTIVE r6(JUD-B #126283/OP #126295) — 조언자의 실제 제품 호출 경로.
+  // 원장(llm-usage·window-account)과 창 스냅숏에서 이미 구조화된 데이터만 — 네트워크 0.
+  usage
+    .command('advisor')
+    .description('구독 조언 — 실제 주·월 사용량 원장(llm-usage)과 창 소진 관측으로 추가·상향·하향·해지 제안 (SUBSCRIPTION-ADVISOR-PROACTIVE)')
+    .option('--json', 'JSON 출력')
+    .action((opts: { json?: boolean }, command: Command) => {
+      // jud-39528 mustFix ③ — 원장·스냅숏을 읽기 «전»에 Pro+ 권한 확인. 거부 시 일반 라우팅 안내만.
+      // MembershipReader(함수)·MembershipResolver(객체) 양쪽을 MembershipResolver로 정규화(r12d — TS2322 수리)
+      const advisorGrant = authorizeRouterFeature('router.subscription_advisor_monthly', { currentTier: typeof deps.advisorMembership === 'function' ? deps.advisorMembership : envMembershipResolver().currentTier });
+      if (!advisorGrant.allowed) {
+        out.log(`⛔ 구독 조언은 프로 이상 기능입니다 — router.subscription_advisor_monthly:${advisorGrant.reason}`);
+        out.log('기본 자동 라우팅(강·중·약)은 모든 등급에서 그대로 쓸 수 있습니다.');
+        exit(1);
+        return;
+      }
+      const json = opts.json || command.optsWithGlobals<{ json?: boolean }>().json;
+      const ledgerInput = subscriptionAdvisorLedgerInput({
+        readRunLogs: deps.readRunLogs ?? readRunLogs,
+        ...(deps.advisorReadSnapshot ? { readSnapshot: deps.advisorReadSnapshot } : {}),
+      });
+      const report = adviseSubscriptions(ledgerInput);
+      if (json) {
+        out.log(JSON.stringify({ ...report, observed: ledgerInput.observed }, null, 2));
+        return;
+      }
+      out.log(report.weeklySummaryMd);
+      out.log(`관측 원장 — 최근 7일 구독 호출 ${ledgerInput.observed.weeklyCalls}건 · 30일 ${ledgerInput.observed.monthlyCalls}건 · 전체 선택 거절(all-exhausted·provider급, 계정 소진 아님) 주/월 ${ledgerInput.observed.weeklyAllExhaustedRefusals}/${ledgerInput.observed.monthlyAllExhaustedRefusals}`);
+    });
+
   usage
     .command('reset')
     .description('⛔ 되돌릴 수 없다 — Codex 리셋권 «하나»를 써서 그 계정의 주간 창을 지금 새로 시작한다')

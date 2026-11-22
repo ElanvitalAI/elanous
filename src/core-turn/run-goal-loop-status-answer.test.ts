@@ -542,21 +542,24 @@ describe('TUI-FACT-TOOL-REPEAT — read-only 중복 억제(동일 tool+args 턴�
     expect(r.updateGoalDispatches).toBe(0);
   });
 
-  test('TUI-FACT-TOOL-REPEAT: 캐시는 현재 턴 밖으로 유지하지 않는다 — 다음 반복에서 같은 조회도 다시 실행된다', async () => {
+  test("TUI-FACT-TOOL-REPEAT: 캐시는 골 루프 단위로 유지된다(ELN-WAIT-NOT-POLL ③') — 다음 반복 같은 조회 억제 · 쓰기 dispatch 뒤 재실행", async () => {
     const r = await driveTracked([
       // 턴 1 — 동일 조회 2회(실제 실행 1회·억제 1회) 뒤 미완 보고형 중간 답 → continuation 재주입.
       [{ type: 'tool_call', id: 'a1', name: 'release_status', args: { topic: 'status' } }],
       [{ type: 'tool_call', id: 'a2', name: 'release_status', args: { topic: 'status' } }],
       [{ type: 'text', delta: INTERIM }],
-      // 턴 2 — 캐시가 턴 시작 시 초기화됐으므로 같은 조회가 다시 실제 실행된다.
+      // 턴 2 — 같은 조회는 골 루프 캐시로 여전히 억제된다(b1). 쓰기 도구 dispatch 가 캐시를
+      // 무효화한 뒤에는 같은 조회도 다시 실제 실행된다(b2).
       [{ type: 'tool_call', id: 'b1', name: 'release_status', args: { topic: 'status' } }],
+      [{ type: 'tool_call', id: 'w1', name: 'RunShell', args: { command: ['echo', 'x'] } }],
       [{ type: 'tool_call', id: 'b2', name: 'release_status', args: { topic: 'status' } }],
       [{ type: 'text', delta: S5_ANSWER }],
       [], [], [], [],
     ], S5_QUESTION, [statusTool, shellTool], (name) => 'ok');
     expect(r.result.iterations).toBe(2);
-    // 턴당 실제 실행 1회씩 총 2회 — 캐시가 턴을 넘어 유지되지 않는다(억제 없으면 4회).
+    // 실제 실행 2회(a1·무효화 뒤 b2) — b1은 골 루프 캐시로 억제(억제 없으면 4회).
     expect(r.dispatchedCalls.filter((c) => c.name === 'release_status')).toHaveLength(2);
+    expect(r.dispatchedCalls.filter((c) => c.name === 'RunShell')).toHaveLength(1);
     expect(r.result.goalComplete).toBe(true);
     expect(r.result.finalText).toBe(S5_ANSWER);
   });

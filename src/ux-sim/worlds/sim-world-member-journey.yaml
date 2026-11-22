@@ -1,0 +1,4 @@
+schema: 1
+world: member-journey
+scenarios:
+  - { id: HANDLE-WEBCHAT-FIRST-TURN, module: src/ux-sim/sim-world/member-journey/scenarios.ts }

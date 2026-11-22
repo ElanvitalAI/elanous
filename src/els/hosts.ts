@@ -16,6 +16,19 @@ export interface FederatedHost {
   /** Explicit, pinned operator transport for remote update-all. Read-only federation does not need this. */
   readonly update?: { readonly sshTarget: string; readonly knownHostsFile: string; readonly catchUpSeat: 'OP' | 'TC' | 'MK' | 'UX'; readonly bin?: string;
     readonly home?: string; readonly stateRoot?: string; readonly cwd?: string };
+  /** Person-pinned SSH transport for the view-only attach bridge. */
+  readonly attach?: { readonly sshTarget: string; readonly knownHostsFile: string };
+}
+
+function attachTransport(raw: unknown, baseUrl: string): FederatedHost['attach'] | string {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return 'attach transport is not an object';
+  const row = raw as Record<string, unknown>;
+  const target = row.sshTarget;
+  const known = row.knownHostsFile;
+  if (typeof target !== 'string' || !/^[a-z_][a-z0-9_-]*@[A-Za-z0-9._-]+$/i.test(target)) return 'attach sshTarget must be user@host';
+  if (target.slice(target.indexOf('@') + 1).toLowerCase() !== new URL(baseUrl).hostname.toLowerCase()) return 'attach SSH HostName differs from registered URL host';
+  if (typeof known !== 'string' || !known.startsWith('/') || /[\s%\0]/.test(known)) return 'attach knownHostsFile must be one absolute literal file';
+  return { sshTarget: target, knownHostsFile: known };
 }
 
 export interface HostRegistry {
@@ -99,8 +112,10 @@ export function loadHostRegistry(path: string): HostRegistry {
     else if (hosts.some((host) => host.name === name)) rejected.push(`${name}: duplicate name`);
     else {
       const update = (row as { update?: unknown }).update === undefined ? undefined : updateTransport((row as { update?: unknown }).update, baseUrl);
+      const attach = (row as { attach?: unknown }).attach === undefined ? undefined : attachTransport((row as { attach?: unknown }).attach, baseUrl);
       if (typeof update === 'string') rejected.push(`${name}: ${update}`);
-      else hosts.push({ name, baseUrl, ...(update ? { update } : {}) });
+      else if (typeof attach === 'string') rejected.push(`${name}: ${attach}`);
+      else hosts.push({ name, baseUrl, ...(update ? { update } : {}), ...(attach ? { attach } : {}) });
     }
   });
   return { hosts, rejected };

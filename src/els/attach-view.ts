@@ -66,7 +66,52 @@ export function fitAnsi(text: string, width: number): string {
   return `${out}${close()}`;
 }
 
+/** `base` (a row that may carry SGR colour) with the cells [at, at + width) replaced by `piece` cut and padded to `width`.
+ *  The colour open at the cut point on the right is carried over; a wide glyph straddling either edge becomes a space. */
+export function spliceCells(base: string, at: number, piece: string, width: number): string {
+  let used = 0;
+  let sgr = '';
+  let right = '';
+  let from = 0;
+  const end = at + width;
+  const take = (plain: string): void => {
+    for (const { segment } of graphemes.segment(plain)) {
+      const cells = Bun.stringWidth(segment);
+      if (used >= end) right += segment;
+      else if (used + cells > end) right += ' '.repeat(used + cells - end);
+      used += cells;
+    }
+  };
+  for (const match of base.matchAll(ESCAPE)) {
+    take(base.slice(from, match.index));
+    from = match.index + match[0].length;
+    if (match[1] === undefined) continue;
+    if (used >= end) right += match[1];
+    else sgr = isSgrReset(match[1]) ? '' : sgr + match[1];
+  }
+  take(base.slice(from));
+  return `${fitAnsi(base, at)}${ESC}[0m${fitAnsi(piece, width)}${ESC}[0m${sgr}${right}`;
+}
+
+/** ELS-APP-RENDER-SINGLE-FRAME: a dialog's rows, drawn with their top-left cell at (x, y) — 0-based — each `width` cells. */
+export interface DialogBox { readonly x: number; readonly y: number; readonly width: number; readonly lines: readonly string[] }
+
 export interface ViewInput { readonly screen: string; readonly cols: number; readonly rows: number; readonly status: string }
+
+/** ELS-ATTACH-FRAME-DIFF (OP #127484 ③): the rows that changed since the previous painted body. `prev === undefined`
+ *  means «everything is new» (the first paint of a view, or a repaint after a lost screen): every row counts as changed
+ *  and no incremental paint is possible, so `paint` stays empty and the caller does one full repaint. A body that
+ *  shrank (a resize down) repaints nothing incremental either: the caller's full repaint already covered it. */
+export function changedRowsPaint(prev: readonly string[] | undefined, next: readonly string[], cols: number): { changed: number[]; paint: string } {
+  if (prev === undefined || prev.length !== next.length) return { changed: next.map((_, i) => i), paint: '' };
+  const changed: number[] = [];
+  for (let i = 0; i < next.length; i++) if (prev[i] !== next[i]) changed.push(i);
+  if (changed.length === 0) return { changed: [], paint: '' };
+  // herdr protocol/render_ansi.rs pattern: cursor-address each changed row (1-based), pad it to the full width, no cursor move back —
+  // the next changed row's addressing supersedes the old position.
+  const paint = changed.map((row) => `${ESC}[${row + 1};1H${fitAnsi(next[row] ?? '', cols)}`).join('');
+  return { changed, paint };
+}
 
 /** One full repaint: cursor home, the pane's lines (rows - 1 of them), then the status line in reverse video. */
 export function drawView(view: ViewInput): string {
@@ -137,6 +182,8 @@ export interface PaneRow {
   readonly remote?: string;
   /** ELS-REMOTE-MARKER: its host is reported down — the last known row stays in the list, dimmed and marked «✕». */
   readonly stale?: boolean;
+  /** Authoritative role from the workspace listing (never inferred from the title). */
+  readonly role?: 'coordinator';
   /** ELS-SIDEBAR-HERDR-CLEAN: the pane's working folder (the selected space's path line). */
   readonly cwd?: string;
 }
@@ -154,20 +201,66 @@ export function buildBadge(value: unknown, unknown = '[build unknown]'): string 
   return `[자체보고·미인증:${[version, channel, stamp, build.sha.slice(0, 7), age].filter(Boolean).join(' ')}]`;
 }
 
-/** The rows of an `els ls` answer, in the server's order. Anything that is not a list gives no rows. */
+/** Group by host and stably put each host's coordinator workspace first. Pane order within a workspace is unchanged. */
+function coordinatorFirst(rows: PaneRow[]): PaneRow[] {
+  const hosts = new Map<string, Map<string, PaneRow[]>>();
+  for (const row of rows) {
+    const host = row.remote ?? '';
+    if (!hosts.has(host)) hosts.set(host, new Map());
+    const spaces = hosts.get(host)!;
+    if (!spaces.has(row.wsId)) spaces.set(row.wsId, []);
+    spaces.get(row.wsId)!.push(row);
+  }
+  return [...hosts.values()].flatMap((spaces) => {
+    const groups = [...spaces.values()];
+    return [...groups.filter((group) => group.some((row) => row.role === 'coordinator')),
+      ...groups.filter((group) => !group.some((row) => row.role === 'coordinator'))].flat();
+  });
+}
+
+/** Keep empty coordinator workspaces as metadata, never fabricate attachable panes. */
+export function emptyCoordinatorSpaces(listJson: string, rows: readonly PaneRow[]): { wsId: string; name: string }[] {
+  try {
+    const workspaces = (JSON.parse(listJson) as { workspaces?: unknown }).workspaces;
+    if (!Array.isArray(workspaces)) return [];
+    return workspaces.flatMap((ws) => ws && typeof ws === 'object' && ws.role === 'coordinator'
+      && typeof ws.id === 'string' && typeof ws.name === 'string' && !rows.some(row => row.wsId === ws.id)
+      ? [{ wsId: ws.id, name: ws.name }] : []);
+  } catch { return []; }
+}
+
+/** Remote metadata is kept separate from panes, so an empty space cannot become an attach target. */
+export function emptyRemoteCoordinators(listJson: string, rows: readonly PaneRow[]): { wsId: string; name: string; remote: string; stale?: boolean }[] {
+  try {
+    const spaces = (JSON.parse(listJson) as { remoteWorkspaces?: unknown }).remoteWorkspaces;
+    if (!Array.isArray(spaces)) return [];
+    return spaces.flatMap((ws) => ws && typeof ws === 'object' && ws.role === 'coordinator' && ws.reach === 'up'
+      && typeof ws.host === 'string' && typeof ws.id === 'string' && typeof ws.name === 'string'
+      && !rows.some((row) => row.wsId === `${ws.host}:${ws.id}`)
+      ? [{ wsId: `${ws.host}:${ws.id}`, name: `⇄${ws.host} ${ws.name}`, remote: ws.host }] : []);
+  } catch { return []; }
+}
+
+/** The rows of an `els ls` answer. Anything that is not a list gives no rows. */
 export function parsePaneRows(listJson: string): PaneRow[] {
   let parsed: unknown;
   try { parsed = JSON.parse(listJson); } catch { return []; }
   const panes = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as { panes?: unknown }).panes : undefined;
   if (!Array.isArray(panes)) return [];
+  const workspaces = (parsed as { workspaces?: unknown }).workspaces;
+  const coordinators = new Set<string>();
+  if (Array.isArray(workspaces)) for (const raw of workspaces) {
+    if (raw && typeof raw === 'object' && raw.role === 'coordinator' && typeof raw.id === 'string') coordinators.add(raw.id);
+  }
   const rows: PaneRow[] = [];
   for (const raw of panes) {
     if (!raw || typeof raw !== 'object') continue;
     const row = raw as Record<string, unknown>;
     if (typeof row.pane !== 'string' || typeof row.address !== 'string') continue;
-    rows.push({ pane: row.pane, wsId: row.address.split('/')[0] ?? '', workspace: String(row.workspace ?? ''), title: `${String(row.title ?? row.pane)} ${buildBadge(row.build)}`, state: String(row.state ?? ''), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
+    const wsId = row.address.split('/')[0] ?? '';
+    rows.push({ pane: row.pane, wsId, ...(coordinators.has(wsId) ? { role: 'coordinator' as const } : {}), workspace: String(row.workspace ?? ''), title: `${String(row.title ?? row.pane)} ${buildBadge(row.build)}`, state: String(row.state ?? ''), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
   }
-  return rows;
+  return coordinatorFirst(rows);
 }
 
 /**
@@ -180,6 +273,7 @@ export function parseRemoteRows(listJson: string): PaneRow[] {
   try { parsed = JSON.parse(listJson); } catch { return []; }
   const panes = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as { panes?: unknown }).panes : undefined;
   if (!Array.isArray(panes)) return [];
+  const spaces = (parsed as { remoteWorkspaces?: unknown }).remoteWorkspaces;
   const rows: PaneRow[] = [];
   for (const raw of panes) {
     if (!raw || typeof raw !== 'object') continue;
@@ -187,11 +281,12 @@ export function parseRemoteRows(listJson: string): PaneRow[] {
     if (row.reach !== 'up' || typeof row.host !== 'string' || typeof row.address !== 'string' || typeof row.ws !== 'string') continue;
     const title = String(row.title ?? '');
     const split = row.host === 'herdr' ? title.indexOf(' · ') : -1;
-    const label = split > 0 ? title.slice(0, split) : row.ws;
+    const space = Array.isArray(spaces) ? spaces.find((ws) => ws && typeof ws === 'object' && ws.host === row.host && ws.id === row.ws && typeof ws.name === 'string') : undefined;
+    const label = split > 0 ? title.slice(0, split) : space?.name ?? row.ws;
     rows.push({ pane: row.address, wsId: `${row.host}:${row.ws}`, workspace: `⇄${row.host} ${label}`, title: `${split > 0 ? title.slice(split + 3) : title || String(row.pane ?? row.address)} ${buildBadge(row.build)}`,
-      state: String(row.state ?? ''), remote: row.host, ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
+      state: String(row.state ?? ''), remote: row.host, ...(row.role === 'coordinator' ? { role: 'coordinator' as const } : {}), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
   }
-  return rows;
+  return coordinatorFirst(rows);
 }
 
 /** Pane state → the shared status word (`exited` reads as done: the screen it left is still there). */
@@ -252,6 +347,8 @@ export interface ComposeInput {
   readonly buttons?: string;
   /** ELS-NARROW-TAB-DROPDOWN: the open tab list, drawn over the pane from the row under the top row (the cursor is hidden). */
   readonly overlay?: readonly string[];
+  /** ELS-APP-RENDER-SINGLE-FRAME: a dialog spliced into the rows it covers (the cursor is hidden) — one frame, no overlay write. */
+  readonly dialog?: DialogBox;
 }
 
 /** One full repaint: sidebar (when it fits) | pane, the status line last, and the terminal cursor put where the pane's is. */
@@ -268,6 +365,8 @@ export function composeView(view: ComposeInput): string {
     lines.push(`${sidebar ? `${fitAnsi(sidebar[row] ?? '', SIDEBAR_COLS)}│` : ''}${centreText}`);
   }
   (view.overlay ?? []).forEach((text, at) => { if (at + 1 < lines.length) lines[at + 1] = fitAnsi(text, view.cols); });
+  const box = view.dialog;
+  box?.lines.forEach((text, at) => { if (box.y + at < lines.length) lines[box.y + at] = spliceCells(lines[box.y + at]!, box.x, text, Math.min(box.width, view.cols - box.x)); });
   // 출처: seat-state/OP/orders/ELS-FIRST-RUN-UX-1119.md ③ — status 는 리터럴 그대로 (패딩 없이; trimRight 화면 판독과 양립)
   // ELS-FIRST-RUN-FU3 ①: cut to the width (no padding) — a long status on a narrow terminal must not wrap and push the
   // whole repaint up a line.
@@ -277,9 +376,38 @@ export function composeView(view: ComposeInput): string {
   lines.push(`${REVERSE}${status}${buttons ? `${' '.repeat(room - Bun.stringWidth(status))}${ESC}[0m${buttons}` : ''}${ESC}[0m`);
   const cursorRow = header ? Number(header[1]) + top : -1;
   const cursorCol = header ? Number(header[2]) : -1;
-  const showCursor = !view.overlay && header !== null && header[3] === 'true' && cursorRow < view.rows - 1 && cursorCol < centre;
+  const showCursor = !view.overlay && !view.dialog && header !== null && header[3] === 'true' && cursorRow < view.rows - 1 && cursorCol < centre;
   const place = showCursor ? `${ESC}[${cursorRow + 1};${left + cursorCol + 1}H${ESC}[?25h` : `${ESC}[?25l`;
   return `${ESC}[?25l${ESC}[H${lines.join('\r\n')}${place}`;
+}
+
+/** DEC 2026 synchronized update: the terminal shows the frame between these two as one (herdr render_ansi). */
+export const SYNC_BEGIN = `${ESC}[?2026h`;
+export const SYNC_END = `${ESC}[?2026l`;
+const COMPOSED_HEAD = `${ESC}[?25l${ESC}[H`;
+const CURSOR_TAIL = /(?:\u001b\[\d+;\d+H\u001b\[\?25h|\u001b\[\?25l)$/;
+
+/** ELS-APP-RENDER-SINGLE-FRAME: the terminal side of the full-screen app. Each composed frame (composeView's output) goes
+ *  out as ONE write wrapped in a synchronized update; after the first frame only the rows that changed since the previous
+ *  frame are written (changedRowsPaint), and an unchanged frame writes nothing. A different row count (the first frame, a
+ *  resize) is a full repaint from home — no 2J (the view's entry already cleared the screen once). */
+export function createAppFrameWriter(write: (text: string) => void): (screen: string) => void {
+  let previous: string[] | undefined;
+  let lastTail = '';
+  return (screen) => {
+    if (!screen.startsWith(COMPOSED_HEAD)) { previous = undefined; write(`${SYNC_BEGIN}${screen}${SYNC_END}`); return; }
+    const rows = screen.slice(COMPOSED_HEAD.length).split('\r\n');
+    const tail = CURSOR_TAIL.exec(rows[rows.length - 1]!)?.[0] ?? '';
+    rows[rows.length - 1] = `${rows[rows.length - 1]!.slice(0, rows[rows.length - 1]!.length - tail.length)}${ESC}[K`;
+    const cols = Bun.stringWidth(rows[0]!.replace(ESCAPE, ''));   // every composed row is exactly the terminal's width
+    const step = changedRowsPaint(previous, rows, cols);
+    const full = previous === undefined || previous.length !== rows.length;
+    previous = rows;
+    if (!full && step.changed.length === 0 && tail === lastTail) return;
+    lastTail = tail;
+    const paint = full ? `${COMPOSED_HEAD}${rows.join('\r\n')}` : `${ESC}[?25l${step.paint}`;
+    write(`${SYNC_BEGIN}${paint}${tail}${SYNC_END}`);
+  };
 }
 
 export const SIDEBAR_HELP = 'ctrl+b: j/k 이동 · w 작업공간 · 1-9 · c 새 pane · a 엘라누스 채팅 · N 새 작업공간 · x 닫기 · D 작업공간 닫기 · s 사이드바 · q 분리';

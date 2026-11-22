@@ -1,10 +1,88 @@
 {
   "schema": 1,
   "entries": {
+    "toolbatch/RUNSHELL-PR2-UNAPPROVED-INGRESS": { "expect": "green", "greenSince": "PR-2 target, not yet observed", "reason": "Target: actual product ingress denies unapproved marker command; this does not measure signed approval issuance or consumption." },
+    "toolbatch/RUNSHELL-PR1-READ-PRESERVATION": { "expect": "green", "greenSince": "PR-1 preparation", "reason": "Product script dispatch runs read-local through a policy callback with no human approval, preserves output hash and exactly one fixture invocation; absent callback remains denied." },
+    "els/E-SEAT-STEER-BUSY-SHELL": {
+      "expect": "green",
+      "greenSince": "0.3.33 SEAT-STEER-PREEMPT",
+      "reason": "A real tool loop with fake provider and a held RunShell receives an OP decision during the tool, detaches it, and injects the decision into the next model request before the shell completes."
+    },
+    "capsule-events/SEAT-STEER-PREEMPT-137": {
+      "expect": "green",
+      "greenSince": "0.3.33 SEAT-STEER-PREEMPT",
+      "reason": "137 concurrent capsule completion frames, three failures and a replay collapse into one queued summary with no result-only wake; the next person turn consumes it."
+    },
+    "toolbatch/RUNSHELL-GRAPH-READ": {
+      "expect": "green",
+      "greenSince": "2026-11-22",
+      "reason": "Real graph lifecycle calls RunShell with isolated fixture binaries, including approval denial and unsafe argv preflight."
+    },
+    "toolbatch/RUNSHELL-ELN-KUBE-HOST-READ": {
+      "expect": "green",
+      "greenSince": "0.3.33 RUNSHELL-ALLOWLIST-EXPAND second read bundle",
+      "reason": "Fake local CLI and cluster binaries through product RunShell dispatch: local results consumed, cluster denial executes zero calls, prior human approval permits one call, unsafe argv refuses before any step."
+    },
+    "toolbatch/RUNSHELL-GIT-GH-READ": {
+      "expect": "green",
+      "greenSince": "0.3.33 RUNSHELL-ALLOWLIST-EXPAND first git/gh bundle",
+      "reason": "A fake git/gh product dispatch proves local git read needs no human prompt, gh GET needs approval, denial has no gh effect, and gh POST is refused before execution."
+    },
+    "member-journey/HANDLE-WEBCHAT-FIRST-TURN": {
+      "expect": "green",
+      "greenSince": "0.3.33 HANDLE-JOOSUNG-PERSONAL-SPACE-1121 simulation closeout",
+      "reason": "A fake Google signup and reserved fake handle pass the production member home serving gate, HMAC bare-origin handoff and first prompt, with restart, concurrent same-token exchange, independent bearer separation, and absent serving injected"
+    },
+    "router-cost/ROUTER-OR-CODEX-MIX-CHOKEPOINT": {
+      "expect": "green",
+      "greenSince": "0.3.33 ROUTER-OR-CODEX-MIX-CHOKEPOINT",
+      "reason": "Core and advisor choose OpenRouter for implementation, fresh Codex subscription for strong checkpoints, reject stale windows after restart, and bound an unresponsive fake provider"
+    },
+    "toolbatch/RUNSHELL-DEFAULT-OP-30M": {
+      "expect": "green",
+      "greenSince": "0.3.33 RUNSHELL-SCRIPT-DEFAULT-CHECKS",
+      "reason": "The OP 30-minute check verifies required steps, incomplete observations for real-format mixed queue rows and an empty landing log, and explicit preview truncation in an isolated universe."
+
+    },
+    "toolbatch/RUNSHELL-SCRIPT-7TASK": {
+      "expect": "green",
+      "greenSince": "2026-11-22 (ELN-TOOLBATCH-EXPERIMENT simulation)",
+      "reason": "Seven isolated product CLI tasks compare ordinary RunShell with script mode; the scripted turn proxy falls at least 30 percent with identical answers and no extra failed CLI calls. Provider usage remains unmeasured."
+    },
+    "toolbatch/RUNSHELL-RECIPE-INPUT-LIMITS": {
+      "expect": "green",
+      "greenSince": "0.3.33 RUNSHELL-RECIPE-INPUT-LIMITS",
+      "reason": "Synthetic input boundaries cover inclusive raw bytes, nodes, depth, text, and expanded shared graph rejection."
+    },
+    "toolbatch/RUNSHELL-RECIPE-SIGNED": {
+      "expect": "green",
+      "greenSince": "0.3.33 RUNSHELL-RECIPE-SIGNED",
+      "reason": "Fake JUD Ed25519 key proves valid grant and denies missing trust, forged signature, changed recipe hash, and signed revoke as a grant; no effects are wired."
+    },
+    "router-cost/ROUTER-COST-LEDGER": {
+      "expect": "green",
+      "greenSince": "0.3.33 LLM-CALL-COST-LEDGER",
+      "reason": "Real streamLLM calls with fake providers preserve measured tokens, mark missing usage and timeout as unknown cost, and survive concurrency plus a fresh provider after restart"
+    },
+    "router-cost/ROUTER-COST-LOCK-RECOVERY": {
+      "expect": "green",
+      "greenSince": "0.3.33 LLM-CALL-COST-LEDGER",
+      "reason": "Real streamLLM usage rows persist through a killed SQLite write-lock holder and a new writer connection; the savings ledger reader sees both calls"
+    },
+    "router-cost/ROUTER-QUALITY-GUARD-95": {
+      "expect": "green",
+      "greenSince": "2026-11-23 PR #39641 (ROUTER-QUALITY-GUARD-95 mustFix ①②③ — 이 PR로 신규 착지)",
+      "reason": "lightweight-first guarded routing: per-task premium shadow comparison (exactly one premium evaluation per task, reused as the delivered score on gate failure), per-task-type floors (chat 0.90, unregistered fallback 0.95) and the daily ledger recalc surface land together (jud-39614 mustFix ①②③)"
+    },
     "capsule-events/C1": {
-      "expect": "red",
-      "reason": "C1 background Agent axis: agent-end delivery passes (exactly one delivery); mail and harness sources remain unmeasured — redReason follows the scenario's own partial-red reason (was the stale pre-fix catch reason, wrong-reason-red since #38582)",
-      "redReason": "C1 mail and harness axes unmeasured"
+      "expect": "green",
+      "reason": "C1 done-event wake axes (flag removed — capsule behavior always on, CAPSULE-FLAGS-REMOVE-DEFAULT): the background Agent end delivery passes here (exactly one wake turn within 20s, duplicates 0) and the harness child end frame is green in capsule-events/C1-HARNESS (B4/B5 queue-bridge); the mail axis keeps its own red row capsule-events/C1-MAIL",
+      "greenSince": "2026-11-21 pool4-capsule-c1-harness"
+    },
+    "capsule-events/C1-HARNESS": {
+      "expect": "green",
+      "reason": "C1 harness child end axis (CAPSULE-B4-HARNESS-DONE-FRAME · B5 queue-bridge): a RunShell mode:'bg' harness child finishes while the seat is idle, its task-notification crosses as one capsule-done frame and opens exactly one next turn within 20s with duplicates 0 — self-implement-stop ('harness' kind) and graph frames remain unmeasured: sim probes at a 20s window (probe-c1-harness-selfimpl-221754) and a 60s window (probe-b-c1-harness-60s-223600) both record stopCount 0, so the axis stays unmeasured (JUD-B #122985)",
+      "greenSince": "2026-11-21 pool4-capsule-c1-harness"
     },
     "capsule-events/C3": {
       "expect": "green",
@@ -291,6 +369,61 @@
       "expect": "green",
       "greenSince": "2026-11-21 (#39405 CEO channel · main d6f032d64f)",
       "reason": "OP-CHANNEL-INGRESS-1121 저장 실패 중 재시작 축 (JUD #119836 / OP #119845): 낡은 (source, message_id) 키 + reply_text 없는 db 부팅 1 → 재키 COPY 실패 → ROLLBACK(migrate-rolled-back) · 행 2 생존 → 열 복구 후 부팅 2 재키 성공 · 같은 행 waiting 2"
+    },
+    "els-remote/SSH-HOST-KEY-MISMATCH": {
+      "expect": "green",
+      "greenSince": "#39350 ELS-SSH-ATTACH-EDGE-FU",
+      "reason": "The pinned SSH command rejects a changed host key before any remote frame."
+    },
+    "els-remote/SSH-UNREGISTERED": {
+      "expect": "green",
+      "greenSince": "#39350 ELS-SSH-ATTACH-EDGE-FU",
+      "reason": "A host absent from the ELS registry cannot start the SSH attach transport."
+    },
+    "els-remote/SSH-DISCONNECT": {
+      "expect": "green",
+      "greenSince": "#39350 ELS-SSH-ATTACH-EDGE-FU",
+      "reason": "A disconnected SSH stream ends once after its last valid frame."
+    },
+    "els/E-REMOTE-LIVE-TURN": {
+      "expect": "green",
+      "greenSince": "ELS-UPDATE-ALL-GRACEFUL 0.3.33 candidate",
+      "reason": "등록 원격 host의 실제 updateAllElsTabs 부모·자식 호출과 runSeatControl 문을 사용한다. 장치는 외부 SSH 전송과 시간을 대체하고 바쁜 턴 종료 뒤 동일 pane의 새 owner PID·세션·cwd를 주입한다. 실 SSH/TUI/인계 프롬프트는 별도 종단 원문으로 판정한다."
+    },
+    "els/E-REMOTE-TIMEOUT": {
+      "expect": "green",
+      "greenSince": "ELS-UPDATE-ALL-GRACEFUL 0.3.33 candidate",
+      "reason": "등록 원격 호스트의 SSH 무응답을 장치로 주입하면 부모 updateAllElsTabs 결과가 호스트·pane 실패 두 행이 되고 로컬 migrate가 호출되지 않는다."
+    },
+    "els/E-LIVE-CWD-OSC7": {
+      "expect": "green",
+      "greenSince": "ELS-LIVE-CWD candidate",
+      "reason": "실제 ELS core의 PTY 출력 구독에 합성 OSC 7을 주입하고 저널 cwd와 삭제된 폴더·원격 호스트 거부를 확인한다. 실제 셸 cd는 별도 검증이다."
+    },
+    "els/E-HOST-SNAPSHOT-BOUND": {
+      "expect": "green",
+      "greenSince": "ELS-REMOTE-TAB-1/2 worker_hosts read bridge 0.3.33 candidate",
+      "reason": "실제 Nexus HTTP 라우터와 worker_hosts WAL을 장치 시간·라우트 문맥 재생성으로 실행한다. 무자격 401, 만료·철회 비가시 endpoint, principal 회전 뒤 새 generation·origin만 노출, WAL 재개 뒤 철회 보존을 검사하며 원격 ELS 호출은 없다."
+    },
+    "machine-infra/OPS-HEAL-RESTART": {
+      "expect": "green",
+      "greenSince": "2026-11-22 (SIM-WORLD-0333-DEVICES · CX-15 원문 052cd31d)",
+      "reason": "a new invocation preserves the prior event and opens one improvement on the third signal"
+    },
+    "machine-infra/OPS-HEAL-DEAD-LOCK": {
+      "expect": "green",
+      "greenSince": "2026-11-22 (SIM-WORLD-0333-DEVICES · CX-15 원문 052cd31d)",
+      "reason": "a dead ledger lock holder is reclaimed before a new heal event is committed"
+    },
+    "machine-infra/OPS-HEAL-CONCURRENT": {
+      "expect": "green",
+      "greenSince": "2026-11-22 (SIM-WORLD-0333-DEVICES · CX-15 원문 052cd31d)",
+      "reason": "two independent heal processes commit two durable ledger rows"
+    },
+    "machine-infra/OPS-HEAL-PROVIDER-REFUSE": {
+      "expect": "green",
+      "greenSince": "2026-11-22 (SIM-WORLD-0333-DEVICES · CX-15 원문 052cd31d)",
+      "reason": "a provider action is rejected before an unresponsive external call can run"
     }
   }
 }

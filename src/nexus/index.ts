@@ -121,6 +121,7 @@ import {
 import { discoverWorkflows as discoverWorkflowsForDaemon } from '../workflow-runtime/discovery.js';
 import { buildDefaultWorkflowDeps as buildWorkflowDaemonDeps } from './api/workflows.js';
 import { startNexusHttpServer, type NexusHttpServer, type NexusWsBridgeInit } from './api/http-server.js';
+import { WorkerRegistryStore } from './worker-registry/store.js';
 import { createNexusScrapsRouteOptions } from './api/scraps-web-digest.js';
 import { trustedTlsEdgeFromEnv } from './api/tls-edge.js';
 import { createGeneratedAppPublisher, createGeneratedAppPublishRoute, withGeneratedAppsPrivateIngress, type GeneratedAppPublisher } from './apps/generated-app-publish.js';
@@ -1387,6 +1388,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
 
   const skipHttp = opts.skipHttpServer ?? !!opts.detachForTesting;
   let httpServer: NexusHttpServer | undefined;
+  let workerRegistryStore: WorkerRegistryStore | undefined;
   let appStorageService: AppStorage | undefined;
   let appLifecycleStore: AppLifecycleStore | undefined;
   let appSimulationStore: AppSimulationStore | undefined;
@@ -3561,7 +3563,17 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       appsRoot: joinPath(nexusRootDir(), 'apps'),
       graphOptions: { deps: { capabilityProviders } },
     }) ?? (async () => { throw new Error('board approval plugin unavailable'); });
+    // Nexus alone owns this WAL store. A failed open leaves the authenticated projection at 503;
+    // the TUI cannot silently replace the ledger with hosts.json in worker_hosts mode.
+    if (!opts.startNexusHttpServerFn) {
+      try { workerRegistryStore = new WorkerRegistryStore(joinPath(nexusRootDir(), 'worker-registry.sqlite')); }
+      catch { workerRegistryStore = undefined; }
+    }
     httpServer = startHttpServer({
+      workerRegistrySnapshot: () => {
+        if (!workerRegistryStore) throw new Error('worker registry unavailable');
+        return workerRegistryStore.snapshot();
+      },
       state,
       registry,
       eventBus,
@@ -4094,6 +4106,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     controlServer?.stop();
     msgSseResident?.stop();
     httpServer?.stop();
+    try { workerRegistryStore?.close(); } catch { /* best-effort shutdown */ }
+    workerRegistryStore = undefined;
     try { appGenerationRuntime?.jobs.close(); } catch { /* best-effort shutdown */ }
     try { appLifecycleStore?.close(); } catch { /* best-effort shutdown */ }
     generatedAppPublisher?.close(); generatedAppPublisher = undefined;

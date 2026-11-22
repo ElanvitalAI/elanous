@@ -1,4 +1,5 @@
 import { isSidetabAgent, type SidetabAgent } from '../../../tui-client/sidetab-agent-pty.js';
+import { safeElsErrorStatus } from '../../sidetab/els-error.js';
 
 export interface SidetabRouteHost {
   state(): { open: boolean; viewMode: 'current' | 'all' | 'workspaces'; rememberedOpen: boolean };
@@ -77,9 +78,15 @@ export async function runNextTuiBranchRoute(input: string, host: SidetabRouteHos
     }
     else host.setStatus(sent ? 'Input sent to selected agent' : 'Agent PTY input failed · check selection/run state');
   } else if (action === 'read') {
-    const screen = await host.readSelectedAgent();
-    if (screen === undefined) host.setStatus('No agent PTY to read');
-    else { host.addHelp(...screen.split(/\r?\n/)); host.setStatus('Selected agent PTY screen'); }
+    try {
+      const screen = await host.readSelectedAgent();
+      if (screen === undefined) host.setStatus('No agent PTY to read');
+      else { host.addHelp(...screen.split(/\r?\n/)); host.setStatus('Selected agent PTY screen'); }
+    } catch (error) {
+      // The remote owner can put arbitrary text in an HTTP error. Only fixed categories reach the TUI:
+      // paths, credentials, terminal controls and oversized bodies never become status text.
+      host.setStatus(`Selected agent PTY read failed · ${safeElsErrorStatus(error)}`);
+    }
   } else if (action === 'keys') {
     const names = parts.slice(2).filter(Boolean);
     if (names.length === 0) { host.setStatus('Keys: enter esc tab up down left right backspace ctrl-c ctrl-d'); return; }

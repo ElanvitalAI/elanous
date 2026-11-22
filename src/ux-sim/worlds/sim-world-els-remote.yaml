@@ -1,0 +1,6 @@
+schema: 1
+world: els-remote
+scenarios:
+  - { id: SSH-HOST-KEY-MISMATCH, module: src/ux-sim/sim-world/els-remote/attach-refusal.ts }
+  - { id: SSH-UNREGISTERED, module: src/ux-sim/sim-world/els-remote/attach-refusal.ts }
+  - { id: SSH-DISCONNECT, module: src/ux-sim/sim-world/els-remote/attach-refusal.ts }

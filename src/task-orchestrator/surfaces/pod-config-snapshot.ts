@@ -18,7 +18,7 @@ const POD_CONFIG_ALLOWLIST = {
   },
   roleLlm: { implement: ROLE, review: ROLE, research: ROLE, planning: ROLE, audit: ROLE, classify: ROLE },
   harness: { worktreeAddTimeoutSec: true, knowhowChildInjection: true, authorGrade: true,
-    exposeGate: true, difficultyRouter: true, failureOracle: true, windowAccounts: true, substrate: true, authorOnPod: true },
+    exposeGate: true, difficultyRouter: true, failureOracle: true, windowAccounts: true, routerMix: true, substrate: true, authorOnPod: true },
   tools: { selfImplement: { childInstanceMode: true, observeOnly: true, fabricDecompose: true,
     autoOpenPr: true } },
   loops: { orchestrator: { enabled: true, mode: true, trafficMode: true, idleRequest: true,

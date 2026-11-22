@@ -128,3 +128,19 @@ test('④ idle arrival (mid-turn deps wired) still opens the next turn — no mi
   expect(injectKeys).toEqual([wake]); // idle = 노크로 새 턴
   expect(enqueued).toEqual([]); // 이벤트함에는 안 들어감
 });
+
+test('JUD security HOLD: no sender preempts a busy turn — OP decision mail rides the same mid-turn box in FIFO order', () => {
+  const midturn: string[] = [];
+  const onArrived = seatMailOnArrived({
+    busy: () => true,
+    injectKey: () => { throw new Error('busy turn must not open a new turn'); },
+    queueWake: wake,
+    enqueueMidTurn: (event) => { midturn.push(`${event.id}:${event.text}`); return true; },
+  });
+  onArrived([
+    { msgId: 801, seat: 'TC-H-CX-13', sender: 'TC', origin: { kind: 'agent', seat: 'TC' }, intent: 'request', text: 'msg:801 · earlier' },
+    { msgId: 802, seat: 'TC-H-CX-13', sender: 'OP', origin: { kind: 'agent', seat: 'OP' }, intent: 'decision', text: 'msg:802 · go' },
+    { msgId: 803, seat: 'TC-H-CX-13', sender: 'TC', origin: { kind: 'agent', seat: 'TC' }, intent: 'request', text: 'msg:803 · later' },
+  ]);
+  expect(midturn).toEqual(['801:msg:801 · earlier', '802:msg:802 · go', '803:msg:803 · later']);
+});

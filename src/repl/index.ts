@@ -1,4 +1,9 @@
+import { execFileSync as ownerExecFileSync } from 'node:child_process';
+import { assignedVersions as ownerAssignedVersions } from '../release-loop/feature-store.js';
+import { releaseLedgerRoot as ownerLedgerRoot } from '../instance/resolve.js';
+import { openMsgStoreReadOnly as openOwnerMsgStore } from '../msg/msg-store.js';
 import { judgeStop } from '../agent/stop-door.js';
+import { sessionProviderAppliesToTurn } from './session-provider-turn.js';
 import { buildInstalledPackQueryTool, dispatchInstalledPackQuery } from '../boot/installed-pack-query.js';
 import { emitTurnLife } from '../debug/turn-life.js';
 import { safeAgentSummary, toolActivityTarget } from '../tui/chat/tool-activity.js';
@@ -34,7 +39,6 @@ import { suggestProjectForFolder } from '../project/project-store.js';
 import { runTurn } from '../session/chat.js';
 import type { MeasuredTurnUsage } from '../session/turn-usage.js';
 import { createTurnIdClaim, usageCompletionFrame } from './usage-completion.js';
-import { classifyTuiChatIntent } from '../core-turn/short-question.js';
 import { withConfiguredWebSearch } from '../core-turn/configured-web-search.js';
 import { getHarnessSpace } from '../harness/harness-space.js';
 import { decideTuiCoreTurn, logTuiCoreTurnRoute } from './tui-core-turn.js';
@@ -63,7 +67,11 @@ import { inspectActiveProvider } from '../provider-summary.js';
 import { parse as parseYaml } from 'yaml';
 import type { PendingTaskNotification } from '../agent/task-notification.js';
 import { dispatchReplMessageTool, isReplMessageTool } from './ops-msg-bridge.js';
-import { buildSeatBootSystemMessages, buildSeatMemoryIndexSystemMessages, resolveSeatMemoryContext, type SeatBootDeps } from '../seat/seat-boot-preamble.js';
+import { buildSeatBootSystemMessages, buildSeatMemoryIndexSystemMessages, detectSeatTui, resolveSeatMemoryContext, type SeatBootDeps } from '../seat/seat-boot-preamble.js';
+import { seatRole, type SeatRole } from '../seat/seat-role.js';
+import { lookupSeatOwners, type SeatOwnerReaders } from '../core-turn/seat-owner-lookup.js';
+import type { WorkReference } from '../core-turn/seat-owner-check.js';
+import { listChecklist } from '../release-loop/checklist.js';
 import type { GraphProgressObservation } from '../graph-runner/graph-progress-observation.js';
 import { installNextTuiSelfHealthTracker } from '../tui/chat/self-health-status.js';
 import { bashApprovalFinding } from '../tool-runtime/bash-approval.js';
@@ -307,6 +315,8 @@ export interface ReplOpts {
 export interface ScenarioTurn {
   id?: string;
   prompt: string;
+  /** Explicit structured references for this turn; never derived from prompt text. */
+  workReferences?: unknown;
   /** Session tier carried from the Next TUI host to its persistent REPL child. */
   modelTier?: 'budget' | 'balanced' | 'best';
   /** Next TUI process-local choice; contains no credential material. */
@@ -407,6 +417,15 @@ export function buildReplTools(options: {
   specs: LLMToolSpec[];
   dispatch: (name: string, args: Record<string, unknown>) => Promise<unknown>;
 } {
+  // The Next chat REPL is a separate, sticky process: the TUI parent's runner
+  // singleton is not inherited. Keep one registry for this child across turns.
+  if (options.nextTui) {
+    const runner = require('../shell-runner/dispatch.js') as typeof import('../shell-runner/dispatch.js');
+    if (!runner.getShellRunnerDeps()) {
+      const { getShellRegistry } = require('../shell-runner/registry.js') as typeof import('../shell-runner/registry.js');
+      runner.setShellRunnerDeps({ registry: getShellRegistry() });
+    }
+  }
   const specs: LLMToolSpec[] = [];
   /** Either signal aborts; undefined when neither exists (callers keep their «no signal» path). */
   const combineSignals = (a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined =>
@@ -534,26 +553,35 @@ export function buildReplTools(options: {
   });
   dispatchByName.set('RunShell', async (args, callSignal) => {
     const signal = combineSignals(options.getSignal?.(), callSignal);
-    const argv = Array.isArray(args.command) && args.command.every((v: unknown) => typeof v === 'string')
-      ? args.command as string[] : [];
-    if (argv.length === 0) return { error: 'RunShell requires a nonempty argv.' };
-    // The file-backed runner does not enforce sandboxing. Fail closed instead of silently ignoring it.
-    if ((args.mode === 'bg' || args.mode === 'inline') && args.sandbox !== undefined && args.sandbox !== 'off')
-      return { error: 'RunShell runner cannot enforce the requested sandbox.' };
-    const command = argv.join(' ');
-    const requiresApproval = !!bashApprovalFinding(command, getUserConfig().shell.bashApproval)
-      || args.approval === 'always' || args.approval === 'first-time';
-    return dispatchNextTuiBash({ command, enabled: true, requiresApproval, approve: shellApprover, signal,
-      dispatch: async (priorHumanApproval) => {
-        const runner = require('../shell-runner/dispatch.js') as typeof import('../shell-runner/dispatch.js');
-        if (!runner.getShellRunnerDeps()) {
-          const { createShellRegistry } = require('../shell-runner/registry.js') as typeof import('../shell-runner/registry.js');
-          const { createFileCaptureEngine } = require('../shell-runner/file-engine.js') as typeof import('../shell-runner/file-engine.js');
-          const { installShellRunnerDeps } = require('../surface/shell-runner-boot.js') as typeof import('../surface/shell-runner-boot.js');
-          installShellRunnerDeps({ registry: createShellRegistry(), fileEngine: createFileCaptureEngine(), setShellRunnerDeps: runner.setShellRunnerDeps });
+    return runShellMod.dispatchRunShellCapsule((args.script !== undefined || args.check !== undefined) ? { ...args, approval: 'none' } : args, {
+      signal, sessionId: options.sessionId, availableToolNames: specs.map(spec => spec.name),
+      // Preserve the existing per-step prompt for local reads. A receipt for an
+      // unlisted step is never execution authority: the spawn gate requires a signed grant.
+      scriptApproval: async (step, stepSignal) => {
+        const requiresApproval = runShellMod.scriptCommandPolicy(step) !== 'read-local' || args.network === 'inherit'
+          || args.approval === 'always' || args.approval === 'first-time';
+        if (!shellApprover) {
+          const cost = ['eln', 'usage', 'runs', '--since', '30m', '--by', 'role', '--json'];
+          const exactCost = step.length === cost.length && step.every((part, i) => part === cost[i]);
+          const inbox = ['eln', 'msg', 'count', '--to', 'OP', '--json'];
+          const exactInbox = step.length === inbox.length && step.every((part, i) => part === inbox[i]);
+          const exactOp = step.length === 8 && step[0] === 'eln' && step[1] === 'ops' && step[2] === 'check-30m'
+            && step[3] === '--previous-green' && /^(?:0|[1-9][0-9]{0,3})$/.test(step[4]!)
+            && step[5] === '--expect-version' && /^[0-9]+\.[0-9]+\.[0-9]+(?:-dev\.[0-9]+)?$/.test(step[6]!)
+            && step[7] === '--json';
+          return { allowed: !requiresApproval && (exactOp || exactCost || exactInbox), priorHumanApproval: false };
         }
-        return runShellMod.dispatchRunShellCapsule({ ...args, approval: 'none' }, { signal, sessionId: options.sessionId, availableToolNames: specs.map(spec => spec.name), priorHumanApproval });
-      } });
+        if (runShellMod.scriptCommandPolicy(step) !== 'read-local')
+          return { allowed: true, priorHumanApproval: false };
+        const promptRequired = args.network === 'inherit' || args.approval === 'always' || args.approval === 'first-time';
+        const gate = await dispatchNextTuiBash({ command: step.join(' '), enabled: true, requiresApproval: promptRequired,
+          approve: shellApprover, signal: stepSignal,
+          dispatch: async (priorHumanApproval) => ({ priorHumanApproval }) });
+        return 'error' in gate
+          ? { allowed: false, priorHumanApproval: false }
+          : { allowed: true, priorHumanApproval: gate.priorHumanApproval };
+      },
+    });
   });
   const appDeploy = require('../agent/app-deploy-plugin.js') as typeof import('../agent/app-deploy-plugin.js');
   const appDeploySpec = appDeploy.appDeployPluginSpec();
@@ -714,6 +742,7 @@ function buildAgentSystemPrompt(
   cfg: UserConfig,
   enabledToolNames: readonly string[],
   cwd: string,
+  role?: SeatRole,
 ): string | undefined {
   try {
     const ulMod = require('../prompt-library/universal-preamble.js') as typeof import('../prompt-library/universal-preamble.js');
@@ -724,6 +753,7 @@ function buildAgentSystemPrompt(
       cwd,
       ...(modelFamily !== undefined ? { modelFamily } : {}),
       enabledTools: [...enabledToolNames],
+      ...(role !== undefined ? { seatRole: role } : {}),
     });
     const joined = universal
       .map(m => (typeof m.content === 'string' ? m.content : ''))
@@ -757,10 +787,15 @@ export function buildReplSystemPrompt(ctx: {
   /** Installed skill summaries are injectable for deterministic prompt tests. */
   skillCatalog?: readonly InstalledSkillSummary[] | undefined;
   skillCatalogContextWindow?: number | null | undefined;
+  workReferences?: unknown;
+  ownerReaders?: SeatOwnerReaders;
 }): string | undefined {
+  // SEAT-COORDINATOR-PROMPT-PROFILE — 자리 성격은 부트 카드와 같은 자리 판정(detectSeatTui) ⊕ 자리 원장 role 로 정한다.
+  //   조율 자리(OP)면 코딩 lifecycle·트리·GPT-6 persist·앱 빌더 힌트 대신 조율자 프로필. 손 자리·비자리는 종전 그대로.
+  const role = replSeatRole(ctx.cwd, ctx.seatBootDeps);
   const base = ctx.enabledToolNames === undefined
     ? undefined
-    : buildAgentSystemPrompt(ctx.cfg, ctx.enabledToolNames, ctx.cwd);
+    : buildAgentSystemPrompt(ctx.cfg, ctx.enabledToolNames, ctx.cwd, role);
   const skillToolsEnabled = ctx.enabledToolNames?.includes('skill_exec') === true
     && ctx.enabledToolNames.includes('elanous_skills_list');
   let skillCatalogText = '';
@@ -792,9 +827,78 @@ export function buildReplSystemPrompt(ctx: {
       { cwd: ctx.cwd, ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}) }, ctx.seatBootDeps ?? {},
     ).map((message) => (typeof message.content === 'string' ? message.content : '')).join('\n\n');
   } catch { /* 색인만 빠진다 */ }
-  const appCapabilityHint = ctx.enabledToolNames === undefined ? '' : '사용자가 시스템 설계·만들기·배포를 요청하면 엘라누스의 등록 도구로 요구사항, 아키텍처 문서·구성도·설계 PDF/도식, 프론트엔드·백엔드 API·DB 스키마/시드 코드와 로컬 실행·시험을 진행하라. 실제 배포는 제공된 app.publish@1/app-publish.action@1 capability와 소유자 검증·게시 승인을 사용하라. 회원 연결이 없거나 app.publish를 쓸 수 없으면 생성 서버를 127.0.0.1의 빈 31500~31599 포트에서 백그라운드 실행하고 tailscale serve status --json으로 해당 포트의 기존 매핑이 없는지 확인한 뒤 tailscale serve --bg --tls-terminated-tcp <선택포트> tcp://127.0.0.1:<선택포트>로 그 포트만 tailnet에 공유하라(443의 루트 경로와 기존 Serve 설정 변경 금지, 공개 인터넷 노출 금지). 실제 URL의 HTTP 200과 앱 화면을 확인한 뒤 URL·프로세스·serve 설정과 되돌리기 명령을 보고하고, 제공되지 않은 실행 기능은 가정하지 마라. 단계별 실제 파일·시험 결과·영수증과 반환된 tailnet URL을 보여 주고, URL의 실제 동작 확인 전 배포 완료를 주장하지 말라. app.publish 되돌리기는 해당 배포 ID·영수증 범위로, 로컬 운영자 배포 되돌리기는 tailscale serve --tls-terminated-tcp <선택포트> off와 보고한 프로세스 종료만 수행하라(serve reset 금지). app_build 실행 확인을 사용자가 거절했거나 응답이 없으면(APP_BUILD_DECLINED) 그 턴에서는 Bash 빌드·tailscale serve/funnel·공개 리스너·배포 CLI 등 다른 경로로 빌드·배포하지 말고 사용자에게 다음 행동을 물어라.';
-  const parts = [skillCatalogText, base ?? '', appCapabilityHint, card, seatMemoryIndex].filter(part => part.length > 0);
+  const appCapabilityHint = ctx.enabledToolNames === undefined || role === 'coordinator' ? '' : '사용자가 시스템 설계·만들기·배포를 요청하면 엘라누스의 등록 도구로 요구사항, 아키텍처 문서·구성도·설계 PDF/도식, 프론트엔드·백엔드 API·DB 스키마/시드 코드와 로컬 실행·시험을 진행하라. 실제 배포는 제공된 app.publish@1/app-publish.action@1 capability와 소유자 검증·게시 승인을 사용하라. 회원 연결이 없거나 app.publish를 쓸 수 없으면 생성 서버를 127.0.0.1의 빈 31500~31599 포트에서 백그라운드 실행하고 tailscale serve status --json으로 해당 포트의 기존 매핑이 없는지 확인한 뒤 tailscale serve --bg --tls-terminated-tcp <선택포트> tcp://127.0.0.1:<선택포트>로 그 포트만 tailnet에 공유하라(443의 루트 경로와 기존 Serve 설정 변경 금지, 공개 인터넷 노출 금지). 실제 URL의 HTTP 200과 앱 화면을 확인한 뒤 URL·프로세스·serve 설정과 되돌리기 명령을 보고하고, 제공되지 않은 실행 기능은 가정하지 마라. 단계별 실제 파일·시험 결과·영수증과 반환된 tailnet URL을 보여 주고, URL의 실제 동작 확인 전 배포 완료를 주장하지 말라. app.publish 되돌리기는 해당 배포 ID·영수증 범위로, 로컬 운영자 배포 되돌리기는 tailscale serve --tls-terminated-tcp <선택포트> off와 보고한 프로세스 종료만 수행하라(serve reset 금지). app_build 실행 확인을 사용자가 거절했거나 응답이 없으면(APP_BUILD_DECLINED) 그 턴에서는 Bash 빌드·tailscale serve/funnel·공개 리스너·배포 CLI 등 다른 경로로 빌드·배포하지 말고 사용자에게 다음 행동을 물어라.';
+  // Every ordinary seat turn receives this reminder, not just the initial boot turn.
+  // No work reference or owner is inferred from the user's prose or the seat name.
+  let ownerCheck = '';
+  try {
+    const seatContext = resolveSeatMemoryContext(ctx.cwd, ctx.seatBootDeps ?? {});
+    if (seatContext) {
+      ownerCheck = '## 조사 전 주인 확인\n일반 조사·구현을 시작하기 전에 현재 일의 구조화된 칸·PR·우편 참조와 최신 주인 정본을 확인하라. 참조가 없거나 주인 조회가 실패·불완전·상충하면 추측하지 말고 unknown이라고 알리고 참조 또는 주인 확인을 요청하라. 다른 자리의 일이면 주인에게 조율하고 중복 조사를 시작하지 마라. 이 지침은 인가 판정이 아니다.';
+      ownerCheck += '\n' + buildTurnOwnerResult(seatContext.seat, ctx.workReferences, ctx.ownerReaders);
+    }
+  } catch { /* seat detection unavailable: do not invent an identity */ }
+  const parts = [skillCatalogText, base ?? '', appCapabilityHint, card, seatMemoryIndex, ownerCheck].filter(part => part.length > 0);
   return parts.length > 0 ? parts.join('\n\n') : undefined;
+}
+
+/** Turn references are explicit JSON data. A cell additionally requires its exact release version. */
+export function buildTurnOwnerResult(seat: string, input: unknown, readers?: SeatOwnerReaders): string {
+  const unknown = '[주인 조회 결과] unknown — 구조화된 참조 또는 최신 주인 확인 필요.';
+  if (!Array.isArray(input) || input.length === 0 || input.length > 32) return unknown;
+  const refs: WorkReference[] = [];
+  const versions = new Map<string, string>();
+  for (const value of input) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return unknown;
+    const r = value as Record<string, unknown>;
+    if (r.kind === 'cell' && typeof r.id === 'string' && /^[A-Za-z0-9_.-]{1,128}$/.test(r.id)
+      && typeof r.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+$/.test(r.version)) {
+      if (versions.has(r.id) && versions.get(r.id) !== r.version) return unknown;
+      versions.set(r.id, r.version); refs.push({ kind: 'cell', id: r.id });
+    } else if (r.kind === 'pr' && typeof r.repository === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(r.repository)
+      && typeof r.number === 'number' && Number.isSafeInteger(r.number) && r.number > 0) {
+      refs.push({ kind: 'pr', repository: r.repository, number: r.number });
+    } else if (r.kind === 'mail' && typeof r.id === 'string' && /^[1-9][0-9]{0,14}$/.test(r.id)) {
+      refs.push({ kind: 'mail', id: r.id });
+    } else return unknown;
+  }
+  const actualReaders: SeatOwnerReaders = readers ?? {
+    checklistVersion: id => {
+      if (versions.has(id)) return versions.get(id)!;
+      const found = ownerAssignedVersions().filter(v => /^0\.3\.\d+$/.test(v))
+        .filter(v => listChecklist(v, ownerLedgerRoot()).items.some(item => item.id === id));
+      return found.length === 1 ? found[0]! : null;
+    },
+    readChecklist: version => listChecklist(version, ownerLedgerRoot()),
+    listChecklists: () => ownerAssignedVersions().filter(v => /^0\.3\.\d+$/.test(v)).map(v => listChecklist(v, ownerLedgerRoot())),
+    readPullRequest: (repository, number) => JSON.parse(ownerExecFileSync('gh', ['pr', 'view', String(number), '--repo', repository, '--json', 'number,body'], { encoding: 'utf8', timeout: 10000 })),
+    readMail: id => { const store = openOwnerMsgStore(); try { return store.getMessage(id); } finally { store.close(); } },
+  };
+  try {
+    const result = lookupSeatOwners(seat, refs, actualReaders);
+    // Conflict is not a confirmed owner. Keep it unknown at the turn boundary.
+    const rows = result.references.map(r => ({ reference: r.reference,
+      status: r.status === 'conflict' ? 'unknown' : r.status,
+      owners: r.status === 'conflict' || r.status === 'unknown' ? [] : r.owners }));
+    const status = rows.some(r => r.status === 'unknown') ? 'unknown' : result.status;
+    return `[주인 조회 결과] ${JSON.stringify({ status, references: rows })} (참고용, 인가 아님)`;
+  } catch { return unknown; }
+}
+
+/** 이 REPL 이 앉은 자리의 성격(자리 원장 role). 자리가 아니거나 판정 실패면 undefined(종전 프롬프트). */
+function replSeatRole(cwd: string, deps: SeatBootDeps | undefined): SeatRole | undefined {
+  try {
+    const detection = detectSeatTui(cwd, {
+      ...(deps?.home !== undefined ? { home: deps.home } : {}),
+      ...(deps?.env !== undefined ? { env: deps.env } : {}),
+    });
+    const role = detection ? seatRole(detection.seat) : null;
+    if (role) debug.log('repl.seat-role', 'resolved', { seat: detection?.seat ?? null, role });
+    return role ?? undefined;
+  } catch (error) {
+    debug.log('repl.seat-role', 'failed', { error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+    return undefined;
+  }
 }
 
 /** 자리 부트 카드 문면(system 메시지 0~1개를 이어 붙인 것). 자리가 아니면 ''. */
@@ -869,7 +973,9 @@ async function runOneTurn(
   onPushNowRequest?: (requestId: string, phase: 'probe' | 'commit', activeTools: string[]) => void,
   /** MSG-SOURCE-HIERARCHY: who sent this turn's text (persisted on the user message). */
   from?: import('../session/index.js').MessageSource,
-): Promise<{ reply: string; provider: string; model: string | null; durationMs: number; logPath: string | null; measuredUsage?: MeasuredTurnUsage; goalComplete?: boolean; goalStopReason?: string }> {
+  /** SEAT-HUMAN-GOAL-PIN ④ — 부모(TUI) 소유 핀(payload) — child 교체/재기동 뒤 복구. */
+  parentPinnedGoal?: string,
+): Promise<{ reply: string; provider: string; model: string | null; durationMs: number; logPath: string | null; measuredUsage?: MeasuredTurnUsage; goalComplete?: boolean; goalStopReason?: string; goalCompletionVia?: string }> {
   const startedAt = Date.now();
   let memorySaveFailed = false;
   (require('../tui/persistent-user-memory.js') as typeof import('../tui/persistent-user-memory.js'))
@@ -883,19 +989,16 @@ async function runOneTurn(
   if (!jsonOutput) {
     process.stdout.write('  ');
   }
-  const tuiIntent = classifyTuiChatIntent(userText, { seat: process.env.COORD_ID?.trim() !== undefined });
   // CHAT-TOOLS-ENTRY-VIA-CORE-TURN (JUD-B TUI clause · OP #84368) — a Next TUI tool turn takes the core turn like
   // `chat --tools` (#38246): structured `coreTurn` flag, WebSearch added when a search provider is configured (the
   // research route needs a web tool in the pool). Goal loop · harness child · no-tools keep their existing path.
   //   Only the Next TUI child (the caller's structured `nextTui` flag): the plain `elanous repl` keeps its old path —
   //   no coreTurn, no added WebSearch, no new route record (Terra #38386 r1 mustFix).
-  //   runTurn arms the goal loop on its own seat verdict (cwd seat or COORD_ID — session/chat.ts), so judge it the same way.
-  const runTurnSeat = /(?:^|\/)seats\/([A-Za-z][A-Za-z0-9_-]{0,63})(?:\/|$)/u.exec(process.cwd())?.[1] ?? process.env.COORD_ID?.trim();
+  //   CHAT-GOAL-LOOP-DEFAULT-OFF(0.3.33) — a TUI turn (human or seat) never arms the goal loop: no config switch,
+  //   no sentence verdict. Only explicit-goal callers (chat --goal-loop · dev --implement · PWA :agent) arm it.
   const coreTurnDecision = !nextTui ? undefined : decideTuiCoreTurn({
     hasTools: (tools?.specs.length ?? 0) > 0,
     harnessChild: getHarnessSpace() !== null,
-    goalLoop: tuiIntent.goalLoop || cfg.llm.goalLoop?.enabled === true
-      || classifyTuiChatIntent(userText, { seat: runTurnSeat !== undefined }).goalLoop,
   });
   const turnTools = tools && coreTurnDecision?.coreTurn ? withConfiguredWebSearch(tools, 'tui') : tools;
   const planCalls: Array<{ outcome: string; elapsedMs: number }> = [];
@@ -952,7 +1055,7 @@ async function runOneTurn(
     : undefined;
   const stopSteerListener = steerInbox && steerTurnId
     ? steerRouter.listen(steerTurnId, (request) => {
-      if (request.kind === 'steer') steerInbox.push(request.steerId, request.text);
+      if (request.kind === 'steer') steerInbox.push(request.steerId, request.text, request.urgent === true, request.seatMail);
       else steerInbox.retract(request.steerIds);
     })
     : undefined;
@@ -961,11 +1064,12 @@ async function runOneTurn(
     result = await runTurn({
     userConfig: cfg,
     sessionId,
+    // SEAT-HUMAN-GOAL-PIN ④: 부모(TUI) 소유 핀(payload) — child 저장소보다 우선, 교체/재기동 뒤 복구.
+    ...(parentPinnedGoal !== undefined ? { parentPinnedGoal } : {}),
     userText,
     ...(surfaceRunId ? { surfaceRunId } : {}),
     utteranceSurface: 'tui',
     ...(from ? { from } : {}),
-    ...(tuiIntent.goalLoop ? { goalLoop: true } : {}),
     systemPrompt,
     userImages: userImages.length > 0 ? userImages : undefined,
     ...(process.env.ELANOUS_TEST_FAKE_LLM === '1' && Number.isFinite(Number(process.env.ELANOUS_TEST_FAKE_LLM_IDLE_TIMEOUT_MS))
@@ -1074,6 +1178,7 @@ async function runOneTurn(
     ...(result.measuredUsage ? { measuredUsage: result.measuredUsage } : {}),
     ...(result.goalComplete ? { goalComplete: true } : {}),
     ...(result.goalStopReason ? { goalStopReason: result.goalStopReason } : {}),
+    ...(result.goalCompletionVia ? { goalCompletionVia: result.goalCompletionVia } : {}),
   };
 }
 
@@ -1287,11 +1392,12 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       return result;
     },
   } : baseTools;
-  const systemPromptForTurn = () => buildReplSystemPrompt({
+  const systemPromptForTurn = (workReferences?: unknown) => buildReplSystemPrompt({
     cfg,
     enabledToolNames: tools?.specs.map(s => s.name),
     cwd: getSessionCwd(),
     sessionId: sessionIdRef.current,
+    workReferences,
   });
   const pendingAttachments: PendingAttachment[] = [];
 
@@ -1367,7 +1473,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         turn.prompt,
         turnAttachments,
         tools,
-        systemPromptForTurn(),
+        systemPromptForTurn(turn.workReferences),
         opts.jsonOutput,
         opts.nextTui === true,
         nextTuiDelivery,
@@ -1449,7 +1555,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       if (selfHealth && typeof turn.id === 'string') {
         process.stdout.write(`${JSON.stringify({ event: 'self-health', turnId: turn.id, sessionId: sessionIdRef.current, selfHealth })}\n`);
       }
-      const systemPrompt = systemPromptForTurn();
+      const systemPrompt = systemPromptForTurn(turn.workReferences);
       const turnSystemPrompt = selfHealth ? `${systemPrompt}\n\n${selfHealth.line}` : systemPrompt;
       let result: Awaited<ReturnType<typeof runOneTurn>>;
       const turnAbort = new AbortController();
@@ -1471,7 +1577,9 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         turnAbort.abort(reason);
       }) : undefined;
       try {
-        const sessionCfg = turn.sessionProvider && process.env.ELANOUS_NEXT_TUI_STREAM === '1'
+        // TUI-NEXT-PROVIDER-FLAG-IGNORED — the session choice applies on plain
+        // JSONL turns too, not only behind the stream gate.
+        const sessionCfg = sessionProviderAppliesToTurn(turn)
           ? await (async () => {
             const { configForSessionProviderTurn, parseSessionProvider } = await import('../tui-client/session-provider.js');
             return configForSessionProviderTurn(cfg, parseSessionProvider(turn.sessionProvider!.provider, turn.sessionProvider!.model));
@@ -1524,6 +1632,9 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
             }
             : undefined,
           parseMessageSource(turn.from),
+          typeof (turn as { parentPinnedGoal?: string }).parentPinnedGoal === 'string'
+            ? (turn as { parentPinnedGoal?: string }).parentPinnedGoal
+            : undefined,
         );
       } catch (error) {
         if (streamTurn) process.off('SIGTERM', onTerminate);
@@ -1568,6 +1679,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         reply: result.reply,
         ...(result.goalComplete ? { goalComplete: true } : {}),
         ...(result.goalStopReason ? { goalStopReason: result.goalStopReason } : {}),
+        ...(result.goalCompletionVia ? { goalCompletionVia: result.goalCompletionVia } : {}),
         ...(() => { const planOutcome = planWireFromState(getPlanState(), planVersionAtStart); return planOutcome ? { planOutcome } : {}; })(),
         durationMs: result.durationMs,
         logPath: result.logPath,
@@ -1581,8 +1693,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         process.stdout.write(`${JSON.stringify(usageFrame)}\n`);
       }
       console.log(JSON.stringify(out));
-    }
-    backgroundBridge?.dispose();
+    }    backgroundBridge?.dispose();
     selfHealthTracker?.dispose();
     return 0;
   }

@@ -18,7 +18,7 @@ import type { KeyEvent } from './display/types.js';
 import { Consumed, Ignored, BoxView, TextView, type EventResult, type FocusSource, type Size, type View } from './ui/view.js';
 import type { Printer } from './ui/printer.js';
 import { LinearLayout } from './ui/layout/linear.js';
-import { resolveModalDialogChromeSpec } from './ui/chrome/dialog-chrome.js';
+import { confirmPopupDialogChrome } from './ui/chrome/dialog-chrome.js';
 import { Dialog } from './ui/widgets/dialog.js';
 import { mountViewAsModalSurface } from './ui/modal-adapter.js';
 import type { ThemeTokens } from './theme/tokens.js';
@@ -125,9 +125,7 @@ class ApprovalDialog implements View {
           ],
       onSubmit: v => resolve(v),
       onCancel: () => resolve(false),
-      theme: spec.theme,
-      chrome: spec.theme ? 'static' : 'legacy',
-      chromeSpec: resolveModalDialogChromeSpec(spec.title, undefined, 'center'),
+      ...confirmPopupDialogChrome(spec.title, spec.theme),
     });
 
     this.root = dialog;

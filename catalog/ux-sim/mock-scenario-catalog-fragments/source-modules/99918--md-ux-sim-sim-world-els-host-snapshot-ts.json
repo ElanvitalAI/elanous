@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-SIM-WORLD-ELS-HOST-SNAPSHOT-TS",
+  "path": "src/ux-sim/sim-world/els/host-snapshot.ts",
+  "boundary": "The ELS world pack calls the real Nexus HTTP router and worker_hosts WAL with only the network listener replaced. A device injects expiry, principal rotation, revocation and route-context restart while no remote ELS owner is contacted",
+  "deviceIds": ["els-worker-host-snapshot-restart"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

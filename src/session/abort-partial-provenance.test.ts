@@ -23,7 +23,7 @@ test('real aborted turn persists provenance and hides partial after reload', asy
     const provider: LLMProvider = { name: 'fake', defaultModel: 'fake', available: () => true,
       async *chat() { yield 'unused'; }, async *streamChat() { yield { type: 'text', delta: 'unused' } as const; } };
     const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
-    const result = await runTurn({ userConfig: { chat: {}, llm: { provider: 'fake', model: 'fake', memoryJudge: { enabled: false, crossRecall: false }, goalLoop: { enabled: false } } } as never,
+    const result = await runTurn({ userConfig: { chat: {}, llm: { provider: 'fake', model: 'fake', memoryJudge: { enabled: false, crossRecall: false } } } as never,
       sessionId: session.id, userText: 'question', systemPrompt: 'base', skipMemoryInjection: true,
       tools: [{ name: 'Read', description: 'read', parameters: { type: 'object', properties: {} } }],
       dispatchTool: async () => 'ok', provider, signal: controller.signal });

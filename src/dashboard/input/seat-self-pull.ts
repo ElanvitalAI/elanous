@@ -42,6 +42,8 @@ export type SelfPullSource = 'checklist' | 'work-queue';
 
 export interface SelfPullCandidate {
   source: SelfPullSource;
+  /** 체크리스트에서 직접 온 경우에만 원장 판을 보존한다. */
+  checklistVersion?: string;
   /** 칸 id(체크리스트) 또는 WORK-QUEUE 항목 id. */
   id: string;
   title: string;
@@ -192,8 +194,8 @@ export function formatSelfPullMail(seat: string, item: SelfPullCandidate, reason
 
 /** 계획 층이 없을 때 H2 내부 턴에 넣는 지시 한 줄. */
 export function formatSelfPullPrompt(seat: string, item: SelfPullCandidate, reason: string): string {
-  return `[자기 집기] 계획·우편·큐가 비어 ${seat} 소유 칸에서 다음 일을 집었다: ${item.id} «${oneLine(item.title)}» (${reason}) `
-    + '— 칸 문면을 읽고 진행 · 끝나면 근거와 함께 닫고 OP 에 한 줄 · 사람이 필요하면 그 사유를 한 줄로';
+  return `[자기 집기] 계획·우편·큐가 비어 ${seat}의 후보 일을 집었다: ${item.id} «${oneLine(item.title)}» (선택 당시: ${reason}) `
+    + '— 조사 전 주인 확인 · 다른 자리 담당이면 그 자리에게 먼저 묻고, 확인되지 않으면 원장과 담당자를 확인 · 자신의 일이면 칸 문면을 읽고 진행';
 }
 
 function oneLine(text: string): string {

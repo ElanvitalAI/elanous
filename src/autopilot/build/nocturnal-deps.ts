@@ -16,7 +16,6 @@ import type { NocturnalDeps } from './nocturnal-runner.js';
 import { critiquePhaseWithLLM, renderCritique } from '../mission-critique.js';
 import { recordAutonomousActionSafe } from '../../domains/autonomy-log.js';
 import { makePrManager, type PrManager } from '../pr-manager.js';
-import { getUserConfig } from '../../user-config/reader.js';
 import { debug } from '../../debug/log.js';
 import { lookupLlmTierSpec } from '../../model-tier/index.js';
 
@@ -74,11 +73,8 @@ function runDelegate(repoRoot: string, cwd: string, prompt: string, backend: str
       // 모델 기본 = codex 사다리 balanced 칸(옛 gpt-5.6-terra 자리 · GPT-6 에는 terra 가 없다). 'elanous-self:opus' 등으로 override.
       const model = backend.includes(':') ? backend.slice(backend.indexOf(':') + 1) : lookupLlmTierSpec('openai-codex', 'balanced').model;
       const verifyCmd = `bun test ${gateScope === 'full' ? '' : gateScope}`.trim();
-      // ★ 이식 #2 배선(2026-07-22) — canonical `llm.goalLoop.enabled`(기존 플래그·chat/session 과 동일 출처)
-      //   가 켜지면 se build delegate 도 canonical goal-loop 엔진(증거게이트·goal.loop 관측·anti-spin)으로
-      //   구동. 별도 플래그 신설 금지(대표 지적 — 과설계). 서브프로세스는 config-dir 미상속이라 부모가
-      //   여기서 config 를 읽어 env(ELANOUS_SELF_*) 로 전파(기존 model/effort 패턴 동일). 미설정=커스텀 루프(무회귀).
-      const goalLoopOn = (() => { try { return getUserConfig().llm.goalLoop?.enabled === true; } catch { return false; } })();
+      // CHAT-GOAL-LOOP-DEFAULT-OFF(0.3.33) — `llm.goalLoop.enabled` 스위치 삭제로 se build delegate 는 기본 동작
+      //   (커스텀 에스컬레이션 루프 · 종전 미설정 기본값과 같다)만 탄다.
       const env: NodeJS.ProcessEnv = {
         ...process.env,
         ELANOUS_SELF_MODEL: model,
@@ -87,7 +83,6 @@ function runDelegate(repoRoot: string, cwd: string, prompt: string, backend: str
         ELANOUS_SELF_SYSTEM: 'optimized',
         ELANOUS_SELF_ADAPTIVE: '1',
         ELANOUS_SELF_VERIFY_CMD: verifyCmd,
-        ...(goalLoopOn ? { ELANOUS_SELF_GOALLOOP: '1' } : {}),
       };
       execFileSync('bun', [join(repoRoot, 'scripts/se-elanous-self-impl.ts'), prompt], { cwd, stdio, timeout: 1_800_000, env });
     } else {

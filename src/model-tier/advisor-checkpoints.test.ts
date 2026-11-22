@@ -15,7 +15,13 @@ const FAKE_LADDER: Readonly<Record<ModelTier, { model: string }>> = {
   budget: { model: 'fake-weak' }, balanced: { model: 'fake-balanced' }, better: { model: 'fake-mid' },
   best: { model: 'fake-strong' }, loaded: { model: 'fake-loaded' },
 };
-const core = createModelOrchestrationCore({ ...DEFAULT_CORE_MODULES, ladder: (p) => (p === 'fake' ? FAKE_LADDER : undefined) });
+// SMART-ROUTER-PLUGIN-TIERS — 이 스위트는 ADVISOR 런타임 자체(세 순간·상한·원장)를 본다. 등급 게이트는 무제한 stub:
+// 등급별 거부·허용은 src/plugins/smart-router/router-gate-wiring.test.ts 가 맡는다(기본 free 에서 same-error 가 막히지 않게).
+const core = createModelOrchestrationCore({
+  ...DEFAULT_CORE_MODULES,
+  gate: { name: 'test-unrestricted', review: () => ({ allowed: true, reason: null }) },
+  ladder: (p) => (p === 'fake' ? FAKE_LADDER : undefined),
+});
 const RISKY = classifyWorkRisk({ paths: ['src/self-implement/run-ledger.ts'] });
 const PLAIN = classifyWorkRisk({ paths: ['src/tui/chat/status-line.ts'] });
 const SECRET = 'PROSE-MARKER-hdr';

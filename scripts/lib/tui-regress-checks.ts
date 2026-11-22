@@ -141,10 +141,12 @@ export const TUI_REGRESS_CHECKS: TuiCheck[] = [
     judge: (s) => judgePalette(s, { directive: true, help: true }),
   },
   {
-    id: 'R5', title: 'general 팔레트 — /directive 숨김 · /help 보임 (MAT1c)',
-    role: 'general',
-    steps: PALETTE_STEPS(['directive', 'help']),
-    judge: (s) => judgePalette(s, { directive: false, help: true }),
+    id: 'R5', title: '미등록 슬래시 — 팔레트에 안 보임 · /help 보임 (MAT1c · audience owner 고정 개정)',
+    // R5 v1 관측('general 역할에 /directive 숨김')은 tui.role 폐지(MAT1b — audience owner 고정,
+    // src/maturity/tui-slash-maturity.ts)로 시험 노후. 개정: 등록되지 않은 이름은 그 어떤 역할에도
+    // 팔레트에 보여선 안 된다(MAT1b «unregistered names are never visible through this predicate»).
+    steps: PALETTE_STEPS(['zz-regress-unregistered', 'help']),
+    judge: (s) => judgePalette(s, { 'zz-regress-unregistered': false, help: true }),
   },
   {
     id: 'R6', title: '/help 가 그려지고 입력칸이 남는다 (U1b · #22802)',

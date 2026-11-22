@@ -46,21 +46,31 @@ export interface SeatControlLike {
 export function createSeatStopDriver(deps: { control: SeatControlLike; busy: () => boolean; capsulesActive?: () => boolean }) {
   let waiting = false;
   let stopping = false;
+  // CTL requestId (JUD-B #38765 ⓜ): the requestId of the stop that owns the door. It is pinned at registration and
+  // a refused request (already-requested · missing-session · a failed attempt) restores the in-flight one — a
+  // rejected duplicate never rewrites the restart metadata of the request that was actually taken on. A request
+  // that is accepted supersedes it, as it should. entry.ts reads this through liveRequestId() — nothing else writes it.
+  let liveRequestId = '';
   return {
     async request(request: SeatStopRequest, session?: string): Promise<SeatStopResult> {
       const busy = deps.busy() || Boolean(deps.capsulesActive?.());
       const before = stopping;
       if (request.mode === 'force' || !busy) stopping = true;
+      const beforeRequestId = liveRequestId;
+      liveRequestId = request.requestId;
       try {
         const result = await deps.control.request(request.mode, busy, session);
         if (result === 'waiting') waiting = true;
-        if (result === 'missing-session' || result === 'already-requested') stopping = before;
+        if (result === 'missing-session' || result === 'already-requested') { stopping = before; liveRequestId = beforeRequestId; }
         return result;
       } catch (error) {
         stopping = before;
+        liveRequestId = beforeRequestId;
         throw error;
       }
     },
+    /** The requestId of the stop that owns the door ('' before the first taken-on stop) — the migrate/checkpoint metadata reads this. */
+    liveRequestId: (): string => liveRequestId,
     /** Call at the turn end (busy → false), before anything can knock the door. */
     async turnEnded(): Promise<void> {
       if (!waiting || deps.busy() || deps.capsulesActive?.()) return;

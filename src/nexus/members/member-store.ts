@@ -420,6 +420,38 @@ export function createMemberStore(options: { readonly path?: string; readonly no
   // Existing free members gain relay access through the plan data seam, including upgraded databases.
   db.query(`UPDATE member_plan_catalog SET entitlements_json = json_set(entitlements_json, '$."relay.connect"', json('true'))
     WHERE plan = 'free' AND json_type(entitlements_json, '$."relay.connect"') IS NULL`).run();
+  // Free-tier cloud sync quotas live in this catalog row, never in application code.
+  // 'secrets' stays explicit opt-in only: no free default row ever carries it (OP #130717 ①).
+  // All-or-nothing one-shot fill inside a single transaction: INSERT OR IGNORE picks exactly
+  // one winner among concurrent openers — the loser's ignored marker never re-fills and
+  // can never crash into the primary key — and only the winner fills. The winner fills only
+  // a free row carrying NO backup.* key at all: any present backup key is explicit operator
+  // state (a provisionPlan sync removal, individually tuned limits, or a partially migrated
+  // row), so the row is left byte-identical and keeps failing closed (quota-unavailable) at
+  // read time. A database that already ran the v1 fill ('free-backup-defaults-v1') is DONE
+  // migrating forever: its marker says the defaults were offered once, so every later edit —
+  // including a full backup.* removal that empties the row again — is explicit operator
+  // state. v2 never inserts its marker over a v1 marker and never re-offers defaults there.
+  db.exec('CREATE TABLE IF NOT EXISTS member_store_migration (id TEXT PRIMARY KEY)');
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const marker = db.query(`INSERT OR IGNORE INTO member_store_migration (id)
+        SELECT 'free-backup-defaults-v2'
+        WHERE NOT EXISTS (SELECT 1 FROM member_store_migration WHERE id = 'free-backup-defaults-v1')`).run();
+    if (Number(marker.changes) > 0) {
+      db.query(`UPDATE member_plan_catalog SET entitlements_json = json_set(entitlements_json,
+          '$.\"backup.sync\"', json('true'),
+          '$.\"backup.maxSyncBytes\"', json('268435456'),
+          '$.\"backup.maxGenerations\"', json('64'),
+          '$.\"backup.dataKinds\"', json('[\"sessions\",\"memory\",\"settings\"]'))
+        WHERE plan = 'free'
+          AND json_type(entitlements_json, '$.\"backup.sync\"') IS NULL
+          AND json_type(entitlements_json, '$.\"backup.maxSyncBytes\"') IS NULL
+          AND json_type(entitlements_json, '$.\"backup.maxGenerations\"') IS NULL
+          AND json_type(entitlements_json, '$.\"backup.dataKinds\"') IS NULL`).run();
+    }
+    db.exec('COMMIT');
+  } catch (error) { db.exec('ROLLBACK'); throw error; }
   db.query(`INSERT OR IGNORE INTO member_plan_assignments (member_id, plan)
     SELECT id, 'free' FROM members`).run();
   db.exec('BEGIN IMMEDIATE');

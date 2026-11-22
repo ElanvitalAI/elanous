@@ -6,6 +6,7 @@
 import { parseAddress } from '../../els/address.js';
 import { STATUS } from '../../els/status-vocab.js';
 import type { SidetabAgentState, SidetabRow } from '../../sidetab-core/model.js';
+import { safeElsErrorStatus } from './els-error.js';
 
 interface ListedPane { stalled?: unknown; address?: unknown; workspace?: unknown; pane?: unknown; title?: unknown; state?: unknown; host?: unknown; reach?: unknown }
 interface ListedHost { name?: unknown; reach?: unknown; reason?: unknown }
@@ -32,6 +33,7 @@ const named = (value: unknown, key: string): Map<string, string> => new Map((Arr
  * (A host that does not answer has no panes here: it is the one ✕ row below.)
  */
 function summaryState(panes: readonly TreePane[]): string {
+  if (panes.length === 0) return 'idle';
   const states = panes.map((pane) => pane.state);
   if (states.includes('failed') || states.includes('blocked')) return 'blocked';
   if (panes.some((pane) => pane.stalled)) return 'stalled';
@@ -73,6 +75,14 @@ export function elsRowsFromList(listJson: string, localHost: string): SidetabRow
     // A child tab's title already carries its ↳ indent and status mark; the row shows it as the els server wrote it.
     tab.panes.push({ address, title: text(raw.title) || text(raw.pane), state: text(raw.state), stalled: raw.stalled === true });
   }
+  // A registered host can be reachable before its first pane exists. Keep its row visible so the person can
+  // distinguish an empty remote els from a host that never answered.
+  for (const raw of Array.isArray(listed.hosts) ? listed.hosts as (ListedHost | null)[] : []) {
+    if (!raw || typeof raw !== 'object' || raw.reach !== 'up') continue;
+    const name = text(raw.name);
+    if (name === localHost || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(name) || tree.has(name)) continue;
+    tree.set(name, { remote: true, workspaces: new Map() });
+  }
   const rows: SidetabRow[] = [];
   const header = (id: string, label: string, depth: number, panes: readonly TreePane[], remoteHost: string | undefined): void => {
     rows.push({ id, kind: 'els', label: `${'  '.repeat(depth)}${label}`, nestDepth: depth, ...stateFields(summaryState(panes)),
@@ -82,7 +92,8 @@ export function elsRowsFromList(listJson: string, localHost: string): SidetabRow
     const remoteHost = hostNode.remote ? host : undefined;
     const base = hostNode.remote ? 1 : 0;
     const panesOf = (workspace: TreeWorkspace) => [...workspace.tabs.values()].flatMap((tab) => tab.panes);
-    if (hostNode.remote) header(`els-host:${host}`, `⇄${host}`, 0, [...hostNode.workspaces.values()].flatMap(panesOf), remoteHost);
+    if (hostNode.remote) header(`els-host:${host}`, `⇄${host}${hostNode.workspaces.size === 0 ? ' · 비어 있음' : ''}`, 0,
+      [...hostNode.workspaces.values()].flatMap(panesOf), remoteHost);
     for (const [ws, workspace] of hostNode.workspaces) {
       header(`els-ws:${host}:${ws}`, workspace.name, base, panesOf(workspace), remoteHost);
       for (const [tabId, tab] of workspace.tabs) {
@@ -101,7 +112,7 @@ export function elsRowsFromList(listJson: string, localHost: string): SidetabRow
     // This host being down means no local server: the panel's normal «els off», not a broken remote.
     if (!name || name === localHost) continue;
     rows.push({ id: `els-host:${name}`, kind: 'els', label: `${STATUS.failed.mark} ⇄${name} · 연결 끊김`, badge: 'stale', remoteHost: name, host: name,
-      status: text(raw.reason) });
+      status: safeElsErrorStatus(raw.reason) });
   }
   return rows;
 }

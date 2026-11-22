@@ -1,4 +1,5 @@
 import { textOnly } from '../llm/stream-text.js';
+import { streamChatLedgered } from '../llm/ledgered-call.js';
 // ── 종합 아침 브리핑 · 에센셜(텔레그램) 조립 (2026-07-10) ─────────────────────
 //
 // 대표 지시: 텔레그램엔 "섹터별 간략 에센셜 + 커뮤니티 버즈 정리 + 반도체 밸류체인/미국장
@@ -145,7 +146,7 @@ export async function synthesizeEssentialBrief(detailMarkdown: string, opts: Ess
       { role: 'user', content: digest },
     ];
     let text = '';
-    for await (const d of textOnly(provider.streamChat(messages, { temperature: 0.3, maxTokens: 640 }))) text += d;
+    for await (const d of textOnly(streamChatLedgered(provider, messages, { temperature: 0.3, maxTokens: 640 }, { site: 'domain-morning-essential', jobKind: 'domain-report' }))) text += d;
     return text.trim();
   } catch { return ''; }
 }

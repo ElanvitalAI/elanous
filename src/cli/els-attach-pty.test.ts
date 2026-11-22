@@ -122,7 +122,7 @@ test('real terminal: inside the els app on pane A, `els attach <B>` shows B and 
   // The person's terminal registers the OP seat first (the explicit owner act, with the server's owner-token file; this process's env is put back
   // after) and then opens the panes, so both are OP-parented panes like the ones the app makes for the person.
   process.env.ELANOUS_ELS_OWNER_TOKEN = readFileSync(join(root, 'els', 'owner-token'), 'utf8').trim();
-  expect(await requestEls(socket, { op: 'seat-set', seat: 'OP' })).toEqual({ exitCode: 0, message: 'els seat: OP registered' });
+  expect(await requestEls(socket, { op: 'seat-set', seat: 'OP' })).toMatchObject({ exitCode: 0, message: 'els seat: OP registered', transport: { outcome: 'answered' } });
   const makePane = async (): Promise<string> => {
     const created = await requestEls(socket, { op: 'new', ws: 'OP', cwd: root, command: ['/bin/sh'] });
     const { pane } = JSON.parse(created.message) as { pane: string };
@@ -143,7 +143,7 @@ test('real terminal: inside the els app on pane A, `els attach <B>` shows B and 
     ready: { label: 'app-on-pane-A', timeoutMs: 30_000, until: (screen) => screen.includes('new · menu') && line(screen, '│') && screen.includes('$') }, // 출처: #37153 live PTY readiness bound
     steps: [
       { label: 'A-marker', text: 'echo A_SCREEN_$((7*6))_MARK', until: (screen) => line(screen, '│A_SCREEN_42_MARK'), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
-      { label: 'real-cli-attach-B', text: attachCommand, until: (screen) => screen.includes(`${paneB} · ctrl+b q 분리`), timeoutMs: 30_000 }, // 출처: #37153 live PTY readiness bound (a real CLI start inside a pane)
+      { label: 'real-cli-attach-B', text: attachCommand, until: (screen) => screen.split('\n').some((row) => row.includes(paneB) && row.includes('ctrl+b q 분리')), timeoutMs: 30_000 }, // 출처: #37153 live PTY readiness bound (a real CLI start inside a pane)
       { label: 'typed-into-B', text: 'echo B_NEST_$((20+22))_OK', until: (screen) => line(screen, 'B_NEST_42_OK') && !line(screen, '│A_SCREEN_42_MARK'), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «attach» — 150 frame polls
       { label: 'detach-through-app', keys: '\u0002\u0002q', until: (screen) => line(screen, '│A_SCREEN_42_MARK') && !screen.includes('ctrl+b q 분리') && !line(screen, 'B_NEST_42_OK'), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «attach» — 150 frame polls
       { label: 'app-still-answers', text: 'echo AFTER_$((8*8))_OK', until: (screen) => line(screen, '│AFTER_64_OK') && line(screen, '│A_SCREEN_42_MARK'), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls

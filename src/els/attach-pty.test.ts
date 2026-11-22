@@ -5,9 +5,11 @@ import { join } from 'node:path';
 import { attachEls, type AttachFrame } from './attach-client.js';
 import { requestEls } from './client.js';
 import { elsSocketPath, startElsServer } from './server.js';
+import { guardElsProcesses, reapElsProcesses } from './test-support/els-process-guard.js';
 
+guardElsProcesses();
 const cleanups: (() => Promise<void> | void)[] = [];
-afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
+afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); await reapElsProcesses(); });
 const until = async (check: () => boolean, ms = 15_000): Promise<void> => {
   const stop = Date.now() + ms;
   while (!check()) { if (Date.now() > stop) throw new Error('timed out waiting'); await new Promise((resolve) => setTimeout(resolve, 20)); }

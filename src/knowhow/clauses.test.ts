@@ -135,10 +135,11 @@ describe('원장 강인성 — 판독 ENOENT · 원자 쓰기 · 직렬화 (OP #
 
 // ── 잠금 = mkdir 원자 디렉터리 + owner.json — OP #118502(6라운드 · 자동 회수 전폐 · 2026-11-21) ──
 // 획득 = 잠금 디렉터리 mkdir(원자 · 이미 있으면 EEXIST = 남이 잠금 중) → 그 안에 owner.json(pid·시각)
-// 기록. 해제 = owner.json 의 pid 가 자기 pid 인지 확인한 뒤에만 rmdir. 남의 잠금(죽은 pid·빈 클레임
-// 포함)은 절대 회수하지 않는다 — rename·덮어쓰기 0(JUD HOLD #118510: 회수 판정과 rename 사이 교체
-// 경합 제거)으로 활성 쓰기 상호배제가 구조적으로 보장된다. 남은 잠금은 대기 상한 뒤 «잠금 남음
-// (pid·시각) — 수동 회수 필요» 오류로 멈춘다. 비정상 종료 뒤 회수는 수동 — FU-39383-LOCK-CRASH-RECOVERY.
+// 기록. 해제 = owner.json 의 pid 가 자기 pid 인지 확인한 뒤에만 rmdir. 남의 잠금 중 **죽은 소유자**
+// (ESRCH 확정 + 나이 하한 경과)의 잔존 잠금은 **기본 동작으로** 자동 회수한다(OP #131901 — 옵션·
+// 깃발 없음). 산 소유자·빈 클레임은 절대 회수하지 않는다 — rename·덮어쓰기 0(JUD HOLD #118510:
+// 회수 판정과 rename 사이 교체 경합 제거)으로 활성 쓰기 상호배제가 구조적으로 보장된다. 회수
+// 불가 잔존 잠금은 대기 상한 뒤 «잠금 남음(pid·시각) — 수동 회수 필요» 오류로 멈춘다.
 
 const deadPidOf = (): number => {
   const pid = spawnSync('true').pid;
@@ -168,14 +169,14 @@ for (let i = 0; i < 50; i += 1) {
 console.log(JSON.stringify({ tag, done: true }));
 `;
 
-describe('잠금 = mkdir 원자 디렉터리 + owner.json — 자동 회수 전폐 · 남은 잠금 = 명확한 오류 (OP #118502 · 6라운드)', () => {
-  test('① 남은 잠금(죽은 소유자) — 회수·묘비 0 · 잠금 바이트 보존 · 원장 무변경 · 수동 회수 오류', () => {
+describe('잠금 = mkdir 원자 디렉터리 + owner.json — 죽은 소유자 잔존은 기본 자동 회수 · 그 외 남은 잠금 = 명확한 오류 (OP #118502 · OP #131901)', () => {
+  test('① 남은 잠금(죽은 소유자 · 나이 하한 이내) — 회수 유예 · 잠금 바이트 보존 · 원장 무변경 · 수동 회수 오류', () => {
     const dir = stateDir();
     const prevTimeout = process.env.KNOWHOW_CLAUSES_LOCK_TIMEOUT_MS;
     try {
       const path = clausesPath(dir);
       appendClause(dir, INPUT, NOW); // 원장 시딩 1조항
-      const lockDir = lockSeed(path, deadPidOf(), { ageMs: 31_000 }); // 죽은 소유자 · 31s 노후(구 나이 상한 30s 초과)
+      const lockDir = lockSeed(path, deadPidOf(), { ageMs: 20_000 }); // 죽은 소유자 · 20s 노후 — 회수 나이 하한(30s) 이내라 기본 회수도 유예(출처: FU-39383 조사 원문 §4 하한 시나리오)
       const ownerBefore = readFileSync(join(lockDir, 'owner.json'), 'utf8');
       // 대기 상한 단축(400ms · 출처: 본 시험 전용 — 제품 기본 LOCK_TIMEOUT_MS_DEFAULT 10s 그대로)
       process.env.KNOWHOW_CLAUSES_LOCK_TIMEOUT_MS = '400';
@@ -264,5 +265,43 @@ describe('잠금 = mkdir 원자 디렉터리 + owner.json — 자동 회수 전�
       expect(existsSync(`${path}.lockdir`), '④ 두 러너의 해제(rmdir) 뒤 남은 잠금').toBe(false);
       expect(readdirSync(dirname(path)).some((name) => name.includes('.tomb-'))).toBe(false); // 회수 잔해 0
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  // FU-39383-LOCK-CRASH-RECOVERY — 소유 프로세스 kill -9 로 잔존한 잠금의 회복 결함: 이후 appendClause
+  // 전부 대기 상한 뒤 clausesLockHeldError 로 실패(회복 경로 0 · 수동 rm 필요). 시험 ⑤ = 자동 회수
+  // **기본 동작**(OP #131901 — 스위치 없음)의 계약 — 죽은 소유자(kill(pid,0) ESRCH 확정) + 나이 하한
+  // (30s) 경과 잔존 잠금만 회수되어 append 가 성공하고, 산 소유자는 절대 회수 금지.
+  test('⑤ 죽은 소유자 잔존 잠금 자동 회수(기본 동작) — append 성공 · 산 소유자는 회수 금지', () => {
+    const dir = stateDir();
+    const prevTimeout = process.env.KNOWHOW_CLAUSES_LOCK_TIMEOUT_MS;
+    try {
+      const path = clausesPath(dir);
+      appendClause(dir, INPUT, NOW); // 원장 시딩 1조항
+      // 죽은 소유자(spawnSync true 자식 — 종료 확정) · 31s 노후 — 회수 나이 하한 30s 초과(출처: FU-39383-LOCK-CRASH-RECOVERY 조사 원문 §4 RED 시나리오)
+      const deadLockDir = lockSeed(path, deadPidOf(), { ageMs: 31_000 });
+      // 대기 상한 단축 50ms(출처: FU-39383-LOCK-CRASH-RECOVERY 조사 원문 §4 RED 시나리오 — 시험 전용 · 제품 기본 LOCK_TIMEOUT_MS_DEFAULT 10s 그대로)
+      process.env.KNOWHOW_CLAUSES_LOCK_TIMEOUT_MS = '50';
+      // ① 죽은 소유자 잔존 잠금은 기본 동작으로 회수되어 쓰기가 성공한다 — 회수 없이는 50ms 대기 뒤 clausesLockHeldError throw → 빨강(RED)
+      const appended = appendClause(dir, { ...INPUT, lessonId: 'l-autoreclaim-dead' }, NOW);
+      expect(appended.duplicate).toBe(false);
+      // ③ 회수 확인 — 잔존 잠금 디렉터리 제거(재취득·해제 포함 최종 부재)
+      expect(existsSync(deadLockDir), '⑤ 죽은 소유자 잔존 잠금 회수').toBe(false);
+      // ② 원장 반영 — 시드 1 + 회수 뒤 추가 1
+      expect(clauseCount(dir)).toBe(2);
+      const lessonIds = (JSON.parse(readFileSync(path, 'utf8')) as { clauses: Array<{ lessonId: string }> }).clauses.map((c) => c.lessonId);
+      expect(lessonIds).toContain('l-autoreclaim-dead');
+      // ④ 배타 — 산 소유자(process.pid) 잔존 잠금은 절대 회수 금지·오류 유지(기존 시험 ③과 같은 계약)
+      const liveLockDir = lockSeed(path, process.pid, { ageMs: 31_000 }); // 산 소유자 · 31s 노후 — 나이 하한과 무관하게 산 것은 회수 금지
+      const liveOwnerBefore = readFileSync(join(liveLockDir, 'owner.json'), 'utf8');
+      expect(() => appendClause(dir, { ...INPUT, lessonId: 'l-live-held-autoreclaim' }, NOW)).toThrow('잠금 남음');
+      expect(existsSync(liveLockDir), '⑤ 산 소유자 잠금은 회수 금지').toBe(true);
+      expect(readFileSync(join(liveLockDir, 'owner.json'), 'utf8')).toBe(liveOwnerBefore); // 바이트 보존 — 회수 판정 흔적 0
+      expect(readdirSync(dirname(path)).some((name) => name.includes('.tomb-'))).toBe(false); // 묘비 0
+      expect(clauseCount(dir)).toBe(2); // 원장 무변경
+    } finally {
+      if (prevTimeout === undefined) delete process.env.KNOWHOW_CLAUSES_LOCK_TIMEOUT_MS;
+      else process.env.KNOWHOW_CLAUSES_LOCK_TIMEOUT_MS = prevTimeout;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

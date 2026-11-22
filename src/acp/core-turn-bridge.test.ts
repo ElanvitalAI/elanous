@@ -29,7 +29,7 @@ function fixture(text = question, overrides: { max?: number; configMax?: number;
   const log = spyOn(debug, 'log');
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
-    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: false } },
+    ...base, llm: { ...base.llm, model: 'gpt-4o-mini' },
     chat: { ...base.chat, factQuestion: { maxToolTurns: overrides.configMax ?? 6 } },
   });
   spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
@@ -158,7 +158,7 @@ test('real core turn caps repeated search requests and synthesizes from returned
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
     ...base,
-    llm: { ...base.llm, provider: 'openai', model: 'gpt-5.6', goalLoop: { enabled: false } },
+    llm: { ...base.llm, provider: 'openai', model: 'gpt-5.6' },
     chat: { ...base.chat, factQuestion: { maxToolTurns: 6 }, autoCompact: { ...base.chat.autoCompact, enabled: false } },
     tools: { ...base.tools, deferred: { ...base.tools.deferred, mode: 'off' } },
   });
@@ -281,9 +281,13 @@ test.each(['src/acp/server.ts 의 승인 정책 고쳐줘', '현재 파일을 �
 
 test('a fact-shaped status question on an armed goal loop gets no fact budget, no search instruction and logs the skip', async () => {
   // 10-14 운영 TUI OP: «지금 … 상황은?» 이 goal loop ⊕ 사실 질문 예산 6 을 동시에 받아 소진 뒤 헛호출 7회.
+  // CHAT-GOAL-LOOP-DEFAULT-OFF — the bridge goal loop is armed only for the harness executor (explicit goal).
+  const savedRole = process.env.ELANOUS_HARNESS_ROLE;
+  process.env.ELANOUS_HARNESS_ROLE = 'executor';
+  try {
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
-    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: true } },
+    ...base, llm: { ...base.llm, model: 'gpt-4o-mini' },
     chat: { ...base.chat, factQuestion: { maxToolTurns: 2 } },
   });
   const coreCalls: CoreTurnContext[] = [];
@@ -314,12 +318,15 @@ test('a fact-shaped status question on an armed goal loop gets no fact budget, n
   }
   expect(log).toHaveBeenCalledWith('chat.turn', 'fact-budget-skipped', { reason: 'goal-loop-armed', route: '코딩·구현' });
   expect(log).toHaveBeenCalledWith('chat.turn', 'tool-budget', expect.objectContaining({ factQuestion: false, maxToolTurns: null }));
+  } finally {
+    if (savedRole === undefined) delete process.env.ELANOUS_HARNESS_ROLE; else process.env.ELANOUS_HARNESS_ROLE = savedRole;
+  }
 });
 
 test('TUI route selects one core turn, matching tools and visible/logged decision; daemon remains unfiltered', async () => {
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
-    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: true } },
+    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: true } as never },
   });
   const coreCalls: CoreTurnContext[] = [];
   spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
@@ -377,18 +384,19 @@ test('TUI route selects one core turn, matching tools and visible/logged decisio
   } as unknown as AcpTurnContext);
   expect(coreCalls.length).toBeGreaterThan(4);
   // The daemon does not use the TUI route allowlist (which excludes Edit for this read route);
-  // ordinary core-turn filtering may still defer research tools, and the goal loop adds update_goal.
+  // ordinary core-turn filtering may still defer research tools. CHAT-GOAL-LOOP-DEFAULT-OFF: the legacy daemon default
+  // is a single core turn even with an old `llm.goalLoop.enabled` config — no goal loop, so no update_goal.
   const daemonTools = coreCalls.at(-1)?.tools.map((tool) => tool.name) ?? [];
   expect(daemonTools).toContain('Edit');
-  expect(daemonTools).toContain('update_goal');
+  expect(daemonTools).not.toContain('update_goal');
   expect(daemonPushes.some((delta) => delta.startsWith('라우팅:'))).toBe(false);
 });
 
-test('TUI read question runs one full-tool turn outside the goal loop; a write request keeps it (10-14 report: UpdateGoal on reads)', async () => {
+test('TUI read question runs one full-tool turn outside the goal loop; a write request is one full-tool turn too (CHAT-GOAL-LOOP-DEFAULT-OFF)', async () => {
   const routeLog = spyOn(debug, 'log');
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
-    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: true } },
+    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: true } as never },
   });
   const coreCalls: CoreTurnContext[] = [];
   spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
@@ -423,11 +431,11 @@ test('TUI read question runs one full-tool turn outside the goal loop; a write r
     route: '읽기·분석', reason: expect.any(String), goalLoop: false, seat: null, seatKnown: false,
   });
   const write = await run('지시 문서에 절 추가');
-  expect(write.tools).toEqual([...specs.map((spec) => spec.name), 'update_goal']);
+  expect(write.tools).toEqual(['Edit', 'Write', 'Bash', 'Agent', 'Read', 'decisions_pending']);
   expect(write.pushes.some((delta) => delta.startsWith('라우팅:'))).toBe(false);
 });
 
-test('TUI-H1-SEAT-GOALLOOP: a seat TUI sends an operational directive to the goal loop; a human TUI keeps the single read turn', async () => {
+test('CHAT-GOAL-LOOP-DEFAULT-OFF: a seat TUI operational directive is the same single read turn as a human TUI', async () => {
   const coreCalls: CoreTurnContext[] = [];
   spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
     coreCalls.push(ctx);
@@ -436,9 +444,10 @@ test('TUI-H1-SEAT-GOALLOOP: a seat TUI sends an operational directive to the goa
   const log = spyOn(debug, 'log');
   const specs = ['Edit', 'Read', 'RunShell'].map((name) => ({ name, description: '', parameters: { type: 'object' as const } }));
   const text = 'OP 13:14: 계속 — draft 다음 행.';
-  const run = async (seat: string | null, goalLoop: boolean) => {
+  const run = async (seat: string | null) => {
     const base = config.getUserConfig();
-    spyOn(config, 'getUserConfig').mockReturnValue({ ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: goalLoop } } });
+    // An old config still carrying the deleted switch — ignored.
+    spyOn(config, 'getUserConfig').mockReturnValue({ ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: true } as never } });
     const pushes: string[] = [];
     await bridgeCoreTurnToAcp({
       tuiRouting: true, resolveSeat: () => seat,
@@ -467,18 +476,18 @@ test('TUI-H1-SEAT-GOALLOOP: a seat TUI sends an operational directive to the goa
   } as unknown as AcpTurnContext);
   expect(log).toHaveBeenCalledWith('core-turn.route', 'decided', expect.objectContaining({ reason: 'short-question', goalLoop: false, seat: 'OPT' }));
   expect(log.mock.calls.some(([c, e]) => c === 'core-turn.route' && e === 'seat-ops-single-turn')).toBe(false);
-  const seatTurn = await run('OPT', true);
-  expect(seatTurn.tools).toEqual([...specs.map((spec) => spec.name), 'update_goal']);
+  const seatTurn = await run('OPT');
+  expect(seatTurn.tools).toEqual(['Edit', 'Read', 'RunShell']);
   expect(seatTurn.pushes.some((delta) => delta.startsWith('라우팅:'))).toBe(false);
-  expect(log).toHaveBeenCalledWith('core-turn.route', 'decided', { route: '읽기·분석', reason: 'seat-read', goalLoop: true, seat: 'OPT', seatKnown: true });
-  const human = await run(null, true);
+  expect(log).toHaveBeenCalledWith('core-turn.route', 'decided', { route: '읽기·분석', reason: 'read', goalLoop: false, seat: 'OPT', seatKnown: true });
+  const human = await run(null);
   expect(human.tools).toEqual(specs.map((spec) => spec.name));
   expect(human.pushes).toEqual([]);
   expect(log).toHaveBeenCalledWith('core-turn.route', 'decided', { route: '읽기·분석', reason: 'read', goalLoop: false, seat: null, seatKnown: true });
   expect(log.mock.calls.some(([c, e]) => c === 'core-turn.route' && e === 'seat-ops-single-turn')).toBe(false);
-  // 인지: a seat operational directive that still runs as a single turn (goal loop off) is warned, not silent.
-  await run('OPT', false);
-  expect(log).toHaveBeenCalledWith('core-turn.route', 'seat-ops-single-turn', expect.objectContaining({ seat: 'OPT', goalLoopEnabled: false }), { level: 'warn' });
+  // The single seat turn is now the contract, so the old «seat-ops-single-turn» warning is gone.
+  await run('OPT');
+  expect(log.mock.calls.some(([c, e]) => c === 'core-turn.route' && e === 'seat-ops-single-turn')).toBe(false);
   // A failed seat lookup is «unknown», not «not a seat» (review r2): routed as a human TUI, logged seatKnown:false.
   const failing = bridgeCoreTurnToAcp({
     tuiRouting: true, resolveSeat: () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); },
@@ -571,7 +580,7 @@ test('Agent is allowed on the investigation quick route only', () => {
 test('TUI-SPEECH-STYLE-DAEMON: 자동 수복 1회 — aborted(수렴 실패)를 좁혀 정확히 1회만 재시도하고 완료 경계를 보존한다', async () => {
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
-    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: false } },
+    ...base, llm: { ...base.llm, model: 'gpt-4o-mini' },
   });
   const log = spyOn(debug, 'log');
   const attempts: CoreTurnContext[] = [];
@@ -609,7 +618,7 @@ test('TUI-SPEECH-STYLE-DAEMON: 자동 수복 1회 — aborted(수렴 실패)를 
   mock.restore();
   const abortBase = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
-    ...abortBase, llm: { ...abortBase.llm, model: 'gpt-4o-mini', goalLoop: { enabled: false } },
+    ...abortBase, llm: { ...abortBase.llm, model: 'gpt-4o-mini' },
   });
   const cancelledAttempts: CoreTurnContext[] = [];
   spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {

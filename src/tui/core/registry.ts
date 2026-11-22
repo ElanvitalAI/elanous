@@ -295,6 +295,23 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     requiredFlags: [],
     helpSummary: 'Check signals',
   },
+  {
+    // TUI-REGRESS-R4 (MAT1c) — /directive is a live command in the slash catalog
+    // (src/chat/index.ts SLASH_COMMANDS · «(운영) 지시를 Linear 이슈로 기록») and the chat
+    // surface shows it to the owner (src/chat/pickers/state.ts owner unhide). The Next TUI
+    // route table never carried it after the registry migration (#35409), so the palette
+    // lost the command. Registry-only route: entry.ts keeps no dedicated dispatch for it,
+    // so Enter falls through to the person's turn and the model receives "/directive <text>".
+    id: 'directive',
+    action: 'command',
+    slash: ['/directive'],
+    slashPrefixes: ['/directive'],
+    phrases: [],
+    roles: ['human'],
+    minimumMaturity: 'stable',
+    requiredFlags: [],
+    helpSummary: '(운영) 지시를 Linear 이슈로 기록',
+  },
 ];
 
 const NEXT_TUI_EXACT_SLASH_ROUTES = new Map<string, NextTuiRoute[]>();

@@ -19,6 +19,11 @@ nodes:
     kind: agent
     recipe: cmd:steward-rejudge
     max_visits: 1
+  # TA-SWEEP-PERIODIC — recycle 15-min-no-progress TA launches on a cadence (off unless taskAgent.sweepEveryMinutes > 0).
+  - node_id: ta-sweep
+    kind: agent
+    recipe: cmd:steward-ta-sweep
+    max_visits: 1
   - node_id: sync
     kind: agent
     recipe: cmd:steward-sync
@@ -46,6 +51,9 @@ edges:
     on: outcome
     map: { ok: rejudge, fail: rejudge }
   - from: rejudge
+    on: outcome
+    map: { ok: ta-sweep, fail: ta-sweep }
+  - from: ta-sweep
     on: outcome
     map: { ok: sync, fail: sync }
   - from: sync

@@ -15,7 +15,7 @@ async function runWith(drive: (ctx: CoreTurnContext) => void): Promise<Array<Rec
   const usages: Array<Record<string, unknown>> = [];
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
-    ...base, llm: { ...base.llm, provider: 'openai-codex', model: 'gpt-cfg', goalLoop: { enabled: false } },
+    ...base, llm: { ...base.llm, provider: 'openai-codex', model: 'gpt-cfg' },
   });
   spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
     drive(ctx);

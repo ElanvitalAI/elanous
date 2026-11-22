@@ -3,19 +3,19 @@
 // caller's own state, never a sentence classifier (R-SIG): `isResearchAgentIntent` no longer decides a Next TUI turn.
 import { debug } from '../debug/log.js';
 
-export type TuiCoreTurnSkipReason = 'no-tools' | 'harness-child' | 'goal-loop';
+export type TuiCoreTurnSkipReason = 'no-tools' | 'harness-child';
 
 export type TuiCoreTurnDecision = { coreTurn: true } | { coreTurn: false; reason: TuiCoreTurnSkipReason };
 
 /**
  * Whether a Next TUI (repl child) turn runs through the core turn. Exclusions match #38246 (agent-cli.ts
- * `routeThroughCoreTurn`): a turn without tools, a harness child (`ELANOUS_HARNESS_SPACE`), and a goal-loop turn keep
- * their existing path. `ask` and allowlisted surfaces never reach the repl child.
+ * `routeThroughCoreTurn`): a turn without tools and a harness child (`ELANOUS_HARNESS_SPACE`) keep their existing path.
+ * A Next TUI turn never arms the goal loop (CHAT-GOAL-LOOP-DEFAULT-OFF), so there is no goal-loop exclusion here.
+ * `ask` and allowlisted surfaces never reach the repl child.
  */
-export function decideTuiCoreTurn(input: { hasTools: boolean; harnessChild: boolean; goalLoop: boolean }): TuiCoreTurnDecision {
+export function decideTuiCoreTurn(input: { hasTools: boolean; harnessChild: boolean }): TuiCoreTurnDecision {
   if (!input.hasTools) return { coreTurn: false, reason: 'no-tools' };
   if (input.harnessChild) return { coreTurn: false, reason: 'harness-child' };
-  if (input.goalLoop) return { coreTurn: false, reason: 'goal-loop' };
   return { coreTurn: true };
 }
 

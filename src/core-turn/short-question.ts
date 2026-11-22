@@ -82,7 +82,8 @@ export interface TuiChatVerdict {
   goalLoop: boolean;
 }
 
-/** 자리(무인) TUI 인가 — 호출부가 `detectSeatTui` 로 정한다. 없으면 사람 대화 TUI(종전 판정 그대로). */
+/** 자리(무인) TUI 인가 — 호출부가 `detectSeatTui` 로 정한다. 관측·라우팅 기록용이며 판정을 바꾸지 않는다
+ *  (CHAT-GOAL-LOOP-DEFAULT-OFF — 자리 승격 삭제). */
 export interface TuiChatContext extends ShortQuestionContext {
   seat?: boolean;
 }
@@ -108,18 +109,12 @@ function everyVerbTakes(text: string, verb: RegExp, object: RegExp): boolean {
   return true;
 }
 
-/** Write, debug, goal, mixed or attached requests retain the coding goal loop; a plain read question is one full-tool turn.
- *  A seat (unattended) TUI reverts #27531 for its work: a read/analysis turn (except a fast short question) and any
- *  operational directive (mail · order · named CLI command · «계속 —») ride the goal loop to completion evidence. */
+/** Write, debug, goal, mixed or attached requests are the coding route; a plain read question is one full-tool turn.
+ *  The verdict's `goalLoop` is a route hint (tool pool), not an arming signal: a TUI turn never arms the goal loop
+ *  (CHAT-GOAL-LOOP-DEFAULT-OFF). A seat gets the same verdict as a human TUI — the seat read / operational-directive
+ *  promotion (TUI-H1-SEAT-GOALLOOP) is deleted; only structural explicit-goal callers arm the loop. */
 export function classifyTuiChatIntent(text: string, ctx: TuiChatContext = {}): TuiChatVerdict {
-  const verdict = classifyTuiChatIntentBase(text, ctx);
-  // A fast short question («다음 행이 뭐야?») stays one turn even in a seat — only work rides the goal loop.
-  if (!ctx.seat || verdict.goalLoop || verdict.reason.startsWith('short-')) return verdict;
-  if (verdict.route === '읽기·분석') {
-    return { route: verdict.route, reason: `seat-${verdict.reason}`, goalLoop: true };
-  }
-  if (isSeatOpsDirective(text)) return { route: verdict.route, reason: `seat-ops-${verdict.reason}`, goalLoop: true };
-  return verdict;
+  return classifyTuiChatIntentBase(text, ctx);
 }
 
 function classifyTuiChatIntentBase(text: string, ctx: ShortQuestionContext): TuiChatVerdict {

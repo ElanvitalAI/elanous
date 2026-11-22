@@ -38,8 +38,13 @@ describe('entry wires the seat stop (Ctrl+Q unchanged)', () => {
   });
 
   test('migrate asks for a same-session restart before leaving; force aborts the turn', () => {
-    expect(entry.includes('migrate: (sessionId) => { requestTuiSelfRestart(`seat-stop:migrate:${sessionId}`); injectKey(seatStopKey); },')).toBe(true);
+    expect(entry.includes('migrate: (sessionId) => { const requestId = driver.liveRequestId(); requestTuiSelfRestart(`seat-stop:migrate:${sessionId}`, Date.now(), requestId ? { requestId } : undefined); injectKey(seatStopKey); },')).toBe(true);
     expect(entry.includes('abort: () => { turnAbort?.abort(); },')).toBe(true);
+  });
+
+  test('JUD-B #38765 ⓜ: no global requestId the handler overwrites per request — the driver owns the live one', () => {
+    expect(entry.includes('let seatStopRequestId')).toBe(false);
+    expect(entry.includes('seatStopRequestId = request.requestId')).toBe(false);
   });
 });
 
@@ -112,6 +117,56 @@ describe('createSeatStopDriver — no new turn while the seat is stopping (JUD #
     await r.driver.turnEnded();
     expect(r.driver.allowsNewTurn()).toBe(true);
     expect(r.events).toEqual([]);
+  });
+});
+
+/** JUD-B #38765 ⓜ — the rig that answers what the migrate/checkpoint metadata saw: the driver-pinned requestId at port time. */
+function pinRig() {
+  const seen: string[] = [];
+  let release!: () => void;
+  let busy = true;
+  const driver = createSeatStopDriver({
+    control: createSeatControl({
+      checkpoint: () => new Promise<void>((resolve) => { release = resolve; }),
+      exit: () => { seen.push(`exit:${driver.liveRequestId()}`); },
+      migrate: (session: string) => { seen.push(`migrate:${session}:${driver.liveRequestId()}`); },
+      abort: () => { seen.push(`abort:${driver.liveRequestId()}`); },
+    }),
+    busy: () => busy,
+  });
+  return { driver, seen, setBusy: (next: boolean) => { busy = next; }, release: () => release() };
+}
+
+describe('createSeatStopDriver — the requestId of the stop that owns the door (JUD-B #38765 ⓜ)', () => {
+  test('an accepted R1 records its own requestId in the migrate metadata', async () => {
+    const r = pinRig();
+    r.setBusy(false);
+    const asked = r.driver.request({ requestId: 'r1', mode: 'migrate' }, 'session-a');
+    r.release();
+    expect(await asked).toBe('accepted');
+    expect(r.seen).toEqual(['migrate:session-a:r1']);
+  });
+
+  test('a refused duplicate R2 after R1 leaves the migrate metadata on R1 — the JUD-B defect', async () => {
+    const r = pinRig();
+    expect(await r.driver.request({ requestId: 'r1', mode: 'migrate' }, 'session-a')).toBe('waiting');
+    expect(await r.driver.request({ requestId: 'r2', mode: 'migrate' }, 'session-a')).toBe('already-requested');
+    expect(r.driver.liveRequestId()).toBe('r1');
+    r.setBusy(false);
+    const ended = r.driver.turnEnded();
+    r.release();
+    await ended;
+    expect(r.seen).toEqual(['migrate:session-a:r1']);
+  });
+
+  test('a normally accepted R2 supersedes — its own requestId is used', async () => {
+    const r = pinRig();
+    r.setBusy(false);
+    expect(await r.driver.request({ requestId: 'r-old', mode: 'migrate' })).toBe('missing-session');
+    const asked = r.driver.request({ requestId: 'r2', mode: 'migrate' }, 'session-b');
+    r.release();
+    expect(await asked).toBe('accepted');
+    expect(r.seen).toEqual(['migrate:session-b:r2']);
   });
 });
 

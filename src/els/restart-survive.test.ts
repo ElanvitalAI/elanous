@@ -13,12 +13,14 @@ import { requestEls } from './client.js';
 import { attachEls, type AttachFrame } from './attach-client.js';
 import { AUTH_OWNER_TOKEN_ENV, AUTH_PANE_TOKEN_ENV } from './server-auth.js';
 import { elsSocketPath, startElsServer } from './server.js';
+import { guardElsProcesses, reapElsProcesses } from './test-support/els-process-guard.js';
 import { connectHolderElsPty, reattachHolder, startHolder } from './holder.js';
 
 // A Unix socket path holds at most 103 bytes (macOS): under a long TMPDIR the els server/holder socket would pass it,
 // so a state dir falls back to /tmp (each test removes its own dir).
 const SOCKET_SAFE_TMP = tmpdir().length > 40 ? '/tmp' : tmpdir();
 
+guardElsProcesses();
 const cleanups: (() => Promise<void> | void)[] = [];
 // The in-process servers set the owner token in this process env (and these tests put a stale one back): every test ends on the env it began with.
 const envAtStart = { owner: process.env[AUTH_OWNER_TOKEN_ENV], pane: process.env[AUTH_PANE_TOKEN_ENV] };
@@ -26,6 +28,7 @@ afterEach(async () => {
   const pending = [...cleanups];
   cleanups.length = 0;
   for (const cleanup of pending.reverse()) await cleanup();
+  await reapElsProcesses();   // the holders a server close() detached (by design) die with the test
   if (envAtStart.owner === undefined) delete process.env[AUTH_OWNER_TOKEN_ENV]; else process.env[AUTH_OWNER_TOKEN_ENV] = envAtStart.owner;
   if (envAtStart.pane === undefined) delete process.env[AUTH_PANE_TOKEN_ENV]; else process.env[AUTH_PANE_TOKEN_ENV] = envAtStart.pane;
 });

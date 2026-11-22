@@ -1,17 +1,23 @@
 // ELS new-tab prompt: retain grapheme-aware key handling while drawing the shared
-// Dialog and EditView centered in the available pane. Enter closes the prompt and
+// Dialog and EditView centered in the available pane. The frame is the yes/no confirm
+// popup's standard chrome (confirmPopupDialogChrome: theme tokens + static modalChrome
+// rail + centred modal-dialog chromeSpec) — never a hand-drawn box. Enter closes the prompt and
 // hands the cleaned name to deps.save; an empty name selects the default tab.
 
 import { clean } from './core.js';
 import { Dialog } from '../ui/widgets/dialog.js';
+import { confirmPopupDialogChrome } from '../ui/chrome/dialog-chrome.js';
+import { DEFAULT_THEME_TOKENS } from '../theme/tokens.js';
 import { EditView } from '../ui/widgets/edit-view.js';
 import { Printer } from '../ui/printer.js';
 import type { View, Size } from '../ui/view.js';
+import { spliceCells, type DialogBox } from './attach-view.js';
 
 /** The name's length cap in terminal cells (a wide glyph is two). */
 export const NEW_TAB_NAME_MAX_CELLS = 40;
 const HINT = ' ↵ save  ^c clear  esc cancel';
 const LABEL = ' new tab ';
+const NEW_TAB_TITLE = '새 탭 이름';
 const ESC = '\u001b';
 const REVERSE = `${ESC}[7m`;
 const DIM = `${ESC}[2m`;
@@ -59,7 +65,7 @@ export function createNewTabPrompt(deps: NewTabPromptDeps) {
     else if (sequence === 'F' || sequence === '4~' || sequence === '8~') cursor = parts.length;
     else if (sequence === '3~' && cursor < parts.length) { parts.splice(cursor, 1); text = parts.join(''); }
   };
-  return {
+  const prompt = {
     openPrompt(): void { open = true; if (!unknown) { text = ''; cursor = 0; } deps.changed(); },
     isOpen: (): boolean => open,
     isSaving: (): boolean => saving,
@@ -101,12 +107,13 @@ export function createNewTabPrompt(deps: NewTabPromptDeps) {
       }
       if (open) deps.changed();
     },
-    /** Draw the shared dialog over the pane, preserving the sidebar when present. */
-    dialog(cols: number, rows: number, sidebar = 0): string {
+    /** ELS-APP-RENDER-SINGLE-FRAME: the dialog as rows at (x, y) — composeView splices them into the one composed frame
+     *  (no separate cursor-addressed overlay write). The sidebar (`sidebar` columns on the left) is never covered. */
+    box(cols: number, rows: number, sidebar = 0): DialogBox {
       const left = Math.max(0, Math.min(cols, sidebar));
       const available = cols - left;
       fits = available >= 24 && rows >= 7;
-      if (!fits) return `\u001b[1;${left + 1}H\u001b[0m${'Screen too small - Esc'.slice(0, Math.max(0, available))}\u001b[?25l`;
+      if (!fits) return { x: left, y: 0, width: available, lines: ['Screen too small - Esc'.slice(0, Math.max(0, available))] };
       const width = Math.min(48, available - 2);
       const height = 7;
       const x = left + Math.floor((available - width) / 2), y = Math.floor((rows - height) / 2);
@@ -136,13 +143,19 @@ export function createNewTabPrompt(deps: NewTabPromptDeps) {
         requiredSize: (size: Size) => size,
         takeFocus: () => input.takeFocus(),
       };
-      const dialog = new Dialog({ title: '새 탭 이름', body, buttons: [], onSubmit: () => {} });
+      const dialog = new Dialog({ title: NEW_TAB_TITLE, body, buttons: [], onSubmit: () => {}, ...confirmPopupDialogChrome(NEW_TAB_TITLE, DEFAULT_THEME_TOKENS) });
       dialog.layout({ width, height });
       const printer = Printer.create({ width, height, focused: true });
       dialog.draw(printer);
-      return printer.lines().map((line, i) => `\u001b[${y + i + 1};${x + 1}H\u001b[0m${line}\u001b[0m`).join('')
-        + `\u001b[${y + 3};${x + 3}H\u001b[0m${' '.repeat(width - 4)}`
-        + `\u001b[${y + 3};${x + 3}H${before}▎${after}\u001b[0m\u001b[?25l`;
+      const lines = printer.lines().map((line) => `${RESET}${line}${RESET}`);
+      // The field row (third line): cells 2 … width-2 carry the clipped name with its caret, graphemes intact.
+      lines[2] = spliceCells(lines[2]!, 2, `${before}▎${after}`, width - 4);
+      return { x, y, width, lines };
+    },
+    /** The box serialised cursor-addressed (one CUP per row) — kept for callers that paint the dialog on its own. */
+    dialog(cols: number, rows: number, sidebar = 0): string {
+      const box = prompt.box(cols, rows, sidebar);
+      return box.lines.map((line, i) => `\u001b[${box.y + i + 1};${box.x + 1}H\u001b[0m${line}`).join('') + '\u001b[?25l';
     },
     /** The prompt row, `cols` cells wide (the field shrinks, then drops the hint, on a narrow terminal). */
     line(cols: number): string {
@@ -157,4 +170,5 @@ export function createNewTabPrompt(deps: NewTabPromptDeps) {
       return `${REVERSE}${LABEL}${RESET}[${shown}${' '.repeat(Math.max(0, field - used))}]${DIM}${hint}${RESET}`;
     },
   };
+  return prompt;
 }

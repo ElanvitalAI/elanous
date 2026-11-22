@@ -125,7 +125,7 @@ elanous chat [options] <text...>
 | `--session <id>` | Continue an explicit session (id or unique prefix). Overrides --new and active session. |
 | `--json` | Emit a single JSON line {sessionId, provider, model, reply, logPath, budget} instead of streaming text + ui.info trailer. Stable shape for LLM self-spawn. |
 | `--tools` | Enable the tool-loop path (Read/Grep/Glob/ListDir/Edit/Write + Bash). Default off — chat is text-only by default for backward compatibility. `elanous agent` is a thin wrapper that flips this on. |
-| `--goal-loop` | Arm the across-turn goal loop (runGoalLoop): wrap the tool-loop so the model keeps iterating until the goal is complete (GOAL-COMPLETE evidence gate) or maxIterations. Requires --tools. Same engine as ACP/dashboard. Config `llm.goalLoop.enabled` also arms it. |
+| `--goal-loop` | Arm the across-turn goal loop (runGoalLoop): wrap the tool-loop so the model keeps iterating until the goal is complete (GOAL-COMPLETE evidence gate) or maxIterations. Requires --tools. Same engine as ACP/dashboard. |
 | `--implement` | Bypass the harness goal-loop guard for the legacy implementation child entrypoint |
 
 ## `elanous config`

@@ -132,40 +132,31 @@ describe('명시 명령·우편 은 «조사» 빠른 경로가 아니다', () =
   });
 });
 
-// TUI-H1-SEAT-GOALLOOP (OP #8953 · 10-16 OPT 13:14): 자리(무인) TUI 에서만 #27531 «읽기·분석 = 단일 턴» 을 되돌린다 —
-// 운영 지시(우편 · 오더 · eln 명령 · «계속 — 다음 행») 는 goal loop 로 완료 증거까지 간다. 사람 대화 TUI 는 그대로.
-describe('자리 TUI 운영 지시 = goal loop (사람 대화 TUI 는 종전 그대로)', () => {
+// CHAT-GOAL-LOOP-DEFAULT-OFF (0.3.33 · 대표) — the TUI-H1-SEAT-GOALLOOP seat promotion is deleted: a seat TUI gets the same
+// verdict as a human TUI, and no seat read / operational directive (우편 · 오더 · eln 명령 · «계속 — 다음 행») is goalLoop.
+describe('자리 TUI 운영 지시 = 사람 TUI 와 같은 판정 · goal loop 승격 없음', () => {
   const OPS = [
     'OP 13:14: 계속 — draft 다음 행.',
     'OP 우편 확인(eln msg list --to OPT): #7139 디스패처 «특인데 Sol 안 붙음» 재현 조사 진행(읽기 전용 · 00:50 까지)',
     '[OP 오더 09:0x] 큐 다음 줄 소화',
     'eln tasks show ta-20261016-abc 보고 진행 판단',
-    '우편 온 것 조사해줘',
     '계속',
     'OP 앞 글 읽고 제안 표로',
+    '오더 상태 알려줘',
   ];
-  test.each(OPS)('seat ⊕ %s → goalLoop:true', (text) => {
-    const verdict = classifyTuiChatIntent(text, { seat: true });
-    expect(verdict.goalLoop).toBe(true);
-    expect(verdict.reason.startsWith('seat-') || verdict.route === '코딩·구현').toBe(true);
+  test.each(OPS)('seat ⊕ %s → same verdict as no seat · goalLoop:false', (text) => {
+    expect(classifyTuiChatIntent(text, { seat: true })).toEqual(classifyTuiChatIntent(text));
+    expect(classifyTuiChatIntent(text, { seat: true }).goalLoop).toBe(false);
   });
-  test('the live 13:14 sample is an operational directive and was a single read turn before (rebuttal anchor)', () => {
+  test('the live 13:14 sample is still recognized as an operational directive (observation only)', () => {
     expect(isSeatOpsDirective('OP 13:14: 계속 — draft 다음 행.')).toBe(true);
-    expect(classifyTuiChatIntent('OP 13:14: 계속 — draft 다음 행.')).toMatchObject({ route: '읽기·분석', goalLoop: false });
-    expect(classifyTuiChatIntent('OP 13:14: 계속 — draft 다음 행.', { seat: true })).toMatchObject({ route: '읽기·분석', goalLoop: true });
-  });
-  test('a quick route carrying an operational directive also rides the goal loop in a seat', () => {
-    expect(classifyTuiChatIntent('오더 상태 알려줘')).toMatchObject({ route: '조회', goalLoop: false });
-    expect(classifyTuiChatIntent('오더 상태 알려줘', { seat: true })).toMatchObject({ route: '조회', reason: 'seat-ops-lookup', goalLoop: true });
+    expect(classifyTuiChatIntent('OP 13:14: 계속 — draft 다음 행.', { seat: true })).toMatchObject({ route: '읽기·분석', goalLoop: false });
   });
   test.each(['다음 행이 뭐야?', 'OP 13:14 뭐야?', '계속 할까?', 'GEO 가 뭐야?', '안녕', '나한테 온 결정 카드 있어?', '한 줄 상태 요약', '이번 주 업계 소식 조사'])(
     'seat ⊕ fast short question / plain quick route «%s» stays a single turn', (text) => {
       expect(classifyTuiChatIntent(text, { seat: true })).toEqual(classifyTuiChatIntent(text));
       expect(classifyTuiChatIntent(text, { seat: true }).goalLoop).toBe(false);
     });
-  test.each(OPS)('not a seat ⊕ %s → verdict unchanged by the seat rule', (text) => {
-    expect(classifyTuiChatIntent(text, { seat: false })).toEqual(classifyTuiChatIntent(text));
-  });
   test('the «OP hh:mm» head is an order only with a time (review r2)', () => {
     for (const text of ['OP 13:14: 계속', 'OP 9:05 점검 결과', '[OP 13:14] 다음 줄', 'op13:14 확인']) expect(isSeatOpsDirective(text)).toBe(true);
     for (const text of ['OP 앞 글: 요약', 'OP: 안녕', 'OPT 의 상태', 'OP 13시 이야기']) expect(isSeatOpsDirective(text)).toBe(false);

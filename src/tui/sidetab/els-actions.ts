@@ -43,10 +43,10 @@ export async function sendToElsRow(deps: ElsRowActionDeps, address: string, text
   }
 }
 
-/** `/side read` on an els row: the pane's visible screen (the same text `els read` prints). */
+/** `/side read` on an els row: the pane's visible screen (the same text `els read` prints).
+ * A failed remote read must keep its cause distinct from an absent selection. */
 export async function readElsRow(deps: ElsRowActionDeps, address: string): Promise<string | undefined> {
-  try {
-    const answer = await deps.read(address);
-    return answer.exitCode === 0 ? answer.message : undefined;
-  } catch { return undefined; }
+  const answer = await deps.read(address);
+  if (answer.exitCode !== 0) throw new Error(answer.message);
+  return answer.message;
 }

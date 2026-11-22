@@ -193,12 +193,9 @@ export interface LLMConfig {
     effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
     summary?: 'auto' | 'concise' | 'detailed';
   };
-  /** Tier 2 across-turn goal-execution loop 아밍(2026-07-19 goal-exec). enabled=true 면
-   *  codex-family 턴을 `runGoalLoop` 으로 감싸 목표 완료(증거게이트·GOAL-COMPLETE 마커)까지
-   *  across-turn 지속·continuation 재주입. 기본 미설정=off(비-아밍·안전). maxIterations 는
-   *  폭주 하드캡(기본 8). config-first 아밍(`elanous config set llm.goalLoop.enabled true`). */
+  /** 명시 골 루프(`runTurn({ goalLoop: true })`)의 반복 하드캡(기본 8). 아밍 스위치는 없다 —
+   *  CHAT-GOAL-LOOP-DEFAULT-OFF(0.3.33)로 `enabled` 삭제 · 옛 키는 로더가 무시하고 한 줄 남긴다. */
   goalLoop?: {
-    enabled?: boolean;
     maxIterations?: number;
   };
   /** LLM-judge memory recall(2026-07-19 · 대표 지시 기본 ON). 세션 턴의 기억 주입이 키워드

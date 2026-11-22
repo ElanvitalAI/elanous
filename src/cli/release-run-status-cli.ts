@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { Command } from 'commander';
 import { debugLogDir } from '../debug/log.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
-import { listChecklist, summarizeChecklist } from '../release-loop/checklist.js';
+import { readOpChecklistGreen } from '../release-loop/checklist-readonly.js';
 import { readSweepCertificate } from '../../scripts/release-loop/sweep-cert.js';
 import { CliUserError } from './cli-user-error.js';
 
@@ -42,7 +42,7 @@ function etaSummary(run: Row | undefined, outputs: readonly Row[], now: number):
   return Number.isFinite(timestamp) ? `ETA ${Math.max(0, Math.ceil((timestamp - now) / 60_000))}m` : 'ETA 미측정';
 }
 
-export function renderReleaseRunStatus(version: string, runs: readonly Row[], progress: readonly Row[], checklist: { green: number; yellow: number; red: number; done: number; certificateMeasuredAt?: number | null }, now = Date.now()): string {
+export function renderReleaseRunStatus(version: string, runs: readonly Row[], progress: readonly Row[], checklist: { green: number | null; yellow: number | null; red: number | null; done: number | null; evidence?: string; complete?: boolean; certificateMeasuredAt?: number | null }, now = Date.now()): string {
   const run = selectReleaseRun(version, runs);
   const nodes = Array.isArray(run?.nodes) ? run.nodes.map(object) : [];
   const active = nodes.find((n) => !n.endedAt && n.startedAt) ?? nodes.find((n) => !n.endedAt);
@@ -92,7 +92,7 @@ export function renderReleaseRunStatus(version: string, runs: readonly Row[], pr
     `${version} · run ${run?.runId ?? '없음'} · ${String(run?.status ?? '미시작')} · node ${String(active?.nodeId ?? nodes.at(-1)?.nodeId ?? '없음')} · 경과 ${elapsed}`,
     `gate ${progressLine}${recheckLine} · 미덮임 ${Number.isFinite(uncoveredFiles) && Number.isFinite(totalFiles) ? `${uncoveredFiles}/${totalFiles}` : '?/?'} · residual 실행 ${residualExecutions ?? '?'} · sweep 증명서 나이 ${certificateAge} · ${etaSummary(run, outputs, now)}`,
     `실패 introduced ${introduced ?? '?'} / preexisting ${preexisting ?? '?'} / 미판정 ${undetermined ?? '?'} · 분류 ${String(classification)} · 다음 HITL ${String(nextHitl)}`,
-    `체크리스트 🟢${checklist.green} 🟡${checklist.yellow} 🔴${checklist.red} ✅${checklist.done}`,
+    `체크리스트 🟢${checklist.green ?? 'unknown'} 🟡${checklist.yellow ?? 'unknown'} 🔴${checklist.red ?? 'unknown'} ✅${checklist.done ?? 'unknown'}${checklist.evidence ? ` · ${checklist.evidence}` : ''}${checklist.complete === false ? ' · complete=false' : ''}`,
   ].join('\n');
 }
 
@@ -124,7 +124,12 @@ export function registerReleaseRunStatusCommand(release: Command, dependencies: 
         return row?.category === 'release-loop.gate' && row?.event === 'isolated-recheck-progress'
           && rowRunId === runId ? [row] : [];
       })) : [];
-      const summary = dependencies.checklist?.(version) ?? summarizeChecklist(listChecklist(version));
+      let summary: { green: number | null; yellow: number | null; red: number | null; done: number | null; evidence?: string; complete?: boolean };
+      try {
+        summary = dependencies.checklist?.(version) ?? { ...JSON.parse(readOpChecklistGreen(version, root)), complete: true };
+      } catch {
+        summary = { green: null, yellow: null, red: null, done: null, complete: false, evidence: 'SQLite immutable snapshot 읽기 실패' };
+      }
       const now = dependencies.now?.() ?? Date.now();
       const certificateMeasuredAt = dependencies.sweepCertificateMeasuredAt
         ? dependencies.sweepCertificateMeasuredAt(version, root)

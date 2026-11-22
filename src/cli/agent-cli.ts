@@ -494,7 +494,7 @@ export async function runChatTurnCli(opts: {
   toolLogCategory?: string;
   /** ⭐ substrate 통합 — goal-loop 아밍. true 면 tool-loop 을 runGoalLoop 으로 감싸
    *  목표 완료(GOAL-COMPLETE 증거게이트)까지 across-turn 반복. config
-   *  llm.goalLoop.enabled 로도 아밍(ACP bridge 와 동일 SSOT). enableTools 필요. */
+   *  명시 전용(config 스위치 없음 · CHAT-GOAL-LOOP-DEFAULT-OFF). enableTools 필요. */
   goalLoop?: boolean;
   /** Test-only seam for observing the production CLI turn's final request without an LLM call. */
   runTurn?: typeof runTurn;

@@ -1,6 +1,7 @@
 import type { NextTuiQueueItem, NextTuiQueueNoticeSource } from './queue.js';
 import { isUrgentSeatMail } from '../seat-mail-priority.js';
 import { seatMessageContextBlock, type ContextHeaderInput } from '../../msg/msg-context-header.js';
+import type { MessageOrigin } from '../../msg/msg-store.js';
 
 /**
  * ELN-CHILD-NOTICE-INTO-QUEUE (IMPL-TASK-QUEUE-1117 D칸) — 완료·도착 사건을 입력 큐의
@@ -11,6 +12,7 @@ import { seatMessageContextBlock, type ContextHeaderInput } from '../../msg/msg-
 /** 큐에서 생산자가 쓰는 표면만 — 단위시험은 가짜 없이 진짜 큐를 그대로 쓴다. */
 export interface ChildNoticeQueue {
   enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta?: { msgId?: number; occurredAt?: number; urgent?: boolean }): NextTuiQueueItem;
+  enqueueCapsuleDoneNotice?(text: string, capsuleId: string, status: string, occurredAt?: number): NextTuiQueueItem | null;
   readonly items: readonly NextTuiQueueItem[];
 }
 
@@ -83,7 +85,8 @@ export function eventWatchNotice(line: string): string | null {
 }
 
 /** SEAT-INBOX B1-C §3a — 메시지 한 통 = notice 한 항목. 문구 = §5d 머리줄 ⊕ msg:<id> ⊕ 전문(모델 맥락 그대로). */
-export type SeatMessageNoticeInput = ContextHeaderInput & { id: number; body: string; createdAt?: string; unreadTotal?: number };
+export type SeatMessageNoticeInput = ContextHeaderInput & { id: number; body: string; origin?: MessageOrigin;
+  createdAt?: string; unreadTotal?: number };
 export function seatMessageNotice(message: SeatMessageNoticeInput): string {
   const body = seatMessageContextBlock(message);
   return message.unreadTotal === undefined ? body : `${body}\n\n[미읽음 총 ${message.unreadTotal}통]`;
@@ -113,6 +116,8 @@ export function createChildNoticeProducers(queue: ChildNoticeQueue) {
       return enqueueOnce(harnessChildNotice(info), 'harness-child', occurredAt);
     },
     capsuleDone(event: Parameters<typeof capsuleDoneNotice>[0], occurredAt?: number): NextTuiQueueItem | null {
+      if (queue.enqueueCapsuleDoneNotice) return queue.enqueueCapsuleDoneNotice(
+        capsuleDoneNotice(event), event.capsuleId, event.status, occurredAt);
       return enqueueOnce(capsuleDoneNotice(event), 'capsule-done', occurredAt);
     },
     seatMailArrived(info: Parameters<typeof seatMailNotice>[0], occurredAt?: number): NextTuiQueueItem | null {

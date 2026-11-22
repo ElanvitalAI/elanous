@@ -10044,7 +10044,7 @@ program
   .option('--session <id>', 'Continue an explicit session (id or unique prefix). Overrides --new, --continue and --resume.')
   .option('--json', 'Emit a single JSON line {sessionId, provider, model, reply, logPath, budget} instead of streaming text + ui.info trailer. Stable shape for LLM self-spawn.')
   .option('--tools', 'Enable the tool-loop path (Read/Grep/Glob/ListDir/Edit/Write + Bash). Default off — chat is text-only by default for backward compatibility. `elanous agent` is a thin wrapper that flips this on.')
-  .option('--goal-loop', 'Arm the across-turn goal loop (runGoalLoop): wrap the tool-loop so the model keeps iterating until the goal is complete (GOAL-COMPLETE evidence gate) or maxIterations. Requires --tools. Same engine as ACP/dashboard (재발명 없음). Config `llm.goalLoop.enabled` also arms it.')
+  .option('--goal-loop', 'Arm the across-turn goal loop (runGoalLoop): wrap the tool-loop so the model keeps iterating until the goal is complete (GOAL-COMPLETE evidence gate) or maxIterations. Requires --tools. Same engine as ACP/dashboard (재발명 없음).')
   .option('--solar-scene5-receipt <file>', 'Use the preceding graph run --json receipt as context for the fixed Solar demo scene 5 question')
   .option('--implement', 'Bypass the harness goal-loop guard for the legacy implementation child entrypoint')
   .action(async (rawParts: string[], opts: { new?: boolean; continue?: boolean; resume?: string | boolean; session?: string; json?: boolean; tools?: boolean; goalLoop?: boolean; solarScene5Receipt?: string; implement?: boolean }) => {

@@ -13,7 +13,7 @@ test('next TUI /help shows Commands and Keys in the terminal screen', async () =
     writeFileSync(join(root, 'config.json'), JSON.stringify({
       onboarding: { completed: true },
       errorReports: { enabled: false },
-      llm: { goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } },
+      llm: { memoryJudge: { enabled: false, crossRecall: false } },
     }));
     const run = await mockSeatPtySequence({
       executable: process.execPath,
@@ -53,7 +53,7 @@ test('next TUI shows transient retry status and does not retain it in the transc
     writeFileSync(join(root, 'config.json'), JSON.stringify({
       onboarding: { completed: true },
       errorReports: { enabled: false },
-      llm: { goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } },
+      llm: { memoryJudge: { enabled: false, crossRecall: false } },
     }));
     const reply = '재시도 응답 조각';
     const run = await mockSeatPtySequence({

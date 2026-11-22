@@ -88,7 +88,7 @@ describe('O4 prompt-cache prefix', () => {
     };
     const userConfig = {
       chat: {},
-      llm: { provider: provider.name, model: provider.defaultModel, goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: true } },
+      llm: { provider: provider.name, model: provider.defaultModel, memoryJudge: { enabled: false, crossRecall: true } },
     } as never;
     const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'cli' });
     const log = spyOn(debug, 'log');

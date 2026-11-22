@@ -8,6 +8,7 @@
 
 import { sshHostsWithRole } from '../../ssh/ssh-hosts.js';
 import { llmNetworkFetch } from '../../session-runtime/llm-call-gateway.js';
+import { logUnmeteredRow } from '../../llm/ledgered-call.js';
 
 export interface LocalLlmOpts {
   endpoints?: string[];   // 기본 defaultEndpoints()
@@ -61,6 +62,7 @@ export function makeLocalLlm(opts: LocalLlmOpts = {}): LocalLlm {
     const model = await resolveModel(base);
     const ctrl = new AbortController();
     const to = setTimeout(() => ctrl.abort(), timeoutMs);
+    let ok = false;
     try {
       const resp = await llmNetworkFetch(`${base}/v1/chat/completions`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -71,8 +73,13 @@ export function makeLocalLlm(opts: LocalLlmOpts = {}): LocalLlm {
       const j = await resp.json() as { choices?: Array<{ message?: { content?: string } }> };
       const content = j?.choices?.[0]?.message?.content;
       if (!content) throw new Error(`${base} 빈 응답`);
+      ok = true;
       return content;
-    } finally { clearTimeout(to); }
+    } finally {
+      // LLM-CALL-COST-LEDGER — 요청 1회당 원장 1행(finally = 성공·실패 모두 1행 보장).
+      logUnmeteredRow(model, { providerName: 'local', site: 'community-buzz-local', ...(ok ? {} : { missingReason: 'provider-call-failed' as const }) });
+      clearTimeout(to);
+    }
   }
 
   return {

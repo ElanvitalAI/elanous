@@ -199,6 +199,24 @@ function rig(over: Partial<SeatAutowakeDeps> = {}) {
 }
 
 describe('createSeatAutowake — 배선 판정(H2 호출자)', () => {
+  test('default budget reads only today for this seat, and skips ledger when no budget is configured', () => {
+    const days: string[] = [];
+    const r = rig({ tokenBudget: undefined, tokensUsed: undefined, readBudgetUsage: (day: string) => {
+      days.push(day);
+      return [{ day, seat: 'OPT', role: 'agent', site: 'agent-turn', inputTokens: 80, outputTokens: 20 },
+        { day, seat: 'TC', role: 'agent', site: 'agent-turn', inputTokens: 200, outputTokens: 0 }];
+    } } as Partial<SeatAutowakeDeps>);
+    expect(r.endTurn().action).toBe('start-turn');
+    expect(days).toEqual([]);
+    const limited = rig({ tokenBudget: undefined, tokensUsed: undefined, readBudgetUsage: (day: string) => {
+      days.push(day);
+      return [{ day, seat: 'OPT', role: 'agent', site: 'agent-turn', inputTokens: 80, outputTokens: 20 }];
+    } } as Partial<SeatAutowakeDeps>);
+    limited.files.set(`${OPT_STATE}/autowake-budget`, '100');
+    expect(limited.endTurn()).toMatchObject({ action: 'skip', reason: 'token-budget' });
+    expect(days).toEqual([new Date(limited.state.now).toISOString().slice(0, 10)]);
+    expect(limited.calls).toHaveLength(0);
+  });
   const codex400 = (callId: string) => {
     const errorDetail = `Codex API 400: No tool call found for function call output with call_id ${callId}.`;
     return { lastLine: formatFailureNotice(matchFailureText(errorDetail)!, { rawHint: '/detail open' }), errorDetail };

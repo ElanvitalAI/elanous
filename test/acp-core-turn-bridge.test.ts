@@ -48,7 +48,7 @@ beforeEach(() => {
   runCoreTurnCalls.length = 0;
   runCoreTurnImpl = async () => ({ stopReason: 'end_turn', finalText: '' });
   spyOn(userConfigModule, 'getUserConfig').mockReturnValue({
-    llm: { model: 'gpt-4o-mini', goalLoop: { enabled: false } },
+    llm: { model: 'gpt-4o-mini' },
   } as ReturnType<typeof userConfigModule.getUserConfig>);
   // BACKLOG #5 — spyOn replaces `runCoreTurn` for this test file
   // only; `mock.restore()` in afterEach reverts. Pre-cleanup version

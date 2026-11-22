@@ -23,8 +23,8 @@ test('multiline composer keeps both prompt rows and the editing cursor in compac
     promptLine: '❯ first', promptLines: ['❯ first', '  second'], notices: [], activity: [],
     scroll: 0, expandedToolIndexes: new Set<number>(),
   });
-  expect(frame.lines).toEqual(['elanous', '❯ first', '  second']);
-  expect(frame.promptRow).toBe(2);
+  expect(frame.lines).toEqual(['elanous', 'No chat history', '❯ first', '  second']);
+  expect(frame.promptRow).toBe(3);
   const screen = simulatedScreen(30, 6);
   const painter = createNextTuiCompactPainter(screen.write);
   try {
@@ -32,10 +32,10 @@ test('multiline composer keeps both prompt rows and the editing cursor in compac
     await screen.settle();
     expect(screen.visible()).toContain('❯ first');
     expect(screen.visible()).toContain('  second');
-    expect(screen.terminal.buffer.active.cursorY).toBe(1);
+    expect(screen.terminal.buffer.active.cursorY).toBe(2);
     painter.paint(frame.lines, 5, 6, 30, 1, frame.promptRow + 1);
     await screen.settle();
-    expect(screen.terminal.buffer.active.cursorY).toBe(2);
+    expect(screen.terminal.buffer.active.cursorY).toBe(3);
   } finally { screen.terminal.dispose(); }
 });
 
@@ -356,4 +356,54 @@ for (const size of [{ cols: 20, rows: 6 }, { cols: 30, rows: 4 }]) {
       expect(screen.visible()).toContain('❯ ');
     } finally { screen.terminal.dispose(); }
   });
+}
+
+// Boundary table for the pinned-header window. Axes: how long the frame is next to the screen height
+// (fits / only the header pushes it over / far over) × how much of the body is already committed to scrollback
+// (none / one row / all). Every cell: the header shows once and never reaches scrollback, the prompt is on screen
+// with the cursor on it, and no body row is printed twice.
+const TABLE_ROWS = 8;
+const TABLE_HEADER = ['elanous', 'rule', '────────────────────────────────────────'];
+// A frame is header + body + status + prompt; `body` is chosen so the frame length is rows - 1 / rows + 1 / rows + header / one past / far over.
+const TABLE_FIXED = 2; // status + prompt
+const TABLE_LENGTHS = [
+  { name: 'fits the screen', body: TABLE_ROWS - 1 - TABLE_HEADER.length - TABLE_FIXED },
+  { name: 'one row over', body: TABLE_ROWS + 1 - TABLE_HEADER.length - TABLE_FIXED },
+  { name: 'over by exactly the header', body: TABLE_ROWS - TABLE_FIXED },
+  { name: 'one past the header', body: TABLE_ROWS - TABLE_FIXED + 1 },
+  { name: 'far over', body: TABLE_ROWS * 2 },
+] as const;
+const TABLE_COMMITTED = [
+  { name: 'nothing committed', committed: (_body: number) => 0 },
+  { name: 'one row committed', committed: (_body: number) => 1 },
+  { name: 'all body committed', committed: (body: number) => body },
+] as const;
+
+for (const length of TABLE_LENGTHS) {
+  for (const commit of TABLE_COMMITTED) {
+    test(`pinned header table: ${length.name} × ${commit.name}`, async () => {
+      const screen = simulatedScreen(40, TABLE_ROWS);
+      const painter = createNextTuiCompactPainter(screen.write);
+      const body = Array.from({ length: length.body }, (_, i) => `BODY-${String(i).padStart(2, '0')}`);
+      const lines = [...TABLE_HEADER, ...body, 'status', '❯ '];
+      const stableCount = TABLE_HEADER.length + commit.committed(length.body);
+      try {
+        for (let paint = 0; paint < 3; paint++) painter.paint(lines, 3, TABLE_ROWS, 40, stableCount, lines.length, TABLE_HEADER.length);
+        await screen.settle();
+        const visible = screen.visible();
+        expect(visible).toContain('elanous');
+        const promptRow = visible.findIndex((line) => line.startsWith('❯'));
+        expect(visible.some((line) => line.startsWith('❯'))).toBe(true);
+        expect(screen.terminal.buffer.active.cursorY).toBe(promptRow);
+        expect(visible).toHaveLength(TABLE_ROWS);
+        const all = screen.allLines();
+        expect(all.filter((line) => line === 'elanous')).toHaveLength(1);
+        for (const row of body) expect([[], [row]]).toContainEqual(all.filter((line) => line === row));
+        // The newest body row is on screen unless it is already committed, and then it is in scrollback exactly once.
+        const newest = body.at(-1)!;
+        if (commit.committed(length.body) < length.body) expect(visible.some((line) => line === newest)).toBe(true);
+        else expect(all.filter((line) => line === newest)).toHaveLength(1);
+      } finally { screen.terminal.dispose(); }
+    });
+  }
 }

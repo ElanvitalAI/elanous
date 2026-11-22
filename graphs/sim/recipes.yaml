@@ -1,0 +1,3 @@
+op-on-eln-world:
+  command: 'bun "${ELANOUS_GRAPH_DIR}/../../src/ux-sim/op-on-eln-run.ts"'
+  timeout_ms: 3600000

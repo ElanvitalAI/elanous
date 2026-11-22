@@ -583,7 +583,7 @@ describe.serial('Codex TUI request-size compact', () => {
     const imageBase64 = 'aW1hZ2UtYnl0ZXM=';
     const statusLines: string[] = [];
     const userConfig = {
-      llm: { provider: 'openai-codex', model, goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } },
+      llm: { provider: 'openai-codex', model, memoryJudge: { enabled: false, crossRecall: false } },
       chat: {
         autoCompact: {
           enabled: true, triggerRatio: 0.9, preserveLastN: 2, preserveFirstN: 0,
@@ -637,7 +637,7 @@ describe.serial('Codex TUI request-size compact', () => {
     };
     const session = createSession({ provider: provider.name, model, source: 'tui' });
     const userConfig = {
-      llm: { provider: 'openai-codex', model, goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } },
+      llm: { provider: 'openai-codex', model, memoryJudge: { enabled: false, crossRecall: false } },
       chat: {
         autoCompact: {
           enabled: true, triggerRatio: 0.9, preserveLastN: 2, preserveFirstN: 0,
@@ -680,7 +680,7 @@ describe.serial('Codex TUI request-size compact', () => {
     };
     const session = createSession({ provider: provider.name, model, source: 'tui' });
     const userConfig = {
-      llm: { provider: 'openai-codex', model, goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } },
+      llm: { provider: 'openai-codex', model, memoryJudge: { enabled: false, crossRecall: false } },
       chat: {
         autoCompact: {
           enabled: true, triggerRatio: 0.9, preserveLastN: 2, preserveFirstN: 0,

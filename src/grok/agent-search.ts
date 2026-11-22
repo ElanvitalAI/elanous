@@ -24,6 +24,7 @@
 // Reference: https://docs.x.ai/docs/guides/tools/overview
 
 import { llmNetworkSend } from '../session-runtime/llm-call-gateway.js';
+import { logUnmeteredRow } from '../llm/ledgered-call.js';
 import { getGrokApiKey, refreshKeyFromCache } from '../config.js';
 import { peekGrokCredential, resolveFreshGrokCredential } from './credential.js';
 import { debug } from '../debug/log.js';
@@ -149,10 +150,14 @@ export async function grokAgentSearch(
       { provider: 'grok', model, role: 'aux', requestedBy: 'grok.agent-search' },
       () => fetchImpl(endpoint, init));
   } catch (err) {
+    logUnmeteredRow(model, { providerName: 'grok', site: 'grok-agent-search', missingReason: 'provider-call-failed' });
     return { ok: false, status: 0, text: '', citations: [], error: `threw: ${err instanceof Error ? err.message : String(err)}` };
   } finally {
     clearTimeout(timer);
   }
+
+  // LLM-CALL-COST-LEDGER — responses 1콜당 1행(성공·HTTP 실패 공통). 조기 return(키 없음 등)엔 위에서 행 없음.
+  logUnmeteredRow(model, { providerName: 'grok', site: 'grok-agent-search' });
 
   if (!res.ok) {
     const bodyText = await res.text().catch(() => '');

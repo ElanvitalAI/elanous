@@ -66,7 +66,7 @@ async function chatTurn(provider: LLMProvider, tools: LLMToolSpec[] | undefined,
   const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
   return runTurn({
     userConfig: { chat: {}, llm: { provider: provider.name, model: provider.defaultModel,
-      memoryJudge: { enabled: false, crossRecall: false }, goalLoop: { enabled: false } } } as never,
+      memoryJudge: { enabled: false, crossRecall: false } } } as never,
     sessionId: session.id, userText: 'Explain the direct provider path', systemPrompt: 'base prompt',
     skipMemoryInjection: true, provider,
     ...(tools ? { tools, dispatchTool: async () => ({ ok: true }) } : {}),

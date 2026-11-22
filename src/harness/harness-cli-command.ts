@@ -19,6 +19,8 @@ import { archiveGoals, type GoalArchiveOptions } from '../self-implement/goal-ar
 import { detectBursts, formatIncidentBurstWarning, incidentLastLines, readRunExits, recentBurst, recordRunExit } from './harness-incidents.js';
 import { Command, InvalidArgumentError, Option } from 'commander';
 import { runGitCommand } from '../git-fs/runner.js';
+import { goalIntakeRefusal } from '../self-implement/goal-contract-fields.js';
+import { isGoalAuthorFileName } from '../self-implement/goal-document.js';
 import { GOAL_TYPES, lintGoalFile, parseGoalId, parseGoalType, resolveGoalAuthorGrade, tracedPathReferences, type GoalAuthorGrade, type GoalAuthorGradeSelection, type GoalType } from '../self-implement/goal-author.js';
 import { templateForGoalType } from '../self-implement/graph-templates.js';
 import { appendRunLedgerEntry, listRunLedgers, loadFederatedRunLedger, loadRunLedger, queryRunScreenKey, runLedgerDir, type RunLedgerEntry, type RunLedgerMatch, type RunLedgerWriter } from '../self-implement/run-ledger.js';
@@ -4038,6 +4040,22 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
         if ((opts as HarnessSubstrateOpts).repairCommitOnly !== undefined) {
           console.error('--repair-commit-only is supported only by harness say');
           process.exitCode = 2;
+          return;
+        }
+        // HARNESS-GOAL-INTAKE-LINT — 다섯 칸 계약이 빠진 골은 입구에서 거절한다(기본 동작 · 깃발 없음).
+        //   골 문서(`GOAL-*.md` · 생산 라우터와 같은 판정)만 본다 — ask-file 은 저작기가 기본값을 채운다.
+        //   못 읽는 경로는 여기서 판정하지 않는다 — 종전 경로가 그 오류를 낸다.
+        let intakeDocument: string | undefined;
+        if (isGoalAuthorFileName(basename(goalPath))) {
+          try { intakeDocument = readFileSync(goalPath, 'utf8'); } catch { intakeDocument = undefined; }
+        }
+        const intakeRefusal = intakeDocument === undefined ? null : goalIntakeRefusal(intakeDocument);
+        // --dry-run 은 발사가 아니다 — 거절 문면을 미리 보이고 나머지 미리보기를 그대로 낸다.
+        if (intakeRefusal && isHarnessDryRun(opts)) {
+          for (const line of intakeRefusal) console.error(`[dry-run] ${line}`);
+        } else if (intakeRefusal) {
+          for (const line of intakeRefusal) console.error(line);
+          process.exitCode = 1;
           return;
         }
         await dispatchHarnessAskSay(

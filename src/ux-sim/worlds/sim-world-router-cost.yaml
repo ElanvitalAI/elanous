@@ -1,0 +1,7 @@
+schema: 1
+world: router-cost
+scenarios:
+  - { id: ROUTER-COST-LEDGER, module: src/ux-sim/sim-world/router-cost/scenarios.ts }
+  - { id: ROUTER-COST-LOCK-RECOVERY, module: src/ux-sim/sim-world/router-cost/scenarios.ts }
+  - { id: ROUTER-OR-CODEX-MIX-CHOKEPOINT, module: src/ux-sim/sim-world/router-cost/mix-scenarios.ts }
+  - { id: ROUTER-QUALITY-GUARD-95, module: src/ux-sim/sim-world/router-cost/quality-scenarios.ts }

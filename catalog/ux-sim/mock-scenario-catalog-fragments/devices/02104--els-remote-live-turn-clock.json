@@ -1,0 +1,23 @@
+{
+  "id": "els-remote-live-turn-clock",
+  "name": "ELS registered remote busy-turn event injector",
+  "audience": "internal",
+  "checklistCells": ["ELS-UPDATE-ALL-GRACEFUL"],
+  "implementation": ["src/ux-sim/sim-world/els/remote-live.ts"],
+  "tests": ["src/ux-sim/sim-world/els/remote-live.test.ts"],
+  "target": "registered remote eln TUI pane during graceful update-all",
+  "inputs": [
+    "one remote TC TUI pane with exact id, PID, session and cwd",
+    "busy turn remains active for one tick, then shell completion and owner restart",
+    "registered SSH transport throws a timeout in the failure scenario"
+  ],
+  "observations": [
+    "parent and child call actual updateAllElsTabs; child calls runSeatControl",
+    "the remote pane row becomes updated only after shell completion and owner PID change with the same session and cwd",
+    "an unresponsive remote host yields failed host and pane rows with zero local migration"
+  ],
+  "entryCommands": ["eln --test=<isolated-state> sim world run els --seed 33 --engine legacy"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

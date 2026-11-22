@@ -263,6 +263,18 @@ export function closeTui(): void {
 // Buffer for keys that arrived in the same stdin chunk
 const _keyQueue: Key[] = [];
 
+/** Stdin owns the human lane. Injected wakes and automation stay behind every parsed physical key. */
+function queuePhysicalKeys(keys: Key[]): void {
+  if (keys.length === 0) return;
+  const firstSynthetic = _keyQueue.findIndex((key) => _injectedKeys.has(key));
+  _keyQueue.splice(firstSynthetic < 0 ? _keyQueue.length : firstSynthetic, 0, ...keys);
+}
+
+function takePriorityKey(): Key {
+  const physical = _keyQueue.findIndex((key) => !_injectedKeys.has(key));
+  return _keyQueue.splice(physical < 0 ? 0 : physical, 1)[0]!;
+}
+
 /**
  * Origin label for a traced key — lets the dashboard distinguish keys
  * delivered through the main readKey loop, the streaming-window listener,
@@ -290,7 +302,7 @@ export function setKeyTracer(fn: ((key: Key, source: KeyTraceSource) => void) | 
  *  becomes a noop when no tracer is registered. */
 export function traceKey(key: Key, source: KeyTraceSource): void {
   // H2 내부 턴 문 — «마지막 사람 키» 시각. 빈 이름(readKey 취소·빈 깨움)·리스너 표지는 사람 키가 아니다.
-  if (key.name && !key.name.startsWith('listener-')) _lastHumanKeyAt = Date.now();
+  if (key.name && !key.name.startsWith('listener-') && !_injectedKeys.has(key)) _lastHumanKeyAt = Date.now();
   if (!_keyTracer) return;
   try { _keyTracer(key, source); } catch { /* swallow — never break input */ }
 }
@@ -332,8 +344,8 @@ export function readKey(source: KeyTraceSource = 'main'): Promise<Key> {
 
     // Drain buffered keys first (from multi-key stdin chunks OR
     // external `injectKey` pushes — see below).
-    if (_keyQueue.length > 0) {
-      const k = _keyQueue.shift()!;
+    if (_keyQueue.some((key) => !_injectedKeys.has(key))) {
+      const k = takePriorityKey();
       traceKey(k, source);
       resolve(k);
       return;
@@ -383,7 +395,7 @@ export function readKey(source: KeyTraceSource = 'main'): Promise<Key> {
         const keys = _stdinParser.flushEscape();
         if (keys.length === 0) return;
         const first = keys.shift()!;
-        if (keys.length > 0) _keyQueue.push(...keys);
+        if (keys.length > 0) queuePhysicalKeys(keys);
         settle(first);
       }, 25);
     };
@@ -404,9 +416,21 @@ export function readKey(source: KeyTraceSource = 'main'): Promise<Key> {
       // dummy `'data'` event with an empty buffer to wake stdin;
       // the parser returns 0 keys for that, but the queued real key
       // is what we want to resolve with.
-      if (_keyQueue.length > 0 || keys.length > 0) {
-        if (keys.length > 0) _keyQueue.push(...keys);
-        settle(_keyQueue.shift()!);
+      if (keys.length > 0) queuePhysicalKeys(keys);
+      // A complete physical key is already known even if the same chunk ends with an
+      // incomplete UTF-8 character or escape sequence. In particular Ctrl+Q must not
+      // wait for those unrelated trailing bytes (the parser keeps them for the next read).
+      if (_keyQueue.some((key) => !_injectedKeys.has(key))) {
+        settle(takePriorityKey());
+        return;
+      }
+      // A real Escape may still be waiting for its CSI quiet window. An injected wake cannot jump over it.
+      if (_stdinParser.hasPendingEscape() || _stdinParser.hasPendingPaste() || _stdinParser.hasPendingDecoderBytes()) {
+        if (_stdinParser.hasPendingEscape()) armEscapeTimer();
+        return;
+      }
+      if (_keyQueue.length > 0) {
+        settle(takePriorityKey());
         return;
       }
 
@@ -432,6 +456,10 @@ export function readKey(source: KeyTraceSource = 'main'): Promise<Key> {
     traceKeyListener('attach', source);
     process.stdin.resume();
     armEscapeTimer();
+    // A buffered synthetic wake must yield one I/O turn so bytes already arriving from the terminal can win.
+    if (_keyQueue.length > 0) setImmediate(() => { if (!settled && _keyQueue.length > 0
+      && !_stdinParser.hasPendingEscape() && !_stdinParser.hasPendingPaste() && !_stdinParser.hasPendingDecoderBytes())
+      settle(takePriorityKey()); });
   });
 }
 
@@ -449,6 +477,10 @@ export function readKey(source: KeyTraceSource = 'main'): Promise<Key> {
  *  §8.6 — "(A) auto-Enter via injectKey" approach. */
 export function injectKey(key: Key): boolean {
   if (!_raw) return false;
+  // Only terminal stdin may carry the immediate cancel/quit keys. An automation or tool-injected key is never physical.
+  if (key.name === 'escape' || (key.ctrl && key.name.toLowerCase() === 'q')) return false;
+  // Repeated knocks use the same empty key object. They only mean "check the queue", so one pending knock is enough.
+  if (!key.name && !key.raw && _keyQueue.includes(key)) return true;
   noteInputLagKey();
   _keyQueue.push(key);
   _injectedKeys.add(key);
@@ -502,8 +534,7 @@ export function takeInjectedKeys(): Key[] {
       i += 1;
     }
   }
-  // 같은 Key 객체가 두 번 주입될 수 있으므로 표지는 다 꺼낸 «뒤에» 지운다.
-  for (const k of taken) _injectedKeys.delete(k);
+  // WeakSet does not retain keys. Keep the origin mark through tracing so automation cannot claim a human key time.
   return taken;
 }
 

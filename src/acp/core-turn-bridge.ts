@@ -48,8 +48,6 @@ import { runGoalLoop } from '../core-turn/run-goal-loop.js';
 import { coreAdvisorForGoalLoop } from '../core-turn/core-advisor-wiring.js';
 import type { CoreTurnDispatchTool } from '../core-turn/types.js';
 import { stripGoalRepeatReadbackPreface } from '../core-turn/run-goal-loop.js';
-import { SEAT_TURN_CAP_DEFAULTS } from '../core-turn/seat-turn-cap.js';
-import { postSeatCapResumeNotice } from '../core-turn/seat-cap-resume-notice.js';
 import { getUserConfig } from '../user-config/reader.js';
 import { getModelFamily } from '../models/prompts.js';
 import { resolveModelContextWindow } from '../models/context-window.js';
@@ -58,11 +56,12 @@ import { acpToolDenialResult } from './tool-approval.js';
 import { readOriginSessionMeta } from './origin-session-meta.js';
 import { isFactQuestion } from './fact-question.js';
 import { resolveSessionSurfaceProfile } from '../session-runtime/index.js';
-import { classifyTuiChatIntent, isSeatOpsDirective, type TuiChatRoute } from '../core-turn/short-question.js';
+import { classifyTuiChatIntent, type TuiChatRoute } from '../core-turn/short-question.js';
 import { HARNESS_ROLE_ENV } from '../harness/harness-space.js';
 import { RESEARCH_TOOL_ALLOWLIST, RESEARCH_TURN_MAX_TOOL_TURNS } from '../core-turn/research-policy.js';
 import { isResearchAgentIntent } from '../tool-hints/signals.js';
 import { createReasoningThoughtBuffer } from './reasoning-thought-buffer.js';
+import { scanTurnSignalsAsync, type TurnObservation } from '../lessons/lesson-turn-signals.js';
 import {
   REQUEST_SIZE_MAX_CHARS,
   createRequestSizeGuard,
@@ -179,6 +178,9 @@ export interface CoreTurnBridgeDeps {
   requestSizeRunCompactPipeline?: RunCompactPipeline;
   /** Override the request-size cap (tests). Defaults to `REQUEST_SIZE_MAX_CHARS`. */
   requestSizeMaxChars?: number;
+  /** POST-TURN-LESSON-REVIEW — friction 원장(stateDir) 루트. 생략 시 운영 기본(elanousStateRoot).
+   *  시험은 임시 디렉터리를 주입해 브리지→원장 배선을 직접 검증한다. */
+  lessonStateDir?: string;
 }
 
 /** Default abort-poll cadence. 50ms = 20 Hz: responsive without
@@ -242,6 +244,69 @@ export function extractLastAssistantText(messages: readonly LLMMessage[]): strin
  *  `AcpServerOptions.runTurn`. The returned function runs a single
  *  core turn per ACP prompt and resolves once the turn finishes —
  *  mirrors how the server's echo stub resolves after the round-trip. */
+/** POST-TURN-LESSON-REVIEW r9 — write-gate·정책 거부 문면(원문 실측: code-edit/tools.ts:173
+ * 'Edit failed: …' · apply.ts EditErrorCode.PolicyRejected/UserRejected/ApproverMissing ·
+ * plan-mode 'PlanModeWriteBlocked' · run-core-turn.ts 연구 정책 거부/예산 안내 문구). */
+const WRITE_GATE_REJECT_RE = /edit failed|policy rejected|user rejected|plan mode write blocked|approver missing|research tool allowlist|research tool budget reached/iu;
+
+/** r10 — 오류 종류 분류(비밀 미포함 · Terra mustFix ⑨): 원문 대신 결정적 종류명만 서명에. */
+const TOOL_ERROR_CLASS_RE: readonly [RegExp, string][] = [
+  [/enoent|no such file|command not found/iu, 'enoent'],
+  [/eacces|permission denied/iu, 'eacces'],
+  [/timeout|timed out/iu, 'timeout'],
+  [/network|econnrefused|econnreset|fetch failed/iu, 'network'],
+  [/abort/iu, 'aborted'],
+  [/internal server error|http\s*5\d{2}|status[:=]\s*5\d{2}\b/iu, 'http-5xx'],
+  [/unauthorized|forbidden|http\s*4\d{2}|status[:=]\s*4\d{2}\b/iu, 'http-4xx'],
+];
+function classifyToolError(errorText: string): string {
+  let classHit: string | null = null;
+  for (const [re, name] of TOOL_ERROR_CLASS_RE) if (re.test(errorText)) { classHit = name; break; }
+  // r16 — Terra r15b ③(DELTA-5): 같은 종류로 분류된 서로 다른 오류도 합쳐지지 않도록
+  // 종류명 뒤에 결정적 지문을 항상 붙인다(원문·비밀 노출 0 — 16진수 다이제스트뿐).
+  // 지문 재료: 8자 이상 영숫자 run 이 있으면 그 run 들만, 없으면(짧은 원문) 접은 전문 —
+  // 지문 재료가 아예 없으면(공백·기호만) 'unclassified' 로 합쳐진다(식별 불가능한 오류는 마땅히 그렇다).
+  const runs = errorText.match(/[A-Za-z0-9_-]{8,}/gu) ?? [];
+  const material = runs.length > 0 ? runs.join(' ') : errorText.replace(/\s+/gu, ' ').trim();
+  if (!material) return classHit ?? 'unclassified';
+  let hash = 5381;
+  for (const ch of material) hash = ((hash * 33) ^ (ch.codePointAt(0) ?? 0)) >>> 0;
+  const fp = `${hash.toString(16)}`;
+  return classHit ? `${classHit}-${fp}` : `unclassified-${fp}`;
+}
+
+/**
+ * POST-TURN-LESSON-REVIEW r9 — Terra mustFix ①: 도구 결과 → 턴 신호 관측 변환(브리지 실배선 헬퍼).
+ * 결정적으로 아는 오류 꼴만 관측한다 — 성공 문안을 오류로 오탐하지 않는다:
+ *  - write-gate·정책·예산 거부 문면(`{ output: 'Edit failed: …' }`(tools.ts:173) · `{ error: '…allowlist…' }`
+ *    (run-core-turn.ts 연구 정책) · 같은 문면의 문자열 결과) → land-rejected
+ *  - 그 외 `{ error: string }` → tool-error(원장이 턴 간 이력을 유지 — 2턴째 repeat-error-2)
+ *  - 나머지(성공 output·오류 문면 아닌 문자열·undefined) → 관측 없음
+ */
+export function collectTurnObservations(
+  calls: readonly { id: string; name: string; result: unknown }[],
+): TurnObservation[] {
+  const observations: TurnObservation[] = [];
+  for (const call of calls) {
+    const result = call.result as { error?: unknown; output?: unknown } | string | undefined;
+    const errorText = typeof result === 'object' && result !== null && typeof result.error === 'string'
+      ? result.error
+      : typeof result === 'string' ? result : '';
+    const outputText = typeof result === 'object' && result !== null && typeof result.output === 'string' ? result.output : '';
+    const candidate = errorText || outputText;
+    if (!candidate) continue;
+    if (WRITE_GATE_REJECT_RE.test(candidate)) {
+      observations.push({ kind: 'land-rejected', signature: `write-gate:${call.name}`, ref: `tool:${call.name}` });
+    } else if (errorText) {
+      // r10 — 서명에 원문 오류를 그대로 싣지 않는다(Terra mustFix ⑨): 비밀 꼴은 접고,
+      // 남는 것은 오류 종류만(ENOENT·timeout·HTTP 4xx…). 원문 전문은 어디에도 저장되지 않는다.
+      const errClass = classifyToolError(errorText);
+      observations.push({ kind: 'tool-error', signature: `tool:${call.name}:${errClass}`, ref: `tool:${call.name}` });
+    }
+  }
+  return observations;
+}
+
 export function bridgeCoreTurnToAcp(
   deps: CoreTurnBridgeDeps,
 ): NonNullable<AcpServerOptions['runTurn']> {
@@ -289,7 +354,9 @@ export function bridgeCoreTurnToAcp(
             hasAttachments: turnCtx.promptBlocks?.some((block) => block.type !== 'text') ?? false,
             seat: seat !== null,
           })
-        : { route: '코딩·구현' as const, reason: harness ? 'harness' : 'legacy', goalLoop: true };
+        // CHAT-GOAL-LOOP-DEFAULT-OFF — the legacy (daemon ACP) default is a single core turn; only the harness executor
+        //   (structural explicit-goal signal) keeps the goal loop.
+        : { route: '코딩·구현' as const, reason: harness ? 'harness' : 'legacy', goalLoop: harness };
       const tools = !route.goalLoop && route.route !== '코딩·구현' && route.route !== '읽기·분석'
         ? toolsForTuiRoute(availableTools, route.route) // bridgeCoreTurnToAcp applies route allowlists here.
         : availableTools;
@@ -316,24 +383,11 @@ export function bridgeCoreTurnToAcp(
           debug.log('self-health.autoheal', 'provider-fallback-none', { sessionId: turnCtx.sessionId, error: String(error) }, { level: 'warn' });
         }
       }
-      // Tier 2 arming(config-gated·2026-07-19 goal-exec → 아크4 전-family) — llm.goalLoop.enabled
-      // 면 across-turn goal loop(runGoalLoop)로 감싸 목표 완료(update_goal 증거게이트)까지 지속·
-      // continuation 재주입. **family 무관**(runGoalLoop 프롬프트·update_goal 툴 전부 provider-generic·
-      // 백스톱=max-iter·spin·blocked-3strike·context-pressure). 그 외엔 단일 turn(runCoreTurn).
-      // 하드코딩 기본 ON 아님 — config 로 아밍(안전).
+      // CHAT-GOAL-LOOP-DEFAULT-OFF(0.3.33 · 대표 «골 루프가 해롭다») — ACP 턴의 goal loop 는 «명시 골» 경로 하나:
+      //   목표 문서를 받아 도는 하니스 실행 자식(ELANOUS_HARNESS_ROLE=executor). 사람 TUI·자리 TUI·데몬 ACP·알림 턴은
+      //   단일 core 턴이다. 옛 `llm.goalLoop.enabled` config 스위치는 삭제(로더가 무시하고 한 줄 남긴다).
       const goalLoopCfg = getUserConfig().llm.goalLoop;
-      const armGoalLoop = goalLoopCfg?.enabled === true && route.goalLoop;
-      // 인지(TUI-H1-SEAT-GOALLOOP) — 자리 TUI 의 운영 지시가 그래도 단일 턴이면(예: llm.goalLoop 꺼짐) 경고로 남긴다.
-      // 빠른 짧은 물음(short-*)은 자리에서도 «의도적» 단일 턴이라 경고에서 뺀다(«다음 행이 뭐야?»).
-      if (deps.tuiRouting && seat !== null && !armGoalLoop && !route.reason.startsWith('short-')
-        && isSeatOpsDirective(turnCtx.userText)) {
-        try {
-          debug.log('core-turn.route', 'seat-ops-single-turn', {
-            seat, route: route.route, reason: route.reason, goalLoop: route.goalLoop,
-            goalLoopEnabled: goalLoopCfg?.enabled === true,
-          }, { level: 'warn' });
-        } catch { /* observation cannot interrupt a turn */ }
-      }
+      const armGoalLoop = harness && route.goalLoop;
       // 사실 질문 예산은 «단일 턴» 전용이다 — goal loop 와 겹치면 예산을 다 쓴 뒤에도 루프가 계속 재촉해
       // 매 continuation 이 «Tool budget reached» 로 거부되고, 모델은 그것을 도구 장애로 읽어 blocked 를 남긴다
       // (10-14 13:48 운영 TUI OP: route short-question·goalLoop ⊕ factQuestion → 소진 뒤 헛호출 7회).
@@ -444,6 +498,14 @@ export function bridgeCoreTurnToAcp(
         });
       }
       let toolCallCount = 0;
+      // POST-TURN-LESSON-REVIEW r8 — 이 턴의 신호 관측(도구 오류·write-gate 거부) 누적 버퍼:
+      // onToolResult 에서 쌓고 autoheal 루프 탈출 직후 scanTurnSignals 로 friction 원장·발화에 연결한다.
+      const turnObservations: TurnObservation[] = [];
+      // r12 — Terra r11 [0]: 이 턴의 사람 입력 원문도 관측에 싣는다(사람 정정·«기억해» 문구 검출 — 실제 진입점).
+      // 발화 시 요약 줄이 note 를 대체하므로 사람 원문 전문은 원장 행에 남지 않는다.
+      if (turnCtx.userText.trim()) {
+        turnObservations.push({ kind: 'human-utterance', text: turnCtx.userText.slice(0, 500), ref: `turn:${turnCtx.sessionId.slice(0, 18)}` });
+      }
       const toolKinds = new Set<string>();
       const observeToolBudget = () => {
         try {
@@ -484,11 +546,6 @@ export function bridgeCoreTurnToAcp(
           safeguard: 'context-pressure-bail',
         });
       }
-      // TUI-SEAT-TURN-CAP — 자리 판정으로 goal loop 에 온 턴만 core 턴 상한·«할 일 0» 판정을 받는다(사람 TUI·하니스 자식 0).
-      //   SEAT-TURN-CAP-DEFAULT-15M — chat.seatTurnCap 옵션 삭제로 상한은 기본값 한 벌.
-      const seatTurnCap = armGoalLoop && seat !== null && route.reason.startsWith('seat-')
-        ? { seat, ...SEAT_TURN_CAP_DEFAULTS }
-        : undefined;
       const runTurnDispatch = (c: CoreTurnContext): Promise<unknown> =>
         armGoalLoop
           ? runGoalLoop(c, {
@@ -502,11 +559,6 @@ export function bridgeCoreTurnToAcp(
               ...(goalLoopCfg?.maxIterations !== undefined ? { maxIterations: goalLoopCfg.maxIterations } : {}),
               // HARNESS-ADVISOR-CHECKPOINTS — 하니스 런에서만 코어 ADVISOR(그림자 기본).
               ...((advisor) => advisor ? { advisor } : {})(coreAdvisorForGoalLoop({ userText: c.userText ?? '', signal: c.signal })),
-              // #29 처방 — 자리 판정으로 goal loop 에 «되돌아온» 턴만 빈 evidence 완료를 답으로 받는다.
-              ...(route.reason.startsWith('seat-') ? { lenientCompletionEvidence: true } : {}),
-              ...(seatTurnCap !== undefined ? { seatTurnCap } : {}),
-              // SEAT-CAP-RESUME-NOTICE(연속 큐 미재개) — 상한 소진 마감 직전 자리 우편함에 재개 안내 1통.
-              ...(seatTurnCap !== undefined ? { onSeatCapExhausted: postSeatCapResumeNotice() } : {}),
               ...(goalCtxWindow > 0 ? { contextTokenLimit: goalCtxWindow } : {}),
             })
           : runCoreTurn(c);
@@ -622,7 +674,14 @@ export function bridgeCoreTurnToAcp(
             reasoningThoughts.flush();
             void turnCtx.pushToolCall(call);
           },
-          onToolResult: (call) => { void turnCtx.pushToolResult(call); },
+          onToolResult: (call) => {
+            void turnCtx.pushToolResult(call);
+            // POST-TURN-LESSON-REVIEW r9 — 관측 변환은 collectTurnObservations 로(모듈 헬퍼·직접 시험).
+            // 여기(onToolResult)는 누적만: 턴 종료 지점에서 scanTurnSignals 가 이 배열을 훑는다(Terra mustFix ①).
+            try {
+              turnObservations.push(...collectTurnObservations([call]));
+            } catch { /* 관측 누적 실패가 턴을 무너뜨리지 않는다(fail-soft) */ }
+          },
           // 실제로 응답한 공급자·모델을 기억한다 — 폴백 체인이 넘기면(예 codex → grok) 턴 모델(turnModel)과 달라진다.
           //   streamLLMWithTools 가 스트림을 (다시) 열 때마다 부른다 → 사용량 직전 값 = 그 사용량을 낸 쪽.
           onResolvedProvider: (provider, model) => { resolvedRoute = { provider, model }; lastResolvedProvider = provider; },
@@ -813,6 +872,19 @@ export function bridgeCoreTurnToAcp(
           debug.log('acp.turn', 'autoheal-retry', { sessionId: turnCtx.sessionId, attempt: attempt + 1 });
         } catch { /* observation cannot interrupt a turn */ }
       }
+      // POST-TURN-LESSON-REVIEW r8 — 턴 종료: 누적 관측(도구 오류·write-gate 거부)을 friction 원장·
+      // 신호 발화로 연결한다(Terra mustFix ① — 시험 외 실제 호출처). fail-soft: 스캔 실패가 턴 결과를
+      // 무너뜨리지 않는다. 승인 거절·멈춤도 이 지점에서 관측에 추가된다(stopReason 기반).
+      try {
+        if (stopReason === 'auth_rejected' || stopReason === 'aborted') {
+          turnObservations.push({ kind: stopReason === 'auth_rejected' ? 'approval-refused' : 'stalled', ref: `turn:${turnCtx.sessionId.slice(0, 18)}` });
+        }
+        if (turnObservations.length > 0) {
+          // r12 — 원장 루트는 deps.lessonStateDir(없으면 운영 기본 elanousStateRoot). 시험은 임시 디렉터리 주입.
+          // async 경로 = 값싼 모델 1회 요약(cheapLessonSummarizer · Terra r11 [1]).
+          await scanTurnSignalsAsync(deps.lessonStateDir ? { stateDir: deps.lessonStateDir } : {}, turnObservations);
+        }
+      } catch { /* lesson scan cannot interrupt a turn */ }
       // ⭐ 인증 거절은 코어 턴이 «던지지 않고» 돌려준다 — 여기서 안 읽으면 서버는 end_turn 을 내고
       //   TUI 엔 «✔ 완료»만 남는다(TUI 결함 #22). 던져서 실패 경로(prompt-failed · 오류 줄)로 보낸다.
       if (stopReason === 'auth_rejected') {

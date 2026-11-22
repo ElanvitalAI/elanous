@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { buildBadge, createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, fitAnsi, fitCells, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from './attach-view.js';
+import { buildBadge, createKeyDecoder, createPrefixFilter, drawView, emptyRemoteCoordinators, ENTER_PANE_VIEW, ENTER_VIEW, fitAnsi, fitCells, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, parseRemoteRows, statusLine } from './attach-view.js';
 
 test('fitCells clips by terminal cells (a wide character is two), pads, and never splits a character', () => {
   expect(fitCells('abc', 5)).toBe('abc  ');
@@ -70,6 +70,17 @@ test('fitAnsi: colon-form SGR (underline style/colour) is an escape, OSC 8 links
   expect(fitAnsi(`${E}[4:3;58:5:6mabcdef${E}[0m`, 3)).toBe(`${E}[4:3;58:5:6mabc${E}[0m`);
   expect(fitAnsi(`${E}[4:1mab${E}[0mcd`, 6)).toBe(`${E}[4:1mab${E}[0mcd  `);
   expect(fitAnsi(`${E}[2Kab${E}[?25l`, 3)).toBe('ab ');
+});
+
+test('remote coordinator keeps its workspace name when its first pane appears', () => {
+  const remoteWorkspaces = [{ host: 'node-b', id: 'w123', name: 'Operations', role: 'coordinator', reach: 'up' }];
+  const empty = emptyRemoteCoordinators(JSON.stringify({ remoteWorkspaces }), []);
+  expect(empty[0]?.name).toBe('⇄node-b Operations');
+  const pane = { host: 'node-b', ws: 'w123', address: 'node-b:w123/t/p', pane: 'p', title: 'shell', state: 'idle', reach: 'up', role: 'coordinator' };
+  const rows = parseRemoteRows(JSON.stringify({ remoteWorkspaces, panes: [pane] }));
+  expect(rows[0]?.workspace).toBe(empty[0]?.name);
+  expect(emptyRemoteCoordinators(JSON.stringify({ remoteWorkspaces }), rows)).toEqual([]);
+  expect(parseRemoteRows(JSON.stringify({ panes: [pane] }))[0]?.workspace).toBe('⇄node-b w123');
 });
 
 test('build badge accepts only the display fields allowed in federated pane reports', () => {

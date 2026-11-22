@@ -20,7 +20,7 @@ export interface FederationDeps {
   readonly postJson?: (host: FederatedHost, path: string, payload: unknown) => Promise<{ status: number; body: unknown }>;
 }
 
-interface RemotePane { ws: string; tab: string; pane: string; title: string; cwd: string; state: string; build?: unknown;
+interface RemotePane { ws: string; tab: string; pane: string; title: string; cwd: string; state: string; build?: unknown; role?: 'coordinator';
   /** ELS-TAB-STATE-BADGE: decided once at the origin server; absent when that server is older (state then reads as before). */
   badge?: string; badgeLabel?: string; stalled?: boolean; lastEventAtMs?: number }
 
@@ -40,6 +40,7 @@ function remotePanes(body: unknown, hostName: string): RemotePane[] | undefined 
     if (!reparsed || reparsed.ws !== parts.ws || reparsed.tab !== parts.tab || reparsed.pane !== parts.pane) return undefined;
     rows.push({ ws: parts.ws, tab: parts.tab, pane: parts.pane,
       title: String(pane.title ?? ''), cwd: String(pane.cwd ?? ''), state: String(pane.state ?? ''), build: pane.build,
+      ...(pane.role === 'coordinator' ? { role: 'coordinator' } : {}),
       ...(typeof pane.badge === 'string' ? { badge: pane.badge } : {}),
       ...(typeof pane.badgeLabel === 'string' ? { badgeLabel: pane.badgeLabel } : {}),
       ...(typeof pane.stalled === 'boolean' ? { stalled: pane.stalled } : {}),
@@ -73,11 +74,14 @@ export function createFederation(deps: FederationDeps) {
       }
       const panes: Record<string, unknown>[] = localBody.panes.map((row) => ({ ...row, host: deps.localHost, reach: 'local',
         address: `${deps.localHost}:${String(row.address)}` }));
+      const remoteWorkspaces: { id: string; name: string; host: string; reach: 'up'; role: 'coordinator' }[] = [];
       const remote = await Promise.all(hosts.map(async (host) => {
         try {
           const answer = await deps.fetchJson(host, '/els/ls');
           const rows = answer.status === 200 ? remotePanes(answer.body, host.name) : undefined;
-          return rows ? { host, rows } : { host, error: answer.status === 200 ? 'malformed answer' : `http ${answer.status}` };
+          const body = answer.body as { workspaces?: unknown } | null;
+          const spaces = Array.isArray(body?.workspaces) ? body.workspaces : [];
+          return rows ? { host, rows, spaces } : { host, error: answer.status === 200 ? 'malformed answer' : `http ${answer.status}` };
         } catch (error) {
           return { host, error: reason(error) };
         }
@@ -85,13 +89,20 @@ export function createFederation(deps: FederationDeps) {
       for (const result of remote) {
         if ('error' in result) { hostRows.push({ name: result.host.name, reach: 'down', reason: result.error }); continue; }
         hostRows.push({ name: result.host.name, reach: 'up' });
+        for (const raw of result.spaces) {
+          if (!raw || typeof raw !== 'object') continue;
+          const ws = raw as Record<string, unknown>;
+          if (ws.role === 'coordinator' && typeof ws.id === 'string' && /^[a-zA-Z0-9._-]+$/.test(ws.id) && typeof ws.name === 'string') {
+            remoteWorkspaces.push({ id: ws.id, name: ws.name, host: result.host.name, reach: 'up', role: 'coordinator' });
+          }
+        }
         for (const row of result.rows) {
           panes.push({ ...row, host: result.host.name, reach: 'up',
             address: formatAddress({ host: result.host.name, ws: row.ws, tab: row.tab, pane: row.pane }) });
         }
       }
       return { exitCode: 0, message: JSON.stringify({ hosts: hostRows, ...registryNotes(),
-        workspaces: localBody.workspaces, tabs: localBody.tabs, panes }, null, 2) };
+        workspaces: localBody.workspaces, remoteWorkspaces, tabs: localBody.tabs, panes }, null, 2) };
     },
 
     /** `els do <address> <text>`: local → this host's owner; remote → the owner on that host (never written from here). */

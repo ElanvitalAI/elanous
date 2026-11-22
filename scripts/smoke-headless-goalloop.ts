@@ -21,7 +21,7 @@ async function main(): Promise<void> {
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
 
-  // 베이스 config = .elanous-test/config.json (이미 local/gemma + goalLoop{enabled,maxIterations:10}).
+  // 베이스 config = .elanous-test/config.json (이미 local/gemma + goalLoop{maxIterations:10} · 아밍은 명시 goalLoop).
   const baseCfg = join(repoRoot, '.elanous-test', 'config.json');
   if (!existsSync(baseCfg)) { console.error('베이스 config 없음:', baseCfg); process.exit(2); }
   cpSync(baseCfg, join(dir, 'config.json'));

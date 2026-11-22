@@ -16,6 +16,10 @@ export interface FakeMemberOidcWorldOptions {
   /** Explicit KCB landing page for one test. Omitted calls keep the product default `/members/`. */
   readonly kcbSuccessRedirectUri?: string;
   readonly runTryExample?: NonNullable<Parameters<typeof createMembersApi>[0]['runTryExample']>;
+  readonly reservedJoosungGoogleEmailSha256?: string;
+  readonly pinPublicHandle?: NonNullable<Parameters<typeof createMembersApi>[0]['pinPublicHandle']>;
+  readonly webChatServing?: NonNullable<Parameters<typeof createMembersApi>[0]['webChatServing']>;
+  readonly webChatHandoff?: NonNullable<Parameters<typeof createMembersApi>[0]['webChatHandoff']>;
   /** Test-only app session issuer. Never configure this on a deployed members API. */
   readonly issueOwnerSession?: (appId: string, memberId: string) => { readonly sessionToken: string; readonly expiresAt: string };
   /** Explicit test-universe Nexus authority. Production boot never imports or configures this simulator seam. */
@@ -37,7 +41,8 @@ export interface FakeMemberOidcWorld {
 /** Fake only the Google/network edge; signup, member keys, app slots and lifecycle use production stores and handlers. */
 export function createFakeMemberOidcWorld(options: FakeMemberOidcWorldOptions = {}): FakeMemberOidcWorld {
   const now = options.now ?? Date.now;
-  const memberStore = createMemberStore({ path: ':memory:', now });
+  const memberStore = createMemberStore({ path: ':memory:', now,
+    ...(options.reservedJoosungGoogleEmailSha256 ? { reservedJoosungGoogleEmailSha256: options.reservedJoosungGoogleEmailSha256 } : {}) });
   const appLifecycle = createAppLifecycleStore(':memory:');
   const identity = options.identity ?? ((_url: URL, sequence: number) => ({
     sub: `fake-google-member-${sequence}`,
@@ -73,6 +78,9 @@ export function createFakeMemberOidcWorld(options: FakeMemberOidcWorldOptions = 
     now,
     getAppLifecycle: () => appLifecycle,
     ...(options.runTryExample ? { runTryExample: options.runTryExample } : {}),
+    ...(options.pinPublicHandle ? { pinPublicHandle: options.pinPublicHandle } : {}),
+    ...(options.webChatServing ? { webChatServing: options.webChatServing } : {}),
+    ...(options.webChatHandoff ? { webChatHandoff: options.webChatHandoff } : {}),
     appAuthRedirectUris: ['elanous://auth/callback'],
     issueOwnerSession: options.issueOwnerSession ?? (testNexus
       ? (appSlug, memberId) => testAppHost().issueOwnerSession(appSlug, memberId)

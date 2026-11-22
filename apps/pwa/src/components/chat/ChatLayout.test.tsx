@@ -402,6 +402,18 @@ test('failed or stopped turn still drains queue; pending attachments and meta co
   expect(input.props.attachments).toHaveLength(1);
 });
 
+test('a provider timeout reaches a visible failure and clears the streaming placeholder', async () => {
+  const error = spyOn(toast, 'error').mockImplementation(() => '' as never);
+  try {
+    const { turns, input } = await mount({ acp: false, deferred: true, bare: true });
+    await act(async () => { input.props.onSubmit('첫 웹채팅'); });
+    await act(async () => { turns[0]!.reject(new Error('turn_failed')); });
+    expect(error).toHaveBeenCalledWith('chat failed: turn_failed');
+    const messages = tree!.root.findByType(ChatHistory).props.messages as Array<{ streaming?: boolean; incomplete?: boolean }>;
+    expect(messages.some(message => message.incomplete && message.streaming === false)).toBe(true);
+  } finally { error.mockRestore(); }
+});
+
 test('pending queue caps at five and keeps overflow in composer', async () => {
   const { input, streams } = await mount({ acp: false, deferred: true });
   await act(async () => { input.props.onSubmit('first'); });

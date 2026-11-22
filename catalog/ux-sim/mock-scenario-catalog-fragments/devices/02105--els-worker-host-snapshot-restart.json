@@ -1,0 +1,24 @@
+{
+  "id": "els-worker-host-snapshot-restart",
+  "name": "ELS worker_hosts authenticated snapshot, clock and route-context restart injector",
+  "audience": "internal",
+  "checklistCells": ["ELS-REMOTE-TAB-1", "ELS-REMOTE-TAB-2"],
+  "implementation": ["src/ux-sim/sim-world/els/host-snapshot.ts"],
+  "tests": ["src/ux-sim/sim-world/els/host-snapshot.test.ts"],
+  "target": "Nexus owner-bearer remote ELS host metadata projection",
+  "inputs": [
+    "host A expires before the first authenticated read",
+    "host B rotates principal and endpoint, then is revoked",
+    "Route context and worker_hosts WAL reopen after revocation"
+  ],
+  "observations": [
+    "unauthenticated request returns 401 without reading a snapshot",
+    "each authenticated GET reads one complete worker_hosts snapshot",
+    "old endpoint and revoked endpoint are absent; all rows say readAllowed=false",
+    "revocation survives route-context and WAL reopen"
+  ],
+  "entryCommands": ["eln --test=<isolated-state> sim world run els --seed 33 --engine legacy"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

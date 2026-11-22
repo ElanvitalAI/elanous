@@ -2,7 +2,7 @@ import { hostname } from 'node:os';
 import { prodInstanceRoot } from '../instance/resolve.js';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { getTestStateRoot } from '../nexus/paths.js';
 import { debug } from '../debug/log.js';
@@ -100,14 +100,57 @@ export function deliverCodexMirrorAndRecord(
   return recordCredentialMirror({ slot: CODEX_CREDENTIAL_SLOT, ownerHost, mirrorHost }, ledgerPath);
 }
 
+/** Did the operator select a universe the operational default root would *escape*?
+ *  Two escape shapes (#126554):
+ *   ① a state stamp (`ELANOUS_STATE_DIR`) pointing outside `~/.elanous` — the default root
+ *     is then a different universe's store (fleet remote must read only its stamped mirror).
+ *     An ambient stamp inherited from the spawning runner does NOT count when the config-dir
+ *     override sits inside the home this process pinned at spawn and the default root still
+ *     follows that same home (bun caches homedir at process start; probe 2026-11-22);
+ *   ② a config-dir override in a process whose `homedir()` no longer matches `$HOME`
+ *     (bun's homedir is cached at startup, so a mid-run `$HOME` edit leaves the default-root
+ *     rung pointing at the real host store where it wins by mere file existence).
+ *  A config-dir selection keeps the same-user default root when that root still sits inside
+ *  the home this process pinned at spawn — the first-turn fallback contract (#37169). */
+export function explicitlySelectedUniverse(): boolean {
+  try {
+    const prodRoot = prodInstanceRoot();
+    const { getElanousConfigDirOverride } = require('../elanous-config-dir.js') as typeof import('../elanous-config-dir.js');
+    const override = getElanousConfigDirOverride();
+    const envHome = process.env.HOME?.trim();
+    // #37169 first-turn contract: when the config-dir selection lives inside the home
+    // this process pinned at spawn and the default root still follows that same home,
+    // the default-root rung is this user's own store — an ambient inherited stamp
+    // (test runner / harness session) must not erase it (#126554).
+    const resolvedHome = envHome ? resolve(envHome) : undefined;
+    const sameUserDefaultRoot = Boolean(override && resolvedHome
+      && resolve(prodRoot) === join(resolvedHome, '.elanous')
+      && resolve(override).startsWith(resolvedHome + sep));
+    const stamp = process.env.ELANOUS_STATE_DIR?.trim();
+    if (stamp && resolve(stamp) !== resolve(prodRoot) && !sameUserDefaultRoot) return true;
+    if (override !== undefined) {
+      if (!envHome) return true;
+      return resolve(prodRoot) !== resolve(join(envHome, '.elanous'));
+    }
+    return false;
+  } catch { return false; }
+}
+
 /** Account discovery and rotation must read the same remote snapshot as execution. */
 export function codexAccountReadStorePath(ownerStorePath: string): string {
   // Never inspect an isolated universe's stale auth before a fleet mirror.
   // The caller validates the access-only snapshot at the point of use.
   if (shouldPreferHostCodexMirror()) return codexOwnerMirrorAuthPath();
+  // ⛔⭐ 명시적으로 선택된 비운영 우주는 운영 default-root 로 «탈출하지 않는다» (2026-11-22 · #126554).
+  //   bun 의 homedir() 은 $HOME 이 아니라 OS 사용자를 따르므로, 격리 우주의 후보 탐색이
+  //   실제 호스트의 ~/.elanous/auth.json 을 «파일이 존재한다»는 이유로 이겨 잡을 수 있다 —
+  //   그러면 실행 계정이 호스트 신원 상태에 좌우된다(HQ-VAULT 계약 위반: 임대 우주는
+  //   host mirror 도 default root 도 밟지 않는다). 명시 우주(config override · state 스탬프)가
+  //   아닐 때만 default-root 사다리가 있다.
+  const explicitUniverse = explicitlySelectedUniverse();
   const candidates = [
     ['config-dir', ownerStorePath],
-    ['default-root', join(prodInstanceRoot(), 'auth.json')],
+    ...(explicitUniverse ? [] : [['default-root', join(prodInstanceRoot(), 'auth.json')]] as const),
     ['owner-mirror', codexOwnerMirrorAuthPath()],
   ] as const;
   for (const [source, path] of candidates) {

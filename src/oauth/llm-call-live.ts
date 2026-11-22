@@ -15,6 +15,7 @@ import {
 } from '../nexus/llm-spend-policy/observations.js';
 import { isLlmSpendPolicyRole, type LlmSpendPolicyRole } from '../nexus/llm-spend-policy/types.js';
 import { createCreditRowStateObserver, type CreditAdapterDeps } from '../nexus/llm-spend-policy/credit-adapter.js';
+import { managementLeasesForSpend } from './llm-call-live-lease-source.js';
 import {
   gateLlmCall, readPolicyFromStore, type LlmCallGateDeps, type LlmCallGateRequest, type LlmCallGateResult, type LlmSignalRecord,
 } from './llm-call-gate.js';
@@ -94,7 +95,10 @@ export async function runLiveGate(
   overrides: Partial<LlmCallGateDeps> & { policyDir?: string; credit?: CreditAdapterDeps } = {},
 ): Promise<LlmCallGateResult> {
   const { policyDir, credit, ...rest } = overrides;
-  const deps = { ...(await defaultLiveGateDeps(policyDir, credit !== undefined ? { credit } : {})), ...rest };
+  // #17 production 조달: credit 을 명시하지 않은 호출(사용자가 치는 그대로)도 금고 static lease 사본에서
+  // 관리 키를 조달해 관측기에 넣는다. 임대 없으면 빈 위임 → 관측기 0(missing-management-lease · 네트워크 0).
+  const creditResolved = credit ?? { leases: managementLeasesForSpend() };
+  const deps = { ...(await defaultLiveGateDeps(policyDir, { credit: creditResolved })), ...rest };
   return gateLlmCall(request, deps);
 }
 

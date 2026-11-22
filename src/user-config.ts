@@ -1981,9 +1981,9 @@ function parseTaskAgentConfig(raw: unknown): UserConfig['taskAgent'] {
     return undefined;
   }
   const parentHost = parseTaskAgentParentHost((raw as Record<string, unknown>).parentHost);
-  // TA-REJUDGE-PERIODIC — 음이 아닌 유한수만 산다(0 = 끔). 그 밖은 경고하고 버린다(= 끔 · 기본 부하 상한).
-  const rejudge: { rejudgeEveryMinutes?: number; rejudgeMaxLoad?: number; repairMaxPerTick?: number; rejudgeMaxAgeHours?: number } = {};
-  for (const key of ['rejudgeEveryMinutes', 'rejudgeMaxLoad'] as const) {
+  // TA-REJUDGE-PERIODIC · TA-SWEEP-PERIODIC — 음이 아닌 유한수만 산다(0 = 끔). 그 밖은 경고하고 버린다(= 끔).
+  const rejudge: { rejudgeEveryMinutes?: number; rejudgeMaxLoad?: number; sweepEveryMinutes?: number; repairMaxPerTick?: number; rejudgeMaxAgeHours?: number } = {};
+  for (const key of ['rejudgeEveryMinutes', 'rejudgeMaxLoad', 'sweepEveryMinutes'] as const) {
     const value = (raw as Record<string, unknown>)[key];
     if (value === undefined) continue;
     if (typeof value === 'number' && Number.isFinite(value) && value >= 0) rejudge[key] = value;
@@ -2921,6 +2921,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       // HARNESS-FAILURE-ORACLE-GEN — `on` 만 싣는다(생략 = shadow · 기본 객체 모양은 그대로).
       // COST-OPTIMIZER-WINDOW-AWARE — 같은 꼴: `on` 만 싣는다.
       ...(harness.windowAccounts === 'on' ? { windowAccounts: 'on' as const } : {}),
+      ...(harness.routerMix === 'on' ? { routerMix: 'on' as const } : {}),
       ...(harness.failureOracle === 'on' ? { failureOracle: 'on' as const } : {}),
       exposeGate: harness.exposeGate === 'strict' ? 'strict' : 'warn',
       queue: { seatCap: Object.fromEntries(Object.entries(
@@ -4182,13 +4183,22 @@ function parseCodexReasoning(raw: unknown): { effort?: 'minimal' | 'low' | 'medi
   return (out.effort !== undefined || out.summary !== undefined) ? out : undefined;
 }
 
-function parseGoalLoop(raw: unknown): { enabled?: boolean; maxIterations?: number } | undefined {
+let goalLoopEnabledDeprecationLogged = false;
+
+/** CHAT-GOAL-LOOP-DEFAULT-OFF(0.3.33) — `llm.goalLoop.enabled` 스위치는 삭제됐다. 골 루프는 명시 골 호출자
+ *  (`runTurn({ goalLoop: true })`)만 켠다. 옛 config 에 남은 키는 읽고 버리며, 프로세스당 한 줄만 남긴다. */
+function parseGoalLoop(raw: unknown): { maxIterations?: number } | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const obj = raw as Record<string, unknown>;
-  const out: { enabled?: boolean; maxIterations?: number } = {};
-  if (typeof obj.enabled === 'boolean') out.enabled = obj.enabled;
+  if (obj.enabled !== undefined && !goalLoopEnabledDeprecationLogged) {
+    goalLoopEnabledDeprecationLogged = true;
+    try {
+      debug.log('config', 'deprecated-key', { key: 'llm.goalLoop.enabled', ignored: true, value: obj.enabled }, { level: 'warn' });
+    } catch { /* a log failure cannot break config loading */ }
+  }
+  const out: { maxIterations?: number } = {};
   if (typeof obj.maxIterations === 'number' && obj.maxIterations > 0) out.maxIterations = Math.floor(obj.maxIterations);
-  return (out.enabled !== undefined || out.maxIterations !== undefined) ? out : undefined;
+  return out.maxIterations !== undefined ? out : undefined;
 }
 
 function parseMemoryJudge(raw: unknown): { enabled?: boolean; model?: string; crossRecall?: boolean } | undefined {

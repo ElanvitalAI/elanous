@@ -5,6 +5,10 @@ steward-rejudge:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/rejudge-tick.ts"'
   # The node kills its own `tasks rejudge` child at 600 s; this leaves room for the log line.
   timeout_ms: 660000
+steward-ta-sweep:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/ta-sweep-tick.ts"'
+  # Inline ledger sweep — card reads plus one stop line per stalled card, no child processes.
+  timeout_ms: 60000
 steward-sync:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/triage.ts" sync'
   timeout_ms: 120000

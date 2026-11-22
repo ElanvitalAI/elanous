@@ -64,12 +64,8 @@ function parseSpec(raw: string): Spec {
   return { label, provider, model, baseUrl, isLocal: provider === 'local' };
 }
 
-/** #2 헤드리스 goal-loop 모드 — llm.goalLoop.enabled=true 면 chat 턴을 runGoalLoop 으로 감싸 목표
- *  완료(증거게이트)까지 across-turn 반복(maxIterations 하드캡). 단일턴 chat --tools 와 달리 반복
- *  자기수정 빌드력을 측정(약한 모델이 이터레이션으로 이득). prepStateDir 이 config 로 아밍한다. */
-
 /** 인스턴스별 격리 state-dir 준비 — 베이스 config 복사 후 provider/model override. */
-function prepStateDir(benchRoot: string, spec: Spec, goalLoop = false): string {
+function prepStateDir(benchRoot: string, spec: Spec): string {
   const dir = join(benchRoot, spec.label);
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
@@ -103,7 +99,6 @@ function prepStateDir(benchRoot: string, spec: Spec, goalLoop = false): string {
       // openai-codex 는 OAuth(별도 토큰스토어) — apiKey 주입 불가. 복사된 config 의 codex 인증에 의존.
     }
     // #2 goal-loop 모드 — across-turn 반복 아밍(증거게이트까지). 단일턴 대신 반복 자기수정.
-    if (goalLoop) { cfg(['config', 'set', 'llm.goalLoop.enabled', 'true']); }
   } catch (e: any) { console.error(`[bench] ${spec.label} config override 경고: ${String(e?.message ?? e).slice(0, 120)}`); }
   return dir;
 }
@@ -113,8 +108,7 @@ function prepStateDir(benchRoot: string, spec: Spec, goalLoop = false): string {
  *  tool-loop(Read/Grep/Edit/Write/Bash)을 헤드리스로 직접 돈다. cwd=worktree → Write/Edit 가 워크트리에
  *  쓰고, `git diff` 로 산출물 회수. config-dir 격리로 모델별 provider/키 적용.
  *  ⭐ goalLoop=true 면 `--goal-loop` 로 canonical goal-loop(runGoalLoop) 아밍 — across-turn 반복
- *  자기수정(증거게이트 GOAL-COMPLETE 까지). prepStateDir 이 config `llm.goalLoop.enabled` 도 켜므로
- *  이중 아밍(플래그+config)이지만 chat 은 둘 중 하나만 true 여도 아밍(동일 SSOT). single-turn 과 대비. */
+ *  자기수정(증거게이트 GOAL-COMPLETE 까지). 아밍 경로는 이 플래그 하나다(CHAT-GOAL-LOOP-DEFAULT-OFF). */
 async function runSpec(_spec: Spec, stateDir: string, goal: string, timeoutMs: number, goalLoop = false): Promise<{ worktree: string | null; completed: boolean; note: string; }> {
   const wt = join(stateDir, 'worktree');
   try { execFileSync('git', ['worktree', 'remove', '--force', wt], { cwd: repoRoot, stdio: 'ignore' }); } catch { /* 없음 */ }
@@ -221,7 +215,7 @@ async function main(): Promise<void> {
   async function execOne(spec: Spec): Promise<Result> {
     const specLoop = goalLoopMode || loopLabels.has(spec.label); // 전역 또는 라벨 지정 시 반복 아밍
     const specAug = augEnabled || augLabels.has(spec.label);      // 전역 또는 라벨 지정 시 프롬프트 보강
-    const dir = prepStateDir(benchRoot, spec, specLoop);
+    const dir = prepStateDir(benchRoot, spec);
     // 모델별 goal — 보강 활성 시 전역 완료규율 + 프로바이더별 맞춤 보강 append.
     const g = specAug ? goal + GLOBAL_AUG + (PER_PROVIDER_AUG[spec.provider] ?? '') : goal;
     console.error(`[bench] ▶ ${spec.label} 시작…${specLoop ? ' [goal-loop]' : ''}${specAug ? ` [augmented${PER_PROVIDER_AUG[spec.provider] ? '+' + spec.provider : ''}]` : ''}`);

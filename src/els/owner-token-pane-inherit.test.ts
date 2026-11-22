@@ -12,6 +12,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { requestEls } from './client.js';
 import { elsSocketPath, startElsServer } from './server.js';
+import { guardElsProcesses, reapElsProcesses } from './test-support/els-process-guard.js';
+
+guardElsProcesses();
 
 // The train TMPDIR is long and unix socket paths are limited (103 bytes): keep the state dir short.
 const SOCKET_SAFE_TMP = tmpdir().length > 40 ? '/tmp' : tmpdir();
@@ -50,6 +53,7 @@ interface PaneRun { readonly env: string; readonly ownerToken: string }
 async function paneEnvDump(): Promise<PaneRun> {
   const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-oti-'));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+  cleanups.push(async () => { await reapElsProcesses(); });   // runs after server.close: the holders it detached die here
   const server = await startElsServer({ stateRoot: root });
   if ('exitCode' in server) throw new Error(server.message);
   cleanups.push(() => server.close());

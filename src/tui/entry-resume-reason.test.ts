@@ -210,7 +210,7 @@ test('Ctrl+C queued human reaches actual fake provider with default interruption
   const root = join(base, 'seats', 'MX13REASON'); const home = join(base, 'home');
   const capture = join(root, 'requests.jsonl');
   mkdirSync(root, { recursive: true }); mkdirSync(join(home, 'elanous-hq', 'seat-state', 'MX13REASON'), { recursive: true });
-  writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false }, llm: { goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } } }));
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false }, llm: { memoryJudge: { enabled: false, crossRecall: false } } }));
   let keep = false;
   try {
     const result = await mockSeatPtySequence({ executable: process.execPath,
@@ -232,7 +232,10 @@ test('Ctrl+C queued human reaches actual fake provider with default interruption
     expect(inputs.filter(x => x === `${INTERRUPTED_ON_PURPOSE_NOTE}\n\nqueued human`)).toHaveLength(1);
     expect(inputs.some(x => x.includes('Esc로') && x.includes('queued human'))).toBe(false);
     expect(inputs.filter(x => x === 'later human')).toHaveLength(1);
-    expect(inputs.filter(x => x.includes(INTERRUPTED_ON_PURPOSE_NOTE))).toHaveLength(1);
+    // CHAT-GOAL-LOOP-DEFAULT-OFF — a seat turn is now the ordinary core turn (no seat goal loop), whose research
+    // preparation call quotes the request; only the model turns (not that planning call) must carry the note once.
+    const turnInputs = inputs.filter(x => !x.startsWith('Prepare the result contract'));
+    expect(turnInputs.filter(x => x.includes(INTERRUPTED_ON_PURPOSE_NOTE))).toHaveLength(1);
   } catch (error) { keep = true; console.error('artifacts', base); throw error; }
   finally { if (!keep) rmSync(base, { recursive: true, force: true }); }
 }, 100_000);

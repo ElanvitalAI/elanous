@@ -21,11 +21,15 @@ test('capsule-events registers one default C1 and the other scenes with literal 
     { id: 'C5', module: 'src/ux-sim/sim-world/capsule-events/c5-wakeup.ts' },
     { id: 'C6', module: 'src/ux-sim/sim-world/capsule-events/c6-boot-backlog.ts' },
     { id: 'C4', module: 'src/ux-sim/sim-world/capsule-events/c4-agent-background.ts' },
-    { id: 'C3-ESC', module: 'src/ux-sim/sim-world/capsule-events/c3-esc-cancel.ts' }]);
+    { id: 'C3-ESC', module: 'src/ux-sim/sim-world/capsule-events/c3-esc-cancel.ts' },
+    { id: 'C1-HARNESS', module: 'src/ux-sim/sim-world/capsule-events/c1-harness.ts' }]);
   expect(simWorldScenarios.map(row => row.id)).toEqual(['C1', 'C5', 'C6']);
-  expect(table.entries['capsule-events/C1']).toEqual({ expect: 'red',
-    reason: "C1 background Agent axis: agent-end delivery passes (exactly one delivery); mail and harness sources remain unmeasured — redReason follows the scenario's own partial-red reason (was the stale pre-fix catch reason, wrong-reason-red since #38582)",
-    redReason: 'C1 mail and harness axes unmeasured' });
+  expect(table.entries['capsule-events/C1']).toEqual({ expect: 'green',
+    reason: "C1 done-event wake axes (flag removed — capsule behavior always on, CAPSULE-FLAGS-REMOVE-DEFAULT): the background Agent end delivery passes here (exactly one wake turn within 20s, duplicates 0) and the harness child end frame is green in capsule-events/C1-HARNESS (B4/B5 queue-bridge); the mail axis keeps its own red row capsule-events/C1-MAIL",
+    greenSince: '2026-11-21 pool4-capsule-c1-harness' });
+  expect(table.entries['capsule-events/C1-HARNESS']).toEqual({ expect: 'green',
+    reason: "C1 harness child end axis (CAPSULE-B4-HARNESS-DONE-FRAME · B5 queue-bridge): a RunShell mode:'bg' harness child finishes while the seat is idle, its task-notification crosses as one capsule-done frame and opens exactly one next turn within 20s with duplicates 0 — self-implement-stop ('harness' kind) and graph frames remain unmeasured: sim probes at a 20s window (probe-c1-harness-selfimpl-221754) and a 60s window (probe-b-c1-harness-60s-223600) both record stopCount 0, so the axis stays unmeasured (JUD-B #122985)",
+    greenSince: '2026-11-21 pool4-capsule-c1-harness' });
   expect(table.entries['capsule-events/C7']).toEqual({ expect: 'red',
     reason: 'C7 partial MCP axis; provider, harness, and deadline event remain unmeasured',
     redReason: 'silent MCP holds the main turn' });

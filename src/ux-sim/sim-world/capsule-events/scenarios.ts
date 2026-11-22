@@ -1,6 +1,7 @@
 // C1 background-agent axis: actual TUI and child REPL; the LLM is the external fake device.
-// The other C1 sources are not measured by this scenario yet; this cannot certify all of C1.
-// Capsule behavior is always enabled; measure one default configuration, not historical stage variants.
+// The C1 wake axes: this scene measures the background Agent end (exactly one wake turn within 20s, duplicates 0);
+// the harness child end frame is measured by capsule-events/C1-HARNESS (B4/B5 queue-bridge) and the mail axis keeps
+// its own red row capsule-events/C1-MAIL. Capsule behavior is always enabled; measure one default configuration.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { mockSeatPtySequence } from '../../mock-seat-pty-sequence.js';
@@ -36,7 +37,7 @@ const c1Scene: SimWorldScenario = {
       });
       const count = delivered().length;
       ctx.recorder.event('c1-agent-delivery', { count, exitCode: run.exitCode });
-      if (run.exitCode === 0 && count === 1) return { ok: false, reason: 'C1 mail and harness axes unmeasured', diff: 'agent delivery passed; C1 mail and harness sources are not yet measured' };
+      if (run.exitCode === 0 && count === 1) return { ok: true };
       return { ok: false, reason: 'background agent completion delivered more than once', diff: `exit ${run.exitCode}, deliveries ${count}` };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

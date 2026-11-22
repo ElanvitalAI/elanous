@@ -1,0 +1,8 @@
+# SIM-WORLD machine-infra pack (SIM-WORLD-0333-DEVICES): ops-heal failure injection — restart persistence, dead lock holder reclaim, concurrent processes, provider refusal (CX-15 원문 · scenarios SHA 052cd31d…).
+schema: 1
+world: machine-infra
+scenarios:
+  - { id: OPS-HEAL-RESTART, module: src/ux-sim/sim-world/machine-infra/scenarios.ts }
+  - { id: OPS-HEAL-DEAD-LOCK, module: src/ux-sim/sim-world/machine-infra/scenarios.ts }
+  - { id: OPS-HEAL-CONCURRENT, module: src/ux-sim/sim-world/machine-infra/scenarios.ts }
+  - { id: OPS-HEAL-PROVIDER-REFUSE, module: src/ux-sim/sim-world/machine-infra/scenarios.ts }

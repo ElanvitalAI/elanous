@@ -68,7 +68,7 @@ beforeEach(() => {
   compactConfig = { archiveEnabled: false };
   coreImpl = async () => ({ stopReason: 'end_turn', finalText: '' });
   spyOn(userConfigModule, 'getUserConfig').mockReturnValue({
-    llm: { model: 'gpt-5.6-terra', goalLoop: { enabled: false } },
+    llm: { model: 'gpt-5.6-terra' },
     chat: {
       factQuestion: { maxToolTurns: 3 },
       autoCompact: { enabled: true, triggerRatio: 0.9, preserveLastN: 2, preserveFirstN: 0, partial: true, workingBudgetTokens: 128_000 },

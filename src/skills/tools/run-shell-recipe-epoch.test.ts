@@ -1,0 +1,35 @@
+import { expect, test } from 'bun:test';
+import { generateKeyPairSync } from 'node:crypto';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { checkRecipeEpoch } from './run-shell-recipe-epoch.js';
+import { readRecipeTrustAnchor, recipeRevocationStateHash } from './run-shell-recipe-trust.js';
+import { readRecipeHighwater } from './run-shell-recipe-highwater.js';
+
+test('epoch check rereads both files and fails closed for changed state', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'recipe-epoch-'));
+  const trustPath = join(dir, 'trust.json'), highPath = join(dir, 'high.json');
+  const publicKeyPem = generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const hash = 'a'.repeat(64);
+  const anchor = { schema: 1, epoch: 2, publicKeyPem, retired: false, revokedRecipeHashes: [] as string[] };
+  const writeAnchor = () => writeFileSync(trustPath, JSON.stringify(anchor), { mode: 0o600 });
+  const writeHigh = (epoch: number) => writeFileSync(highPath, JSON.stringify({ schema: 2, epoch, revocationStateSha256: recipeRevocationStateHash(anchor) }), { mode: 0o600 });
+  const readers = { trust: () => readRecipeTrustAnchor(trustPath, process.getuid?.() ?? 0), highwater: () => readRecipeHighwater(highPath) };
+  expect(checkRecipeEpoch(hash, readers).ok).toBe(false);
+  writeAnchor(); writeHigh(2);
+  expect(checkRecipeEpoch(hash, readers)).toEqual({ ok: true, epoch: 2, publicKeyPem });
+  writeHigh(3);
+  expect(checkRecipeEpoch(hash, readers)).toEqual({ ok: false, reason: 'epoch-mismatch' });
+  writeHigh(1);
+  expect(checkRecipeEpoch(hash, readers)).toEqual({ ok: false, reason: 'epoch-mismatch' });
+  writeHigh(2); anchor.revokedRecipeHashes = [hash]; writeAnchor();
+  expect(checkRecipeEpoch(hash, readers)).toEqual({ ok: false, reason: 'revocation-state-mismatch' });
+  anchor.epoch = 3; writeAnchor(); writeHigh(3);
+  expect(checkRecipeEpoch(hash, readers)).toEqual({ ok: false, reason: 'recipe-revoked-by-anchor' });
+  anchor.revokedRecipeHashes = []; anchor.retired = true; writeAnchor();
+  expect(checkRecipeEpoch(hash, readers)).toEqual({ ok: false, reason: 'revocation-state-mismatch' });
+  anchor.epoch = 4; writeAnchor(); writeHigh(4);
+  expect(checkRecipeEpoch(hash, readers)).toEqual({ ok: false, reason: 'trust-epoch-retired' });
+  expect(checkRecipeEpoch('bad', readers)).toEqual({ ok: false, reason: 'invalid-recipe-hash' });
+});

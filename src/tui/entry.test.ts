@@ -11,6 +11,8 @@
  * src/tui/turn-start-segments.ts · src/tui/input-lag-probe.ts)는 실물로 돈다 —
  * 닫힌 턴의 줄은 실제 지연 emit(박동 두 번)까지 기다려 읽는다.
  */
+// This suite imports the RunShell runtime; bootstrap the shared test key first.
+import '../shell-primitive/runshell-test-issuer.js';
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -205,6 +207,7 @@ mock.module('../tui.js', () => ({
 mock.module('../tui-client/local-chat-turn.js', () => ({
   setNextSidetabHandler: (handler: NextSidetabHandler | null) => { nextSidetabHandler = handler; },
   setNextTuiShellApprovalHandler: (handler: ((command: string, callId: string) => Promise<boolean | ApprovalOutcome>) | null) => { shellApprovalHandler = handler; },
+  setNextRunShellCardHandler: () => {},
   setNextTuiShellApprovalCancelHandler: (handler: typeof shellApprovalCancelHandler) => { shellApprovalCancelHandler = handler; },
   runLocalChatTurn: async (
     sessionId: string,

@@ -1,4 +1,5 @@
 import { textOnly } from '../llm/stream-text.js';
+import { streamChatLedgered } from '../llm/ledgered-call.js';
 // ── 회고 리포트 생성 (R1 · retro-report · 2026-07-08) ─────────────────────
 //
 // PeriodSummary(R0) → REFLECTION-<period>-<date>.md. 결정론 base(순수 렌더) +
@@ -116,7 +117,7 @@ export async function narrateRetro(summary: PeriodSummary): Promise<string | und
       { role: 'user', content: base },
     ];
     let text = '';
-    for await (const delta of textOnly(provider.streamChat(messages, { temperature: 0.3, maxTokens: 320 }))) {
+    for await (const delta of textOnly(streamChatLedgered(provider, messages, { temperature: 0.3, maxTokens: 320 }, { site: 'domain-retro-report', jobKind: 'domain-report' }))) {
       text += delta;
     }
     return text.trim() || undefined;

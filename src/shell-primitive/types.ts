@@ -29,6 +29,8 @@ export interface ShellRequest {
   /** Env vars MERGED into process.env for the child (child copies the
    *  parent env; keys here override). */
   env?: Record<string, string>;
+  /** Use the SHELL-ISOLATION-TRIAGE child allowlist instead of inheriting the parent environment. */
+  envPolicy?: 'allowlist';
   /** Approval policy.
    *   'none'         — run unconditionally (skill author trusted).
    *   'first-time'   — prompt on first instance of this commandKey,
@@ -53,6 +55,8 @@ export interface ShellRequest {
   signal?: AbortSignal;
   /** CAPSULE-A2 — called once the process is spawned (after any approval wait): the capsule sync clock starts here. */
   onSpawn?: () => void;
+  /** Parent session identity for signed RunShell approvals. */
+  runShellSessionId?: string;
   /** Max bytes captured per stream (stdout + stderr). Past this,
    *  head+tail with truncation marker. Default SHELL_MAX_OUTPUT. */
   maxOutputChars?: number;

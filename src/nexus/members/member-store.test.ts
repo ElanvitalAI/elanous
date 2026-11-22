@@ -14,7 +14,9 @@ test('member plan is read from the catalog and free includes relay access', () =
   const member = store.register({ sub: 'google-sub', email: 'member@example.test', emailVerified: true, name: 'Member' }, {
     consents: { privacy: 'rev-1', terms: 'rev-1' },
   });
-  expect(store.memberPlanForMember(member.id)).toEqual({ plan: 'free', entitlements: { 'relay.connect': true } });
+  expect(store.memberPlanForMember(member.id)).toEqual({ plan: 'free', entitlements: { 'relay.connect': true,
+    'backup.sync': true, 'backup.maxSyncBytes': 268435456, 'backup.maxGenerations': 64,
+    'backup.dataKinds': ['sessions', 'memory', 'settings'] } });
 
   store.provisionPlan({ plan: 'catalog-row', entitlements: { feature: true } });
   expect(store.assignPlan(member.id, 'catalog-row')).toBe(true);
@@ -106,6 +108,143 @@ test('explicitly revoked free relay entitlement survives store reopening', () =>
     store = createMemberStore({ path });
     expect(store.memberPlanForMember(member.id)?.entitlements['relay.connect']).toBe(false);
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('explicit backup.sync removal and edited limits survive store reopening (defaults are one-shot)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'member-backup-defaults-'));
+  const path = join(dir, 'members.sqlite');
+  let store = createMemberStore({ path });
+  try {
+    const member = store.register({ sub: 'backup-sub', email: 'backup@example.test', emailVerified: true, name: 'Backup' },
+      { consents: { privacy: 'v1', terms: 'v1' } });
+    // Explicit operator edit: revoke sync and set a custom byte ceiling.
+    store.provisionPlan({ plan: 'free', entitlements: { 'relay.connect': true, 'backup.sync': false,
+      'backup.maxSyncBytes': 1024, 'backup.maxGenerations': 3,
+      'backup.dataKinds': ['sessions'] } });
+    store.close();
+    store = createMemberStore({ path });
+    const entitlements = store.memberPlanForMember(member.id)?.entitlements;
+    expect(entitlements?.['backup.sync']).toBe(false);
+    expect(entitlements?.['backup.maxSyncBytes']).toBe(1024);
+    expect(entitlements?.['backup.maxGenerations']).toBe(3);
+    expect(entitlements?.['backup.dataKinds']).toEqual(['sessions']);
+    // Reopening again must still not re-offer the defaults.
+    store.close();
+    store = createMemberStore({ path });
+    expect(store.memberPlanForMember(member.id)?.entitlements?.['backup.sync']).toBe(false);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('pre-marker partial backup entitlements stay untouched and keep failing closed (all-or-nothing fill)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'member-backup-prefill-'));
+  const path = join(dir, 'members.sqlite');
+  let store = createMemberStore({ path });
+  try {
+    const member = store.register({ sub: 'prefill-sub', email: 'prefill@example.test', emailVerified: true, name: 'Pre' },
+      { consents: { privacy: 'v1', terms: 'v1' } });
+    // Operator edit predating the first fill: a tuned byte ceiling with sync intentionally absent.
+    store.provisionPlan({ plan: 'free', entitlements: { 'relay.connect': true, 'backup.maxSyncBytes': 2048 } });
+    store.close();
+    // A racing opener's marker insert never landed: the next open migrates again — and must
+    // treat any backup.* key as explicit operator state: no default top-up, sync stays absent,
+    // and the row keeps failing closed (quota-unavailable) at read time.
+    const raw = new Database(path);
+    try { raw.query(`DELETE FROM member_store_migration WHERE id='free-backup-defaults-v2'`).run(); }
+    finally { raw.close(); }
+    store = createMemberStore({ path });
+    const entitlements = store.memberPlanForMember(member.id)?.entitlements;
+    expect(entitlements?.['backup.maxSyncBytes']).toBe(2048);
+    expect(entitlements?.['backup.sync']).toBeUndefined();
+    expect(entitlements?.['backup.maxGenerations']).toBeUndefined();
+    expect(entitlements?.['backup.dataKinds']).toBeUndefined();
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('pre-marker clean free row without any backup key gains the full default set in one shot', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'member-backup-clean-'));
+  const path = join(dir, 'members.sqlite');
+  let store = createMemberStore({ path });
+  try {
+    const member = store.register({ sub: 'clean-sub', email: 'clean@example.test', emailVerified: true, name: 'Clean' },
+      { consents: { privacy: 'v1', terms: 'v1' } });
+    // Simulate a pre-feature database: the free row carries no backup.* key and the marker is absent.
+    store.close();
+    const raw = new Database(path);
+    try {
+      raw.query(`UPDATE member_plan_catalog SET entitlements_json = '{"relay.connect":true}' WHERE plan = 'free'`).run();
+      raw.query(`DELETE FROM member_store_migration WHERE id='free-backup-defaults-v2'`).run();
+    } finally { raw.close(); }
+    store = createMemberStore({ path });
+    const entitlements = store.memberPlanForMember(member.id)?.entitlements;
+    expect(entitlements?.['backup.sync']).toBe(true);
+    expect(entitlements?.['backup.maxSyncBytes']).toBe(268435456);
+    expect(entitlements?.['backup.maxGenerations']).toBe(64);
+    expect(entitlements?.['backup.dataKinds']).toEqual(['sessions', 'memory', 'settings']);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v1-migrated database never re-offers defaults: an operator-emptied free row stays empty', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'member-backup-v1-marker-'));
+  const path = join(dir, 'members.sqlite');
+  let store = createMemberStore({ path });
+  try {
+    const member = store.register({ sub: 'v1-sub', email: 'v1@example.test', emailVerified: true, name: 'V1' },
+      { consents: { privacy: 'v1', terms: 'v1' } });
+    // A database that ran the v1 fill, after which the operator removed every backup.* key
+    // (a deliberate full deprovision). The row looks clean again — v2 must not refill it.
+    store.close();
+    const raw = new Database(path);
+    try {
+      raw.query(`DELETE FROM member_store_migration WHERE id='free-backup-defaults-v2'`).run();
+      raw.query(`INSERT OR REPLACE INTO member_store_migration (id) VALUES ('free-backup-defaults-v1')`).run();
+      raw.query(`UPDATE member_plan_catalog SET entitlements_json = '{"relay.connect":true}' WHERE plan = 'free'`).run();
+    } finally { raw.close(); }
+    store = createMemberStore({ path });
+    const entitlements = store.memberPlanForMember(member.id)?.entitlements;
+    expect(entitlements?.['backup.sync']).toBeUndefined();
+    expect(entitlements?.['backup.maxSyncBytes']).toBeUndefined();
+    expect(entitlements?.['backup.maxGenerations']).toBeUndefined();
+    expect(entitlements?.['backup.dataKinds']).toBeUndefined();
+    // The v1 completion is respected forever: v2 never even writes its marker there.
+    const check = new Database(path);
+    try {
+      const v2 = check.query(`SELECT COUNT(*) AS n FROM member_store_migration WHERE id='free-backup-defaults-v2'`).get() as { n: number };
+      expect(v2.n).toBe(0);
+    } finally { check.close(); }
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('concurrent openers stay crash-free: the loser skips the fill and a lost marker refills without clobbering edits', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'member-backup-atomic-'));
+  const path = join(dir, 'members.sqlite');
+  const first = createMemberStore({ path });
+  const second = createMemberStore({ path });
+  try {
+    const member = first.register({ sub: 'atomic-sub', email: 'atomic@example.test', emailVerified: true, name: 'Atomic' },
+      { consents: { privacy: 'v1', terms: 'v1' } });
+    first.provisionPlan({ plan: 'free', entitlements: { 'relay.connect': true, 'backup.sync': true,
+      'backup.maxSyncBytes': 4096, 'backup.maxGenerations': 2, 'backup.dataKinds': ['sessions'] } });
+    // The second opener saw the marker and skipped the fill — it must stay readable and unharmed.
+    expect(second.memberPlanForMember(member.id)?.entitlements?.['backup.maxSyncBytes']).toBe(4096);
+    // The marker insert of a racing opener is lost: the next open wins the fill again.
+    // INSERT OR IGNORE can never crash into the primary key; the all-or-nothing fill keeps the edits.
+    const raw = new Database(path);
+    try { raw.query(`DELETE FROM member_store_migration WHERE id='free-backup-defaults-v2'`).run(); }
+    finally { raw.close(); }
+    const third = createMemberStore({ path });
+    try {
+      const entitlements = third.memberPlanForMember(member.id)?.entitlements;
+      expect(entitlements?.['backup.sync']).toBe(true);
+      expect(entitlements?.['backup.maxSyncBytes']).toBe(4096);
+      expect(entitlements?.['backup.maxGenerations']).toBe(2);
+      expect(entitlements?.['backup.dataKinds']).toEqual(['sessions']);
+      const check = new Database(path);
+      try {
+        const marker = check.query(`SELECT COUNT(*) AS n FROM member_store_migration WHERE id='free-backup-defaults-v2'`).get() as { n: number };
+        expect(marker.n).toBe(1);
+      } finally { check.close(); }
+    } finally { third.close(); }
+  } finally { first.close(); second.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('signup issues one private member key and rotation invalidates the old key', () => {

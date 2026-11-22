@@ -1,0 +1,14 @@
+graph_id: op-on-eln-world
+version: 1
+loop:
+  title: OP 격리 운영 시뮬레이션
+  description: 가짜 자리·우편·PR 원장·시계·기억을 주입해 eln OP의 결정을 채점한다.
+  trigger: { events: [manual] }
+entry_node: simulate
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: simulate, kind: agent, recipe: 'cmd:op-on-eln-world', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: simulate, on: outcome, map: { ok: done, fail: failed, error: failed } }

@@ -11,6 +11,8 @@ export interface Workspace {
   readonly rootCwd: string;
   readonly purpose: string;
   readonly host: string;
+  /** Explicit coordinator assignment; absent on ordinary and legacy workspaces. */
+  readonly role?: 'coordinator';
 }
 
 export interface Tab {
@@ -27,6 +29,10 @@ export interface Pane {
   readonly kind: PaneKind;
   readonly title: string;
   readonly cwd: string;
+  /** A validated OSC 7 was observed during this pane's PTY lifetime. */
+  readonly cwdOsc7?: true;
+  /** Unvalidated OSC candidates checkpointed at graceful shutdown, oldest first. */
+  readonly cwdOscPending?: readonly string[];
   readonly command: readonly string[];
   readonly state: PaneState;
   readonly restore: RestorePolicy;
@@ -40,7 +46,16 @@ export interface Pane {
   readonly ownerSeat?: string;
 }
 
+export interface CoordinatorAudit {
+  readonly at: string;
+  readonly op: 'coordinator' | 'coordinator-unset';
+  readonly result: string;
+  readonly peerPid?: number;
+}
+
 export interface SpaceJournal {
+  /** Authoritative coordinator audit; committed in the same journal replacement as the assignment. */
+  readonly coordinatorAudit?: CoordinatorAudit[];
   readonly version: 1;
   readonly workspaces: Workspace[];
   readonly tabs: Tab[];

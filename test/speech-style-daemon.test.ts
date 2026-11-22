@@ -28,7 +28,7 @@ function turnCtx(sessionId: string, isAborted: () => boolean, pushes: string[]):
 function fixedConfig() {
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
-    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: false } },
+    ...base, llm: { ...base.llm, model: 'gpt-4o-mini' },
   });
 }
 

@@ -304,7 +304,7 @@ describe('llm-cost-ledger balance reconcile', () => {
     expect(printed).toContain('alert reconcile-diff');
   });
 
-  it('prints the unchanged ledger when no provider balance is supplied', () => {
+  it('prints the ledger plus the seat axis when no provider balance is supplied', () => {
     expectReconcileApi();
     const out: string[] = [];
     const summary = main(process.cwd(), {
@@ -323,6 +323,8 @@ describe('llm-cost-ledger balance reconcile', () => {
       `partialModels ${PRICED_MODEL}`,
       'rows 3',
       'incomplete false',
+      // TOKEN-BURN-BY-SEAT: fixture 3행 모두 스탬프 이전 — seat 줄 없이 unstamped 계수만(OP #132232 수정1).
+      'unstamped 3',
     ].join('\n'));
   });
 });

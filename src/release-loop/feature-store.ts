@@ -39,8 +39,16 @@ const SCHEMA_COLUMNS: Record<string, readonly string[]> = {
   assignments: ['priority', 'predecessors', 'deadline_version', 'ceo_minutes', 'ceo_date', 'accelerator', 'refs', 'dispatch_kind', 'known_issue'],
   release_schedules: ['freeze_from', 'freeze_until', 'publish_at'],
 };
+// RELEASE-CHECKLIST-BULK-MOVE: snapshot() read `events WHERE version = ? ORDER BY seq` over ~59k rows with no index and
+// items() ran one evidence lookup per cell — both full scans. These follow the actual query columns.
+const SCHEMA_INDEXES: Record<string, string> = {
+  events_version_seq: 'CREATE INDEX IF NOT EXISTS events_version_seq ON events(version, seq)',
+  events_feature_seq: 'CREATE INDEX IF NOT EXISTS events_feature_seq ON events(feature_id, seq)',
+  evidence_feature_version: 'CREATE INDEX IF NOT EXISTS evidence_feature_version ON evidence(feature_id, version)',
+};
 function schemaCurrent(db: Database): boolean {
-  return Object.entries(SCHEMA_COLUMNS).every(([table, names]) => {
+  const indexes = new Set((db.query("SELECT name FROM sqlite_master WHERE type = 'index'").all() as Array<{ name: string }>).map((row) => row.name));
+  return Object.keys(SCHEMA_INDEXES).every((name) => indexes.has(name)) && Object.entries(SCHEMA_COLUMNS).every(([table, names]) => {
     const columns = new Set((db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name));
     return names.every((name) => columns.has(name));
   });
@@ -86,6 +94,7 @@ function open(root = releaseLedgerRoot()): Database {
       }
       const scheduleColumns = db.query('PRAGMA table_info(release_schedules)').all() as Array<{ name: string }>;
       for (const name of ['freeze_from', 'freeze_until', 'publish_at']) if (!scheduleColumns.some((column) => column.name === name)) db.exec(`ALTER TABLE release_schedules ADD COLUMN ${name} TEXT`);
+      for (const sql of Object.values(SCHEMA_INDEXES)) db.exec(sql);
     }).immediate();
     return db;
   } catch (error) { db.close(); throw error; }
@@ -462,28 +471,54 @@ export function remove(version: string, id: string, by: string, released = relea
     return true;
   });
 }
+/**
+ * RELEASE-CHECKLIST-BULK-MOVE: move every id in ONE write transaction — all of them or none.
+ * Every id is checked first (present in `from`, absent from `to`, given once); any problem throws before the first UPDATE.
+ * No snapshot is built here: the caller reads the board only when it prints JSON.
+ */
+export function moveMany(ids: readonly string[], from: string, to: string, by: string, released = releasedVersion(), dev = devVersion(), reason?: string, options: { clearDisposition?: boolean } = {}): string[] {
+  return moveOnLedger(ids, from, to, by, released, dev, reason, options, false).moved;
+}
 export function move(id: string, from: string, to: string, by: string, released = releasedVersion(), dev = devVersion(), reason?: string, options: { clearDisposition?: boolean } = {}): Checklist {
+  return moveOnLedger([id], from, to, by, released, dev, reason, options, true).snapshot!;
+}
+function moveOnLedger(ids: readonly string[], from: string, to: string, by: string, released: string, dev: string, reason: string | undefined, options: { clearDisposition?: boolean }, withSnapshot: boolean): { moved: string[]; snapshot?: Checklist } {
   validateVersion(from); validateVersion(to);
   if (from === to) throw new CliUserError('같은 판으로 옮길 수 없다');
+  if (!ids.length) throw new CliUserError('옮길 칸 id 가 없다');
+  const repeated = [...new Set(ids.filter((id, index) => ids.indexOf(id) !== index))];
+  if (repeated.length) throw new CliUserError(`같은 칸을 두 번 주었다: ${repeated.join(', ')} — 아무 칸도 옮기지 않았다`);
   const db = open();
   try {
     let importedFrom = false; let importedTo = false;
     const result = transaction(db, () => {
       importedFrom = importOnDb(db, from); importedTo = importOnDb(db, to);
-      const item = items(db, from).find((i) => i.id === id);
-      if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
-      const collision = items(db, to).find((i) => i.id === id);
-      if (collision) throw new CliUserError(`이미 있는 칸: ${JSON.stringify(id).slice(1, -1)} — ${to} · 담당 ${JSON.stringify(collision.owner ?? '-').slice(1, -1)} · ${collision.title.replace(/\s+/g, ' ').slice(0, 40)}`);
+      const present = db.query('SELECT 1 FROM assignments a JOIN features f ON f.id = a.feature_id WHERE a.feature_id = ? AND a.version = ?');
+      const missing = ids.filter((id) => !present.get(id, from));
+      if (missing.length) throw new CliUserError(`없는 칸: ${missing.join(', ')}${ids.length > 1 ? ' — 아무 칸도 옮기지 않았다' : ''}`, 'list 로 칸 목록을 본다');
+      const target = db.query(`SELECT a.owner, COALESCE(a.title_override, f.title) AS title FROM assignments a JOIN features f ON f.id = a.feature_id
+        WHERE a.feature_id = ? AND a.version = ?`);
+      const collisions = ids.flatMap((id) => {
+        const row = target.get(id, to) as { owner: string | null; title: string } | null;
+        return row ? [`${JSON.stringify(id).slice(1, -1)} — ${to} · 담당 ${JSON.stringify(row.owner ?? '-').slice(1, -1)} · ${row.title.replace(/\s+/g, ' ').slice(0, 40)}`] : [];
+      });
+      if (collisions.length) throw new CliUserError(`이미 있는 칸: ${collisions.join(' / ')}${ids.length > 1 ? ' — 아무 칸도 옮기지 않았다' : ''}`);
       const at = new Date().toISOString();
-      db.query('UPDATE assignments SET version = ?, updated_at = ?, updated_by = ? WHERE feature_id = ? AND version = ?').run(to, at, by, id, from);
-      if (options.clearDisposition) db.query('UPDATE assignments SET disposition = NULL WHERE feature_id = ? AND version = ?').run(id, to);
-      db.query('UPDATE evidence SET version = ? WHERE feature_id = ? AND version = ?').run(to, id, from);
-      record(db, to, { at, by, id, field: 'move', from, to, released, dev, ...(reason !== undefined ? { reason } : {}) });
-      return snapshot(db, to, released, dev);
+      const updateAssignment = db.query('UPDATE assignments SET version = ?, updated_at = ?, updated_by = ? WHERE feature_id = ? AND version = ?');
+      const clearDisposition = db.query('UPDATE assignments SET disposition = NULL WHERE feature_id = ? AND version = ?');
+      const updateEvidence = db.query('UPDATE evidence SET version = ? WHERE feature_id = ? AND version = ?');
+      for (const id of ids) {
+        updateAssignment.run(to, at, by, id, from);
+        if (options.clearDisposition) clearDisposition.run(id, to);
+        updateEvidence.run(to, id, from);
+        record(db, to, { at, by, id, field: 'move', from, to, released, dev, ...(reason !== undefined ? { reason } : {}) });
+      }
+      return { moved: [...ids], ...(withSnapshot ? { snapshot: snapshot(db, to, released, dev) } : {}) };
     });
     if (importedFrom) debug.log('release.features', 'imported', { version: from });
     if (importedTo) debug.log('release.features', 'imported', { version: to });
-    debug.log('release.features', 'moved', { id, from, to, by });
+    if (ids.length === 1) debug.log('release.features', 'moved', { id: ids[0], from, to, by });
+    else debug.log('release.features', 'moved', { ids: [...ids], count: ids.length, from, to, by });
     return result;
   } finally { db.close(); }
 }

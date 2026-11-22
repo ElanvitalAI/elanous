@@ -103,6 +103,7 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
       difficultyRouter: cfg.harness?.difficultyRouter === 'on' ? 'on' : undefined,
       failureOracle: cfg.harness?.failureOracle === 'on' ? 'on' : undefined,
       windowAccounts: cfg.harness?.windowAccounts === 'on' ? 'on' : undefined,
+      routerMix: cfg.harness?.routerMix === 'on' ? 'on' : undefined,
       defaultRepo: cfg.harness?.defaultRepo ?? rawHarness.defaultRepo,
       repo: cfg.harness?.repo,
       substrate: cfg.harness?.substrate,

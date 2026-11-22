@@ -14,7 +14,10 @@ import {
 import { applyClaudeMemoryImport, claudeMemoryRoot, collectClaudeMemoryFiles } from '../context-bus/claude-memory-import.js';
 import { importClaudeMemories } from '../context-bus/long-term-memory.js';
 import { buildSeatMemoryIndexBlock, normalizeSeat, rebuildSeatMemoryIndex, seatMemoryDir } from '../seat-memory/seat-memory.js';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { applySeatMemoryImport, planSeatMemoryImport, summarizeSeatMemoryImport, type SeatMemoryImportPlan } from '../seat-memory/seat-memory-import.js';
+import { OP_SEED_ALLOWED_SOURCE_ROOTS, OP_SEED_DECISIONS_RECENT_DEFAULT, applyOpMemorySeed, planOpMemorySeed, summarizeOpMemorySeed, type OpMemorySeedPlan } from '../seat-memory/op-memory-seed.js';
 
 export function registerMemoryCommands(program: Command): void {
   const memCmd = program.command('memory').description('Persistent memories injected into every chat turn (user / feedback / project / reference)');
@@ -208,6 +211,42 @@ export function registerMemoryCommands(program: Command): void {
     if (plan.supplementalIndex) console.log(`  unindexed reference ${plan.supplementalIndex.file}`);
     for (const [reason, count] of Object.entries(summary.skippedByReason)) console.log(`  skipped ${reason}: ${count}`);
     // 비밀처럼 보인 파일은 이름만(본문·일치 값 0).
+    for (const name of summary.refusedNames) console.log(`  refused (secret-pattern): ${name}`);
+    if (!opts.apply) console.log('  re-run with --apply to write');
+  });
+
+  // ELN-OP-MEMORY-SEED (TC-H-CC-1 · OP #128162 · 11-22) — 진단 DIAG-ELN-OP-COORDINATOR-1122 §2·지렛대 4.
+  // Claude OP 기억(⭐ 색인) ⊕ OPS-RULES 핵심 ⊕ DECISIONS 최근 행 ⊕ LANDING 노하우 머리를
+  // OP 자리 기억 저장소에 한 번에 시딩한다. 원본 읽기 전용 · 기본 미리보기 · --apply 일 때만 쓴다.
+  memCmd
+  .command('seed-op')
+  .description('Seed the OP seat memory store from Claude OP memories + OPS-RULES + recent DECISIONS + LANDING knowhow (dry-run unless --apply; sources read-only)')
+  .option('--claude-dir <dir>', 'Claude Code OP memory dir (read-only source)', join(homedir(), '.claude', 'projects', '-Users-user-elanous-hq-repo-git', 'memory'))
+  .option('--ops-rules <path>', 'OPS-RULES.md path (read-only source)', join(homedir(), 'elanous-hq', 'seat-state', 'OPS', 'OPS-RULES.md'))
+  .option('--decisions <path>', 'DECISIONS-OP.tsv path (read-only source)', join(homedir(), 'elanous-hq', 'seat-state', 'OP', 'DECISIONS-OP.tsv'))
+  .option('--landing <path>', 'LANDING-KNOWHOW.md path (read-only source)', join(homedir(), 'elanous-hq', 'seat-state', 'OP', 'LANDING-KNOWHOW.md'))
+  // JUD 보안(jud-39558-649412ff0298 · OP #130135/#130136 «목적지 OP 고정») — --seat/--to 선택지 폐지.
+  // OP 원본을 타 자리 저장소로 옮기는 길을 CLI 표면에서 완전히 닫는다(목적지 = <memoryRoot>/seats/OP 고정).
+  .option('--decisions-recent <n>', 'recent DECISIONS rows to keep', '25')
+  .option('--apply', 'write the files (default: dry-run preview)')
+  .action((opts: { claudeDir: string; opsRules: string; decisions: string; landing: string; decisionsRecent: string; apply?: boolean }) => {
+    // 목적지 OP 고정(JUD 보안 jud-39558-649412ff0298) — 선택지 폐지로 <memoryRoot>/seats/OP 만 가능.
+    const seat = 'OP';
+    let plan: OpMemorySeedPlan;
+    try {
+      plan = planOpMemorySeed({
+        claudeDir: opts.claudeDir, opsRulesPath: opts.opsRules, decisionsPath: opts.decisions, landingPath: opts.landing,
+        allowedSourceRoots: [...OP_SEED_ALLOWED_SOURCE_ROOTS],
+        to: seatMemoryDir(seat), seat,
+        decisionsRecent: parseInt(opts.decisionsRecent, 10) || OP_SEED_DECISIONS_RECENT_DEFAULT,
+      });
+    } catch (error) { ui.error(error instanceof Error ? error.message : String(error)); process.exit(1); }
+    const applied = opts.apply ? applyOpMemorySeed(plan) : null;
+    const summary = summarizeOpMemorySeed(plan, Boolean(applied));
+    ui.header(`seat memory seed-op ${opts.apply ? '(applied)' : '(dry-run — nothing written)'} → ${plan.to}`);
+    console.log(`  create ${summary.create} · update ${summary.update} · same ${summary.same} · skipped ${summary.skipped} · index lines dropped ${plan.indexDroppedLines}`);
+    console.log(`  generated: ${summary.generated.join(', ') || 'none'}`);
+    for (const [reason, count] of Object.entries(summary.skippedByReason)) console.log(`  skipped ${reason}: ${count}`);
     for (const name of summary.refusedNames) console.log(`  refused (secret-pattern): ${name}`);
     if (!opts.apply) console.log('  re-run with --apply to write');
   });

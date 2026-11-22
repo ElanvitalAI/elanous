@@ -453,10 +453,64 @@ describe('tui exit handlers are start-gated', () => {
     });
   }, 10_000);
 
-  // ⭐ TUI-ESC-ABORT-TOOLS (2026-10-15) — 바깥 키(`pty key` · 제어 IPC input-key)는 `injectKey`
-  //    큐로 들어온다. 턴 중 키를 받는 스트리밍 리스너가 그 큐를 비우지 않으면 Esc 가 escGate 에
-  //    닿지 않고 턴 끝까지 잠든다(TUI 결함 #60 · #40). 반증: takeInjectedKeys 배수를 빼면 두 시험이 깨진다.
-  test('PTY streaming listener receives an injected Escape within 1s', async () => {
+  test('physical Ctrl+Q overtakes a backlog of synthetic wake keys', async () => {
+    const { code, stdout } = await runPtyChild(`
+      const { initTui, injectKey, readKey } = await import(${JSON.stringify(TUI_PATH)});
+      initTui(false);
+      const wake = { name: '', ctrl: false, shift: false, raw: '' };
+      for (let i = 0; i < 137; i++) injectKey(wake);
+      process.nextTick(() => process.stdin.emit('data', Buffer.from('\\x11')));
+      const first = await readKey();
+      const second = await readKey();
+      process.stdout.write('KEY-PRIORITY:' + JSON.stringify({ first: [first.name, first.ctrl], second: [second.name, second.ctrl] }) + '\\n');
+      process.exit(0);
+    `, { signal: 'SIGTERM' });
+    const marked = stdout.match(/KEY-PRIORITY:(\{.*\})/);
+    expect(code).toBe(0);
+    expect(marked?.[1]).toBeTruthy();
+    expect(JSON.parse(marked![1]!)).toEqual({ first: ['q', true], second: ['', false] });
+  }, 10_000);
+
+  test('physical Ctrl+Q resolves before an incomplete UTF-8 tail', async () => {
+    const { code, stdout } = await runPtyChild(`
+      const { initTui, readKey } = await import(${JSON.stringify(TUI_PATH)});
+      initTui(false);
+      const reading = readKey();
+      process.stdin.emit('data', Buffer.from([0x11, 0xe2]));
+      const before = await Promise.race([reading.then((key) => [key.name, key.ctrl]),
+        new Promise((resolve) => setTimeout(() => resolve('timeout'), 100))]);
+      process.stdin.emit('data', Buffer.from([0x82, 0xac]));
+      process.stdout.write('UTF8-CTRLQ:' + JSON.stringify({ before }) + '\\n');
+      process.exit(0);
+    `, { signal: 'SIGTERM' });
+    const marked = stdout.match(/UTF8-CTRLQ:(\{.*\})/);
+    expect(code).toBe(0);
+    expect(JSON.parse(marked![1]!)).toEqual({ before: ['q', true] });
+  }, 10_000);
+
+  test('injected ordinary key cannot update the physical human-key clock', async () => {
+    const { code, stdout } = await runPtyChild(`
+      const { initTui, injectKey, readKey, lastHumanKeyAt } = await import(${JSON.stringify(TUI_PATH)});
+      initTui(false);
+      const before = lastHumanKeyAt();
+      injectKey({ name: 'x', ctrl: false, shift: false });
+      await readKey();
+      const afterSynthetic = lastHumanKeyAt();
+      process.nextTick(() => process.stdin.emit('data', Buffer.from('q')));
+      await readKey();
+      const afterPhysical = lastHumanKeyAt();
+      process.stdout.write('KEY-ORIGIN:' + JSON.stringify({ before, afterSynthetic, afterPhysical }) + '\\n');
+      process.exit(0);
+    `, { signal: 'SIGTERM' });
+    const marked = stdout.match(/KEY-ORIGIN:(\{.*\})/);
+    expect(code).toBe(0);
+    expect(marked?.[1]).toBeTruthy();
+    const row = JSON.parse(marked![1]!) as { before: number; afterSynthetic: number; afterPhysical: number };
+    expect(row.afterSynthetic).toBe(row.before);
+    expect(row.afterPhysical).toBeGreaterThan(row.afterSynthetic);
+  }, 10_000);
+
+  test('synthetic Esc and Ctrl+Q are refused; physical Escape still reaches the streaming listener', async () => {
     const { code, stdout } = await runPtyChild(`
       const { initTui, injectKey } = await import(${JSON.stringify(TUI_PATH)});
       const { attachStreamingKeys } = await import(${JSON.stringify(CHAT_PATH)});
@@ -465,21 +519,23 @@ describe('tui exit handlers are start-gated', () => {
       const cleanup = attachStreamingKeys((key) => { got.push(key.name); });
       await new Promise((r) => setTimeout(r, 50));
       const t0 = Date.now();
-      injectKey({ name: 'escape', ctrl: false, shift: false });
+      const syntheticEsc = injectKey({ name: 'escape', ctrl: false, shift: false });
+      const syntheticQuit = injectKey({ name: 'q', ctrl: true, shift: false });
+      process.stdin.emit('data', Buffer.from('\\x1b'));
       while (!got.includes('escape') && Date.now() - t0 < 1000) await new Promise((r) => setTimeout(r, 10));
       cleanup();
-      process.stdout.write('STREAM-KEYS:' + JSON.stringify({ got, withinMs: Date.now() - t0 }) + '\\n');
+      process.stdout.write('STREAM-KEYS:' + JSON.stringify({ got, syntheticEsc, syntheticQuit, withinMs: Date.now() - t0 }) + '\\n');
       process.exit(0);
     `, { signal: 'SIGTERM', timeoutMs: 45_000 });
     const marked = stdout.match(/STREAM-KEYS:(\{.*\})/);
     expect(marked?.[1]).toBeTruthy();
     expect(code).toBe(0);
     const parsed = JSON.parse(marked![1]!) as { got: string[]; withinMs: number };
-    expect(parsed.got).toEqual(['escape']);
+    expect(parsed).toMatchObject({ got: ['escape'], syntheticEsc: false, syntheticQuit: false });
     expect(parsed.withinMs).toBeLessThan(1000);
   }, 60_000);
 
-  test('PTY onEscAbort aborts the controller on an injected Escape within 1s (incl. key queued before attach)', async () => {
+  test('PTY onEscAbort ignores synthetic Escape but aborts on physical Escape within 1s', async () => {
     const { code, stdout } = await runPtyChild(`
       const { initTui, injectKey } = await import(${JSON.stringify(TUI_PATH)});
       const { onEscAbort } = await import(${JSON.stringify(CHAT_PATH)});
@@ -488,28 +544,24 @@ describe('tui exit handlers are start-gated', () => {
       const cleanupLive = onEscAbort(live);
       await new Promise((r) => setTimeout(r, 50));
       const t0 = Date.now();
-      injectKey({ name: 'escape', ctrl: false, shift: false });
+      const refused = injectKey({ name: 'escape', ctrl: false, shift: false });
+      await new Promise((r) => setTimeout(r, 30));
+      const beforePhysical = live.signal.aborted;
+      process.stdin.emit('data', Buffer.from('\\x1b'));
       while (!live.signal.aborted && Date.now() - t0 < 1000) await new Promise((r) => setTimeout(r, 10));
       const liveMs = Date.now() - t0;
       cleanupLive();
-      // 턴 시작 «전»에 주입돼 큐에 남은 Esc — attach 직후 배수로 받는다.
-      injectKey({ name: 'escape', ctrl: false, shift: false });
-      const queued = new AbortController();
-      const t1 = Date.now();
-      const cleanupQueued = onEscAbort(queued);
-      while (!queued.signal.aborted && Date.now() - t1 < 1000) await new Promise((r) => setTimeout(r, 10));
-      cleanupQueued();
-      process.stdout.write('ESC-ABORT:' + JSON.stringify({ live: live.signal.aborted, liveMs, queued: queued.signal.aborted, queuedMs: Date.now() - t1 }) + '\\n');
+      process.stdout.write('ESC-ABORT:' + JSON.stringify({ refused, beforePhysical, live: live.signal.aborted, liveMs }) + '\\n');
       process.exit(0);
     `, { signal: 'SIGTERM', timeoutMs: 45_000 });
     const marked = stdout.match(/ESC-ABORT:(\{.*\})/);
     expect(marked?.[1]).toBeTruthy();
     expect(code).toBe(0);
-    const parsed = JSON.parse(marked![1]!) as { live: boolean; liveMs: number; queued: boolean; queuedMs: number };
+    const parsed = JSON.parse(marked![1]!) as { refused: boolean; beforePhysical: boolean; live: boolean; liveMs: number };
+    expect(parsed.refused).toBe(false);
+    expect(parsed.beforePhysical).toBe(false);
     expect(parsed.live).toBe(true);
     expect(parsed.liveMs).toBeLessThan(1000);
-    expect(parsed.queued).toBe(true);
-    expect(parsed.queuedMs).toBeLessThan(1000);
   }, 60_000);
 
   test('PTY readKey keeps ownership of injected keys while it is awaiting', async () => {

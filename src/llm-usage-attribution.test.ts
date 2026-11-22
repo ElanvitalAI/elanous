@@ -3,7 +3,7 @@ import { debug } from './debug/log.js';
 import { judgeGoalTurn } from './goals/judge.js';
 import { analyzeDiff } from './grok.js';
 import * as llm from './llm.js';
-import { PROVIDERS, streamLLM, type LLMProvider } from './llm.js';
+import { PROVIDERS, streamLLM, streamLLMWithTools, type LLMProvider } from './llm.js';
 import { setUserConfigOverlay } from './user-config.js';
 
 // Tests here inject fixture providers; a global ELANOUS_TEST_FAKE_LLM=1 (gate pods) is a forced-fake fence that outranks
@@ -81,6 +81,42 @@ test('streamLLM attributes measured and unmeasured usage to its active model', a
       usage: 'unmeasured',
     }),
   ]);
+  expect(observed.usage).toEqual([
+    expect.objectContaining({ model: 'measured-model', inputTokens: 12, outputTokens: 3 }),
+    expect.objectContaining({ model: 'unmeasured-model', billingProvider: 'unmeasured-provider',
+      measured: false, missingReason: 'provider-usage-absent', cost: { kind: 'unknown', model: 'unmeasured-model' } }),
+  ]);
+  expect(observed.usage[1]).not.toHaveProperty('inputTokens');
+  expect(observed.usage[1]).not.toHaveProperty('outputTokens');
+});
+
+test('tool-loop records a bounded unknown-cost row when the provider finishes without usage', async () => {
+  const provider: LLMProvider = { name: 'silent-usage-provider', defaultModel: 'silent-model', available: () => true,
+    async *chat() { yield 'unused'; }, async *streamChat() { yield { type: 'text', delta: 'answer' }; } };
+  const observed = await observeAttempts(async () => {
+    expect(await streamLLMWithTools([{ role: 'user', content: 'question' }],
+      { onText() {}, dispatchTool: async () => 'unused' }, { provider, model: 'silent-model',
+        tools: [{ name: 'noop', description: 'noop', parameters: { type: 'object', properties: {} } }] })).toBe('answer');
+  });
+  expect(observed.usage).toEqual([expect.objectContaining({ site: 'stream-llm-with-tools',
+    model: 'silent-model', billingProvider: 'silent-usage-provider', measured: false,
+    cost: { kind: 'unknown', model: 'silent-model' } })]);
+});
+
+test('tool-loop records a failed provider attempt without inventing tokens or zero cost', async () => {
+  const provider: LLMProvider = { name: 'failed-tool-provider', defaultModel: 'failed-tool-model', available: () => true,
+    async *chat() { yield 'unused'; }, async *streamChat() { throw new Error('synthetic provider outage'); } };
+  const observed = await observeAttempts(async () => {
+    await expect(streamLLMWithTools([{ role: 'user', content: 'question' }],
+      { onText() {}, dispatchTool: async () => 'unused' }, { provider, model: 'failed-tool-model',
+        tools: [{ name: 'noop', description: 'noop', parameters: { type: 'object', properties: {} } }] }))
+      .rejects.toThrow('synthetic provider outage');
+  });
+  expect(observed.usage).toEqual([expect.objectContaining({ site: 'stream-llm-with-tools',
+    model: 'failed-tool-model', billingProvider: 'failed-tool-provider', measured: false,
+    missingReason: 'provider-call-failed', cost: { kind: 'unknown', model: 'failed-tool-model' } })]);
+  expect(observed.usage[0]).not.toHaveProperty('inputTokens');
+  expect(observed.usage[0]).not.toHaveProperty('outputTokens');
 });
 
 test('streamLLM forced fake fences provider, initialProvider, and session pin', async () => {

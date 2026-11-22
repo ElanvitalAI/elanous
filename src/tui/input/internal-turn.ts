@@ -34,6 +34,7 @@ export interface InternalTurnRequest {
   reason?: string;
   /** The agent seat this turn delivers for (see `StartTurnIfIdleOptions.from`). */
   from?: import('../../session/index.js').MessageSource;
+  workReferences?: StartTurnIfIdleOptions['workReferences'];
 }
 
 export interface InternalTurnGateDeps {
@@ -242,7 +243,8 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
       idBeforePending = lastId;
       unclaimedBeforePending = idUnclaimed;
       pending = { turnId, input: text, origin, ...(opts.reason ? { reason: opts.reason } : {}),
-        ...(opts.from?.kind === 'agent' ? { from: opts.from } : {}) };
+        ...(opts.from?.kind === 'agent' ? { from: opts.from } : {}),
+        ...(opts.workReferences ? { workReferences: opts.workReferences } : {}) };
       // ⭐ 물러남은 textInput 의 몫 — 버퍼가 비었을 때만 true 를 낸다(입력칸 무접촉).
       let yielded = false;
       try { yielded = requestYield(); } catch { yielded = false; }

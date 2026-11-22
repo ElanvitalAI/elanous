@@ -153,7 +153,7 @@ export function checklistCandidates(seat: string, versions: readonly SelfPullChe
       ordinal++;
       if (ownerSeat(item.owner) !== want) continue;
       candidates.push({
-        source: 'checklist', id: item.id, title: item.title, owner: item.owner ?? null,
+        source: 'checklist', checklistVersion: v.version, id: item.id, title: item.title, owner: item.owner ?? null,
         open: OPEN_CELL.has(item.status), rank, ordinal,
         addedAt: isoMs(v.addedAt?.get(item.id) ?? item.updatedAt),
         predecessors: item.predecessors ?? [], origin: `checklist ${v.version}`,
@@ -314,6 +314,28 @@ export function createDefaultSelfPullGather(deps: DefaultSelfPullSourceDeps = {}
 
 // ── autowake 기본 배선 ────────────────────────────────────────────────────────────────
 
+/** Re-read only the explicitly versioned checklist reference, just before opening the turn.
+ * Queue ids are not necessarily checklist ids; no relationship is inferred from their text. */
+export function selfPullOwnerLine(
+  seat: string,
+  item: SelfPullCandidate,
+  readChecklist: (version: string) => readonly Pick<SelfPullChecklistItem, 'id' | 'owner'>[],
+): string {
+  if (item.source !== 'checklist' || !item.checklistVersion || !seat.trim()) {
+    return '[주인 확인] 확인 불가 — 조사 전에 원장과 담당자를 직접 확인하세요.';
+  }
+  try {
+    const matches = readChecklist(item.checklistVersion).filter(row => row.id === item.id);
+    const owner = matches.length === 1 ? ownerSeat(matches[0]!.owner) : null;
+    if (!owner) return '[주인 확인] 확인 불가 — 조사 전에 원장과 담당자를 직접 확인하세요.';
+    return owner === seat.trim().toUpperCase()
+      ? `[주인 확인] 이 일의 주인 = ${owner} (이 자리) · 조사 전 담당 이력을 확인하세요.`
+      : `[주인 확인] 이 일의 주인 = ${owner} · 조사 전에 담당자에게 묻기 우선.`;
+  } catch {
+    return '[주인 확인] 확인 불가 — 조사 전에 원장과 담당자를 직접 확인하세요.';
+  }
+}
+
 export interface AutowakeSelfPullHookDeps {
   /** H2 내부 턴 문(autowake 와 같은 문). */
   startTurnIfIdle: (input: string, opts: StartTurnIfIdleOptions) => StartTurnIfIdleResult;
@@ -332,8 +354,16 @@ export function createAutowakeSelfPullHook(deps: AutowakeSelfPullHookDeps): (ctx
     isEnabled: (seat) => isSelfPullEnabled(seat, home),
     gather: createDefaultSelfPullGather({ home }),
     handOff: (picked) => {
-      const opened = deps.startTurnIfIdle(formatSelfPullPrompt(picked.seat, picked.item, picked.reason),
-        { origin: deps.origin ?? 'autowake', reason: `자기 집기 ${picked.item.id}` });
+      const ownerLine = selfPullOwnerLine(picked.seat, picked.item, version => {
+        const { listChecklist } = require('../../release-loop/checklist.js') as typeof import('../../release-loop/checklist.js');
+        const { releaseLedgerRoot } = require('../../instance/resolve.js') as typeof import('../../instance/resolve.js');
+        return listChecklist(version, releaseLedgerRoot()).items;
+      });
+      const opened = deps.startTurnIfIdle(`${ownerLine}\n${formatSelfPullPrompt(picked.seat, picked.item, picked.reason)}`,
+        { origin: deps.origin ?? 'autowake', reason: `자기 집기 ${picked.item.id}`,
+          ...(picked.item.source === 'checklist' && picked.item.checklistVersion
+            ? { workReferences: [{ kind: 'cell' as const, id: picked.item.id, version: picked.item.checklistVersion }] }
+            : {}) });
       return opened.opened ? { accepted: true } : { accepted: false, detail: opened.reason };
     },
     postToOp: (seat, line) => {

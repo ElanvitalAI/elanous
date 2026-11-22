@@ -16,7 +16,7 @@ beforeEach(async () => { sender = await createBackupSenderKeyPair(); });
 afterEach(() => { for (const fn of cleanup.splice(0)) fn(); });
 const text = (value: string) => new Uint8Array(Buffer.from(value, 'utf8'));
 const encryptMemberBackup = (plaintext: Uint8Array, recoveryPublicKey: Uint8Array,
-  input: { id?: string; generation?: number } = {}) =>
+  input: { id?: string; generation?: number; dataKind?: string } = {}) =>
   encryptSignedMemberBackup(plaintext, recoveryPublicKey, sender, input);
 const decryptMemberBackup = (value: unknown, recovery: { publicKey: Uint8Array; secretKey: Uint8Array },
   expected: { id: string; minGeneration: number }) =>
@@ -35,6 +35,11 @@ function world() {
   };
   const alice = member('alice');
   const bob = member('bob');
+  // 'secrets' is explicit opt-in only (OP #130717 ①): the shipped secret-backup client's
+  // kind rides a provisioned catalog row here, never a free default.
+  store.provisionPlan({ plan: 'free', entitlements: { 'relay.connect': true, 'backup.sync': true,
+    'backup.maxSyncBytes': 268435456, 'backup.maxGenerations': 64,
+    'backup.dataKinds': ['sessions', 'memory', 'settings', 'secrets'] } });
   const call = (token: string | null, method: string, path: string, body?: unknown,
     headers: Record<string, string> = {}, server = api) =>
     server.handle(new Request(`https://fake-storage.example.test${path}`, {
@@ -66,7 +71,7 @@ test('free member encrypts before fake-server upload; server persists ciphertext
     expect(db.query('PRAGMA table_info(member_backup)').all().map((x: any) => x.name)).not.toContain('plaintext');
   } finally { db.close(); }
   const listed = await w.call(w.alice.token, 'GET', w.base);
-  expect(await listed.json()).toEqual({ backups: [{ id: envelope.id, generation: 1, sha256: envelope.sha256 }] });
+  expect(await listed.json()).toMatchObject({ backups: [{ id: envelope.id, generation: 1, sha256: envelope.sha256 }] });
   const denied = await w.call(null, 'GET', `${w.base}/${envelope.id}`);
   expect(denied.status).toBe(401);
   const downloaded = await w.call(w.alice.token, 'GET', `${w.base}/${envelope.id}`);
@@ -86,7 +91,7 @@ test('fake server denies cross-member GET, list and forged owner fields without 
   const envelope = await encryptMemberBackup(text('SYNTHETIC-A'), recovery.publicKey);
   expect((await w.call(w.alice.token, 'POST', w.base, envelope, { 'if-match': '"0"', 'idempotency-key': 'a' })).status).toBe(201);
   expect((await w.call(w.bob.token, 'GET', `${w.base}/${envelope.id}`)).status).toBe(404);
-  expect(await (await w.call(w.bob.token, 'GET', w.base)).json()).toEqual({ backups: [] });
+  expect(await (await w.call(w.bob.token, 'GET', w.base)).json()).toMatchObject({ backups: [] });
   const foreignRotation = await encryptMemberBackup(text('SYNTHETIC-B'), recovery.publicKey,
     { id: envelope.id, generation: 2 });
   expect((await w.call(w.bob.token, 'PUT', `${w.base}/${envelope.id}`, foreignRotation,

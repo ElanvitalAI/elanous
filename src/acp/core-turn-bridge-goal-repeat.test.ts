@@ -14,8 +14,16 @@ import type { LLMMessage, LLMProvider, LLMStreamEvent } from '../llm.js';
 import * as config from '../user-config.js';
 import type { AcpTurnContext } from './server.js';
 import { bridgeCoreTurnToAcp, extractLastAssistantText } from './core-turn-bridge.js';
+import { HARNESS_ROLE_ENV } from '../harness/harness-space.js';
 
-afterEach(() => mock.restore());
+// CHAT-GOAL-LOOP-DEFAULT-OFF — the bridge goal loop runs only for the harness executor (explicit goal), so this file
+// drives that role instead of the deleted `llm.goalLoop.enabled` switch.
+const savedHarnessRole = process.env[HARNESS_ROLE_ENV];
+afterEach(() => {
+  mock.restore();
+  if (savedHarnessRole === undefined) delete process.env[HARNESS_ROLE_ENV];
+  else process.env[HARNESS_ROLE_ENV] = savedHarnessRole;
+});
 
 // 골 루프 시나리오: iteration 1 은 update_goal(complete, evidence 비어)로 반려되고
 // (GOAL_EVIDENCE_REQUIRED_PROMPT 재주입), iteration 2 는 증거를 채워 완료한다. 두 iteration
@@ -40,12 +48,13 @@ function goalRepeatProvider(rounds: LLMStreamEvent[][]): LLMProvider {
 }
 
 function setup() {
+  process.env[HARNESS_ROLE_ENV] = 'executor';
   const pushes: string[] = [];
   const persisted: LLMMessage[][] = [];
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
     ...base,
-    llm: { ...base.llm, provider: 'openai', model: 'gpt-5.6', fallbackChain: [], goalLoop: { enabled: true } },
+    llm: { ...base.llm, provider: 'openai', model: 'gpt-5.6', fallbackChain: [] },
     chat: { ...base.chat, autoCompact: { ...base.chat.autoCompact, enabled: false } },
     tools: { ...base.tools, deferred: { ...base.tools.deferred, mode: 'off' } },
   });

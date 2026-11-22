@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { Terminal } from '@xterm/headless';
-import { buildSpaceList, buildTabRow, layoutSpaceList, paneEmoji, withCommands, type SpaceTabRow } from './space-tabs-view.js';
+import { buildSpaceList, buildTabDropdown, buildTabRow, layoutSpaceList, paneEmoji, withCommands, type SpaceTabRow } from './space-tabs-view.js';
 import { parsePaneRows } from './attach-view.js';
 
 // Expectations are literals (OP rule 11): typed out, never built from the product's tables.
@@ -183,6 +183,14 @@ test('ELS-NEW-TAB-NAME-WIDGET: the tab row tells where its «+» is (one cell, a
   expect(buildTabRow(ROWS, 'p1', 10).plus).toBeUndefined();
 });
 
+test('narrow dropdown closes the active background even when a title is clipped', () => {
+  const row = { pane: 'p', wsId: 'w', workspace: 'w', title: 'long title', state: 'idle', command: ['bash'] };
+  expect(buildTabDropdown([row], 'p', undefined, 8, 3).line).toBe(`${A} ⌨︎  LONG${O}`);
+  const empty = [{ wsId: 'w', name: '가나다라마바사' }];
+  expect(buildTabDropdown([], undefined, undefined, 7, 3, empty, 'w').line).toBe(`${A} 🎼 가${O} `);
+  expect(buildTabDropdown([row], 'p', undefined, 30, 3).line).toContain(`${O} ▾`);
+});
+
 test('xterm cells and hitboxes agree for shell tabs and the plus at 80, 120 and 200 columns', async () => {
   const shells: SpaceTabRow[] = [
     { pane: 's1', wsId: 'w', workspace: 'w', title: 'one', state: 'idle', command: ['sh'] },
@@ -202,4 +210,17 @@ test('xterm cells and hitboxes agree for shell tabs and the plus at 80, 120 and 
     expect(screen.translateToString(false, 9, 17)).toBe(' ⌨︎  TWO ');
     terminal.dispose();
   }
+});
+
+// ELS-TAB-NAME-LABEL-FIRST: the seat/tab name (title) leads; the agent kind names the tab only when the title is empty or just a
+// default command name — the kind stays visible as the 💬/🤖 emoji. Literals.
+test('ELS-TAB-NAME-LABEL-FIRST: title first (JUD-B · JUD-3), agent kind only for an empty title (CODEX), emoji by the agent', () => {
+  const tab = (title: string, kind: string, fgCommand: string[]) => {
+    const ls = JSON.stringify({ panes: [{ address: 'jud/t1/p1', workspace: 'jud', pane: 'p1', title, state: 'idle', command: ['/bin/zsh'], kind, fgCommand }] });
+    return plain(buildTabRow(withCommands(parsePaneRows(ls), ls), 'p1', 40).line!).trimEnd();
+  };
+  expect(tab('JUD-B', 'eln', ['bun', '/opt/x/elanous.mjs'])).toBe(' 💬 JUD-B  +');
+  expect(tab('', 'codex', ['codex', '--yolo'])).toBe(' 🤖 CODEX  +');
+  expect(tab('JUD-3', 'codex', ['codex'])).toBe(' 🤖 JUD-3  +');
+  expect(tab('/bin/zsh', 'claude', ['claude'])).toBe(' 🤖 CLAUDE  +');   // a default command title still yields to the agent
 });

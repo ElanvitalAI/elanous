@@ -84,6 +84,15 @@ export function isEmptyMailListResult(name: string, result: unknown): boolean {
   return (result as { count?: unknown }).count === 0;
 }
 
+/** ELN-WAIT-NOT-POLL ④' — 살아 있는 백그라운드 자식 peek(AgentOutput not_ready)도 «할 일 0»
+ *  스트릭에 센다: 자식 완료 이벤트(캡슐 노크·우편)가 다음 턴을 여므로 이 턴은 더 조회하지 않고
+ *  닫는다(OP 진단 DIAG-ELN-OP-COORDINATOR-1122 · «도착했는지 확인하겠습니다» 반복 폴링의 원인 ③). */
+export function isIdleAgentOutputNotReady(name: string, result: unknown): boolean {
+  if (name !== 'AgentOutput') return false;
+  if (!result || typeof result !== 'object') return false;
+  return (result as { retrievalStatus?: unknown }).retrievalStatus === 'not_ready';
+}
+
 /** 셸 도구 이름(카탈로그 aliases — RunShell·Bash 계열). */
 export const SHELL_TOOL_NAMES: ReadonlySet<string> = new Set(['RunShell', 'run_shell', 'exec_argv', 'Bash', 'shell']);
 

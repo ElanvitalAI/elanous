@@ -11,6 +11,21 @@ export function registerOpsCommands(program: Command): void {
 const opsCmd = program.command('ops')
   .description('운영 관측·수복 — 미션·태스크·계약 루프·오케스트레이터 상태와 카드 기반 heal. --json 프로그래매틱.');
 
+opsCmd.command('check-30m').description('trainTickObserved·landingSubObserved는 원문이 아닌 관측 여부(boolean). OP 30분 점검 원천을 한 번에 읽어 근거와 누락 여부를 반환한다')
+  .option('--previous-green <count>', '직전 점검의 초록 수')
+  .option('--expect-version <version>', '호출자가 기대한 main 개발판')
+  .option('--json', '기계 판독 JSON')
+  .action(async (opts: { previousGreen?: string; expectVersion?: string; json?: boolean }) => {
+    if (opts.previousGreen !== undefined && (opts.previousGreen.trim() !== opts.previousGreen
+      || !/^(?:0|[1-9][0-9]{0,3})$/u.test(opts.previousGreen))) throw new Error('previous green count must be an integer from 0 to 9999');
+    const { loadOpThirtyMinuteSources, opThirtyMinuteSnapshot } = await import('./ops-30m-check.js');
+    const snapshot = opThirtyMinuteSnapshot(loadOpThirtyMinuteSources(), opts.previousGreen === undefined ? undefined : Number(opts.previousGreen));
+    if (opts.expectVersion !== undefined && snapshot.version !== opts.expectVersion.replace(/-dev\.[0-9]+$/u, '')) throw new Error('OP 30-minute check main version changed');
+    const originMainFreshness = `origin/main 기준 시각 ${snapshot.lastFetchAt ?? 'unknown'}${snapshot.fetchStale ? '(오래됐을 수 있음)' : ''}`;
+    if (opts.json) await writeStdoutJson(`${JSON.stringify({ ...snapshot, originMainFreshness })}\n`);
+    else { console.log(originMainFreshness); console.log(snapshot); }
+  });
+
 interface OpsOpts { entityType?: string; event?: string; sinceHours?: string; limit?: string; json?: boolean }
 
 // ops 연합(fleet · --all-instances) — 각 인스턴스에 opsSnapshot 을 인스턴스별 스토어 경로로

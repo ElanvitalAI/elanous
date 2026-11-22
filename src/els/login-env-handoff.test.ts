@@ -10,6 +10,9 @@ import { getCapturedEnv } from '../shell-env-bootstrap.js';
 import { requestEls } from './client.js';
 import { loginEnvForSpawn, loginEnvKey, packLoginEnv, resetLoginEnvHandoffForTesting, unpackLoginEnv, warmLoginEnv } from './login-env-handoff.js';
 import { elsSocketPath, startElsServer } from './server.js';
+import { guardElsProcesses, reapElsProcesses } from './test-support/els-process-guard.js';
+
+guardElsProcesses();
 
 const SOCKET_SAFE_TMP = tmpdir().length > 40 ? '/tmp' : tmpdir();
 const TOUCHED_ENV = ['ELANOUS_SKIP_LOGIN_ENV', 'SHELL', 'TERM_PROGRAM', 'ELANOUS_ELS_OWNER_TOKEN', 'ELANOUS_ELS_PANE_TOKEN', 'HOME'] as const;
@@ -78,6 +81,7 @@ test('three new panes cost one login-shell capture, and the owner token still re
   setEnv('TERM_PROGRAM', undefined);
   setEnv('SHELL', join(bin, 'sh'));
   resetLoginEnvHandoffForTesting();
+  cleanups.push(async () => { await reapElsProcesses(); });   // runs after server.close: the holders it detached die here
   const server = await startElsServer({ stateRoot: root });
   if ('exitCode' in server) throw new Error(server.message);
   cleanups.push(() => server.close());

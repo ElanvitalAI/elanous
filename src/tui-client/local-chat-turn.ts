@@ -1,3 +1,4 @@
+import { createRunShellApprovalIssuer, isRunShellApprovalCall, runShellApprovalCard, RUNSHELL_APPROVAL_RESULT, RUNSHELL_PUBLIC_KEY_ENV } from './next-runshell-approval.js';
 import type { ApprovalOutcome } from '../graph-runner/approval-outcome.js';
 import type { MessageSource } from '../session/index.js';
 import { safeAgentSummary, safeToolActivityTarget } from '../tui/chat/tool-activity.js';
@@ -25,6 +26,8 @@ import {
 import { answerHarnessAskUserCall, HARNESS_ASK_USER_IPC_ENV, isHarnessAskUserCall,
   isHarnessAskUserCancel, type HarnessAskUserCall } from './next-harness-ask-user.js';
 import { getSessionTierOverride } from '../model-tier/session-override.js';
+import { serializeTurnPayload, shouldReleasePinForGoalLoop, type GoalCompletionVia } from './local-chat-turn-goalpin-wire.js';
+import { releasePinnedGoal, resolvePinnedObjective, sessionGoalPinStore } from '../core-turn/human-goal-pin.js';
 import { configForSessionProviderTurn, getSessionProvider, sessionProviderChildEnv } from './session-provider.js';
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -43,6 +46,8 @@ const STATUS_PREFIX = 'ELANOUS_TUI_BG_STATUS\t';
 const capsuleListeners = new Map<string, Set<(event: CapsuleEvent) => void>>();
 let nextSidetabHandler: NextSidetabHandler | null = null;
 let nextSidetabIpcEnabled = false;
+let nextRunShellCardHandler: ((command: string, callId: string) => Promise<ApprovalOutcome>) | null = null;
+export function setNextRunShellCardHandler(handler: typeof nextRunShellCardHandler): void { nextRunShellCardHandler = handler; }
 let nextTuiShellApprovalHandler: ((command: string, callId: string, kind: 'bash' | 'graph', windowMs?: number) => Promise<boolean | ApprovalOutcome>) | null = null;
 let nextTuiShellApprovalCancelHandler: ((callId: string, reason: 'timeout' | 'turn-cancelled' | 'host-cancelled') => void) | null = null;
 let nextTuiHarnessAskUserHandler: ((call: HarnessAskUserCall) => Promise<string | null>) | null = null;
@@ -104,6 +109,8 @@ interface TurnResult {
   model?: string | null;
   goalComplete?: boolean;
   goalStopReason?: string;
+  /** SEAT-HUMAN-GOAL-PIN ④ — child 골 루프 완료 경로(via 원문): update_goal complete 만이 부모 핀 해제 선언이다. */
+  goalCompletionVia?: string;
   /** The turn's plan state as the REPL child sees it (untrusted until parsePlanWire). */
   planOutcome?: unknown;
   name?: string;
@@ -193,6 +200,8 @@ class LocalChatSession {
         source: sessionSelection ? 'session' : process.env.ELANOUS_LLM_PROVIDER ? 'env' : 'config',
       });
     } catch { /* observation cannot block the child */ }
+    const runShellIssuer = createRunShellApprovalIssuer();
+    const runShellCallerSeat = process.env.ELANOUS_TRACK;
     this.child = spawnElanousBun(
       useFastChild
         ? [sessionId, getElanousConfigDir()]
@@ -214,6 +223,7 @@ class LocalChatSession {
         // The child may be created before the UI callback is installed. Always
         // enable the approval boundary; an absent parent handler answers deny.
         [NEXT_TUI_SHELL_APPROVAL_IPC_ENV]: '1',
+        [RUNSHELL_PUBLIC_KEY_ENV]: runShellIssuer.publicKey,
         [HARNESS_ASK_USER_IPC_ENV]: '1',
       },
       ipc: (message: unknown, child: { send(message: unknown): unknown }) => {
@@ -242,6 +252,25 @@ class LocalChatSession {
               this.pendingHarnessAskUserIds.delete(message.callId);
               try { child.send(reply); } catch { /* child exited during interview */ }
             });
+          } else if (isRunShellApprovalCall(message)) {
+            // Never route RunShell cards through the seat's automatic/mail approver.
+            if (!runShellCallerSeat || message.request.callerSeat !== runShellCallerSeat
+              || message.request.sessionId !== this.sessionId || !this.waiting || this.pendingShellApprovalIds.has(message.callId)) {
+              try { child.send({ type: RUNSHELL_APPROVAL_RESULT, callId: message.callId, approval: null }); } catch { /* exited */ }
+              return;
+            }
+            this.pendingShellApprovalIds.add(message.callId);
+            const turn = this.waiting;
+            const request = { ...message.request, argv: [...message.request.argv] };
+            const handler = nextRunShellCardHandler;
+            void (async () => {
+              let approved = false;
+              try { approved = (await handler?.(runShellApprovalCard(request), message.callId))?.approved === true; } catch { /* deny */ }
+              // Cancellation, turn completion and shutdown revoke a pending prompt before issuance.
+              if (!this.pendingShellApprovalIds.delete(message.callId) || this.closed || this.waiting !== turn) return;
+              try { child.send({ type: RUNSHELL_APPROVAL_RESULT, callId: message.callId,
+                approval: approved ? runShellIssuer.issue(request) : null }); } catch { /* exited */ }
+            })();
           } else if (isShellApprovalCallMessage(message)) {
             this.pendingShellApprovalIds.add(message.callId);
             const publish = publishApprovalOf(message);
@@ -494,17 +523,23 @@ class LocalChatSession {
     }
   }
 
-  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string, replace?: boolean, source?: 'assistant-text') => void, attachments: readonly string[] = [], onStatus?: (text: string) => void, onAgent?: (event: AgentDisplayEvent) => void, onMessageBlock?: (block: MessageBlock) => void, onShellActivity?: WaitingTurn['onShellActivity'], onToolActivity?: WaitingTurn['onToolActivity'], onPushNowResult?: WaitingTurn['onPushNowResult'], onMeasuredUsage?: WaitingTurn['onMeasuredUsage'], onGraphProgress?: WaitingTurn['onGraphProgress'], from?: MessageSource, onPromptWritten?: () => void): Promise<TurnResult> {
+  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string, replace?: boolean, source?: 'assistant-text') => void, attachments: readonly string[] = [], onStatus?: (text: string) => void, onAgent?: (event: AgentDisplayEvent) => void, onMessageBlock?: (block: MessageBlock) => void, onShellActivity?: WaitingTurn['onShellActivity'], onToolActivity?: WaitingTurn['onToolActivity'], onPushNowResult?: WaitingTurn['onPushNowResult'], onMeasuredUsage?: WaitingTurn['onMeasuredUsage'], onGraphProgress?: WaitingTurn['onGraphProgress'], from?: MessageSource, onPromptWritten?: () => void, workReferences?: readonly import('../core-turn/seat-owner-check.js').WorkReference[]): Promise<TurnResult> {
     if (this.closed) throw new Error('REPL child exited');
     if (this.waiting) throw new Error('REPL turn already running');
     const turnId = `tui-${++this.turnCount}`;
     const modelTier = getSessionTierOverride(this.sessionId)?.llm;
     const providerSelection = getSessionProvider(this.sessionId);
-    const payload = JSON.stringify({ prompt, id: turnId, ...(modelTier ? { modelTier } : {}),
+    // SEAT-HUMAN-GOAL-PIN ① 단일 소싱(JUD-B #131273): payload 직렬화는 serializeTurnPayload 하나로만 —
+    // 이중 구현은 순수 모듈 시험과 실경로가 어긋나는 «죽은 수출»을 만든다. from 포함 규칙은 모듈 참조.
+    // ④ 부모(TUI) 소유 핀(GOAL-PIN-2 · OP #128939): 사람 줄을 이 프로세스 저장소에 쓴다(상태줄
+    // pinnedGoalOf 가 읽는 싱글턴). 사람 줄이 아닌 턴엔 살아 있는 핀을 payload 로 child 에 넘겨
+    // child 교체/재기동 뒤 복구한다. 판별은 모듈 계약 그대로(구조화 출처 · fail-closed).
+    const goalPin = resolvePinnedObjective({ sessionId: this.sessionId, from, turnText: prompt }, sessionGoalPinStore());
+    const payload = serializeTurnPayload({ prompt, id: turnId, ...(modelTier ? { modelTier } : {}),
       ...(providerSelection ? { sessionProvider: providerSelection } : {}),
-      ...(attachments.length ? { attachments } : {}),
-      // MSG-SOURCE-HIERARCHY: the child persists who sent the turn; a human turn sends nothing (human is the default).
-      ...(from && from.kind !== 'human' ? { from } : {}) }) + '\n';
+      ...(attachments.length ? { attachments } : {}), from,
+      ...(workReferences ? { workReferences } : {}),
+      ...(goalPin.noticeTurn && goalPin.objective !== undefined ? { parentPinnedGoal: goalPin.objective } : {}) }) + '\n';
     const response = new Promise<TurnResult>((resolve, reject) => { this.waiting = { turnId, userText: prompt, onDelta, onStatus, onAgent, onMessageBlock, onShellActivity, onToolActivity, onPushNowResult, onMeasuredUsage, onGraphProgress, resolve, reject }; });
     try {
       if (writePrompt) await writePrompt(payload);
@@ -577,9 +612,9 @@ class LocalChatSession {
     catch { return false; }
   }
   /** A200 — hand input typed during this turn to the child; it joins the next model request. */
-  requestSteer(steerId: string, text: string): boolean {
+  requestSteer(steerId: string, text: string, urgent = false, seatMail?: { msgId: number; from: string; intent?: string | null }): boolean {
     if (this.closed || !this.waiting) return false;
-    try { this.child.send({ type: 'elanous.next-tui.steer', turnId: this.waiting.turnId, steerId, text }); return true; }
+    try { this.child.send({ type: 'elanous.next-tui.steer', turnId: this.waiting.turnId, steerId, text, urgent, ...(seatMail ? { seatMail } : {}) }); return true; }
     catch { return false; }
   }
   retractSteer(steerIds: readonly string[]): boolean {
@@ -710,8 +745,9 @@ export function requestLocalChatPushNow(sessionId: string, requestId: string): b
 export function commitLocalChatPushNow(sessionId: string, requestId: string): boolean {
   return sessions.get(sessionId)?.commitPushNow(requestId) ?? false;
 }
-export function requestLocalChatSteer(sessionId: string, steerId: string, text: string): boolean {
-  return sessions.get(sessionId)?.requestSteer(steerId, text) ?? false;
+export function requestLocalChatSteer(sessionId: string, steerId: string, text: string, urgent = false,
+  seatMail?: { msgId: number; from: string; intent?: string | null }): boolean {
+  return sessions.get(sessionId)?.requestSteer(steerId, text, urgent, seatMail) ?? false;
 }
 export function retractLocalChatSteer(sessionId: string, steerIds: readonly string[]): boolean {
   return sessions.get(sessionId)?.retractSteer(steerIds) ?? false;
@@ -739,7 +775,8 @@ export async function runLocalChatTurn(
   from?: MessageSource,
   /** Called after the prompt is flushed to the child, not an acknowledgement from the provider. */
   onPromptWritten?: () => void,
-): Promise<{ goalComplete: boolean; goalStopReason?: string; planOutcome?: PlanWire }> {
+  workReferences?: readonly import('../core-turn/seat-owner-check.js').WorkReference[],
+): Promise<{ goalComplete: boolean; goalStopReason?: string; goalCompletionVia?: string; planOutcome?: PlanWire }> {
   if (signal.aborted) throw new Error('응답을 취소했습니다');
   if (!cli) throw new Error('elanous CLI entry is unavailable');
   // An auth refusal in the child can leave the Next TUI waiting indefinitely.
@@ -863,7 +900,7 @@ export async function runLocalChatTurn(
       (event) => { if (!signal.aborted) onToolActivity?.(event); },
       (event) => { if (!signal.aborted) onPushNowResult?.(event); },
       (usage) => { if (!signal.aborted) compact.onMeasuredUsage?.(usage); },
-      (event) => { if (!signal.aborted) onGraphProgress?.(event); }, from, onPromptWritten);
+      (event) => { if (!signal.aborted) onGraphProgress?.(event); }, from, onPromptWritten, workReferences);
     } catch (error) {
       if (signal.aborted) throw new Error('응답을 취소했습니다');
       await closeLocalChatSession(sessionId);
@@ -889,9 +926,15 @@ export async function runLocalChatTurn(
     // Match the caller's terminal result to a cancellation received during that await.
     if (signal.aborted) throw new Error('응답을 취소했습니다');
     outcome = 'completed';
+    // SEAT-HUMAN-GOAL-PIN ④: child 의 완료 선언(update_goal complete)만 부모 핀을 해제한다 —
+    // structured-final·상태질문 종결은 그 턴의 종결일 뿐 핀은 유지한다(OP #131052 · wire 계약).
+    if (shouldReleasePinForGoalLoop({ stopReason: result.goalStopReason ?? '', completionVia: result.goalCompletionVia as GoalCompletionVia | undefined })) {
+      releasePinnedGoal(sessionId, sessionGoalPinStore());
+    }
     return {
       goalComplete: result.goalComplete === true,
       ...(typeof result.goalStopReason === 'string' ? { goalStopReason: result.goalStopReason } : {}),
+      ...(typeof result.goalCompletionVia === 'string' ? { goalCompletionVia: result.goalCompletionVia } : {}),
       ...(() => { const planOutcome = parsePlanWire(result.planOutcome); return planOutcome ? { planOutcome } : {}; })(),
     };
   } finally {

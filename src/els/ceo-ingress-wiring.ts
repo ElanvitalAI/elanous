@@ -26,7 +26,7 @@ import {
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { createCeoChannel, type CeoInbound, type CeoLedgerPost } from './ceo-channel.js';
 import { createCeoTelegramAdapter, runCeoTelegramLoop, type CeoTelegramAdapter } from './ceo-channel-telegram.js';
-import { openCeoMailDb, scanCeoMail } from './ceo-channel-mail-watch.js';
+import { openCeoMailDb, scanCeoMail, type CeoMailDb } from './ceo-channel-mail-watch.js';
 import { defaultMsgStorePath } from '../msg/msg-store.js';
 import { verifyCeoReplyProof } from './ceo-reply-proof.js';
 import { createCeoSideAlertWriter } from './ceo-side-alert.js';
@@ -86,6 +86,8 @@ export interface CeoChannelWiringOpts {
   readonly post?: CeoLedgerPost;
   /** The same durable ledger the channel posts into. ELS supplies its state-root path explicitly. */
   readonly mailPath?: string;
+  /** OP #127483 — the mail-db seam (tests inject a fixture; the default opens the real ledger). */
+  readonly mailDb?: () => CeoMailDb | null;
   readonly log?: (event: string, data: Record<string, unknown>) => void;
   /** Synthetic SLA clock for the complete channel and ingress path. */
   readonly clock?: CeoClock;
@@ -100,6 +102,8 @@ export interface CeoChannelWiring {
   envFor(seat: string): Record<string, string>;
   /** The product loop the daemon runs (poll → handle; back off on error). */
   run(): Promise<void>;
+  /** OP #127483 — one mail scan on the persistent cursor (the 1 s timer calls exactly this). */
+  scanMail(): Promise<void>;
   stop(): void;
 }
 
@@ -201,25 +205,37 @@ export function startCeoChannelWiring(opts: CeoChannelWiringOpts): CeoChannelWir
   let scanning = false;
   const replyCursor = new Map<number, number>();
   const pendingReplySince = new Map<number, number>();
+  // OP #127688 — parent rows this daemon already answered: a settled row never reclassifies as
+  // open on a re-scan (the open window is the unanswered-parent set, not a min-id cursor).
+  const answeredParents = new Set<number>();
+  // OP #127483 — the daemon carries the scan cursor between polls: 0 exactly once at boot
+  // (downtime catch-up), then the open window (the oldest correlatable row without a trusted
+  // answer) — never a cursor:0 full re-query every second again.
+  let mailCursor = 0;
   const scanMail = async (): Promise<void> => {
     if (stopped || scanning) return;
     scanning = true;
-    let mail: ReturnType<typeof openCeoMailDb> = null;
+    let mail: CeoMailDb | null = null;
     try {
-      mail = openCeoMailDb(opts.mailPath ?? defaultMsgStorePath());
-      if (mail) await scanCeoMail({ cursor: 0, mail, replyCursor, pendingReplySince, channel: {
+      mail = opts.mailDb ? opts.mailDb() : openCeoMailDb(opts.mailPath ?? defaultMsgStorePath());
+      if (mail) {
+        const out = await scanCeoMail({ cursor: mailCursor, mail, replyCursor, pendingReplySince, answeredParents, channel: {
         ...channel,
         markAnswered: async (key, body, grant) => {
           const sent = await channel.markAnswered(key, body, grant);
           if (sent) ingress.markAnswered(key.source, key.chatId, key.messageId);
           return sent;
         },
-      }, verifyReply: (parent, key, reply) => {
-        const proof = verifyCeoReplyProof(reply.refsJson, { source: key.source, threadId: key.chatId,
-          messageId: key.messageId }, parent.id, reply.body, destinations.get(OP_SEAT)!.authSecret);
-        if (!proof) return null;
-        return channel.hasAcceptedIngress(key, proof.ingressId, proof) ? proof : 'pending';
-      }, log });
+        }, verifyReply: (parent, key, reply) => {
+          const proof = verifyCeoReplyProof(reply.refsJson, { source: key.source, threadId: key.chatId,
+            messageId: key.messageId }, parent.id, reply.body, destinations.get(OP_SEAT)!.authSecret);
+          if (!proof) return null;
+          return channel.hasAcceptedIngress(key, proof.ingressId, proof) ? proof : 'pending';
+        }, log });
+        // A late CEO reply to any still-open row must be seen next second: resume from the open
+        // window, not from the walked tail. Settled/foreign rows stay behind the cursor.
+        mailCursor = out.openSince > 0 ? out.openSince - 1 : out.cursor;
+      }
       await channel.retryOutbox();
     } catch (error) { log('ceo-mail-watch-error', { error: error instanceof Error ? error.message : String(error) }); }
     finally { mail?.close?.(); scanning = false; }
@@ -232,6 +248,7 @@ export function startCeoChannelWiring(opts: CeoChannelWiringOpts): CeoChannelWir
   return {
     adapter,
     ingress,
+    scanMail,
     envFor: (seat: string): Record<string, string> => {
       const destination = destinations.get(seat);
       if (!destination) return {};

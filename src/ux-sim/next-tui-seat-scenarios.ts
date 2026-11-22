@@ -122,7 +122,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
   // First-run onboarding would otherwise ask for a provider before the TUI opens.
   writeFileSync(join(root, 'config.json'), JSON.stringify({
     onboarding: { completed: true }, errorReports: { enabled: false },
-    ...(seatTurnCapScenario ? { llm: { goalLoop: { enabled: true, maxIterations: 4 } } } : {}),
+    ...(seatTurnCapScenario ? { llm: { goalLoop: { maxIterations: 4 } } } : {}),
   }));
   const reply = spec.reply ?? DEFAULT_REPLY;
   const base = {

@@ -192,3 +192,46 @@ describe('telegram adapter OP #119477 mustFix — store-first cursor ① · toke
     } finally { channel.stop(); rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+describe('mail watcher — OP #127688 열린 창 재분류 회귀 (PR #39547)', () => {
+  test('답변된 부모는 재스캔에서 미결로 재분류되지 않는다 — 열린 창 = 미답변 집합, openSince 0 전진', async () => {
+    // OP probe(/tmp/judb-39547-nRkknw/probe.log) 시나리오: m2 처리 → m1 처리 뒤 처리된 m2가
+    // openSince=2로 재분류되어 다음 scan이 정체하던 결함(열린 창 = 미답변 집합, 최소 id 커서 아님).
+    type ScanOpts = Parameters<typeof scanCeoMail>[0];
+    type VerifyReply = NonNullable<ScanOpts['verifyReply']>;
+    const rows = [1, 2].map((id) => ({ id, refsJson: JSON.stringify([ceoMessageRef(`m${id}`), 'telegram-chat:c']), createdAt: '2026-01-01T00:00:00.000Z' }));
+    let m1Open = true;
+    const replies: Record<number, { id: number; sender: string; body: string; refsJson: string | null }> = {
+      1: { id: 3, sender: 'OP', body: 'one', refsJson: null },
+      2: { id: 4, sender: 'OP', body: 'two', refsJson: null },
+    };
+    const ceoRowsCalls: number[] = [];
+    const mail: CeoMailDb = {
+      ceoRows: (after) => { ceoRowsCalls.push(after); return rows.filter((row) => row.id > after); },
+      firstReplyAfter: (messageId, _seat, after) => {
+        if (messageId === 1 && m1Open) return null;
+        const reply = replies[messageId]!;
+        return reply.id > after ? reply : null;
+      },
+    };
+    const replyCursor = new Map<number, number>();
+    const answeredParents = new Set<number>();
+    const answered: string[] = [];
+    const channel = {
+      markAnswered: async (key: { messageId: string }) => { answered.push(key.messageId); return true; },
+    } as unknown as CeoChannel;
+    const opts = { channel, mail, replyCursor, answeredParents, verifyReply: (() => ({ fixture: true })) as unknown as VerifyReply, log: () => {} };
+    const scan1 = await scanCeoMail({ ...opts, cursor: 0 });
+    expect(scan1).toEqual({ acted: 1, cursor: 2, openSince: 1 }); // m2 답 전송 · m1은 아직 열림
+    expect(answered).toEqual(['m2']);
+    m1Open = false;
+    const resume2 = scan1.openSince > 0 ? scan1.openSince - 1 : scan1.cursor; // wiring 재개 규칙 그대로
+    const scan2 = await scanCeoMail({ ...opts, cursor: resume2 });
+    expect(answered).toEqual(['m2', 'm1']); // m1 답 전송
+    expect(scan2).toEqual({ acted: 1, cursor: 2, openSince: 0 }); // 처리된 m2 재분류 없음 → 열린 창 소멸
+    const resume3 = scan2.openSince > 0 ? scan2.openSince - 1 : scan2.cursor;
+    const scan3 = await scanCeoMail({ ...opts, cursor: resume3 });
+    expect(scan3).toEqual({ acted: 0, cursor: 2, openSince: 0 }); // 정체 없음: 전진 완료
+    expect(ceoRowsCalls).toEqual([0, 0, 2]); // 다음 스캔은 2부터 — 리와인드 아님
+  });
+});

@@ -1,8 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import { CliUserError } from '../cli/cli-user-error.js';
 import { resolveRepositoryName } from '../harness/repository-name.js';
-import { addItem, checklistHistory, listChecklist, ownerMatches, parseOwner, setItem, validateCeoLoad, type ChecklistItem } from './checklist.js';
-import { assignedVersions, move, releasedVersion } from './feature-store.js';
+import { addItem, checklistHistory, listChecklist, ownerMatches, parseOwner, setItem, validateCeoLoad, type Checklist, type ChecklistItem } from './checklist.js';
+import { assignedVersions, move, moveMany, releasedVersion } from './feature-store.js';
 import { debug } from '../debug/log.js';
 import { placementConfig, validCeoCap, type CeoCalendar } from './placement-config.js';
 import { ceoOverload as evaluateCeoOverload, checkScheduleCeoLoad as checkScheduleCeoLoadWithDeps } from './placement-ceo-load.js';
@@ -469,4 +469,28 @@ export function seatMove(id: string, from: string, to: string, by: string, reaso
   const violation = moveConstraint(item, next, backlog, snapshots, now, rate, deps.seatCap ?? placementSeatCap(), rows, validCeoCap(deps.ceoDailyCap ?? placementCeoDailyCap()), deps.ceoCalendar ?? placementConfig().ceoCalendar ?? {}, deps.released ?? releasedVersion());
   if (violation) throw new CliUserError(`${id}: ${violation}`);
   if (!deps.dryRun) move(id, from, to, by, undefined, undefined, reason);
+}
+
+/**
+ * RELEASE-CHECKLIST-BULK-MOVE: a seat moving several of its own cells. Each id passes the same seat rules as
+ * {@link seatMove}, checked against a board that already counts the earlier ids of this batch (so capacity holds),
+ * and only then does one all-or-nothing ledger transaction move them.
+ */
+export function seatMoveMany(ids: readonly string[], from: string, to: string, by: string, reason: string, deps: PlacementDeps = {}): void {
+  const read = deps.checklist ?? listChecklist;
+  const boards = new Map<string, Checklist>();
+  const board = (version: string): Checklist => {
+    let found = boards.get(version);
+    if (!found) { found = read(version); boards.set(version, found); }
+    return found;
+  };
+  const schedules = deps.schedules ?? listSchedules();
+  const merged24h = deps.merged24h ?? mergedPrsLast24h(deps.now ?? new Date());
+  for (const id of ids) {
+    seatMove(id, from, to, by, reason, { ...deps, schedules, merged24h, checklist: board, dryRun: true });
+    const source = board(from).items;
+    const index = source.findIndex((cell) => cell.id === id);
+    if (index >= 0) board(to).items.push(...source.splice(index, 1));
+  }
+  if (!deps.dryRun) moveMany(ids, from, to, by, undefined, undefined, reason);
 }

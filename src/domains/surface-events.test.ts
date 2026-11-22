@@ -233,28 +233,36 @@ test('a fresh process reclassifies late stray signals and retries a failed migra
   const strayPath = join(home, '.elanous', 'surface_events.db');
   const canonicalPath = join(home, '.elanous', 'memory', 'surface_events.db');
   const moduleUrl = pathToFileURL(join(import.meta.dir, 'surface-events.ts')).href;
-  const childCode = `import { openSurfaceEventsDb } from ${JSON.stringify(moduleUrl)};
+  const externalModuleUrl = pathToFileURL(join(import.meta.dir, '../context-bus/external-events.ts')).href;
+  const childCode = `import { openSurfaceEventsDb, pruneStaleEvents } from ${JSON.stringify(moduleUrl)};
+    import { recordExternalEvent } from ${JSON.stringify(externalModuleUrl)};
     const db = openSurfaceEventsDb();
+    if (process.env.PROBE_REDELIVER === '1') pruneStaleEvents(db, { nowExpr: '2026-11-21T12:00:00Z' });
+    const replayedId = process.env.PROBE_REDELIVER === '1'
+      ? recordExternalEvent({ origin: 'release-graph', kind: 'exit', summary: 'late receipt',
+          source: 'elanous://release/late', delivery: { eventId: 'late-event', subscriberId: 'context-bus' } }, { db })
+      : undefined;
     const rows = {
       events: db.prepare('SELECT id FROM events ORDER BY id').all(),
       signals: db.prepare('SELECT id FROM signals ORDER BY id').all(),
       fts: db.prepare('SELECT id FROM events_fts ORDER BY id').all(),
+      ...(replayedId ? { replayedId } : {}),
     };
     db.close();
     console.log(JSON.stringify(rows));`;
   const { ELANOUS_STATE_DIR: _stateDir, ...parentEnv } = process.env;
-  const runFreshProcess = () => spawnSync(process.execPath, ['-e', childCode], {
-      cwd: join(import.meta.dir, '../..'), env: { ...parentEnv, HOME: home }, encoding: 'utf8', timeout: 10_000,
+  const runFreshProcess = (replay = false) => spawnSync(process.execPath, ['-e', childCode], {
+      cwd: join(import.meta.dir, '../..'), env: { ...parentEnv, HOME: home, ...(replay ? { PROBE_REDELIVER: '1' } : {}) }, encoding: 'utf8', timeout: 10_000,
     });
-  const openInFreshProcess = () => {
-    const child = runFreshProcess();
+  const openInFreshProcess = (replay = false) => {
+    const child = runFreshProcess(replay);
     expect(child.status).toBe(0);
-    return JSON.parse(child.stdout.trim()) as { events: Array<{ id: string }>; signals: Array<{ id: string }>; fts: Array<{ id: string }> };
+    return JSON.parse(child.stdout.trim()) as { events: Array<{ id: string }>; signals: Array<{ id: string }>; fts: Array<{ id: string }>; replayedId?: string };
   };
   try {
     mkdirSync(join(home, '.elanous'), { recursive: true });
     const stray = new Database(strayPath);
-    stray.run('CREATE TABLE events(id TEXT PRIMARY KEY, ts TEXT, surface TEXT, direction TEXT, kind TEXT, text TEXT, summary TEXT)');
+    stray.run('CREATE TABLE events(id TEXT PRIMARY KEY, ts TEXT, surface TEXT, direction TEXT, kind TEXT, text TEXT, summary TEXT, refs TEXT)');
     stray.run('CREATE VIRTUAL TABLE events_fts USING fts5(id UNINDEXED, search_text)');
     stray.run("INSERT INTO events(id,ts,surface,direction,kind,text) VALUES ('early-memory','2026-11-21T01:00:00Z','cli','inbound','utterance','early')");
     stray.run("INSERT INTO events_fts(id,search_text) VALUES ('early-memory','early')");
@@ -289,6 +297,80 @@ test('a fresh process reclassifies late stray signals and retries a failed migra
       signals: [{ id: 'late-signal' }, { id: 'retry-signal' }],
       fts: [{ id: 'early-memory' }, { id: 'late-memory' }],
     });
+
+    const receiptStray = new Database(strayPath);
+    receiptStray.run(`INSERT INTO events(id,ts,surface,direction,kind,text,refs)
+      VALUES (?,?,?,?,?,?,?)`, ['late-receipt', '2026-11-01T01:04:00Z', 'context:external', 'outbound', 'exit',
+      'late receipt', JSON.stringify({ origin: 'release-graph', eventId: 'late-event', subscriberId: 'context-bus' })]);
+    receiptStray.run("INSERT INTO events_fts(id,search_text) VALUES ('late-receipt','late receipt')");
+    receiptStray.close();
+    expect(openInFreshProcess(true)).toEqual({
+      events: [{ id: 'early-memory' }, { id: 'late-memory' }],
+      signals: [{ id: 'late-signal' }, { id: 'retry-signal' }],
+      fts: [{ id: 'early-memory' }, { id: 'late-memory' }],
+      replayedId: 'late-receipt',
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a merged non-exit external event retries receipt backfill after a later transaction failure', () => {
+  const root = mkdtempSync(join(tmpdir(), 'surface-receipt-retry-'));
+  const home = join(root, 'home');
+  const strayPath = join(home, '.elanous', 'surface_events.db');
+  const canonicalPath = join(home, '.elanous', 'memory', 'surface_events.db');
+  const moduleUrl = pathToFileURL(join(import.meta.dir, 'surface-events.ts')).href;
+  const externalModuleUrl = pathToFileURL(join(import.meta.dir, '../context-bus/external-events.ts')).href;
+  const childCode = `import { openSurfaceEventsDb } from ${JSON.stringify(moduleUrl)};
+    import { recordExternalEvent } from ${JSON.stringify(externalModuleUrl)};
+    const db = openSurfaceEventsDb();
+    const id = process.env.PROBE_REPLAY === '1'
+      ? recordExternalEvent({ origin: 'release-graph', kind: 'finished', summary: 'late finished',
+          source: 'elanous://release/finished', delivery: { eventId: 'late-finished-event', subscriberId: 'context-bus' } }, { db })
+      : undefined;
+    db.close();
+    console.log(JSON.stringify({ id }));`;
+  const { ELANOUS_STATE_DIR: _stateDir, ...parentEnv } = process.env;
+  const run = (replay = false) => spawnSync(process.execPath, ['-e', childCode], {
+    cwd: join(import.meta.dir, '../..'), env: { ...parentEnv, HOME: home, ...(replay ? { PROBE_REPLAY: '1' } : {}) },
+    encoding: 'utf8', timeout: 10_000,
+  });
+  try {
+    const seed = run();
+    expect(seed.status).toBe(0);
+    const seeded = new Database(canonicalPath);
+    expect(seeded.prepare("SELECT version FROM signal_migrations WHERE version=1").get()).toBeTruthy();
+    expect(seeded.prepare("SELECT 1 FROM sqlite_master WHERE name='external_delivery_receipts'").get()).toBeTruthy();
+    seeded.close();
+
+    mkdirSync(join(home, '.elanous'), { recursive: true });
+    const stray = new Database(strayPath);
+    stray.run('CREATE TABLE events(id TEXT PRIMARY KEY, ts TEXT, surface TEXT, direction TEXT, kind TEXT, text TEXT, refs TEXT)');
+    stray.run('CREATE VIRTUAL TABLE events_fts USING fts5(id UNINDEXED, search_text)');
+    stray.run(`INSERT INTO events(id,ts,surface,direction,kind,text,refs) VALUES (?,?,?,?,?,?,?)`,
+      ['late-finished', '2026-11-01T01:05:00Z', 'context:external', 'outbound', 'finished', 'late finished',
+        JSON.stringify({ origin: 'release-graph', eventId: 'late-finished-event', subscriberId: 'context-bus' })]);
+    stray.run("INSERT INTO events_fts(id,search_text) VALUES ('late-finished','late finished')");
+    stray.close();
+
+    const failReceipt = new Database(canonicalPath);
+    failReceipt.run(`CREATE TRIGGER fail_finished_receipt BEFORE INSERT ON external_delivery_receipts
+      WHEN NEW.event_id='late-finished-event' BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END`);
+    failReceipt.close();
+    expect(run().status).not.toBe(0);
+    const afterFailure = new Database(canonicalPath);
+    expect(afterFailure.prepare("SELECT id FROM events WHERE id='late-finished'").all()).toEqual([{ id: 'late-finished' }]);
+    expect(afterFailure.prepare("SELECT surface_event_id FROM external_delivery_receipts WHERE event_id='late-finished-event'").all()).toEqual([]);
+    afterFailure.run('DROP TRIGGER fail_finished_receipt');
+    afterFailure.close();
+
+    const replay = run(true);
+    expect(replay.status).toBe(0);
+    expect(JSON.parse(replay.stdout.trim())).toEqual({ id: 'late-finished' });
+    const recovered = new Database(canonicalPath);
+    expect(recovered.prepare("SELECT id FROM events WHERE id='late-finished'").all()).toEqual([{ id: 'late-finished' }]);
+    expect(recovered.prepare("SELECT surface_event_id FROM external_delivery_receipts WHERE event_id='late-finished-event'").all())
+      .toEqual([{ surface_event_id: 'late-finished' }]);
+    recovered.close();
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

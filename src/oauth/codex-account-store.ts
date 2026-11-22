@@ -345,9 +345,21 @@ function rotationCreditsGrant(candidates: readonly RotationCandidate[]): Rotatio
 
 function buildRotationCandidates(path: string, now: number, env: NodeJS.ProcessEnv = process.env,
   quotaRead: QuotaSignalReader = createQuotaSignalDecisionReader(now)): RotationCandidate[] {
-  return listCodexAccountsInStore(path, now)
-    .map((row) => {
-      const stored = loadTokens(row.storeKey, path);
+  // ⛔⭐ 회전 후보의 단위는 «스토어»가 아니라 «쓸 수 있는 계정»이다 (2026-11-22 · #126554).
+  //   소유자 미러(allowlist)가 들여온 계정은 정본 스토어 우주에 항목이 없어도 후보여야 한다 —
+  //   스토어 한 경로만 보면 그 계정들은 «후보가 아니게» 되고, 암묵 실행은 회전 없이
+  //   default 에 머문다(허용되지 않은 계정으로 도는 누출과 같은 형태다).
+  //   ⛔ 중복은 storeKey 로 잡는다 — 정본 스토어의 같은 계정이 이긴다(정본 우선).
+  const mirrorPath = path === codexOwnerMirrorAuthPath() ? undefined : codexOwnerMirrorAuthPath();
+  const rows: { row: StoredCodexAccount; storePath: string }[] =
+    listCodexAccountsInStore(path, now).map((row) => ({ row, storePath: path }));
+  if (mirrorPath) {
+    for (const row of listCodexAccountsInStore(mirrorPath, now)) {
+      if (!rows.some((r) => r.row.storeKey === row.storeKey)) rows.push({ row, storePath: mirrorPath });
+    }
+  }
+  return rows.map(({ row, storePath }) => {
+      const stored = loadTokens(row.storeKey, storePath);
       // ⛔ 홈을 모르는 «이름» 계정은 후보가 «아니다» — 모르는 곳으로 넘기지 않는다.
       // ⭐ 기본 계정(`openai-codex`)은 정본에 홈을 안 적는다 — 그 홈은 «기본 위치»(`CODEX_HOME` 또는 `~/.codex`)로
       //    이미 정해져 있다(`resolveCodexAccount` · `effectiveCodexHome` 과 같은 해석). 종전엔 이 계정이 후보에서
@@ -364,7 +376,7 @@ function buildRotationCandidates(path: string, now: number, env: NodeJS.ProcessE
         home,
         reached: quota.reached,
         resetCreditAvailability: resetCreditAvailability(home, now),
-        unhealthy: isCodexUnauthorized(path, row.storeKey, codexHealthCredential(stored?.tokens ?? {})),
+        unhealthy: isCodexUnauthorized(storePath, row.storeKey, codexHealthCredential(stored?.tokens ?? {})),
         ...(usedPercent === undefined ? {} : { usedPercent }),
         ...(credits.balance === undefined ? {} : { creditBalance: credits.balance }),
         ...(credits.hasCredits === undefined ? {} : { hasCredits: credits.hasCredits }),

@@ -42,12 +42,12 @@ function overlay(mode: 'shadow' | 'on' | undefined): void {
 beforeAll(() => overlay(undefined));
 afterAll(() => setUserConfigOverlay(null));
 
-async function launch(goalDocument: string, childLlm?: { provider: string; model: string; source: 'flag' }) {
+async function launch(goalDocument: string, childLlm?: { provider: string; model: string; source: 'flag' }, readAccountWindows?: (provider: string) => AccountState | undefined) {
   let env: Record<string, string> | undefined;
   const rows: RunLedgerEntry[] = [];
   await runHeadlessGoalLoopPty({
     binRoot: '/tmp/repo', cwd: '/tmp/hdr-child', featurePrompt: `decorated instructions ${PROSE_MARKER}`,
-    goalDocument, runId: 'run-hdr-wiring', ...(childLlm ? { childLlm } : {}),
+    goalDocument, runId: 'run-hdr-wiring', ...(childLlm ? { childLlm } : {}), ...(readAccountWindows ? { readAccountWindows } : {}),
     recordWorkRoute: (entry) => { rows.push(entry); },
     // 출처: R-TST36 — 가짜 spawn 은 isAlive 두 번 뒤 끝나 이 값은 실제 대기가 아니다(가짜 발사).
     maxWaitSec: 1, maxHardWaitSec: 1, pollMs: 1, activityGraceSec: 100,
@@ -83,6 +83,33 @@ describe('difficultyRouter flag', () => {
     // 산문에 «lock»·«session» 이 있어도 경로·칸이 아니면 위험이 아니다(A205 · R-SIG).
     const prose = workRiskInputFromGoal(`lock the session store\n대상 경로: src/tui/a.ts`);
     expect(classifyWorkRisk(prose).riskCategories).toEqual([]);
+  });
+});
+
+describe('ROUTER-OR-CODEX-MIX-CHOKEPOINT launch', () => {
+  test('actual PTY launch uses OpenRouter for implementation and preserves explicit child choice', async () => {
+    setUserConfigOverlay((c) => ({ ...c, llm: { ...c.llm, provider: 'openai-codex' },
+      harness: { ...c.harness, difficultyRouter: 'on', routerMix: 'on' },
+      roleLlm: undefined, roleModels: undefined, roleModelTiers: undefined }));
+    const previous = process.env.ELANOUS_LLM_MODEL;
+    delete process.env.ELANOUS_LLM_MODEL;
+    const read = (provider: string): AccountState => ({
+      active: { provider, account: 'codex-a' }, candidates: [], selection: 'on',
+      routerMix: { codex: { active: { provider: 'openai-codex', account: 'codex-a' }, candidates: [],
+        observedAtMs: 1, readAtMs: 1, selection: 'on' } },
+    });
+    try {
+      if (resolveRoleLlm('implement').source !== 'default') return;
+      const mixed = await launch(PLAIN_GOAL, undefined, read);
+      expect(mixed.env.ELANOUS_LLM_PROVIDER).toBe('openrouter');
+      expect(mixed.rows[0]!.data).toMatchObject({ applied: true, launched: { provider: 'openrouter' } });
+      const pinned = await launch(PLAIN_GOAL, { provider: 'openai-codex', model: 'pinned', source: 'flag' }, read);
+      expect(pinned.env.ELANOUS_LLM_PROVIDER).toBe('openai-codex');
+      expect(pinned.env.ELANOUS_LLM_MODEL).toBe('pinned');
+    } finally {
+      overlay(undefined);
+      if (previous === undefined) delete process.env.ELANOUS_LLM_MODEL; else process.env.ELANOUS_LLM_MODEL = previous;
+    }
   });
 });
 

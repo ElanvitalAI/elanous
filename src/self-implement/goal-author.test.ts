@@ -8053,6 +8053,7 @@ ${report}`);
       '## 불변식',
       '## 판정 신호',
       '## 검증 시나리오', '## L. 라이브', '## 결과 보고 양식',
+      '## 골 계약',
       '## 메타데이터',
     ]);
     expect(document).toEndWith([
@@ -9157,6 +9158,7 @@ await writeAuthoredGoal('Crash after temporary backlink write.', ${JSON.stringif
     expect(persisted.match(/^## .+$/gm)?.filter((heading) => heading !== '## 왜 이 골인가')).toEqual([
       '## PROBLEM', '## WHAT TO BUILD', '## ACCEPTANCE CRITERIA', '## REQUIRED EVIDENCE', '## TRACED PATHS', '## SCOPE BOUNDARY', '## 답하지 못하는 것', '## 불변식', '## 판정 신호',
       '## 검증 시나리오', '## L. 라이브', '## 결과 보고 양식',
+      '## 골 계약',
       '## 메타데이터',
     ]);
   });

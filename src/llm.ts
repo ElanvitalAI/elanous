@@ -38,6 +38,7 @@ import {
 import { debug, getAmbientSessionId, redactSecrets, redactSecretText } from './debug/log.js';
 import { emitTurnLife } from './debug/turn-life.js';
 import { llmObserveSend, withLlmCallContext } from './session-runtime/llm-call-gateway.js';
+import { onUrgentSteer, urgentSteerVersion } from './session/urgent-steer.js';
 import { estimateMessagesTokens, estimateTokens } from './tokens.js';
 import { isVerifiedOpenGatewayModel } from './llm/opengateway-models.js';
 import { timelyRouterBaseUrl } from './llm/timelyrouter-credential.js';
@@ -466,7 +467,7 @@ export interface LLMOpts {
    * ⚠️ 미주입이면 종전 동작 그대로 — 이 훅이 없으면 아무것도 배수되지 않는다.
    * ⛔ 호출자는 «비우면서» 돌려줘야 한다(같은 발화를 두 번 넣지 않기 위해).
    */
-  drainPendingUserInput?: () => readonly string[];
+  drainPendingUserInput?: () => readonly import('./chat/interjection.js').PendingInterjection[];
   /** Per-call codex reasoning effort override (codex/gpt-5 family only).
    *  Wins over cfg.codexReasoning + reasoningLevel for THIS call so a
    *  reasoning-heavy op (e.g. 미션 멀티페이즈 분해) can request high/max
@@ -5200,11 +5201,9 @@ async function streamLLMCore(
     if (consumed.ok) opts.onFinishReason?.(consumed.finishReason ?? 'unknown');
     if (consumed.ok) {
       await recordChildFirstLlmResponse({ status: 'ok' });
-      if (consumed.usage !== 'unmeasured') {
-        try {
-          logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm', role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind, ...(opts.sessionId ? { sessionId: opts.sessionId } : {}) });
-        } catch { /* best-effort observation */ }
-      }
+      try {
+        logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm', role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind, ...(opts.sessionId ? { sessionId: opts.sessionId } : {}) });
+      } catch { /* best-effort observation */ }
       debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'ok', kind: 'streamLLM', finishReason: consumed.finishReason ?? null, durationMs: Date.now() - started });
       debug.log('llm.router.done', 'streamLLM', {
         provider: activeProvider.name,
@@ -5224,7 +5223,21 @@ async function streamLLMCore(
       ...(Number.isSafeInteger(err?.status) ? { httpStatus: err.status as number } : Number.isSafeInteger(err?.statusCode) ? { httpStatus: err.statusCode as number } : {}),
       error: err,
     });
-    if (err instanceof StreamTotalTimeoutError) throw err;
+    // A failed attempt still occupies a ledger row. The provider did not
+    // report billable tokens, so the amount is unknown rather than zero.
+    logAgentTurnUsage(activeModel, 'unmeasured', {
+      providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm',
+      role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind,
+      missingReason: 'provider-call-failed',
+      ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+    });
+    if (err instanceof StreamTotalTimeoutError) {
+      debug.log('llm.router.error', 'streamLLM', {
+        provider: activeProvider.name, model: activeModel,
+        durationMs: Date.now() - started, message: sanitizeProviderFailureReason(err.message),
+      }, { level: 'error' });
+      throw err;
+    }
     if (err instanceof OverloadFailoverError && !opts.provider && !testFakeLlmDefaultSelected()) {
       const switched = activeProvider.name === 'openai-codex'
         ? firstAvailableFallbackProvider(attemptedProviders, opts)
@@ -8537,10 +8550,26 @@ export function billingRouteForProvider(provider: string | undefined, model: str
   }
 }
 
+/** TOKEN-BURN-BY-SEAT — 좌석 귀속: env(ELANOUS_SEAT ?? SEAT) → cwd `/seats/<이름>` 세그먼트.
+ *  패턴 = src/els/control-cli.ts ambientSeat(OP 확인). 게이트 Pod 처럼 env·cwd 어느 쪽도
+ *  자리를 말해주지 않으면 undefined — 스탬프를 지어내지 않는다(거짓 라벨 0).
+ *  시험이 env·cwd 를 바꿔가며 검증하므로 캐시 없이 호출마다 계산한다(debug emit 경로 · 비용 미미). */
+function ambientSeatForUsage(): string | undefined {
+  const fromEnv = process.env.ELANOUS_SEAT || process.env.SEAT;
+  if (fromEnv) return fromEnv;
+  try {
+    const parts = process.cwd().split(/[\\/]/).filter(Boolean);
+    const i = parts.lastIndexOf('seats');
+    if (i >= 0 && i + 1 < parts.length) return parts[i + 1]!;
+  } catch { /* cwd unavailable — no seat */ }
+  return undefined;
+}
+
 /** Observe usage with optional site/role metadata; a provider-name string remains supported. */
-export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOrOptions?: string | { providerName?: string; site?: string; role?: UsageRole; phase?: string; jobKind?: string; sessionId?: string }): void {
+export function logAgentTurnUsage(model: string, usage: LLMUsage | 'unmeasured', providerNameOrOptions?: string | { providerName?: string; site?: string; role?: UsageRole; phase?: string; jobKind?: string; sessionId?: string; missingReason?: 'provider-call-failed' }): void {
   try {
     const providerName = typeof providerNameOrOptions === 'string' ? providerNameOrOptions : providerNameOrOptions?.providerName;
+    const seatStamp = ambientSeatForUsage();
     const site = (typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.site) ?? 'agent-turn';
     const role = typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.role;
     const phase = typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.phase;
@@ -8550,28 +8579,31 @@ export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOr
     const sessionId = (typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.sessionId)
       ?? getAmbientSessionId() ?? undefined;
     const billing = billingRouteForProvider(providerName, model);
+    const values = usage === 'unmeasured' ? undefined : usage;
     debug.log('llm.usage', 'llm-usage', {
       site,
       ...(role !== undefined ? { role } : {}),
       ...(phase !== undefined ? { phase } : {}),
       ...(jobKind !== undefined ? { jobKind } : {}),
       ...(sessionId ? { sessionId } : {}),
+      ...(seatStamp ? { seat: seatStamp } : {}),
       model,
-      ...(usage.provider !== undefined && { provider: usage.provider }),
+      ...(values?.provider !== undefined && { provider: values.provider }),
       // ⭐ `provider` 는 «선 어댑터»(openai/anthropic)다 — 과금 주체는 별칭 칸으로(BACKLOG B10).
       ...(providerName ? { billingProvider: providerName.replace(/^auto:/, ''), billing } : {}),
-      ...(usage.inputTokens !== undefined && { inputTokens: usage.inputTokens }),
-      ...(usage.outputTokens !== undefined && { outputTokens: usage.outputTokens }),
-      ...(usage.stopReason !== undefined && { stopReason: usage.stopReason }),
-      ...(usage.estimated ? { estimated: true } : {}),
-      ...(usage.cacheReadInputTokens !== undefined && { cacheReadInputTokens: usage.cacheReadInputTokens }),
-      ...(usage.cacheCreationInputTokens !== undefined && { cacheCreationInputTokens: usage.cacheCreationInputTokens }),
-      ...llmUsageCostFields(model, usage, undefined, billing),
+      ...(values?.inputTokens !== undefined && { inputTokens: values.inputTokens }),
+      ...(values?.outputTokens !== undefined && { outputTokens: values.outputTokens }),
+      ...(values?.stopReason !== undefined && { stopReason: values.stopReason }),
+      ...(values?.estimated ? { estimated: true } : {}),
+      ...(values?.cacheReadInputTokens !== undefined && { cacheReadInputTokens: values.cacheReadInputTokens }),
+      ...(values?.cacheCreationInputTokens !== undefined && { cacheCreationInputTokens: values.cacheCreationInputTokens }),
+      ...(values ? llmUsageCostFields(model, values, undefined, billing)
+        : { measured: false, missingReason: (typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.missingReason) ?? 'provider-usage-absent', cost: { kind: 'unknown', model } }),
       // ⭐ 모델 오케스트레이션 코어 — 호출마다 {등급·계기}(토큰·비용·계정은 위 칸). 문면 0 · 사다리에 없으면 칸 없음.
       ...(() => { try { return modelOrchestrationCore().callFields({ provider: providerName, model }); } catch { return {}; } })(),
     });
-    if (usage.stopReason !== undefined) debug.log('llm.request', 'completed', {
-      model, provider: providerName ?? usage.provider ?? null, site, stopReason: usage.stopReason,
+    if (values?.stopReason !== undefined) debug.log('llm.request', 'completed', {
+      model, provider: providerName ?? values.provider ?? null, site, stopReason: values.stopReason,
     });
   } catch { /* usage observation must not change the turn */ }
 }
@@ -9160,10 +9192,15 @@ export async function streamLLMWithTools(
   let previousRequestEstimatedTokens: number | undefined;
   let loopTermination: 'budget-exhausted' | 'aborted' = 'budget-exhausted';
   let terminalTurn = maxTurns;
+  // An urgent decision may arrive while the one budget grace request is still generating.
+  // Permit at most two extra requests for those interruptions, never an unbounded model loop.
+  let urgentGraceGrants = 0;
+  let urgentGraceArmed = false;
 
   let lengthContinuationUsed = false;
   let lengthContinuationNeeded = false;
-  for (let turn = 0; turn < maxTurns || ((completionNeedsFinalTurn || codexContinuationNeeded || lengthContinuationNeeded) && turn === maxTurns); turn++) {
+  for (let turn = 0; turn < maxTurns || ((completionNeedsFinalTurn || codexContinuationNeeded || lengthContinuationNeeded) && turn === maxTurns) || urgentGraceArmed; turn++) {
+    urgentGraceArmed = false;
     // ★ /cancel 범용화(대표 2026-07-12) — abort 신호가 오면 tool 루프를 즉시 중단한다. 이게 없으면
     //   fetch 는 abort 돼도 루프가 다음 turn 으로 계속 돌아 tool 반복(grep 폭주 등)이 멈추지 않는다.
     if (opts.signal?.aborted) {
@@ -9386,6 +9423,7 @@ export async function streamLLMWithTools(
       ...(modelFamily !== 'other' ? { modelFamily } : {}),
     });
     let evCount = 0;
+    let turnUsageSeen = false;
     let lastEvType = 'none';
     // ⭐ TUI-STREAM-RETRY(2026-10-14 실측) — 200 OK 로 흐르던 스트림이 소켓 끊김으로 죽으면 같은 공급자로
     //   다시 건다(codex `stream_max_retries` 동형). 이 턴에서 받은 tool_call·image 가 있으면 재시도하지 않는다.
@@ -9422,11 +9460,14 @@ export async function streamLLMWithTools(
       evCount = 0;
       lastEvType = 'none';
       sawFirstToken = false;
+      turnUsageSeen = false;
     };
     // ⚠️ idle watchdog(2026-07-17) — codex SSE 가 완료 신호 없이 hang 하는 간헐 케이스 방어. 각
     // 이벤트 대기를 idle timeout 과 race — STREAM_IDLE_TIMEOUT_MS 무이벤트면 스트림 정리·탈출(받은
     // 텍스트로 진행). 35분 무한 hang → 자동 복구. 원인 규명은 consume-end 부재/idle-timeout 로그가.
     let streamIter: AsyncIterator<LLMStreamEvent> | undefined;
+    let urgentBoundary = false;
+    const urgentAtRoundStart = opts.sessionId ? urgentSteerVersion(opts.sessionId) : 0;
     let streamAttemptAbort: AbortController | undefined;
     let streamAttemptAbortCleanup: (() => void) | undefined;
     const releaseStreamAttempt = (abort = false, reason?: unknown): void => {
@@ -9442,12 +9483,14 @@ export async function streamLLMWithTools(
     }> | undefined;
     while (true) {
       let idleTimer: ReturnType<typeof setTimeout> | undefined;
-      let step: { idle: true } | { idle: false; r: IteratorResult<LLMStreamEvent, void> };
+      let step: { idle: true } | { idle: false; r: IteratorResult<LLMStreamEvent, void> } | { urgent: true };
+      let offUrgent: (() => void) | undefined;
       // Validate before entering the provider stream's catch/fallback boundary.
       // An incompatible request is deterministic and must not be retried elsewhere.
       if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(turnOpts.tools);
       try {
         if (!streamIter) {
+          turnUsageSeen = false;
           const finalized = finalizeStreamingProviderModel(activeProvider, activeModel);
           activeProvider = finalized.provider;
           activeModel = finalized.model;
@@ -9519,6 +9562,12 @@ export async function streamLLMWithTools(
         const quietMs = Date.now() - progressAt;
         if (quietMs >= noProgress.ms) throw new StreamNoProgressError(noProgress.ms, quietMs);
         const waitMs = Math.max(1, Math.min(phaseTimeoutMs, remainingMs, noProgress.ms - quietMs));
+        const urgent = opts.sessionId && opts.drainPendingUserInput
+          ? new Promise<{ urgent: true }>((resolve) => {
+            offUrgent = onUrgentSteer(opts.sessionId!, () => resolve({ urgent: true }));
+            if (urgentSteerVersion(opts.sessionId!) !== urgentAtRoundStart) resolve({ urgent: true });
+          })
+          : null;
         step = await Promise.race([
           withLlmCallContext({
             provider: activeProvider.name, model: activeModel, sessionId: opts.sessionId,
@@ -9528,7 +9577,24 @@ export async function streamLLMWithTools(
               : opts.initialProvider || opts.sessionId ? 'session' : opts.provider || opts.model ? 'explicit' : 'config'),
           }, () => streamIter!.next()).then((r) => ({ idle: false as const, r })),
           new Promise<{ idle: true }>((res) => { idleTimer = setTimeout(() => res({ idle: true }), waitMs); }),
+          ...(urgent ? [urgent] : []),
         ]);
+        offUrgent?.();
+        offUrgent = undefined;
+        if ('urgent' in step) {
+          if (idleTimer) clearTimeout(idleTimer);
+          releaseStreamAttempt(true, 'urgent decision');
+          const interrupted = streamIter;
+          if (interrupted?.return) {
+            try { void Promise.resolve(interrupted.return(undefined)).catch(() => {}); } catch { /* detached cleanup */ }
+          }
+          // A proposed tool call has not executed. Do not dispatch an incomplete response after interruption.
+          pendingCalls.length = 0;
+          turnEnd = false;
+          urgentBoundary = true;
+          debug.log('llm.interjection', 'urgent-stream-boundary', { turn, provider: activeProvider.name, textChars: turnText.length }, { level: 'info' });
+          break;
+        }
         if (step.idle) {
           if (Date.now() - streamStartedAt >= totalTimeoutMs) throw new StreamTotalTimeoutError(totalTimeoutMs);
           // The timer may have been the no-progress deadline (the shortest of the three), not the idle one.
@@ -9538,11 +9604,21 @@ export async function streamLLMWithTools(
         }
         await recordChildFirstLlmResponse({ status: 'ok' });
       } catch (err) {
+        offUrgent?.();
         const status = Number.isSafeInteger((err as { status?: unknown })?.status) ? (err as { status: number }).status
           : Number.isSafeInteger((err as { statusCode?: unknown })?.statusCode) ? (err as { statusCode: number }).statusCode : undefined;
         await recordChildFirstLlmResponse({ status: 'error', ...(status === undefined ? {} : { httpStatus: status }), error: err });
         if (idleTimer) clearTimeout(idleTimer);
         releaseStreamAttempt(true, err);
+        if (streamIter && !turnUsageSeen && !(err instanceof RequestSizeLimitError)) {
+          logAgentTurnUsage(activeModel, 'unmeasured', {
+            providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm-with-tools',
+            role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind,
+            missingReason: 'provider-call-failed',
+            ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+          });
+          turnUsageSeen = true;
+        }
         if (err instanceof RequestSizeLimitError) throw err;
         if (err instanceof StreamTotalTimeoutError) {
           debug.log('llm.stream', 'total-timeout', { provider: activeProvider.name, model: activeModel, turn, totalMs: err.totalMs }, { level: 'warn' });
@@ -9954,6 +10030,7 @@ export async function streamLLMWithTools(
           ...(ev.revisedPrompt !== undefined ? { revisedPrompt: ev.revisedPrompt } : {}),
         });
       } else if (ev.type === 'usage') {
+        turnUsageSeen = true;
         // Provider parsers normalize inputTokens to uncached input; cache
         // reads/writes are separate fields (prompt-cache/types.ts contract).
         const observedPromptTokens = (ev.usage.inputTokens ?? 0)
@@ -10003,6 +10080,21 @@ export async function streamLLMWithTools(
         handlers.onUsage?.(ev.usage);
       }
     }
+    if (urgentBoundary) {
+      codexContinuationNeeded = true;
+      if (urgentGraceGrants < 2) {
+        urgentGraceGrants++;
+        urgentGraceArmed = true;
+      }
+    }
+
+    // A completed provider turn without usage still occupies one explicit ledger row.
+    // Unknown tokens and cost stay absent/unknown; they must never become a false $0 saving.
+    if (!turnUsageSeen) logAgentTurnUsage(activeModel, 'unmeasured', {
+      providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm-with-tools',
+      role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind,
+      ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+    });
 
     // A whitespace-only reply has no paragraph content to separate.
     if (paragraphLeadingText) {
@@ -10062,7 +10154,7 @@ export async function streamLLMWithTools(
       debug.log('llm.router', 'codex.end-turn-false-continue', { turn, phase: turnTextPhase ?? 'unknown', textChars: turnText.length });
       // The one grace turn is also unfinished. Fall through to the existing
       // budget notice; never present a phase-marked progress item as final.
-      if (turn >= maxTurns) break;
+      if (turn >= maxTurns && !urgentGraceArmed) break;
       continue;
     }
     // #36714 contract (see streamLLM): a CALLER output cap gets no automatic continuation; a role default does, once.

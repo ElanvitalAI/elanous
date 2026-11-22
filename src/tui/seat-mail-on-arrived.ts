@@ -20,7 +20,7 @@ export interface SeatMailOnArrivedDeps {
    * SEAT-TURN-MIDTURN-MAIL 어댑터 — 턴 중 도착은 이벤트함에 한 건(id = ledger msgId).
    * `onDrained` 는 그 건이 배수될 때 불린다(원본 큐에서 이 노티스를 지우는 뒷정리 · fail-open).
    */
-  enqueueMidTurn?: (event: { kind: string; id: string; text: string }, onDrained?: () => void) => boolean;
+  enqueueMidTurn?: (event: { kind: string; id: string; text: string; from?: string; intent?: string | null }, onDrained?: () => void) => boolean;
   /** OP #106762 ⓐ — 배수된 사건의 대기 큐 노티스를 지운다(fail-open · 지운 건수를 돌려준다). */
   removeQueuedNotice?: (match: { source: string; msgId?: number; text?: string }) => number;
 }
@@ -33,15 +33,16 @@ export function seatMailOnArrived(deps: SeatMailOnArrivedDeps): (arrivals?: read
       try {
         emitTurnLife('turn-life:event-while-busy', { source: 'seat-mail', action: 'wait', ...(msgIds.length === 0 ? {} : { msgIds }) });
       } catch { /* observability is fail-open */ }
-      if (deps.enqueueMidTurn !== undefined) {
-        for (const arrival of arrivals ?? []) {
-          // 수 모드 노티스엔 msgId 가 없다 — 세션 1회 계약을 못 세우니 이벤트함에 넣지 않고 턴 끝 노크에 맡긴다.
-          if (arrival.msgId === undefined) continue;
-          deps.enqueueMidTurn(
-            { kind: 'seat-mail', id: String(arrival.msgId), text: arrival.text },
-            deps.removeQueuedNotice === undefined ? undefined : () => { deps.removeQueuedNotice?.({ source: 'seat-mail', msgId: arrival.msgId }); },
-          );
-        }
+      for (const arrival of arrivals ?? []) {
+        // 수 모드 노티스엔 msgId 가 없다 — 세션 1회 계약을 못 세우니 턴 끝 노크에 맡긴다.
+        if (arrival.msgId === undefined) continue;
+        // JUD security HOLD: no sender (OP · 대표) preempts — `--from` is not authenticated. Every mail, decisions
+        // included, rides the same mid-turn event box in arrival (msgId) order.
+        deps.enqueueMidTurn?.(
+          { kind: 'seat-mail', id: String(arrival.msgId), text: arrival.text,
+            ...(arrival.sender === undefined ? {} : { from: arrival.sender }), ...(arrival.intent === undefined ? {} : { intent: arrival.intent }) },
+          deps.removeQueuedNotice === undefined ? undefined : () => { deps.removeQueuedNotice?.({ source: 'seat-mail', msgId: arrival.msgId }); },
+        );
       }
       return;
     }

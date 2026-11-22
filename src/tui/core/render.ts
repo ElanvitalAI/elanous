@@ -364,6 +364,10 @@ export function renderNextTuiCompactFrame(input: NextTuiLogFrameInput, prepared 
     ...input.notices.flatMap((line) => wrapLogLines(line, input.columns).map((row) => dimContinueBanner(row))),
     ...input.activity.flatMap((line) => nextTuiActivityRows(line, input.columns)),
   ];
+  // A fresh session still answers «what is on screen»: keep the one-row history placeholder on the
+  // compact primary screen so the pinned header, every prompt row of a multiline composer and the
+  // editing cursor keep their places (the log view keeps its empty-transcript layout untouched).
+  if (body.length === 0) body.push('No chat history');
   const below = input.belowPrompt ?? [];
   const bodyRows = Math.max(1, input.rows - input.header.length - input.footer.length - promptLines.length - below.length);
   const maxScroll = Math.max(0, body.length - bodyRows);
@@ -477,23 +481,23 @@ export function createNextTuiCompactPainter(write: (text: string) => void): {
         committed = Math.min(stable.length, stable.length + reservedRows - rows);
       }
       const committedEnd = committed > 0 ? historyStart + committed : 0;
-      // A fold can shrink the entire transcript back into the viewport.
-      // Previously committed rows must be painted again in that case, or
-      // PageUp at the now-zero scroll range leaves only the footer visible.
-      const visibleStart = historyStart > 0 && lines.length <= rows
-        ? 0 : Math.max(Math.min(committedEnd, lines.length), lines.length - rows);
-      // A 24-row viewport otherwise keeps only the tail, so the title scrolls
-      // off while the seeded tail, footer, and prompt stay. Keep the header
-      // rows in the visible screen; the same number of older body rows yield.
+      // The window is the pinned header (up to `rows - 1` rows) plus the newest rows that fit under it, never
+      // reaching back into rows already committed to scrollback, and never taller than the screen: a taller
+      // paint scrolls its own top (the header) into scrollback on every repaint.
+      // A fold can shrink the entire transcript back into the viewport; then everything is painted again,
+      // or PageUp at the now-zero scroll range leaves only the footer visible.
       const chrome = Math.min(historyStart, Math.max(0, rows - 1));
-      let visible = lines.slice(visibleStart);
-      if (chrome > 0 && visibleStart > 0 && visible.length > chrome) {
-        visible = [...lines.slice(0, chrome), ...visible.slice(chrome)];
-      }
-      const topChrome = Math.max(0, Math.min(visible.length, historyStart - visibleStart));
+      const fitsWhole = historyStart > 0 && lines.length <= rows;
+      const bodyStart = fitsWhole ? 0
+        : Math.max(chrome, Math.min(committedEnd, lines.length), lines.length - (rows - chrome));
+      const visible = fitsWhole ? [...lines] : [...lines.slice(0, chrome), ...lines.slice(bodyStart)];
+      const topChrome = fitsWhole ? Math.min(visible.length, historyStart) : chrome;
       const padding = Array.from({ length: historyStart > 0 ? Math.max(0, rows - visible.length) : 0 }, () => '');
       const pinned = [...visible.slice(0, topChrome), ...padding, ...visible.slice(topChrome)];
-      const visibleCursorRow = Math.max(1, Math.min(rows, cursorRow - visibleStart + padding.length));
+      // `cursorRow` is a 1-based row of `lines`; find it in the painted window (header rows keep their place).
+      const cursorInWindow = fitsWhole ? cursorRow
+        : cursorRow <= chrome ? cursorRow : chrome + Math.max(0, cursorRow - bodyStart);
+      const visibleCursorRow = Math.max(1, Math.min(rows, cursorInWindow + padding.length));
       write(`\x1b[?25l\x1b[H\x1b[2J${(decorate?.(pinned) ?? pinned).join('\r\n')}\x1b[${visibleCursorRow};${Math.max(1, cursorCol)}H\x1b[?25h`);
       previousRows = rows;
       previousColumns = columns;

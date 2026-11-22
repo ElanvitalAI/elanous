@@ -44,6 +44,9 @@ async function session(worktree: string, stateDir: string, id: string, work: str
     const first = readyMs === null ? '' : text();
     let help = '';
     let afterEsc = '';
+    // esc-alive probe state (OP #129723): the unique marker typed after Esc, and the screen it produces.
+    let marker = '';
+    let afterMarker = '';
     if (readyMs !== null) {
       sim('send', id, '/help');
       await sleep(3000);
@@ -51,13 +54,20 @@ async function session(worktree: string, stateDir: string, id: string, work: str
       sim('key', id, 'esc');
       await sleep(1500);
       afterEsc = text();
+      // esc-alive (OP #129723 / JUD-C mustFix): type a unique marker AFTER Esc — a live session echoes it
+      // on the input line with the footer still «Turn idle»; a frozen/dead TUI shows no fresh frame, so
+      // tuiChecks esc-alive fails instead of passing vacuously on the already-seen /help frame.
+      marker = `esc-alive-${id}-${Date.now().toString(36)}`;
+      sim('type', id, marker);
+      await sleep(1500);
+      afterMarker = text();
     }
     const dump = readyMs === null ? '' : sim('dump', id, 'release-check').stderr;
     const inTree = /files: .*?(\S+\.png)/.exec(dump)?.[1];
     // The worktree is removed at the end — keep the screen next to it, in the temp work dir.
     let png: string | undefined;
     if (inTree && existsSync(inTree)) { png = join(work, basename(inTree)); copyFileSync(inTree, png); }
-    return { checks: tuiChecks({ readyMs, first, help, afterEsc }), png };
+    return { checks: tuiChecks({ readyMs, first, help, afterEsc, marker, afterMarker }), png };
   } finally {
     sim('stop', id);
     await sleep(3000);

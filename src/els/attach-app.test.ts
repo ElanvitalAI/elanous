@@ -36,11 +36,8 @@ test('a damaged CEO side status is visibly unknown rather than silently zero', a
   h.tick(); await Bun.sleep(20);
   expect(h.lastScreen()).not.toContain('대표 대기 글');
 });
-// Inspect the actual absolute-positioned overlay, not the old underlying screen row.
-const modalRow = (screen: string, y: number, x = 31): string => {
-  const match = new RegExp(`\\x1b\\[${y};${x}H([^\\x1b]*(?:\\x1b\\[[0-9;]*m[^\\x1b]*)*)`).exec(screen);
-  return plain(match?.[1] ?? '');
-};
+// ELS-APP-RENDER-SINGLE-FRAME: the dialog is spliced into the composed rows — read row `y` (1-based) of the one frame.
+const modalRow = (screen: string, y: number): string => plain(screen.split('\r\n')[y - 1] ?? '');
 
 test('key router: plain text is input; ctrl+b then a herdr key is an action; ctrl+b ctrl+b is a literal ctrl+b; Esc cancels; the prefix survives a split read', () => {
   const router = createKeyRouter();
@@ -204,6 +201,7 @@ test('new tab modal: incomplete escape cannot consume pane input after save fini
   let resolve!: (value: ElsResult) => void;
   h.setNewResponse(() => new Promise((r) => { resolve = r; }));
   h.app.key('\u0002c'); h.app.key('named\r');
+  await Bun.sleep(0); // creation first refreshes the owner's current cwd
   h.app.key('\u001b[');
   h.setListing(listOf(row('w1', 'p1', 'one', 'idle'), row('w1', 'p2', 'new', 'idle')));
   resolve({ exitCode: 0, message: JSON.stringify({ pane: 'p2' }) });
@@ -372,6 +370,7 @@ test('new tab modal: Ctrl+B during a pending request cannot consume later Esc', 
   h.setNewResponse(() => new Promise((done) => { resolve = done; }));
   await h.app.start();
   h.app.key('\u0002cwork\r');
+  await Bun.sleep(0); // wait for the cwd refresh before the create is in flight
   h.app.key('\u0002');
   resolve({ exitCode: 1, message: 'refused' });
   await Bun.sleep(10);
@@ -387,6 +386,7 @@ test('new tab modal: repeated Enter while creation is pending sends only one req
   await h.app.start();
   h.app.key('\u0002cwork\r');
   h.app.key('\r\r');
+  await Bun.sleep(0); // the cwd lookup precedes the single create
   expect(h.requests.filter((r) => r.op === 'new')).toHaveLength(1);
   resolve({ exitCode: 1, message: 'refused' });
   await Bun.sleep(10);
@@ -413,6 +413,7 @@ test('new tab modal: Ctrl+B does not consume Esc or name characters and does not
   h.app.key('\u0002c');
   h.app.key('a\u0002b');
   h.app.key('\r');
+  await Bun.sleep(0); // wait for the cwd refresh
   expect(h.requests.filter((r) => r.op === 'new').at(-1)).toMatchObject({ title: 'ab' });
 });
 
@@ -913,8 +914,8 @@ test('app: sidebar clicks follow the drawn rows — a space row selects its firs
   h.app.key(click(5, 3)); h.app.key('\u001b[<0;5;3m');                         // second space row → its first pane p3
   expect(h.attachments.at(-1)!.pane).toBe('p3');
   h.app.key(click(3, 23)); h.app.key('\u001b[<0;3;23m');                       // the word «new»
-  expect(modalRow(h.writes.at(-1)!, 9)).toContain('┌ 새 탭 이름');
-  expect(modalRow(h.writes.at(-1)!, 15)).toContain('└');
+  expect(modalRow(h.writes.at(-1)!, 9)).toMatch(/╔ +새 탭 이름 +✕ ╗/);
+  expect(modalRow(h.writes.at(-1)!, 15)).toMatch(/╚═+╝/);
   expect(h.attachments.every((a) => a.typed.length === 0)).toBe(true);
 }, 10_000);
 
@@ -1134,9 +1135,9 @@ test('app: clicking «+» opens the name prompt (press consumed, its release swa
   await h.app.start();
   const x = plusAt(h);
   h.app.key(`\u001b[<0;${x};1M`); h.app.key(`\u001b[<0;${x};1m`);
-  expect(modalRow(h.writes.at(-1)!, 9)).toContain('┌ 새 탭 이름');
+  expect(modalRow(h.writes.at(-1)!, 9)).toMatch(/╔ +새 탭 이름 +✕ ╗/);
   expect(modalRow(h.writes.at(-1)!, 10)).toContain('Name');
-  expect(modalRow(h.writes.at(-1)!, 15)).toContain('└');
+  expect(modalRow(h.writes.at(-1)!, 15)).toMatch(/╚═+╝/);
   h.app.key('빌드 x'); h.app.key('\u007f');
   expect(await renderedRow(h.writes.at(-1)!, 11)).toContain('빌드 ');
   expect(h.attachments.at(-1)!.typed).toEqual([]);               // nothing reached the pane (not the text, not the click or its release)
@@ -1156,4 +1157,14 @@ test('app: Esc cancels (no request), Ctrl+C clears, ESC bytes and ctrl+b c typed
   expect(modalRow(h.writes.at(-1)!, 9)).not.toContain('새 탭 이름');
   expect(h.requests.filter((r) => r.op === 'new')).toEqual([]);
   expect(h.attachments.at(-1)!.typed).toEqual([]);
+});
+
+test('new tab samples the selected pane cwd after a synthetic cd event, not the cached cwd', async () => {
+  const listing = (cwd: string) => JSON.stringify({ workspaces: [{ id: 'w1', rootCwd: '/workspace' }], panes: [{ ...row('w1', 'p1', 'shell', 'idle'), cwd }] });
+  const h = harness(listing('/workspace/before'));
+  await h.app.start();
+  h.setListing(listing('/workspace/after'));
+  h.app.key('\u0002c\r');
+  await Bun.sleep(20);
+  expect(h.requests.filter((r) => r.op === 'new').at(-1)).toMatchObject({ ws: 'name-w1', cwd: '/workspace/after' });
 });

@@ -10,6 +10,8 @@ export interface EncryptedMemberBackup {
   readonly version: 1;
   readonly id: string;
   readonly generation: number;
+  /** Entitlement kind of the encrypted payload; legacy rows predate it and read without one. */
+  readonly dataKind: string;
   readonly nonce: string;
   readonly ciphertext: string;
   readonly sealedKey: string;
@@ -42,8 +44,8 @@ function signatureMessage(item: Omit<EncryptedMemberBackup, 'senderSignature'>):
 /** Exact JSON/base64 transport ceiling; this is not the proposed free-tier quota. */
 export function maxBackupPlaintextBytes(id: string, generation: number): number {
   if (!ID.test(id) || !Number.isSafeInteger(generation) || generation < 1) throw new Error('BACKUP_INVALID');
-  const fixed = JSON.stringify({ version: 1, id, generation, nonce: 'A'.repeat(32), ciphertext: '',
-    sealedKey: 'A'.repeat(108), recoveryPublicKey: 'A'.repeat(44), sha256: '0'.repeat(64),
+  const fixed = JSON.stringify({ version: 1, id, generation, dataKind: 'A'.repeat(64), nonce: 'A'.repeat(32),
+    ciphertext: '', sealedKey: 'A'.repeat(108), recoveryPublicKey: 'A'.repeat(44), sha256: '0'.repeat(64),
     senderPublicKey: 'A'.repeat(44), senderSignature: 'A'.repeat(88) });
   const availableBase64Bytes = MAX_BACKUP_WIRE_BYTES - Buffer.byteLength(fixed, 'utf8');
   return Math.max(0, 3 * Math.floor(availableBase64Bytes / 4) - AEAD_TAG_BYTES);
@@ -60,12 +62,17 @@ function decode(value: unknown, min: number, max: number): Uint8Array {
 function validate(value: unknown): EncryptedMemberBackup {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('BACKUP_INVALID');
   const item = value as Record<string, unknown>;
-  const keys = ['version', 'id', 'generation', 'nonce', 'ciphertext', 'sealedKey', 'recoveryPublicKey', 'sha256',
-    'senderPublicKey', 'senderSignature'];
-  if (Object.keys(item).length !== keys.length || Object.keys(item).some(key => !keys.includes(key))
+  const keys = ['version', 'id', 'generation', 'dataKind', 'nonce', 'ciphertext', 'sealedKey', 'recoveryPublicKey',
+    'sha256', 'senderPublicKey', 'senderSignature'];
+  // dataKind is required on writes; legacy stored rows predate it, so reads tolerate its absence.
+  const itemKeys = Object.keys(item);
+  if ((itemKeys.length !== keys.length && itemKeys.length !== keys.length - 1)
+    || itemKeys.some(key => !keys.includes(key))
     || item.version !== 1 || typeof item.id !== 'string' || !ID.test(item.id)
     || !Number.isSafeInteger(item.generation) || (item.generation as number) < 1
     || typeof item.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(item.sha256)) throw new Error('BACKUP_INVALID');
+  if (itemKeys.length === keys.length && (typeof item.dataKind !== 'string' || item.dataKind.length === 0
+    || item.dataKind.length > 64 || item.dataKind.trim() !== item.dataKind)) throw new Error('BACKUP_INVALID');
   decode(item.nonce, 24, 24);
   const ciphertext = decode(item.ciphertext, 17, MAX_REQUEST_BYTES);
   decode(item.sealedKey, 80, 80); // sealed 32-byte key plus crypto_box_SEALBYTES
@@ -93,7 +100,7 @@ export async function createBackupSenderKeyPair(): Promise<BackupSenderKeyPair> 
 /** Client only: encrypt before any network request. No plaintext or secret key enters the API body. */
 export async function encryptMemberBackup(
   plaintext: Uint8Array, recoveryPublicKey: Uint8Array, sender: BackupSenderKeyPair,
-  input: { id?: string; generation?: number } = {},
+  input: { id?: string; generation?: number; dataKind?: string } = {},
 ): Promise<EncryptedMemberBackup> {
   await sodium.ready;
   if (!(plaintext instanceof Uint8Array) || plaintext.length === 0
@@ -104,13 +111,16 @@ export async function encryptMemberBackup(
   }
   const id = input.id ?? randomUUID();
   const generation = input.generation ?? 1;
+  // The shipped secret-backup client syncs the 'secrets' kind; other kinds are declared per call.
+  const dataKind = input.dataKind ?? 'secrets';
+  if (dataKind.length === 0 || dataKind.length > 64 || dataKind.trim() !== dataKind) throw new Error('BACKUP_INVALID');
   if (plaintext.length > maxBackupPlaintextBytes(id, generation)) throw new Error('BACKUP_INVALID');
   const key = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_KEYBYTES);
   const nonce = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
   try {
     const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(plaintext, aad(id, generation), null, nonce, key);
     const sealedKey = sodium.crypto_box_seal(key, recoveryPublicKey);
-    const unsigned = { version: 1 as const, id, generation, nonce: encode(nonce), ciphertext: encode(ciphertext),
+    const unsigned = { version: 1 as const, id, generation, dataKind, nonce: encode(nonce), ciphertext: encode(ciphertext),
       sealedKey: encode(sealedKey), recoveryPublicKey: encode(recoveryPublicKey), sha256: digest(ciphertext),
       senderPublicKey: encode(sender.publicKey) };
     const message = signatureMessage(unsigned);
@@ -151,6 +161,37 @@ export async function decryptMemberBackup(
   finally { if (key) sodium.memzero(key); }
 }
 
+export interface BackupQuota {
+  readonly plan: string;
+  readonly maxSyncBytes: number;
+  readonly maxGenerations: number;
+  readonly dataKinds: readonly string[];
+  readonly usedSyncBytes: number;
+  readonly liveGenerations: number;
+}
+
+function quotaError(quota: Record<string, unknown>): Response {
+  return response({ error: 'backup-quota-exceeded', quota }, 403);
+}
+
+/** Reads only catalog rows; a numeric limit in application code is a contract violation. */
+function readBackupQuota(entitlements: Readonly<Record<string, unknown>>, plan: string,
+  liveBytes: number, liveGenerations: number): BackupQuota | { error: 'plan-required' } | { error: 'unavailable' } {
+  if (entitlements['backup.sync'] !== true) return { error: 'plan-required' };
+  const maxSyncBytes = entitlements['backup.maxSyncBytes'];
+  const maxGenerations = entitlements['backup.maxGenerations'];
+  const dataKinds = entitlements['backup.dataKinds'];
+  if (typeof maxSyncBytes !== 'number' || !Number.isSafeInteger(maxSyncBytes) || maxSyncBytes < 1
+    || typeof maxGenerations !== 'number' || !Number.isSafeInteger(maxGenerations) || maxGenerations < 1
+    || !Array.isArray(dataKinds) || dataKinds.length === 0
+    || !dataKinds.every(kind => typeof kind === 'string' && kind.length > 0 && kind.trim() === kind)
+    || new Set(dataKinds).size !== dataKinds.length) {
+    return { error: 'unavailable' };
+  }
+  return { plan, maxSyncBytes, maxGenerations, dataKinds, usedSyncBytes: liveBytes, liveGenerations };
+}
+
+const liveBytesQuery = 'SELECT COALESCE(SUM(length(envelope)),0) AS bytes, COUNT(*) AS generations FROM member_backup WHERE owner=? AND deleted=0';
 type Row = { generation: number; deleted: number; envelope: string; sha256: string };
 function response(body: Record<string, unknown>, status = 200): Response {
   return Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
@@ -190,7 +231,7 @@ async function readLimitedJson(request: Request): Promise<{ raw: string; value: 
 /** Fake-server-compatible HTTP boundary. SQLite stores ciphertext, envelope and opaque metadata only. */
 export function createMemberCloudBackupApi(options: {
   dbPath: string;
-  memberStore: Pick<MemberStore, 'memberForSession'>;
+  memberStore: Pick<MemberStore, 'memberForSession' | 'memberPlanForMember'>;
   now?: () => Date;
 }) {
   mkdirSync(dirname(options.dbPath), { recursive: true, mode: 0o700 });
@@ -207,6 +248,15 @@ export function createMemberCloudBackupApi(options: {
     );`);
   const row = (owner: string, id: string) => db.query('SELECT generation,deleted,envelope,sha256 FROM member_backup WHERE owner=? AND id=?')
     .get(owner, id) as Row | null;
+  const liveUsage = (owner: string) => db.query(liveBytesQuery).get(owner) as { bytes: number; generations: number };
+  const quotaFor = (owner: string) => {
+    try {
+      const planRow = options.memberStore.memberPlanForMember(owner);
+      if (!planRow) return { error: 'plan-required' as const };
+      const usage = liveUsage(owner);
+      return readBackupQuota(planRow.entitlements, planRow.plan, Number(usage.bytes), Number(usage.generations));
+    } catch { return { error: 'unavailable' as const }; }
+  };
   const now = () => (options.now?.() ?? new Date()).toISOString();
   return {
     async handle(request: Request): Promise<Response | undefined> {
@@ -225,7 +275,13 @@ export function createMemberCloudBackupApi(options: {
       if (request.method === 'GET' && id === null) {
         const rows = db.query('SELECT id,generation,sha256 FROM member_backup WHERE owner=? AND deleted=0 ORDER BY id')
           .all(owner) as Array<{ id: string; generation: number; sha256: string }>;
-        return response({ backups: rows });
+        // Catalog rows are the only quota source; a degraded plan fails the listing closed
+        // with the same contract as writes — never a 200 without the required quota block.
+        const quota = quotaFor(owner);
+        if ('error' in quota) return quota.error === 'plan-required'
+          ? response({ error: 'backup-plan-required' }, 403)
+          : response({ error: 'quota-unavailable' }, 503);
+        return response({ backups: rows, quota });
       }
       if (request.method === 'GET' && id !== null) {
         const found = row(owner, id);
@@ -260,9 +316,35 @@ export function createMemberCloudBackupApi(options: {
                 return response({ error: 'generation-conflict' }, 409);
               return response(original);
             }
+            // Quota is enforced after the retry cache so an idempotent replay of an already
+            // committed request still returns its original response under any later plan change.
+            const quota = quotaFor(owner);
+            if ('error' in quota) return quota.error === 'plan-required'
+              ? response({ error: 'backup-plan-required' }, 403)
+              : response({ error: 'quota-unavailable' }, 503);
+            // JUD-B #130562 must-fix: the envelope declares its dataKind and the plan row's
+            // dataKinds decides admission — a kind branch or numeric limit in application code
+            // is a contract violation. Writes require the field; legacy rows only ever read.
+            if (typeof item.dataKind !== 'string' || item.dataKind.length === 0
+              || item.dataKind.length > 64 || item.dataKind.trim() !== item.dataKind)
+              return response({ error: 'invalid-request' }, 400);
+            if (!quota.dataKinds.includes(item.dataKind))
+              return quotaError({ reason: 'kind', dataKind: item.dataKind, dataKinds: quota.dataKinds });
             const old = row(owner, item.id);
             if (old?.deleted || (old?.generation ?? 0) !== expected || item.generation !== expected + 1)
               return response({ error: 'generation-conflict' }, 409);
+            // Catalog-row ceilings, enforced inside the same immediate transaction as the CAS
+            // check so concurrent writers cannot both spend the same quota room. A rotation
+            // replaces the old envelope bytes instead of double-counting them.
+            const incomingBytes = Buffer.byteLength(JSON.stringify(item), 'utf8');
+            const replacedBytes = old ? Buffer.byteLength(old.envelope, 'utf8') : 0;
+            if (!old && quota.liveGenerations + 1 > quota.maxGenerations)
+              return quotaError({ reason: 'generations', maxGenerations: quota.maxGenerations,
+                liveGenerations: quota.liveGenerations });
+            const projectedBytes = quota.usedSyncBytes - replacedBytes + incomingBytes;
+            if (projectedBytes > quota.maxSyncBytes)
+              return quotaError({ reason: 'bytes', maxSyncBytes: quota.maxSyncBytes,
+                usedSyncBytes: quota.usedSyncBytes, incomingBytes, replacedBytes });
             db.query(`INSERT INTO member_backup(owner,id,generation,envelope,sha256) VALUES (?,?,?,?,?)
               ON CONFLICT(owner,id) DO UPDATE SET generation=excluded.generation,envelope=excluded.envelope,sha256=excluded.sha256`)
               .run(owner, item.id, item.generation, JSON.stringify(item), item.sha256);

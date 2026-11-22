@@ -82,10 +82,12 @@ export async function routeElsHttp(core: ElsCore, hostName: string, method: stri
   if (method === 'POST' && url.pathname === '/els/do' && info.policy) return routeDo(core, hostName, info);
   if (method !== 'GET') return json(405, { error: 'read-only: GET only' });
   if (url.pathname === '/els/ls') {
-    const listed = JSON.parse(core.list().message) as { panes: { tab: string; pane: string; title: string; cwd: string; state: string; address: string; build?: unknown;
+    const listed = JSON.parse(core.list().message) as { workspaces?: { id: string; role?: string }[]; panes: { tab: string; pane: string; title: string; cwd: string; state: string; address: string; build?: unknown;
       badge?: string; badgeLabel?: string; stalled?: boolean; lastEventAtMs?: number }[] };
+    const coordinators = new Set((listed.workspaces ?? []).filter((ws) => ws.role === 'coordinator').map((ws) => ws.id));
     // ELS-TAB-STATE-BADGE: stalled is decided HERE, once, by the origin server's clock; a federated reader only carries it.
-    return json(200, { host: hostName, panes: listed.panes.map((row) => ({ ws: row.address.split('/')[0], tab: row.tab, pane: row.pane,
+    return json(200, { host: hostName, workspaces: (listed.workspaces ?? []).filter((ws) => ws.role === 'coordinator'), panes: listed.panes.map((row) => ({ ws: row.address.split('/')[0], tab: row.tab, pane: row.pane,
+      ...(coordinators.has(row.address.split('/')[0] ?? '') ? { role: 'coordinator' } : {}),
       title: row.title, cwd: row.cwd, state: row.state, build: row.build,
       badge: row.badge, badgeLabel: row.badgeLabel, stalled: row.stalled, lastEventAtMs: row.lastEventAtMs })) });
   }

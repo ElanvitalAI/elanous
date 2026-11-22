@@ -22,7 +22,7 @@ test('80×24 Next PTY: the compact footer keeps the folder and the version befor
   try {
     writeFileSync(join(root, 'config.json'), JSON.stringify({
       onboarding: { completed: true }, errorReports: { enabled: false },
-      llm: { goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } },
+      llm: { memoryJudge: { enabled: false, crossRecall: false } },
     }));
     const evidence = await mockSeatPtySequence({
       executable: process.execPath,

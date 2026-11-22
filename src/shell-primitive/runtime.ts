@@ -1,8 +1,8 @@
 // ── Ephemeral shell runtime — X1 ──
 //
-// runShell(req): Promise<ShellResult>.  argv-exec, captured output,
-// timeout, abort signal composition, and (when approval !== 'none')
-// a prompt hook that consults/updates the session cache.
+// runShell(req): Promise<ShellResult>. argv execution, captured output,
+// timeout and abort signal composition. Executions outside the local-read
+// policy require a parent-issued, single-use grant at the spawn gateway.
 //
 // Intentionally thin layer over node's child_process.spawn:
 //   • No shell interpretation (argv[0] is the binary path).
@@ -10,12 +10,18 @@
 //     argv[0] contains no slash. Otherwise pass straight through.
 //   • stdout/stderr captured as utf8 strings with a combined
 //     truncation budget (head + tail).
-//   • approval: first-time → consults approval cache, falls back to
-//     the approver DI (caller supplies; fail-closed when missing).
+//   • The legacy approval cache is not execution authority; the gateway
+//     verifies and consumes the signed grant immediately before spawn.
 //
 // Design ref: DESIGN-codex-pty-port.md §3 Phase X1.
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
+import { accessSync, constants, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { delimiter, resolve } from 'node:path';
+import { requestRunShellApproval, RUNSHELL_PUBLIC_KEY_ENV } from '../tui-client/next-runshell-approval.js';
+import type { SignedRunShellApproval } from './runshell-approval.js';
+import { isLocalRead, spawnGateway } from './spawn-gateway.js';
 import {
   commandKey,
   getCachedDecision,
@@ -26,6 +32,7 @@ import { terminateTree } from './terminate-tree.js';
 import { applySandbox, SandboxUnavailableError } from './sandbox.js';
 import { getSessionCwd } from '../session/working-dir.js';
 import { runtimeProcessIdentity } from '../els/seat-runtime.js';
+import { shellChildEnv } from '../shell-runner/child-env.js';
 import { classifyDestructive, type GuardianFinding } from '../ask-user-question/guardian.js';
 import { detectSandboxFailure } from './escalation-prompt.js';
 import {
@@ -37,6 +44,8 @@ import {
   type ApprovalDecision,
 } from './types.js';
 
+// The parent supplies this once at child boot; individual requests cannot choose a verifier.
+const trustedRunShellPublicKey = process.env[RUNSHELL_PUBLIC_KEY_ENV];
 let approverRef: ShellApprover | null = null;
 
 /** Wire the approver (typically createShellApprover() from the
@@ -97,7 +106,7 @@ export async function runShell(req: ShellRequest, priorHumanApproval = false): P
   // WD5 — default to the session working directory so a user who
   // Ctrl+W'd into /some/project has shells spawn there without every
   // caller threading cwd explicitly.
-  const cwd = req.cwd ?? getSessionCwd();
+  const cwd = resolve(req.cwd ?? getSessionCwd());
   const key = commandKey({ command: req.command, cwd });
 
   // ─── AU3 — Guardian pre-check ────────────────────────────────
@@ -110,20 +119,31 @@ export async function runShell(req: ShellRequest, priorHumanApproval = false): P
     guardian ? { ...r, guardian } : r
   );
 
-  const gateResult = await gateShellCommand(req, priorHumanApproval);
-  if (gateResult) return gateResult;
+  // A boolean/cache is not authority for an argv execution.  The product
+  // approval below is always per invocation and is verified at spawn.
+  let originalExecutable: string;
+  try { originalExecutable = resolveExecutable(req.command[0]!, cwd); }
+  catch (err) {
+    if (req.signal?.aborted) return withG(aborted(key));
+    return withG({
+      exitCode: null, stdout: '', stderr: '', elapsedMs: 0, approvalKey: key,
+      outcome: 'spawn-error', truncated: false,
+      spawnError: err instanceof Error ? err.message : String(err),
+      sandboxed: false, sandboxTool: 'none',
+    });
+  }
+  const originalCommand = [originalExecutable, ...req.command.slice(1)];
 
   // ─── Sandbox wrapping (X3) ───────────────────────────────────
-  // Happens after approval so the audit trail shows the user's
-  // un-wrapped argv (what the LLM/skill asked for), not the
-  // sandbox-exec frame. The sandboxed flag on the result still
-  // surfaces whether isolation was in effect.
+  // Wrap before requesting the one-use approval so its argv binds the
+  // exact process invocation. Audit records retain the original request;
+  // the result also reports whether isolation was applied.
   let sandboxedCommand: string[];
   let sandboxed = false;
   let sandboxTool: ShellResult['sandboxTool'] = 'none';
   try {
     const decision = applySandbox({
-      command: req.command,
+      command: originalCommand,
       cwd,
       network: req.network,
       sandbox: req.sandbox,
@@ -174,7 +194,27 @@ export async function runShell(req: ShellRequest, priorHumanApproval = false): P
     return withG(abortResult);
   }
 
-  const child = spawnSafely(sandboxedCommand, cwd, req.env);
+  const localRead = isLocalRead(sandboxedCommand[0]!, sandboxedCommand.slice(1), cwd);
+  // Local reads retain the ordinary approval policy (including explicit
+  // 'always'); non-local executions still require the signed spawn grant.
+  if (localRead) {
+    const gateResult = await gateShellCommand(req, priorHumanApproval);
+    if (gateResult) return gateResult;
+  }
+  let approval: SignedRunShellApproval | null = null;
+  const publicKeyPem = trustedRunShellPublicKey;
+  const callerSeat = process.env.ELANOUS_TRACK;
+  const sessionId = req.runShellSessionId;
+  if (!localRead) {
+    if (!publicKeyPem || !callerSeat || !sessionId) return withG(denied(key));
+    try {
+      const bytesSha256 = createHash('sha256').update(readFileSync(originalExecutable)).digest('hex');
+      approval = await requestRunShellApproval(process, { argv: sandboxedCommand, cwd, bytesSha256, callerSeat, sessionId }, req.signal);
+    } catch { return withG(denied(key)); }
+    if (!approval) return withG(req.signal?.aborted ? aborted(key) : denied(key));
+  }
+  const child = spawnSafely(sandboxedCommand, cwd, req.env, req.envPolicy,
+    approval ? { approval, publicKeyPem: publicKeyPem!, callerSeat: callerSeat!, sessionId: sessionId!, executablePath: originalExecutable, signal: req.signal } : undefined);
   if (child instanceof Error) {
     const result: ShellResult = {
       exitCode: null, stdout: '', stderr: '',
@@ -287,27 +327,54 @@ function aborted(key: string): ShellResult {
   };
 }
 
+function resolveExecutable(command: string, cwd: string): string {
+  const candidates = command.includes('/') ? [resolve(cwd, command)]
+    : (process.env.PATH ?? '/usr/bin:/bin').split(delimiter).map(dir => resolve(cwd, dir || '.', command));
+  for (const candidate of candidates) {
+    try { accessSync(candidate, constants.X_OK); return candidate; } catch { /* next PATH entry */ }
+  }
+  throw new Error('RunShell executable unavailable');
+}
+
 function spawnSafely(
   command: string[],
   cwd: string,
   env: Record<string, string> | undefined,
+  envPolicy: ShellRequest['envPolicy'],
+  grant?: { approval: SignedRunShellApproval; publicKeyPem: string; callerSeat: string; sessionId: string; executablePath: string; signal?: AbortSignal },
 ): ChildProcess | Error {
   try {
-    const childEnv = { ...process.env, ...(env ?? {}) };
+    const childEnv = envPolicy === 'allowlist'
+      ? shellChildEnv(process.env, env)
+      : { ...process.env, ...(env ?? {}) };
     // The child claims this live runtime, not a possibly inherited stale claim.
     const runtime = runtimeProcessIdentity(process.pid);
     if (runtime) childEnv.ELN_SEAT_RUNTIME = JSON.stringify({ pid: runtime.pid, start: runtime.start });
     else delete childEnv.ELN_SEAT_RUNTIME;
-    return spawn(command[0]!, command.slice(1), {
+    return spawnGateway(command[0]!, command.slice(1), {
       cwd,
-      env: childEnv,
+      // The project augments ProcessEnv with a required NODE_ENV; the allowlist deliberately omits it.
+      env: childEnv as unknown as NodeJS.ProcessEnv,
       shell: false,
       // own process group → terminateTree kills the whole tree (and only it).
       detached: process.platform !== 'win32',
-    });
+    }, undefined, grant);
   } catch (err) {
     return err instanceof Error ? err : new Error(String(err));
   }
+}
+
+/** The capture budget is bytes across both streams, including malformed UTF-8 replacement bytes. */
+function decodeWithinByteBudget(chunks: Buffer[], budget: number): string {
+  const text = Buffer.concat(chunks).toString('utf8');
+  if (Buffer.byteLength(text, 'utf8') <= budget) return text;
+  const encoded = Buffer.from(text, 'utf8');
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  for (let end = Math.min(budget, encoded.length); end >= Math.max(0, budget - 3); end--) {
+    try { return decoder.decode(encoded.subarray(0, end)); }
+    catch { /* one incomplete UTF-8 code point at the byte edge */ }
+  }
+  return '';
 }
 
 function collectOutput(
@@ -321,24 +388,22 @@ function collectOutput(
   sandboxTool: ShellResult['sandboxTool'],
 ): Promise<ShellResult> {
   return new Promise<ShellResult>((resolve) => {
-    let stdout = '';
-    let stderr = '';
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
     let truncated = false;
     let outcome: ShellResult['outcome'] = 'exit';
     let settled = false;
     let spawnErrorMsg: string | undefined;
 
-    const append = (dst: 'stdout' | 'stderr', chunk: string) => {
-      const current = dst === 'stdout' ? stdout : stderr;
-      const budgetLeft = maxOutput - current.length;
+    const append = (dst: 'stdout' | 'stderr', chunk: Buffer) => {
+      const budgetLeft = maxOutput - stdoutBytes - stderrBytes;
       if (budgetLeft <= 0) { truncated = true; return; }
-      if (chunk.length <= budgetLeft) {
-        if (dst === 'stdout') stdout += chunk; else stderr += chunk;
-      } else {
-        if (dst === 'stdout') stdout += chunk.slice(0, budgetLeft);
-        else stderr += chunk.slice(0, budgetLeft);
-        truncated = true;
-      }
+      const retained = Buffer.from(chunk.subarray(0, budgetLeft));
+      if (dst === 'stdout') { stdoutChunks.push(retained); stdoutBytes += retained.length; }
+      else { stderrChunks.push(retained); stderrBytes += retained.length; }
+      if (retained.length < chunk.length) truncated = true;
     };
 
     // A201 — wall-clock timeout ⊕ no-output stall line. Kills the exact child; a stall
@@ -360,8 +425,8 @@ function collectOutput(
         }, KILL_ESCALATE_MS * 2).unref();
       },
     });
-    child.stdout?.on('data', (c: Buffer) => { watchdog.touch(); append('stdout', c.toString('utf8')); });
-    child.stderr?.on('data', (c: Buffer) => { watchdog.touch(); append('stderr', c.toString('utf8')); });
+    child.stdout?.on('data', (c: Buffer) => { watchdog.touch(); append('stdout', c); });
+    child.stderr?.on('data', (c: Buffer) => { watchdog.touch(); append('stderr', c); });
 
     const onAbort = () => {
       if (outcome === 'exit') outcome = 'aborted';
@@ -394,8 +459,8 @@ function collectOutput(
       resolve({
         ...(watchdog.fired ? { watchdog: watchdog.fired } : {}),
         exitCode,
-        stdout,
-        stderr,
+        stdout: decodeWithinByteBudget(stdoutChunks, stdoutBytes),
+        stderr: decodeWithinByteBudget(stderrChunks, stderrBytes),
         elapsedMs: Date.now() - started,
         approvalKey: key,
         outcome,

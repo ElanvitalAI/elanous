@@ -1,5 +1,6 @@
 import type { InternalTurnOrigin } from './internal-turn-origin.js';
 import type { MessageSource } from '../session/index.js';
+import type { WorkReference } from '../core-turn/seat-owner-check.js';
 
 /** Shared contract for callers of the classic internal-turn gate. */
 export type InternalTurnRejectReason =
@@ -19,6 +20,8 @@ export interface StartTurnIfIdleOptions {
    * Only `kind: 'agent'` is carried; absent = the harness itself (system · `origin`).
    */
   from?: MessageSource;
+  /** Explicit references from the producer, not inferred from turn text or routing metadata. */
+  workReferences?: readonly WorkReference[];
 }
 
 export type StartTurnIfIdleResult =

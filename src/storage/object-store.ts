@@ -3,7 +3,7 @@
 // 자격·서명 URL 은 관측에 싣지 않는다.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, copyFileSync, rmSync } from 'node:fs';
+import { closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { dirname, join } from 'node:path';
@@ -30,6 +30,16 @@ export interface StorageConfig {
 export interface ObjectHead {
   exists: boolean;
   bytes?: number;
+  /**
+   * 불변 객체 버전(WIRE ① OBJECTHEAD-GENERATION · OP #128878/#128835). 같은 경로를 교체해도
+   * 값이 바뀐다 — 회원 공유 링크가 발급 때의 버전에만 결속되게 하는 원료다.
+   *  - local: `${dev}:${ino}:${mtimeNs}` (put 은 tmp+rename 이라 inode·mtimeNs 이 매번 바뀐다)
+   *  - gcs: objects describe 의 `generation`
+   *  - s3/r2: head-object 의 `VersionId` — 버전 미활성 버킷은 CLI 가 주지 않으므로 미포함.
+   *    세대가 없으면 generation 을 못 믿는다(발급 계층에서 거부).
+   *  - azure: 미제공(blob 버전 정책 계약 밖 — 소비 계층은 undefined 를 «세대 결속 불가» 로 다룬다).
+   */
+  generation?: string;
 }
 
 export interface PutOptions {
@@ -41,11 +51,23 @@ export interface PutOptions {
   gcsAccessTokenFile?: string;
 }
 
+export interface GetOptions {
+  /**
+   * 발급 시점의 불변 객체 버전(ObjectHead.generation) — jud-39564-e5edf3206d3b(보안 HOLD 수리):
+   * 공유 링크 읽기는 «소유자 확인 + 읽을 객체 버전 결속» 계약이다. generation 을 주면 그 세대의
+   * 바이트만 내린다 — head 확인 직후 같은 경로가 교체돼도 «최신» 객체를 반환하지 않는다
+   * (불일치·소실 = 거부 · fail-closed). 소유자 확인은 발급·폐기·검증 계층 계약
+   * (member-share-link · jud-39544-1868e6b6c4)이고 이 계층은 읽을 객체의 버전 결속을 담당한다.
+   * azure 는 head 가 generation 을 내지 않는다 — 결속 요청 자체를 거부한다(세대 없음 = 결속 불가).
+   */
+  generation?: string;
+}
+
 export interface ObjectStore {
   provider: StorageProvider;
   put(key: string, body: string | Uint8Array, opts?: PutOptions): void;
   delete(key: string): void;
-  get(key: string, localPath: string): void;
+  get(key: string, localPath: string, opts?: GetOptions): void;
   head(key: string): ObjectHead;
   list(prefix: string): string[];
   publicUrl(key: string): string | null;
@@ -347,26 +369,74 @@ export function createObjectStore(config: StorageConfig, deps: ObjectStoreDeps =
         }
       });
     },
-    get(key, localPath) {
+    get(key, localPath, opts) {
       const { kind, bucket } = resolveBucket(config, key);
+      // jud-39564-e5edf3206d3b — 세대 결속 읽기: 발급 때의 generation 과 다르면 최신 객체를 내주지 않는다.
+      const pin = opts?.generation;
+      if (pin !== undefined && pin === '') {
+        throw new Error(`고정 읽기 generation 이 빈 문자열이다 — 결속 불능(발급 계층 결함)이라 거부한다: ${key}`);
+      }
       timed('get', kind, key, () => {
         mkdirSync(dirname(localPath), { recursive: true });
         if (config.provider === 'local') {
           const src = localObjectPath(config, bucket, key);
           if (!existsSync(src)) throw new Error(`객체가 없다: ${key}`);
-          copyFileSync(src, localPath);
-          return;
+          if (pin === undefined) {
+            copyFileSync(src, localPath);
+            return;
+          }
+          // fd 를 열어 원본 inode 를 고정한 뒤 fstat 세대를 대조한다 — 경로가 교체돼도 열린 fd 는
+          // 발급 때의 원본을 계속 가리킨다. 세대 불일치는 «거부»다: 교체본(최신)을 내주면
+          // 옛 링크가 새 바이트를 가리킨다(jud-39564 HOLD 사유 그대로).
+          const fd = openSync(src, 'r');
+          try {
+            const st = fstatSync(fd, { bigint: true });
+            const gen = `${st.dev}:${st.ino}:${st.mtimeNs}`;
+            if (gen !== pin) {
+              throw new Error(`object generation mismatch — 발급 때 세대와 달라 교체·이동되었다, 최신 객체를 내주지 않는다 (jud-39564): ${key}`);
+            }
+            const size = Number(st.size);
+            const buf = Buffer.alloc(size);
+            let off = 0;
+            while (off < size) {
+              // position null = 현재 파일 위치에서 순차 읽기(fd 는 발급 때 inode 에 고정).
+              const n = readSync(fd, buf, off, size - off, null);
+              if (n <= 0) break;
+              off += n;
+            }
+            if (off !== size) throw new Error(`고정 세대 읽기가 객체 크기에 못 미친다 — 원본 보존 거부 (jud-39564): ${key}`);
+            const st2 = fstatSync(fd, { bigint: true });
+            if (`${st2.dev}:${st2.ino}:${st2.mtimeNs}` !== pin) {
+              throw new Error(`object generation changed during read — 읽기 도중 세대가 바뀌었다, 내주지 않는다 (jud-39564): ${key}`);
+            }
+            writeFileSync(localPath, buf);
+            return;
+          } finally {
+            closeSync(fd);
+          }
         }
         if (config.provider === 's3' || config.provider === 'r2') {
-          const bin = which('aws');
-          run(bin, ['s3', 'cp', `s3://${bucket}/${key}`, localPath, '--quiet', ...awsExtra(config)], { timeoutMs: 30_000 });
+          if (pin === undefined) {
+            run(which('aws'), ['s3', 'cp', `s3://${bucket}/${key}`, localPath, '--quiet', ...awsExtra(config)], { timeoutMs: 30_000 });
+            return;
+          }
+          // s3api get-object --version-id 는 그 세대의 불변 바이트만 내린다 — 세대 소실·권한 오류는 그대로 전파(fail-closed).
+          run(which('aws'), ['s3api', 'get-object', '--bucket', bucket, '--key', key, '--version-id', pin, ...awsExtra(config), localPath], { timeoutMs: 30_000 });
           return;
         }
         if (config.provider === 'gcs') {
-          run(which('gcloud'), ['storage', 'cp', `gs://${bucket}/${key}`, localPath], { timeoutMs: 30_000 });
+          if (pin === undefined) {
+            run(which('gcloud'), ['storage', 'cp', `gs://${bucket}/${key}`, localPath], { timeoutMs: 30_000 });
+            return;
+          }
+          // gcloud storage 세대 문법: gs://bucket/key#<generation> 이 그 세대의 불변 바이트를 지목한다.
+          run(which('gcloud'), ['storage', 'cp', `gs://${bucket}/${key}#${pin}`, localPath], { timeoutMs: 30_000 });
           return;
         }
         if (config.provider === 'azure') {
+          if (pin !== undefined) {
+            throw new Error(`azure 공급자는 불변 세대를 제공하지 않는다(head.generation 없음) — 고정 읽기를 거부한다 (jud-39564 fail-closed): ${key}`);
+          }
           const account = config.azure?.account ?? '';
           if (!account) throw new Error('azure.account 가 설정되지 않았다');
           run(which('az'), [
@@ -386,8 +456,8 @@ export function createObjectStore(config: StorageConfig, deps: ObjectStoreDeps =
         const p = localObjectPath(config, bucket, key);
         if (!existsSync(p)) return { exists: false };
         try {
-          const st = statSync(p);
-          return { exists: true, bytes: st.size };
+          const st = statSync(p, { bigint: true });
+          return { exists: true, bytes: Number(st.size), generation: `${st.dev}:${st.ino}:${st.mtimeNs}` };
         } catch {
           return { exists: false };
         }
@@ -396,17 +466,29 @@ export function createObjectStore(config: StorageConfig, deps: ObjectStoreDeps =
         if (config.provider === 's3' || config.provider === 'r2') {
           const out = run(which('aws'), ['s3api', 'head-object', '--bucket', bucket, '--key', key, ...awsExtra(config)], { timeoutMs: 30_000 });
           let bytes: number | undefined;
-          try { const j = JSON.parse(out.stdout) as { ContentLength?: number }; if (typeof j.ContentLength === 'number') bytes = j.ContentLength; } catch { /* 크기 없으면 생략 */ }
-          return { exists: true, ...(bytes !== undefined ? { bytes } : {}) };
+          let generation: string | undefined;
+          try {
+            const j = JSON.parse(out.stdout) as { ContentLength?: number; VersionId?: string };
+            if (typeof j.ContentLength === 'number') bytes = j.ContentLength;
+            if (typeof j.VersionId === 'string' && j.VersionId !== '' && j.VersionId !== 'null') generation = j.VersionId; // 버전 미활성이면 없음 · "null"(중단 버킷 널 버전)은 덮어써지므로 결속 불가 — 어느 쪽이든 생략해 소비층에서 거부 (terra mustFix ①)
+          } catch { /* 크기 없으면 생략 */ }
+          return { exists: true, ...(bytes !== undefined ? { bytes } : {}), ...(generation !== undefined ? { generation } : {}) };
         }
         if (config.provider === 'gcs') {
           const out = run(which('gcloud'), ['storage', 'objects', 'describe', `gs://${bucket}/${key}`, '--format=json'], { timeoutMs: 30_000 });
           let bytes: number | undefined;
+          let generation: string | undefined;
           try {
-            const j = JSON.parse(out.stdout) as { size?: string | number };
+            const j = JSON.parse(out.stdout) as { size?: string | number; generation?: string | number };
             if (j.size !== undefined) bytes = Number(j.size);
+            // GCS 는 객체마다 항상 세대가 있다. 최상위 generation 만 본다(JSON.parse 는 구조적 — 중첩 필드 오독 없음).
+            // number 는 안전 정수(2^53-1) 범위일 때만 문자열화한다 — 범위를 넘으면 double 반올림으로 서로 다른 세대가
+            // 한 세대로 합쳐지므로 생략해 소비층에서 결속 거부하게 한다 (terra mustFix ②·r2).
+            if (typeof j.generation === 'string' && j.generation !== '') generation = j.generation;
+            else if (typeof j.generation === 'number' && Number.isSafeInteger(j.generation)) generation = `${j.generation}`;
+            else if (j.generation !== undefined) generation = undefined; // 안전하게 표현 불가 — 생략
           } catch { /* 크기 없으면 생략 */ }
-          return { exists: true, ...(bytes !== undefined && Number.isFinite(bytes) ? { bytes } : {}) };
+          return { exists: true, ...(bytes !== undefined && Number.isFinite(bytes) ? { bytes } : {}), ...(generation !== undefined ? { generation } : {}) };
         }
         if (config.provider === 'azure') {
           const account = config.azure?.account ?? '';

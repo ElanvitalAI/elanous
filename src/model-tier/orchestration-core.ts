@@ -74,6 +74,8 @@ export interface AccountState {
   readonly selection?: 'shadow' | 'on';
   /** 사람이 계정을 명시했다(예: `ELANOUS_CODEX_ACCOUNT`) — 의도가 이긴다. 창 선택기는 바꾸지 않는다. */
   readonly explicit?: boolean;
+  /** 0.3.33 router mix: separately observed Codex subscription window. */
+  readonly routerMix?: { readonly codex: AccountState | undefined; readonly codexReadFailed?: boolean };
 }
 
 export interface CoreDecisionInput {
@@ -139,13 +141,29 @@ export interface AccountSelector {
     { readonly provider: string; readonly account: string | null; readonly reason: string; readonly unmeasured?: readonly WindowSignalField[] };
 }
 
+/** 등급 게이트 — SMART-ROUTER-PLUGIN-TIERS 자리. 올림이 내린 등급이 회원 등급 표를 통과하는지.
+ *  deny 면 호출을 막지 않고 «올림»만 되돌린다(기본 자동 라우팅은 무료 등급에도 허용 — 제품 정본). */
+export interface TierGateModule {
+  readonly name: string;
+  review(context: { readonly trigger: WorkTierTrigger; readonly checkpoint?: AdvisorMoment; readonly tier: WorkTierClass }):
+    { readonly allowed: boolean; readonly reason: string | null };
+}
+
+/** 회원 등급 판독기 — 구독 창 인식 라우팅(routerMix) 등 Pro+ 기능의 좌석 게이트가 쓴다(jud-39528 mustFix ②). */
+export type MembershipReader = () => string | null | undefined;
+
 export interface CoreModules {
   /** 올림 규칙 모듈 — 내장 섞기 정책 v0 표 «앞»에 돈다(ADVISOR 칸 자리). 첫 제안 하나만 쓴다. */
   readonly escalate?: readonly EscalateRule[];
+  /** 등급 게이트 칸 — SMART-ROUTER-PLUGIN-TIERS. 생략 = 게이트 없음(기존 동작). */
+  readonly gate?: TierGateModule;
   /** 계정/창 선택 — COST-OPTIMIZER-WINDOW-AWARE 자리. 기본 = 활성 계정 유지. */
   readonly accounts?: AccountSelector;
   /** provider → 사다리(기본 = `LLM_TIER_MAP_BY_PROVIDER`). 시험은 가짜 사다리를 끼운다. */
   readonly ladder?: (provider: string) => Readonly<Record<ModelTier, { readonly model: string }>> | undefined;
+  /** 회원 등급 판정 — jud-39528 mustFix ②: routerMix 계정 전환은 router.subscription_window_aware(프로+).
+   *  생략 = 신뢰 호스트 seam(env ELANOUS_ROUTER_TIER · 없으면 free — fail-closed). */
+  readonly membership?: MembershipReader;
 }
 
 // ── 원장(결정 한 줄 · 호출 한 줄 · runId 로 잇는다 · 문면 0) ───────────────────

@@ -1,4 +1,5 @@
 import { textOnly } from '../llm/stream-text.js';
+import { streamChatLedgered } from '../llm/ledgered-call.js';
 // ── R2 · 적응 해상도 디깅 엔진 v1 (2026-07-06 · ROADMAP-organic-signal-engine) ──
 //
 // "필요한 순간에 해상도를 알아서 올려서" — 고영향 신호(breaking_signals의
@@ -384,7 +385,7 @@ export async function runDig(db: Database, item: DigItem): Promise<DigResult | n
           { role: 'system', content: item.id.startsWith('pulse:') ? STOCK_DIG_SYSTEM : DIG_SYSTEM },
           { role: 'user', content: `트리거: [${item.sector}·${item.score}] ${item.topic}\n\n${context}`.slice(0, 12_000) },
         ];
-        for await (const d of textOnly(provider.streamChat(messages, { temperature: 0.3, maxTokens: 700 }))) verdict += d;
+        for await (const d of textOnly(streamChatLedgered(provider, messages, { temperature: 0.3, maxTokens: 700 }, { site: 'domain-dig-verdict', jobKind: 'domain-report' }))) verdict += d;
         verdict = verdict.trim();
       }
     } catch { verdict = ''; }

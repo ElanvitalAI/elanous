@@ -1,10 +1,13 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { requestEls } from '../../els/client.js';
 import { createFederation } from '../../els/federation.js';
+import { elsHostsPath, loadHostRegistry } from '../../els/hosts.js';
+import { routeElsHttp } from '../../els/http.js';
 import { startElsServer, elsSocketPath } from '../../els/server.js';
+import { readElsRow } from './els-actions.js';
 import { elsRowsFromList, fetchElsSidetabRows } from './els-rows.js';
 import { formatSidetabSectionFrame, groupSidetabSections } from './sections.js';
 
@@ -54,6 +57,23 @@ test('malformed or hostile answers give no rows, never a throw', () => {
   expect(elsRowsFromList(list([{ title: 'no address' }, null as never]), 'node-b')).toEqual([]);
 });
 
+test('a down host status never contains an untrusted remote reason', () => {
+  const rows = elsRowsFromList(list([], [
+    { name: 'node-b', reach: 'local' },
+    { name: 'minim5', reach: 'down', reason: '/Users/owner/.cache/secret API_KEY=private\u001b[31m' + 'x'.repeat(1000) },
+  ]), 'node-b');
+  expect(rows).toMatchObject([{ id: 'els-host:minim5', status: 'unavailable' }]);
+});
+
+test('a registered, reachable remote host remains visible before it has any panes', () => {
+  const rows = elsRowsFromList(list([], [
+    { name: 'node-b', reach: 'local' },
+    { name: 'minim5', reach: 'up' },
+  ]), 'node-b');
+  expect(rows).toMatchObject([{ id: 'els-host:minim5', label: '⇄minim5 · 비어 있음', remoteHost: 'minim5', badge: 'idle' }]);
+  expect(formatSidetabSectionFrame(rows, 0, 30, 20).lines.join('\n')).toContain('⇄minim5');
+});
+
 test('the Els section exists only while the server lists panes, after the stored section order', () => {
   const only = [{ id: 's', label: 'a', kind: 'tui', badge: 'idle' as const, sessionId: 'x' }];
   expect(groupSidetabSections(only).map((section) => section.id)).toEqual(['sessions']);
@@ -88,6 +108,35 @@ test('real els server: the panel reads its panes, sees a state change, and closi
   // «Closing the panel» = no more polls. The owner and its pane are exactly as they were.
   expect((await askLocal({ op: 'ping' })).exitCode).toBe(0);
   expect((await fetchElsSidetabRows(deps())).map((row) => row.label.trim()).slice(2)).toEqual(['worker']);
+});
+
+test('registered hosts.json remote: an empty host is visible, then its live pane screen is read through the owner window', async () => {
+  const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-side-'));
+  cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+  const localRoot = join(root, 'local');
+  const remoteRoot = join(root, 'remote');
+  const registryPath = elsHostsPath(localRoot);
+  mkdirSync(join(localRoot, 'els'), { recursive: true });
+  writeFileSync(registryPath, JSON.stringify({ hosts: [{ name: 'minim5', baseUrl: 'http://127.0.0.1:8790' }] }));
+  const screen = { text: 'remote live screen\n' };
+  const spawn = () => ({ id: 'pty_1', isAlive: () => true, write: () => {}, renderScreen: async () => screen.text, onExit: () => {}, kill: () => {} });
+  const local = await startElsServer({ stateRoot: localRoot, spawn });
+  const remote = await startElsServer({ stateRoot: remoteRoot, spawn });
+  if ('exitCode' in local || 'exitCode' in remote) throw new Error('test els owner did not start');
+  cleanups.push(() => local.close(), () => remote.close());
+  const fetchJson = async (_host: unknown, path: string) => {
+    const answer = await routeElsHttp(remote.core, 'minim5', 'GET', path);
+    return { status: answer.status, body: JSON.parse(answer.body) as unknown };
+  };
+  const federation = createFederation({ localHost: 'node-b', registry: loadHostRegistry(registryPath),
+    askLocal: (request) => requestEls(elsSocketPath(localRoot), request), fetchJson });
+  const deps = { localHost: 'node-b', list: () => federation.list() };
+  expect(await fetchElsSidetabRows(deps)).toMatchObject([{ id: 'els-host:minim5', label: '⇄minim5 · 비어 있음', badge: 'idle' }]);
+  const created = await requestEls(elsSocketPath(remoteRoot), { op: 'new', ws: 'HQ', cwd: '/work', command: ['eln'], title: 'remote worker' });
+  expect(created.exitCode).toBe(0);
+  const pane = (await fetchElsSidetabRows(deps)).find((row) => row.label.trim() === 'remote worker');
+  expect(pane?.id).toStartWith('els:minim5:');
+  expect(await readElsRow({ from: 'TC-H-CX-14', do: federation.do, read: federation.read }, pane!.id.slice(4))).toBe(screen.text);
 });
 
 test('no els server: the panel gets no rows and nothing is started', async () => {

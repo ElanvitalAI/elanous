@@ -86,7 +86,6 @@ let firstCited: Array<Record<string, unknown>> = [];
 let modelCalls = 0;
 let coreCalls: CoreTurnContext[] = [];
 let clock = 0;
-let goalLoopEnabled = false;
 const spies: Array<{ mockRestore(): void }> = [];
 
 function world(opts: { search: 'evidence' | 'down'; planFor: (request: string) => string }): void {
@@ -107,14 +106,12 @@ beforeEach(() => {
   for (const name of FAKE_SWITCHES) { savedSwitches.set(name, process.env[name]); delete process.env[name]; }
   delete process.env[HARNESS_ROLE_ENV];
   searches = []; routeEvents = []; firstCited = []; modelCalls = 0; coreCalls = []; clock = 1_800_000_000_000;
-  goalLoopEnabled = false;
   const base = config.getUserConfig();
   spies.push(
     // Fake clock: fakes jump it (search · model), and every read ticks 1ms so no wait loop can stall on a frozen clock.
     spyOn(Date, 'now').mockImplementation(() => (clock += 1)),
     spyOn(config, 'getUserConfig').mockImplementation(() => ({
       ...base,
-      llm: { ...base.llm, goalLoop: { enabled: goalLoopEnabled } },
       chat: { ...base.chat, autoCompact: { ...base.chat.autoCompact, enabled: false } },
     })),
     spyOn(runObserver, 'registerResearchRun').mockImplementation(() => ({ event() {}, finish() {} })),
@@ -245,13 +242,14 @@ describe('ACP prompts take the core turn and its structured research route', () 
   });
 
   test('goal-loop turn (excluded path) keeps its pre-existing research budget verdict unchanged', async () => {
-    goalLoopEnabled = true;
+    // CHAT-GOAL-LOOP-DEFAULT-OFF — the only bridge goal-loop path is the harness executor (structural explicit goal).
+    process.env[HARNESS_ROLE_ENV] = 'executor';
     const goalCalls: CoreTurnContext[] = [];
     spies.push(spyOn(goalLoop, 'runGoalLoop').mockImplementation(async (ctx) => {
       goalCalls.push(ctx);
       return { finalText: 'goal loop reply', iterations: 1, stopReason: 'goal_complete', goalComplete: true } as Awaited<ReturnType<typeof goalLoop.runGoalLoop>>;
     }));
-    // A daemon ACP prompt is routed «코딩·구현» (goal loop) when llm.goalLoop is enabled; the regex budget stays there.
+    // A harness executor prompt is routed «코딩·구현» (goal loop); the regex budget stays there.
     await acpTurn(LEGACY_RESEARCH_TEXT, { tuiRouting: false });
     expect(goalCalls).toHaveLength(1);
     expect(goalCalls[0]!.maxToolTurns).toBe(RESEARCH_TURN_MAX_TOOL_TURNS);
