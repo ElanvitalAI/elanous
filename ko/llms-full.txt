@@ -4015,7 +4015,7 @@ elanous chat [options] <text...>
 | `--session <id>` | Continue an explicit session (id or unique prefix). Overrides --new and active session. |
 | `--json` | Emit a single JSON line {sessionId, provider, model, reply, logPath, budget} instead of streaming text + ui.info trailer. Stable shape for LLM self-spawn. |
 | `--tools` | Enable the tool-loop path (Read/Grep/Glob/ListDir/Edit/Write + Bash). Default off — chat is text-only by default for backward compatibility. `elanous agent` is a thin wrapper that flips this on. |
-| `--goal-loop` | Arm the across-turn goal loop (runGoalLoop): wrap the tool-loop so the model keeps iterating until the goal is complete (GOAL-COMPLETE evidence gate) or maxIterations. Requires --tools. Same engine as ACP/dashboard. Config `llm.goalLoop.enabled` also arms it. |
+| `--goal-loop` | Arm the across-turn goal loop (runGoalLoop): wrap the tool-loop so the model keeps iterating until the goal is complete (GOAL-COMPLETE evidence gate) or maxIterations. Requires --tools. Same engine as ACP/dashboard. |
 | `--implement` | Bypass the harness goal-loop guard for the legacy implementation child entrypoint |
 
 ## `elanous config`
@@ -5200,13 +5200,49 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.3.33
+
+Source: https://docs.elanous.ai/releases/0-3-33/
+
+## Behavior changes
+
+- When the operations coordination session begins, it recalls previous memories and works with a tone and guidance tailored to the coordinator.
+- The goal set by a person is fixed, so notifications arriving mid-way cannot change it. The fixed marker stays visible even on narrow screens.
+- Important messages can interject even while a response is in progress, and instead of repeatedly checking for results, the system waits for them to arrive.
+- Multiple notifications are batched and processed together, and when background work finishes, the idle spot is woken up once.
+- The tab name appears first in the Elanous Side tab bar, and new tabs open in the working folder of the current window.
+- Lines typed during a conversation and the number of pending entries are now shown directly on screen.
+- RunShell script mode supports signed recipes, revocation handling, an expanded read-command allowlist, and execution after approval.
+- The Smart Router is now available in Free, Pro, and Advanced plugin tiers, and Quality Guard monitors the quality of lightweight models.
+- All LLM calls are logged in the cost ledger, and you can view per-seat token usage and spike alerts.
+- The work goal document is written in a five-field format, and blank fields are checked upon receipt.
+- Connections of previously open tabs are maintained even when the Elanous Side server is restarted.
+- Cleans up orphaned server processes and safely preserves windows restored to a missing working folder.
+- Fixed an issue where account execution was switching to a different account.
+
+## Security
+
+- Secret values in RunShell output are masked before being passed to the model.
+- Security audit events, such as rejected inputs and approval records, are logged immediately.
+- When sharing memories to another chat, sharing is denied by default and only a summary is delivered.
+
+Plus 124 internal changes.
+
+## Known issues
+
+The following issues are known in this release.
+
+- Critical release expedited; gate verification will continue after publication.
+
+---
+
 # 0.3.32
 
 Source: https://docs.elanous.ai/releases/0-3-32/
 
 ## Behavior changes
 
-- You can now forward requests sent by the CEO to the task owner and receive the results back.
+- You can now forward requests you send from chat to the task owner and receive the results back.
 - If the message sent to the assignee hasn't been read yet, they'll now be notified again.
 - Improved handling so that messages arriving while a conversation is in progress are processed after the current response finishes.
 - When resuming a task, previous work content and memories are now loaded, making it easy to pick up where you left off.
@@ -5215,13 +5251,11 @@ Source: https://docs.elanous.ai/releases/0-3-32/
 - Improved handling of tab control failures and message delivery stability.
 - Improved the flow for reloading a member's session history in web conversations.
 - Fixed an error that occurred when bundling the files required for installation and execution in a clean environment.
-- Known issue: In environments where tab control is not supported, you may need to use herdr to control tabs.
 
 ## Security
 
 - We hardened the boundary that verifies allowed origins and member sessions in web conversations.
 - Control characters that cannot be sent to a tab are now rejected, and dangerous commands must go through an approval process.
-- Known issue: Conversation compaction summary requests may include secret values such as API keys verbatim. Please review conversations containing sensitive information before compaction. This will be fixed in 0.3.33.
 
 Plus 134 internal changes.
 
@@ -5229,8 +5263,9 @@ Plus 134 internal changes.
 
 The following issues are known in this release.
 
-- Gate shards interrupted for time; completed shards preserved and remaining shards will be re-run after release. No user-facing regression known.
-- Two TUI regression checks failed in the release sandbox due to missing test configuration; core chat flows passed. Will re-verify after release.
+- Do not paste secret values such as API keys into a conversation: a conversation compaction summary may include them verbatim. Automatic masking for this case is planned for an upcoming release.
+- In environments where tab control is not supported, you may need to use herdr to control tabs.
+- Some pre-release checks will be re-run after release; no user-facing problem is known.
 
 ---
 
