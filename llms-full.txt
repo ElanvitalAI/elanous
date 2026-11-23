@@ -5200,6 +5200,24 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.3.34
+
+Source: https://docs.elanous.ai/releases/0-3-34/
+
+## New features
+- View seat status and reasons across workspaces, move tabs between spaces, and restore the last focused pane.
+- Declare and manage workspaces with els up.
+- Use remote hosts and Pod pools through Nexus, with Pod panes shown as tabs.
+- View acknowledged seat mail and acknowledge several messages together.
+
+## Improvements and fixes
+- Prompt caching and seat mail delivery have been improved.
+- Mouse-wheel scrolling works over full-screen programs in els.
+- Slash commands entered during a running turn execute immediately.
+- Seat tabs recover more reliably after migrations, and the agents panel distinguishes agent panes from shell tabs.
+
+---
+
 # 0.3.33
 
 Source: https://docs.elanous.ai/releases/0-3-33/
