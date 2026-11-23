@@ -8,7 +8,7 @@ import { elsSocketPathProblem } from './server.js';
 import { createLineDecoder } from './wire.js';
 import { AUTH_PANE_TOKEN_ENV, AUTH_OWNER_TOKEN_ENV } from './server-auth.js';
 
-export interface AttachFrame { readonly pane: string; readonly seq: number; readonly cols: number; readonly rows: number; readonly screen: string; /** Lines this frame is scrolled above the live bottom (0 = live). */ readonly back: number }
+export interface AttachFrame { readonly pane: string; readonly seq: number; readonly cols: number; readonly rows: number; readonly screen: string; /** Lines this frame is scrolled above the live bottom (0 = live). */ readonly back: number; /** ELS-WHEEL-SCROLLBACK (OP #136704): the pane tracks its own mouse on an alternate screen — a wheel there belongs to the pane program as bytes, not to the els scrollback (which is empty there). */ readonly wheelPassthrough?: boolean }
 
 export interface AttachHandlers {
   readonly onFrame: (frame: AttachFrame) => void;
@@ -16,6 +16,8 @@ export interface AttachHandlers {
   readonly onEnd: (exitCode: 0 | 1 | 2, reason: string) => void;
   /** A line the server refused (a bad input or resize); the attach stays open. */
   readonly onError?: (message: string) => void;
+  /** Request from this pane's verified child to select another pane in this view. */
+  readonly onFocus?: (pane: string, acknowledge: (accepted: boolean) => void) => void;
 }
 
 export interface Attached {
@@ -61,12 +63,12 @@ export function attachEls(socketPath: string, pane: string, size: { cols: number
   // so an `input`/`resize` called before `connect` can only follow it, never overtake it.
   // ELS-ATTACH-FRAME-DIFF (OP #127484 ③): `diff:true` asks the server for row diffs; the assembler below rebuilds the
   // full screen before the handlers see it, so the AttachHandlers contract (a full frame) never changes.
-  write({ op: 'attach', pane, cols: size.cols, rows: size.rows, ...(opts?.diff ? { diff: true } : {}) });
+  write({ op: 'attach', pane, cols: size.cols, rows: size.rows, ...(opts?.diff ? { diff: true } : {}), ...(handlers.onFocus ? { focusEvents: true } : {}) });
   // The row-diff assembler: the last full screen this attach assembled. A `frame` (always full) resets it; a
   // `frame-diff` patches the changed rows. Cleared on end — a re-attach starts from a server full frame again.
   let assembled: string[] | undefined;
   const lines = createLineDecoder((line) => {
-    let value: { type?: string; exitCode?: 0 | 1 | 2; message?: string } & Partial<AttachFrame> & { count?: unknown; lines?: unknown };
+    let value: { type?: string; exitCode?: 0 | 1 | 2; message?: string } & Partial<AttachFrame> & { count?: unknown; lines?: unknown; id?: unknown };
     try { value = JSON.parse(line) as typeof value; } catch { end(1, 'els: malformed frame from the els server'); return; }
     // The door answers a refused attach with a plain result line (no `type`) and closes: that refusal is the end, with its own
     // words — left to the socket close it would read as «the server closed the connection», the signal views retry on.
@@ -76,7 +78,7 @@ export function attachEls(socketPath: string, pane: string, size: { cols: number
       // The assembler baseline is the same body the server diffs against — renderScreen's scroll header stripped —
       // so a diff row index after a scroll → live return addresses the row the server means (JUD #127758).
       assembled = value.screen.replace(/^\[screen \d+x\d+ scrolled-back=\d+\]\n/, '').split('\n');
-      handlers.onFrame({ pane: String(value.pane), seq: Number(value.seq), cols: Number(value.cols), rows: Number(value.rows), back: Number(value.back ?? 0), screen: value.screen });
+      handlers.onFrame({ pane: String(value.pane), seq: Number(value.seq), cols: Number(value.cols), rows: Number(value.rows), back: Number(value.back ?? 0), screen: value.screen, ...(value.wheelPassthrough === true ? { wheelPassthrough: true } : {}) });
     } else if (value.type === 'frame-diff') {
       const count = Number(value.count);
       const rows = Array.isArray(value.lines) ? value.lines : [];
@@ -87,8 +89,12 @@ export function attachEls(socketPath: string, pane: string, size: { cols: number
         const t = (row as { t?: unknown }).t;
         if (Number.isInteger(i) && i >= 1 && i <= count && typeof t === 'string') assembled[i - 1] = t;
       }
-      handlers.onFrame({ pane: String(value.pane), seq: Number(value.seq), cols: Number(value.cols), rows: Number(value.rows), back: Number(value.back ?? 0), screen: assembled.join('\n') });
-    } else if (value.type === 'end') end(value.exitCode ?? 0, value.message ?? '');
+      handlers.onFrame({ pane: String(value.pane), seq: Number(value.seq), cols: Number(value.cols), rows: Number(value.rows), back: Number(value.back ?? 0), screen: assembled.join('\n'), ...(value.wheelPassthrough === true ? { wheelPassthrough: true } : {}) });
+    } else if (value.type === 'focus' && typeof value.pane === 'string' && typeof value.id === 'string') {
+      const id = value.id;
+      handlers.onFocus?.(value.pane, accepted => write({ op: 'focus-ack', id, accepted }));
+    }
+    else if (value.type === 'end') end(value.exitCode ?? 0, value.message ?? '');
     else if (value.type === 'error') handlers.onError?.(value.message ?? 'refused');
   });
   socket.on('data', (chunk: Buffer) => lines.push(chunk));
@@ -100,7 +106,7 @@ export function attachEls(socketPath: string, pane: string, size: { cols: number
     input: (bytes) => write({ op: 'input', bytes }),
     resize: (cols, rows) => write({ op: 'resize', cols, rows }),
     scroll: (lines) => write({ op: 'scroll', lines }),
-    detach: () => { if (!ended) { ended = true; socket.destroy(); } },
+    detach: () => { if (!ended) { ended = true; socket.end(); } },
   };
 }
 

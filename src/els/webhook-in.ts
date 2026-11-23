@@ -3,23 +3,32 @@
 // X-Els-Signature: sha256=HMAC(secret, `${name}.${timestamp}.${nonce}.${body}`) · X-Els-Timestamp (unix seconds,
 // ±5 min) · X-Els-Nonce (refused once seen inside the window). The hook's own name is inside the signed material
 // (#38609 REVIEW must ⓒ): hooks may share a secret file, but a signature made for one never opens another.
+// A graph-target hook (GRAPH-SCHEDULER §1-1 ④) renders nothing into a pane: the proven envelope becomes
+// a graph event envelope through the one dispatch entrance, and a write/external-send risk class holds
+// the first firing for a person (§1-3).
 // Any failure is 401, audited, nothing typed.
 // The secret lives in a file named by secretRef. It is never echoed, logged, or audited.
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { audit, createControl, type ControlExecute, type ControlOutcome, type HitlAsk } from './control.js';
+import type { GraphExternalTriggerDispatchResult, HookInGraphTriggerDanger, HookInGraphTriggerEnvelope } from '../graph-runner/graph-events.js';
 
 export interface HookConfig {
   /** File holding the shared secret. Relative paths resolve against the state dir. */
   readonly secretRef: string;
-  readonly workspace: string;
-  readonly pane: string;
+  /** Template target: the workspace whose pane receives the rendered line. */
+  readonly workspace?: string;
+  readonly pane?: string;
   /** Ignored (#38453 REVIEW must ②): the server decides the pane kind via paneIsShell, a hook cannot opt out of the danger classifier. */
   readonly shell?: boolean;
   /** `{{field}}` takes a top-level string or number from the JSON body. Missing fields render empty. */
-  readonly template: string;
+  readonly template?: string;
+  /** GRAPH-SCHEDULER §1-1 ④ — graph target: the graph yaml this hook fires (its loop.trigger.events must declare hook.in). */
+  readonly graph?: string;
+  /** §1-3 risk class of the graph target: write/external-send hold the first firing for a person. */
+  readonly danger?: HookInGraphTriggerDanger;
   /** Source addresses allowed to call. Absent or empty = any source that can reach the listener. */
   readonly sources?: readonly string[];
 }
@@ -34,6 +43,17 @@ export interface HookDeps {
   readonly now?: () => number;
   /** Seen nonces → first-seen ms. Shared for the life of the listener. */
   readonly nonces: Map<string, number>;
+  /** GRAPH-SCHEDULER §1-3 — person gate for the first firing of a write/external-send graph hook.
+   *  Absent = fail closed: the firing is held and never dispatched. */
+  readonly askGraphFirstFiring?: (request: {
+    readonly hookName: string;
+    readonly graphPath: string;
+    readonly danger: HookInGraphTriggerDanger;
+    readonly nonce: string;
+    readonly source: string;
+  }) => Promise<'approve' | 'deny' | 'timeout'>;
+  /** Injected for tests; the default dispatches through the graph trigger entrance (GRAPH-SCHEDULER §5). */
+  readonly dispatchHookInGraphTrigger?: (envelope: HookInGraphTriggerEnvelope) => Promise<GraphExternalTriggerDispatchResult>;
 }
 
 export interface HookRequest {
@@ -54,10 +74,26 @@ function parseHook(value: unknown): HookConfig | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const row = value as Record<string, unknown>;
   if (typeof row.secretRef !== 'string' || !row.secretRef) return undefined;
-  if (typeof row.workspace !== 'string' || !row.workspace || typeof row.pane !== 'string' || !row.pane) return undefined;
-  if (typeof row.template !== 'string' || !row.template) return undefined;
   if (row.shell !== undefined && typeof row.shell !== 'boolean') return undefined;
   if (row.sources !== undefined && (!Array.isArray(row.sources) || !row.sources.every((s) => typeof s === 'string'))) return undefined;
+  // GRAPH-SCHEDULER §1-3 — a graph-target hook declares its graph and its risk class, and never a pane.
+  const graph = typeof row.graph === 'string' ? row.graph : '';
+  const danger = row.danger;
+  if (row.graph !== undefined && !graph) return undefined;
+  if (danger !== undefined && danger !== 'read' && danger !== 'write' && danger !== 'external-send') return undefined;
+  if (graph) {
+    if (danger === undefined) return undefined;
+    if (row.workspace !== undefined || row.pane !== undefined || row.template !== undefined) return undefined;
+    return {
+      secretRef: row.secretRef, graph,
+      ...(danger !== undefined ? { danger: danger as HookInGraphTriggerDanger } : {}),
+      ...(row.sources !== undefined ? { sources: row.sources as string[] } : {}),
+    };
+  }
+  // Template target: one rendered line into one pane, as before. A risk class without a graph is not a hook.
+  if (danger !== undefined) return undefined;
+  if (typeof row.workspace !== 'string' || !row.workspace || typeof row.pane !== 'string' || !row.pane) return undefined;
+  if (typeof row.template !== 'string' || !row.template) return undefined;
   return {
     secretRef: row.secretRef, workspace: row.workspace, pane: row.pane, template: row.template,
     ...(row.shell !== undefined ? { shell: row.shell as boolean } : {}),
@@ -168,14 +204,83 @@ export async function routeElsHook(deps: HookDeps, req: HookRequest): Promise<{ 
       body = parsed as Record<string, unknown>;
     } catch { return reject('body must be JSON'); }
   }
-  const text = renderTemplate(hook.template, body);
+  // GRAPH-SCHEDULER §1-1 ④ — a graph-target hook never types a pane: the proven envelope becomes a graph
+  // event envelope through the one dispatch entrance (§5). Everything above already refused unsigned,
+  // replayed or late firings (#39168): only a proven envelope reaches this branch.
+  if (hook.graph !== undefined) {
+    const envelope: HookInGraphTriggerEnvelope = {
+      hookName: req.name, nonce, at: new Date(now).toISOString(), body,
+      graphPath: hook.graph, danger: hook.danger ?? 'read',
+    };
+    const dispatch = deps.dispatchHookInGraphTrigger ?? (async (input) => {
+      const { dispatchHookInGraphTrigger } = await import('../graph-runner/graph-events.js');
+      return dispatchHookInGraphTrigger(input);
+    });
+    const firstFiringFile = join(deps.stateDir, 'hook-trigger-first-firing.json');
+    const firstFiring = (): Record<string, unknown> => {
+      try {
+        const parsed: unknown = JSON.parse(readFileSync(firstFiringFile, 'utf8'));
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+      } catch { return {}; }
+    };
+    // §1-3 — 쓰기/외부 발신 위험이면 첫 발화 HITL: a person approves the hook↔graph pairing once.
+    // No person channel = fail closed: the firing is held, not dispatched.
+    // #39687 — the approval key binds name·graphPath·danger as one: a record counts only when the stored
+    // graph and risk class still match the hook's declared target. A repointed graph or a changed risk
+    // class is a different pairing and asks the person again (a record that predates the danger field,
+    // or any mismatch, fails closed).
+    const approvedPairing = (record: Record<string, unknown>): boolean => {
+      const row: unknown = record[req.name];
+      if (row === undefined || row === null || typeof row !== 'object' || Array.isArray(row)) return false;
+      const binding = row as { graphPath?: unknown; danger?: unknown };
+      return binding.graphPath === hook.graph && binding.danger === envelope.danger;
+    };
+    if (envelope.danger !== 'read' && !approvedPairing(firstFiring())) {
+      const answer = deps.askGraphFirstFiring !== undefined
+        ? await deps.askGraphFirstFiring({ hookName: req.name, graphPath: hook.graph, danger: envelope.danger, nonce, source })
+        : 'timeout';
+      if (answer !== 'approve') {
+        const reason = answer === 'deny' ? 'graph-first-firing-person-denied' : 'graph-first-firing-person-timeout';
+        audit(deps.stateDir, { principal: `hook:${req.name}`, kind: 'webhook', surface: 'webhook', action: 'do', result: 'held', reason, source, at: now });
+        return json(403, { error: OUTCOME_ERROR.held, code: 'graph-first-firing' });
+      }
+    }
+    let result: GraphExternalTriggerDispatchResult;
+    try { result = await dispatch(envelope); }
+    catch {
+      audit(deps.stateDir, { principal: `hook:${req.name}`, kind: 'webhook', surface: 'webhook', action: 'do', result: 'refused', reason: 'graph-dispatch-failed', source, at: now });
+      return json(503, { error: OUTCOME_ERROR['executor-error'] });
+    }
+    if (result.disposition === 'ignored') {
+      // The graph's own loop.trigger.events declaration decides (§5): a hook aimed at a graph that does
+      // not declare hook.in is a configuration error, never a firing.
+      audit(deps.stateDir, { principal: `hook:${req.name}`, kind: 'webhook', surface: 'webhook', action: 'do', result: 'refused', reason: 'graph-event-not-declared', source, at: now });
+      return json(503, { error: 'invalid-graph-trigger' });
+    }
+    // §1-3 — the person's approval of this hook↔graph↔risk pairing is remembered: later firings of the
+    // same pairing dispatch without asking. #39687 — a record for a different pairing is replaced by the
+    // one the person just approved; graphPath and danger ride in the record so the check above can
+    // compare them, not just the hook name.
+    if (envelope.danger !== 'read') {
+      const record = firstFiring();
+      if (!approvedPairing(record))
+        writeFileSync(firstFiringFile, `${JSON.stringify({ ...record, [req.name]: { graphPath: hook.graph, danger: envelope.danger, at: new Date(now).toISOString() } }, null, 2)}\n`);
+    }
+    audit(deps.stateDir, { principal: `hook:${req.name}`, kind: 'webhook', surface: 'webhook', action: 'do', result: 'executed', reason: `graph-${result.disposition}`, source, at: now });
+    return json(202, { ok: true, disposition: result.disposition, graphId: result.graphId, runId: result.runId });
+  }
+  const workspace = hook.workspace;
+  const pane = hook.pane;
+  const template = hook.template;
+  if (workspace === undefined || pane === undefined || template === undefined) return json(404, { error: 'not found' });
+  const text = renderTemplate(template, body);
   if (!text.trim()) return reject('template rendered empty');
   const control = createControl({ stateDir: deps.stateDir, execute: deps.execute, ...(deps.now ? { now: deps.now } : {}), ...(deps.hitl ? { hitl: deps.hitl } : {}) });
   const outcome = await control.run({
     principal: { id: `hook:${req.name}`, kind: 'webhook' },
     action: 'do',
     // #38453 REVIEW must ② — hooks.json `shell` never decides: only the server's paneIsShell does (fail closed).
-    target: { workspace: hook.workspace, pane: hook.pane, shell: deps.paneIsShell ? deps.paneIsShell(hook.workspace, hook.pane) : true },
+    target: { workspace, pane, shell: deps.paneIsShell ? deps.paneIsShell(workspace, pane) : true },
     text,
   });
   return outcomeToHttp(outcome);

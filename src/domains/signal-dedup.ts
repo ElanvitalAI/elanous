@@ -136,6 +136,7 @@ export async function llmOnce(prompt: string): Promise<string | null> {
       const local = (cfg?.llm?.rotation ?? []).find(r => r?.provider === 'local');
       if (local?.baseUrl) base = String(local.baseUrl).replace(/\/$/, '');
     } catch { /* 기본값 */ }
+    // llm-ledger-exempt: model-listing
     const models = (await (await fetch(`${base}/models`, { signal: AbortSignal.timeout(5_000) })).json()) as { data?: Array<{ id: string }> };
     const ids = (models?.data ?? []).map(m => m.id);
     if (!ids.length) return null;

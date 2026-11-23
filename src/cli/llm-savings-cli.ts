@@ -18,6 +18,7 @@ import {
   type SavingsReceipt,
 } from '../model-tier/router-savings.js';
 import { LogStore, logsDbPath, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
+import { decideGuardedRoute, type GuardedRouteDecision } from '../llm/route-quality-guard.js';
 
 /** 원장 행 최소 형태(LogStoreRow 와 구조 호환 — 시험 주입용). `ts` 는 ISO 문자열(원장 실측 계약). */
 export interface SavingsLedgerRow {
@@ -61,6 +62,10 @@ export function savingsCallsFromLedger(rows: readonly SavingsLedgerRow[], opts: 
     const cost = (data.cost ?? null) as { usd?: unknown; apiEquivalentUsd?: unknown } | null;
     const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
     const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+    // 실측값 계약(router-savings.ts): 구독 호출의 실측값은 apiEquivalentUsd(API 환산)다.
+    // 구독 행의 cost.usd(부과분 0)를 costUsd 로 내보내면 요약이 0을 집어 절감이 100%로 과장된다
+    // (judb-39664-84d0ecbb51c6 수리 중 발견 — 18707420 실측: usd=0 · apiEquivalentUsd=0.0033936).
+    const costUsd = cost !== null && str(data.billing) !== 'subscription' ? (num(cost.usd) ?? null) : null;
     out.push({
       at: atMs,
       role: str(data.role),
@@ -68,10 +73,11 @@ export function savingsCallsFromLedger(rows: readonly SavingsLedgerRow[], opts: 
       model: str(data.model) ?? '(모델 미기록)',
       provider: str(data.billingProvider),
       billing: str(data.billing),
+      runKey: str(data.runId),
       tier: str(data.workTier),
       inputTokens: num(data.inputTokens),
       outputTokens: num(data.outputTokens),
-      costUsd: cost !== null ? (num(cost.usd) ?? null) : null,
+      costUsd,
       apiEquivalentUsd: cost !== null ? (num(cost.apiEquivalentUsd) ?? null) : null,
     });
   }
@@ -82,7 +88,7 @@ export function savingsCallsFromLedger(rows: readonly SavingsLedgerRow[], opts: 
  *  ⛔ 가격 비공개 — savingsPct 는 주입 단가로 «내부» 계산한 비율뿐. 시각을 못 매긴 행은 '시각 미측정' 버킷(렌더 방어 관습). */
 export function summarizeDailySavings(
   calls: readonly SavingsCallRow[],
-  opts: { readonly premiumModel: string; readonly priceOf: SavingsPriceOf },
+  opts: { readonly premiumModel: string; readonly premiumModels?: readonly string[]; readonly priceOf: SavingsPriceOf },
 ): readonly SavingsDayRow[] {
   const buckets = new Map<string, SavingsCallRow[]>();
   for (const call of calls) {
@@ -94,7 +100,7 @@ export function summarizeDailySavings(
   return [...buckets.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([day, dayCalls]) => {
-      const receipt = summarizeRouterSavings({ calls: dayCalls, premiumModel: opts.premiumModel, priceOf: opts.priceOf });
+      const receipt = summarizeRouterSavings({ calls: dayCalls, premiumModel: opts.premiumModel, premiumModels: opts.premiumModels, priceOf: opts.priceOf });
       return {
         day,
         totalCalls: receipt.totalCalls,
@@ -106,9 +112,170 @@ export function summarizeDailySavings(
     });
 }
 
+// ── 과제/런 키 대차 증거(judb-39664-84d0ecbb51c6 mustFix) ─────────────────────
+// 같은 묶음을 ① 고정 티어 실행(전 과제 강 모델)과 ② 라우터 실행(가벼운 선출→임계 게이트→상향)으로
+// 모두 돌려 비용·품질을 한 세트로 대차한다. 키 = 과제 id(묶음)·원장 runId(실측 행).
+// ⛔ 가격 비공개 — 증거에는 주입 단가로 계산한 비율·횟수만 남는다.
+
+/** 런 키 대차 한 행 — 같은 runId 에 묶인 실측 호출의 짝 대차(강 단독 단가 기준). */
+export interface PairedRunKeyRow {
+  /** 원장 data.runId — 그룹 키. */
+  readonly key: string;
+  readonly calls: number;
+  readonly pricedCalls: number;
+  readonly unpricedCalls: number;
+  /** 1 − 실측합/강단가합(매긴 호출 0이거나 강단가합 ≤0 이면 null). */
+  readonly savingsPct: number | null;
+}
+
+/**
+ * 실측 원장 행을 런 키(data.runId)로 묶어 짝 대차한다 — 키 순서는 원장 첫 등장 순.
+ * 각 키 안에서 실측값(구독=apiEquivalentUsd · credit/api=costUsd — 실측 계약) 합을
+ * 같은 토큰의 강 단독 단가 합으로 다시 계산한 값에 대비한다. ⛔ 합성 0 — 매긴 호출이 없으면 null.
+ */
+export function pairLedgerRowsByRunKey(
+  rows: readonly SavingsLedgerRow[],
+  opts: { readonly now: number; readonly sinceMs?: number; readonly premiumModel: string; readonly priceOf: SavingsPriceOf },
+): readonly PairedRunKeyRow[] {
+  const calls = savingsCallsFromLedger(rows, { now: opts.now, sinceMs: opts.sinceMs });
+  const buckets = new Map<string, SavingsCallRow[]>();
+  for (const call of calls) {
+    const key = call.runKey ?? '(런 미기록)';
+    const list = buckets.get(key);
+    if (list) list.push(call);
+    else buckets.set(key, [call]);
+  }
+  return [...buckets.entries()].map(([key, keyCalls]) => {
+    let actual = 0;
+    let fixed = 0;
+    let priced = 0;
+    let unpriced = 0;
+    for (const call of keyCalls) {
+      const actualUsd = call.costUsd ?? call.apiEquivalentUsd ?? null;
+      const tokens = call.inputTokens !== undefined && call.outputTokens !== undefined
+        ? { inputTokens: call.inputTokens, outputTokens: call.outputTokens }
+        : null;
+      const fixedUsd = tokens !== null ? opts.priceOf(opts.premiumModel, tokens) : null;
+      if (actualUsd === null || fixedUsd === null || !Number.isFinite(actualUsd) || !Number.isFinite(fixedUsd)) {
+        unpriced += 1;
+        continue;
+      }
+      actual += actualUsd;
+      fixed += fixedUsd;
+      priced += 1;
+    }
+    const savingsPct = priced === 0 || fixed <= 0 ? null : 1 - actual / fixed;
+    return { key, calls: keyCalls.length, pricedCalls: priced, unpricedCalls: unpriced, savingsPct } satisfies PairedRunKeyRow;
+  });
+}
+
+/** 대차 과제 한 건 — 같은 토큰 묶음을 두 실행(고정 티어 vs 라우터)으로 돌린다. */
+export interface PairedBundleTask {
+  /** 과제 키 — 세트 내 유일(원장 runId 와 같은 축의 증거 키). */
+  readonly key: string;
+  readonly taskType: string;
+  readonly tokens: { readonly inputTokens: number; readonly outputTokens: number };
+}
+
+/** 과제 한 행의 대차 — 고정 티어 실행과 라우터 실행의 모델·품질·절감 비율. ⛔ 가격 비공개 — 비율만. */
+export interface PairedBundleRow {
+  readonly key: string;
+  readonly taskType: string;
+  readonly fixedTierModel: string;
+  /** 고정 티어 품질 — 라우터의 shadow 강 평가 점수를 그대로 재사용(평가 이중화 0). */
+  readonly fixedTierQuality: number;
+  readonly routedModel: string;
+  readonly escalated: boolean;
+  readonly routedQuality: number;
+  readonly appliedFloor: number;
+  /** 인도 품질 − 적용 임계(품질 하한 보존 근거). */
+  readonly qualityVsFloor: number;
+  /** 1 − 인도 단가/강 단독 단가(같은 과제 토큰 · 주입 단가 — 비공개). */
+  readonly costSavingsPct: number | null;
+}
+
+/** 과제/런 키 대차 증거 한 세트 — 같은 묶음의 비용·품질 대차를 한 표에 남긴다. */
+export interface PairedBundleEvidence {
+  readonly rows: readonly PairedBundleRow[];
+  readonly escalated: number;
+  readonly kept: number;
+  /** shadow 강 평가 횟수(과제당 정확히 1회). */
+  readonly premiumEvaluations: number;
+  /** 묶음 최저 (인도 품질 − 적용 임계) — 전 과제 ≥0 이면 품질 하한 보존. */
+  readonly minQualityVsFloor: number | null;
+  /** 묶음 절감 비율 — 1 − 인도 단가 합/강 단독 단가 합. */
+  readonly costSavingsPct: number | null;
+}
+
+export interface BuildPairedBundleInput {
+  readonly tasks: readonly PairedBundleTask[];
+  readonly lightweight: string;
+  readonly premium: string;
+  /** (모델, 과제 키) → 품질 점수(0~1). shadow 강 평가가 곧 고정 티어 품질이다(과제당 강 평가 정확히 1회). */
+  readonly evaluate: (model: string, key: string) => number | Promise<number>;
+  /** 유형→인도 임계(전유형 바닥 ≥0.95 — route-quality-guard 계약). */
+  readonly floors?: Readonly<Record<string, number>>;
+  readonly priceOf: SavingsPriceOf;
+}
+
+/**
+ * 묶음 대차 증거를 만든다(judb-39664 mustFix): 과제마다 라우터를 돌려(shadow 기본 on —
+ * 프리미엄 평가 과제당 정확히 1회) 그 shadow 점수를 고정 티어(강) 품질로 그대로 재사용하고,
+ * 같은 과제 토큰으로 인도 모델 단가 vs 강 단독 단가를 짝 대차한다.
+ */
+export async function buildPairedBundleEvidence(input: BuildPairedBundleInput): Promise<PairedBundleEvidence> {
+  const rows: PairedBundleRow[] = [];
+  let premiumEvaluations = 0;
+  let actualTotal = 0;
+  let fixedTotal = 0;
+  let priced = 0;
+  for (const task of input.tasks) {
+    const decision: GuardedRouteDecision = await decideGuardedRoute({
+      lightweight: input.lightweight,
+      premium: input.premium,
+      evaluate: model => input.evaluate(model, task.key),
+      taskType: task.taskType,
+      floors: input.floors,
+    });
+    if (decision.shadowScore !== null) premiumEvaluations += 1;
+    const fixedTierQuality = decision.shadowScore ?? decision.qualityScore;
+    const routedPrice = input.priceOf(decision.model, task.tokens);
+    const fixedPrice = input.priceOf(input.premium, task.tokens);
+    let costSavingsPct: number | null = null;
+    if (routedPrice !== null && fixedPrice !== null && Number.isFinite(routedPrice) && Number.isFinite(fixedPrice) && fixedPrice > 0) {
+      costSavingsPct = 1 - routedPrice / fixedPrice;
+      actualTotal += routedPrice;
+      fixedTotal += fixedPrice;
+      priced += 1;
+    }
+    rows.push({
+      key: task.key,
+      taskType: decision.taskType,
+      fixedTierModel: input.premium,
+      fixedTierQuality,
+      routedModel: decision.model,
+      escalated: decision.escalated,
+      routedQuality: decision.qualityScore,
+      appliedFloor: decision.appliedFloor,
+      qualityVsFloor: decision.qualityScore - decision.appliedFloor,
+      costSavingsPct,
+    });
+  }
+  const escalated = rows.filter(r => r.escalated).length;
+  return {
+    rows,
+    escalated,
+    kept: rows.length - escalated,
+    premiumEvaluations,
+    minQualityVsFloor: rows.length === 0 ? null : Math.min(...rows.map(r => r.qualityVsFloor)),
+    costSavingsPct: priced === 0 || fixedTotal <= 0 ? null : 1 - actualTotal / fixedTotal,
+  };
+}
+
 export interface LlmSavingsOpts {
   /** «강 단독» 기준 모델 id — 필수. */
   readonly premiumModel?: string;
+  readonly premiumModels?: readonly string[];
   /** 측정 창(분). 기본 60. */
   readonly minutes?: number;
   /** 특정 런만. */
@@ -173,10 +340,10 @@ export async function runLlmSavings(opts: LlmSavingsOpts, deps: LlmSavingsDeps =
     ? deps.rows
     : savingsCallsFromLedger(readLedgerWindow(), { now, sinceMs: minutes * 60_000, runId: opts.runId });
   const priceOf = deps.priceOf ?? defaultPriceOf;
-  const receipt = summarizeRouterSavings({ calls, premiumModel: opts.premiumModel, priceOf });
+  const receipt = summarizeRouterSavings({ calls, premiumModel: opts.premiumModel, premiumModels: opts.premiumModels, priceOf });
   // 일일 재계산(--daily): UTC 일 버킷 표를 영수에 함께 실는다 — 가격은 비공개(비율만).
   const json = opts.daily
-    ? { ...receipt, daily: summarizeDailySavings(calls, { premiumModel: opts.premiumModel, priceOf }) }
+    ? { ...receipt, daily: summarizeDailySavings(calls, { premiumModel: opts.premiumModel, premiumModels: opts.premiumModels, priceOf }) }
     : receipt;
   const out = deps.out ?? ((line: string) => console.log(line));
   if (opts.json) {

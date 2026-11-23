@@ -12,6 +12,7 @@ import {
   buildElsControlTool,
   elsControlSocketPath,
   runElsControl,
+  elsControlSeat,
 } from './els-control-tool.js';
 
 function rules(actions: readonly ControlAction[]): AllowRule[] {
@@ -122,11 +123,13 @@ describe('ELN-ELS-NATIVE-TOOL · 가짜 els 소켓 왕복', () => {
     const socketPath = join(dir, 's.sock');
     const fake = await fakeEls(socketPath, journal());
     try {
-      const denied = await runElsControl({ action: 'stop', pane: 'pa' }, { socketPath, stateDir: dir });
+      // A seated non-OP caller still needs the do rule (the 11-23 seatless default does not apply to it).
+      const seat = { name: 'MK' };
+      const denied = await runElsControl({ action: 'stop', pane: 'pa' }, { socketPath, stateDir: dir, seat });
       expect(denied.allowed).toBe(false);
       expect(sentWithoutLookup(fake)).toEqual([]);
       allow(dir, ['do']);
-      const allowed = await runElsControl({ action: 'stop', pane: 'pa', text: 'ignored' }, { socketPath, stateDir: dir });
+      const allowed = await runElsControl({ action: 'stop', pane: 'pa', text: 'ignored' }, { socketPath, stateDir: dir, seat });
       expect(allowed).toMatchObject({ ok: true });
       expect(sentWithoutLookup(fake)).toEqual([{ op: 'interrupt', pane: 'pa' }]);
     } finally {
@@ -149,13 +152,21 @@ describe('ELN-ELS-NATIVE-TOOL · 가짜 els 소켓 왕복', () => {
     } finally { await fake.close(); }
   });
 
-  test('허용목록 없으면 기본 거부(문이 막는다)', async () => {
+  test('허용목록 없음: 자리 없는 호출은 허용·감사 · 확인 없는 close 는 거부(CEO 11-23 완화)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'elsctl-'));
     const fake = await fakeEls(join(dir, 's.sock'), journal());
     const outcome = await runElsControl({ action: 'ls', pane: 'p1' }, { socketPath: join(dir, 's.sock'), stateDir: dir });
-    expect(outcome.allowed).toBe(false);
-    expect(outcome.message).toContain('not in control-allow.json');
-    expect(sentWithoutLookup(fake).length).toBe(0);
+    expect(outcome.allowed).toBe(true);
+    expect(outcome.ok).toBe(true);
+    expect(fake.received.map((request) => (request as { op: string }).op)).toEqual(['ls', 'ls']);
+    const closed = await runElsControl({ action: 'close', pane: 'p1' }, { socketPath: join(dir, 's.sock'), stateDir: dir });
+    expect(closed.allowed).toBe(false);
+    expect(closed.reason).toBe('close needs confirm:true (human confirmation)');
+    expect(sentWithoutLookup(fake).length).toBe(0); // the statement ls and the lookup ls share an op; close never reached the socket
+    const audit = readFileSync(join(dir, 'control-audit.jsonl'), 'utf8');
+    expect(audit).toContain('"action":"list"');
+    expect(audit).toContain('"result":"executed"');
+    expect(audit).toContain('"result":"denied"');
     await fake.close();
   });
 
@@ -248,13 +259,15 @@ describe('ELN-ELS-NATIVE-TOOL · 가짜 els 소켓 왕복', () => {
     const dir = mkdtempSync(join(tmpdir(), 'elsctl-'));
     allow(dir, ['read']);
     const fake = await fakeEls(join(dir, 's.sock'), journal());
+    // A seated non-OP caller is held to the file rules (the 11-23 seatless default does not apply to it).
     const outcome = await runElsControl(
       { action: 'do', pane: 'p1', text: 'echo hi' },
-      { socketPath: join(dir, 's.sock'), stateDir: dir },
+      { socketPath: join(dir, 's.sock'), stateDir: dir, seat: { name: 'MK' } },
     );
     expect(outcome.allowed).toBe(false);
     expect(outcome.message).toContain('not in control-allow.json');
     expect(sentWithoutLookup(fake).length).toBe(0);
+    expect(readFileSync(join(dir, 'control-audit.jsonl'), 'utf8')).toContain('"result":"denied"');
     await fake.close();
   });
 });
@@ -264,10 +277,12 @@ describe('ELN-ELS-NATIVE-TOOL · 저널 조회 대상 (JUD fail must ⓒ)', () =
     const dir = mkdtempSync(join(tmpdir(), 'elsctl-'));
     allow(dir, ['do']);
     const fake = await fakeEls(join(dir, 's.sock'), journal());
+    // A seated non-OP caller (MK) is held to the file rule; the 11-23 seatless default does not apply to it.
+    const seat = { name: 'MK' };
     // p2 lives in w2 (rule allows w1 only); the LLM claims w1 · a safe-looking shell:false.
     const denied = await runElsControl(
       { action: 'do', pane: 'p2', workspace: 'w1', tab: 't1', shell: false, text: 'echo hi' },
-      { socketPath: join(dir, 's.sock'), stateDir: dir },
+      { socketPath: join(dir, 's.sock'), stateDir: dir, seat },
     );
     expect(denied.allowed).toBe(false);
     expect(denied.message).toContain('not in control-allow.json');
@@ -276,7 +291,7 @@ describe('ELN-ELS-NATIVE-TOOL · 저널 조회 대상 (JUD fail must ⓒ)', () =
     // p1 is a shell pane in w1: shell:false from the LLM does not skip danger classification (no person → held).
     const held = await runElsControl(
       { action: 'do', pane: 'p1', workspace: 'w2', shell: false, text: 'rm -rf /' },
-      { socketPath: join(dir, 's.sock'), stateDir: dir },
+      { socketPath: join(dir, 's.sock'), stateDir: dir, seat },
     );
     expect(held.allowed).toBe(false);
     expect(held.code).toBe('held');
@@ -284,7 +299,7 @@ describe('ELN-ELS-NATIVE-TOOL · 저널 조회 대상 (JUD fail must ⓒ)', () =
     // the true values pass: statement is built from the journal (w1) whatever the LLM claimed.
     const ok = await runElsControl(
       { action: 'do', pane: 'p1', workspace: 'w2', text: 'echo hi' },
-      { socketPath: join(dir, 's.sock'), stateDir: dir },
+      { socketPath: join(dir, 's.sock'), stateDir: dir, seat },
     );
     expect(ok.allowed).toBe(true);
     expect(sentWithoutLookup(fake).length).toBe(1);
@@ -319,4 +334,12 @@ describe('ELN-ELS-NATIVE-TOOL · 저널 조회 대상 (JUD fail must ⓒ)', () =
     expect(sentWithoutLookup(fake).length).toBe(0);
     await fake.close();
   });
+});
+
+// ELS-ORCH-PEER-IDENTITY 최소판(CEO 11-23 15:1x): the tool carries its own seat from the env els set on the seat tab.
+test('elsControlSeat reads the seat and its workspace from the env', () => {
+  expect(elsControlSeat({ ELANOUS_TRACK: 'OP', ELANOUS_ELS_WS: 'w8ad91a8f' })).toEqual({ name: 'OP', workspaces: ['w8ad91a8f'] });
+  expect(elsControlSeat({ ELANOUS_SEAT: 'HAND-ELN-ELS-API' })).toEqual({ name: 'HAND-ELN-ELS-API' });
+  expect(elsControlSeat({})).toBeUndefined();
+  expect(elsControlSeat({ ELANOUS_TRACK: '  ' })).toBeUndefined();
 });

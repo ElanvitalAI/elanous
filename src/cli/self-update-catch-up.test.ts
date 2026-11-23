@@ -5,7 +5,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { Command } from 'commander';
 import { registerDecisionsCommands } from './decisions-cli.js';
-import { parseRailAllowed, raiseHitlArgs, runCatchUp, type CatchUpDeps } from './self-update-catch-up.js';
+import { holdMailArgs, holdRecordArgs, opDecisionArgs, parseRailAllowed, recordSeatSucceeded, runCatchUp, type CatchUpDeps } from './self-update-catch-up.js';
 import { updateAllElsTabs, type UpdateSeatRow } from '../els/update-all.js';
 import { runSeatControl } from './seat-control-cli.js';
 import { runUpdateForInstallation } from './self-update.js';
@@ -30,7 +30,7 @@ function rig(opts: { installed?: string; rail?: boolean | 'throw'; desired?: str
   writeFileSync(join(root, 'versions', oldName, 'node_modules', 'elanous', 'bin', 'elanous.mjs'), '// entry\n');
   symlinkSync(`versions/${oldName}`, join(root, 'current'));
   writeFileSync(join(root, 'install.json'), JSON.stringify({ version: '0.2.15', versionDir: `versions/${oldName}`, source: checkout, ...(opts.channel === null ? {} : { channel: opts.channel ?? 'dev' }), ...(opts.noCommit ? {} : { commit: (opts.installed ?? OLD).slice(0, 12) }) }));
-  const calls: string[] = []; const raised: string[] = []; const handoffs: string[] = [];
+  const calls: string[] = []; const raised: string[] = []; const handoffs: string[] = []; const opDecisions: string[] = [];
   const st = { daemon: opts.daemon ?? (opts.installed ?? OLD) };
   const deps: CatchUpDeps = {
     cliRoot: checkout, installRoot: root, stateDir, host: 'host-a', now: () => new Date('2026-11-20T00:00:00Z'), packageVersion: () => '0.2.16-dev.0',
@@ -42,13 +42,14 @@ function rig(opts: { installed?: string; rail?: boolean | 'throw'; desired?: str
     restartEdgeRail: async () => { calls.push('restart'); return false; },
     verifyRestart: async () => (st.daemon === 'down' ? { ok: false } : { ok: true, daemonSha: st.daemon }),
     raiseHitl: (t) => { raised.push(t); },
+    recordOpDecision: (t) => { opDecisions.push(t); },
     recordHandoff: (t) => { handoffs.push(t); },
   };
   const gateFile = join(stateDir, 'host-assign-gate.json');
   const gate = () => (JSON.parse(readFileSync(gateFile, 'utf8')) as { gate: string }).gate;
   const seed = (g: string) => { mkdirSync(stateDir, { recursive: true }); writeFileSync(gateFile, JSON.stringify({ host: 'host-a', gate: g, sha: OLD })); };
   const setRecord = (commit: string) => writeFileSync(join(root, 'install.json'), JSON.stringify({ version: '0.2.15', versionDir: `versions/${oldName}`, source: checkout, channel: 'dev', commit: commit.slice(0, 12) }));
-  return { deps, calls, raised, handoffs, gate, seed, root, st, setRecord };
+  return { deps, calls, raised, handoffs, opDecisions, gate, seed, root, st, setRecord };
 }
 
 const sh = (cwd: string, ...args: string[]): string => {
@@ -79,7 +80,7 @@ function realRig(o: { detach?: boolean; installerFails?: boolean; overlap?: 'sam
   sh(work, 'commit', '-qam', 'two'); sh(work, 'push', '-q', 'origin', 'main');
   const two = sh(work, 'rev-parse', 'HEAD');
   if (o.detach) sh(co, 'checkout', '-q', '--detach', one);
-  const calls: string[] = []; const raised: string[] = [];
+  const calls: string[] = []; const raised: string[] = []; const opDecisions: string[] = [];
   const env = { ...process.env, HOME: home, BUN_INSTALL: join(home, '.bun'), BUN_INSTALL_CACHE_DIR: process.env.BUN_INSTALL_CACHE_DIR ?? join(homedir(), '.bun', 'install', 'cache'), ELANOUS_INSTALL_LANG: 'en', NODE_ENV: 'test' };
   const realRun: NonNullable<CatchUpDeps['run']> = (cmd, args, cwd) => {
     calls.push(`run ${cmd}`);
@@ -101,10 +102,10 @@ function realRig(o: { detach?: boolean; installerFails?: boolean; overlap?: 'sam
     run: realRun,
     restartEdgeRail: async () => { calls.push('restart'); st.daemon = installedCommit(); return true; },
     verifyRestart: async () => ({ ok: true, daemonSha: st.daemon }),
-    raiseHitl: (t) => { raised.push(t); }, recordHandoff: () => {},
+    raiseHitl: (t) => { raised.push(t); }, recordOpDecision: (t) => { opDecisions.push(t); }, recordHandoff: () => {},
   };
   const gate = () => (JSON.parse(readFileSync(join(stateDir, 'host-assign-gate.json'), 'utf8')) as { gate: string }).gate;
-  return { deps, calls, raised, root, co, one, two, st, gate, installedCommit };
+  return { deps, calls, raised, opDecisions, root, co, one, two, st, gate, installedCommit };
 }
 
 describe('self-update --catch-up (real installer, real git; only restart + health faked)', () => {
@@ -180,6 +181,9 @@ describe('self-update --catch-up (real installer, real git; only restart + healt
     expect(sent).toEqual(['tui:10']);
     expect(r.installedCommit()).toBe(r.two);
     expect(approvals).toBe(2);
+    // OP's own terminal answer is the decision: no hold notice (no CEO card), one OP-decided trace for the approved run.
+    expect(r.raised.length).toBe(0);
+    expect(r.opDecisions.length).toBe(1);
   });
   test('behind: real install.sh installs desiredSha (content, record, current link — none written by the test), checkout restored to its branch, restart verified, gate opens', async () => {
     const r = realRig();
@@ -424,20 +428,41 @@ describe('self-update --catch-up (decision, gate and HITL paths)', () => {
       expect(res.exitCode).toBe(expectRun ? 0 : 1);
     }
   });
-  test('HITL raise args satisfy the real decisions command contract (in-process command tree, isolated state dir: card persisted)', () => {
+  test('OP-seat hold and approval are seat-decision rows, never a CEO card (in-process decisions command tree, isolated state dir)', () => {
     const stateDir = tmp('catchup-dec-');
-    const saved = { seat: process.env.ELANOUS_SEAT, agent: process.env.AI_AGENT };
-    delete process.env.ELANOUS_SEAT; delete process.env.AI_AGENT;   // a seat env would route the card to OP mail instead of the ledger
-    try {
-      const lines: string[] = [];
-      const program = new Command();
-      registerDecisionsCommands(program, { humanTerminal: () => true, stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: (line) => lines.push(line) });
-      program.parse([...raiseHitlArgs('OP', 'host-a not running desired'), '--json'], { from: 'user' });
-      expect(readFileSync(join(stateDir, 'decisions', 'decisions.jsonl'), 'utf8')).toContain(JSON.parse(lines[0]!).id);
-    } finally {
-      if (saved.seat === undefined) delete process.env.ELANOUS_SEAT; else process.env.ELANOUS_SEAT = saved.seat;
-      if (saved.agent === undefined) delete process.env.AI_AGENT; else process.env.AI_AGENT = saved.agent;
-    }
+    const lines: string[] = [];
+    const program = new Command();
+    registerDecisionsCommands(program, { humanTerminal: () => true, stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: (line) => lines.push(line) });
+    program.parse([...holdRecordArgs('OP', 'host-a not running desired', 'host-a', NEW), '--json'], { from: 'user' });
+    const program2 = new Command();
+    registerDecisionsCommands(program2, { humanTerminal: () => true, stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: (line) => lines.push(line) });
+    program2.parse([...opDecisionArgs('OP', 'host-a not running desired', 'host-a', NEW), '--json'], { from: 'user' });
+    const events = readFileSync(join(stateDir, 'decisions', 'decisions.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { type: string; entry: { seat: string; title: string; refs?: string[] } });
+    expect(events.map((e) => e.type)).toEqual(['seat-recorded', 'seat-recorded']);
+    expect(events.map((e) => [e.entry.seat, e.entry.title, e.entry.refs])).toEqual([
+      ['OP', 'OP seat self-update held', ['catch-up:host-a:222222222222']],
+      ['OP', 'OP seat self-update approved', ['catch-up-approved:host-a:222222222222']],
+    ]);
+    // A retry with the same ref adds no row and is reported as already recorded (treated as success by the hold notice).
+    const program3 = new Command();
+    registerDecisionsCommands(program3, { humanTerminal: () => true, stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: (line) => lines.push(line) });
+    expect(() => program3.parse([...holdRecordArgs('OP', 'host-a not running desired', 'host-a', NEW), '--json'], { from: 'user' })).toThrow('seat decision source already recorded');
+    expect(readFileSync(join(stateDir, 'decisions', 'decisions.jsonl'), 'utf8').trim().split('\n').length).toBe(2);
+    expect([recordSeatSucceeded(0, ''), recordSeatSucceeded(1, 'decisions: seat decision source already recorded'), recordSeatSucceeded(1, 'decisions: invalid seat'), recordSeatSucceeded(null, '')]).toEqual([true, true, false, false]);
+    expect(holdRecordArgs('OP', 'x', 'host-a', NEW)).not.toContain('raise');
+    expect(holdMailArgs('OP', 'x')).toEqual(['msg', 'post', '--from', 'OP', '--to', 'OP', '--kind', 'alert', '--body',
+      '[self-update] OP seat update held; run els update-all from the OP seat to apply. x']);
+  });
+  test('background OP catch-up (no approval) records a hold once and never asks for OP approval; interactive approval sends no hold notice', async () => {
+    const bg = rig();
+    expect((await runCatchUp({ seat: 'OP', restart: true }, bg.deps)).exitCode).toBe(0);
+    expect([bg.raised.length, bg.opDecisions.length, bg.calls.length]).toEqual([1, 0, 0]);
+    const fg = rig();
+    const res = await runCatchUp({ seat: 'OP', restart: false }, { ...fg.deps, approveOp: () => true });
+    expect(fg.raised.length).toBe(0);
+    expect(fg.opDecisions).toEqual(["OP approved on its terminal. host host-a, installed 111111111111, desired 222222222222."]);
+    expect(fg.calls[0]).toBe('git diff --quiet HEAD --');   // proceeded to the install path (the fake rig's git then fails it)
+    expect(res.exitCode).toBe(1);
   });
   test('parseRailAllowed is fail-closed: only explicit true passes', () => {
     expect(parseRailAllowed('{"phase":"dev-normal","rules":{"rail":true}}')).toBe(true);

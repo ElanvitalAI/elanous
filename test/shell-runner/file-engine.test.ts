@@ -1,8 +1,10 @@
 import { describe, test, expect } from 'bun:test';
-import { EventEmitter } from 'node:events';
+import { spawn } from 'node:child_process';
+import { once, EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 
 import { createFileCaptureEngine } from '../../src/shell-runner/file-engine.js';
+import { TERMINATE_TREE_GRACE_MS, TERMINATE_TREE_KILL_WAIT_MS } from '../../src/shell-primitive/terminate-tree.js';
 import type { RunCtx } from '../../src/shell-runner/types.js';
 
 // ── fake child_process.spawn ────────────────────────────────────
@@ -47,6 +49,66 @@ const ctx: RunCtx = { getCwd: () => '/tmp' };
 async function drain(ms = 20) {
   await new Promise(r => setTimeout(r, ms));
 }
+
+// 출처: 내부 문서 `FILE-ENGINE-TIMEOUT-SETTLE-AFTER-KILL`
+const workerTimeoutMs = 800;
+const postWorkerProbeMs = 3000;
+// 출처: src/shell-primitive/terminate-tree.ts and the worker probe above.
+const regressionBudgetMs = workerTimeoutMs + TERMINATE_TREE_GRACE_MS
+  + TERMINATE_TREE_KILL_WAIT_MS + 2 * postWorkerProbeMs;
+
+test.skipIf(process.platform === 'win32')(
+  'FILE-ENGINE-TIMEOUT-SETTLE-AFTER-KILL: the caller can exit as soon as timeout resolves',
+  async () => {
+    const engineUrl = new URL('../../src/shell-runner/file-engine.ts', import.meta.url).href;
+    const command = [
+      '/bin/sh', '-c',
+      `(trap '' TERM; exec sleep 30) & descendant=$!; printf '%s %s\n' "$$" "$descendant"; wait`,
+    ];
+    const worker = spawn(process.execPath, ['-e', `
+      import { createFileCaptureEngine } from ${JSON.stringify(engineUrl)};
+      const handle = createFileCaptureEngine().run({
+        command: ${JSON.stringify(command)},
+        timeoutMs: ${workerTimeoutMs},
+      }, { getCwd: () => process.cwd() });
+      handle.onChunk(({ bytes }) => process.stdout.write(bytes));
+      const result = await handle.result;
+      const pids = result.stdout.text.trim().split(' ').map(Number);
+      let alive = false;
+      try { process.kill(pids[1], 0); alive = true; }
+      catch (error) { if (error.code !== 'ESRCH') throw error; }
+      console.log(JSON.stringify({ alive, outcome: result.outcome, timedOut: result.timedOut,
+        interrupted: result.interrupted, failureReason: result.failureReason }));
+      process.exit(0);
+    `], { stdio: ['ignore', 'pipe', 'inherit'] });
+    let output = '';
+    worker.stdout.setEncoding('utf8').on('data', (chunk) => { output += chunk; });
+    const watchdog = setTimeout(() => worker.kill('SIGKILL'), regressionBudgetMs);
+    try {
+      const [code] = await once(worker, 'close');
+      expect(code).toBe(0);
+      const [pidLine, resultLine] = output.trim().split('\n');
+      const descendant = Number(pidLine?.split(' ')[1]);
+      expect(descendant).toBeGreaterThan(1);
+      await drain(postWorkerProbeMs);
+      let probe = 'alive';
+      try { process.kill(descendant, 0); }
+      catch (error) { probe = (error as NodeJS.ErrnoException).code ?? String(error); }
+      expect(probe).toBe('ESRCH');
+      expect(JSON.parse(resultLine!)).toEqual({
+        alive: false, outcome: 'timeout', timedOut: true, interrupted: true,
+      });
+    } finally {
+      clearTimeout(watchdog);
+      const group = Number(output.split(' ')[0]);
+      if (Number.isSafeInteger(group) && group > 1) {
+        try { process.kill(-group, 'SIGKILL'); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+      }
+    }
+  },
+  regressionBudgetMs,
+);
 
 describe('FileCaptureEngine', () => {
   test('captures stdout on normal exit 0', async () => {
@@ -138,14 +200,25 @@ describe('FileCaptureEngine', () => {
   test('timeout → timedOut + SIGTERM sent', async () => {
     const { spawn, children } = fakeSpawn();
     const engine = createFileCaptureEngine({ spawnFn: spawn });
-    const h = engine.run({ command: 'sleep 100', timeoutMs: 40 }, ctx);
+    const controller = new AbortController();
+    const settled: unknown[] = [];
+    const h = engine.run({ command: 'sleep 100', timeoutMs: 40, signal: controller.signal }, {
+      ...ctx, onSettled: (value) => settled.push(value),
+    });
     const child = children[0]!;
     await drain(80);
     expect(child.lastSignal).toBe('SIGTERM');
     child.stdout.end();
     child.stderr.end();
     child.emit('exit', null, 'SIGTERM');
+    controller.abort();
+    h.kill('SIGKILL');
+    await Promise.resolve();
+    expect(settled).toEqual([]);
     const r = await h.result;
+    expect(settled).toEqual([r]);
+    expect(r.failureReason).toContain('Process tree termination unconfirmed');
+    expect(r.exitCode).toBe(143);
     expect(r.timedOut).toBe(true);
     expect(r.outcome).toBe('timeout');
   });

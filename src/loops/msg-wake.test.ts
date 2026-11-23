@@ -230,6 +230,36 @@ test('remote-host registry seats skip the local pane census; the remote prompt s
     .toMatchObject({ wake: 'herdr', target: 'w5:p2N', source: 'seat-registry' });
 });
 
+test('remote wake uses the remote census and never submits to a missing or working pane', async () => {
+  for (const state of ['missing', 'working', 'idle'] as const) {
+    const remote = createFakeHerdr({ panes: state === 'missing' ? [] : [
+      { paneId: 'w5:p2N', agent: 'elanous', status: state },
+    ] });
+    const hosts: string[] = [];
+    const f = fixture({
+      localHostAliases: ['mshq'],
+      listHerdrPanes: () => [],
+      readRegistry: () => ({ status: 'ready', registry: { version: 1, seats: [
+        { address: 'RES23N04', host: 'node-b', target: 'w5:p2N', wake: 'herdr', replyBody: 'agent', optIn: true },
+      ] } }),
+      herdrRunForHost: host => { hosts.push(host); return remote.run; },
+      herdrRun: async () => { throw new Error('local herdr must not be used'); },
+    });
+    const result = await wakeRecipient('RES23N04', 1, { from: 'OP' }, f.deps);
+    expect(hosts).toEqual(['node-b']);
+    expect(remote.calls().some(argv => argv[0] === 'pane' && argv[1] === 'list')).toBe(true);
+    if (state === 'idle') {
+      expect(result.result).toBe('injected');
+      expect(remote.submissions()).toHaveLength(1);
+      expect(remote.submissions()[0]!.paneId).toBe('w5:p2N');
+    } else {
+      expect(result.result).not.toBe('injected');
+      expect(remote.submissions()).toHaveLength(0);
+      expect(remote.calls().some(argv => argv[0] === 'pane' && argv[1] === 'run')).toBe(false);
+    }
+  }
+});
+
 test('pane title and cwd disagreement stays ambiguous instead of routing either seat', () => {
   const f = fixture({ readRegistry: () => ({ status: 'absent' }), listHerdrPanes: () => [
     { paneId: 'wT:p4', sessionId: 'sess-4', title: 'work | OTHER', cwd: '/hq/seats/TC', status: 'idle' },
@@ -585,14 +615,20 @@ test('a herdr pane that changes during the status query gets no injection into t
 
 test('a re-resolution that runs past the deadline starts no herdr injection', async () => {
   let reads = 0;
-  const f = fixture({ timeoutMs: 30, readPane: path => {
-    if (!path.endsWith(join('MK', 'herdr.pane'))) return null;
-    if (++reads === 2) { const end = Date.now() + 60; while (Date.now() < end) { /* a slow seat folder */ } }
-    return 'wJ:p1';
-  } });
-  expect((await wakeRecipient('MK', 1, { from: 'OP' }, f.deps)).result).toBe('timeout');
-  await new Promise(resolve => setTimeout(resolve, 20));
-  expect(f.herdr).toEqual([]);
+  let now = 1_000_000;
+  const clock = spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const f = fixture({ timeoutMs: 3_000, readPane: path => {
+      if (!path.endsWith(join('MK', 'herdr.pane'))) return null;
+      if (++reads === 2) now += 3_001;
+      return 'wJ:p1';
+    } });
+    expect((await wakeRecipient('MK', 1, { from: 'OP' }, f.deps)).result).toBe('timeout');
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(f.herdr).toEqual([]);
+  } finally {
+    clock.mockRestore();
+  }
 });
 
 test('a slow pty module load past the deadline starts no injection and returns the window', async () => {

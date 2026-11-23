@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
 import { validateProvenance, type Provenance } from '../provenance/provenance.js';
-import { hasReceiptTable, latestReceiptIdOn, legacyIntent, listReceiptsOn, MSG_RECEIPTS_SCHEMA, recordReceiptOn, type Receipt, type ReceiptInput, type ReceiptQuery, type ReceiptRecordOutcome, type ReceiptSource, type ReceiptState } from './msg-receipts.js';
+import { hasReceiptTable, latestReceiptIdOn, TERMINAL_RECEIPT_STATES, legacyIntent, listReceiptsOn, MSG_RECEIPTS_SCHEMA, recordReceiptOn, type Receipt, type ReceiptInput, type ReceiptQuery, type ReceiptRecordOutcome, type ReceiptSource, type ReceiptState } from './msg-receipts.js';
 import { recordReceiptClock } from '../hq/msg-receipt-clock-sink.js';
 import { appendLedgerEvent } from './ledger-events.js';
 
@@ -174,15 +174,16 @@ export function validateMessageEnvelope(input: unknown): MessageEnvelope {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('message must be an object');
   const record = input as Record<string, unknown>;
   const fromAddress = canonicalMessageAddress(record.from as string);
-  if (fromAddress.startsWith('group:') || fromAddress.startsWith('pane:') || fromAddress.startsWith('session:') || fromAddress.includes('/')) throw new Error('sender must be a seat');
-  const from = canonicalSeatId(fromAddress);
+  // MSG-FILTERS-RELAX: a sub-seat (`MK/graphics`), pane or session address may send — the reply goes back to that same
+  // address. Only ALL and group:* stay refused: they name many readers, not one sender.
+  if (fromAddress.startsWith('group:')) throw new Error('sender must be a seat');
+  const from = fromAddress;
   const to = canonicalMessageAddress(record.to as string);
   if (from === 'ALL') throw new Error('ALL cannot send messages');
   if (from.startsWith('group:')) throw new Error('sender must be a seat');
   if (typeof record.body !== 'string' || !record.body.trim()) throw new Error('message body must be nonempty');
-  if (record.kind !== undefined && (typeof record.kind !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(record.kind))) {
-    throw new Error('invalid message kind');
-  }
+  // MSG-FILTERS-RELAX: any kind tag is accepted and stored (trimmed, lowercased); an empty tag is the same as none.
+  const kind = record.kind === undefined || record.kind === null ? undefined : String(record.kind).trim().toLowerCase() || undefined;
   const replyTo = record.replyTo;
   if (replyTo !== undefined && (typeof replyTo !== 'number' || !Number.isSafeInteger(replyTo) || replyTo < 1)) {
     throw new Error('replyTo must be a positive integer message ID');
@@ -191,46 +192,54 @@ export function validateMessageEnvelope(input: unknown): MessageEnvelope {
   if (record.priority !== undefined && (typeof record.priority !== 'number' || !Number.isFinite(record.priority))) throw new Error('priority must be a finite number');
   if (record.supersedes !== undefined && (typeof record.supersedes !== 'number' || !Number.isSafeInteger(record.supersedes) || record.supersedes < 1)) throw new Error('supersedes must be a positive message ID');
   if (record.provenance !== undefined && !validateProvenance(record.provenance)) throw new Error('invalid message provenance');
-  if (record.intent !== undefined && !['request', 'decision', 'info', 'alert'].includes(record.intent as string)) throw new Error('intent must be request, decision, info, or alert');
-  if (record.refs !== undefined && (!Array.isArray(record.refs) || record.refs.length === 0 || !(record.refs as unknown[]).every(item => typeof item === 'string'))) throw new Error('refs must be a nonempty array of strings (omit it to store NULL)');
+  // MSG-FILTERS-RELAX: an unknown intent is not a refusal — the ledger column only holds the four canonical intents
+  // (schema CHECK), so it is stored as `info` and the caller's word is kept as an `intent:<word>` ref.
+  const rawIntent = record.intent === undefined || record.intent === null ? undefined : String(record.intent).trim().toLowerCase() || undefined;
+  const intent = rawIntent === undefined || ['request', 'decision', 'info', 'alert'].includes(rawIntent) ? rawIntent : 'info';
+  // MSG-FILTERS-RELAX: a single ref or non-string refs are kept as strings; an empty list is the same as none.
+  const refs = [
+    ...(record.refs === undefined || record.refs === null ? []
+      : (Array.isArray(record.refs) ? record.refs : [record.refs]).map(item => String(item)).filter(item => item.trim() !== '')),
+    ...(rawIntent !== undefined && rawIntent !== intent ? [`intent:${rawIntent}`] : []),
+  ];
   if (record.deadlineAt !== undefined && (typeof record.deadlineAt !== 'string' || !Number.isFinite(Date.parse(record.deadlineAt)))) throw new Error('deadlineAt must be an ISO timestamp');
   if (record.needsAck !== undefined && typeof record.needsAck !== 'boolean') throw new Error('needsAck must be a boolean');
-  if (record.doneWhen !== undefined && (typeof record.doneWhen !== 'string' || !record.doneWhen.trim() || record.doneWhen.length > 500)) throw new Error('doneWhen must be a nonempty string of at most 500 characters');
-  if (record.crownDirective !== undefined && (typeof record.crownDirective !== 'string' || !record.crownDirective.trim())) throw new Error('crownDirective must be a nonempty string');
+  // MSG-FILTERS-RELAX: no length cap on the completion condition; an empty one is the same as none.
+  const doneWhen = typeof record.doneWhen === 'string' && record.doneWhen.trim() ? record.doneWhen.trim() : undefined;
+  const crownDirective = record.crownDirective === undefined || record.crownDirective === null ? undefined : String(record.crownDirective).trim() || undefined;
   if (record.origin !== undefined && (typeof record.origin !== 'object' || record.origin === null || Array.isArray(record.origin)
       || !['human', 'agent', 'system', 'tool'].includes((record.origin as { kind?: unknown }).kind as string))) throw new Error('origin.kind must be human, agent, system, or tool');
-  if (Object.keys(record).some(key => !['from', 'to', 'body', 'kind', 'replyTo', 'expiresAt', 'priority', 'supersedes', 'provenance', 'intent', 'refs', 'deadlineAt', 'doneWhen', 'needsAck', 'crownDirective', 'origin'].includes(key))) throw new Error('unknown message field');
+  // MSG-FILTERS-RELAX: an unknown field is ignored (and logged), never a refused message.
+  const unknownFields = Object.keys(record).filter(key => !['from', 'to', 'body', 'kind', 'replyTo', 'expiresAt', 'priority', 'supersedes', 'provenance', 'intent', 'refs', 'deadlineAt', 'doneWhen', 'needsAck', 'crownDirective', 'origin'].includes(key));
+  if (unknownFields.length > 0) {
+    try { debug.log('msg', 'msg.envelope.unknown-fields-ignored', { fields: unknownFields }, { level: 'warn' }); } catch { /* observability is fail-open */ }
+  }
   return {
     from, to, body: record.body,
-    ...(record.kind === undefined ? {} : { kind: record.kind as string }),
+    ...(kind === undefined ? {} : { kind }),
     ...(replyTo === undefined ? {} : { replyTo }),
     ...(record.expiresAt === undefined ? {} : { expiresAt: normalizeExpiry(record.expiresAt as string) }),
     ...(record.priority === undefined ? {} : { priority: record.priority as number }),
     ...(record.supersedes === undefined ? {} : { supersedes: record.supersedes as number }),
     ...(record.provenance === undefined ? {} : { provenance: Object.freeze({ ...(record.provenance as Provenance) }) }),
-    ...(record.intent === undefined ? {} : { intent: record.intent as MessageEnvelope['intent'] }),
-    ...(record.refs === undefined ? {} : { refs: [...(record.refs as string[])] }),
+    ...(intent === undefined ? {} : { intent: intent as MessageEnvelope['intent'] }),
+    ...(refs.length === 0 ? {} : { refs }),
     ...(record.deadlineAt === undefined ? {} : { deadlineAt: record.deadlineAt as string }),
-    ...(record.doneWhen === undefined ? {} : { doneWhen: (record.doneWhen as string).trim() }),
+    ...(doneWhen === undefined ? {} : { doneWhen }),
     ...(record.needsAck === undefined ? {} : { needsAck: record.needsAck as boolean }),
-    ...(record.crownDirective === undefined ? {} : { crownDirective: record.crownDirective as string }),
+    ...(crownDirective === undefined ? {} : { crownDirective }),
     ...(record.origin === undefined ? {} : { origin: normalizeMessageOrigin(record.origin as Record<string, unknown>, from) }),
   };
 }
 
 function normalizeMessageOrigin(value: Record<string, unknown>, sender: string): MessageOrigin {
   const kind = value.kind as MessageOrigin['kind'];
-  if (value.seat !== undefined && value.seat !== sender) {
-    throw new Error('origin.seat must match the sender');
-  }
-  if (value.delegatedByCrown !== undefined && typeof value.delegatedByCrown !== 'boolean') {
-    throw new Error('origin.delegatedByCrown must be a boolean when present');
-  }
-  const extra = Object.keys(value).filter(key => !['kind', 'seat', 'delegatedByCrown'].includes(key));
-  if (extra.length > 0) throw new Error('unknown origin field');
-  // An explicit origin always carries the sender. Omitting seat must not make a reread differ.
+  // MSG-FILTERS-RELAX: seat mail between one operator's seats is not a security boundary — a sender that differs from
+  // the real caller is stored, and origin.seat records that caller instead of refusing the message.
+  const seat = typeof value.seat === 'string' && value.seat.trim() ? value.seat.trim() : sender;
+  // An omitted seat carries the sender, so a reread does not differ.
   // false is a real value (the public type allows it) and must survive a reread, not be dropped.
-  return { kind, seat: sender,
+  return { kind, seat,
     ...(typeof value.delegatedByCrown === 'boolean' ? { delegatedByCrown: value.delegatedByCrown } : {}) };
 }
 
@@ -700,15 +709,14 @@ export class MsgStore {
 
   /** Append once for a coordination comment, task failure, or decided notification. */
   appendWithProvenance(input: MessageEnvelope, provenanceKey: string): Message {
-    if (typeof provenanceKey !== 'string' || !/^(?:coord|ta-failure|decision):[^:]+:[^:]+$/.test(provenanceKey) &&
-        !/^release-stage:[^:]+:event$/.test(provenanceKey) &&
-        !/^(?:release-event|rla-held-event):[A-Za-z0-9_-]+:(?:OP|RLA)$/.test(provenanceKey) &&
-        !/^rla-command-reply:[1-9][0-9]*:OP$/.test(provenanceKey) &&
-        !/^rla-question-reply:[1-9][0-9]*:OP$/.test(provenanceKey)) {
+    // MSG-FILTERS-RELAX: any nonempty key without whitespace names one logical message (no prefix allowlist).
+    if (typeof provenanceKey !== 'string' || !/^\S{1,512}$/.test(provenanceKey)) {
       throw new Error('invalid message provenance key');
     }
     const msg = validateMessageEnvelope(input);
-    if (!provenanceKey.startsWith('release-stage:') && provenanceKey.split(':')[2] !== msg.to) {
+    // Integrity kept: a known family's key names its recipient in the third part — one key, one recipient.
+    if (/^(?:coord|ta-failure|decision|release-event|rla-held-event|rla-command-reply|rla-question-reply):[^:]+:[^:]+$/.test(provenanceKey)
+      && provenanceKey.split(':')[2] !== msg.to) {
       throw new Error('provenance recipient does not match message recipient');
     }
     return this.withPostedEvents(() => {
@@ -867,29 +875,12 @@ export class MsgStore {
         const existing = recent();
         return existing === null ? insert(message) : this.recordRepeat(existing, windowMs);
       }
-      // ALL: a retried identical broadcast is the same logical send — it returns the stored row and spends no budget.
+      // ALL: a retried identical broadcast is the same logical send — it returns the stored row.
       const existing = recent();
       if (existing !== null) return this.recordRepeat(existing, windowMs);
-      const now = this.clock();
-      const hourStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours())).toISOString();
-      const row = this.db.query(`SELECT broadcast_count, summary_id FROM msg_group_all_budget
-        WHERE sender = ? AND hour_start = ?`).get(message.from, hourStart) as { broadcast_count: number; summary_id: number | null } | null;
-      if (row && row.broadcast_count >= 2) {
-        if (row.summary_id !== null) {
-          return this.getMessage(row.summary_id)!;
-        }
-        const summary = insert({ from: message.from, to: 'ALL', kind: 'summary',
-          body: 'group:all 시간당 상한(2건)을 초과한 방송은 이 요약 한 건으로 접었습니다.' });
-        this.db.query('UPDATE msg_group_all_budget SET summary_id = ? WHERE sender = ? AND hour_start = ?')
-          .run(summary.id, message.from, hourStart);
-        return summary;
-      }
-      const stored = insert(message);
-      this.db.query(`INSERT INTO msg_group_all_budget(sender, hour_start, broadcast_count, summary_id)
-        VALUES (?, ?, 1, NULL) ON CONFLICT(sender, hour_start)
-        DO UPDATE SET broadcast_count = msg_group_all_budget.broadcast_count + 1`)
-        .run(message.from, hourStart);
-      return stored;
+      // MSG-FILTERS-RELAX: the old 2-per-hour broadcast cap folded the 3rd broadcast into a summary and lost its body.
+      // Every broadcast is stored now; the budget table stays only so older binaries keep opening the ledger.
+      return insert(message);
     });
     if (posted.deduped) {
       try { debug.log('msg', 'msg.post.deduped', { msgId: posted.id, from: posted.from, to: posted.to, windowMs, repeatCount: posted.repeatCount }, { level: 'warn' }); }
@@ -1342,10 +1333,65 @@ export class MsgStore {
     return true;
   }
 
+  /** A batch either acknowledges every requested message or none, without moving the cursor. */
+  ackMessages(recipient: string, ids: readonly number[]): void {
+    if (!ids.length) throw new Error('at least one message ID is required');
+    this.db.transaction(() => { for (const id of ids) this.ackMessage(recipient, id); }).immediate();
+    if (!this.db.inTransaction) this.emitLedgerEvent('ack');
+  }
+
   unreadCount(recipient: string): number {
     const to = canonicalMessageAddress(recipient);
     if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     return unreadCountOn(this.db, to);
+  }
+
+  /**
+   * MSG-RECEIPT-IMPLIES-ACK ② — the seat counter («[미읽음 총 N통]»): unread mail that still needs this seat. Same unread
+   * set as {@link unreadCount} (cursor · per-id ack · expiry), narrowed to ACTIONABLE rows: needsAck, or intent
+   * request · decision · alert; and no terminal receipt (accepted · rejected · done · expired) for this recipient.
+   * Info mail never counts — it is read, not handled.
+   */
+  actionableUnreadCount(recipient: string): number {
+    const to = canonicalMessageAddress(recipient);
+    if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
+    const arms = unreadArmsOn(this.db, to);
+    const intentSql = columnPresent(this.db, 'intent') ? 'm.intent' : 'NULL';
+    const needsAckSql = columnPresent(this.db, 'needs_ack') ? 'm.needs_ack' : 'NULL';
+    // A row without a stored intent reads the legacy kind the same way legacyIntent() does.
+    const actionable = `(COALESCE(${needsAckSql}, 0) = 1 OR COALESCE(${intentSql}, CASE
+        WHEN m.kind IN ('request', 'question', 'ask') THEN 'request' WHEN m.kind = 'decision' THEN 'decision'
+        WHEN m.kind IN ('alert', 'supervisor') THEN 'alert' ELSE 'info' END) IN ('request', 'decision', 'alert'))`;
+    const terminal = hasReceiptTable(this.db)
+      ? `AND NOT EXISTS (SELECT 1 FROM msg_receipts r WHERE r.message_id = m.id AND r.recipient = ?
+          AND r.state IN (${TERMINAL_RECEIPT_STATES.map(state => `'${state}'`).join(', ')}))`
+      : '';
+    return (this.db.query(`SELECT COUNT(*) AS count FROM (${arms.sql}) u JOIN msg_messages m ON m.id = u.id
+      WHERE ${actionable} ${terminal}`).get(...arms.params, ...(terminal ? [to] : [])) as { count: number }).count;
+  }
+
+  /**
+   * MSG-RECEIPT-IMPLIES-ACK ③ — one-shot backfill (`eln msg ack --to <seat> --receipted`): per-id ack every message this
+   * recipient already has a terminal receipt for (done → done, the rest → acked). Idempotent: an existing ack is kept
+   * (never downgraded). Returns the ids newly acked, oldest first.
+   */
+  ackReceipted(recipient: string): number[] {
+    const to = canonicalMessageAddress(recipient);
+    if (to === 'ALL' || to.startsWith('group:')) throw new Error('receipted ack needs one seat');
+    if (!hasReceiptTable(this.db)) return [];
+    const ids = this.db.transaction((): number[] => {
+      const rows = this.db.query(`SELECT r.message_id AS id, MAX(r.state = 'done') AS done FROM msg_receipts r
+        JOIN msg_messages m ON m.id = r.message_id
+        WHERE r.recipient = ? AND r.state IN (${TERMINAL_RECEIPT_STATES.map(state => `'${state}'`).join(', ')})
+          AND NOT EXISTS (SELECT 1 FROM msg_message_acks a WHERE a.message_id = r.message_id AND a.recipient = ?)
+        GROUP BY r.message_id ORDER BY r.message_id ASC`).all(to, to) as Array<{ id: number; done: number }>;
+      const insert = this.db.query(`INSERT INTO msg_message_acks(message_id, recipient, status) VALUES (?, ?, ?)
+        ON CONFLICT(message_id, recipient) DO NOTHING`);
+      for (const row of rows) insert.run(row.id, to, row.done ? 'done' : 'acked');
+      return rows.map(row => row.id);
+    }).immediate();
+    if (ids.length > 0) this.emitLedgerEvent('ack');
+    return ids;
   }
 
   /** Count the same unacknowledged, unexpired recipient set as list(), strictly after an explicit ID. */

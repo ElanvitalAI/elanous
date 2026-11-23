@@ -44,3 +44,27 @@ test('a frame that cannot serialize fails that frame only - it never escapes the
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('pane authentication ack is consumed before the event answer', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-events-auth-'));
+  const path = join(dir, 'host.sock'), seen: string[] = [];
+  const server = createServer(socket => {
+    let pending = '';
+    socket.on('data', chunk => {
+      pending += String(chunk);
+      let end: number;
+      while ((end = pending.indexOf('\n')) >= 0) {
+        const line = pending.slice(0, end); pending = pending.slice(end + 1); seen.push(line);
+        if (seen.length === 1) socket.write('{"exitCode":0,"message":"auth: ok"}\n');
+        else socket.end('{"exitCode":0,"message":"event: accepted"}\n');
+      }
+    });
+  });
+  await new Promise<void>(resolve => server.listen(path, resolve));
+  try {
+    const frame: AgentEventFrame = { op: 'event', v: 1, ws: 'HQ', pane: 'p', sid: 's', seq: 1, at: 1, event: { kind: 'turn', phase: 'start', id: 't' } };
+    expect(await sendFrameOverSocket(path, frame, { paneAuth: { token: 'pane-token', pid: 7 } })).toEqual({ exitCode: 0, message: 'event: accepted' });
+    expect(JSON.parse(seen[0]!)).toEqual({ op: 'auth', token: 'pane-token', pid: 7 });
+    expect(JSON.parse(seen[1]!)).toEqual(frame);
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); rmSync(dir, { recursive: true, force: true }); }
+});

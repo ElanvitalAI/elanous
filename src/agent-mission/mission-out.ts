@@ -35,6 +35,8 @@ export function missionChildEnv(root: string, missionId: string, base: NodeJS.Pr
   for (const key of HAND_CHILD_ENV_KEYS) delete childBase[key];
   return {
     ...childBase,
+    // Each mission is its own seat; never let a child act as its parent seat.
+    ELANOUS_TRACK: `MISSION-${missionId}`,
     ELANOUS_STATE_DIR: storeRoot,
     ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(storeRoot, base),
     ...(line ? { ELANOUS_MISSION_ID: missionId, ELANOUS_ATTEMPT_ID: line.attemptId,

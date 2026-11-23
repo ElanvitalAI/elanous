@@ -1,0 +1,27 @@
+{
+  "id": "sim-world-worker",
+  "name": "SIM-WORLD worker wire-frame device and pack (WORKER-UNIFY)",
+  "audience": "internal",
+  "implementation": [
+    "src/ux-sim/sim-world/worker/device.ts",
+    "src/ux-sim/sim-world/worker/scenarios.ts"
+  ],
+  "tests": [
+    "src/ux-sim/sim-world/worker/device.test.ts"
+  ],
+  "target": "a deterministic external worker device emits v1 wire frames (sid/seq, restart in the same pane) to the production frame reader",
+  "inputs": [
+    "worker scenario rows",
+    "scripted wire frames from device.ts"
+  ],
+  "observations": [
+    "the production v1 frame reader accepts or refuses each frame with a reason",
+    "RED means a missing observation, not a defective consumer"
+  ],
+  "entryCommands": [
+    "eln --test=<isolated-state> sim world run worker --seed 1"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

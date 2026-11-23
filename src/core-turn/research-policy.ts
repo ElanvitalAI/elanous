@@ -180,6 +180,19 @@ export const RESEARCH_TOOL_ALLOWLIST = [
 ] as const;
 
 /**
+ * ELN-RESEARCH-TURN-SEAT-REPLY: a research turn that runs on an eln seat (the turn knows its seat) may also post and
+ * acknowledge seat mail, so a mail turn like «look this up and reply to MK» can reply. Non-seat research turns (human
+ * chat · PWA) keep the plain allowlist above — these two tools are never implicit there.
+ */
+export const RESEARCH_SEAT_MAIL_TOOLS = ['MsgPost', 'MsgAck'] as const;
+const SEAT_MAIL_TOOL_NAMES: ReadonlySet<string> = new Set(RESEARCH_SEAT_MAIL_TOOLS);
+
+/** True only for a seat's research turn and only for MsgPost/MsgAck. */
+export function isResearchSeatMailTool(name: string, seat: string | null | undefined): boolean {
+  return Boolean(seat) && SEAT_MAIL_TOOL_NAMES.has(name);
+}
+
+/**
  * MOB-1 FINANCE-FIRST (OP #110867): read-only market-data capability tools a research turn may call. Before this the
  * research allowlist was web-only, so a configured finance pack (finance_quote EODHD/Toss · finance_kr_flow KIS/KRX 수급 ·
  * MarketQuote · KrFlowSnapshot) was filtered out of every research/webchat turn and numbers came from web search alone.

@@ -20,6 +20,8 @@ export interface SavingsCallRow {
   readonly model: string;
   readonly provider?: string;
   readonly billing?: string;
+  /** 원장 런 키(data.runId) — 과제/런 키 대차 증거의 그룹 키(judb-39664). 원장 밖 행은 undefined. */
+  readonly runKey?: string;
   /** 원장의 호출 등급 칸(workTier: weak/mid/strong). 없어도 영수는 나온다. */
   readonly tier?: string;
   readonly inputTokens?: number;
@@ -58,6 +60,8 @@ export interface SavingsDayRow {
 export interface SavingsReceipt {
   readonly totalCalls: number;
   readonly premiumCalls: number;
+  /** Present for explicit multi-model classification so the denominator is auditable. */
+  readonly premiumModels?: readonly string[];
   readonly rows: readonly SavingsReceiptRow[];
   /** 1 − 실측값/강단독값. 매긴 호출이 없거나 분모가 0 이하면 null. */
   readonly savingsPct: number | null;
@@ -70,6 +74,8 @@ export interface SummarizeSavingsInput {
   readonly calls: readonly SavingsCallRow[];
   /** «강 단독» 기준 모델 — 이 모델 단가로 전 호출을 다시 계산한 값이 비교 기준. */
   readonly premiumModel: string;
+  /** Additional exact model IDs counted as premium; the counterfactual price still uses premiumModel. */
+  readonly premiumModels?: readonly string[];
   readonly priceOf: SavingsPriceOf;
   /** 고급 등급 칸 집합(원장 workTier 어휘). 기본 {strong}. */
   readonly premiumTiers?: ReadonlySet<string>;
@@ -86,9 +92,10 @@ export function summarizeRouterSavings(input: SummarizeSavingsInput): SavingsRec
   let counterfactual = 0;
   let priced = 0;
   let unpriced = 0;
+  const premiumModels = new Set([input.premiumModel, ...(input.premiumModels ?? [])]);
   for (const call of input.calls) {
     const tier = call.tier ?? null;
-    const premium = (tier !== null && premiumTiers.has(tier)) || call.model === input.premiumModel;
+    const premium = (tier !== null && premiumTiers.has(tier)) || premiumModels.has(call.model);
     if (premium) premiumCalls += 1;
     rows.push({ at: call.at, role: call.role ?? '(없음)', phase: call.phase ?? null, model: call.model, tier, premium });
     const actualUsd = call.costUsd ?? call.apiEquivalentUsd ?? null;
@@ -105,7 +112,7 @@ export function summarizeRouterSavings(input: SummarizeSavingsInput): SavingsRec
     priced += 1;
   }
   const savingsPct = priced === 0 || counterfactual <= 0 ? null : 1 - actual / counterfactual;
-  return { totalCalls: input.calls.length, premiumCalls, rows, savingsPct, unpricedCalls: unpriced };
+  return { totalCalls: input.calls.length, premiumCalls, ...(input.premiumModels ? { premiumModels: [...premiumModels] } : {}), rows, savingsPct, unpricedCalls: unpriced };
 }
 
 export interface RenderSavingsReceiptOpts {
@@ -126,6 +133,7 @@ export function renderSavingsReceiptMd(receipt: SavingsReceipt, opts: RenderSavi
     ``,
     `- 기준 시각: ${opts.at}`,
     ...(opts.premiumModel ? [`- 강 단독 기준 모델: ${opts.premiumModel}`] : []),
+    ...(receipt.premiumModels ? [`- 고급 호출 모델 집합: ${receipt.premiumModels.join(', ')}`] : []),
     `- 고급 호출 수/전체: ${receipt.premiumCalls}/${receipt.totalCalls}`,
     `- 강 단독 대비 절감: ${savings} (매긴 호출 ${receipt.totalCalls - receipt.unpricedCalls}건 기준 · 단가는 비공개 내부 계산)`,
     `- 단가 미측정 호출: ${receipt.unpricedCalls}건 (합성 미기입)`,

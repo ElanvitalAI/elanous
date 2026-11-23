@@ -164,14 +164,15 @@ describe('syncTestConfig — 파일 물질화 + 부속 복사', () => {
     const { dir, src, testDir } = setup();
     const r = syncTestConfig(testDir, src);
     const saved = JSON.parse(readFileSync(r.testConfigPath, 'utf-8')) as Record<string, any>;
-    expect(saved.telegram.botToken).toBe('8724930076:TEST');
-    expect(saved.telegram.testChannel.botToken).toBeUndefined();
+    expect(saved.telegram.botToken).toBeUndefined();
+    expect(saved.telegram.testChannel).toBeUndefined();
     expect(saved.discord.botToken).toBeUndefined();
     expect(saved._testSecretsStripped).toBe(1);
     expect(r.testSecretsStripped).toBe(1);
     expect(typeof saved._testSyncedAt).toBe('string');
-    expect(r.copied).toEqual(['secrets.json']); // 존재하는 허용 파일만
-    expect(r.telegramMode).toBe('test-token');
+    expect(r.copied).toEqual([]);
+    expect(r.telegramMode).toBe('disabled');
+    expect(() => readFileSync(join(testDir, 'secrets.json'))).toThrow();
     // 제외 파일은 test dir 에 절대 없음
     expect(() => readFileSync(join(testDir, 'apns.p8'))).toThrow();
     expect(() => readFileSync(join(testDir, 'autopilot.json'))).toThrow();
@@ -220,42 +221,16 @@ describe('syncTestConfig — 파일 물질화 + 부속 복사', () => {
     }
   });
 
-  // 🆕 2026-09-24 — 읽기 전용(0444) 대상이 같은 바이트면 건너뛰고, 목록 뒤 파일(auth.json)까지 복사가 이어진다.
-  it('an identical read-only destination is skipped and the files after it are still copied', () => {
-    const { dir, src, testDir } = setup();
-    writeFileSync(join(src, 'llm-fallback.json'), '{"same":true}');
-    writeFileSync(join(src, 'auth.json'), '{"a":1}');
-    mkdirSync(testDir, { recursive: true });
-    writeFileSync(join(testDir, 'llm-fallback.json'), '{"same":true}');
-    chmodSync(join(testDir, 'llm-fallback.json'), 0o444);
-    const r = syncTestConfig(testDir, src);
-    expect(r.skippedIdentical).toEqual(['llm-fallback.json']);
-    expect(r.copied).toContain('auth.json');
-    expect(readFileSync(join(testDir, 'auth.json'), 'utf-8')).toBe('{"a":1}');
-    chmodSync(join(testDir, 'llm-fallback.json'), 0o644);
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it('0444 source creates 0600 ancillary copy, identical sync stays 0600, widened copy is repaired', () => {
+  it('does not copy credential-bearing auxiliary files and leaves preexisting test files alone', () => {
     const { dir, src, testDir } = setup();
     try {
-      const source = join(src, 'llm-fallback.json');
-      const dest = join(testDir, 'llm-fallback.json');
-      writeFileSync(source, '{"apiKey":"PRIVATE"}');
-      chmodSync(source, 0o444);
-      const permission = () => lstatSync(dest).mode & 0o777;
-      expect(syncTestConfig(testDir, src).copied).toContain('llm-fallback.json');
-      expect(permission()).toBe(0o600);
-      expect(syncTestConfig(testDir, src).skippedIdentical).toContain('llm-fallback.json');
-      expect(permission()).toBe(0o600);
-      chmodSync(dest, 0o644);
-      expect(syncTestConfig(testDir, src).skippedIdentical).toContain('llm-fallback.json');
-      expect(permission()).toBe(0o600);
-      expect(lstatSync(source).mode & 0o777).toBe(0o444);
-      const secret = join(testDir, 'secrets.json');
-      chmodSync(secret, 0o644);
-      expect(syncTestConfig(testDir, src).skippedIdentical).toContain('secrets.json');
-      expect(lstatSync(secret).mode & 0o777).toBe(0o600);
+      writeFileSync(join(src, 'auth.json'), '{"token":"production"}');
+      writeFileSync(join(src, 'llm-fallback.json'), '{"apiKey":"production"}');
+      mkdirSync(testDir, { recursive: true });
+      writeFileSync(join(testDir, 'auth.json'), '{"token":"test-only"}');
+      syncTestConfig(testDir, src);
+      expect(readFileSync(join(testDir, 'auth.json'), 'utf8')).toBe('{"token":"test-only"}');
+      expect(() => readFileSync(join(testDir, 'llm-fallback.json'))).toThrow();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -306,26 +281,13 @@ describe('채널 탭 봇 토큰 — 격리 우주에 운영 봇이 가지 않는
     expect(resolveChannelBotToken('telegram', out as never)?.token).toBe('8724930076:TEST');
   });
 
-  it('secrets.json 사본은 채널 탭 봇 토큰과 VAPID 를 빼고 나머지는 남긴다', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'elanous-cfgsync-tabs-'));
-    const src = join(dir, 'prod');
-    const testDir = join(dir, 'repo', '.elanous-test');
-    mkdirSync(src, { recursive: true });
-    writeFileSync(join(src, 'config.json'), JSON.stringify(RAW_WITH_TABS));
-    writeFileSync(join(src, 'secrets.json'), JSON.stringify({ version: 1, secrets: {
-      telegram_1__tokenRef: 'PROD-BOT', discord_1__tokenRef: 'PROD-DISCORD',
-      'pwa-push-vapid-public': 'PUB', 'pwa-push-vapid-private': 'PRIV', other: 'KEEP', llmKey: 'KEEP2',
-    } }));
-    try {
-      const r = syncTestConfig(testDir, src);
-      const copy = JSON.parse(readFileSync(join(testDir, 'secrets.json'), 'utf-8')) as { version: number; secrets: Record<string, string> };
-      expect(Object.keys(copy.secrets).sort()).toEqual(['llmKey', 'other']);
-      expect(copy.version).toBe(1);
-      expect(JSON.stringify(copy)).not.toContain('PROD-BOT');
-      expect(r.copied).toEqual(['secrets.json(아웃바운드 자격 4개 뺌)']);
-      // 두 번째 판은 같은 내용이라 건너뛴다(멱등)
-      expect(syncTestConfig(testDir, src).skippedIdentical).toContain('secrets.json');
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+  it('never copies the production secret store', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-sync-no-store-'));
+    const src = join(dir, 'source'); const dest = join(dir, 'test');
+    mkdirSync(src); writeFileSync(join(src, 'config.json'), '{}');
+    writeFileSync(join(src, 'secrets.json'), '{"secrets":{"key":"production"}}');
+    try { syncTestConfig(dest, src); expect(() => readFileSync(join(dest, 'secrets.json'))).toThrow(); }
+    finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('testSyncExcludedSecretIds — 탭이 참조하는 id 는 이름 규칙 밖이어도 뺀다', () => {
@@ -333,23 +295,7 @@ describe('채널 탭 봇 토큰 — 격리 우주에 운영 봇이 가지 않는
     expect(testSyncExcludedSecretIds(raw, ['custom-bot', 'llm'])).toEqual(['custom-bot']);
   });
 
-  it('test sync excludes the Nexus app auth signing key while keeping LLM secrets', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'elanous-cfgsync-app-auth-'));
-    const src = join(dir, 'operating');
-    const testDir = join(dir, 'test');
-    mkdirSync(src, { recursive: true });
-    writeFileSync(join(src, 'config.json'), '{}');
-    writeFileSync(join(src, 'secrets.json'), JSON.stringify({ version: 1, secrets: {
-      'nexus.app-auth-signing-key': 'fake-operating-signing-key-with-256-bits',
-      llmKey: 'fake-llm-key',
-    } }));
-    try {
-      syncTestConfig(testDir, src);
-      const copied = JSON.parse(readFileSync(join(testDir, 'secrets.json'), 'utf8')) as { secrets: Record<string, string> };
-      expect(copied.secrets['nexus.app-auth-signing-key']).toBeUndefined();
-      expect(copied.secrets.llmKey).toBe('fake-llm-key');
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
+
 });
 
 describe('overlay(buildTestSafeDaemonConfig) 파리티 — 정책 원전과 결과 동일', () => {

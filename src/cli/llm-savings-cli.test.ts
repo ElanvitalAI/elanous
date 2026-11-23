@@ -26,6 +26,11 @@ function capture(): { lines: string[]; out: (l: string) => void } {
 }
 
 describe('runLlmSavings', () => {
+  test('multiple explicitly selected premium models apply to both overall and daily call shares', async () => {
+    const { out } = capture();
+    const result = await runLlmSavings({ premiumModel: PREMIUM_MODEL, premiumModels: ['cheap-model'], daily: true, json: true }, { rows: calls, priceOf, out });
+    expect(result.json).toMatchObject({ totalCalls: 4, premiumCalls: 3, premiumModels: ['strong-model', 'cheap-model'], daily: [{ totalCalls: 4, premiumCalls: 3, premiumShare: 0.75 }] });
+  });
   test('md 영수 — 고급 1/4 · 절감 · 가격 비공개', async () => {
     const { lines, out } = capture();
     const r = await runLlmSavings({ premiumModel: PREMIUM_MODEL }, { rows: calls, priceOf, out });

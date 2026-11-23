@@ -107,14 +107,16 @@ describe('createSeatMailAdapter — failed turns back off per path (D10 · L7)',
     expect(mail.owner(100)).toBe('done');
   });
 
-  test('cancelled and stopped are not failures: mail is due at once, no attempt counted, the circuit stays shut', () => {
+  test('cancelled and stopped are not failures: mail is due at once and the circuit stays shut, but only one re-injection (SEAT-MAIL-COALESCE-NOTICE)', () => {
     const { mail } = fixture();
     mail.claim('notice', [41]);
     expect(mail.settle('notice', [41], 'cancelled')).toEqual({ seen: [], retry: [41], gaveUp: [], retryAt: 1_000_000 });
-    expect(mail.settle('notice', [41], 'stopped').retry).toEqual([41]);
-    expect(mail.settle('notice', [41], 'cancelled').retry).toEqual([41]);
     expect(mail.circuitOpen('notice')).toBe(false);
     expect(mail.due('notice')).toEqual([41]);
+    expect(mail.settle('notice', [41], 'stopped')).toEqual({ seen: [], retry: [], gaveUp: [41], retryAt: 1_000_000 });
+    expect(mail.owner(41)).toBe('done');
+    expect(mail.circuitOpen('notice')).toBe(false);
+    expect(mail.due('notice')).toEqual([]);
   });
 
   test('an answered turn closes the circuit and resets the back-off', () => {

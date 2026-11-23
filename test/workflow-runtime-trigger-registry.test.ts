@@ -200,6 +200,37 @@ describe('startScheduler', () => {
     expect(firedFor).toBe('demo');
     handle.stop();
   });
+
+  it('keys one cron minute and one interval window even when the callback clock drifts by milliseconds', () => {
+    const fires: Array<{ nodeId: string; scheduledAt: number }> = [];
+    let cronCb: (() => void) | null = null;
+    let intervalCb: (() => void) | null = null;
+    let clock = Date.parse('2026-11-17T15:00:00.250Z');
+    const handle = startScheduler({
+      registry: [
+        { workflowName: 'graph:tick-test', nodeId: 'schedule:0', trigger: { type: 'cron', cron: '0 15 * * *' } },
+        { workflowName: 'graph:tick-test', nodeId: 'schedule:1', trigger: { type: 'interval', interval: 60_000 } },
+      ],
+      now: () => clock,
+      runWorkflow: (entry, fire) => { fires.push({ nodeId: entry.nodeId, scheduledAt: fire.scheduledAt }); },
+      cronSchedule: (_expr: string, cb: () => void, _timeZone: string) => { cronCb = cb; return { stop: () => {} }; },
+      setInterval: ((cb: () => void) => { intervalCb = cb; return 1 as unknown as ReturnType<typeof globalThis.setInterval>; }) as never,
+      clearInterval: (() => {}) as never,
+    });
+    cronCb!();
+    clock = Date.parse('2026-11-17T15:00:00.900Z');
+    cronCb!();
+    intervalCb!();
+    clock = Date.parse('2026-11-17T15:00:59.999Z');
+    intervalCb!();
+    expect(fires).toEqual([
+      { nodeId: 'schedule:0', scheduledAt: Date.parse('2026-11-17T15:00:00.000Z') },
+      { nodeId: 'schedule:0', scheduledAt: Date.parse('2026-11-17T15:00:00.000Z') },
+      { nodeId: 'schedule:1', scheduledAt: Date.parse('2026-11-17T15:00:00.000Z') },
+      { nodeId: 'schedule:1', scheduledAt: Date.parse('2026-11-17T15:00:00.000Z') },
+    ]);
+    handle.stop();
+  });
 });
 
 describe('checkAuth (pure)', () => {

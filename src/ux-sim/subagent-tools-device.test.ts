@@ -19,7 +19,7 @@ test('dispatch observation counts truncated arrays and rejects malformed summari
   expect(observedArrayCount(['Read', { _more: 1, extra: true }])).toBe(-1);
 });
 
-describe('N03 subagent-tools 장치 (이 트리 classic TUI · fake LLM)', () => {
+describe('N03 subagent-tools 장치 (이 트리 next TUI · fake LLM)', () => {
   test('mismatch: 모르는 이름뿐인 allow 는 무시되고 자식이 도구를 물려받는다', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'n03-subtools-'));
     try {

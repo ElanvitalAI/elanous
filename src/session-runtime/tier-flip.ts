@@ -192,7 +192,11 @@ function splitDeferredToolSpecsInternal(
       seen.add(name);
       continue;
     }
-    if (entry && isDeferred(entry)) {
+    if (spec.coordinatorDefer && entry?.toolSearchable !== false) {
+      const name = entry?.displayName ?? spec.name;
+      if (!seen.has(name)) deferred.push({ name, summary: entry?.promptSummary ?? synthesiseFallbackSummary(spec) });
+      seen.add(name);
+    } else if (entry && isDeferred(entry)) {
       // P3 — turn intent 가 이 툴의 스코프를 활성화했으면 defer 하지 않고
       // active 로 선주입(왕복 0). 매칭 안 되면 deferred 유지(P4 폴백).
       if (entry.warmPreload !== false && entry.intentScope && warmPreloadScopes.has(entry.intentScope)) {

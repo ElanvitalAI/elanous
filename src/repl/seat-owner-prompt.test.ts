@@ -17,7 +17,6 @@ test('일반 자리 턴마다 조사 전 구조화 참조·주인 확인과 unkn
     const prompt = buildReplSystemPrompt({ ...context, sessionId });
     expect(prompt).toContain('## 조사 전 주인 확인');
     expect(prompt).toContain('구조화된 칸·PR·우편 참조와 최신 주인 정본');
-    expect(prompt).toContain('추측하지 말고 unknown');
     expect(prompt).toContain('중복 조사를 시작하지 마라');
   }
 });
@@ -44,4 +43,15 @@ test('실제 턴 프롬프트에 구조화 참조의 현재 조회 결과를 싣
   expect(buildReplSystemPrompt({ ...context, workReferences: undefined })).toContain('[주인 조회 결과] unknown');
   expect(buildReplSystemPrompt({ ...context, workReferences: [{ kind: 'cell', id: 'CELL-X' }] })).toContain('[주인 조회 결과] unknown');
   expect(buildReplSystemPrompt({ ...context, workReferences: [{ kind: 'cell', id: 'CELL-X', version: '0.3.30' }, { kind: 'cell', id: 'CELL-X', version: '0.3.31' }] })).toContain('[주인 조회 결과] unknown');
+});
+
+test('참조가 없으면 사람을 부르지 않고 내 노랑 칸·미읽음 우편에서 스스로 고르게 한다', () => {
+  const prompt = buildReplSystemPrompt({ cfg, enabledToolNames: undefined, cwd: '/workspace/seats/TC-1', seatBootDeps, sessionId: 'no-ref' }) ?? '';
+  expect(prompt).toContain('멈추거나 사람을 부르지 말고 내 일을 직접 찾는다');
+  expect(prompt).toContain('eln release checklist status --version <현재 판> --owner TC-1 --json');
+  expect(prompt).toContain('eln msg list --to TC-1');
+  expect(prompt).toContain('맨 위 일로 바로 진행하라');
+  expect(prompt).toContain('[주인 조회 결과] unknown — 확인된 다른 주인 없음 · 막힘 아님.');
+  expect(prompt).not.toContain('요청하라');
+  expect(prompt).not.toContain('주인 확인 필요');
 });

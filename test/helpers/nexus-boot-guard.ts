@@ -12,6 +12,7 @@
 //      끝까지 기다려 잠금을 놓는다. 시간초과로 끝난 시험이 남긴 부팅도 «자기 폴더 안에서» 끝난다.
 
 import type { RunNexusOptions } from '../../src/nexus/index.js';
+import { stopEventLoopWatchdog } from '../../src/debug/event-loop-watchdog.js';
 
 type RunNexus = typeof import('../../src/nexus/index.js').runNexus;
 type Handle = NonNullable<Awaited<ReturnType<RunNexus>>>;
@@ -55,4 +56,7 @@ export async function drainNexusBoots(): Promise<void> {
   await Promise.all(boots.map(async (boot) => {
     try { (await boot)?.release(); } catch { /* 시험 쪽에서 이미 드러났다 */ }
   }));
+  // runNexus 는 프로세스 전역 이벤트루프 워치독(interval + worker)을 켜고 release 는 끄지 않는다(데몬은 곧 종료).
+  // 시험 프로세스에선 같은 샤드의 뒤 파일까지 살아남는다(event-loop-watchdog.test.ts 가 «켜져 있음»을 본다).
+  stopEventLoopWatchdog();
 }

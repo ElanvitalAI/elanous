@@ -59,6 +59,33 @@ export function isVerifyProbeEnabled(): boolean {
   return verifyProbeEnabled;
 }
 
+// ── ★ ELN-COMPACT-REAL(OP #135458 §4-4③) — no-op force backoff ──
+//
+// A turn-start force that ended in no-op (nothing could be compacted) buys nothing by repeating
+// on the next turn: the compactor holds off re-forcing until the stored record has grown +25%
+// past the level it measured at the last no-op.
+
+/** sessionId → record tokens measured at the last no-op force. */
+const noOpBackoff = new Map<string, number>();
+/** §4-4③ 배율 — 재force 보류가 풀리는 기록 성장률. */
+const NO_OP_BACKOFF_GROWTH = 1.25; // 출처: #135458
+
+/** Record (or refresh) the hold level after a no-op force for this session. */
+export function recordNoOpBackoff(sessionId: string, historyUsedTokens: number): void {
+  noOpBackoff.set(sessionId, historyUsedTokens);
+}
+
+/** Clear the hold after a compaction actually fired for this session. */
+export function clearNoOpBackoff(sessionId: string): void {
+  noOpBackoff.delete(sessionId);
+}
+
+/** §4-4③ — true while the record is still within +25% of the last no-op level (re-force withheld). */
+export function noOpBackoffHeld(sessionId: string, historyUsedTokens: number): boolean {
+  const held = noOpBackoff.get(sessionId);
+  return typeof held === 'number' && historyUsedTokens < held * NO_OP_BACKOFF_GROWTH;
+}
+
 /** Test-only — also re-exported through `index.ts` for production
  *  callers that need to clear state between runs (multi-session
  *  CLI). */
@@ -67,4 +94,5 @@ export function resetAutoCompactStateForTest(): void {
   breakerTripped = false;
   breakerReason = '';
   verifyProbeEnabled = false;
+  noOpBackoff.clear();
 }

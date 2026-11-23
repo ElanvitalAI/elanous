@@ -51,6 +51,7 @@ export function makeLocalLlm(opts: LocalLlmOpts = {}): LocalLlm {
     if (opts.model) return opts.model;
     const cached = modelCache.get(base);
     if (cached) return cached;
+    // llm-ledger-exempt: model-listing
     const r = await fetch(`${base}/v1/models`);
     const j = await r.json() as { data?: Array<{ id: string }> };
     const picked = pickModel((j.data ?? []).map(m => m.id)) ?? 'default';
@@ -103,6 +104,7 @@ export async function localLlmAvailable(endpoints: string[] = defaultEndpoints()
     try {
       const ctrl = new AbortController();
       const to = setTimeout(() => ctrl.abort(), 4000);
+      // llm-ledger-exempt: model-listing
       const r = await fetch(`${e}/v1/models`, { signal: ctrl.signal });
       clearTimeout(to);
       return r.ok ? e : null;

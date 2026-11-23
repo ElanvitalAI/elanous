@@ -1,6 +1,6 @@
 # Memory sim world pack (SIM-WORLD-MEMORY · S0) — kernel pack schema 1 (seat-state/TC/SIM-KERNEL-API.md §1).
 # The kernel owns this file's existence and `eln sim world run memory`; the rows below belong to S0.
-# Expectations live in src/ux-sim/worlds/sim-world-expect.json (memory/M01 … memory/M12 and memory/M25: green except M09 and M10, which are xfail).
+# Expectations live in src/ux-sim/worlds/expect/memory.json (memory/M01 … memory/M12 and memory/M25: green except M09 and M10, which are xfail).
 schema: 1
 world: memory
 scenarios:

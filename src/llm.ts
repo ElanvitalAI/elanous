@@ -12,7 +12,7 @@ import { StreamNoProgressError, isTurnProgressEvent, resolveTurnNoProgressMs, ty
 import { wellFormedLLMMessages } from './llm-wellformed.js';
 import { truncateOutput } from './output-truncation.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { isTestUniverseFakeProviderName, testFakeLlmDefaultSelected, testFakeLlmEnabled, testFakeLlmProvider } from './ux-sim/fake-llm.js';
+import { isTestUniverseFakeProviderName, testFakeLlmDefaultSelected, testFakeLlmFencesInjectedProvider, testFakeLlmEnabled, testFakeLlmProvider } from './ux-sim/fake-llm.js';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { globalAnchorPath } from './prompt-library/universal-preamble.js';
@@ -5105,10 +5105,7 @@ async function streamLLMCore(
   // owns this turn. Explicit fake and sim-world switches still forbid using it.
   // Same contract as streamLLMWithTools (#36949) — preferExplicitProvider stays
   // the session-turn pin and is not required for a direct fixture injection.
-  const forcedFake = process.env.ELANOUS_LLM_MODE === 'fake'
-    || process.env.ELANOUS_TEST_FAKE_LLM === '1'
-    || Boolean(process.env.ELANOUS_UX_SIM_RUN_ID?.trim())
-    || process.env.ELANOUS_SIM_UNIVERSE === '1';
+  const forcedFake = testFakeLlmFencesInjectedProvider();
   const fakeDefault = testFakeLlmDefaultSelected()
     && (!(opts.provider ?? opts.initialProvider) || forcedFake);
   // Explicit fake/sim selection fences every injection path, including the
@@ -8736,6 +8733,7 @@ export async function streamLLMWithTools(
     skipProviders?: readonly string[];
   } = {},
 ): Promise<string> {
+  const coordinatorSeat = messages.some(message => message.role === 'system' && typeof message.content === 'string' && message.content.includes('## 조율자 프로필 (이 자리 = 조율 자리)'));
   // Fixed providers keep the original synchronous launch path. Load the circuit before
   // selection only when it can change this turn's initial provider.
   const circuit = !opts.provider && !opts.initialProvider && !testFakeLlmDefaultSelected()
@@ -8743,10 +8741,7 @@ export async function streamLLMWithTools(
     : undefined;
   // NODE_ENV=test chooses a fake default, but an injected fixture provider
   // owns this turn. Explicit fake and sim-world switches still forbid using it.
-  const forcedFake = process.env.ELANOUS_LLM_MODE === 'fake'
-    || process.env.ELANOUS_TEST_FAKE_LLM === '1'
-    || Boolean(process.env.ELANOUS_UX_SIM_RUN_ID?.trim())
-    || process.env.ELANOUS_SIM_UNIVERSE === '1';
+  const forcedFake = testFakeLlmFencesInjectedProvider();
   const fakeDefault = testFakeLlmDefaultSelected()
     && (!(opts.provider ?? opts.initialProvider) || forcedFake);
   const provider = fakeDefault ? testFakeLlmProvider : opts.provider ?? opts.initialProvider ?? await resolveDefaultProviderAsync(opts.model);
@@ -12111,9 +12106,11 @@ export async function streamLLMWithTools(
         const { result, isError } = dispatchedResults[dispatchIndex]!;
         const toolResultInlineLimitBytes = opts.toolResultInlineLimitBytes === undefined
           ? undefined
-          : activeProvider.name === 'openai-codex'
-            ? Math.min(opts.toolResultInlineLimitBytes, 10 * 1024)
-            : opts.toolResultInlineLimitBytes;
+          : coordinatorSeat
+            ? Math.min(opts.toolResultInlineLimitBytes, 8 * 1024)
+            : activeProvider.name === 'openai-codex'
+              ? Math.min(opts.toolResultInlineLimitBytes, 10 * 1024)
+              : opts.toolResultInlineLimitBytes;
         const imageBearing = maybeImageBearingResult(result);
         if (imageBearing) {
           // Image-bearing tool result (Phase 1, 2026-05-05) — see

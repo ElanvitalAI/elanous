@@ -19,6 +19,7 @@ export interface ScheduleSourceOpts {
   setInterval?: SchedulerOpts['setInterval'];
   clearInterval?: SchedulerOpts['clearInterval'];
   cronSchedule?: SchedulerOpts['cronSchedule'];
+  now?: SchedulerOpts['now'];
 }
 
 export interface ScheduleSource extends TriggerSource {
@@ -28,8 +29,10 @@ export interface ScheduleSource extends TriggerSource {
   handle(): SchedulerHandle | null;
   /** Subscription snapshot for `daemon.status()`. */
   subscriptions(): TriggerSubscription[];
-  /** Subscribe a graph YAML's schedule declarations to the same scheduler. */
-  subscribeGraph(file: string, onFire: () => void | Promise<void>): void;
+  /** Subscribe a graph YAML's schedule declarations to the same scheduler.
+   *  `fire.scheduledAt` is the occurrence boundary (cron minute, or the
+   *  interval window), not the raw callback clock. */
+  subscribeGraph(file: string, onFire: (fire: { nodeId: string; scheduledAt: number }) => void | Promise<void>): void;
 }
 
 interface Binding {
@@ -42,7 +45,7 @@ interface Binding {
 interface GraphBinding {
   file: string;
   scheduleEntry: ScheduleEntry;
-  onFire: () => void | Promise<void>;
+  onFire: (fire: { nodeId: string; scheduledAt: number }) => void | Promise<void>;
 }
 
 export function createScheduleSource(opts: ScheduleSourceOpts = {}): ScheduleSource {
@@ -90,10 +93,12 @@ export function createScheduleSource(opts: ScheduleSourceOpts = {}): ScheduleSou
       started = true;
       handle = startScheduler({
         registry: [...bindings.map(b => b.scheduleEntry), ...graphBindings.map(b => b.scheduleEntry)],
-        runWorkflow: async (scheduleEntry) => {
-          const graphBinding = graphBindings.find(b => b.scheduleEntry === scheduleEntry);
+        runWorkflow: async (scheduleEntry, fire) => {
+          const graphBinding = graphBindings.find(b =>
+            b.scheduleEntry.workflowName === scheduleEntry.workflowName
+            && b.scheduleEntry.nodeId === scheduleEntry.nodeId);
           if (graphBinding) {
-            await graphBinding.onFire();
+            await graphBinding.onFire({ nodeId: scheduleEntry.nodeId, scheduledAt: fire.scheduledAt });
             return;
           }
           const binding = bindings.find(b =>
@@ -109,6 +114,7 @@ export function createScheduleSource(opts: ScheduleSourceOpts = {}): ScheduleSou
         setInterval: opts.setInterval,
         clearInterval: opts.clearInterval,
         cronSchedule: opts.cronSchedule,
+        now: opts.now,
       });
     },
     async stop() {

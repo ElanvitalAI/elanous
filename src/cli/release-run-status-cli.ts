@@ -1,4 +1,4 @@
-import { RELEASE_CUT_NODE_IDS } from '../../scripts/release-loop/release-node-ids.js';
+import { RELEASE_INITIAL_NODE_IDS } from '../../scripts/release-loop/release-node-ids.js';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Command } from 'commander';
@@ -13,7 +13,10 @@ const object = (value: unknown): Row => value && typeof value === 'object' && !A
 const json = (text: string): Row | null => { try { return object(JSON.parse(text)); } catch { return null; } };
 function selectReleaseRun(version: string, runs: readonly Row[]): Row | undefined {
   const matchingRuns = runs.filter((r) => object(r.input).version === version);
-  const fullRuns = matchingRuns.filter((r) => Array.isArray(r.nodes) && r.nodes.some((n) => RELEASE_CUT_NODE_IDS.includes(String(object(n).nodeId))));
+  const fullRuns = matchingRuns.filter((r) => Array.isArray(r.nodes) && (
+    r.nodes.some((n) => RELEASE_INITIAL_NODE_IDS.includes(String(object(n).nodeId))) ||
+    (r.nodes.length === 0 && (!object(r.currentNode).nodeId || RELEASE_INITIAL_NODE_IDS.includes(String(object(r.currentNode).nodeId))))
+  ));
   return [...fullRuns].sort((a, b) => {
     const aStarted = Date.parse(String(a.startedAt ?? ''));
     const bStarted = Date.parse(String(b.startedAt ?? ''));
@@ -45,7 +48,7 @@ function etaSummary(run: Row | undefined, outputs: readonly Row[], now: number):
 export function renderReleaseRunStatus(version: string, runs: readonly Row[], progress: readonly Row[], checklist: { green: number | null; yellow: number | null; red: number | null; done: number | null; evidence?: string; complete?: boolean; certificateMeasuredAt?: number | null }, now = Date.now()): string {
   const run = selectReleaseRun(version, runs);
   const nodes = Array.isArray(run?.nodes) ? run.nodes.map(object) : [];
-  const active = nodes.find((n) => !n.endedAt && n.startedAt) ?? nodes.find((n) => !n.endedAt);
+  const active = nodes.find((n) => !n.endedAt && n.startedAt) ?? nodes.find((n) => !n.endedAt) ?? (object(run?.currentNode).nodeId ? object(run?.currentNode) : undefined);
   const nodeStarts = nodes.map((n) => Date.parse(String(n.startedAt ?? ''))).filter(Number.isFinite);
   const nodeEnds = nodes.map((n) => Date.parse(String(n.endedAt ?? ''))).filter(Number.isFinite);
   const runStart = Date.parse(String(run?.startedAt ?? ''));

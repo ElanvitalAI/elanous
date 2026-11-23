@@ -100,15 +100,16 @@ for (const placement of ['before', 'after'] as const) test(`Next PTY completes a
       args: [join(repo, 'bin', 'elanous.mjs'), '--test={root}', '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', 'next'],
       root, cols: 120, rows: 36,
       env: { ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1' },
-      ready: { label: 'boot', until: screen => screen.includes('Enter 전송 · Esc 취소 · Ctrl+Q 종료') },
+      ready: { label: 'boot', until: screen => screen.includes('Enter send · Esc cancel · Ctrl+Q quit') },
       steps: [{
         label: 'grounded goal dry run', text: placement === 'before'
           ? `/harness ask --dry-run "${goal}"` : `/harness ask "${goal}" --dry-run`,
-        until: screen => screen.includes('턴 완료') && screen.includes('ask 마커 — 경고 없음') && screen.includes('[dry-run] 입력:'),
+        until: screen => screen.includes('Harness command done') && screen.includes('ask 마커 — 경고 없음') && screen.includes('[dry-run] 입력:'),
       }],
     });
     const screen = run.frames.at(-1)?.screen ?? '';
-    expect(screen).toContain('턴 완료');
+    // 11-23 next TUI footer for a harness-command turn: «Turn Harness command done · …».
+    expect(screen).toContain('Harness command done');
     expect(screen).toContain('ask 마커 — 경고 없음');
     expect(run.exitCode).toBe(0);
     expect(run.entrySha256).toHaveLength(64);

@@ -3,7 +3,6 @@ import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { mockSeatPtySequence } from './mock-seat-pty-sequence.js';
-import { NEXT_TUI_TITLE } from '../tui/core/render.js';
 
 test('actual default Next CLI supplies its config-root member session to Scene 6 board receipt', async () => {
   const root = mkdtempSync(join(tmpdir(), 'next-scene6-cli-board-'));
@@ -50,12 +49,15 @@ test('actual default Next CLI supplies its config-root member session to Scene 6
         ELANOUS_TEST_FAKE_LLM_TOOL_CALL: JSON.stringify({ when: 'SCENE6-CLI', name: 'ToolSearch',
           args: { query: 'route:제안 적용해줘' }, after: { name: 'suggest_accept', args: { suggestionId: cardId } } }),
         ELANOUS_CONFIG_DIR: root, ELANOUS_STATE_DIR: root },
-      ready: { label: 'boot', until: screen => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: screen => screen.split('\n').includes('elanous') && screen.includes('Ctrl+Q quit') },
       steps: [
         { label: 'approval', text: 'SCENE6-CLI 제안 적용해줘',
-          until: screen => screen.includes('플러그인 그래프 승인 · 요청 내용') && screen.includes('이 제안을 격리된 앱 복사본에 적용') },
-        { label: 'done', keys: 'y', until: screen => screen.includes('턴 완료') },
-        { label: 'board receipt log', keys: '\x1b[5~', until: screen => screen.includes('개발 진행 보드 · 배포됨') },
+          until: screen => screen.includes('Plugin graph approval · Request details') && screen.includes('이 제안을 격리된 앱 복사본에 적용') },
+        { label: 'done', keys: 'y', until: screen => screen.includes('Turn done') },
+        // 11-23 next TUI log view: PageUp enters «● log» with every block folded; each Tab unfolds the next level —
+        // L1 for the two plan-status blocks and the two tool rows (4 Tabs), L2 then L3 for each tool (4 more). L3 shows the result body.
+        { label: 'log navigation', keys: '\x1b[5~', until: screen => screen.includes('● log') && screen.includes('▸ tool · suggest_accept') },
+        { label: 'board receipt log', keys: '\t'.repeat(8), until: screen => screen.includes('개발 진행 보드 · 배포됨') },
       ],
     });
     const sessionName = readdirSync(join(root, 'sessions')).find(name => name.endsWith('.jsonl'));

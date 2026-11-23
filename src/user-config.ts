@@ -1486,7 +1486,7 @@ function normalizeIntakeAmbientCaptureMode(v: unknown): IntakeAmbientCaptureMode
 
 const FINANCE_DEFAULTS: FinanceConfig = {
   enabled: false,
-  autoLoop: { enabled: false, maxPerScan: 2 },
+  autoLoop: { enabled: false },
   dig: { autoGoal: { enabled: false, maxPerDay: 2, maxTurns: 6, independentChecker: false } },
   kg: { extract: { enabled: false }, anomalyDig: { enabled: false } },
   replay: { autoGoal: { enabled: false, maxTurns: 3, tokenCap: 80_000, windowStartHour: 6, windowEndHour: 7 } },
@@ -3209,7 +3209,6 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       enabled: fin.enabled === true,
       autoLoop: {
         enabled: ((fin.autoLoop ?? {}) as Record<string, unknown>).enabled === true,
-        maxPerScan: Math.max(1, Math.min(Number(((fin.autoLoop ?? {}) as Record<string, unknown>).maxPerScan ?? 2) || 2, 5)),
       },
       // R5 — strict-true arming + clamped budgets (autoLoop pattern).
       dig: {

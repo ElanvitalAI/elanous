@@ -4,7 +4,6 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { mockSeatPtySequence } from './mock-seat-pty-sequence.js';
-import { NEXT_TUI_TITLE } from '../tui/core/render.js';
 
 test('Scene 5 Next TUI rejects tampered packet then retries N and y without an unearned decision', async () => {
   const keptRoot = process.env.ELANOUS_SCENE5_NEXT_OUT?.trim();
@@ -58,20 +57,21 @@ test('Scene 5 Next TUI rejects tampered packet then retries N and y without an u
         ELANOUS_TEST_FAKE_LLM_TOOL_CALL: JSON.stringify({ when: 'SCENE5-PACKET', name: 'ToolSearch',
           args: { query: 'route:GCP 확장안' }, after: { name: 'gcp_architect_expand', args: { ticketDesignPath: designPath } } }),
         ELANOUS_CONFIG_DIR: root, ELANOUS_STATE_DIR: root },
-      ready: { label: 'boot', until: screen => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: screen => screen.split('\n').includes('elanous') && screen.includes('Ctrl+Q quit') },
       steps: [
         { label: 'tampered proposal', text: 'SCENE5-PACKET 티켓팅 GCP 확장안',
           until: screen => screen.includes('GCP 확장 설계 그래프를 실행할까요?') },
         { label: 'tampered turn complete', keys: 'y', until: screen => {
-          if (!screen.includes('턴 완료')) return false;
+          if (!screen.includes('Turn done')) return false;
           failureNeedsLogView = !screen.includes('packet bytes do not match');
           return true;
         } },
-        // The Next basic chat hides tool payloads; use its real detailed log view.
-        { label: 'tampered failure', get keys() { return failureNeedsLogView ? '\x1b[5~' : ''; },
+        // The Next basic chat hides tool payloads; use its real detailed log view. 11-23: PageUp enters «● log» with
+        // every block folded, and 8 Tabs unfold the two status blocks and the two tool rows down to L3 (result body).
+        { label: 'tampered failure', get keys() { return failureNeedsLogView ? '\x1b[5~' + '\t'.repeat(8) : ''; },
           until: screen => screen.includes('packet bytes do not match') },
         { label: 'retry input', get keys() { return failureNeedsLogView ? '\x1b' : ''; },
-          until: screen => !screen.includes('턴 로그') && !screen.includes('로그 탐색') && screen.includes('턴 완료') },
+          until: screen => !screen.includes('● log') && screen.includes('Turn done') },
 
         { label: 'N proposal', text: () => {
           expect(existsSync(join(root, 'next-graph-calls.test.jsonl'))).toBe(false);
@@ -80,11 +80,11 @@ test('Scene 5 Next TUI rejects tampered packet then retries N and y without an u
         },
           until: screen => screen.includes('GCP 확장 설계 그래프를 실행할까요?') },
         { label: 'N packet', keys: 'y', until: screen => screen.includes('proposal-kcb-1') && screen.includes('비용: usage × SKU') },
-        { label: 'N complete', keys: 'n', until: screen => screen.includes('턴 완료') },
+        { label: 'N complete', keys: 'n', until: screen => screen.includes('Turn done') },
         { label: 'y proposal', text: 'SCENE5-PACKET 티켓팅 GCP 확장안',
           until: screen => screen.includes('GCP 확장 설계 그래프를 실행할까요?') },
         { label: 'y packet', keys: 'y', until: screen => screen.includes('proposal-kcb-1') && screen.includes('절감: idle TTL') },
-        { label: 'y complete', keys: 'y', until: screen => screen.includes('턴 완료') },
+        { label: 'y complete', keys: 'y', until: screen => screen.includes('Turn done') },
       ],
       ...(keptRoot ? { artifactPath: join(root, 'pty.json') } : {}),
     });

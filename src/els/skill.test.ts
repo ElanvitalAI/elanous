@@ -1,5 +1,5 @@
 // ELS-SKILL literals (OP #103395): `els --skill` exits 0 and prints the guide; its verb table is the real command table —
-// a new els verb changes the list below and turns this test red until the guide is looked at; the pane env names verbatim.
+// captured verbs stay in it in order, new verbs may join without editing this file, hidden commands never appear; the pane env names verbatim.
 import { expect, test } from 'bun:test';
 import { Command } from 'commander';
 import { registerElsCommands, skillVerbs } from '../cli/els-cli.js';
@@ -11,15 +11,37 @@ const sideOf = (): Command => {
   return program.commands.find((command) => command.name() === 'side')!;
 };
 
-test('the verb table is every visible els command, as typed (hidden ones left out)', () => {
-  expect(skillVerbs(sideOf()).map((verb) => verb.usage)).toEqual([
-    'els seat set <seat>', 'els supervisor on', 'els supervisor off', 'els supervisor status', 'els serve', 'els mcp serve', 'els acp serve',
-    'els ls', 'els new [command...]', 'els read <pane>', 'els status <pane>', 'els grep <pattern>', 'els send <pane> <text>',
-    'els do <pane> <text>', 'els snapshot <pane>', 'els record <pane>', 'els input <pane> <text>', 'els workspace list', 'els workspace create [command...]', 'els workspace close <workspace>',
-    'els workspace move <workspace>', 'els tab list', 'els tab move <tab>', 'els attach <pane>', 'els pane list',
-    'els pane read <pane>', 'els pane send-text <pane> <text>', 'els pane run <pane> <text>', 'els pane send-keys <pane> <keys...>',
-    'els pane close <pane>', 'els import herdr',
-  ]);
+// Verbs captured when the guide was written (OP #103395) — they must stay in the table, in this order, as typed.
+const CAPTURED_VERBS = [
+  'els seat set <seat>', 'els supervisor on', 'els supervisor off', 'els supervisor status', 'els serve', 'els mcp serve', 'els acp serve',
+  'els ls', 'els new [command...]', 'els read <pane>', 'els status <pane>', 'els grep <pattern>', 'els send <pane> <text>',
+  'els do <pane> <text>', 'els snapshot <pane>', 'els record <pane>', 'els input <pane> <text>', 'els workspace list', 'els workspace create [command...]', 'els workspace close <workspace>',
+  'els workspace move <workspace>', 'els tab list', 'els tab move <tab>', 'els attach <pane>', 'els pane list',
+  'els pane read <pane>', 'els pane send-text <pane> <text>', 'els pane run <pane> <text>', 'els pane send-keys <pane> <keys...>',
+  'els pane close <pane>', 'els import herdr',
+];
+
+test('the verb table keeps every captured verb in order and leaves hidden commands out', () => {
+  const side = sideOf();
+  const usages = skillVerbs(side).map((verb) => verb.usage);
+  let cursor = 0;
+  for (const verb of CAPTURED_VERBS) {
+    const at = usages.indexOf(verb, cursor);
+    expect({ verb, inOrder: at !== -1 }).toEqual({ verb, inOrder: true });
+    cursor = at + 1;
+  }
+  expect(new Set(usages).size).toBe(usages.length);
+  const hidden: string[] = [];
+  const walk = (command: Command, prefix: string): void => {
+    for (const child of command.commands) {
+      const path = `${prefix} ${child.name()}`;
+      if ((child as unknown as { _hidden?: boolean })._hidden || child.name().startsWith('_')) hidden.push(path);
+      walk(child, path);
+    }
+  };
+  walk(side, 'els');
+  expect(hidden).toContain('els _wake-request');
+  for (const path of hidden) expect(usages.filter((usage) => usage === path || usage.startsWith(`${path} `))).toEqual([]);
 });
 
 test('`els --skill` exits 0 and prints the guide: verbs from the table, the three pane env names, plain one-line rule, doors', async () => {

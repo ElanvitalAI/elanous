@@ -9,6 +9,7 @@ import { requestEls } from './client.js';
 import { runElsControl } from './els-control-tool.js';
 import { loadJournal } from './journal.js';
 import { processIdentity } from './peer-seat.js';
+import { openMsgStore } from '../msg/msg-store.js';
 
 test.skipIf(process.platform !== 'darwin')('a known peer never silently creates a pane owned by unknown', async () => {
   if (process.env.ELS_OP_PEER_PRIVATE_TTY !== '1') {
@@ -213,18 +214,50 @@ test('stale agent display must not allow prose into a shell', async () => {
   } finally { await server.close(); }
 });
 
-test('tool prose is held even for an agent display and directs operators to seat mail', async () => {
+// ELS-OP-PROSE-INPUT-HOLD: the HQ coordinator (OP) may type plain words into another seat's agent tab; the line is
+// typed as-is, and a copy goes to that seat's mailbox so the instruction is durable.
+test('HQ prose into another seat agent tab is typed and mailed to that seat', async () => {
   const root = mkdtempSync('/tmp/op-agent-prose-'); const writes: string[] = [];
   const server = await startElsServer({ stateRoot: root, stall: false,
     seatLookup: () => ({ pane: 'op-pane', seat: 'OP' }),
     ps: async () => '42 43 /bin/zsh\n43 43 eln\n',
-    spawn: () => ({ id: 'fake', pid: 42, isAlive: () => true, write: value => writes.push(value), renderScreen: async () => '', onExit: () => {}, kill: () => {} }),
+    spawn: () => ({ id: 'fake', pid: 42, isAlive: () => true, write: value => writes.push(value), bracketedPasteEnabled: () => true, renderScreen: async () => '', onExit: () => {}, kill: () => {} }),
   });
   if ('exitCode' in server) throw new Error(server.message);
   try {
-    const made = await requestEls(elsSocketPath(root), { op: 'new', ws: 'test', cwd: root, command: ['eln'] });
+    const made = server.core.newPane({ ws: 'test', cwd: root, command: ['eln'], ownerSeat: 'JUD' });
+    expect(made.exitCode).toBe(0);
     const pane = JSON.parse(made.message).pane;
-    // Listing is presentation only; the control decision must perform its own fresh probe.
+    server.core.setForegrounds(new Map([[pane, { kind: 'eln', command: ['eln'], pid: 43 }]]));
+    writeFileSync(join(root, 'els/control-allow.json'), JSON.stringify({ rules: [{ principal: 'eln:tool', workspace: '*', pane: '*', actions: ['do'] }] }));
+    const sent = await runElsControl({ action: 'send', pane, text: 'Please inspect this task' }, { socketPath: elsSocketPath(root), stateDir: join(root, 'els') });
+    expect(sent).toMatchObject({ ok: true, exitCode: 0 });
+    expect(writes).toEqual(['\x1b[200~Please inspect this task\x1b[201~\r']);
+    const store = openMsgStore(join(root, 'msg', 'messages.db'));
+    try {
+      expect(store.list('JUD').map(m => ({ from: m.from, to: m.to, kind: m.kind, body: m.body }))).toEqual([
+        { from: 'OP', to: 'JUD', kind: 'info', body: '[typed into your tab] Please inspect this task' },
+      ]);
+    } finally { store.close(); }
+    const rows = readFileSync(join(root, 'els', 'control-audit.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(rows.filter(row => row.principal === 'hq-typed-mail').map(row => ({ seat: row.seat, to: row.to, result: row.result, chars: row.chars }))).toEqual([
+      { seat: 'OP', to: 'JUD', result: 'mail-posted', chars: 24 },
+    ]);
+  } finally { await server.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a hand seat sending prose to its own agent tab is still held and pointed at seat mail', async () => {
+  const root = mkdtempSync('/tmp/op-hand-prose-'); const writes: string[] = [];
+  const server = await startElsServer({ stateRoot: root, stall: false,
+    seatLookup: () => ({ pane: 'tc-pane', seat: 'TC' }),
+    ps: async () => '42 43 /bin/zsh\n43 43 eln\n',
+    spawn: () => ({ id: 'fake', pid: 42, isAlive: () => true, write: value => writes.push(value), bracketedPasteEnabled: () => true, renderScreen: async () => '', onExit: () => {}, kill: () => {} }),
+  });
+  if ('exitCode' in server) throw new Error(server.message);
+  try {
+    const made = server.core.newPane({ ws: 'test', cwd: root, command: ['eln'], ownerSeat: 'TC' });
+    expect(made.exitCode).toBe(0);
+    const pane = JSON.parse(made.message).pane;
     server.core.setForegrounds(new Map([[pane, { kind: 'eln', command: ['eln'], pid: 43 }]]));
     writeFileSync(join(root, 'els/control-allow.json'), JSON.stringify({ rules: [{ principal: 'eln:tool', workspace: '*', pane: '*', actions: ['do'] }] }));
     const sent = await runElsControl({ action: 'send', pane, text: 'Please inspect this task' }, { socketPath: elsSocketPath(root), stateDir: join(root, 'els') });
@@ -232,6 +265,7 @@ test('tool prose is held even for an agent display and directs operators to seat
     expect(sent.message).toContain('agent prose is not supported');
     expect(sent.message).toContain('eln msg');
     expect(writes).toEqual([]);
+    expect(existsSync(join(root, 'msg', 'messages.db'))).toBe(false);
   } finally { await server.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -258,7 +292,8 @@ test('tool do applies shell policy on the server independently of the client', a
   } finally { await server.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
-test('ElsControl refuses send and stop when the target has no seat ownership record', async () => {
+// ELS-OP-CROSS-SPACE-SEND (#39797): the OP/HQ caller may type into a pane with no owner record; stop (Escape) stays owner-only.
+test('ElsControl lets OP send into a pane with no seat ownership record but still refuses stop', async () => {
   const root = mkdtempSync(join(tmpdir(), 'op-owner-')); const writes: string[] = [];
   let verified = false;
   const server = await startElsServer({ stateRoot: root,
@@ -272,9 +307,12 @@ test('ElsControl refuses send and stop when the target has no seat ownership rec
     const pane = JSON.parse(made.message).pane;
     verified = true;
     writeFileSync(join(stateDir, 'control-allow.json'), JSON.stringify({ rules: [{ principal: 'eln:tool', workspace: '*', pane: '*', actions: ['do'] }] }));
-    expect((await runElsControl({ action: 'send', pane, text: 'pwd' }, { socketPath, stateDir })).ok).toBe(false);
-    expect((await runElsControl({ action: 'stop', pane }, { socketPath, stateDir })).ok).toBe(false);
-    expect(writes).toEqual([]);
+    expect(await runElsControl({ action: 'send', pane, text: 'pwd' }, { socketPath, stateDir })).toMatchObject({ ok: true, exitCode: 0 });
+    expect(writes).toEqual(['pwd\r']);
+    const stopped = await runElsControl({ action: 'stop', pane }, { socketPath, stateDir });
+    expect(stopped.ok).toBe(false);
+    expect(stopped.message).toContain('target pane owner is unknown or differs from caller seat');
+    expect(writes).toEqual(['pwd\r']);
   } finally { await server.close(); }
 });
 

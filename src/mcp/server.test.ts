@@ -47,7 +47,7 @@ describe('MCP native runtime exposure', () => {
       const inbox = tools.find(tool => tool.name === 'MsgInbox');
       const ack = tools.find(tool => tool.name === 'MsgAck');
       expect(inbox).toBeDefined();
-      expect(ack?.inputSchema.properties).toEqual({ id: expect.any(Object) });
+      expect(ack?.inputSchema.properties).toEqual({ ids: expect.any(Object), id: expect.any(Object), receipted: expect.any(Object) });
       const result = await handleMcpRequest({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'MsgInbox', arguments: {} } }, ctx);
       const messages = (result.result as { structuredContent: { messages: Array<{ id: number; body: string }> } }).structuredContent.messages;
       expect(messages).toEqual([expect.objectContaining({ id: tcMessage.id, body: 'for TC' })]);

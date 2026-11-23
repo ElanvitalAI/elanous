@@ -1,4 +1,5 @@
 import type { LLMToolSpec } from '../llm/tool-spec.js';
+import { BLOCK_REASONS, isBlockReason, type BlockReason } from '../agent-events/protocol.js';
 // update_plan tool — Phase WF2.
 //
 // Progress checklist for multi-step tasks. Adapted from codex-rs's
@@ -36,6 +37,8 @@ export interface PlanStep {
   status: PlanStepStatus;
   /** Required when `blocked`: why a person (or something outside the plan) is needed. */
   reason?: string;
+  /** SEAT-STATE-ENUM: optional code for a `blocked` step — what kind of block it is (the seat reports this code, not `reason`). */
+  code?: BlockReason;
   /** Required when `waiting`: the wake condition. */
   wake?: PlanWake;
 }
@@ -128,6 +131,10 @@ export function parseUpdatePlanArgs(
     if (status === 'in_progress') inProgressCount++;
     const reason = typeof s.reason === 'string' ? s.reason.trim() : '';
     if (status === 'blocked' && !reason) return { ok: false, reason: `step ${i}: a blocked step needs a "reason" (what is needed, from whom)` };
+    if (status === 'blocked' && s.code !== undefined && !isBlockReason(s.code)) {
+      return { ok: false, reason: `step ${i}: "code" must be one of ${BLOCK_REASONS.join(' | ')}` };
+    }
+    const code = status === 'blocked' && isBlockReason(s.code) ? s.code : undefined;
     const wakeRaw = s.wake !== null && typeof s.wake === 'object' ? s.wake as Record<string, unknown> : undefined;
     const wakeKind = typeof wakeRaw?.kind === 'string' ? wakeRaw.kind.trim() : '';
     const wakeTarget = typeof wakeRaw?.target === 'string' ? wakeRaw.target.trim() : '';
@@ -138,6 +145,7 @@ export function parseUpdatePlanArgs(
     steps.push({
       step, status: status as PlanStepStatus,
       ...(status === 'blocked' ? { reason } : {}),
+      ...(code ? { code } : {}),
       ...(status === 'waiting' ? { wake: { kind: wakeKind, target: wakeTarget, ...(until ? { until } : {}) } } : {}),
     });
   }
@@ -183,6 +191,13 @@ export function buildUpdatePlanTool(): LLMToolSpec {
                   + 'waiting = paused until something happens (give `wake`). End every turn with the plan updated.',
               },
               reason: { type: 'string', description: 'Required for `blocked`: what is needed and from whom.' },
+              code: {
+                type: 'string',
+                enum: [...BLOCK_REASONS],
+                description: 'For `blocked`: the kind of block. OWNER_UNKNOWN = the work\'s owner is not confirmed, '
+                  + 'APPROVAL_PENDING = waiting for an approval, TOOL_DENIED = a tool was refused, PROVIDER_ERROR = the model call failed, '
+                  + 'NO_WORK = nothing to do, DEPENDENCY_WAIT = another PR or task must land first, HUMAN_DECISION = only a person can decide.',
+              },
               wake: {
                 type: 'object',
                 description: 'Required for `waiting`: what resumes the step.',

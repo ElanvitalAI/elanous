@@ -150,10 +150,63 @@ export class PaneRegistry {
     return { kind: 'hand', seat: found.seat ?? 'unknown', workspaces: [found.workspace], pane: found.pane };
   }
 
+  movePanes(panes: readonly string[], workspace: string): void {
+    const moved = new Set(panes);
+    for (const [token, row] of this.byToken) if (moved.has(row.pane)) this.byToken.set(token, { ...row, workspace });
+  }
+
   entries(): readonly PaneRegistration[] { return [...this.byToken.values()]; }
 }
 
 export type AuthVerdict = { readonly allow: true } | { readonly allow: false; readonly reason: string };
+
+/**
+ * CEO 11-23 (ELS-ELN-SECURITY-RELAX): reading a pane's screen or status changes nothing, so the HQ observer may read
+ * every pane in every space. HQ observer = the OP seat or the journal's HQ coordinator seat, or a seatless pane caller
+ * (seat absent or `unknown`, e.g. the eln OP pane opened by `els seat`) that sits in a workspace whose journal coordinator
+ * is OP/HQ. A named non-HQ seat (hand, sub-coordinator) keeps its own-pane scope. `read`/`status` use this, and so does
+ * non-destructive typing (`hqTypingRequest`, ELS-OP-CROSS-SPACE-SEND).
+ */
+export function hqReadObserver(seat: string | undefined, callerPane: string | undefined,
+  journal: { readonly hqCoordinatorSeat?: string; readonly workspaces: readonly { readonly id: string; readonly coordinatorSeat?: string }[];
+    readonly tabs: readonly { readonly id: string; readonly workspaceId: string }[]; readonly panes: readonly { readonly id: string; readonly tabId: string }[] }): boolean {
+  const hq = journal.hqCoordinatorSeat;
+  const isHq = (name: string | undefined): boolean => name === 'OP' || (!!hq && name === hq);
+  if (isHq(seat)) return true;
+  if (seat !== undefined && seat !== 'unknown') return false;
+  const row = callerPane ? journal.panes.find(p => p.id === callerPane) : undefined;
+  const wsId = row && journal.tabs.find(t => t.id === row.tabId)?.workspaceId;
+  return isHq(journal.workspaces.find(w => w.id === wsId)?.coordinatorSeat);
+}
+
+/**
+ * ELS-OP-CROSS-SPACE-SEND (CEO 11-23 relaxed security): the HQ observer (see `hqReadObserver`) may also TYPE a line into
+ * any pane in any space, so the OP coordinator can hand work to another seat's tab. Only non-destructive typing counts:
+ * `do`, `input-line`, `send`, `send-verified`, and raw `input` bytes that carry no interrupt/escape/EOF/suspend key.
+ * `interrupt`, `close`, `snapshot` and everything else keep the own-pane rule (close also keeps its confirmation).
+ */
+export function hqTypingRequest(request: { readonly op: string; readonly bytes?: unknown }): boolean {
+  if (request.op === 'do' || request.op === 'input-line' || request.op === 'send' || request.op === 'send-verified') return true;
+  // ESC (also arrow/function-key prefix), ^C, ^D, ^Z, ^\ stay owner-only: they interrupt, end or suspend the pane's process.
+  return request.op === 'input' && typeof request.bytes === 'string' && !/[\x03\x04\x1a\x1b\x1c]/.test(request.bytes);
+}
+
+/** Assignment is server journal state; a claimed seat, cwd or request tag is never authority. */
+export function coordinatorTabScope(role: ServerRole, request: { readonly op: string; readonly ws?: string; readonly kind?: string; readonly id?: string; readonly before?: string },
+  journal: { readonly workspaces: readonly { readonly id: string; readonly name: string; readonly coordinatorSeat?: string }[]; readonly tabs: readonly { readonly id: string; readonly workspaceId: string }[] }): AuthVerdict | undefined {
+  if (role.kind !== 'hand' && role.kind !== 'peer') return undefined;
+  if (!role.seat || role.seat === 'unknown' || role.seat === 'OP') return undefined;
+  const spaces = journal.workspaces.filter(ws => ws.coordinatorSeat === role.seat);
+  if (!spaces.length) return undefined;
+  if (request.op !== 'new' && !(request.op === 'reorder' && request.kind === 'tab')) return undefined;
+  const own = spaces.length === 1 ? spaces[0] : undefined;
+  const tab = (id: string | undefined) => journal.tabs.find(row => row.id === id);
+  const valid = !!own && (request.op === 'new'
+    ? journal.workspaces.find(ws => ws.id === request.ws || ws.name === request.ws)?.id === own.id
+    : tab(request.id)?.workspaceId === own.id &&
+      (request.before === undefined || request.before === '' || request.before === 'end' || tab(request.before)?.workspaceId === own.id));
+  return valid ? { allow: true } : { allow: false, reason: `els: ${request.op} denied — coordinator is restricted to its assigned workspace` };
+}
 
 /** Server-resolved tab target. Seats come from server-minted pane registrations, never from cwd or request fields. */
 export interface TabCloseScope {
@@ -182,7 +235,7 @@ export function resolveTabCloseScope(
 }
 
 // Payload fields (text/pattern/from) ride along so callers pass real op shapes; the door itself never reads them.
-interface RequestShape { readonly op: string; readonly pane?: string; readonly tab?: string; readonly ws?: string; readonly at?: { readonly ws: string }; readonly action?: string; readonly seat?: string; readonly runtime?: unknown; readonly text?: string; readonly pattern?: string; readonly from?: string; readonly confirmed?: boolean }
+interface RequestShape { readonly op: string; readonly kind?: string; readonly id?: string; readonly pane?: string; readonly tab?: string; readonly ws?: string; readonly at?: { readonly ws: string }; readonly action?: string; readonly seat?: string; readonly runtime?: unknown; readonly text?: string; readonly pattern?: string; readonly from?: string; readonly confirmed?: boolean }
 
 /** op → control door action vocabulary (control.ts CONTROL_ACTIONS). */
 function doorAction(op: string): 'read' | 'do' | 'input' | 'new' | 'close' | 'move' | undefined {
@@ -202,7 +255,9 @@ export function isMutating(request: RequestShape): boolean {
 }
 
 /** The one rule set: reuse the door's defaultDecision + allow-list file so client and server cannot drift. */
-export function authorizeRequest(role: ServerRole, request: RequestShape, workspace: string | undefined, rules: readonly AllowRule[] | undefined, tabScope?: TabCloseScope): AuthVerdict {
+export function authorizeRequest(role: ServerRole, request: RequestShape, workspace: string | undefined, rules: readonly AllowRule[] | undefined, tabScope?: TabCloseScope, acting = false): AuthVerdict {
+  // `acting` is computed by the server from its verified role and the current baton, never from a request.
+  const actingOp = acting && (role.kind === 'hand' || role.kind === 'peer');
   // A server-minted OP pane may attempt registration only with a runtime claim;
   // registerSeatRuntime independently verifies the actual OS ancestry and publishes its token.
   if (request.op === 'seat-set') {
@@ -210,42 +265,36 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
       ? { allow: true }
       : { allow: false, reason: `els: seat-set denied — only the server owner may register the OP seat (${role.kind === 'hand' ? `hand seat ${role.seat}` : role.kind === 'peer' ? `peer seat ${role.seat}` : role.kind === 'op' ? `OP pane ${role.pane}` : role.note})` };
   }
+  // CEO 11-23 15:3x «심한 보안 장치 다 완화 · 사람도 똑같이 막힌다»(ELS-ELN-SECURITY-RELAX): the server socket is
+  // same-uid only, so a caller outside any pane (the person's own terminal, or an advisor like Claude OP) is the operator —
+  // every op is allowed and still audited. Pane roles (op/hand/peer) keep their scopes below.
+  if (role.kind === 'outsider' || role.kind === 'owner') return { allow: true };
+  if (request.op === 'move-tab') return role.kind === 'op' || (role.kind === 'peer' && role.seat === 'OP') || actingOp
+    ? { allow: true } : { allow: false, reason: 'els: move-tab denied — OP authority required' };
   // Coordinator assignment is global, never delegated by a workspace allow-list.
-  if (request.op === 'coordinator' || request.op === 'coordinator-unset') {
-    return role.kind === 'op' || (role.kind === 'peer' && role.seat === 'OP')
+  if (request.op === 'coordinator' || request.op === 'coordinator-unset' || request.op === 'hq-coordinator') {
+    return role.kind === 'op' || (role.kind === 'peer' && role.seat === 'OP') || actingOp
       ? { allow: true }
       : { allow: false, reason: `els: ${request.op} denied — OP authority required` };
   }
   if (!isMutating(request)) return { allow: true };
-  // `new` stays open to any same-uid caller (main #39060 behavior): spawning a pane is not typing
-  // into one — the child gets a server-minted token and role 'hand', and the door keeps guarding
-  // every other mutating op. JUD #39096 ⓑ: the door must not block the herdr-style OP flow at `new`.
-  if ((role.kind === 'outsider' || role.kind === 'owner') && request.op === 'new') return { allow: true };
-  // JUD #39096 ⓒ (OP #107371·#107528): typing is default-deny without a token. The owner token
-  // types (input-line/input/resize); a no-token outsider may attach (view) but every typing
-  // op — input-line AND interactive input/resize — is denied: a setsid/double-fork caller has
-  // no resolvable pane ancestor, so ancestor-based triage cannot rescue it; the door refuses.
-  if (role.kind === 'owner' && (request.op === 'snapshot' || request.op === 'attach' || request.op === 'input' || request.op === 'resize' || request.op === 'input-line')) {
-    return { allow: true };
-  }
-  if (role.kind === 'outsider' && request.op === 'attach') {
-    return { allow: true };
-  }
-  if (role.kind === 'outsider') return { allow: false, reason: `els: ${request.op} denied — ${role.note}; mutating ops need a pane of this els server (token from its env)` };
-  // The owner credential is not OP until it explicitly registers the seat; it cannot mutate anything else.
-  if (role.kind === 'owner') return { allow: false, reason: `els: ${request.op} denied — ${role.note}` };
+  // (11-23 완화) outsider/owner are allowed above — the old outsider/owner new·attach·typing branches are gone.
   // `reorder` changes tab/workspace order in the owner UI: a workspace-less mutation any pane role may do.
   if (request.op === 'reorder') return { allow: true };
   // ELS-BUILD-BADGE: `build` is a pane's report about the TUI running in it — its own pane only (token-bound), never a command
   // to another pane — so it skips the control door, which a person-spawned pane (seat 'unknown') can never pass.
   if (request.op === 'build' && (role.kind === 'hand' || role.kind === 'op') && request.pane === role.pane) return { allow: true };
-  const action = doorAction(request.op);
+  // Only workspace rename is mapped; other structural mutations remain fail-closed.
+  // The server must resolve the actual target, never a caller-supplied `at` or pane.
+  if (request.op === 'rename' && request.kind === 'workspace' && !workspace)
+    return { allow: false, reason: 'els: rename denied — workspace target not resolved' };
+  const action = request.op === 'rename' && request.kind === 'workspace' ? 'do' : doorAction(request.op);
   if (!action) return { allow: false, reason: `els: ${request.op} is mutating but has no door action mapping` };
   if (request.op === 'close-tab') {
-    if (request.confirmed !== true) return { allow: false, reason: 'els: close-tab denied — close needs confirm:true (human confirmation)' };
+    if (request.confirmed !== true && role.kind !== 'op' && !(role.kind === 'peer' && role.seat === 'OP')) return { allow: false, reason: 'els: close-tab denied — close needs confirm:true (human confirmation)' };
     if (!tabScope || tabScope.tabId !== request.tab || tabScope.workspace !== workspace || !tabScope.workspace)
       return { allow: false, reason: 'els: close-tab denied — tab identity or workspace changed before authorization' };
-    if ((role.kind === 'hand' || role.kind === 'peer')
+    if (!actingOp && (role.kind === 'hand' || role.kind === 'peer')
       && (!tabScope.ownerSeats.length || tabScope.ownerSeats.some((seat) => seat !== role.seat)))
       return { allow: false, reason: 'els: close-tab denied — tab contains another or unverified seat owner' };
   }
@@ -258,10 +307,16 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
       : { id: `els-pane:${role.pane}`, kind: 'eln', seat: role.seat, workspaces: role.workspaces };
   const confirmed = Boolean((request as { confirmed?: boolean }).confirmed);
   const target: ControlTarget = { workspace: workspace ?? '', pane: request.op === 'close-tab' ? tabScope!.tabId : request.pane ?? '', shell: false };
-  const decision = defaultDecision(principal, target, action, confirmed);
-  if (decision) return decision.allow ? { allow: true } : { allow: false, reason: `els: ${request.op} denied — ${decision.reason}` };
+  // The seat on the real principal remains unchanged for audit/rules. Use OP only for
+  // this decision, and never bypass the acting seat's close confirmation requirement.
+  const decisionPrincipal = actingOp ? { ...principal, seat: 'OP' } : principal;
+  if (actingOp && action === 'close' && !confirmed)
+    return { allow: false, reason: 'els: close denied — close needs confirm:true (human confirmation)' };
+  const decision = defaultDecision(decisionPrincipal, target, action, confirmed);
+  const guidance = '; an OP pane is authorized for this request at this gate (other checks may still apply)';
+  if (decision) return decision.allow ? { allow: true } : { allow: false, reason: `els: ${request.op} denied — ${decision.reason}${guidance}` };
   if (rules && authorize(rules, principal, target, action)) return { allow: true };
-  return { allow: false, reason: `els: ${request.op} denied — no rule grants ${action} to this pane` };
+  return { allow: false, reason: `els: ${request.op} denied — no rule grants ${action} to this pane${guidance}` };
 }
 
 /** Audit line for a denial, in the control-audit.jsonl format (same fields as control.ts). */

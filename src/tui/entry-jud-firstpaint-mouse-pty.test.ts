@@ -78,7 +78,7 @@ test('mouse wheel scrolls older chat after compact to general transition', async
       ready: { label: 'compact boot', until: (screen) => screen.includes('❯') },
       steps: [
         { label: 'settled compact reply', text: 'mouse transition probe',
-          until: (screen) => screen.includes('MOUSE-TRANSITION-44') && screen.includes('턴 완료') },
+          until: (screen) => screen.includes('MOUSE-TRANSITION-44') && screen.includes('● Turn done') },
         { label: 'general after compact', resize: { cols: 80, rows: 24 }, chunks: ['', ''], gapMs: 350,
           until: (screen) => screen.includes('MOUSE-TRANSITION-44') && raw.slice(resizeOffsets[0]).join('').includes(ansi.mouseOn) },
         { label: 'wheel up in general', keys: '\x1b[<64;30;10M',

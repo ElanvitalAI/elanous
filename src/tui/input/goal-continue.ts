@@ -17,6 +17,7 @@
 
 import { compareTurnOutcome } from '../../commitment/turn-outcome-shadow.js';
 import type { PlanTurnOutcome } from '../../code-edit/plan-outcome.js';
+import type { BlockReason } from '../../agent-events/protocol.js';
 import { outcomeOfPlanWire, type PlanWire } from '../../code-edit/plan-wire.js';
 import type { TextInputInternalTurnYieldPort } from '../../chat/index.js';
 import { debug } from '../../debug/log.js';
@@ -103,6 +104,11 @@ export interface GoalContinueDeps {
   /** Automatic continues allowed after seat-cap exhaustion before a person is needed (default 5; env ELANOUS_TUI_SEAT_CAP_CONTINUE overrides, 0 = off). */
   seatCapContinueLimit?: number;
   notify?: (line: string) => void;
+  /**
+   * SEAT-STATE-ENUM: the same «a person is needed» stop as a code — BLOCKED with one reason — so a coordinator never reads the
+   * notice wording. A plan block carries the model's own `code`; the automatic-continue limits are a person's decision.
+   */
+  onBlocked?: (reason: BlockReason, detail: string) => void;
   /** Clock for a paced retry (`retryAt`). Default Date.now. */
   now?: () => number;
   /** 사람 입력 직후 거부(HumanTyping)면 다시 잴 시각까지 미룬다(기본 setTimeout · unref). */
@@ -158,6 +164,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
   const retryFromEnv = Number(process.env.ELANOUS_TEST_GOAL_CONTINUE_RETRY_MS);
   const retryMs = deps.retryMs ?? (Number.isFinite(retryFromEnv) && retryFromEnv >= 0 ? retryFromEnv : 10_500);
   const log = deps.log ?? ((c, e, d) => debug.log(c, e, d));
+  const blockedFor = (reason: BlockReason, detail: string): void => { try { deps.onBlocked?.(reason, detail); } catch { /* reporting cannot break a turn end */ } };
 
   const seatCapLimit = (() => {
     const raw = Number((process.env[SEAT_CAP_CONTINUE_ENV] ?? '').trim());
@@ -208,6 +215,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
         armed = null;
         log('tui', 'turn.auto-continue', { rejected: true, reason: 'plan-limit', n: planConsecutive, limit: planLimit });
         deps.notify?.(`⏸ Plan still has open steps after ${planConsecutive} automatic continues — a person is needed · any key resumes`);
+        blockedFor('HUMAN_DECISION', 'plan-limit');
         return { opened: false, reason: 'plan-limit' };
       }
       const planResult = deps.startTurnIfIdle(mode === 'plan' ? PLAN_CONTINUE_PROMPT : PLAN_NUDGE_PROMPT,
@@ -227,6 +235,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
         armed = null;
         log('tui', 'turn.auto-continue', { rejected: true, reason: 'seat-cap-limit', n: seatCapConsecutive, limit: seatCapLimit });
         deps.notify?.(`⏸ Seat turn cap reached ${seatCapConsecutive} times in a row — a person is needed · any key resumes`);
+        blockedFor('HUMAN_DECISION', 'seat-cap-limit');
         return { opened: false, reason: 'seat-cap-limit' };
       }
       const capResult = deps.startTurnIfIdle(SEAT_CAP_CONTINUE_PROMPT, { origin: 'goal-continue', reason: CONTINUE_REASON.turnLimit(seatCapConsecutive + 1, seatCapLimit) });
@@ -346,7 +355,10 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
         }
         planConsecutive = 0;
         log('tui', 'turn.plan-outcome', { kind: planOutcome.kind, ...(planOutcome.kind === 'blocked' ? { reasonChars: planOutcome.reason.length } : {}) });
-        if (planOutcome.kind === 'blocked') deps.notify?.(`⏸ Blocked: ${planOutcome.reason || planOutcome.step} — a person is needed · any key resumes`);
+        if (planOutcome.kind === 'blocked') {
+          deps.notify?.(`⏸ Blocked: ${planOutcome.reason || planOutcome.step} — a person is needed · any key resumes`);
+          blockedFor(planOutcome.code ?? 'HUMAN_DECISION', 'plan-blocked');
+        }
         else if (planOutcome.kind === 'waiting') deps.notify?.(`⏳ Waiting for ${planOutcome.wake.kind} ${planOutcome.wake.target}`);
         try { if (end.plan) deps.onPlanOutcome?.(planOutcome, end.plan); } catch { /* the host's reaction cannot break a turn end */ }
         return;

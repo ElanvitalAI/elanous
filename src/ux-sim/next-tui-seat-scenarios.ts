@@ -352,7 +352,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       steps: [
         // 탐침 실측(.probe/probe-dock-freeze · 11-19): stall: 칸은 Thinking 상 동결이고 동결 창(0~45s) 내내 본문 dock-stream-line-*은 한 줄도 렌더되지 않는다(45s idle 와치독이 rewind 후 기본 답으로 교체). '긴 출력이 스트리밍 중'은 경과 초 지시자(≥10s)+핀된 작성칸으로 증명한다.
         { label: 'long output remains streaming', text: 'stream a long answer', until: (s) => { const m = /Thinking \((\d+)s/.exec(s); return m !== null && Number(m[1]) >= 10 && s.includes('❯ '); } }, // #38392/#73315 — 영어 크롬 실측 계약
-        { label: 'long output cancelled', keys: '\x1b', until: (s) => /(응답 취소됨|이 턴을 중단했습니다|Stopped after)/.test(s) }, // #38392/#73315 — 취소 통보 둘 다 승인
+        { label: 'long output cancelled', keys: '\x1b', until: (s) => /(응답 취소됨|이 턴을 중단했습니다|Stopped after|Response cancelled)/.test(s) }, // #38392/#73315 — 취소 통보 둘 다 승인 · 11-23 실측 크롬 «● Response cancelled · sent text restored to the prompt»
         { label: 'picker open after long output', text: 'Read @picked', enter: false, until: (s) => s.includes('▸ picked.txt') && s.match(/@ (파일 첨부|Attach file)/) !== null },
         { label: 'picker closed after long output', keys: '\x1b', until: (s) => s.includes('Read @picked') && !/@ (파일 첨부|Attach file)/.test(s) },
       ],

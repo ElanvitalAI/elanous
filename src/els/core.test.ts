@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createElsCore, type ElsPty } from './core.js';
+import { AUTH_PANE_TOKEN_ENV, PaneRegistry, authorizeRequest } from './server-auth.js';
 import { elsJournalPath, loadJournal, saveJournal } from './journal.js';
 import { emptyJournal, type SpaceJournal } from './space.js';
 import { createLineDecoder } from './wire.js';
@@ -788,4 +789,57 @@ test('legacy exited pane without an exit clock receives a full retention period 
   clock += 1;
   expect(core.reapExited()).toBe(1);
   expect(archived).toEqual([pane]);
+});
+
+test('move tab preserves the live PTY, cwd and token; failed saves leave authorization and journal unchanged', async () => {
+  let stored = emptyJournal();
+  let fail = false;
+  const registry = new PaneRegistry();
+  const ptys: ReturnType<typeof fakePty>[] = [];
+  const tokens: string[] = [];
+  const core = createElsCore({
+    load: () => stored,
+    save: next => { if (fail) throw new Error('disk full'); stored = next; },
+    spawn: (_cmd, _cwd, _label, env) => {
+      const registered = registry.registerSpawn(env, _cwd, { kind: 'hand', seat: 'test-hand', workspaces: ['alpha'] });
+      tokens.push(registered[AUTH_PANE_TOKEN_ENV]!);
+      const pty = fakePty(`pty_${ptys.length + 1}`); ptys.push(pty); return pty.pty;
+    },
+    onTabMoved: (panes, workspace) => registry.movePanes(panes, workspace),
+  });
+  core.start();
+  const pane = paneOf(core.newPane({ ws: 'alpha', cwd: '/original', command: ['sh'] }));
+  paneOf(core.newPane({ ws: 'beta', cwd: '/elsewhere', command: ['sh'] }));
+  const tab = stored.panes.find(p => p.id === pane)!.tabId;
+  const before = stored.panes.find(p => p.id === pane)!;
+  const token = tokens[0]!;
+  fail = true;
+  expect(core.moveTab(tab, 'beta').exitCode).toBe(1);
+  expect(core.workspaceOf(pane)?.name).toBe('alpha');
+  expect(registry.classify({ token })).toMatchObject({ kind: 'hand', workspaces: ['alpha'] });
+  fail = false;
+  expect(core.moveTab(tab, 'beta').exitCode).toBe(0);
+  expect(core.workspaceOf(pane)?.name).toBe('beta');
+  expect(stored.panes.find(p => p.id === pane)).toEqual(before);
+  expect(registry.classify({ token })).toMatchObject({ kind: 'hand', workspaces: ['beta'] });
+  expect(ptys).toHaveLength(2);
+  expect(ptys[0]!.pty.killed).toBe(false);
+  expect(core.input(pane, 'still alive\r').exitCode).toBe(0);
+  expect(ptys[0]!.writes).toEqual(['still alive\r']);
+  expect((await core.read(pane)).message).toBe('pty_1 ready\n');
+  expect(core.moveTab('missing', 'beta').exitCode).toBe(1);
+  expect(core.moveTab(tab, 'missing').exitCode).toBe(1);
+  expect(authorizeRequest(registry.classify({ token }), { op: 'move-tab' }, undefined, []).allow).toBe(false);
+});
+
+// CEO 11-23 15:5x: a seat tab carries its seat as ELANOUS_TRACK so ElsControl calls go out as that seat (door default rules apply).
+test('newPane with a seat identity passes ELANOUS_TRACK to the spawned process', () => {
+  let seen: Readonly<Record<string, string>> = {};
+  let stored = { version: 1, workspaces: [], tabs: [], panes: [] } as never;
+  const core = createElsCore({ load: () => stored, save: (j) => { stored = j as never; }, spawn: (_c, _w, _t, env) => { seen = env; return fakePty('pty_seat').pty; } });
+  expect(core.newPane({ ws: 'OP', cwd: '/x/seats/OP', command: ['eln'], title: 'OP', seatIdentity: 'OP' }).exitCode).toBe(0);
+  expect(seen.ELANOUS_TRACK).toBe('OP');
+  expect(seen.ELANOUS_ELS_WS).toBe('OP');
+  expect(core.newPane({ ws: 'TC', cwd: '/x/work', command: ['zsh'] }).exitCode).toBe(0);
+  expect(seen.ELANOUS_TRACK).toBeUndefined();
 });

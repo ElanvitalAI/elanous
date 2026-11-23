@@ -2,7 +2,8 @@ import { streamLLM, type LLMProvider } from '../../../llm.js';
 import { createModelOrchestrationCore, DEFAULT_CORE_MODULES } from '../../../model-tier/model-orchestration.js';
 import { createCoreAdvisor } from '../../../model-tier/advisor-checkpoints.js';
 import { WINDOW_SNAPSHOT_TTL_MS } from '../../../model-tier/window-account-selector.js';
-import type { AccountState } from '../../../model-tier/orchestration-core.js';
+import { createSmartRouterTierGate } from '../../../plugins/smart-router/consumer.js';
+import type { AccountState, CoreModules } from '../../../model-tier/orchestration-core.js';
 import type { SimWorldScenario } from '../types.js';
 
 const observed = WINDOW_SNAPSHOT_TTL_MS * 4;
@@ -16,13 +17,24 @@ const state = (remaining: number, stale = false): AccountState => ({
   } },
 });
 
+// jud-39528 mustFix ② 배선 이후 등급 게이트가 무등급(free)을 fail-closed 로 강등·거부한다(SMART-ROUTER-PLUGIN-TIERS).
+// 이 시나리오가 검증하는 것은 자격 회원의 믹스 라우팅(싼 구현 + 구독 창 프리미엄 검문)이므로,
+// 신뢰 호스트 seam(CoreModules.membership · 게이트 리졸버)으로 자격(pro) 회원 상태를 명시한다.
+// 무등급 거부 경로는 router-gate-wiring.test.ts(free → strong_three_moments 거부)가 별도 검증.
+const entitledResolver = { currentTier: () => 'pro' };
+const entitledModules: CoreModules = {
+  ...DEFAULT_CORE_MODULES,
+  membership: () => 'pro',
+  gate: createSmartRouterTierGate(entitledResolver),
+};
+
 export const simWorldScenarios: readonly SimWorldScenario[] = [{
   id: 'ROUTER-OR-CODEX-MIX-CHOKEPOINT',
   title: 'cheap implementation, subscription-aware premium checkpoints and bounded provider failure',
   devices: ['ROUTER-COST-FAKE-PROVIDERS'],
   async run(ctx) {
     const fake = ctx.device<{ provider: (name: string, mode: 'measured' | 'unmeasured' | 'silent') => LLMProvider }>('ROUTER-COST-FAKE-PROVIDERS');
-    const core = createModelOrchestrationCore(DEFAULT_CORE_MODULES);
+    const core = createModelOrchestrationCore(entitledModules);
     const input = { runId: 'mix-sim', provider: 'openrouter', work, accounts: state(0.8) };
     const implementation = core.decide({ ...input, moment: 'implement' });
     const [plan, judge] = await Promise.all([
@@ -32,7 +44,7 @@ export const simWorldScenarios: readonly SimWorldScenario[] = [{
     ctx.recorder.event('router-mix:concurrent', { implement: implementation.provider, plan: plan.provider, judge: judge.provider });
     if (implementation.provider !== 'openrouter' || plan.provider !== 'openai-codex' || judge.provider !== 'openai-codex')
       return failure('mixed route mismatch');
-    const afterRestart = createModelOrchestrationCore(DEFAULT_CORE_MODULES).decide({ ...input, moment: 'design', checkpoint: 'plan', accounts: state(0, true) });
+    const afterRestart = createModelOrchestrationCore(entitledModules).decide({ ...input, moment: 'design', checkpoint: 'plan', accounts: state(0, true) });
     ctx.recorder.event('router-mix:restart-stale', { provider: afterRestart.provider });
     if (afterRestart.provider !== 'openrouter') return failure('stale subscription selected after restart');
     const readFailed = core.decide({ ...input, moment: 'design', checkpoint: 'plan',

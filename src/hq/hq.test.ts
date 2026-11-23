@@ -488,7 +488,7 @@ describe('tailnet probe (OP 10-04 09:04 — the arbiter never sshes into home ma
   });
 
   test('health URL: pinned per host, else the tailnet MagicDNS name on the nexus port', () => {
-    expect(healthUrlFor('mbp', { healthUrls: { mbp: 'https://x.example:9/v1/health' } }, () => 'tail.ts.net')).toBe('https://x.example:9/v1/health');
+    expect(healthUrlFor('mbp', { healthUrls: { 'mbp': 'https://x.example:9/v1/health' } }, () => 'tail.ts.net')).toBe('https://x.example:9/v1/health');
     expect(healthUrlFor('node-b', {}, () => 'tail.ts.net')).toBe('https://node-b.tail.ts.net:31415/v1/health');
     expect(healthUrlFor('node-b', { tailnetDomain: 'pinned.ts.net' }, () => 'tail.ts.net')).toBe('https://node-b.pinned.ts.net:31415/v1/health');
     expect(healthUrlFor('node-b', {}, () => undefined)).toBeUndefined();
@@ -563,8 +563,8 @@ describe('hq config block is read from config.json (was silently dropped)', () =
   test('parseHqConfig keeps typed fields and drops invalid ones', async () => {
     const { parseHqConfig } = await import('../user-config.js');
     expect(parseHqConfig(undefined)).toBeUndefined();
-    expect(parseHqConfig({ arbiter: 'gcpvm', hostName: ' mbp ', ttlSeconds: 900, failOpenRoles: ['cron', 'nope'], healthUrls: { mbp: 'https://x/v1/health', bad: 3 }, seenGenerationFile: '/tmp/s' }))
-      .toEqual({ arbiter: 'gcpvm', hostName: 'mbp', ttlSeconds: 900, failOpenRoles: ['cron'], healthUrls: { mbp: 'https://x/v1/health' }, seenGenerationFile: '/tmp/s' });
+    expect(parseHqConfig({ arbiter: 'gcpvm', hostName: ' mbp ', ttlSeconds: 900, failOpenRoles: ['cron', 'nope'], healthUrls: { 'mbp': 'https://x/v1/health', bad: 3 }, seenGenerationFile: '/tmp/s' }))
+      .toEqual({ arbiter: 'gcpvm', hostName: 'mbp', ttlSeconds: 900, failOpenRoles: ['cron'], healthUrls: { 'mbp': 'https://x/v1/health' }, seenGenerationFile: '/tmp/s' });
     expect(parseHqConfig({ ttlSeconds: -1, arbiter: '' })).toBeUndefined();
     expect(parseHqConfig({ autoPromote: { enabled: true, streak: 4 } })).toEqual({ autoPromote: { enabled: true, streak: 4 } });
     expect(parseHqConfig({ autoPromote: { enabled: 'yes', streak: -2 } })).toBeUndefined();

@@ -162,6 +162,9 @@ export interface CoreTurnContext {
   /** Caller-selected surface. ACP passes its one per-turn verdict through;
    * direct callers can omit it and let core-turn resolve from userText. */
   surfaceProfile?: import('../session-runtime/index.js').SessionSurfaceProfile;
+  /** ELN-PROMPT-CACHE-PIN — the caller keeps one tool set per session: deferred tools are not warm-preloaded from
+   *  this turn's text (the tools array and the deferred announce stay byte-identical across turns). */
+  stableToolSet?: boolean;
   /** Full prompt (system + history + current user blocks). */
   messages: LLMMessage[];
   /** Optional provider request-size hook. Only providers with a measured

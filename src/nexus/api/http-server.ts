@@ -90,6 +90,7 @@ import {
   handleResourceLedgerPoolDeclarationPost,
   handleResourceLedgerPoolsApi,
 } from "./resource-ledger.js";
+import { handleHostsHeartbeatPost } from "./hosts-heartbeat.js";
 import {
   handleMissionLineRequest,
   MissionLineHttpError,
@@ -3343,6 +3344,23 @@ export async function routeRequest(
       : undefined;
     if (!machine) return jsonResponse({ error: "unauthorized" }, 401);
     return handleResourceLedgerHostReadinessPost(req, machine);
+  }
+
+  // Installed-sha host heartbeats land in the central hosts list; identity comes from the expiring machine token.
+  if (pathname === "/v1/hosts/heartbeat") {
+    if (method !== "POST")
+      return jsonResponse({ error: "method-not-allowed" }, 405);
+    if (!isResourceLedgerTransportSecure(req, opts, server))
+      return jsonResponse({ error: "secure-transport-required" }, 403);
+    const offered = req.headers.get("authorization");
+    const presented = offered?.startsWith("Bearer ")
+      ? offered.slice(7).trim()
+      : "";
+    const machine = presented
+      ? machineForExpiringToken(presented, effectiveInstanceRoot())
+      : undefined;
+    if (!machine) return jsonResponse({ error: "unauthorized" }, 401);
+    return handleHostsHeartbeatPost(req, machine);
   }
 
   if (pathname === HQ_LLM_PROXY_PATH) {

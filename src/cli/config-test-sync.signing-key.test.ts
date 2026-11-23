@@ -29,9 +29,7 @@ describe('test sync Nexus app authentication boundary', () => {
     } }));
     try {
       syncTestConfig(testDir, operatingDir);
-      const before = JSON.parse(readFileSync(join(testDir, 'secrets.json'), 'utf8')) as { secrets: Record<string, string> };
-      expect(Object.hasOwn(before.secrets, APP_AUTH_SIGNING_KEY_ID)).toBe(false);
-      expect(before.secrets.llmKey).toBe('synthetic-llm-key');
+      expect(() => readFileSync(join(testDir, 'secrets.json'), 'utf8')).toThrow();
 
       setTestStateRoot(testDir);
       setElanousConfigDir(testDir);
@@ -39,8 +37,7 @@ describe('test sync Nexus app authentication boundary', () => {
       expect(digest(testKey) === digest(operatingKey)).toBe(false);
       expect(await getSecretAsync(APP_AUTH_SIGNING_KEY_ID)).toBeUndefined();
       expect(await getOrCreateAppAuthSigningKey()).toBe(testKey);
-      const after = JSON.parse(readFileSync(join(testDir, 'secrets.json'), 'utf8')) as { secrets: Record<string, string> };
-      expect(Object.hasOwn(after.secrets, APP_AUTH_SIGNING_KEY_ID)).toBe(false);
+      expect(() => readFileSync(join(testDir, 'secrets.json'), 'utf8')).toThrow();
       const keyPath = join(testDir, 'nexus', 'app-auth-test-signing-key');
       expect(digest(readFileSync(keyPath, 'utf8'))).toBe(digest(testKey));
       expect(statSync(keyPath).mode & 0o077).toBe(0);

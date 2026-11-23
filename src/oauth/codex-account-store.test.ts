@@ -100,7 +100,18 @@ test('window selection uses one changing quota observation per home through the 
   const snapshot = readAccountWindowSnapshot('openai-codex', {
     now: () => now, config: () => ({ harness: { windowAccounts: 'on' } }), inspectCodex: () => inspected,
   });
-  const plan = planWorkRoute('대상 경로: src/self-implement/run-ledger.ts', 'openai-codex', snapshot);
+  // jud-39528 ② · COST-OPTIMIZER-WINDOW-AWARE(ROSTER-0334 P2-11) — 창 인지 계정 전환(등급 배정 반영 포함)은
+  // router.subscription_window_aware(프로+ 게이트) 안이다. 실경로 시험에 자격(pro)을 주입한다 —
+  // 기본(free)이면 활성 계정 고정으로 team 전환을 못 한다(선재 실패의 정체 · 2026-11-23 재실행 원문으로 실측).
+  const previousRouterTier = process.env.ELANOUS_ROUTER_TIER;
+  process.env.ELANOUS_ROUTER_TIER = 'pro';
+  let plan: ReturnType<typeof planWorkRoute>;
+  try {
+    plan = planWorkRoute('대상 경로: src/self-implement/run-ledger.ts', 'openai-codex', snapshot);
+  } finally {
+    if (previousRouterTier === undefined) delete process.env.ELANOUS_ROUTER_TIER;
+    else process.env.ELANOUS_ROUTER_TIER = previousRouterTier;
+  }
   expect(reads.get(realpathSync(defaultHome))).toBe(1);
   expect(reads.get(realpathSync(teamHome))).toBe(1);
   expect(inspected.currentCreditBalance).toBe(100);

@@ -233,6 +233,26 @@ export function elsSelfContextSystemMessages(
 ): LLMMessage[] {
   const ctx = elsSelfContextEnv(env);
   if (ctx === null) return [];
+  const state = fillAndRefreshElsSelfContext(ctx, sessionKey);
+  if (state.cachedSummary === null || state.cachedSummary === state.emittedSummary) return [];
+  state.emittedSummary = state.cachedSummary;
+  return [{ role: 'system', content: state.cachedSummary }];
+}
+
+/** ELN-PROMPT-CACHE-PIN — the per-turn variant. The block rides in the turn's volatile context (after history,
+ *  outside the cached system prefix), so it is sent on EVERY turn instead of only when it changed: a block that
+ *  appears on some turns and not others inside the fixed instructions is what broke the prompt cache. '' when
+ *  there is no els env or no summary yet. Same session cache · first-use fill · background refresh as above. */
+export function elsSelfContextVolatileText(
+  sessionKey: string = ELS_SELF_CONTEXT_DEFAULT_SESSION_KEY,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const ctx = elsSelfContextEnv(env);
+  if (ctx === null) return '';
+  return fillAndRefreshElsSelfContext(ctx, sessionKey).cachedSummary ?? '';
+}
+
+function fillAndRefreshElsSelfContext(ctx: ElsSelfContextEnv, sessionKey: string): ElsSelfContextSessionState {
   const state = sessionStateFor(sessionKey);
   if (state.cachedSummary === null && !state.firstFillAttempted) {
     state.firstFillAttempted = true;
@@ -245,7 +265,5 @@ export function elsSelfContextSystemMessages(
   if (!underBunTest && inflight === null) {
     inflight = refreshElsSelfContext(ctx, lsViaSocket, sessionKey).catch(() => null).finally(() => { inflight = null; });
   }
-  if (state.cachedSummary === null || state.cachedSummary === state.emittedSummary) return [];
-  state.emittedSummary = state.cachedSummary;
-  return [{ role: 'system', content: state.cachedSummary }];
+  return state;
 }

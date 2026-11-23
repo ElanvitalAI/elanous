@@ -6,10 +6,15 @@
     "SIM-WORLD-MEMORY"
   ],
   "implementation": [
-    "src/ux-sim/sim-world/memory/store.ts"
+    "src/ux-sim/sim-world/memory/store.ts",
+    "src/ux-sim/sim-world/memory/scenarios.ts",
+    "src/ux-sim/sim-world/memory/signal-scenarios.ts",
+    "src/ux-sim/sim-world/memory/signals.ts"
   ],
   "tests": [
-    "src/ux-sim/sim-world/memory/store.test.ts"
+    "src/ux-sim/sim-world/memory/store.test.ts",
+    "src/ux-sim/sim-world/memory/scenarios.test.ts",
+    "src/ux-sim/sim-world/memory/signal-scenarios.test.ts"
   ],
   "target": "Deterministic in-process memory store (instance/template/global layers, promote only with an approver, tenant isolation, serialized concurrent writes, death mid-write leaves no record, clock-driven expiry with tombstones) that stands in for the graph memory storage port in the memory sim world.",
   "inputs": [

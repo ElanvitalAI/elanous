@@ -35,10 +35,11 @@ import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
 import { isSimpleQuestionFastRoute } from '../model-tier/simple-question-fast-route.js';
 import { recordTurn } from '../status/metrics.js';
 import { createMeasuredTurnUsage, type MeasuredTurnUsage } from './turn-usage.js';
-import { resolveTurnCompactTrigger, trimKeepingAnchorAndLatestTurn } from './long-session-compact.js';
+import { shouldFireTurnStartCompact, trimKeepingAnchorAndLatestTurn } from './long-session-compact.js';
 import { compactSessionHistory } from './compact-session.js';
 import { CHAT_DEFAULTS } from '../user-config/chat.js';
 import type { CompactProvider } from '../compact/provider.js';
+import { clearNoOpBackoff, noOpBackoffHeld, recordNoOpBackoff } from '../compact/auto-state.js';
 import {
   buildTerminalCapableTurn,
   isTerminalCapableTurn,
@@ -69,12 +70,21 @@ import {
 
 export interface RunTurnOpts {
   userConfig: UserConfig;
+  /** Coordinator turns retain their reasoning default instead of the automatic low-effort shortcut. */
+  disableSimpleQuestionFastRoute?: boolean;
   sessionId: string;
   userText: string;
   /** Stable per-turn identity shared with surface MessageBlock raw references. */
   surfaceRunId?: string;
   /** System prompt applied only if the session has none. */
   systemPrompt?: string;
+  /** ELN-PROMPT-CACHE-PIN — caller-owned per-turn context (e.g. the seat's els location · owner check). Sent as this
+   *  turn's volatile context after the history (withTurnVolatileContext), never folded into `systemPrompt`, so the
+   *  cached system prefix stays byte-identical across turns. */
+  turnVolatileContext?: readonly string[];
+  /** ELN-PROMPT-CACHE-PIN — keep the advertised tool set fixed for the session: deferred tools stay deferred
+   *  (reachable through ToolSearch) instead of being warm-preloaded from this message's wording. */
+  stableToolSet?: boolean;
   /** Token budget (rough); defaults to DEFAULT_TOKEN_BUDGET. */
   maxTokens?: number;
   /** Summarizer for turn-start compaction (test seam for the external LLM). Default = getDefaultCompactProvider(). */
@@ -387,6 +397,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   const explicitTier = opts.llmOpts?.model ? undefined : explicitTurnTier(opts.userConfig, opts.sessionId);
   const priorUserTurns = messages.filter(message => message.role === 'user').length;
   const simpleQuestionFastRouteCandidate = meta.source === 'tui'
+    && !opts.disableSimpleQuestionFastRoute
     && !opts.llmOpts?.model && !opts.llmOpts?.reasoningEffort && !explicitTier
     && isSimpleQuestionFastRoute({
       text: opts.userText,
@@ -412,7 +423,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   //   reuse the cached prefix (system prompt + history). It now travels as ONE `cacheVolatile` system
   //   message placed right before the current user message (withTurnVolatileContext): everything
   //   before it is a byte prefix of the next turn's request.
-  const turnVolatileBlocks: string[] = [];
+  const turnVolatileBlocks: string[] = [...(opts.turnVolatileContext ?? [])];
   if (meta.source === 'tui' && takeResumeBoundary(opts.sessionId, priorUserTurns)) {
     turnVolatileBlocks.push(RESUME_BOUNDARY_BLOCK);
     try { debug.log('session', 'resume-boundary', { sessionId: opts.sessionId, priorUserTurns }); } catch { /* observability is fail-open */ }
@@ -557,42 +568,56 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     return wire;
   };
   const turnInputCap = opts.maxTokens ?? DEFAULT_TOKEN_BUDGET;
-  // ⭐ OP-LONG-SESSION-COMPACT (D1) — turn-start auto-compaction fires before the trim. The existing
-  //   threshold is clamped to the input cap (long-session-compact.ts), and it is measured on the
-  //   request as sent (images included). A caller with an explicit opts.maxTokens keeps its
-  //   trim-only contract (no storage rewrite).
+  // ⭐ ELN-COMPACT-REAL(OP #135458 §4-4①) — turn-start auto-compaction fires before the trim on
+  //   the RECORD only (fixed prefix excluded): history 16k OR the whole measured input 60k,
+  //   whichever comes first. The old request-as-sent basis (ratio × min(window, budget), clamped
+  //   to the input cap) fired every turn on a large fixed prefix alone (audit W3). A caller with
+  //   an explicit opts.maxTokens keeps its trim-only contract (no storage rewrite).
   const autoCompactCfg = opts.userConfig.chat?.autoCompact ?? CHAT_DEFAULTS.autoCompact;
   let compactedThisTurn = false;
   if (autoCompactCfg.enabled && opts.maxTokens === undefined) {
     const turnModelId = llmOpts?.model ?? provider.defaultModel;
-    const trigger = resolveTurnCompactTrigger(turnModelId, autoCompactCfg, turnInputCap);
-    const used = estimateMessagesTokens(buildTurnWire(effectiveSystemPrompt));
-    if (trigger > 0 && used >= trigger) {
-      try {
-        const result = await compactSessionHistory(opts.sessionId, {
-          config: autoCompactCfg,
-          force: true,
-          modelId: turnModelId,
-          ...(opts.compactProvider ? { provider: opts.compactProvider } : {}),
-        });
+    const historyUsedTokens = estimateMessagesTokens(toLLM([...messages, userMsg]));
+    const fullInputTokens = estimateMessagesTokens(buildTurnWire(effectiveSystemPrompt));
+    if (shouldFireTurnStartCompact(historyUsedTokens, fullInputTokens)) {
+      // ⭐ §4-4③ — a no-op force buys nothing by repeating: hold off re-forcing until the
+      //   record has grown +25% past the level measured at the last no-op.
+      if (noOpBackoffHeld(opts.sessionId, historyUsedTokens)) {
         debug.log('compact.session', 'turn-start', {
-          sessionId: opts.sessionId, usedTokens: used, triggerTokens: trigger, fired: result.fired, reason: result.reason,
+          sessionId: opts.sessionId, historyUsedTokens, fullInputTokens,
+          fired: false, reason: 'no-op-backoff', // 출처: #135458 §4-4③
         }, { level: 'info' });
-        if (result.fired) {
-          compactedThisTurn = true;
-          // The rewritten store holds this turn's user row (rows appended meanwhile may follow it).
-          // Take that row out wherever it sits; the wire adds it back once, last.
-          const stored = loadSession(opts.sessionId)?.messages ?? messages;
-          let own = -1;
-          for (let i = stored.length - 1; i >= 0 && own < 0; i--) {
-            if (stored[i]!.role === 'user' && stored[i]!.content === userMsg.content) own = i;
+      } else {
+        try {
+          const result = await compactSessionHistory(opts.sessionId, {
+            config: autoCompactCfg,
+            force: true,
+            modelId: turnModelId,
+            ...(opts.compactProvider ? { provider: opts.compactProvider } : {}),
+          });
+          debug.log('compact.session', 'turn-start', {
+            sessionId: opts.sessionId, historyUsedTokens, fullInputTokens,
+            fired: result.fired, reason: result.reason,
+          }, { level: 'info' });
+          if (result.fired) {
+            clearNoOpBackoff(opts.sessionId);
+            compactedThisTurn = true;
+            // The rewritten store holds this turn's user row (rows appended meanwhile may follow it).
+            // Take that row out wherever it sits; the wire adds it back once, last.
+            const stored = loadSession(opts.sessionId)?.messages ?? messages;
+            let own = -1;
+            for (let i = stored.length - 1; i >= 0 && own < 0; i--) {
+              if (stored[i]!.role === 'user' && stored[i]!.content === userMsg.content) own = i;
+            }
+            messages = own >= 0 ? [...stored.slice(0, own), ...stored.slice(own + 1)] : stored;
+          } else if (result.reason === 'no-op') {
+            recordNoOpBackoff(opts.sessionId, historyUsedTokens); // 출처: #135458 §4-4③
           }
-          messages = own >= 0 ? [...stored.slice(0, own), ...stored.slice(own + 1)] : stored;
+        } catch (error) {
+          debug.log('compact.session', 'turn-start-error', {
+            sessionId: opts.sessionId, error: error instanceof Error ? error.message : String(error),
+          }, { level: 'warn' });
         }
-      } catch (error) {
-        debug.log('compact.session', 'turn-start-error', {
-          sessionId: opts.sessionId, error: error instanceof Error ? error.message : String(error),
-        }, { level: 'warn' });
       }
     }
   }
@@ -757,6 +782,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         userText: opts.userText,
         messages: kept,
         tools: turnTools,
+        ...(opts.stableToolSet === true ? { stableToolSet: true } : {}),
         ...(guardedTurnLlmOpts?.requestSizeGuard
           ? { requestSizeGuard: guardedTurnLlmOpts.requestSizeGuard } : {}),
         dispatchTool: async (name, args, ctx) => dispatchTool(name, args, ctx),

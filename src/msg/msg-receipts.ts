@@ -7,7 +7,7 @@
 //   accepted · rejected · done = B2(계획 원장 구독). 여기는 API 와 명시 CLI(`eln msg receipt`)만.
 // 답의 문장을 읽어 상태를 세우는 길은 없다.
 //
-// 호환 쓰기(§4c): seen → msg_message_acks(acked) · done → msg_message_acks(done). 그래서 `eln msg list`
+// 호환 쓰기(§4c): seen · accepted · rejected → msg_message_acks(acked) · done → msg_message_acks(done). 그래서 `eln msg list`
 // (미ack 숨김) · messageStatus · 감시기 mail-missed 가 그대로 돈다.
 // 관측: debug.log('msg', 'msg.receipt.<state>', {msgId, from, to, intent, at, …}) — 본문은 싣지 않는다.
 
@@ -116,6 +116,11 @@ export function legacyIntent(kind: string | undefined | null): 'request' | 'deci
   return 'info';
 }
 
+/** Receipt states that also mean «handled» for the recipient — each writes the compat ack row (§4c) in the same transaction. */
+export const ACK_IMPLYING_STATES: ReadonlySet<ReceiptState> = new Set<ReceiptState>(['seen', 'accepted', 'rejected', 'done']);
+/** Terminal «decided» receipts — the mail needs nothing more from its recipient. */
+export const TERMINAL_RECEIPT_STATES = ['accepted', 'rejected', 'done', 'expired'] as const satisfies readonly ReceiptState[];
+
 export function isReceiptState(value: string): value is ReceiptState {
   return (RECEIPT_STATES as readonly string[]).includes(value);
 }
@@ -185,7 +190,9 @@ export function recordReceiptOn(db: Database, input: ReceiptInput, now: () => Da
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(input.messageId, input.recipient, input.state, input.planItemId ?? null,
       input.queueItemId ?? null, input.reason ?? null, input.evidence ?? null, at, input.source);
     // §4c 호환 쓰기 — seen 은 acked 를 «없을 때만»(done 을 되감지 않는다), done 은 done 으로 올린다.
-    if ((input.state === 'seen' || input.state === 'done') && input.recipient !== 'ALL' && !input.recipient.startsWith('group:')) {
+    // MSG-RECEIPT-IMPLIES-ACK — accepted · rejected 도 «처리함» 이다: acked 를 «없을 때만» 같이 쓴다. 그래야 결정된
+    // 승인 요청이 미읽음으로 영영 남지 않는다(11-23 OP 미읽음 29통 중 14통 = 이미 결정한 승인 요청).
+    if (ACK_IMPLYING_STATES.has(input.state) && input.recipient !== 'ALL' && !input.recipient.startsWith('group:')) {
       db.query(`INSERT INTO msg_message_acks(message_id, recipient, status) VALUES (?, ?, ?)
         ON CONFLICT(message_id, recipient) DO ${input.state === 'done' ? "UPDATE SET status = 'done'" : 'NOTHING'}`)
         .run(input.messageId, input.recipient, input.state === 'done' ? 'done' : 'acked');

@@ -596,6 +596,7 @@ async function fetchWithTimeout(
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const request = { ...init, signal: ac.signal };
+    // llm-ledger-exempt: model-listing
     if (init.method !== 'POST') return await fetch(url, request); // model discovery is not inference
     let model: string | undefined;
     try { model = (JSON.parse(String(init.body)) as { model?: string }).model; } catch { /* preserve malformed request behavior */ }

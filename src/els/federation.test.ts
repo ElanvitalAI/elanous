@@ -2,7 +2,8 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ElsCore, ElsResult } from './core.js';
+import { createElsCore, type ElsCore, type ElsResult } from './core.js';
+import { emptyJournal } from './space.js';
 import { parseRemoteRows } from './attach-view.js';
 import { routeElsHttp } from './http.js';
 import { createFederation } from './federation.js';
@@ -47,6 +48,23 @@ test('ls merges this host and the answering hosts; a host that fails or answers 
   expect(body.hosts.map((host) => [host.name, host.reach])).toEqual([['mshq', 'local'], ['host-a', 'up'], ['host-b', 'down'], ['odd', 'down']]);
   expect(body.hosts.find((host) => host.name === 'odd')?.reason).toBe('malformed answer');
   expect(body.panes.map((pane) => [pane.address, pane.reach])).toEqual([['mshq:w1/t1/p1', 'local'], ['host-a:w9/t9/p9', 'up']]);
+});
+
+test('seat travels through HTTP and federation without forwarding untrusted fields', async () => {
+  const origin = { list: () => ({ exitCode: 0, message: JSON.stringify({ workspaces: [], panes: [
+    { address: 'w/t/p1', tab: 't', pane: 'p1', title: 'one', cwd: '/a', state: 'working', seat: 'OP', token: 'secret' },
+    { address: 'w/t/p2', tab: 't', pane: 'p2', title: 'two', cwd: '/b', state: 'working', seat: 'TC' },
+    { address: 'w/t/p3', tab: 't', pane: 'p3', title: 'shell', cwd: '/c', state: 'idle', seat: null },
+    { address: 'w/t/p4', tab: 't', pane: 'p4', title: 'bad', cwd: '/d', state: 'idle', seat: 'OP\nFAKE' },
+  ] }) }) } as unknown as ElsCore;
+  const response = await routeElsHttp(origin, 'host-a', 'GET', '/els/ls');
+  const body = JSON.parse(response.body);
+  expect(body.panes.map((row: { seat?: string | null }) => row.seat)).toEqual(['OP', 'TC', null, undefined]);
+  expect(response.body).not.toContain('secret');
+  const { fed } = federation({ hosts: [hostA], remote: { 'host-a': () => ({ status: 200, body }) } });
+  const rows = JSON.parse((await fed.list()).message).panes.filter((row: { host: string }) => row.host === 'host-a');
+  expect(rows.map((row: { seat?: string | null }) => row.seat)).toEqual(['OP', 'TC', null, undefined]);
+  expect(JSON.stringify(rows)).not.toContain('secret');
 });
 
 test('origin workspace role travels through HTTP and federation to remote rows, scoped to each host', async () => {
@@ -224,4 +242,21 @@ test('do: local goes to this host\'s owner; a remote address is posted to that h
   expect(down.exitCode).toBe(1);
   expect(down.message).toContain('not sent');
   expect((await fed.do('nowhere:w9/t9/p9', 'go', 'OP')).message).toContain('not registered');
+});
+
+test('origin foreground kind survives the HTTP and federation listing', async () => {
+  let journal = emptyJournal();
+  const owner = createElsCore({ load: () => journal, save: value => { journal = value; },
+    spawn: () => ({ id: 'fixture', pid: 42, isAlive: () => true, write() {}, kill() {}, renderScreen: async () => '', onExit() {} }),
+    mailBadges: () => new Map() });
+  owner.start();
+  try {
+    const created = JSON.parse(owner.newPane({ ws: 'W', cwd: '/test/seats/TC', command: ['sh'] }).message);
+    owner.setForegrounds(new Map([[created.pane, { kind: 'codex', command: ['codex'], pid: 42 }]]));
+    const origin = await routeElsHttp(owner, 'host-a', 'GET', '/els/ls');
+    const { fed } = federation({ hosts: [hostA], remote: { 'host-a': () => ({ status: origin.status, body: JSON.parse(origin.body) }) } });
+    const listed = JSON.parse((await fed.list()).message);
+    const pane = listed.panes.find((row: { host: string }) => row.host === 'host-a');
+    expect([pane.seat, pane.kind, pane.activityState]).toEqual(['TC', 'codex', 'idle']);
+  } finally { owner.stopAll(); }
 });

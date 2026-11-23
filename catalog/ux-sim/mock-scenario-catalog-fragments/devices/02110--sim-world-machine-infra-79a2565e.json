@@ -1,0 +1,26 @@
+{
+  "id": "sim-world-machine-infra",
+  "name": "SIM-WORLD machine-infra pack",
+  "audience": "internal",
+  "implementation": [
+    "src/ux-sim/sim-world/machine-infra/scenarios.ts",
+    "src/ux-sim/sim-world/machine-infra/worker.ts"
+  ],
+  "tests": ["src/ux-sim/sim-world/kernel.test.ts"],
+  "target": "replays machine/host infrastructure scenarios where every call gets fresh dependencies (as after a CLI restart) and only the ledger carries state",
+  "inputs": [
+    "machine-infra scenario rows",
+    "a fake worker host device (worker.ts)",
+    "a throw-away ledger per scenario"
+  ],
+  "observations": [
+    "state survives only through the ledger between calls",
+    "each verdict goes through the kernel expectation ratchet"
+  ],
+  "entryCommands": [
+    "eln --test=<isolated-state> sim world run machine-infra --seed 1"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

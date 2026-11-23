@@ -71,6 +71,7 @@ function geminiApiKey(): string {
 async function geminiUploadFile(filePath: string): Promise<{ uri: string; name: string }> {
   const apiKey = geminiApiKey();
   const buffer = await readFile(filePath);
+  // llm-ledger-exempt: gemini-file-api
   const startRes = await fetch(
     `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`,
     {
@@ -88,6 +89,7 @@ async function geminiUploadFile(filePath: string): Promise<{ uri: string; name: 
   const uploadUrl = startRes.headers.get('X-Goog-Upload-URL');
   if (!uploadUrl) throw new Error('Gemini Files API 업로드 URL을 받지 못했습니다.');
 
+  // llm-ledger-exempt: gemini-file-api
   const uploadRes = await fetch(uploadUrl, {
     method: 'POST',
     headers: {
@@ -106,6 +108,7 @@ async function geminiUploadFile(filePath: string): Promise<{ uri: string; name: 
 async function geminiDeleteFile(fileName: string): Promise<void> {
   try {
     const apiKey = geminiApiKey();
+    // llm-ledger-exempt: gemini-file-api
     await fetch(`https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${apiKey}`, { method: 'DELETE' });
   } catch { /* ignore */ }
 }

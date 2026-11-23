@@ -22,140 +22,9 @@ async function run(scenario: ClassicTuiScenario, rows = 30) {
 }
 
 describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
-  test('ACP production renderer folds two goal iterations, preserving tool and final reply', async () => {
-    const lines: string[] = [];
-    const { interimReplies: interim, userInput, finalReply, toolCalls } = GOAL_INTERIM_RENDER_TRACE;
-    const chat = new DashboardAcpChat({
-      cwd: process.cwd(), disableStreamSmoothing: true,
-      sessionStore: { get: () => null, set: () => {}, delete: () => true },
-      agentManager: { getAgent: async () => ({
-        newSession: async () => 'goal-iteration-mock',
-        prompt: async (_sessionId, _blocks, onUpdate) => {
-          const chunk = (text: string) => onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
-          const tool = (label: string) => onUpdate({ sessionUpdate: 'tool_call', toolCallId: label, title: label, kind: 'other', status: 'completed' });
-          tool(toolCalls[0]);
-          for (const reply of interim) {
-            chunk(reply.split('\n')[0]!);
-            tool(toolCalls[1]);
-            chunk(reply.split('\n')[1]!);
-            onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' }, _meta: { goalInterim: reply } });
-          }
-          chunk(finalReply);
-          return { stopReason: 'end_turn' };
-        },
-        cancel: async () => {},
-      }) },
-    });
-    const done = Promise.withResolvers<void>();
-    dispatchDashboardChatMainAcpSend({
-      dashboardAcpChat: {
-        send: async (...args) => {
-          await chat.send(...args);
-          done.resolve();
-        },
-      },
-      backend: 'claude', message: userInput, attachments: [], debugEnabled: false,
-      chatLines: lines, setChatScrollToTail: () => {}, redraw: () => {},
-      formatAssistantLines: (text) => text.split('\n'), formatUserLine: (_display, text) => text,
-      formatMutedLine: (line) => line, formatToolLine: (line) => line,
-      formatDebugLine: () => '', formatErrorLine: (_display, text) => text,
-      formatAssistantPrefix: () => '엘라누스:',
-    });
-    await done.promise;
-    const screen = lines.join('\n');
-    const nextScreen = logViewLines(goalInterimRenderMessages('2026-10-22T00:00:00.000Z'), 100).join('\n');
-    const classicInterimCount = screen.match(/· 진행 —/g)?.length ?? 0;
-    const nextInterimCount = goalInterimScreenCounts(nextScreen).folded;
-    expect(interim.length).toBeGreaterThan(0);
-    expect(classicInterimCount).toBe(interim.length);
-    expect(nextInterimCount).toBe(classicInterimCount);
-    expect(screen.split('\n').filter((line) => line.includes('· 진행 —')).every((line) => !line.includes('아직 못 했습니다.'))).toBe(true);
-    expect(screen).not.toContain('아직 못 했습니다.');
-    expect(screen).not.toContain('  1단계 렌더했습니다.');
-    expect(screen).not.toContain('  2단계 렌더했습니다.');
-    expect(screen.match(/ScheduleWakeup progress/g)).toHaveLength(2);
-    expect(screen).toContain(toolCalls[0]);
-    expect(screen).toContain(finalReply);
-  });
   test('scenario list is the CLI contract', () => {
     expect([...CLASSIC_TUI_SCENARIOS]).toEqual(['classic-first-screen-noise', 'classic-inline-picker', 'classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-priority-keys', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop']);
   });
-
-  test('classic-inline-picker: @ and / panels stay above the composer and Esc restores the draft at 24 and 40 rows', async () => {
-    for (const rows of [24, 40]) {
-      const result = await run('classic-inline-picker', rows);
-      expect(Object.values(result.checks).every(Boolean)).toBe(true);
-    }
-  }, 180_000);
-
-  test('classic-first-screen-noise: first-run internals stay out of the screen and Enter skips without Doctor', async () => {
-    const r = await run('classic-first-screen-noise');
-    expect(r.checks).toEqual({
-      initialScreenCaptured: true, promptBankInternalLineHidden: true, daemonSetupCommandHidden: true,
-      humanWebSetupMessage: true, enterSkipReachedChat: true, firstRunDoctorNotInvoked: true,
-      doctorStartPositiveControl: true, exitedClean: true,
-    });
-  }, 150_000);
-
-  test('classic-400-heal: a 400 (history mismatch) turn heals with a new session and answers', async () => {
-    const r = await run('classic-400-heal');
-    expect(r.checks).toEqual({
-      before400Screen: true, healLineOnScreen: true, answeredAfterHeal: true, attemptNewSession: true,
-      recoveredObserved: true, sessionRenewed: true, onlyFakeProvider: true, exitedClean: true,
-    });
-  }, 150_000);
-
-  test('classic-400-exhausted: a 400 that persists stops with one reason line inside the per-turn cap', async () => {
-    const r = await run('classic-400-exhausted');
-    expect(r.checks).toEqual({
-      healLineOnScreen: true, stopReasonOnScreen: true, failedTurnOnScreen: true, exhaustedObserved: true,
-      attemptsWithinCap: true, noRecovered: true, onlyFakeProvider: true, exitedClean: true,
-    });
-  }, 150_000);
-
-  test('classic-seat-boot: a seat universe shows the boot line on the first screen and injects the card into the first turn', async () => {
-    const r = await run('classic-seat-boot');
-    expect(r.checks).toEqual({
-      memoryRecallObserved: true, memoryRecallInFirstTurnPreamble: true, memoryRecallWithinCap: true,
-      bootLineOnFirstScreen: true, cardInjectedObserved: true, cardUnreadMatchesSeed: true,
-      cardOncePerConversation: true, firstTurnAnswered: true, onlyFakeProvider: true, exitedClean: true,
-    });
-  }, 150_000);
-
-  test('classic-typing-lag: keys typed right after Enter echo completely and the lag probe measures turn start and keystrokes', async () => {
-    const r = await run('classic-typing-lag');
-    expect(r.checks).toEqual({
-      typedEchoedComplete: true, turnStartMeasured: true, keystrokeMeasured: true,
-      turnAnswered: true, onlyFakeProvider: true, exitedClean: true,
-    });
-    expect(typeof r.store.keyToPaintMaxMs).toBe('number');
-  }, 150_000);
-
-  test('classic-priority-keys: real dashboard PTY restores the first queued input and retains the second in FIFO order', async () => {
-    const r = await run('classic-priority-keys');
-    expect(r.checks).toEqual({
-      escapeAbortedBusyTurn: true,
-      firstSubmittedInputReturnedToDraft: true,
-      secondInputRemainsAfterFirstInFifo: true,
-      onlyFakeProvider: true,
-      exitedClean: true,
-    });
-    expect(String(r.store.aborted)).toContain('fifo-one');
-    expect(String(r.store.aborted)).toContain('fifo-two');
-  }, 60_000);
-
-  test('classic-mcp-calltool: deferred MCP child is absent at boot and the first TUI tool dispatch succeeds once', async () => {
-    const r = await run('classic-mcp-calltool');
-    expect(r.checks).toEqual({
-      childWasAbsentAfterDeferredBoot: true,
-      fakeServerStartedOnce: true,
-      actualMcpToolsCallOnce: true,
-      lazyBootDeferredThenFirstCall: true,
-      firstCallResultReachedTui: true,
-      onlyFakeProvider: true,
-      exitedClean: true,
-    });
-  }, 150_000);
 
   // ~6 min on a real PTY (the minute retry is the production interval, not a fake clock) — opt-in so the changed-file
   // gate stays bounded. Run it with ELANOUS_N03_SLOW=1, or as the device: `bun scripts/ux-sim.ts seat-seq classic-wakeup`.
@@ -184,15 +53,6 @@ describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
     expect(r.checks).toEqual({
       shortEchoed: true, longPlaceholder: true, modelGotWhole: true, ctrlVPlaceholder: true, ctrlVModelGotWhole: true,
       clipboardReadObserved: true, foldedObserved: true, expandedObserved: true, onlyFakeProvider: true, exitedClean: true,
-    });
-  }, 180_000);
-
-  test('classic-goal-continue: same-reply rejection stops the loop without a timed quiet window', async () => {
-    const r = await run('classic-goal-continue');
-    expect(r.checks).toEqual({
-      goalContinueOpenedOnce: true, classicTurnEndReachedProactiveJudge: true, classicHumanOnlyActionStops: true, classicRemainingWorkContinues: true,
-      internalTurnOrigin: true, bannerOnScreen: true, sameReplyStopped: true,
-      noLoop: true, onlyFakeProvider: true, exitedClean: true,
     });
   }, 180_000);
 

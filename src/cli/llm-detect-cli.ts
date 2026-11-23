@@ -208,14 +208,19 @@ export function registerLlmDetectCommand(program: Command): void {
   // LLM 지출 절감 영수 — SMART-ROUTER-DEMO-SAVINGS(타임리 시연 · OP #116366). 실측 원장(llm-usage)만 · 가격 비공개(비율만).
   llmCommand.command('savings').description('스마트 라우터 절감 영수 — 실측 원장 창의 호출 표 · 고급/전체 · «강 단독» 대비 절감 비율(가격·금액 비공개)')
     .option('--premium-model <모델>', '«강 단독» 기준 모델 id(필수 — 이 모델로 다 돌았을 때와 비교)')
+    .option('--premium-include <모델들>', '고급 호출 수에 추가할 정확한 모델 id(쉼표 구분); 비용 기준 모델은 바꾸지 않는다')
     .option('--minutes <N>', '측정 창(분 · 기본 60)')
     .option('--run-id <id>', '특정 런만')
     .option('--json', 'JSON 출력(영수 수치)')
-    .action(async (opts: { premiumModel?: string; minutes?: string; runId?: string; json?: boolean }) => {
+    .action(async (opts: { premiumModel?: string; premiumInclude?: string; minutes?: string; runId?: string; json?: boolean }) => {
       const { runLlmSavings } = await import('./llm-savings-cli.js');
+      if (opts.premiumInclude !== undefined && opts.premiumInclude.split(',').some(value => !value.trim())) {
+        console.error('--premium-include requires comma-separated model IDs'); process.exitCode = 2; return;
+      }
       const minutes = opts.minutes !== undefined ? Number(opts.minutes) : undefined;
       const result = await runLlmSavings({
         ...(opts.premiumModel !== undefined ? { premiumModel: opts.premiumModel } : {}),
+        ...(opts.premiumInclude !== undefined ? { premiumModels: opts.premiumInclude.split(',').map(value => value.trim()).filter(Boolean) } : {}),
         ...((minutes !== undefined && Number.isFinite(minutes)) ? { minutes } : {}),
         ...(opts.runId !== undefined ? { runId: opts.runId } : {}),
         json: Boolean(opts.json),

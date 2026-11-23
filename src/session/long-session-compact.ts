@@ -1,31 +1,27 @@
-// ── OP-LONG-SESSION-COMPACT core (trigger-only scope) ──
+// ── OP-LONG-SESSION-COMPACT core + ELN-COMPACT-REAL turn-start trigger ──
 //
-// Root cause (D1): `runTurn` trimmed every request to its input cap (DEFAULT_TOKEN_BUDGET = 24k,
-// tokens.ts, unless the caller passes opts.maxTokens) BEFORE anything checked the compaction
-// trigger, which is ratio × min(window, workingBudgetTokens) (compact/auto.ts). For any model whose
-// threshold lies above the cap the trigger was unreachable: turn-start compaction never fired and the
-// oldest rows — the seat instruction first — were dropped silently by the trim.
+// D1 root cause (OP-LONG-SESSION-COMPACT): `runTurn` trimmed every request to its input cap
+// (DEFAULT_TOKEN_BUDGET = 24k) BEFORE anything checked the compaction trigger, so the oldest rows —
+// the seat instruction first — were dropped silently by the trim. The D1 fix clamped the existing
+// ratio threshold to the input cap and measured it on the request as sent.
 //
-// Fix (this scope only): keep the existing threshold, but never above the request's input cap, so
-// the stored session is compacted before the trim would have to cut anything:
-//   trigger = min(ratio × min(window, workingBudgetTokens), inputCap)
-// The cap, the trim and the session compactor themselves are unchanged.
+// ★ ELN-COMPACT-REAL(OP #135458 §4-4①) — the request-as-sent basis fired every turn on the fixed
+// prefix alone (audit W3): a 30k-token system prompt crossed the 24k trigger on turn 1 of a fresh
+// session. The turn-start trigger now measures the RECORD only (the stored history rows — fixed
+// prefix excluded): fire when the record reaches 16k tokens OR the whole measured input (prompt +
+// turn-volatile blocks + images) reaches 60k tokens, whichever comes first. The config working
+// budget no longer lowers the turn-start trigger; the 24k input cap, the trim and the session
+// compactor are unchanged.
 
-import { resolveAutoCompactWindow } from '../compact/auto.js';
-import type { ChatAutoCompactConfig } from '../user-config/chat.js';
+/** ★ ELN-COMPACT-REAL(OP #135458 §4-4①) — 기록 기준: 저장된 기록(고정 접두 제외)이 이만큼 자라면 발화. */
+export const TURN_COMPACT_HISTORY_TOKENS = 16_000; // 출처: #135458
+/** ★ ELN-COMPACT-REAL(OP #135458 §4-4①) — 전체 밸브: 실측 전체 입력(접두·턴 휘발성·이미지 포함)이
+ *  이만큼이면 기록이 짧아도 발화(고정 접두만으로 터지는 낭비도 잡는다). */
+export const TURN_COMPACT_FULL_INPUT_TOKENS = 60_000; // 출처: #135458
 
-/** Turn-start compaction threshold: the existing one, clamped to the request input cap. */
-export function resolveTurnCompactTrigger(
-  modelId: string | undefined,
-  config: Pick<ChatAutoCompactConfig, 'triggerRatio' | 'workingBudgetTokens'>,
-  inputCapTokens: number,
-): number {
-  const windowTokens = resolveAutoCompactWindow(modelId);
-  const budget = config.workingBudgetTokens;
-  const workingBudget = typeof budget === 'number' && Number.isInteger(budget) && budget > 0 ? budget : Number.POSITIVE_INFINITY;
-  const ratio = Number.isFinite(config.triggerRatio) ? Math.min(1, Math.max(0, config.triggerRatio)) : 1;
-  const existingThreshold = Math.floor(ratio * Math.min(windowTokens, workingBudget));
-  return Math.max(0, Math.min(existingThreshold, inputCapTokens));
+/** §4-4① — turn-start compaction fires on the record (16k) OR the full measured input (60k). */
+export function shouldFireTurnStartCompact(historyUsedTokens: number, fullInputTokens: number): boolean {
+  return historyUsedTokens >= TURN_COMPACT_HISTORY_TOKENS || fullInputTokens >= TURN_COMPACT_FULL_INPUT_TOKENS;
 }
 
 interface WireLike { role: string; content: string | unknown[] }

@@ -162,6 +162,16 @@ export interface TaRecycleOutcome {
   minutesStalled: number;
   stopRecorded: boolean;
   skipNote: string;
+  /** 원장 stop은 기록됐지만 카드 원장 쓰기가 실패했다(EACCES 등) — skip-note 미부착, 다음 스윙 재조정 대상(FU-39400). */
+  cardWriteFailed?: boolean;
+  /** 카드 쓰기 실패 뒤 재독까지 실패했다(ENOENT·파서 오류 등) — skip-note 부착 여부가 «불명»이다(terra mustFix 2 · FU-39400 r2).
+   *  cardWriteFailed(미부착 관측)과 구별된다: 단정 없이 미확인 상태로 보존해 다음 스윕이 원장→카드 정합을 판정하게 한다. */
+  cardWriteUnknown?: boolean;
+  /** 잠금 안 콜백 진입 여부(= 정확 runId stop «시도»가 있었는가) — false 면 «잠금 전 오류»(잠금 획득 실패 등)로
+   *  stop 시도 자체가 없었다. 카드 쓰기 실패 catch 경로 outcome 에만 관측한다: stopRecorded=false 가
+   *  «시도했으나 실패»(stopAttempted=true)와 «시도 없음»(잠금 전 오류 · false)으로 갈리는 것을 호출부가 구별하게
+   *  한다(JUD-C #129833 mustFix 2 · FU-39400 r5). */
+  stopAttempted?: boolean;
 }
 
 function defaultRecordStop(input: { runId: string; cause: string; evidenceRef: string; nextMove: string; site?: string }): boolean {
@@ -213,7 +223,14 @@ export function recycleStalledLaunches(cards: readonly TaskCard[], deps: TaRecyc
     // 재시도를 못 한다. 마커만 남긴다: 이벤트 이름이 달라 hasSkipNote 에 걸리지 않고,
     // at 이 관측 시각을 갱신해 다음 회수 창(15분)을 연다(JUD-B HOLD 8a9c06bfb0f4).
     const failNote = `stop-record-failed/${cause}: 정확 runId stop 기록 실패 — 재시도 대상 유지(15분 무진척 ${minutesStalled}분 · runId ${runId}) · 다음 관측에서 다시 회수 시도`;
+    // 출처: terra r5 mustFix 1 — #39574 · stop 시도 자체가 없었던 경우(잠금 획득·진입 전 오류)의 노트:
+    // «stop 기록 실패»(failNote)와 구별해 «시도 안 함» 을 남긴다 — 시도 안 함 ≠ 실패.
+    const stopNotAttemptedNote = `stop-not-attempted/${cause}: stop 시도 자체가 없었다(잠금 획득·진입 전 오류) — 재시도 대상 유지(15분 무진척 ${minutesStalled}분 · runId ${runId}) · 다음 관측에서 회수 재시도`;
     let stopRecorded = false;
+    // 잠금 안 콜백 진입(= stop 시도) 관측 — 잠금 «전» 오류(잠금 획득 실패)와 «잠금 안에서 stop 이 실패한» 경우를
+    // outcome 에서 구별한다(JUD-C #129833 mustFix 2 · FU-39400 r5). 콜백이 return undefined 로 재검증에 밀리면
+    // stop 을 시도하지 않으므로 이 값은 그대로 false 다.
+    let stopAttempted = false;
     let appended = false;
     if (deps.appendHistory) {
       // 순수 spy 경로(디스크 없음) — 잠금이 없으므로 옛 순서(stop → spy 노트)로 기록만 관찰한다.
@@ -222,21 +239,65 @@ export function recycleStalledLaunches(cards: readonly TaskCard[], deps: TaRecyc
     } else {
       // 원장(디스크) 경로 — 임계 구간: 잠금 «안» 재검증을 통과해야만 stop 을 기록하고 노트를 붙인다.
       // 진척(런 생존)·재발사(runId 교체)·중복 회수가 잠금 안에서 보이면 stop 줄도 노트도 남기지 않는다.
-      updateTaskCard(deps.statePath ?? taskAgentStatePath(), card.id, (live) => {
-        if (!live) return undefined; // 관측 사이 삭제 — 노트를 만들지 않는다.
-        if (live.runId !== runId) return undefined; // 재발사로 runId 교체 — 옛 런의 stop·노트 금지.
-        if (findStalledLaunches([live], nowMs).length === 0) return undefined; // 진척 또는 이미 회수 — 자격 상실·중복.
-        // void(성공)와 true 는 기록됨, false 만 실패 — 잠금 안에서 기록한다(런 원장은 별도 파일 · 교착 없음).
-        stopRecorded = recordStop(stopInput) !== false;
-        appended = true;
-        const entry = {
-          at: new Date(nowMs).toISOString(),
-          event: stopRecorded ? TA_SKIP_NOTE_EVENT : TA_STOP_FAILED_EVENT,
-          detail: stopRecorded ? stopNote : failNote,
-          runId,
-        };
-        return { ...live, history: [...(live.history ?? []), entry] } as TaskCard;
-      });
+      try {
+        updateTaskCard(deps.statePath ?? taskAgentStatePath(), card.id, (live) => {
+          if (!live) return undefined; // 관측 사이 삭제 — 노트를 만들지 않는다.
+          if (live.runId !== runId) return undefined; // 재발사로 runId 교체 — 옛 런의 stop·노트 금지.
+          if (findStalledLaunches([live], nowMs).length === 0) return undefined; // 진척 또는 이미 회수 — 자격 상실·중복.
+          // void(성공)와 true 는 기록됨, false 만 실패 — 잠금 안에서 기록한다(런 원장은 별도 파일 · 교착 없음).
+          stopAttempted = true; // recordStop 직전 — 이 줄을 지나면 stop «시도»는 실제로 있었다(잠금 전 오류와 구별).
+          stopRecorded = recordStop(stopInput) !== false;
+          appended = true;
+          const entry = {
+            at: new Date(nowMs).toISOString(),
+            event: stopRecorded ? TA_SKIP_NOTE_EVENT : TA_STOP_FAILED_EVENT,
+            detail: stopRecorded ? stopNote : failNote,
+            runId,
+          };
+          return { ...live, history: [...(live.history ?? []), entry] } as TaskCard;
+        });
+      } catch (error) {
+        // FU-39400(CARD-WRITE-FAIL) — 카드 원장 쓰기 실패(EACCES 등): 잠금은 해제됐다(finally), throw 는 여기서
+        // 끊는다 — 한 카드의 쓰기 실패가 틱 전체와 같은 틱 나머지 카드 회수를 태우지 않게 한다(부분 실패 격리).
+        // 콜백 안 stop 기록이 이미 원장에 남았을 수 있다: 디스크에서 skip-note 부착 여부를 재확인해
+        // «원장 stop 1줄 + 카드 skip-note 0» 상태를 관측 가능한 outcome(stopRecorded=true·skip-note 미부착)로
+        // 보고한다. 재시도 대상 유지 — hasSkipNote 에 걸리지 않아 다음 스윕이 잡아 정합한다(appendRunStopEntryOnce 멱등).
+        appended = false;
+        // 출처: terra r5 mustFix 1 — #39574 · catch outcome 노트: stop 시도가 없었으면(잠금 획득·진입 전 오류)
+        // «시도 안 함» 노트로 구별해 남긴다(outcome·표시 양쪽 보존 — 시도 안 함 ≠ 실패).
+        const outcomeStopNote = stopRecorded ? stopNote : (stopAttempted ? failNote : stopNotAttemptedNote);
+        // 쓰기 실패 뒤 카드 상태는 재독으로만 안다 — 재독 결과 3분기(terra mustFix 1·2 · FU-39400 r2):
+        //   undefined/throw  → 부착 여부 불명(cardWriteUnknown — 미부착으로 단정하지 않는다)
+        //   runId 불일치     → 이 카드는 더 이상 이 런의 것이 아니다 — 다른 런의 skip-note 는 이 런 회수의 증거가 아니다
+        //   같은 runId       → hasSkipNote 만 유일한 부착 증거
+        let onDiskCard: TaskCard | undefined;
+        let rereadFailed = false;
+        try {
+          onDiskCard = readCard(card.id);
+        } catch { rereadFailed = true; /* 재독 실패 — 부착 여부 불명으로 보존 */ }
+        const skipNoteLanded = !!onDiskCard && onDiskCard.runId === runId && hasSkipNote(onDiskCard);
+        if (skipNoteLanded) {
+          // throw 가 쓰기 이후 단계에서 났고 노트는 실제로 랜딩했다 — 정상 회수로 센다.
+          outcomes.push({ cardId: card.id, runId, cause, minutesStalled, stopRecorded, stopAttempted, skipNote: outcomeStopNote });
+        } else if (rereadFailed || !onDiskCard) {
+          // 재독 실패/부재(ENOENT·파서 오류·삭제) — 부착 여부를 알 수 없다: cardWriteUnknown 으로 보존(단정 금지).
+          outcomes.push({ ...cardWriteFailedOutcome({ cardId: card.id, runId, cause, minutesStalled, stopNote: outcomeStopNote, stopRecorded }), cardWriteFailed: false, cardWriteUnknown: true, stopAttempted });
+        } else {
+          // 재독은 성공했지만 skip-note 도 stop 실패 마커도 디스크에 없다 — stopRecorded 무관 같은 상태다.
+          // «stop 기록 false + 쓰기 실패 + 재독 성공» 분기에서 outcome 을 누락하면 이 회수 시도가 관측에서
+          // 사라진다(스튜어드 집계·tasks show 어느 쪽에도 안 오른다 — JUD-C #129833 mustFix 2). 관측값
+          // stopRecorded(false 보존 · 허위 성공 금지) 그대로 cardWriteFailed 로 보고한다 — stopAttempted 로
+          // 잠금 전 오류(시도 없음)와 구별한다.
+          outcomes.push({ ...cardWriteFailedOutcome({ cardId: card.id, runId, cause, minutesStalled, stopNote: outcomeStopNote, stopRecorded }), stopAttempted });
+        }
+        try {
+          const { debug } = require('../debug/log.js') as typeof import('../debug/log.js');
+          debug.log('task-agent', 'card-write-failed', {
+            card: card.id, runId, cause, stopRecorded, stopAttempted, error: error instanceof Error ? error.message : String(error),
+          });
+        } catch { /* 관측은 fail-soft */ }
+        continue; // 이 카드의 회수는 여기서 마감 — 다음 카드로.
+      }
     }
     // 추가가 잠금 아래 재검증을 통과했을 때만 회수 결과로 센다 — 재발사·진척·중복에 밀리면 결과 없이 건너뛴다.
     if (appended) {
@@ -244,6 +305,27 @@ export function recycleStalledLaunches(cards: readonly TaskCard[], deps: TaRecyc
     }
   }
   return outcomes;
+}
+
+/**
+ * FU-39400(CARD-WRITE-FAIL) — 카드 원장 쓰기(EACCES 등)가 실패한 회수의 재조정 outcome:
+ * 원장 stop은 디스크에 남아(appendRunStopEntryOnce 멱등 — 재시도가 두 번째 stop 줄을 적립하지 않는다) 카드 skip-note 만
+ * 빠진 상태다. 관측 가능한 구분: stopRecorded=«실제 기록 결과» + skipNoteAttached=false. stopRecorded 는 호출부의
+ * 실제 관측값을 그대로 보존한다 — 원장 stop 기록까지 실패한 경우(false)를 «성공»으로 허위 보고하지 않는다
+ * (terra r2 mustFix 1 · FU-39400 r3). 재시도 대상 유지 — hasSkipNote 에 걸리지 않는다(스윙이 이 카드를 다시 집어
+ * 원장→카드 정합을 완료한다). 출처: OP #119367 · FU-39400-CARD-WRITE-FAIL.
+ * 외부 소비처가 없어 export 를 제거했다 — 모듈 내부(catch 두 곳) 사용은 유지한다(terra r5 mustFix 3 — #39574).
+ */
+function cardWriteFailedOutcome(input: { cardId: string; runId: string; cause: NoProgressCause; minutesStalled: number; stopNote: string; stopRecorded: boolean }): TaRecycleOutcome {
+  return {
+    cardId: input.cardId,
+    runId: input.runId,
+    cause: input.cause,
+    minutesStalled: input.minutesStalled,
+    stopRecorded: input.stopRecorded, // 실제 관측값 보존 — 하드코드 true 폐지(terra r2 mustFix 1 · FU-39400 r3)
+    skipNote: input.stopNote,
+    cardWriteFailed: true,
+  };
 }
 
 /** LANDING-20 매시 점검 «TA 줄» — 착지 N 중 TA M ⊕ 발사·진행·회수 보조 수. */

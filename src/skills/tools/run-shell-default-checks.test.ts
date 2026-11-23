@@ -33,6 +33,7 @@ case "$1:$2:$3" in
   msg:list:*) printf '[{"id":17,"to":"OP","body":"PRIVATE-MAIL-CANARY"}]' ;;
   msg:count:*) if [ -f '${root}/real-count.ts' ]; then exec '${process.execPath}' '${root}/real-count.ts' "$@"; fi; if [ -f '${root}/count-fail' ]; then exit 7; fi; cat '${root}/count.json' ;;
   msg:unread:*) printf '[{"recipient":"OP","count":1}]' ;;
+  msg:delete:*) printf '{"deleted":1}' ;;
   ops:status:*) printf '{"healthy":true}' ;;
   ops:check-30m:*) if [ -f '${root}/git-fail' ]; then printf '{"complete":false,"error":{"code":"GIT_FAILED","message":"git failed at /private/secret"},"private":"DO-NOT-PROJECT"}'; exit 1; fi; printf '{"originMainFreshness":"origin/main 기준 시각 2026-11-22T09:00:00.000Z(오래됐을 수 있음)","lastFetchAt":"2026-11-22T09:00:00.000Z","fetchStale":true,"legacyQueueRows":2,"version":"0.3.33","landings30m":12,"landingsWithoutPr30m":1,"landingTarget":10,"green":9,"greenDelta":6,"greenDeltaTarget":5,"reviewUnclaimed":1,"malformedQueueRows":0,"unknownQueueRows":2,"unclaimedUnknownQueueRows":1,"trainTickObserved":true,"landingSubObserved":true,"complete":false}' ;;
   release:checklist:status) printf '{"green":4,"yellow":1,"red":0,"done":2}' ;;
@@ -185,11 +186,11 @@ test('inbox tolerance never swallows gate errors, spawn errors, denial, cancella
   }
 });
 
-test('message list and show require prior human approval; unrelated read policies stay intact', async () => {
+test('own seat mail reads run without a grant; a destructive eln verb keeps the signed grant', async () => {
   // Other test files may already have loaded the immutable gateway trust key.
   // Exercise the real signed path in a fresh process, not a mutable test override.
   if (process.env.RUNSHELL_DEFAULT_CHECKS_CHILD !== '1') {
-    const child = spawnSync(process.execPath, ['test', import.meta.path, '--test-name-pattern', 'message list and show require prior human approval'], {
+    const child = spawnSync(process.execPath, ['test', import.meta.path, '--test-name-pattern', 'own seat mail reads run without a grant'], {
       env: { ...process.env, RUNSHELL_DEFAULT_CHECKS_CHILD: '1' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
     });
     expect(child.stderr).toContain('1 pass');
@@ -206,15 +207,12 @@ test('message list and show require prior human approval; unrelated read policie
     expect(scriptCommandPolicy([bin, 'ops', 'status', '--json'])).toBe('approval');
     expect(scriptCommandPolicy([bin, 'msg', 'post', '--to', 'OP'])).toBe('approval');
   }
+  // CEO 11-23 ELS-ELN-SECURITY-RELAX — reading seat mail is neither destructive nor a secret: it runs and is audited.
   const unread = [{ id: 'mail', command: ['eln', 'msg', 'unread', '--to', 'OP', '--json'] }];
-  const unreadDenied = await dispatchRunShell({ script: unread }, { scriptApproval: async () => ({ allowed: true, priorHumanApproval: false }) });
-  expect(unreadDenied.outcome).toBe('denied');
-  expect(() => readFileSync(join(root, 'calls'), 'utf8')).toThrow();
-  // A policy approval is not a spawn grant. Exercise both failure without IPC
-  // and the existing signed, single-use IPC grant path for private mail.
-  const noGrant = await dispatchRunShell({ script: unread }, { scriptApproval: async () => ({ allowed: true, priorHumanApproval: true }), sessionId: 'test-session' });
-  expect(noGrant.outcome).toBe('denied');
-  expect(() => readFileSync(join(root, 'calls'), 'utf8')).toThrow();
+  const unreadRan = await dispatchRunShell({ script: unread }, { scriptApproval: async () => ({ allowed: true, priorHumanApproval: false }) });
+  expect([unreadRan.outcome, unreadRan.exitCode]).toEqual(['exit', 0]);
+  expect(readFileSync(join(root, 'calls'), 'utf8').trim()).toBe('msg unread --to OP --json');
+  writeFileSync(join(root, 'calls'), '');
   const prevHome = process.env.HOME, prevSeat = process.env.ELANOUS_TRACK, prevKey = process.env[RUNSHELL_PUBLIC_KEY_ENV];
   const prevSend = process.send;
   const connectedDescriptor = Object.getOwnPropertyDescriptor(process, 'connected');
@@ -233,20 +231,24 @@ test('message list and show require prior human approval; unrelated read policie
   };
   try {
     const opts = { scriptApproval: async () => ({ allowed: true, priorHumanApproval: true }), sessionId: 'test-session' };
-    const forged = await dispatchRunShell({ script: unread }, opts);
-    expect(forged.outcome).not.toBe('exit');
-    expect(() => readFileSync(join(root, 'calls'), 'utf8')).toThrow();
-    useOtherKey = false;
-    const unreadAllowed = await dispatchRunShell({ script: unread }, opts);
-    expect([unreadAllowed.outcome, unreadAllowed.exitCode]).toEqual(['exit', 0]);
-    expect(readFileSync(join(root, 'calls'), 'utf8').trim()).toBe('msg unread --to OP --json');
-    writeFileSync(join(root, 'calls'), '');
+    // With a seat identity the mail read still runs without a card.
     const script = [{ id: 'mail', command: ['eln', 'msg', 'list', '--to', 'OP', '--json'] }];
     const allowed = await dispatchRunShell({ script }, opts);
     expect([allowed.outcome, allowed.exitCode]).toEqual(['exit', 0]);
     expect(allowed.stdout).toContain('PRIVATE-MAIL-CANARY');
     expect(readFileSync(join(root, 'calls'), 'utf8').trim()).toBe('msg list --to OP --json');
-    expect(grants).toBe(3);
+    expect(grants).toBe(0);
+    writeFileSync(join(root, 'calls'), '');
+    // A destructive verb keeps the signed one-use grant: a forged key never reaches the CLI.
+    const destructive = [{ id: 'drop', command: ['eln', 'msg', 'delete', '17'] }];
+    const forged = await dispatchRunShell({ script: destructive }, opts);
+    expect(forged.outcome).not.toBe('exit');
+    expect(readFileSync(join(root, 'calls'), 'utf8')).toBe('');
+    useOtherKey = false;
+    const granted = await dispatchRunShell({ script: destructive }, opts);
+    expect(granted.outcome).toBe('exit');
+    expect(readFileSync(join(root, 'calls'), 'utf8').trim()).toBe('msg delete 17');
+    expect(grants).toBe(2);
   } finally {
     (process as any).send = prevSend;
     if (connectedDescriptor) Object.defineProperty(process, 'connected', connectedDescriptor);

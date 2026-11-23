@@ -24,7 +24,7 @@ async function registerOpSeat(root: string): Promise<{ exitCode: number; message
 test('real terminal: bare els on an empty state dir → server started, first screen = left list + right shell prompt; keys switch, create, close; ctrl+b q leaves the pane running', async () => {
   const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-app-'));
   const folder = basename(root).toUpperCase();                      // ELS-SIDEBAR-HERDR-CLEAN: the space list shows names UPPERCASE and no pane count
-  const tabCount = (screen: string): number => (screen.split('\n')[0] ?? '').split('⌨').length - 1; // shell tabs in the tab row
+  const tabCount = (screen: string): number => ((screen.split('\n')[0] ?? '').split('│').slice(1).join('│').match(/ SH /g) ?? []).length; // «SH» shell tabs in the tab row (no runtime emoji since OP 11-23)
   let pid = 0;
   try {
     const view = { executable: process.execPath, args: [BIN, '--test-state-dir', '{root}', 'side'], root, rows: 24, cols: 100, env: { SHELL: '/bin/sh', NODE_ENV: 'development' } };
@@ -148,7 +148,7 @@ test('real terminal: bare els lists the herdr panes under ⇄herdr, shows a sele
     expect(run.frames.at(-1)!.screen).toContain('⊟ HERDR · 1');      // selecting one of them opens the bundle …
     expect(run.frames.at(-1)!.screen).toContain('⇄HERDR HERDR_WS'); // … and its workspace is a space under the head
     expect(run.frames.at(-1)!.screen).toContain('HERDR_READ_SCREEN');
-    expect(run.frames.at(-1)!.screen).toContain('🌐 ⇄herdr HERDR_PANE');    // once selected, the pane is the tab (#39322: the ⇄host prefix; its name stays uppercase)
+    expect(run.frames.at(-1)!.screen).toContain('  ⇄herdr HERDR_PANE');    // once selected, the pane is the tab (#39322: the ⇄host prefix; its name stays uppercase)
     pid = Number((await requestEls(elsSocketPath(root), { op: 'ping' })).message.match(/pid (\d+)/)?.[1]);
   } finally {
     if (pid > 0) { try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ } }

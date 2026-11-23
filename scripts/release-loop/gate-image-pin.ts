@@ -520,9 +520,13 @@ async function prebuildFromArgs(args: string[], progress: PrebuildProgress): Pro
       enter('pack-pwa');
       const listing = spawnSync('tar', ['-tzf', archive], { encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
       if (listing.status !== 0) failStage('pack-pwa', listing.status, `package archive unreadable: ${listing.stderr || listing.error}`);
-      if (!listing.stdout.split(/\r?\n/).some((entry) => entry.replace(/^\.\//, '') === 'package/apps/pwa/out/index.html'))
-        failStage('pack-pwa', 1, 'package archive has no package/apps/pwa/out/index.html', { packagePwaPresent: false });
-      passed('pack-pwa');
+      const entries = new Set(listing.stdout.split(/\r?\n/).map((entry) => entry.replace(/^\.\//, '')));
+      if (!entries.has('package/package.json'))
+        failStage('pack-pwa', 1, 'gate layer archive has no package/package.json');
+      // This probe built a gate-runtime layer with ELANOUS_BUILD_GATE_LAYER_ONLY=1.
+      // Its installer allows a missing PWA; release prepare and release-build still require it.
+      passed('pack-pwa', entries.has('package/apps/pwa/out/index.html')
+        ? 'ok' : 'gate layer archive verified; PWA optional and absent');
       enter('push');
       for (const member of members) {
         const registry = member.registry ?? `k3d-elanous-registry:${process.env.ELANOUS_FLEET_REGISTRY_PORT || '5050'}`;

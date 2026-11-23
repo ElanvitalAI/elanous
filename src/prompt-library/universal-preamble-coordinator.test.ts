@@ -26,13 +26,13 @@ afterEach(() => {
 const text = (msgs: ReturnType<typeof buildUniversalPreamble>): string => msgs.map((m) => String(m.content)).join('\n\n');
 
 describe('coordinator preamble profile', () => {
-  test('coordinator: no coding lifecycle, no tree, no GPT-6 persist/permission addendum, profile present', () => {
+  test('coordinator: no coding lifecycle, no tree, no GPT-6 persist, permission addendum and profile present', () => {
     const out = text(buildUniversalPreamble({ cwd, modelFamily: 'gpt', enabledTools: ['Read'], seatRole: 'coordinator' }));
     expect(out).not.toContain('# Coding Agent Pipelines');
     expect(out).not.toContain('## Project Layout');
     expect(out).not.toContain('persist until the user');
     expect(out).not.toContain('Autonomy and persistence');
-    expect(out).not.toContain('Do not introduce unsolicited warnings, disclaimers, approval flows');
+    expect(out).toContain('## When to ask for permission (GPT-6 guidance)');
     expect(out).toContain('## 조율자 프로필');
     expect(out).toContain('위임');
     expect(out).toContain('한 것·남은 것·증거');
@@ -41,13 +41,27 @@ describe('coordinator preamble profile', () => {
     expect(out).toContain('# Environment');
   });
 
-  test('hand seat / no role: exact current preamble (lifecycle, tree, GPT-6 addendum)', () => {
+  test('hand seat adds contract while preserving lifecycle, tree, GPT-6 addendum', () => {
     const plain = text(buildUniversalPreamble({ cwd, modelFamily: 'gpt', enabledTools: ['Read'] }));
     const hand = text(buildUniversalPreamble({ cwd, modelFamily: 'gpt', enabledTools: ['Read'], seatRole: 'hand' }));
-    expect(hand).toBe(plain);
+    expect(hand).toContain('## Seat operating contract (every elanous seat)');
+    expect(plain).not.toContain('## Seat operating contract (every elanous seat)');
     expect(plain).toContain('# Coding Agent Pipelines');
     expect(plain).toContain('## Project Layout');
     expect(plain).toContain('Autonomy and persistence');
     expect(plain).not.toContain('## 조율자 프로필');
   });
+});
+
+test('seat contract pins the complete investigation ladder for both roles', () => {
+  for (const seatRole of ['coordinator', 'hand'] as const) {
+    const out = text(buildUniversalPreamble({ cwd, modelFamily: 'gpt', enabledTools: ['Read'], seatRole }));
+    expect(out).toContain("read the full checklist item's evidence");
+    expect(out).toContain('git log origin/main --grep <work-item>');
+    expect(out).toContain('gh pr list --search <work-item> --state all');
+    expect(out).toContain('inspect `elanous logs` and calculate the observed values');
+    expect(out).toContain('read the relevant seat-state ledger');
+    expect(out).toContain('including a merged PR number when present');
+    expect(out).toContain('do not ask an owner for evidence already found');
+  }
 });

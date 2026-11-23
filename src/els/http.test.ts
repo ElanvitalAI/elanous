@@ -23,8 +23,9 @@ test('GET /els/ls lists this host and its panes from the owner journal', async (
   const body = JSON.parse(answer.body) as { host: string; panes: ({ build?: unknown } & Record<string, unknown>)[] };
   const panes = body.panes.map(({ build, ...row }) => row);
   expect(body.host).toBe('node-b');
-  expect(panes).toEqual([{ ws, tab, pane, title: 'sh', cwd: '/work', state: 'working',
-    badge: 'working', badgeLabel: '[▶ working]', stalled: false, lastEventAtMs: 1_700_000_000_000 }]);
+  expect(panes).toEqual([{ ws, tab, pane, title: 'sh', cwd: '/work', state: 'working', activityState: 'idle', seat: null,
+    badge: 'working', badgeLabel: '[▶ working]', stalled: false, lastEventAtMs: 1_700_000_000_000,
+    status: { state: 'IDLE', since: 1_700_000_000_000, source: 'derived' } }]);
 });
 
 test('GET /els/read answers only for an address of this host that names exactly one pane', async () => {

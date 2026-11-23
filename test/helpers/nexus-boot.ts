@@ -1,4 +1,5 @@
 import { runNexus, type RunNexusHandle, type RunNexusOptions } from '../../src/nexus/index.js';
+import { stopEventLoopWatchdog } from '../../src/debug/event-loop-watchdog.js';
 
 const activeBoots: RunNexusHandle[] = [];
 
@@ -15,5 +16,8 @@ export function drainNexusBoots(): void {
   for (const handle of activeBoots.splice(0).reverse()) {
     try { handle.release(); } catch (error) { errors.push(error); }
   }
+  // runNexus starts the process-wide event-loop watchdog and release does not stop it; stop it here so the
+  // interval and worker do not outlive this file in a shared shard process.
+  stopEventLoopWatchdog();
   if (errors.length > 0) throw new AggregateError(errors, `drainNexusBoots: ${errors.length} release(s) failed`);
 }

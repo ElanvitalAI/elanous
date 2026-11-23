@@ -1,23 +1,23 @@
 /**
  * ELN-SEAT-APPROVAL-POLICY (OP promotion checklist ③ · ELN-SEAT-LIVE 11-18 13:10): an autonomous eln seat has nobody at
- * the keyboard, so every approval prompt (git commit · apt · gcloud ssh on MVP-B / HAND-VM-GOLDEN) sat until its timer
- * and was refused by default — the work stopped. In a seat TUI:
- *   - a command whose argv matches the seat allowlist exactly is approved automatically;
- *   - anything else — destructive, credential, cost, shell expansion, or simply unknown — is asked of OP by mail (HITL),
- *     while the local prompt stays up; the EARLIER answer wins (OP's `accepted`/`rejected` receipt time vs the keyboard).
- * Nothing here ever approves a command the allowlist does not name; the default for the unknown is «ask OP», not «no».
+ * the keyboard, so every approval prompt sat until its timer and was refused by default — the work stopped.
  *
- * Design (#38454 r4 · OP «기본 거부 + argv 정확 일치» Bloom 5, 11-18): 판정 원칙은 공용 모듈(src/security/shell-argv-policy.ts)에
- * 있다 — 자동 승인은 argv 가 허용 목록 항목의 고정 모양과 정확히 일치할 때만 나오고, 메타문자가 하나라도 있거나 환경 접두가
- * NODE_ENV/CI 가 아니면 OP 에게 간다(«안전 명령이니 인자는 자유» 범주는 폐지). 이 파일은 자리몫 게이트(credential · op-only ·
- * destructive · graph)를 그 앞에 두고, 감사 기록은 sha256 감사 해시로 남기되 OP 우편 본문은 비밀만 가린 명령 원문(경로·크기·이유
- * 그대로)에 해시를 덧붙인다(#15 APPROVAL-REQUEST-PLAINTEXT · SEAT-MAIL-EXCHANGE-FIX-1119 — #38454 r4 «해시만» 폐지). The allowlist file
- * itself is OP's single-writer artifact — version + sha256 lock + stable item IDs + revocation tombstones (a resurrected
- * id or a backwards version is refused) at `seat-state/OP/approval-allow/<SEAT>` — read-only here.
+ * SEAT-APPROVAL-DEFAULT-ALLOW (11-23 · ELS-ELN-SECURITY-RELAX «only big irreversible destruction is held; everything
+ * else runs, audited»): the default is inverted. In a seat TUI a Bash command is APPROVED automatically — pipes,
+ * metacharacters, heredocs, env prefixes and unknown commands included — and audited (sha256 + secret-masked command).
+ * The ONLY case that still asks OP by mail is a hold from the shared relaxHold judge (src/shell-primitive/relax-hold.ts:
+ * broad recursive delete outside temp/build dirs · protected roots · data-store destruction · gh repo delete · force push
+ * to main · public tunnels · secrets sent off-machine · guardian off), plus OP's own two doors (`gh pr merge` — landing is
+ * `pr land` — and pattern kills `pkill`/`killall`). No new heuristics live here; the old «default deny + argv exact-match
+ * allowlist» gate and its credential-word / destructive-word scans are gone. The allowlist shapes stay only as rule
+ * names for the audit line (and for the guardian pre-call policy that imports them).
+ * While OP is asked the local prompt stays up; the EARLIER answer wins (OP's `accepted`/`rejected` receipt vs keyboard).
+ * The OP mail body carries the secret-masked command (#15 APPROVAL-REQUEST-PLAINTEXT) plus the sha256 audit hash.
+ * The allowlist file is OP's single-writer artifact at `seat-state/OP/approval-allow/<SEAT>` — read-only here.
  */
-import { classifyDestructive } from '../ask-user-question/guardian.js';
 import { APPROVAL_APPROVED, type ApprovalOutcome } from '../graph-runner/approval-outcome.js';
 import { classifyShellArgv, commandNameFromArgv, parseSeatAllowList, shellArgvAuditSha256, simpleArgv, type AllowShape, type AllowToken } from '../security/shell-argv-policy.js';
+import { relaxHold } from '../shell-primitive/relax-hold.js';
 
 export type SeatApprovalDecision
   = { readonly decision: 'allow'; readonly rule: string; readonly name: string; readonly auditSha256: string }
@@ -132,33 +132,34 @@ export function seatDefaultAllowShapes(): readonly AllowShape[] {
   return SEAT_DEFAULT_ALLOW_SHAPES;
 }
 
-/** Never automatic, whatever any allowlist says: credentials and their files — and the OP-owned allow files themselves. */
-const CREDENTIAL = /(\.ssh\/|id_rsa|id_ed25519|\.env(\s|$|\.)|secrets?\.json|credentials|auth\.json|\btoken\b|api[_-]?key|password|passwd|gh\s+auth|security\s+find-generic-password|approval-allow)/i;
-/** Merge / process-kill — OP's own list (no pkill · no gh pr merge). */
-const OP_ONLY = /(^|\s)(pkill|killall)(\s|$)|\bgh\s+pr\s+merge\b|\bkill\s+-9\b/;
+/** OP's own doors (not a heuristic — two command names in command position): landing is `pr land`, and pattern kills
+ *  (`pkill`/`killall`, the 11-20 macOS pattern-trap incident) are never a seat's call. Exact-PID `kill` runs. */
+const OP_ONLY = /(?:^|[;&|(\n])\s*(?:sudo\s+)?(?:(?:pkill|killall)(?:\s|$)|gh\s+pr\s+merge\b)/;
+
+/** Mail prefix for the only case that still asks OP. */
+export const SEAT_HOLD_LABEL = '큰 비가역 보류 (OP 확인이 필요한 유일한 경우)';
 
 /**
- * Pure policy — 자리몫 게이트(credential · op-only · destructive · graph) 륤 공용 argv 판정으로.
- * 결정 어디에도 인자 원문은 없다: 이유·명령 이름·sha256 감사 해시만 남는다 — 우편 «본문» 의 비밀 가림 원문은 #15(마스킹은 핸들러).
+ * Pure policy — default allow. A Bash command asks OP only when relaxHold holds it (big irreversible harm) or it is one
+ * of OP's own doors; everything else is `allow` with the matching allowlist rule name (or `default-allow`) for the audit.
  */
-export function seatApprovalDecision(command: string, kind: 'bash' | 'graph', extraAllowShapes: readonly AllowShape[] = []): SeatApprovalDecision {
+export function seatApprovalDecision(command: string, kind: 'bash' | 'graph', extraAllowShapes: readonly AllowShape[] = [], cwd: string = process.cwd()): SeatApprovalDecision {
   const auditSha256 = shellArgvAuditSha256(command);
+  // A graph approval node is an explicit human decision point (approval step · publish), not a shell command: it is not
+  // the deny-by-default allowlist rule, so it still goes to OP.
   if (kind !== 'bash') return { decision: 'ask-op', reason: 'graph approval (not a shell command)', name: '(graph)', auditSha256 };
   const parsed = simpleArgv(command.trim());
-  // 기본 표가 먼저다 — 목록 파일 모양은 기본 표가 못 정한 것만 정한다(#38454 Terra ③ 정신).
   const allow = [...SEAT_DEFAULT_ALLOW_SHAPES, ...extraAllowShapes];
   let nameFrom = 0;
   if (parsed !== null) while (nameFrom < parsed.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(parsed[nameFrom]!)) nameFrom += 1;
-  const name = parsed === null || parsed.length === 0 ? '(unparsed)' : commandNameFromArgv(parsed.slice(nameFrom), allow);
-  if (CREDENTIAL.test(command)) return { decision: 'ask-op', reason: 'credential', name, auditSha256 };
-  if (OP_ONLY.test(command)) return { decision: 'ask-op', reason: 'op-only (merge · kill)', name, auditSha256 };
-  const destructive = classifyDestructive(command);
-  if (destructive) return { decision: 'ask-op', reason: `${destructive.severity}: ${destructive.reason}`, name, auditSha256 };
-  if (parsed === null || parsed.length === 0) return { decision: 'ask-op', reason: 'unbalanced quote or empty', name, auditSha256 };
-  const verdict = classifyShellArgv({ command, argv: parsed, allow });
-  return verdict.verdict === 'allow'
-    ? { decision: 'allow', rule: verdict.rule ?? 'allow', name, auditSha256 }
-    : { decision: 'ask-op', reason: verdict.reason, name, auditSha256 };
+  const name = parsed === null || parsed.slice(nameFrom).length === 0 ? '(unparsed)' : commandNameFromArgv(parsed.slice(nameFrom), allow);
+  if (command.trim() === '') return { decision: 'ask-op', reason: 'empty command', name, auditSha256 };
+  if (OP_ONLY.test(command)) return { decision: 'ask-op', reason: 'op-only (gh pr merge · pkill/killall)', name, auditSha256 };
+  // The whole command text is judged as a shell body, so pipes, `&&`, heredocs and `bash -lc` bodies are all seen.
+  const hold = relaxHold(['bash', '-c', command], cwd);
+  if (hold !== null) return { decision: 'ask-op', reason: `${hold.class}: ${hold.reason}`, name, auditSha256 };
+  const named = parsed !== null && parsed.length > 0 ? classifyShellArgv({ command, argv: parsed, allow }) : null;
+  return { decision: 'allow', rule: named?.verdict === 'allow' ? named.rule ?? 'default-allow' : 'default-allow', name, auditSha256 };
 }
 
 // Source: #38163 receipts poll cadence for a waiting seat (one SELECT per tick on an indexed column).
@@ -237,7 +238,7 @@ export function maskApprovalCommandSecrets(command: string): string {
   return masked;
 }
 
-/** Wrap the TUI approval handler for a seat. Auto-approve on the allowlist; otherwise ask OP and the keyboard, earlier wins. */
+/** Wrap the TUI approval handler for a seat. Auto-approve (audited) unless held; a hold asks OP and the keyboard, earlier wins. */
 export function createSeatApprovalHandler(ports: SeatApprovalPorts) {
   const now = ports.now ?? Date.now;
   // #25 APPROVAL-REPEAT-AUTO-DENY (SEAT-MAIL-EXCHANGE-FIX-1119 · 결함 #25): 밤 실측 — 같은 명령의 승인 요청이
@@ -247,14 +248,15 @@ export function createSeatApprovalHandler(ports: SeatApprovalPorts) {
   return async (command: string, callId: string, kind: 'bash' | 'graph', windowMs?: number): Promise<ApprovalOutcome> => {
     const verdict = seatApprovalDecision(command, kind, ports.extraAllowShapes?.() ?? []);
     if (verdict.decision === 'allow') {
-      ports.log('auto-approved', { seat: ports.seat, callId, rule: verdict.rule, auditSha256: verdict.auditSha256 });
-      ports.setStatus(`자리 허용 목록 자동 승인 · ${verdict.rule}`);
+      ports.log('auto-approved', { seat: ports.seat, callId, rule: verdict.rule, command: maskApprovalCommandSecrets(command), auditSha256: verdict.auditSha256 });
+      ports.setStatus(`자동 승인 (감사 기록) · ${verdict.rule}`);
       return APPROVAL_APPROVED;
     }
     const repeatKey = `${kind}:${verdict.auditSha256}`;
     const prior = repeatAsks.get(repeatKey);
-    if (prior?.outcome !== undefined && !prior.outcome.approved) {
-      // JUD ⓑ: 첫 요청이 거부·시간초과로 끝난 뒤의 재발만 즉시 자동 거부한다(창 = 이 핸들러의 세션 수명).
+    if (prior?.outcome !== undefined && !prior.outcome.approved && prior.outcome.reason === 'declined') {
+      // JUD ⓑ: 첫 요청이 명시 거부(declined)로 끝난 뒤의 재발만 즉시 자동 거부한다(창 = 이 핸들러의 세션 수명).
+      // MSG-FILTERS-RELAX: 시간초과·취소로 끝난 요청은 OP 가 답하지 않은 것뿐이다 — 재발은 OP 에 다시 우편으로 묻는다.
       ports.log('approval-repeat-denied', { seat: ports.seat, callId, reason: verdict.reason, auditSha256: verdict.auditSha256, firstAskedAtMs: prior.askedAtMs, firstOutcome: prior.outcome.reason });
       ports.setStatus('같은 승인 요청 반복 — 즉시 자동 거부 (OP 우편 없음)');
       return { approved: false, reason: 'repeat-approval-request' };
@@ -278,7 +280,8 @@ export function createSeatApprovalHandler(ports: SeatApprovalPorts) {
       // #15 APPROVAL-REQUEST-PLAINTEXT (SEAT-MAIL-EXCHANGE-FIX-1119): the body carries the command itself, secrets
       // masked (경로·크기·이유 그대로) so OP can judge it — the sha256 audit hash stays appended. #38454 r4 «hash-only» 폐지.
       const maskedCommand = maskApprovalCommandSecrets(command);
-      mailId = ports.postRequest(`[승인 요청 · ${ports.seat}] ${kind === 'bash' ? 'Bash' : '그래프'} · 이유 ${verdict.reason}\n명령(비밀 가림): ${maskedCommand}\n명령 이름: ${maskApprovalCommandSecrets(verdict.name)} · 감사 해시 sha256:${verdict.auditSha256}\n답: eln msg receipt <이 우편 id> accepted --to OP  |  rejected --to OP --reason "…" (화면에서 y/n 도 됨)`);
+      const label = kind === 'bash' ? `Bash · ${SEAT_HOLD_LABEL}` : '그래프';
+      mailId = ports.postRequest(`[승인 요청 · ${ports.seat}] ${label} · 이유 ${verdict.reason}\n명령(비밀 가림): ${maskedCommand}\n명령 이름: ${maskApprovalCommandSecrets(verdict.name)} · 감사 해시 sha256:${verdict.auditSha256}\n답: eln msg receipt <이 우편 id> accepted --to OP  |  rejected --to OP --reason "…" (화면에서 y/n 도 됨)`);
       ports.log('asked-op', { seat: ports.seat, callId, mailId, reason: verdict.reason, auditSha256: verdict.auditSha256 });
     } catch (error) {
       // Never silent: the keyboard prompt still runs, and the failure is a warn line.

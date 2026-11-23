@@ -61,6 +61,71 @@ export interface GuardianHostLeaseRecord {
   alternatives?: string[];
 }
 
+/** P2-4 lease kinds follow the RFC-guardian-resource-ledger §A2 registry (`host | gate-slot | pod-pool | other`). */
+export const SLOT_LEASE_KINDS = ['host', 'gate-slot', 'pod-pool', 'other'] as const;
+export type SlotLeaseKind = typeof SLOT_LEASE_KINDS[number];
+
+export const SLOT_LEASE_DENIED_REASON_CODES = [
+  'env-image-stale', 'env-namespace', 'env-no-provider', 'capacity-unknown', 'capacity-invalid',
+  'policy-untrusted', 'request-owner-mismatch',
+  'invalid-request', 'ledger-unavailable',
+] as const;
+export type SlotLeaseDeniedReasonCode = typeof SLOT_LEASE_DENIED_REASON_CODES[number];
+
+/** Environment-contract evidence required before any slot-lease grant (§A-L: stale image, namespace, providers). */
+export interface SlotLeaseEnvironment {
+  imageFresh?: boolean;
+  namespace?: string;
+  providersAvailable?: number;
+}
+
+export interface SlotLeaseRequest {
+  requestId: string;
+  kind: SlotLeaseKind;
+  host: string;
+  runId: string;
+  consumer: string;
+  purpose: string;
+  ttlMs: number;
+  lane?: ResourceLane;
+  requiredBy?: string;
+  priority?: string;
+  env?: SlotLeaseEnvironment;
+}
+
+/** Read-only slot-capacity policy value; RES owns the policy, this ledger only consumes it. */
+export interface SlotLeasePolicy {
+  capacity: number;
+  version?: string;
+  /** Policy author identity; only 'RES'-authored ledger rows are trusted at grant time (JUD-2 SEC-FU 필수 2ⓐ). */
+  writtenBy: string;
+}
+
+export type SlotLeaseDecision =
+  | { status: 'granted'; leaseId: string; expiresAt: string; policyVersion?: string }
+  | { status: 'queued'; position: number; alternatives: string[] }
+  | { status: 'denied'; reasonCode: SlotLeaseDeniedReasonCode; alternatives: string[] };
+
+export interface SlotLeaseRecord {
+  leaseId: string;
+  requestId: string;
+  kind: SlotLeaseKind;
+  host: string;
+  runId: string;
+  consumer: string;
+  purpose: string;
+  state: 'requested' | 'active' | 'queued' | 'released' | 'expired' | 'denied';
+  requestedAt: string;
+  lane?: ResourceLane;
+  priority?: string;
+  requiredBy?: string;
+  expiresAt?: string;
+  policyVersion?: string;
+  position?: number;
+  alternatives?: string[];
+  reasonCode?: SlotLeaseDeniedReasonCode;
+}
+
 /** Human-authored, durable policy for the train worker supervisor. */
 export interface TrainWorkerPolicy {
   minWorkers: number;
@@ -111,12 +176,20 @@ export type ResourceLedgerEvent =
   | { event: 'lease-heartbeat'; at: string; id: string; heartbeatAt: string; resources?: ResourceLease['resources'] }
   | { event: 'lease-ended'; at: string; id: string; reason: string; stoppedBy: string }
   | { event: 'lease-reaped'; at: string; id: string; expectedHeartbeatAt: string; expectedExpiresAt: string; observedAt: string; reason: 'expired-and-absent' | 'machine-disappeared' }
+  | { event: 'lease.requested'; at: string; requestId: string; request: SlotLeaseRequest }
+  | { event: 'lease.granted'; at: string; leaseId: string; kind: SlotLeaseKind; host: string; runId: string; consumer: string; expiresAt: string; policyVersion?: string }
+  | { event: 'lease.queued'; at: string; leaseId: string; kind: SlotLeaseKind; host: string; runId: string; consumer: string; position: number; alternatives: string[] }
+  | { event: 'lease.denied'; at: string; leaseId: string; requestId: string; kind: SlotLeaseKind; host: string; runId: string; consumer: string; reasonCode: SlotLeaseDeniedReasonCode; alternatives: string[] }
+  | { event: 'lease.released'; at: string; leaseId: string; reason: string }
+  | { event: 'lease.expired'; at: string; leaseId: string }
+  | { event: 'lease.violation'; at: string; host: string; detail: string; leaseId?: string; runId?: string; consumer?: string }
   | { event: 'pool-declared'; at: string; pool: MachinePoolDeclaration }
   | { event: 'pool-pod-receipt'; at: string; receipt: WarmPoolPodReceipt }
   | GuardianHostLeaseEvent
   | GuardianHostLeaseConflictEvent
   | GuardianHostLeaseAdmittedEvent
   | GuardianHostLeaseAdmissionDeniedEvent
+  | { event: 'slot-capacity-policy'; at: string; writer: 'RES'; policy: { kind: SlotLeaseKind; host: string; capacity: number; version?: string } }
   | { event: 'train-worker-policy'; at: string; policy: TrainWorkerPolicy }
   | { event: 'guardian-cost-snapshot'; at: string; snapshot: GuardianCostSnapshot }
   | { event: 'host-readiness-heartbeat'; at: string; heartbeat: HostReadinessHeartbeat };
@@ -176,6 +249,30 @@ function validGuardianRequest(value: unknown): value is GuardianHostLeaseRequest
     && (value.releaseVersion === undefined || validGuardianText(value.releaseVersion));
 }
 
+const validSlotLeaseKind = (value: unknown): value is SlotLeaseKind =>
+  typeof value === 'string' && (SLOT_LEASE_KINDS as readonly string[]).includes(value);
+
+const validSlotLeaseReasonCode = (value: unknown): value is SlotLeaseDeniedReasonCode =>
+  typeof value === 'string' && (SLOT_LEASE_DENIED_REASON_CODES as readonly string[]).includes(value);
+
+function validSlotLeaseRequest(value: unknown): value is SlotLeaseRequest {
+  if (!isRecord(value)) return false;
+  const env = isRecord(value.env) ? value.env : undefined;
+  return validGuardianText(value.requestId) && validSlotLeaseKind(value.kind)
+    && validHost(String(value.host ?? ''))
+    && ['runId', 'consumer', 'purpose'].every(key => validGuardianText(value[key]))
+    && positive(value.ttlMs)
+    && (value.lane === undefined || RESOURCE_LANES.includes(value.lane as ResourceLane))
+    && (value.requiredBy === undefined || validTimestamp(value.requiredBy))
+    && (value.priority === undefined || validGuardianText(value.priority))
+    && (value.env === undefined || (env !== undefined
+      && (env.imageFresh === undefined || typeof env.imageFresh === 'boolean')
+      // Empty or missing namespace is a representable request; the grant gate denies it as env-namespace (§A-L).
+      && (env.namespace === undefined || typeof env.namespace === 'string')
+      && (env.providersAvailable === undefined || (typeof env.providersAvailable === 'number'
+        && Number.isFinite(env.providersAvailable) && env.providersAvailable >= 0))));
+}
+
 export function resourceLedgerPath(stateDir = elanousStateRoot()): string {
   return join(stateDir, LEDGER_FILE);
 }
@@ -219,8 +316,9 @@ export function readResourceLedgerWithObservations(path = resourceLedgerPath()):
 const KNOWN_RESOURCE_LEDGER_EVENT_TYPES = new Set([
   'llm-proxy-call',
   'lease-created', 'lease-heartbeat', 'lease-ended', 'lease-reaped', 'pool-declared', 'pool-pod-receipt',
+  'lease.requested', 'lease.granted', 'lease.queued', 'lease.denied', 'lease.released', 'lease.expired', 'lease.violation',
   'guardian-host-lease', 'guardian-host-lease-conflict', 'guardian-host-lease-admitted', 'guardian-host-lease-admission-denied',
-  'train-worker-policy', 'guardian-cost-snapshot', 'host-readiness-heartbeat',
+  'train-worker-policy', 'guardian-cost-snapshot', 'host-readiness-heartbeat', 'slot-capacity-policy',
 ]);
 
 export function parseResourceLedgerEvents(text: string): ResourceLedgerEvent[] {
@@ -281,6 +379,45 @@ function parseResourceLedgerEventsWithObservations(text: string): {
       if (!validGuardianText(row.id) || !validTimestamp(row.expectedHeartbeatAt) || !validTimestamp(row.expectedExpiresAt)
         || !validTimestamp(row.observedAt) || !['expired-and-absent', 'machine-disappeared'].includes(String(row.reason)))
         throw new Error(`resource ledger invalid lease reap at line ${index + 1}`);
+    }
+    if (eventType === 'lease.requested') {
+      if (!validGuardianText(row.requestId) || !validSlotLeaseRequest(row.request))
+        throw new Error(`resource ledger invalid slot lease request at line ${index + 1}`);
+    }
+    if (eventType === 'lease.granted') {
+      if (!validGuardianText(row.leaseId) || !validSlotLeaseKind(row.kind) || !validHost(String(row.host ?? ''))
+        || !validGuardianText(row.runId) || !validGuardianText(row.consumer) || !validTimestamp(row.expiresAt)
+        || (row.policyVersion !== undefined && !validGuardianText(row.policyVersion)))
+        throw new Error(`resource ledger invalid slot lease grant at line ${index + 1}`);
+    }
+    if (eventType === 'lease.queued') {
+      if (!validGuardianText(row.leaseId) || !validSlotLeaseKind(row.kind) || !validHost(String(row.host ?? ''))
+        || !validGuardianText(row.runId) || !validGuardianText(row.consumer)
+        || !Number.isSafeInteger(row.position) || Number(row.position) < 1
+        || !Array.isArray(row.alternatives) || !row.alternatives.every(validGuardianText))
+        throw new Error(`resource ledger invalid slot lease queue at line ${index + 1}`);
+    }
+    if (eventType === 'lease.denied') {
+      if (!validGuardianText(row.leaseId) || !validGuardianText(row.requestId) || !validSlotLeaseKind(row.kind)
+        || !validHost(String(row.host ?? '')) || !validGuardianText(row.runId) || !validGuardianText(row.consumer)
+        || !validSlotLeaseReasonCode(row.reasonCode)
+        || !Array.isArray(row.alternatives) || !row.alternatives.every(validGuardianText))
+        throw new Error(`resource ledger invalid slot lease denial at line ${index + 1}`);
+    }
+    if (eventType === 'lease.released') {
+      if (!validGuardianText(row.leaseId) || !validGuardianText(row.reason))
+        throw new Error(`resource ledger invalid slot lease release at line ${index + 1}`);
+    }
+    if (eventType === 'lease.expired') {
+      if (!validGuardianText(row.leaseId))
+        throw new Error(`resource ledger invalid slot lease expiry at line ${index + 1}`);
+    }
+    if (eventType === 'lease.violation') {
+      if (!validHost(String(row.host ?? '')) || !validGuardianText(row.detail)
+        || (row.leaseId !== undefined && !validGuardianText(row.leaseId))
+        || (row.runId !== undefined && !validGuardianText(row.runId))
+        || (row.consumer !== undefined && !validGuardianText(row.consumer)))
+        throw new Error(`resource ledger invalid slot lease violation at line ${index + 1}`);
     }
     if (eventType === 'pool-declared') {
       try { parseMachinePoolDeclarations({ pools: [row.pool] }); }
@@ -359,6 +496,13 @@ function parseResourceLedgerEventsWithObservations(text: string): {
         || Number(policy.scaleUpCpuPercent) >= Number(policy.scaleDownCpuPercent)
         || !Number.isSafeInteger(policy.gateReserveWorkers) || Number(policy.gateReserveWorkers) < 0)
         throw new Error(`resource ledger invalid train worker policy at line ${index + 1}`);
+    }
+    if (eventType === 'slot-capacity-policy') {
+      const policyRow = row.policy;
+      // Source: JUD-2 SEC-FU 필수 2ⓐ — kind·host 실물, capacity 는 0 이상 안전 정수, 작성자는 RES 만.
+      if (row.writer !== 'RES' || !isRecord(policyRow) || !validSlotLeaseKind(policyRow.kind)
+        || !validHost(String(policyRow.host ?? '')) || !Number.isSafeInteger(policyRow.capacity) || Number(policyRow.capacity) < 0)
+        throw new Error(`resource ledger invalid slot capacity policy at line ${index + 1}`);
     }
     if (eventType === 'guardian-cost-snapshot' && !validGuardianCostSnapshot(row.snapshot))
       throw new Error(`resource ledger invalid Guardian cost snapshot at line ${index + 1}`);
@@ -538,6 +682,205 @@ export function endGuardianHostLease(leaseId: string, reason: string, now = new 
     ended = true;
   });
   return ended;
+}
+
+// --- P2-4: generalized slot-lease API (kinds per RFC §A2, request/grant contract per RFC §A12) ---
+
+const slotLeaseId = (kind: SlotLeaseKind, requestId: string) => `slot:${kind}:${requestId}`;
+
+/** Latest durable slot-lease state per leaseId, rebuilt from the append-only ledger. */
+export function slotLeaseRecords(events: readonly ResourceLedgerEvent[]): SlotLeaseRecord[] {
+  const records = new Map<string, SlotLeaseRecord>();
+  for (const event of events) {
+    if (event.event === 'lease.requested') {
+      records.set(slotLeaseId(event.request.kind, event.requestId), {
+        leaseId: slotLeaseId(event.request.kind, event.requestId),
+        requestId: event.requestId, kind: event.request.kind, host: event.request.host,
+        runId: event.request.runId, consumer: event.request.consumer, purpose: event.request.purpose,
+        state: 'requested', requestedAt: event.at, lane: event.request.lane,
+        priority: event.request.priority, requiredBy: event.request.requiredBy,
+      });
+    } else if (event.event === 'lease.granted') {
+      const current = records.get(event.leaseId);
+      if (current) records.set(event.leaseId, { ...current, state: 'active', expiresAt: event.expiresAt,
+        ...(event.policyVersion ? { policyVersion: event.policyVersion } : {}) });
+    } else if (event.event === 'lease.queued') {
+      const current = records.get(event.leaseId);
+      if (current) records.set(event.leaseId, { ...current, state: 'queued', position: event.position,
+        alternatives: [...event.alternatives] });
+    } else if (event.event === 'lease.denied') {
+      const current = records.get(slotLeaseId(event.kind, event.requestId));
+      if (current) records.set(current.leaseId, { ...current, state: 'denied', reasonCode: event.reasonCode,
+        alternatives: [...event.alternatives] });
+    } else if (event.event === 'lease.released' || event.event === 'lease.expired') {
+      const current = records.get(event.leaseId);
+      if (current) records.set(event.leaseId, { ...current,
+        state: event.event === 'lease.released' ? 'released' : 'expired' });
+    }
+  }
+  return [...records.values()];
+}
+
+/** Slot-capacity policy row recorded by RES into the append-only ledger; the ledger only consumes it. */
+export interface SlotCapacityPolicyRow {
+  kind: SlotLeaseKind;
+  host: string;
+  capacity: number;
+  version?: string;
+}
+
+/** Record one RES-authored slot-capacity policy row (RES owns the value; grant-time provenance verifies it). */
+export function recordSlotCapacityPolicy(policy: SlotCapacityPolicyRow, now = new Date(), path = resourceLedgerPath()): void {
+  if (!(SLOT_LEASE_KINDS as readonly string[]).includes(policy.kind) || !validHost(policy.host)
+    || !Number.isSafeInteger(policy.capacity) || policy.capacity < 0)
+    throw new Error('slot capacity policy requires kind, host, and a nonnegative integer capacity');
+  const event: ResourceLedgerEvent = { event: 'slot-capacity-policy', at: now.toISOString(), writer: 'RES', policy };
+  parseResourceLedgerEvents(`${JSON.stringify(event)}\n`);
+  withLedgerLock(path, () => appendEvent(event, path));
+}
+
+/** Latest RES-authored slot-capacity policy row for a kind+host; rows by any other writer are never trusted. */
+export function latestSlotCapacityPolicy(events: readonly ResourceLedgerEvent[], kind: SlotLeaseKind, host: string): SlotCapacityPolicyRow | undefined {
+  return [...events].reverse().find((event): event is Extract<ResourceLedgerEvent, { event: 'slot-capacity-policy' }> =>
+    event.event === 'slot-capacity-policy' && event.writer === 'RES' && event.policy.kind === kind && event.policy.host === host)?.policy;
+}
+
+/**
+ * Generalized reserve→grant entry point for all slot-lease kinds (RFC §A12).
+ * Fail-closed: unreadable ledger, missing environment evidence, or a missing policy
+ * deny new admission instead of proceeding implicitly.
+ */
+export function requestSlotLease(request: SlotLeaseRequest, options: { now?: Date; path?: string; policy?: SlotLeasePolicy } = {}): SlotLeaseDecision {
+  const now = options.now ?? new Date();
+  const target = options.path ?? resourceLedgerPath();
+  const failClosed: SlotLeaseDecision = { status: 'denied', reasonCode: 'ledger-unavailable', alternatives: [] };
+  if (!validSlotLeaseRequest(request)) return { status: 'denied', reasonCode: 'invalid-request', alternatives: [] };
+  let decision: SlotLeaseDecision | undefined;
+  try {
+    withLedgerLock(target, () => {
+      let records: SlotLeaseRecord[];
+      let events: ResourceLedgerEvent[];
+      try { events = readResourceLedger(target); records = slotLeaseRecords(events); }
+      catch { decision = failClosed; return; }
+      const leaseId = slotLeaseId(request.kind, request.requestId);
+      // Lazily expire stale active leases so capacity reflects reality (§A12: no implicit extension).
+      for (const record of records) if (record.state === 'active' && record.expiresAt !== undefined
+        && Date.parse(record.expiresAt) <= now.getTime()) {
+        appendEvent({ event: 'lease.expired', at: now.toISOString(), leaseId: record.leaseId }, target);
+        record.state = 'expired';
+      }
+      const prior = records.find(record => record.leaseId === leaseId);
+      // Replay identity guard (JUD-2 SEC-FU 필수 2ⓑ): only a re-request with host·runId·consumer all equal replays a standing decision.
+      if (prior && prior.state !== 'requested'
+        && (prior.host !== request.host || prior.runId !== request.runId || prior.consumer !== request.consumer)) {
+        appendEvent({ event: 'lease.violation', at: now.toISOString(), host: request.host,
+          detail: `slot lease re-request owner mismatch: leaseId=${leaseId} expected host=${prior.host} runId=${prior.runId} consumer=${prior.consumer}`,
+          leaseId, runId: request.runId, consumer: request.consumer }, target);
+        decision = { status: 'denied', reasonCode: 'request-owner-mismatch', alternatives: [] };
+        return;
+      }
+      if (prior?.state === 'active' && prior.expiresAt) {
+        decision = { status: 'granted', leaseId, expiresAt: prior.expiresAt,
+          ...(prior.policyVersion ? { policyVersion: prior.policyVersion } : {}) };
+        return;
+      }
+      if (prior?.state === 'queued') {
+        decision = { status: 'queued', position: prior.position ?? 1, alternatives: prior.alternatives ?? [] };
+        return;
+      }
+      const alternatives = HOST_LEASE_ALTERNATIVE_HOSTS.filter(host => host !== request.host);
+      appendEvent({ event: 'lease.requested', at: now.toISOString(), requestId: request.requestId, request }, target);
+      // Environment contract first (§A-L): stale image, missing namespace, no provider — then capacity policy.
+      const env = request.env;
+      const policyInput = options.policy;
+      let denial: SlotLeaseDeniedReasonCode | undefined = env?.imageFresh !== true ? 'env-image-stale'
+        : typeof env?.namespace !== 'string' || !env.namespace.trim() ? 'env-namespace'
+        : !(typeof env?.providersAvailable === 'number' && Number.isFinite(env.providersAvailable) && env.providersAvailable >= 1) ? 'env-no-provider'
+        : !policyInput ? 'capacity-unknown'
+        : !Number.isSafeInteger(policyInput.capacity) || policyInput.capacity < 0 ? 'capacity-invalid'
+        : undefined;
+      // Policy provenance (JUD-2 SEC-FU 필수 2ⓐ): trust only RES-authored ledger rows — writer identity and value equality with the latest row.
+      if (!denial) {
+        const ledgerPolicy = latestSlotCapacityPolicy(events, request.kind, request.host);
+        if (policyInput!.writtenBy !== 'RES' || !ledgerPolicy || ledgerPolicy.capacity !== policyInput!.capacity
+          || (ledgerPolicy.version ?? undefined) !== (policyInput!.version ?? undefined)) denial = 'policy-untrusted';
+      }
+      if (denial) {
+        const denialAlternatives = denial === 'capacity-unknown' || denial === 'capacity-invalid' || denial === 'policy-untrusted' ? [...alternatives] : [];
+        appendEvent({ event: 'lease.denied', at: now.toISOString(), leaseId, requestId: request.requestId, kind: request.kind,
+          host: request.host, runId: request.runId, consumer: request.consumer, reasonCode: denial,
+          alternatives: denialAlternatives }, target);
+        decision = { status: 'denied', reasonCode: denial, alternatives: denialAlternatives };
+        return;
+      }
+      const policy = options.policy!;
+      const activeCount = records.filter(record => record.state === 'active'
+        && record.kind === request.kind && record.host === request.host).length;
+      if (activeCount >= policy.capacity) {
+        // Full capacity queues with position and alternative hosts; never over-allocate.
+        const position = records.filter(record => record.state === 'queued'
+          && record.kind === request.kind && record.host === request.host).length + 1;
+        appendEvent({ event: 'lease.queued', at: now.toISOString(), leaseId, kind: request.kind, host: request.host,
+          runId: request.runId, consumer: request.consumer, position, alternatives: [...alternatives] }, target);
+        decision = { status: 'queued', position, alternatives: [...alternatives] };
+        return;
+      }
+      const expiresAt = new Date(now.getTime() + request.ttlMs).toISOString();
+      appendEvent({ event: 'lease.granted', at: now.toISOString(), leaseId, kind: request.kind, host: request.host,
+        runId: request.runId, consumer: request.consumer, expiresAt,
+        ...(policy.version ? { policyVersion: policy.version } : {}) }, target);
+      decision = { status: 'granted', leaseId, expiresAt,
+        ...(policy.version ? { policyVersion: policy.version } : {}) };
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('resource ledger')) return failClosed;
+    throw error;
+  }
+  return decision ?? failClosed;
+}
+
+/** Idempotent release; mirrors the endGuardianHostLease contract (reason required, second call is a no-op). */
+export function releaseSlotLease(leaseId: string, reason: string, now = new Date(), path?: string): boolean {
+  if (!leaseId.trim() || !reason.trim()) throw new Error('slot lease release requires leaseId and reason');
+  const target = path ?? resourceLedgerPath();
+  let released = false;
+  withLedgerLock(target, () => {
+    const current = slotLeaseRecords(readResourceLedger(target)).find(record => record.leaseId === leaseId);
+    if (!current || current.state !== 'active') return;
+    appendEvent({ event: 'lease.released', at: now.toISOString(), leaseId, reason: reason.trim() }, target);
+    released = true;
+  });
+  return released;
+}
+
+/** Append the final lease.expired only if the observed lease version is still current under the ledger lock (CAS). */
+export function reapSlotLeaseIfCurrent(input: { leaseId: string; expectedExpiresAt: string; observedAtMs: number }, path?: string): boolean {
+  if (!input.leaseId.trim() || !Number.isFinite(Date.parse(input.expectedExpiresAt))
+    || !Number.isSafeInteger(input.observedAtMs)) return false;
+  const target = path ?? resourceLedgerPath();
+  let reaped = false;
+  withLedgerLock(target, () => {
+    const current = slotLeaseRecords(readResourceLedger(target)).find(record => record.leaseId === input.leaseId);
+    if (!current || current.state !== 'active' || current.expiresAt !== input.expectedExpiresAt
+      || input.observedAtMs < Date.parse(current.expiresAt ?? '')) return;
+    appendEvent({ event: 'lease.expired', at: new Date(input.observedAtMs).toISOString(), leaseId: current.leaseId }, target);
+    reaped = true;
+  });
+  return reaped;
+}
+
+/** Record an observed §A12 lease violation (e.g. a launch without a grant) in the shared ledger. */
+export function recordSlotLeaseViolation(input: { host: string; detail: string; leaseId?: string; runId?: string; consumer?: string }, now = new Date(), path?: string): void {
+  if (!validHost(input.host) || !input.detail.trim()
+    || (input.leaseId !== undefined && !validGuardianText(input.leaseId))
+    || (input.runId !== undefined && !validGuardianText(input.runId))
+    || (input.consumer !== undefined && !validGuardianText(input.consumer)))
+    throw new Error('invalid slot lease violation report');
+  const target = path ?? resourceLedgerPath();
+  withLedgerLock(target, () => appendEvent({ event: 'lease.violation', at: now.toISOString(), host: input.host,
+    detail: input.detail.trim(), ...(input.leaseId ? { leaseId: input.leaseId } : {}),
+    ...(input.runId ? { runId: input.runId } : {}),
+    ...(input.consumer ? { consumer: input.consumer } : {}) }, target));
 }
 
 export function activeResourceLeases(events: readonly ResourceLedgerEvent[]): ResourceLease[] {

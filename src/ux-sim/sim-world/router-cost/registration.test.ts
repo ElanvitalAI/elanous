@@ -26,7 +26,7 @@ test('router-cost 팩은 ROUTER-QUALITY-GUARD-95(mustFix ①②③)를 quality-s
 
 test('기대표 — router-cost/ROUTER-QUALITY-GUARD-95 green 행(이 PR로 신규 착지)', () => {
   const world = join(import.meta.dir, '../../worlds');
-  const table = parseSimWorldExpectTable(readFileSync(join(world, 'sim-world-expect.json'), 'utf8'));
+  const table = parseSimWorldExpectTable(readFileSync(join(world, 'expect', 'router-cost.json'), 'utf8'));
   expect(table.entries['router-cost/ROUTER-QUALITY-GUARD-95']).toEqual({
     expect: 'green',
     reason: 'lightweight-first guarded routing: per-task premium shadow comparison (exactly one premium evaluation per task, reused as the delivered score on gate failure), per-task-type floors (chat 0.90, unregistered fallback 0.95) and the daily ledger recalc surface land together (jud-39614 mustFix ①②③)',

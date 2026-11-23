@@ -21,6 +21,9 @@ describe('file engine signed spawn', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.text.trim()).toBe('hello');
     expect(() => engine.run({ command: argv, cwd, runShellGrant: grant }, ctx)).toThrow();
-    expect(() => engine.run({ command: argv, cwd }, ctx)).toThrow();
+    const prevTrack = process.env.ELANOUS_TRACK;
+    process.env.ELANOUS_TRACK = callerSeat; // grant route present → an ungranted destructive argv is refused
+    try { expect(() => engine.run({ command: ['/bin/rm', '-rf', '/srv/runshell-file-grant-fixture-absent'], cwd }, ctx)).toThrow(); }
+    finally { if (prevTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = prevTrack; }
   });
 });

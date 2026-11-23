@@ -10,11 +10,15 @@ import { simCli } from '../ux-sim/in-process-cli.js';
 
 const repo = resolve(import.meta.dir, '../..');
 
-async function say(extraEnv: Record<string, string> = {}, flags: string[] = [], activeDuplicate = false, mode: 'in-process' | 'spawn' = 'in-process') {
+// The door decision is judged on a real child: `--test` there pins the LLM to real, so with no credential the run
+// stops at «No LLM provider available» right after dispatch. In-process the bun-test fake LLM is selected instead,
+// and the dispatched run keeps going until the test budget (measured on minim5: 300 s, no exit).
+async function say(extraEnv: Record<string, string> = {}, flags: string[] = [], activeDuplicate = false, mode: 'in-process' | 'spawn' = 'spawn') {
   const root = mkdtempSync(join(tmpdir(), 'launch-door-env-'));
+  const sayId = randomUUID();
   try {
     const state = join(root, 'state');
-    const sentence = `launch door ${randomUUID()}\n대상 경로: src/harness/launch-door-env.test.ts`;
+    const sentence = `launch door ${sayId}\n대상 경로: src/harness/launch-door-env.test.ts`;
     let duplicateRunId: string | undefined;
     let activeDuplicateRuns: readonly string[] = [];
     if (activeDuplicate) {
@@ -70,7 +74,14 @@ async function say(extraEnv: Record<string, string> = {}, flags: string[] = [], 
       } catch { return []; }
     }));
     return { ...result, runLedgers, launchStamps, launchDoorDecisions, duplicateRunId, activeDuplicateRuns };
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    // `harness say` authors its goal file under the checkout it runs in; remove this call's file so the tree stays clean.
+    const goals = join(repo, 'docs', 'goals');
+    if (existsSync(goals)) for (const name of readdirSync(goals)) {
+      if (name.startsWith(`GOAL-launch-door-${sayId}-`)) rmSync(join(goals, name), { force: true });
+    }
+  }
 }
 
 test('default shadow records the launch door without refusing before dispatch', async () => {
@@ -118,7 +129,7 @@ test('enforce refuses before dispatch with an explicit status and reason, even w
     expect(result.stdout).not.toContain('[self-dev] run run-');
     expect(result.launchStamps).toEqual([]);
   }
-});
+}, 300_000);
 
 test('ordinary CLI and queue-tick admit a green signal and allow permission under enforce', async () => {
   const permission = { ELANOUS_LAUNCH_DOOR_MODE: 'enforce', ELANOUS_LAUNCH_DOOR_PERMISSION: 'allow', ELANOUS_LAUNCH_DOOR_SIGNAL: 'green' };

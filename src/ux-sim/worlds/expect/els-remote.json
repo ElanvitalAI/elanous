@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "entries": {
+    "els-remote/SSH-HOST-KEY-MISMATCH": {
+      "expect": "green",
+      "greenSince": "#39350 ELS-SSH-ATTACH-EDGE-FU",
+      "reason": "The pinned SSH command rejects a changed host key before any remote frame."
+    },
+    "els-remote/SSH-UNREGISTERED": {
+      "expect": "green",
+      "greenSince": "#39350 ELS-SSH-ATTACH-EDGE-FU",
+      "reason": "A host absent from the ELS registry cannot start the SSH attach transport."
+    },
+    "els-remote/SSH-DISCONNECT": {
+      "expect": "green",
+      "greenSince": "#39350 ELS-SSH-ATTACH-EDGE-FU",
+      "reason": "A disconnected SSH stream ends once after its last valid frame."
+    }
+  }
+}

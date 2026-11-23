@@ -41,15 +41,22 @@ export interface SchedulerOpts {
   registry: ScheduleEntry[];
   /** Invoked when a tick fires. Caller owns the workflow run
    *  (e.g. via `runWorkflow` with the workflow definition + a fresh
-   *  runId). */
-  runWorkflow: (entry: ScheduleEntry) => void | Promise<void>;
+   *  runId). `scheduledAt` is the occurrence boundary, not the raw
+   *  callback clock: cron is truncated to the minute and interval is
+   *  `floor(now/interval)*interval`, so two daemons a few milliseconds
+   *  apart share one graph-start key. */
+  runWorkflow: (entry: ScheduleEntry, fire: { scheduledAt: number }) => void | Promise<void>;
+  /** Inject for tests. Defaults to Date.now. The occurrence boundary is
+   *  computed from this clock, so a fixed value makes the key stable. */
+  now?: () => number;
   /** Inject for tests so we can use a fake timer. Defaults to globalThis.setInterval. */
   setInterval?: (cb: () => void, ms: number) => IntervalHandle;
   /** Inject for tests. Defaults to globalThis.clearInterval. */
   clearInterval?: (handle: IntervalHandle) => void;
   /** Inject for tests so we can avoid real cron wall-clock waits.
-   *  Defaults to `node-cron`. Must return an object with `stop()`. */
-  cronSchedule?: (expr: string, cb: () => void, timeZone: string) => CronTaskLike;
+   *  Defaults to `node-cron`. Must return an object with `stop()`.
+   *  A test clock may return the workflow promise; production cron drops it. */
+  cronSchedule?: (expr: string, cb: () => void | Promise<void>, timeZone: string) => CronTaskLike;
 }
 
 const MIN_INTERVAL_MS = 1_000;
@@ -65,9 +72,18 @@ export function startScheduler(opts: SchedulerOpts): SchedulerHandle {
   // 옵션을 안 넘기면 node-cron 이 프로세스 주변 TZ 를 쓰는데, launchd 데몬은 `TZ` 를
   // 물려받지 못해 환경에 따라 조용히 밀린다. 계약: src/time/format.ts
   const timeZone = resolveTimeZone().timeZone;
-  const cronScheduleFn: (expr: string, cb: () => void, timeZone: string) => CronTaskLike =
+  const cronScheduleFn: (expr: string, cb: () => void | Promise<void>, timeZone: string) => CronTaskLike =
     opts.cronSchedule
     ?? ((expr, cb, zone) => cron.schedule(expr, cb, { timezone: zone }) as unknown as CronTaskLike);
+  const now = opts.now ?? Date.now;
+  const occurrenceAt = (entry: ScheduleEntry): number => {
+    const clock = now();
+    if (entry.trigger.type === 'interval') {
+      const ms = entry.trigger.interval ?? 0;
+      return ms > 0 ? Math.floor(clock / ms) * ms : clock;
+    }
+    return Math.floor(clock / 60_000) * 60_000;
+  };
 
   const handles: IntervalHandle[] = [];
   const cronTasks: CronTaskLike[] = [];
@@ -87,7 +103,7 @@ export function startScheduler(opts: SchedulerOpts): SchedulerHandle {
         return;
       }
       const h = setIntervalFn(() => {
-        void opts.runWorkflow(entry);
+        void opts.runWorkflow(entry, { scheduledAt: occurrenceAt(entry) });
       }, ms);
       handles.push(h);
     } else if (entry.trigger.type === 'cron') {
@@ -100,9 +116,7 @@ export function startScheduler(opts: SchedulerOpts): SchedulerHandle {
         skipped.push({ entry, reason: `invalid cron expression '${expr}'` });
         return;
       }
-      const task = cronScheduleFn(expr, () => {
-        void opts.runWorkflow(entry);
-      }, timeZone);
+      const task = cronScheduleFn(expr, () => opts.runWorkflow(entry, { scheduledAt: occurrenceAt(entry) }), timeZone);
       cronTasks.push(task);
     } else {
       skipped.push({

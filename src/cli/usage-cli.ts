@@ -52,6 +52,8 @@ export interface UsageCliDeps {
   readonly advisorReadSnapshot?: typeof import('../model-tier/account-window-snapshot.js').readAccountWindowSnapshot;
   /** 구독 조언자 회원 등급 심(jud-39528 mustFix ③) — 원장·스냅숏을 읽기 전 Pro+ 인가를 본다. 기본 = env seam(free fail-closed). */
   readonly advisorMembership?: () => string | null | undefined;
+  /** 구독 조언자 시계 심(terra r1 mustFix ③ · PR 39662 r2) — 주·월 집계 창의 기준 시각. 기본 = 실시간(Date.now). */
+  readonly advisorNow?: () => number;
 }
 
 /** 계정 이름 → CODEX_HOME 기본 표.
@@ -697,6 +699,8 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
       const ledgerInput = subscriptionAdvisorLedgerInput({
         readRunLogs: deps.readRunLogs ?? readRunLogs,
         ...(deps.advisorReadSnapshot ? { readSnapshot: deps.advisorReadSnapshot } : {}),
+        // terra r1 mustFix ③(PR 39662 r2) — 조언자 시계 주입: 없으면 실시간(Date.now). 시험은 고정 시각(실행 날짜 무관).
+        ...(deps.advisorNow ? { now: deps.advisorNow } : {}),
       });
       const report = adviseSubscriptions(ledgerInput);
       if (json) {

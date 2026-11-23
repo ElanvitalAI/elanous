@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "entries": {
+    "machine-infra/OPS-HEAL-RESTART": {
+      "expect": "green",
+      "greenSince": "2026-11-22 (SIM-WORLD-0333-DEVICES · CX-15 원문 052cd31d)",
+      "reason": "a new invocation preserves the prior event and opens one improvement on the third signal"
+    },
+    "machine-infra/OPS-HEAL-DEAD-LOCK": {
+      "expect": "green",
+      "greenSince": "2026-11-22 (SIM-WORLD-0333-DEVICES · CX-15 원문 052cd31d)",
+      "reason": "a dead ledger lock holder is reclaimed before a new heal event is committed"
+    },
+    "machine-infra/OPS-HEAL-CONCURRENT": {
+      "expect": "green",
+      "greenSince": "2026-11-22 (SIM-WORLD-0333-DEVICES · CX-15 원문 052cd31d)",
+      "reason": "two independent heal processes commit two durable ledger rows"
+    },
+    "machine-infra/OPS-HEAL-PROVIDER-REFUSE": {
+      "expect": "green",
+      "greenSince": "2026-11-22 (SIM-WORLD-0333-DEVICES · CX-15 원문 052cd31d)",
+      "reason": "a provider action is rejected before an unresponsive external call can run"
+    }
+  }
+}

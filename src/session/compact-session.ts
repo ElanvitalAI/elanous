@@ -77,6 +77,18 @@ function isAuditRow(m: SerializedMessage): boolean {
   return m.role === 'tool' || m.goalInterim === true;
 }
 
+/** ★ ELN-COMPACT-REAL(OP #135458 §4-4②) — agent/system 전송원(`from`)을 가진 user 행(자리
+ *  우편 알림·시스템 통지)은 원문 보존 대상이 아니다: `[seat-mail <msgId> from <seat>] <첫 줄>`
+ *  한 줄 스텁으로 응축된다. 사람(human/`from` 부재)만 원문 보존 계약(COMPACT P0 OP #123867)의
+ *  대상이다. 행 정체성(role·ts·from·turn_id)은 그대로 두고 content/tokenEstimate만 바꾼다. */
+function stubMailRow(m: SerializedMessage): SerializedMessage {
+  const from = m.from;
+  if (!from || from.kind === 'human') return m;
+  const firstLine = m.content.split('\n', 1)[0] ?? '';
+  const stub = `[seat-mail ${from.msgId ?? '(unnumbered)'} from ${from.seat ?? from.kind}] ${firstLine}`;
+  return { ...m, content: stub, tokenEstimate: estimateTokens(stub) };
+}
+
 /** SerializedMessage → LLM wire role, for conversation rows only (audit rows never get here). */
 function toLLMMessage(m: SerializedMessage): LLMMessage {
   const role: LLMMessage['role'] =
@@ -172,10 +184,13 @@ export async function compactSessionHistory(
   const before = loaded.messages.length;
 
   const rows = loaded.messages;
+  // §4-4② — machine-mail rows enter BOTH the summarizer input and the rewritten store as
+  // one-line stubs (agent/system `from` rows are not preserved verbatim; only human rows are).
+  const stubbed = rows.map(stubMailRow);
   // Conversation rows only; `workingRows[k]` is the stored index of `working[k]`.
   const convoIdx: number[] = [];
   for (let i = 0; i < rows.length; i++) if (!isAuditRow(rows[i]!)) convoIdx.push(i);
-  const llm = convoIdx.map(i => toLLMMessage(rows[i]!));
+  const llm = convoIdx.map(i => toLLMMessage(stubbed[i]!));
   const decision = shouldAutoCompact(llm, opts.modelId, opts.config);
   // Force bypasses the token-ratio gate (external `elanous session compact
   // --force`); otherwise the auto path no-ops below threshold.
@@ -230,7 +245,7 @@ export async function compactSessionHistory(
   }
 
   const ts = new Date().toISOString();
-  const rewritten = rewriteKeepingAuditRows(rows, workingRows, result, ts);
+  const rewritten = rewriteKeepingAuditRows(stubbed, workingRows, result, ts);
   // Deferred commit (codex request-size guard): the same append-keeping write; a changed prefix
   // skips the commit and leaves the store as it is.
   const commit = () => {

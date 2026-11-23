@@ -4,7 +4,8 @@
 //   · openai-codex — 계정별 쿼터 신호 파일(`inspectCodexRotation`): 사용률·「찼다」·관측 시각·신선함(1시간)·명시 계정·건강.
 // 없는 것은 «모름»으로 둔다(지어 넣지 않는다):
 //   · 옛 Codex 신호의 창 리셋 시각 · 버텨야 할 시각 · API 결과당 비용 순위 · 다른 provider 의 계정 목록.
-//   · codex 크레딧 잔액은 신호에 있지만 이 판은 싣지 않는다 — 크레딧 정책은 회전 판정(`codex-account-rotation`)의 몫이고 가격 숫자는 결정 칸에 넣지 않는다.
+//   · codex 크레딧 «잔액 숫자»는 이 판에 없다 — 회전 판정(`codex-account-rotation`)의 몫이고 가격 숫자는 결정 칸에 넣지 않는다.
+//     ROSTER-0334 P2-11 — 크레딧 «보유 여부»(boolean)만 싣는다(창이 어디에도 없을 때 등급 배정의 원천).
 // ⛔ Claude 창(OAuth 조회)·teamclaude 할당량은 «호출»이라 판정 경로에서 읽지 않는다(src/budget/codex-reset-credit-state.ts «판정 경로에서 네트워크를 치지 않는다»).
 
 import { debug } from '../debug/log.js';
@@ -67,6 +68,8 @@ export function readAccountWindowSnapshot(provider: string, deps: AccountWindowS
     candidates.push({
       provider, account: c.name, billing: 'subscription',
       ...(remaining === undefined ? {} : { window: { remaining, ...(resetsAtMs === undefined ? {} : { resetsAtMs }) } }),
+      // ROSTER-0334 P2-11 — 크레딧 «보유 여부»만(잔액 숫자는 회전 판정의 몫 · 가격 숫자는 결정 칸 금지).
+      ...(c.hasCredits === undefined ? {} : { credits: { available: c.hasCredits } }),
     });
   }
   if (unhealthy > 0) observe('snapshot-skip', { provider, reason: 'unhealthy-excluded', count: unhealthy });

@@ -132,6 +132,8 @@ export interface ControlDeps {
   /** Resolves names in the allow list to ids, pining them back to the file (REVIEW-1 must ③). Absent = ids already. */
   readonly resolve?: IdResolver;
   readonly now?: () => number;
+  /** Transport-owned, verified identity check; never derived from a caller-supplied principal. */
+  readonly isActingOperator?: (principal: Principal) => boolean;
   /** Test seam for the audit file. */
   readonly appendAudit?: (path: string, line: string) => void;
   /** A caller's door-front constraint (optional): when it returns a reason, the door refuses the call
@@ -259,7 +261,8 @@ export function authorize(rules: readonly AllowRule[], principal: Principal, tar
 }
 
 /** ELS-OP-ALLOW-RULE(ELS-OP-SMALLWINS ⑦): actions that destroy or relocate work — they need an explicit human confirmation marker or nothing moves. Guards close/move wherever the vocabulary lands (#39025 짝). */
-export const CONFIRM_REQUIRED_ACTIONS: ReadonlySet<string> = new Set(['close', 'move']);
+// CEO 11-23 15:3x 완화(ELS-ELN-SECURITY-RELAX): move is reversible — only close asks, and never for the OP seat.
+export const CONFIRM_REQUIRED_ACTIONS: ReadonlySet<string> = new Set(['close']);
 
 /**
  * ELS-OP-ALLOW-RULE: coded default rules (옵션 0 · 기본 동작). File rules (control-allow.json) stay
@@ -268,8 +271,13 @@ export const CONFIRM_REQUIRED_ACTIONS: ReadonlySet<string> = new Set(['close', '
  * confirmation marker; anything else → deny with audit. Null when the principal carries no seat identity.
  */
 export function defaultDecision(principal: Principal, target: ControlTarget, action: ControlAction, confirmed: boolean): { readonly allow: boolean; readonly reason: string } | null {
-  if (!principal.seat) return null;
-  if (CONFIRM_REQUIRED_ACTIONS.has(action) && !confirmed) return { allow: false, reason: `${action} needs confirm:true (human confirmation)` };
+  // CEO 11-23 15:3x 완화(ELS-ELN-SECURITY-RELAX): a seatless caller (e.g. an eln tool whose seat env did not reach it) may
+  // read/list/status and act on panes like any operator; only close still needs a human confirmation. Audited by the caller.
+  if (!principal.seat) {
+    if (CONFIRM_REQUIRED_ACTIONS.has(action) && !confirmed) return { allow: false, reason: `${action} needs confirm:true (human confirmation)` };
+    return { allow: true, reason: 'default rules (11-23 relaxed): seatless caller allowed, audited' };
+  }
+  if (CONFIRM_REQUIRED_ACTIONS.has(action) && !confirmed && principal.seat !== 'OP') return { allow: false, reason: `${action} needs confirm:true (human confirmation)` };
   if (principal.seat === 'OP') return { allow: true, reason: 'default rules: OP seat commands all panes' };
   if (principal.seat.startsWith('HAND-')) {
     const own = principal.workspaces ?? [];
@@ -484,7 +492,7 @@ export function createControl(deps: ControlDeps) {
         if (auditFailure) return { ok: false, code: 'audit-failed', reason: auditFailure, message: `els ${input.action}: denied; audit not written` };
         return { ok: false, code: 'denied', reason, message: `els ${input.action}: denied (${reason})` };
       }
-      if (CONFIRM_REQUIRED_ACTIONS.has(input.action) && input.confirm !== true) {
+      if (CONFIRM_REQUIRED_ACTIONS.has(input.action) && input.confirm !== true && input.principal.seat !== 'OP') {
         const reason = `${input.action} needs confirm:true (human confirmation)`;
         audit({ ...base, result: 'denied', danger: 'n/a', reason });
         return { ok: false, code: 'denied', reason, message: `els ${input.action}: denied for ${input.principal.id} (${reason})` };
@@ -511,14 +519,15 @@ export function createControl(deps: ControlDeps) {
       // The socket transport authenticates callerSeat/callerPane, then revalidates at execution.
       // File denies override the built-in input rule; legacy allow rows cannot grant input.
       const principal = input.principal;
+      const acting = deps.isActingOperator?.(principal) === true;
       const inputDefault = input.action === 'input' && principal.kind === 'cli'
         && /^local:\d+$/.test(principal.id) && !!principal.callerPane
-        && INPUT_SEATS.includes(principal.callerSeat ?? '');
+        && (INPUT_SEATS.includes(principal.callerSeat ?? '') || acting);
       const inputDenied = input.action === 'input' && inputExplicitlyDenied(rules, principal, input.target);
       const permitted = input.action === 'input' ? inputDefault && !inputDenied
         : authorize(rules, principal, input.target, input.action);
       // ELS-OP-ALLOW-RULE: coded defaults fill the gap when control-allow.json is silent (input keeps its builtin rule).
-      const coded = input.action === 'input' ? null : (permitted ? null : defaultDecision(principal, input.target, input.action, input.confirm === true));
+      const coded = input.action === 'input' ? null : (permitted ? null : defaultDecision(acting ? { ...principal, seat: 'OP' } : principal, input.target, input.action, input.confirm === true));
       const authorization = input.action === 'input' && inputDefault && !inputDenied ? 'builtin-input' : undefined;
       if (!permitted && !coded?.allow) {
         const reason = input.action === 'input' ? (inputDenied ? 'explicit input deny' : 'not in control-allow.json') : (coded?.reason ?? 'not in control-allow.json');
@@ -528,7 +537,7 @@ export function createControl(deps: ControlDeps) {
       }
       // SAME-UID-SEAT-ISOLATION: seats share one UID; a seat may not type into another seat's pane unless shared.
       if (input.action === 'do' || input.action === 'input') {
-        const boundary = sameUidSeatBoundary(principal.callerSeat ?? principal.seat, input.target);
+        const boundary = sameUidSeatBoundary(acting ? 'OP' : principal.callerSeat ?? principal.seat, input.target);
         if (!boundary.allow) {
           const auditFailure = audit({ ...base, result: 'denied', danger: 'n/a', reason: boundary.reason });
           if (auditFailure) return { ok: false, code: 'audit-failed', reason: auditFailure, message: `els ${input.action}: denied; audit not written` };

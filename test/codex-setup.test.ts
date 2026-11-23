@@ -23,16 +23,23 @@ import { CODEX_MODELS } from '../src/codex/models';
 
 let root: string;
 let cfgPath: string;
+let priorStateDir: string | undefined;
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'codex-setup-'));
   cfgPath = join(root, 'config.json');
-  // Isolate OAuth store.
+  // Isolate OAuth store. The test preload pins one process-wide ELANOUS_STATE_DIR,
+  // and authStorePath() follows it ahead of XDG — so each test needs its own,
+  // or tokens saved by one test make the next one see «already signed in».
+  priorStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
   process.env.XDG_CONFIG_HOME = root;
   process.env.CODEX_HOME = join(root, 'codex-home');
 });
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
+  if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+  else process.env.ELANOUS_STATE_DIR = priorStateDir;
   delete process.env.XDG_CONFIG_HOME;
   delete process.env.CODEX_HOME;
 });

@@ -83,13 +83,19 @@ export async function routeElsHttp(core: ElsCore, hostName: string, method: stri
   if (method !== 'GET') return json(405, { error: 'read-only: GET only' });
   if (url.pathname === '/els/ls') {
     const listed = JSON.parse(core.list().message) as { workspaces?: { id: string; role?: string }[]; panes: { tab: string; pane: string; title: string; cwd: string; state: string; address: string; build?: unknown;
-      badge?: string; badgeLabel?: string; stalled?: boolean; lastEventAtMs?: number }[] };
+      seat?: string | null; spaceCoordinator?: boolean; activityState?: string; kind?: string; badge?: string; badgeLabel?: string; stalled?: boolean; lastEventAtMs?: number; status?: unknown }[] };
     const coordinators = new Set((listed.workspaces ?? []).filter((ws) => ws.role === 'coordinator').map((ws) => ws.id));
     // ELS-TAB-STATE-BADGE: stalled is decided HERE, once, by the origin server's clock; a federated reader only carries it.
     return json(200, { host: hostName, workspaces: (listed.workspaces ?? []).filter((ws) => ws.role === 'coordinator'), panes: listed.panes.map((row) => ({ ws: row.address.split('/')[0], tab: row.tab, pane: row.pane,
       ...(coordinators.has(row.address.split('/')[0] ?? '') ? { role: 'coordinator' } : {}),
+      ...(row.spaceCoordinator === true ? { spaceCoordinator: true } : {}),
+      ...(typeof row.activityState === 'string' ? { activityState: row.activityState } : {}),
       title: row.title, cwd: row.cwd, state: row.state, build: row.build,
-      badge: row.badge, badgeLabel: row.badgeLabel, stalled: row.stalled, lastEventAtMs: row.lastEventAtMs })) });
+      ...(['eln', 'codex', 'claude', 'grok', 'shell', 'other'].includes(row.kind ?? '') ? { kind: row.kind } : {}),
+      ...(row.seat === null || (typeof row.seat === 'string' && /^[A-Z][A-Z0-9_-]{0,63}$/.test(row.seat)) ? { seat: row.seat } : {}),
+      badge: row.badge, badgeLabel: row.badgeLabel, stalled: row.stalled, lastEventAtMs: row.lastEventAtMs,
+      // SEAT-STATE-ENUM: the status codes, decided here like the stall (origin clock).
+      ...(row.status !== undefined ? { status: row.status } : {}) })) });
   }
   if (url.pathname === '/els/read') {
     const address = parseAddress(url.searchParams.get('address') ?? '');

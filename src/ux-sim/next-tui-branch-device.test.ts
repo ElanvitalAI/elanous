@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
@@ -15,8 +15,8 @@ test('next TUI memory and decide branches reuse classic behavior in an isolated 
     writeFileSync(join(root, 'config.json'), JSON.stringify({
       onboarding: { completed: true }, errorReports: { enabled: false },
     }));
-    const cwdSlug = realpathSync(root).replace(/\//g, '-').replace(/^-/, '-');
-    const memoryDir = join(root, '.claude', 'projects', cwdSlug, 'memory');
+    // #37989: /memory reads the elanous memory root (<state>/elanous/memory), not Claude Code's ~/.claude/projects store.
+    const memoryDir = join(root, 'elanous', 'memory');
     mkdirSync(memoryDir, { recursive: true });
     writeFileSync(join(memoryDir, 'MEMORY.md'), '# Memory index\n- anchor: isolated TUI memory fixture\n');
     writeFileSync(join(memoryDir, 'anchor.md'), 'description: SIM memory anchor\ntype: note\n\nMEMORY-FACT-733\n');
@@ -42,7 +42,7 @@ test('next TUI memory and decide branches reuse classic behavior in an isolated 
         ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
         ELANOUS_TEST_FAKE_LLM_RESPONSE: '[fake-llm] unexpected chat turn',
       },
-      ready: { label: 'boot', until: 'elanous next ·' },
+      ready: { label: 'boot', until: (screen) => screen.split('\n').includes('elanous') && screen.includes('Ctrl+Q quit') },
       steps: [
         { label: 'memory list canonical', text: '/memory list', until: 'anchor' },
         { label: 'memory show alias', text: '/mem show anchor', until: 'MEMORY-FACT-733' },

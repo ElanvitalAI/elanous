@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "entries": {
+    "els/E-SEAT-STEER-BUSY-SHELL": {
+      "expect": "green",
+      "greenSince": "0.3.33 SEAT-STEER-PREEMPT",
+      "reason": "A real tool loop with fake provider and a held RunShell receives an OP decision during the tool, detaches it, and injects the decision into the next model request before the shell completes."
+    },
+    "els/E-REMOTE-LIVE-TURN": {
+      "expect": "green",
+      "greenSince": "ELS-UPDATE-ALL-GRACEFUL 0.3.33 candidate",
+      "reason": "등록 원격 host의 실제 updateAllElsTabs 부모·자식 호출과 runSeatControl 문을 사용한다. 장치는 외부 SSH 전송과 시간을 대체하고 바쁜 턴 종료 뒤 동일 pane의 새 owner PID·세션·cwd를 주입한다. 실 SSH/TUI/인계 프롬프트는 별도 종단 원문으로 판정한다."
+    },
+    "els/E-REMOTE-TIMEOUT": {
+      "expect": "green",
+      "greenSince": "ELS-UPDATE-ALL-GRACEFUL 0.3.33 candidate",
+      "reason": "등록 원격 호스트의 SSH 무응답을 장치로 주입하면 부모 updateAllElsTabs 결과가 호스트·pane 실패 두 행이 되고 로컬 migrate가 호출되지 않는다."
+    },
+    "els/E-LIVE-CWD-OSC7": {
+      "expect": "green",
+      "greenSince": "ELS-LIVE-CWD candidate",
+      "reason": "실제 ELS core의 PTY 출력 구독에 합성 OSC 7을 주입하고 저널 cwd와 삭제된 폴더·원격 호스트 거부를 확인한다. 실제 셸 cd는 별도 검증이다."
+    },
+    "els/E-HOST-SNAPSHOT-BOUND": {
+      "expect": "green",
+      "greenSince": "ELS-REMOTE-TAB-1/2 worker_hosts read bridge 0.3.33 candidate",
+      "reason": "실제 Nexus HTTP 라우터와 worker_hosts WAL을 장치 시간·라우트 문맥 재생성으로 실행한다. 무자격 401, 만료·철회 비가시 endpoint, principal 회전 뒤 새 generation·origin만 노출, WAL 재개 뒤 철회 보존을 검사하며 원격 ELS 호출은 없다."
+    }
+  }
+}

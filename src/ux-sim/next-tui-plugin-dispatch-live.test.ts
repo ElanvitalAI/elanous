@@ -3,7 +3,6 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { mockSeatPtySequence } from './mock-seat-pty-sequence.js';
-import { NEXT_TUI_TITLE } from '../tui/core/render.js';
 
 // PTY steps use mockSeatPtySequence's existing default; no per-scene timeout policy.
 
@@ -47,13 +46,18 @@ test('next TUI PTY hydrates a plugin graph tool, then refuses an ownerless call 
         ELANOUS_CONFIG_DIR: root,
         ELANOUS_STATE_DIR: root,
       },
-      ready: { label: 'boot', until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') && screen.includes('❯') },
+      ready: { label: 'boot', until: (screen) => screen.split('\n').includes('elanous') && screen.includes('Ctrl+Q quit') && screen.includes('❯') },
       steps: [{
         // Source: 내부 문서 `next-tui-production` B2 PTY receipt uses a bounded isolated turn.
         label: 'plugin round', text: 'PLUGIN-LIVE 제안 적용해줘',
-        until: (screen) => screen.includes('턴 완료'),
+        until: (screen) => screen.includes('Turn done'),
       }, {
-        label: 'owner denial log', keys: '\x1b[5~',
+        // 11-23 next TUI log view: PageUp enters «● log» with every block folded; each Tab unfolds the next level —
+        // L1 for the two plan-status blocks and the two tool rows (4 Tabs), L2 then L3 for each tool (4 more). L3 shows the result body.
+        label: 'log navigation', keys: '\x1b[5~',
+        until: (screen) => screen.includes('● log') && screen.includes('▸ tool · suggest_accept'),
+      }, {
+        label: 'owner denial log', keys: '\t'.repeat(8),
         until: (screen) => screen.includes('graph route requires a verified owner context'),
       }],
       ...(keptRoot ? { artifactPath: join(root, 'pty.json') } : {}),
@@ -67,11 +71,11 @@ test('next TUI PTY hydrates a plugin graph tool, then refuses an ownerless call 
     expect(JSON.parse(search?.toolResult ?? '{}')).toMatchObject({ matched: ['suggest_accept'] });
     expect(JSON.parse(search?.toolResult ?? '{}').content).toContain('"suggestionId"');
     expect(JSON.parse(graph?.toolResult ?? '{}')).toEqual({ error: 'graph route requires a verified owner context' });
-    expect(run.frames.find(frame => frame.label === 'plugin round')?.screen).toContain('턴 완료');
+    expect(run.frames.find(frame => frame.label === 'plugin round')?.screen).toContain('Turn done');
     const screen = run.frames.find(frame => frame.label === 'owner denial log')?.screen ?? '';
-    expect(screen).toContain('턴 로그');
+    expect(screen).toContain('● log');
     expect(screen).toContain('graph route requires a verified owner context');
-    expect(screen).not.toContain('응답 완료');
+    expect(screen).not.toContain('Turn done');
     expect(screen).not.toContain('y/n');
     expect(run.exitCode).toBe(0);
     expect(run.binarySha256).toHaveLength(64);
@@ -111,12 +115,15 @@ test('next TUI demo scene 1 routes injected scrap arguments to the owner gate', 
         }),
         ELANOUS_CONFIG_DIR: root, ELANOUS_STATE_DIR: root,
       },
-      ready: { label: 'boot', until: screen => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: screen => screen.split('\n').includes('elanous') && screen.includes('Ctrl+Q quit') },
       steps: [{
         label: 'scene1 scrap', text: `SCENE1-SCRAP 이 기사 스크랩해줘 ${url}`,
-        until: screen => screen.includes('턴 완료'),
+        until: screen => screen.includes('Turn done'),
       }, {
-        label: 'scene1 owner denial log', keys: '\x1b[5~',
+        label: 'scene1 log navigation', keys: '\x1b[5~',
+        until: screen => screen.includes('● log') && screen.includes('▸ tool · scrap_add'),
+      }, {
+        label: 'scene1 owner denial log', keys: '\t'.repeat(8),
         until: screen => screen.includes('graph route requires a verified owner context'),
       }],
       ...(keptRoot ? { artifactPath: join(root, 'pty.json') } : {}),
@@ -130,8 +137,8 @@ test('next TUI demo scene 1 routes injected scrap arguments to the owner gate', 
     expect(scrap).toBeDefined();
     expect(JSON.stringify(scrap?.toolArgs)).toContain(url);
     expect(JSON.parse(scrap?.toolResult ?? '{}')).toEqual({ error: 'graph route requires a verified owner context' });
-    expect(run.frames.find(frame => frame.label === 'scene1 scrap')?.screen).toContain('턴 완료');
-    expect(run.frames.at(-1)?.screen).toContain('턴 로그');
+    expect(run.frames.find(frame => frame.label === 'scene1 scrap')?.screen).toContain('Turn done');
+    expect(run.frames.at(-1)?.screen).toContain('● log');
     expect(run.frames.at(-1)?.screen).toContain('graph route requires a verified owner context');
     expect(run.exitCode).toBe(0);
     if (keptRoot) console.log(`next TUI demo scene 1 PTY receipt: ${root}`);
@@ -168,11 +175,11 @@ test('next TUI test-world member session reaches graph y/N and N denies executio
           args: { query: 'route:제안 적용해줘' }, after: { name: 'suggest_accept', args: { suggestionId: 'demo' } } }),
         ELANOUS_CONFIG_DIR: root, ELANOUS_STATE_DIR: root,
       },
-      ready: { label: 'boot', until: screen => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: screen => screen.split('\n').includes('elanous') && screen.includes('Ctrl+Q quit') },
       steps: [
         { label: 'approval', text: 'GRAPH-APPROVAL 제안 적용해줘',
-          until: screen => screen.includes('플러그인 그래프 승인 · 요청 내용') && screen.includes('y 승인 · n 거부') },
-        { label: 'N denial', keys: 'n', until: screen => screen.includes('턴 완료') },
+          until: screen => screen.includes('Plugin graph approval · Request details') && screen.includes('y approve · n deny') },
+        { label: 'N denial', keys: 'n', until: screen => screen.includes('Turn done') },
       ],
       ...(keptRoot ? { artifactPath: join(root, 'pty.json') } : {}),
     });
@@ -218,9 +225,9 @@ test('next TUI test world completes scene 1 scrap route with a verified mock Nex
           args: { query: 'route:이 기사 스크랩해줘' }, after: { name: 'scrap_add',
             args: { kind: 'web', text: '축제·콘서트 티켓 대란 — 접속 폭주로 예매 실패', url } } }),
         ELANOUS_CONFIG_DIR: root, ELANOUS_STATE_DIR: root },
-      ready: { label: 'boot', until: screen => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: screen => screen.split('\n').includes('elanous') && screen.includes('Ctrl+Q quit') },
       steps: [{ label: 'scene1 pass', text: `SCENE1-PASS 이 기사 스크랩해줘 ${url}`,
-        until: screen => screen.includes('턴 완료') }],
+        until: screen => screen.includes('Turn done') }],
       ...(keptRoot ? { artifactPath: join(root, 'pty.json') } : {}),
     });
     const calls = readFileSync(join(root, 'next-graph-calls.test.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
@@ -274,11 +281,11 @@ test('next TUI private host session carries briefing and suggestion approval thr
           { name: 'ToolSearch', args: { query: 'route:이 제안 수락' } },
           { name: 'suggest_accept', args: { suggestionId: 'suggestion-kcb-ticket-1' } },
         ] }), ELANOUS_CONFIG_DIR: root, ELANOUS_STATE_DIR: root },
-      ready: { label: 'boot', until: screen => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: screen => screen.split('\n').includes('elanous') && screen.includes('Ctrl+Q quit') },
       steps: [
         { label: 'scene 3 approval', text: 'SCENE2-3 오늘 브리핑 보고 티켓 제안을 수락해줘',
-          until: screen => screen.includes('플러그인 그래프 승인 · 요청 내용') && screen.includes('이 제안을 격리된 앱 복사본에 적용') },
-        { label: 'scene 2 and 3 complete', keys: 'y', until: screen => screen.includes('턴 완료') },
+          until: screen => screen.includes('Plugin graph approval · Request details') && screen.includes('이 제안을 격리된 앱 복사본에 적용') },
+        { label: 'scene 2 and 3 complete', keys: 'y', until: screen => screen.includes('Turn done') },
       ],
       ...(keptRoot ? { artifactPath: join(root, 'pty.json') } : {}),
     });
@@ -329,14 +336,14 @@ test('next TUI scene 5 GCP graph approval denies N and accepts a later y in the 
         ELANOUS_TEST_FAKE_LLM_TOOL_CALL: JSON.stringify({ when: 'SCENE5-GCP', name: 'ToolSearch',
           args: { query: 'route:GCP 확장안' }, after: { name: 'gcp_architect_expand', args: { ticketDesignPath: designPath } } }),
         ELANOUS_CONFIG_DIR: root, ELANOUS_STATE_DIR: root },
-      ready: { label: 'boot', until: screen => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: screen => screen.split('\n').includes('elanous') && screen.includes('Ctrl+Q quit') },
       steps: [
         { label: 'GCP first approval', text: 'SCENE5-GCP 티켓팅 설계 GCP 확장안',
-          until: screen => screen.includes('플러그인 그래프 승인 · 요청 내용') && screen.includes('GCP 확장 설계 그래프를 실행할까요?') },
-        { label: 'GCP N', keys: 'n', until: screen => screen.includes('턴 완료') },
+          until: screen => screen.includes('Plugin graph approval · Request details') && screen.includes('GCP 확장 설계 그래프를 실행할까요?') },
+        { label: 'GCP N', keys: 'n', until: screen => screen.includes('Turn done') },
         { label: 'GCP second approval', text: 'SCENE5-GCP 티켓팅 설계 GCP 확장안',
-          until: screen => screen.includes('플러그인 그래프 승인 · 요청 내용') && screen.includes('GCP 확장 설계 그래프를 실행할까요?') },
-        { label: 'GCP y', keys: 'y', until: screen => screen.includes('턴 완료') },
+          until: screen => screen.includes('Plugin graph approval · Request details') && screen.includes('GCP 확장 설계 그래프를 실행할까요?') },
+        { label: 'GCP y', keys: 'y', until: screen => screen.includes('Turn done') },
       ],
       ...(keptRoot ? { artifactPath: join(root, 'pty.json') } : {}),
     });

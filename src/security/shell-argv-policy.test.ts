@@ -225,6 +225,39 @@ describe('SHELL-POLICY-REDACT-EDGE-FU — #38524 r3 must (JUD 20261118-1835-PREC
   });
 });
 
+describe('seat allowlist scoped API paths', () => {
+  const body = [
+    'version 1',
+    'allow pull gh api repos/<segment>/<segment>/pulls/<number>',
+    'allow comment gh api repos/<segment>/<segment>/issues/comments/<number>',
+  ].join('\n');
+  const parsed = parseSeatAllowList(`${body}\nlock ${sha256(body)}\n`);
+  test('GET endpoints match exactly; other paths, options and shell metacharacters do not', () => {
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error(parsed.error);
+    const verdict = (command: string) => classifyShellArgv({ command, argv: simpleArgv(command) ?? [], allow: parsed.list.shapes }).verdict;
+    expect(verdict('gh api repos/owner/repo/pulls/42')).toBe('allow');
+    expect(verdict('gh api repos/owner/repo/issues/comments/123')).toBe('allow');
+    for (const command of [
+      'gh api repos/owner/repo/pulls/42/files',
+      'gh api repos/owner/repo/issues/42',
+      'gh api repos/owner/repo/pulls/../issues',
+      'gh api repos/owner/repo/pulls/%32',
+      'gh api repos/owner/repo/pulls/42 -X POST',
+      'gh api repos/owner/repo/pulls/42 -X DELETE',
+      'gh api repos/owner/repo/pulls/42 -f title=x',
+      'gh api repos/owner/repo/pulls/42?x=y',
+      'gh api repos/owner/repo/pulls/42;echo bad',
+    ]) expect(verdict(command)).not.toBe('allow');
+  });
+  test('unknown and malformed placeholders fail closed', () => {
+    for (const template of ['repos/<owner>/pulls/<number>', 'repos/<segment>/../pulls/<number>', 'repos/<segment>/pulls/<number>/']) {
+      const bad = `version 1\nallow bad gh api ${template}`;
+      expect(parseSeatAllowList(`${bad}\nlock ${sha256(bad)}\n`).ok).toBe(false);
+    }
+  });
+});
+
 describe('SHELL-POLICY-REDACT-EDGE-FU — Terra #38524 처분 3 (dispositions-76d092c6b9fe.json)', () => {
   const lockOf = (body: string): string => createHash('sha256').update(body, 'utf8').digest('hex');
   const listText = (body: string): string => `${body}\nlock ${lockOf(body)}\n`;

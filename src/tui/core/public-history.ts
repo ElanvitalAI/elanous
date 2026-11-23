@@ -1,6 +1,6 @@
 import { stripQueueModelContext } from '../../chat/interjection.js';
 import type { SerializedMessage } from '../../session/index.js';
-import { projectKnownAuthFailure, streamReplyFailure, streamReplyFinal } from './next-public-reply.js';
+import { projectKnownAuthFailure, savedFailureCause, streamReplyFailure, streamReplyFinal } from './next-public-reply.js';
 
 /** Preserve saved indexes for log anchors while showing only the final public answer in the basic chat view. */
 export function nextTuiPublicHistory(messages: readonly SerializedMessage[], omitLastTurnAnswer = false): SerializedMessage[] {
@@ -21,7 +21,7 @@ export function nextTuiPublicHistory(messages: readonly SerializedMessage[], omi
     if (message.replyFailure !== true && message.replyFinal === undefined && !legacyLastAnswer) { candidate = -1; return; }
     const turnId = String(message.turn_id ?? `history-${turn}`);
     const answer = message.replyFailure === true
-      ? (projectKnownAuthFailure(message.replyFailureKind) ?? streamReplyFailure(turnId))
+      ? (projectKnownAuthFailure(message.replyFailureKind) ?? withSavedCause(streamReplyFailure(turnId), message.content))
       : streamReplyFinal(turnId, message.content);
     const publicAnswer = message.replyFinal === undefined && legacyLastAnswer
       ? `이전 버전 기록 · 완료 여부 확인 안 됨\n\n${answer}` : answer;
@@ -45,4 +45,10 @@ export function nextTuiPublicHistory(messages: readonly SerializedMessage[], omi
   }
   if (!omitLastTurnAnswer) commit(true);
   return visible;
+}
+
+/** NEXT-TUI-FEATURE-COMPLETE ② — keep the known cause label the live turn showed. */
+function withSavedCause(notice: string, saved: string): string {
+  const cause = savedFailureCause(saved);
+  return cause ? `${notice} (${cause})` : notice;
 }

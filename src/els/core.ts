@@ -16,10 +16,12 @@ import { osc7CwdParser } from './osc7-cwd.js';
 import { createProcCwdReader } from './proc-cwd.js';
 import { isAbsolute } from 'node:path';
 import { addPane, addTab, findPane, findWorkspace, journalIds, patchPane, upsertWorkspace } from './journal.js';
+import { createSeatStatusClock, seatStatusOf, type ReportedSeat } from './seat-status.js';
 import { emptyJournal, paneAddress, type Pane, type PaneState, type SpaceJournal, type Tab, type Workspace } from './space.js';
 import { paneStatus } from './pane-status.js';
 import { tabBadge } from './tab-badge.js';
 import type { Foreground } from './foreground.js';
+import type { AgentEventFrame } from '../agent-events/protocol.js';
 import type { SpawnParent } from './server-auth.js';
 import { grepScreens, type GrepHit } from './pane-grep.js';
 import { readUnreadMailBadges, type UnreadMailBadge } from '../msg/msg-store.js';
@@ -63,6 +65,9 @@ export interface ElsPty {
   resize?(cols: number, rows: number): void;
   /** When the PTY last produced output (ms) — absent = not known (ELS-PANE-STATUS says unknown). */
   lastOutputAt?(): number | undefined;
+  /** ELS-WHEEL-SCROLLBACK (OP #136704): true while this pane's emulator is on the alternate screen tracking its own mouse —
+   *  a wheel there belongs to the pane program as bytes (the els scrollback lane is empty on an alternate screen). Absent = not known. */
+  wheelPassthrough?(): boolean;
   /** The shell's process id (ELS-PANE-AGENT-DETECT reads its terminal's foreground group); absent = not known. */
   readonly pid?: number;
   /** OS identity captured when the holder's PTY generation was bound. */
@@ -81,6 +86,7 @@ export interface ElsCoreDeps {
   readonly reattach?: (pane: Pane) => ElsPty | undefined;
   /** OP #128343(OP 승인 #128469): a closed pane's server-minted credential is revoked — the server forgets its pane token. */
   readonly onPaneClosed?: (paneId: string) => void;
+  readonly onTabMoved?: (panes: readonly string[], workspace: string) => void;
   /** D1b: read (non-destructively) a reboot-orphaned pane's saved screen snapshot (holder's <paneId>.snap.json);
    *  returns the restored screen, or undefined when none remains. */
   readonly restoreScreen?: (paneId: string) => string | undefined;
@@ -114,6 +120,8 @@ export interface ElsNewInput {
   readonly parent?: SpawnParent;
   /** Server-verified creator, never sourced from request data. */
   readonly ownerSeat?: string;
+  /** Persistent display identity, not an authorization principal. */
+  readonly seatIdentity?: string;
 }
 
 // 출처: ids carry 8 random hex digits (32 bits); retrying this many times on a collision is enough for any journal
@@ -159,6 +167,20 @@ export const EXITED_PANE_RETENTION_MS = 30 * 60_000;
 export const DEFAULT_PANE_COLS = 80;
 export const DEFAULT_PANE_ROWS = 24;
 
+// ELS-POD-TAB (출처: seat-state/OP/orders/WORKER-MIGRATION-PHASE1-1119.md 45행): a pane whose foreground executable
+// is kubectl is a Pod tab — this host's own els reads the pod's log stream through it (the credentials stay on this
+// host), so its physical place is a pod runtime under the workspace's host, never another workspace or host. Runtime
+// wrappers are skipped — the same executable-only rule as the tab emoji (#38438 review must[2]).
+const PLACE_WRAPPERS = new Set(['bun', 'bunx', 'node', 'npm', 'npx', 'pnpm', 'yarn', 'deno']);
+const podRuntime = (command: readonly string[]): boolean => {
+  let at = 0;
+  while (at + 1 < command.length && PLACE_WRAPPERS.has(command[at]!.split('/').pop() ?? command[at]!)) at++;
+  return (command[at]?.split('/').pop() ?? '') === 'kubectl';
+};
+
+/** ELS-POD-TAB: a pod pane's control inbox keeps at most this many memos (the newest) — the journal validates the same bound. */
+const POD_INBOX_MAX = 32;
+
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 export function createElsCore(deps: ElsCoreDeps) {
@@ -179,6 +201,12 @@ export function createElsCore(deps: ElsCoreDeps) {
   const now = deps.now ?? Date.now;
   /** ELS-PANE-AGENT-DETECT: what each live pane runs in its foreground now (refreshed by the server). */
   const foregrounds = new Map<string, Foreground>();
+  // SEAT-STATE-ENUM: `seat` = the last code report of the current state (cleared by a turn boundary or a v1 state word).
+  const agentTurns = new Map<string, { sid: string; seq: number; state: PaneState | undefined; turnId: string | undefined; old: Set<string>;
+    seat?: ReportedSeat; waitingInput?: boolean; model?: string }>();
+  const seatClock = createSeatStatusClock(() => now());
+  // Recent PTY output is the activity signal for external agent CLIs (30 seconds).
+  const AGENT_OUTPUT_ACTIVE_MS = 30_000;
   /** `do` lines waiting for a pane whose turn is running (memory only: a restart drops them). */
   const queues = new Map<string, { from: string; text: string; typed?: boolean; audit?: QueueAudit; validate?: () => Promise<boolean> }[]>();
   const lastDelivery = new Map<string, number>();
@@ -698,13 +726,15 @@ export function createElsCore(deps: ElsCoreDeps) {
         paneId = freshId('p', taken);
       } catch (error) { return { exitCode: 1, message: `els new: ${message(error)}` }; }
       let pty: ElsPty;
-      try { pty = deps.spawn(input.command, input.cwd, label, { ELANOUS_ELS_WS: ws.name, ELANOUS_ELS_PANE: paneId }, input.parent); }
+      try { pty = deps.spawn(input.command, input.cwd, label, { ELANOUS_ELS_WS: ws.name, ELANOUS_ELS_PANE: paneId, ...((input.seatIdentity ?? input.ownerSeat) ? { ELANOUS_TRACK: (input.seatIdentity ?? input.ownerSeat)! } : {}) }, input.parent); }
       catch (error) { return { exitCode: 1, message: `els new: failed to spawn: ${message(error)}` }; }
       let address = '';
       try {
         const tab: Tab = { id: tabId, workspaceId: ws.id, label, focusPaneId: paneId };
         const pane: Pane = { id: paneId, tabId, kind: 'pty', title: label, cwd: input.cwd, command: input.command,
-          state: 'working', restore: 'cwd', ptyId: pty.id, scrollback: '', ...(input.ownerSeat ? { ownerSeat: input.ownerSeat } : {}) };
+          state: 'working', restore: 'cwd', ptyId: pty.id, scrollback: '', ...(input.ownerSeat ? { ownerSeat: input.ownerSeat } : {}),
+          ...(input.seatIdentity ? { seatIdentity: input.seatIdentity } : {}),
+          ...(podRuntime(input.command) ? { place: { host: ws.host, runtime: 'pod' as const } } : {}) };
         address = paneAddress(ws, tab, pane);
         firstSeen.set(pane.id, now());
         commit(addPane(addTab(existing ? journal : upsertWorkspace(journal, ws), tab), pane));
@@ -756,6 +786,58 @@ export function createElsCore(deps: ElsCoreDeps) {
       return { exitCode: 0, message: result };
     },
 
+    /** Server-local HQ designation, distinct from workspace coordinator roles. */
+    setHqCoordinator(seat: string): ElsResult {
+      if (typeof seat !== 'string' || !/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(seat))
+        return { exitCode: 2, message: 'els hq coordinator: valid seat required' };
+      if (journal.hqCoordinatorSeat === seat) return { exitCode: 0, message: `els hq coordinator: ${seat} (unchanged)` };
+      if (journal.hqCoordinatorSeat) return { exitCode: 1, message: `els hq coordinator: already assigned to ${journal.hqCoordinatorSeat}; cannot assign ${seat}` };
+      const matches = journal.panes.filter(p => p.kind === 'pty' && (p.seatIdentity ?? seatOf(p.cwd)) === seat);
+      if (matches.length !== 1) return { exitCode: 1, message: `els hq coordinator: seat ${seat} ${matches.length ? 'is duplicated' : 'not found'}` };
+      try { commit({ ...journal, hqCoordinatorSeat: seat }); }
+      catch (error) { return { exitCode: 1, message: `els hq coordinator: not saved: ${message(error)}` }; }
+      return { exitCode: 0, message: `els hq coordinator: ${seat}` };
+    },
+
+    /** Designate a seat already present exactly once in this space; preserve the global coordinator role. */
+    setSpaceCoordinator(ref: string, seat: string): ElsResult {
+      if (typeof ref !== 'string' || !ref.trim() || typeof seat !== 'string' || !/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(seat))
+        return { exitCode: 2, message: 'els ws coordinator: workspace and valid seat required' };
+      const ws = findWorkspace(journal, ref);
+      if (!ws) return { exitCode: 1, message: `els ws coordinator: unknown workspace ${ref}` };
+      const matches = journal.panes.filter(pane => pane.kind === 'pty' && seatOf(pane.cwd) === seat);
+      if (matches.length !== 1) return { exitCode: 1, message: `els ws coordinator: seat ${seat} ${matches.length ? 'is duplicated' : 'not found'}` };
+      const tab = journal.tabs.find(row => row.id === matches[0]!.tabId);
+      if (tab?.workspaceId !== ws.id) return { exitCode: 1, message: `els ws coordinator: seat ${seat} is not in ${ws.name}` };
+      if (journal.workspaces.some(row => row.id !== ws.id && row.coordinatorSeat === seat))
+        return { exitCode: 1, message: `els ws coordinator: seat ${seat} already coordinates another workspace` };
+      if (ws.coordinatorSeat === seat) return { exitCode: 0, message: `els ws coordinator: ${ws.name} = ${seat} (unchanged)` };
+      const workspaces = journal.workspaces.map(row => row.id === ws.id ? { ...row, coordinatorSeat: seat } : row);
+      try { commit({ ...journal, workspaces }); }
+      catch (error) { return { exitCode: 1, message: `els ws coordinator: not saved: ${message(error)}` }; }
+      return { exitCode: 0, message: `els ws coordinator: ${ws.name} = ${seat}` };
+    },
+
+    /** Only an authenticated owner view calls this after selecting a local pane. */
+    rememberFocus(ref: string): void {
+      const hit = resolve(ref);
+      if (!hit) return;
+      const lastFocus = { workspaceId: hit.ws.id, tabId: hit.tab.id, paneId: hit.pane.id };
+      const old = journal.lastFocus;
+      if (old?.workspaceId === lastFocus.workspaceId && old.tabId === lastFocus.tabId && old.paneId === lastFocus.paneId) return;
+      const error = persist({ ...journal, lastFocus });
+      if (error) process.stderr.write(`els: focus not saved yet: ${error}\n`);
+    },
+
+    /** Record an empty local workspace only; stale IDs and populated spaces are refused. */
+    rememberEmptyWorkspace(ref: string): void {
+      const ws = journal.workspaces.find(row => row.id === ref);
+      if (!ws || journal.tabs.some(tab => tab.workspaceId === ws.id && journal.panes.some(pane => pane.tabId === tab.id))) return;
+      if (journal.lastFocus?.workspaceId === ws.id && journal.lastFocus.tabId === undefined) return;
+      const error = persist({ ...journal, lastFocus: { workspaceId: ws.id } });
+      if (error) process.stderr.write(`els: focus not saved yet: ${error}\n`);
+    },
+
     list(): ElsResult {
       // An explicit role wins; otherwise select the first OP workspace, without writing on the listing path.
       const coordinator = coordinatorOf();
@@ -765,14 +847,20 @@ export function createElsCore(deps: ElsCoreDeps) {
       // journal order inside a tab — so every client (els, the eln side tab) draws the same list from the same answer.
       const wsAt = (id: string): number => workspaces.findIndex((row) => row.id === id);
       const tabAt = (id: string): number => journal.tabs.findIndex((row) => row.id === id);
+      const isSpaceCoordinatorTab = (tab: Tab): boolean => {
+        const seat = journal.workspaces.find(ws => ws.id === tab.workspaceId)?.coordinatorSeat;
+        if (!seat) return false;
+        const matches = journal.panes.filter(pane => pane.kind === 'pty' && seatOf(pane.cwd) === seat);
+        return matches.length === 1 && matches[0]!.tabId === tab.id;
+      };
       const ordered = journal.panes.map((pane, index) => ({ pane, index, tab: journal.tabs.find((row) => row.id === pane.tabId) }))
         .filter((row): row is { pane: Pane; index: number; tab: Tab } => row.tab !== undefined)
-        .sort((a, b) => wsAt(a.tab.workspaceId) - wsAt(b.tab.workspaceId) || tabAt(a.tab.id) - tabAt(b.tab.id) || a.index - b.index);
+        .sort((a, b) => wsAt(a.tab.workspaceId) - wsAt(b.tab.workspaceId) || Number(isSpaceCoordinatorTab(b.tab)) - Number(isSpaceCoordinatorTab(a.tab)) || tabAt(a.tab.id) - tabAt(b.tab.id) || a.index - b.index);
       const desired = desiredSha();
       // JUD #39000 FU: the mail ledger is read once per listing for all seats (not once per pane), with a short wait.
       // ELS-SERVER-MAINLOOP-STARVATION: in the server this is the cached answer of the badge worker (no ledger read here).
       const displayCwd = (pane: Pane) => livePty(pane) ? foregroundCwds.get(pane.id) ?? pane.cwd : pane.cwd;
-      const badges = (deps.mailBadges ?? mailBadgesOf)(ordered.map(({ pane }) => seatOf(displayCwd(pane))).filter((seat): seat is string => seat !== null));
+      const badges = (deps.mailBadges ?? mailBadgesOf)(ordered.map(({ pane }) => pane.seatIdentity ?? seatOf(displayCwd(pane))).filter((seat): seat is string => seat !== null));
       const panes = ordered.flatMap(({ pane, tab }) => {
         const ws = journal.workspaces.find((row) => row.id === tab.workspaceId);
         if (!ws) return [];
@@ -784,12 +872,23 @@ export function createElsCore(deps: ElsCoreDeps) {
           ...(sha && report?.version ? { version: report.version } : {}),
           ...(sha && report?.stamp ? { stamp: report.stamp } : {}) };
         const cwd = displayCwd(pane);
-        const seat = seatOf(cwd);
+        const seat = pane.seatIdentity ?? seatOf(cwd);
         const unreadMail = seat !== null ? badges.get(seat) ?? null : null;
         // ELS-TAB-STATE-BADGE: the badge is the contract state; a working pane with no output, `do` or first sight for the
         // stall window reads `stalled`. The server computes it (one clock), so every client — `els ls`, sidetab — shows the same.
         const unavailableReason = unavailableCwds.get(pane.id);
+        const fg = foregrounds.get(pane.id);
+        const reported = agentTurns.get(pane.id);
+        const lastOutput = live?.lastOutputAt?.();
         const listedState = pane.state === 'exited' ? 'exited' : live ? pane.state : unavailableReason ? 'blocked' : 'idle';
+        // ELS-AGENT-STATUS-UNKNOWN: a live pane always gets a status. Self-report (an eln turn event) wins; without one
+        // (an eln started before #39760, an agent, a pane whose foreground probe missed) the PTY's own output time decides:
+        // output within the window = working, otherwise idle. Only a row the server has no pane data for shows unknown.
+        const byOutput: PaneState = lastOutput !== undefined && now() - lastOutput <= AGENT_OUTPUT_ACTIVE_MS ? 'working' : 'idle';
+        const activityState: PaneState | 'unknown' = pane.state === 'exited' ? 'exited' : !live ? unavailableReason ? 'blocked' : 'idle'
+          : !fg ? byOutput : fg.kind === 'eln' ? reported?.state ?? byOutput
+          : fg.kind === 'codex' || fg.kind === 'claude' || fg.kind === 'grok' ? byOutput
+          : fg.kind === 'shell' ? 'idle' : 'working';
         if (!firstSeen.has(pane.id)) firstSeen.set(pane.id, now());
         // Last-event policy: the REAL last event wins — the PTY's own lastOutputAt (a reattached holder pane keeps the output
         // time it really had before this server restarted) or the last `do` delivered, whichever is later. firstSeen
@@ -798,12 +897,20 @@ export function createElsCore(deps: ElsCoreDeps) {
         const realEventAtMs = Math.max(live?.lastOutputAt?.() ?? 0, lastDelivery.get(pane.id) ?? 0);
         const lastEventAtMs = realEventAtMs > 0 ? realEventAtMs : firstSeen.get(pane.id)!;
         const badge = tabBadge({ state: listedState, lastEventAtMs }, now());
-        return [{ build, lastEventAtMs, badge: badge.state, badgeLabel: badge.label, stalled: badge.stalled, address: paneAddress(ws, tab, pane), workspace: ws.name, tab: tab.id, pane: pane.id, title: pane.title, kind: pane.kind,
-          cwd, command: pane.command, state: listedState, ...(unavailableReason ? { unavailableReason } : {}),
+        // SEAT-STATE-ENUM: the pane status as codes — the eln's own report when it is the foreground, else the server's facts.
+        const elnReport = live && fg?.kind === 'eln' ? reported : undefined;
+        const status = seatClock.stamp(pane.id, seatStatusOf({ exited: pane.state === 'exited', activityState, stalled: badge.stalled,
+          ...(elnReport?.seat ? { reported: elnReport.seat } : {}), ...(elnReport?.waitingInput ? { legacyWaitingInput: true } : {}),
+          ...(unavailableReason ? { unavailable: true } : {}) }));
+        return [{ build, lastEventAtMs, badge: badge.state, badgeLabel: badge.label, stalled: badge.stalled, status, ...(elnReport?.model ? { model: elnReport.model } : {}), address: paneAddress(ws, tab, pane), workspace: ws.name, tab: tab.id, pane: pane.id, title: pane.title, kind: pane.kind,
+          cwd, command: pane.command, state: listedState, activityState, ...(unavailableReason ? { unavailableReason } : {}),
           ptyId: live ? pane.ptyId : '', ...(live?.pid ? { pid: live.pid } : {}), restore: pane.restore, seat, unreadMail,
-          ...(live && foregrounds.has(pane.id) ? { kind: foregrounds.get(pane.id)!.kind, fgCommand: foregrounds.get(pane.id)!.command } : {}) }];
+          ...(ws.coordinatorSeat && seatOf(pane.cwd) === ws.coordinatorSeat && isSpaceCoordinatorTab(tab) ? { spaceCoordinator: true } : {}),
+          ...(live && foregrounds.has(pane.id) ? { kind: foregrounds.get(pane.id)!.kind, fgCommand: foregrounds.get(pane.id)!.command } : {}),
+          ...(pane.place ? { place: pane.place } : {}),
+          ...(pane.inbox?.length ? { inbox: pane.inbox } : {}) }];
       });
-      return { exitCode: 0, message: JSON.stringify({ workspaces, tabs: journal.tabs, panes }, null, 2) };
+      return { exitCode: 0, message: JSON.stringify({ workspaces, tabs: journal.tabs, panes, ...(journal.lastFocus ? { lastFocus: journal.lastFocus } : {}), ...(journal.hqCoordinatorSeat ? { hqCoordinatorSeat: journal.hqCoordinatorSeat } : {}), ...(journal.hqAuthorityLocation ? { hqAuthorityLocation: journal.hqAuthorityLocation } : {}) }, null, 2) };
     },
 
     /**
@@ -844,6 +951,21 @@ export function createElsCore(deps: ElsCoreDeps) {
       return { exitCode: 0, message: `els reorder: tab ${moving.id} moved` };
     },
 
+    /** Move the existing tab without touching any pane, PTY, cwd, or credential. */
+    moveTab(tabId: string, workspace: string): ElsResult {
+      if (typeof tabId !== 'string' || !tabId || typeof workspace !== 'string' || !workspace)
+        return { exitCode: 2, message: 'els tab move: tab and workspace required' };
+      const tab = journal.tabs.find(row => row.id === tabId);
+      const dest = findWorkspace(journal, workspace);
+      if (!tab || !dest) return { exitCode: 1, message: 'els tab move: unknown tab or workspace' };
+      if (tab.workspaceId === dest.id) return { exitCode: 0, message: `els tab move: ${tab.id} stays` };
+      const tabs = journal.tabs.map(row => row.id === tab.id ? { ...row, workspaceId: dest.id } : row);
+      try { commit({ ...journal, tabs }); }
+      catch (error) { return { exitCode: 1, message: `els tab move: not saved: ${message(error)}` }; }
+      deps.onTabMoved?.(journal.panes.filter(row => row.tabId === tab.id).map(row => row.id), dest.name);
+      return { exitCode: 0, message: `els tab move: ${tab.id} -> ${dest.id}` };
+    },
+
     /**
      * ELS-DOOR-STRUCT-OPS: rename a workspace or a tab. The name is a person-facing label only — permissions key on
      * stable ids, never names (control.ts pins names to ids on load), so a rename moves no permission.
@@ -852,7 +974,8 @@ export function createElsCore(deps: ElsCoreDeps) {
       if (input.kind !== 'workspace' && input.kind !== 'tab') return { exitCode: 2, message: 'els rename: kind must be workspace or tab' };
       if (typeof input.id !== 'string' || typeof input.name !== 'string' || !input.name.trim()) return { exitCode: 2, message: 'els rename: id and a non-empty name are required' };
       if (input.kind === 'workspace') {
-        const ws = findWorkspace(journal, input.id);
+        // Server authorization pins an exact id; never let another workspace's name shadow it.
+        const ws = journal.workspaces.find(row => row.id === input.id) ?? findWorkspace(journal, input.id);
         if (!ws) return { exitCode: 1, message: `els rename: unknown workspace ${input.id}` };
         const workspaces = journal.workspaces.map((row) => row.id === ws.id ? { ...row, name: input.name } : row);
         try { commit({ ...journal, workspaces }); } catch (error) { return { exitCode: 1, message: `els rename: not saved: ${message(error)}` }; }
@@ -860,9 +983,11 @@ export function createElsCore(deps: ElsCoreDeps) {
       }
       const tab = journal.tabs.find((row) => row.id === input.id);
       if (!tab) return { exitCode: 1, message: `els rename: unknown tab ${input.id}` };
-      const tabs = journal.tabs.map((row) => row.id === tab.id ? { ...row, label: input.name } : row);
+      const name = clean(input.name);
+      if (!name) return { exitCode: 2, message: 'els rename: a non-empty name is required' };
+      const tabs = journal.tabs.map((row) => row.id === tab.id ? { ...row, label: name } : row);
       try { commit({ ...journal, tabs }); } catch (error) { return { exitCode: 1, message: `els rename: not saved: ${message(error)}` }; }
-      return { exitCode: 0, message: `els rename: tab ${tab.id} renamed to ${input.name}` };
+      return { exitCode: 0, message: `els rename: tab ${tab.id} renamed to ${name}` };
     },
 
     /** ELS-DOOR-STRUCT-OPS: close every pane of a tab, then the tab itself. Same shape as `close` for a pane. */
@@ -934,6 +1059,14 @@ export function createElsCore(deps: ElsCoreDeps) {
 
     paneSize(paneId: string): { cols: number; rows: number } {
       return sizes.get(paneId) ?? { cols: DEFAULT_PANE_COLS, rows: DEFAULT_PANE_ROWS };
+    },
+
+    /** ELS-WHEEL-SCROLLBACK (OP #136704): the pane's own wheel lane — true while the live PTY's emulator is on an alternate
+     *  screen tracking its own mouse, so a wheel belongs to the pane program as bytes (the els scrollback lane is empty there). */
+    wheelPassthrough(ref: string): boolean {
+      const hit = resolve(ref);
+      const pty = hit ? livePty(hit.pane) : undefined;
+      try { return pty?.wheelPassthrough?.() === true; } catch { return false; }
     },
 
     /** The live PTY's data stream (attach turns it into immediate frame pushes — UX #38884 ④). */
@@ -1037,11 +1170,40 @@ export function createElsCore(deps: ElsCoreDeps) {
       foregrounds.clear();
       for (const [pane, fg] of next) foregrounds.set(pane, fg);
       for (const pane of new Set([...previous.keys(), ...next.keys()])) {
+        if (previous.get(pane)?.kind === 'eln' && (previous.get(pane)?.pid !== next.get(pane)?.pid || next.get(pane)?.kind !== 'eln')) agentTurns.delete(pane);
         if (previous.get(pane)?.pid !== next.get(pane)?.pid || previous.get(pane)?.kind !== next.get(pane)?.kind) foregroundCwds.delete(pane);
         cwdSubscriptions.get(pane)?.foregroundChanged();
       }
       if (changed.length > 0 || forgotten) notifyChange();
       return changed;
+    },
+
+    /** A verified pane reports its own ordered turn/state events; no screen text is inspected. */
+    agentEvent(pane: string, frame: AgentEventFrame): ElsResult {
+      if (!resolve(pane) || !livePty(resolve(pane)!.pane)) return { exitCode: 1, message: 'event: pane is not live' };
+      const prior = agentTurns.get(pane);
+      if (prior && ((frame.sid === prior.sid && frame.seq <= prior.seq) || (frame.sid !== prior.sid && prior.old.has(frame.sid))))
+        return { exitCode: 1, message: 'event: stale sequence' };
+      const old = prior?.old ?? new Set<string>();
+      if (prior && frame.sid !== prior.sid) old.add(prior.sid);
+      const event = frame.event;
+      const sameSender = prior?.sid === frame.sid;
+      const turnId = event.kind === 'turn' ? event.phase === 'start' ? event.id : sameSender && prior?.turnId === event.id ? undefined : prior?.turnId : sameSender ? prior?.turnId : undefined;
+      const state: PaneState | undefined = event.kind === 'turn' ? event.phase === 'start' ? 'working' : sameSender && prior?.turnId === event.id ? 'idle' : prior?.state
+        : event.kind === 'state' ? event.state === 'waiting-input' ? 'blocked' : event.state === 'exited' || event.state === 'done' ? 'idle' : event.state
+        : event.kind === 'release' ? undefined : sameSender ? prior?.state : undefined;
+      // SEAT-STATE-ENUM: a code report is kept as sent; a turn edge or a codeless state word replaces it; meta/notice keep it.
+      const seat: ReportedSeat | undefined = event.kind === 'state' ? event.code
+        // The same state and reason again (a new wording) keeps its first time: `since` follows the code, not the text.
+        ? { state: event.code, ...(event.reason ? { reason: event.reason } : {}), ...(event.detail ? { detail: event.detail } : {}),
+            at: sameSender && prior?.seat?.state === event.code && prior.seat.reason === event.reason ? prior.seat.at : frame.at } : undefined
+        : event.kind === 'turn' || event.kind === 'release' ? undefined : sameSender ? prior?.seat : undefined;
+      const waitingInput = event.kind === 'state' ? event.state === 'waiting-input' && !event.code
+        : event.kind === 'turn' || event.kind === 'release' ? false : sameSender ? prior?.waitingInput === true : false;
+      const model = event.kind === 'meta' && event.model ? event.model : sameSender ? prior?.model : undefined;
+      agentTurns.set(pane, { sid: frame.sid, seq: frame.seq, state, turnId, old, ...(seat ? { seat } : {}), ...(waitingInput ? { waitingInput } : {}), ...(model ? { model } : {}) });
+      notifyChange();
+      return { exitCode: 0, message: 'event: accepted' };
     },
 
     /** Submit one intact paste, then report whether this PTY displayed a new running turn. */
@@ -1189,6 +1351,17 @@ export function createElsCore(deps: ElsCoreDeps) {
         if (!hit) return { exitCode: 1, message: `els do: unknown pane ${ref}` };
         const pty = livePty(hit.pane);
         if (!pty) return { exitCode: 1, message: `els do: pane ${hit.pane.id} has no live pty (restart restores cwd only)` };
+        // ELS-POD-TAB (출처: seat-state/OP/orders/WORKER-MIGRATION-PHASE1-1119.md 45행): a pod pane is steered by
+        // control inbox memos — a soft note beside the pod's stream, never PTY bytes into it (the stream is the
+        // pod's own log, not a prompt). Accepted INTO the pane's control inbox — persisted in the journal (it
+        // survives a restart), bounded to the newest POD_INBOX_MAX, stamped by this server's clock and surfaced by
+        // `ls` — and never rendered, never queued, never injected.
+        if (hit.pane.place?.runtime === 'pod') {
+          const inbox = [...(hit.pane.inbox ?? []).slice(-(POD_INBOX_MAX - 1)), { from, at: now(), text }];
+          const saveError = persist(patchPane(journal, hit.pane.id, { inbox }));
+          if (saveError) return { exitCode: 1, message: `els do: ${hit.pane.id} memo not stored: ${saveError}` };
+          return { exitCode: 0, message: `els do: ${hit.pane.id} memo ${text.length} chars from ${from} (pod pane — control inbox memo, no PTY injection)` };
+        }
         const approvalRefusal = await machineInputRefusal(hit.pane, pty);
         if (approvalRefusal) return { exitCode: 1, message: `els do: ${approvalRefusal}; not sent` };
         // A raw attach input can arrive while screen inspection or authorization awaits.

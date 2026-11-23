@@ -38,10 +38,17 @@ export interface TaSweepTickResult {
   everyMinutes: number | null;
   /** Cards seen in the ledger when due. */
   cards?: number;
-  /** Recycled (skip-noted) launches this sweep — 성공(stopRecorded=true) outcome 만 센다. */
+  /** Recycled (skip-noted) launches this sweep — 카드 skip-note 가 «실제로 붙은» outcome 만 센다:
+   *  stopRecorded=true 지만 카드 쓰기가 실패/불명(cardWriteFailed·cardWriteUnknown)인 회수는 여기 못 들어간다. */
   recycled?: number;
-  /** Stop 시도 중 run 원장 stop 기록에 실패한 수(outcome.stopRecorded=false) — recycled 와 별개 관측치. */
+  /** 원장 stop 기록에 실패한 수(outcome.stopRecorded=false · 단 stopAttempted=false인 잠금 전 오류 미시도는 제외 —
+   *  JUD-C HOLD #130489 · #39574) — 카드 쓰기 실패·불명과 동시에 난 행도 포함해 보존한다(집계끼리 겹친다 ·
+   *  terra r5 mustFix 2 — #39574). recycled 와 별개 관측치. */
   stopRecordFailed?: number;
+  /** 카드 원장 쓰기 실패·재독 불명(cardWriteFailed/cardWriteUnknown)으로 skip-note 가 안 붙은 수 —
+   *  stopRecorded=true 여도 회수 성공이 아니다(원장 stop 만 남은 재조정 대상). recycled·stopRecordFailed 와
+   *  별개 관측치(JUD-C #129833 mustFix 1 · FU-39400 r5). */
+  cardWriteFailed?: number;
   outcomes?: TaRecycleOutcome[];
   lastStartedAt?: string | null;
   ms?: number;
@@ -126,14 +133,22 @@ export function taSweepTick(deps: TaSweepTickDeps = {}): TaSweepTickResult {
     writeFileSync(stampPath, JSON.stringify({ startedAt: now.toISOString() }));
     const started = Date.now();
     const outcomes = (deps.recycle ?? defaultRecycle(deps.statePath))(cards, now.getTime());
-    // 집계 — 회수 성공(recycled)은 run 원장 stop 이 «기록된» outcome 만 센다. recordStop 이 false 를
-    // 돌려준 실패 stop 시도(launch-result-loop: ta-stop-record-failed)도 outcome 으로 오지만, 이를
-    // recycled 에 세면 정지 기록 실패가 회수 성공으로 오표시된다(JUD-C #39483) — 별도 관측치로 노출.
-    const recycled = outcomes.filter((row) => row.stopRecorded);
-    const stopRecordFailed = outcomes.length - recycled.length;
+    // 집계 — 회수 성공(recycled)은 «카드 skip-note 가 실제로 붙은» outcome 만 센다. stopRecorded=true 라도
+    // 카드 쓰기가 실패/불명(cardWriteFailed·cardWriteUnknown)이면 skip-note 는 디스크에 없다 — 회수 성공이
+    // 아니므로 recycled 에 세면 오표시다(JUD-C #129833 mustFix 1 · FU-39400 r5). 이 outcome 들은 별도 관측치
+    // cardWriteFailed 로 갈라 센다. 원장 stop 기록 실패(outcome.stopRecorded=false)는 cardWrite* 무관
+    // stopRecordFailed 로 센다 — 동시 실패 행은 두 집계에 모두 보존된다(terra r5 mustFix 2 — #39574 · #39483).
+    const recycled = outcomes.filter((row) => row.stopRecorded && !row.cardWriteFailed && !row.cardWriteUnknown);
+    const cardWriteFailed = outcomes.filter((row) => row.cardWriteFailed || row.cardWriteUnknown).length;
+    // 출처: terra r5 mustFix 2 — #39574 · stop 기록 실패(outcome.stopRecorded=false)는 카드 쓰기 실패·불명과
+    // 동시에 난 행도 빼지 않고 보존한다 — 두 실패는 각자의 집계에 모두 올린다(집계끼리 겹친다).
+    // 출처: JUD-C HOLD #130489 — #39574 · stopAttempted=false(잠금 획득·진입 전 오류로 stop 시도 자체가 없음)는
+    // stop 기록 «실패» 가 아니므로 제외한다 — true(시도했으나 실패)·undefined(관측 없음 · spy 경로)만 센다.
+    // tasks-card-show.ts 의 «시도 안 함 ≠ 실패» 기준(terra r5 mustFix 1)과 같은 구별을 집계에도 적용한다.
+    const stopRecordFailed = outcomes.filter((row) => !row.stopRecorded && row.stopAttempted !== false).length;
     return emit({
       decision: 'ran', everyMinutes, cards: cards.length,
-      recycled: recycled.length, stopRecordFailed, outcomes, lastStartedAt,
+      recycled: recycled.length, stopRecordFailed, cardWriteFailed, outcomes, lastStartedAt,
       ms: Date.now() - started,
     });
   } catch (error) {

@@ -23,6 +23,14 @@ const calls: SavingsCallRow[] = [
 ];
 
 describe('summarizeRouterSavings', () => {
+  test('additional premium model IDs affect the call share but not the counterfactual cost', () => {
+    const base = summarizeRouterSavings({ calls, premiumModel: PREMIUM_MODEL, priceOf });
+    const result = summarizeRouterSavings({ calls, premiumModel: PREMIUM_MODEL, premiumModels: ['cheap-model', PREMIUM_MODEL], priceOf });
+    expect(result.premiumModels).toEqual([PREMIUM_MODEL, 'cheap-model']);
+    expect(result.premiumCalls).toBe(3);
+    expect(result.totalCalls).toBe(4);
+    expect(result.savingsPct).toBe(base.savingsPct);
+  });
   test('고급 호출 수/전체 · 호출별 모델·길목 표', () => {
     const r = summarizeRouterSavings({ calls, premiumModel: PREMIUM_MODEL, priceOf });
     expect(r.totalCalls).toBe(4);

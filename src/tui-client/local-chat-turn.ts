@@ -169,6 +169,8 @@ class LocalChatSession {
   readonly child: ReturnType<typeof Bun.spawn>;
   readonly exited: Promise<number>;
   readonly instanceRoot: string;
+  /** CAPSULE-K3 — when this chat child was spawned (ms): with its pid, the owner identity the capsule ledger records. */
+  readonly spawnedAt: number = Date.now();
   /** Session provider choice baked into the child env (HARNESS-CHILD-PROVIDER-PASSTHROUGH). */
   readonly providerKey: string;
   private readonly writeInput: (payload: string) => Promise<void>;
@@ -751,6 +753,13 @@ export function requestLocalChatSteer(sessionId: string, steerId: string, text: 
 }
 export function retractLocalChatSteer(sessionId: string, steerIds: readonly string[]): boolean {
   return sessions.get(sessionId)?.retractSteer(steerIds) ?? false;
+}
+/** CAPSULE-K3 — the live chat child that hosts this session's capsules ({pid, startedAt}), or null. The capsule
+ *  ledger records it as each capsule's owner; at boot a dead owner (pid gone or restarted) means «interrupted». */
+export function localChatChildOwner(sessionId: string): { pid: number; startedAt: number } | null {
+  const session = sessions.get(sessionId);
+  const pid = session?.child.pid;
+  return session && typeof pid === 'number' && pid > 0 ? { pid, startedAt: session.spawnedAt } : null;
 }
 export function requestLocalChatTaskStop(sessionId: string, taskId: string): boolean {
   return sessions.get(sessionId)?.requestTaskStop(taskId) ?? false;

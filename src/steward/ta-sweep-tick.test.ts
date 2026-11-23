@@ -1,13 +1,14 @@
 import { expect, test } from 'bun:test';
 import { afterEach, beforeAll } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { readTaskCard, writeTaskCards } from '../task-agent/task-card-state.js';
 import type { TaskCard } from '../task-agent/task-hand.js';
-import { TA_SKIP_NOTE_EVENT, type TaRecycleOutcome } from '../task-agent/launch-result-loop.js';
-import { taSweepTick, TA_SWEEP_TICK_EVENT, type TaSweepTickDeps } from './ta-sweep-tick.js';
+import { findStalledLaunches, recycleStalledLaunches, TA_SKIP_NOTE_EVENT, type TaRecycleOutcome } from '../task-agent/launch-result-loop.js';
+import { recordRunStop } from '../self-implement/run-stop.js';
+import { taSweepTick, TA_SWEEP_TICK_EVENT, type TaSweepTickDeps, type TaSweepTickResult } from './ta-sweep-tick.js';
 
 /**
  * TA-SWEEP-PERIODIC(FU of TA-LAUNCH-RESULT-LOOP · 칸 0.3.33) — 회수 스윕의 주기 루프.
@@ -57,7 +58,7 @@ function harness(
   const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
   const calls: RecycleCall[] = [];
   const outcome: TaRecycleOutcome = {
-    cardId: 'ta-stale', runId: 'r-stale', cause: 'grounding', minutesStalled: 20, // 출처: #39483 fixture 관측값 — 마지막 live-move(AT(20 * 60_000)) 20분 후 경과(15분 무진척 상한의 초과분), 게이트 상한 아님
+    cardId: 'ta-stale', runId: 'r-stale', cause: 'grounding', minutesStalled: 20, // 출처: #39574 — 출처: #39483 fixture 관측값 — 마지막 live-move(AT(20 * 60_000)) 20분 후 경과(15분 무진척 상한의 초과분), 게이트 상한 아님
     stopRecorded: true, skipNote: 'failed/recycled/grounding: 15분 무진척(20분) — 정확 runId r-stale stop · 재발사는 사람/판단부 몫',
   };
   const cards: readonly TaskCard[] | undefined = opts.cards; // const 포획 — 파라미터 속성 좁힘은 클로저에서 살지 않는다
@@ -231,4 +232,133 @@ test('default wiring: reads the whole card ledger and recycles a stalled launch 
     if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = priorStateDir;
   }
+});
+// ── FU-39400 r5 — JUD-C #129833 mustFix ①(RED 우선): 카드 쓰기 실패/재독 불명 outcome 은 회수 성공(recycled)이 아니다 ──
+// 출처: JUD-C #129833(head 758150648e9b) — ta-sweep-tick.ts:129-136 은 stopRecorded 만으로 recycled 를 집계한다.
+
+/** FU-39400 r5(JUD-C #129833) — TaSweepTickResult 의 cardWriteFailed 관측치(skip-note 미부착·불명 별도 집계 · 관측 접근). */
+const cardWriteFailedCountOf = (result: TaSweepTickResult): unknown =>
+  (result as unknown as Record<string, unknown>)['cardWriteFailed'];
+
+test('card-write-failed/unknown outcomes never count as recycled — separate observation instead (JUD-C #129833 mustFix ①)', () => {
+  const h = harness({ sweepEveryMinutes: 30 }, {
+    outcomes: [
+      { cardId: 'ta-r5-cwf', runId: 'r-r5-cwf', cause: 'grounding', minutesStalled: 30, stopRecorded: true, skipNote: 'failed/recycled/grounding: …', cardWriteFailed: true }, // 출처: #129833 (JUD-C HOLD) — EACCES 쓰기 실패 outcome(launch-result-loop catch 관측값 · 시뮬 S1)
+      { cardId: 'ta-r5-cwu', runId: 'r-r5-cwu', cause: 'grounding', minutesStalled: 30, stopRecorded: true, skipNote: 'failed/recycled/grounding: …', cardWriteFailed: false, cardWriteUnknown: true }, // 출처: #129833 (JUD-C HOLD) — 재독 실패 불명 outcome(시뮬 S2)
+      { cardId: 'ta-r5-ok', runId: 'r-r5-ok', cause: 'grounding', minutesStalled: 30, stopRecorded: true, skipNote: 'failed/recycled/grounding: …' }, // 출처: #129833 (JUD-C HOLD) — 정상 회수 fixture(시뮬 S3 대조) — 이것만 recycled
+    ],
+  });
+  const result = taSweepTick(h.deps);
+  expect(result.recycled).toBe(1); // 수리 전 빨강: 3 — stopRecorded=true 전부 recycled 로 집계(오표시) · 출처: JUD-C #129833 mustFix ①
+  expect(cardWriteFailedCountOf(result)).toBe(2); // skip-note 미부착·불명 별도 관측치 · 출처: JUD-C #129833 mustFix ①
+  expect(result.stopRecordFailed).toBe(0); // cardWrite* 는 stopRecorded=true — stop 기록 실패와 구별 · 출처: JUD-C #129833 mustFix ①
+  expect(cardWriteFailedCountOf({ ...(h.logs.at(-1)?.data ?? {}) } as unknown as TaSweepTickResult)).toBe(2); // 관측 라인에도 별도 관측치 · 출처: JUD-C #129833 mustFix ①
+});
+
+test('real EISDIR fixture — ledger stop lands, card skip-note does not: recycled stays 0 and the misfit is a separate observation (terra r5 mustFix 4 · JUD-C #129833 mustFix ①)', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ta-sweep-r5-eisdir-'));
+  dirs.push(root);
+  setElanousConfigDir(root);
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root; // 런 원장도 같은 격리 뿌리(기록기 = 정본 recordRunStop)
+  try {
+    mkdirSync(join(root, 'run-ledger'), { recursive: true });
+    const statePath = join(root, 'task-agent-actions.json');
+    const staleAt = new Date(NOW - 30 * 60_000).toISOString(); // 출처: 기존 «stale» 패턴 — NO_PROGRESS_MS 상한 위 회수 자격
+    const seededView = card({
+      id: 'ta-sweep-r5-eisdir', runId: 'r-sweep-r5-eisdir', checklistId: 'FU-39400-R5', createdAt: staleAt,
+      history: hist([{ at: staleAt, event: 'live-move', detail: 'x' }]),
+    });
+    writeTaskCards(statePath, [seededView]);
+    // 출처: terra r5 mustFix 4 — #39574 · chmod 444 EACCES 주입은 root 처럼 mode 비트를 우회하는 환경에서 의도적으로
+    // 실패한다. 실제 진입점(recycleStalledLaunches ⊕ recordRunStop 실경로)을 그대로 부르고, 잠금 안 콜백(recordStop)
+    // 에서 카드 스토어 «파일 경로»를 디렉터리로 교체해 writeFileSync 를 EISDIR 로 결정적으로 실패시킨다.
+    const result = taSweepTick({
+      now: () => new Date(NOW),
+      config: () => ({ sweepEveryMinutes: 30 }),
+      stampPath: join(root, 'steward', 'ta-sweep-tick.json'),
+      statePath,
+      recycle: (cardsList: readonly TaskCard[], nowMs: number) => recycleStalledLaunches(cardsList, {
+        nowMs,
+        statePath,
+        reasonCodeFor: () => 'provider-credential-failure',
+        // 재독 «성공» 갈래 보존(빨강 B 관측 계약) — EISDIR 스토어의 실디스크 재독은 반드시 실패하므로 관측 사이
+        // 변화 없은 카드 뷰를 돌려준다(기존 r2 시험의 readCard 주입 패턴).
+        readCard: () => seededView,
+        recordStop: (input) => {
+          recordRunStop(input); // 실경로 원장 stop — 정본 기록기(ELANOUS_STATE_DIR=시험 격리 뿌리)
+          rmSync(statePath);
+          mkdirSync(statePath); // 카드 스토어 파일→디렉터리 — 결정적 쓰기 실패 주입(EISDIR)
+          return true;
+        },
+      }),
+      log: () => { /* 관측만 */ },
+    });
+    expect(result.decision).toBe('ran');
+    expect(result.recycled).toBe(0); // 수리 전 빨강: 1 — 원장 stop 만으로 회수 성공 오표시 · 출처: JUD-C #129833 mustFix ①
+    expect(cardWriteFailedCountOf(result)).toBe(1); // 카드 skip-note 미부착 별도 관측치 · 출처: JUD-C #129833 mustFix ①
+    expect(result.outcomes?.every((row) => row.cardWriteFailed === true)).toBe(true); // outcome 자체는 cardWriteFailed 로 관측됨(r2 계약 유지)
+    expect(result.outcomes?.every((row) => row.stopRecorded === true)).toBe(true); // 원장 stop 은 잠금 안에서 «이미» 기록됐다(시험명 계약)
+    expect(result.stopRecordFailed).toBe(0); // stop 기록은 성공 — stopRecordFailed 와 구별
+    // 런 원장 — 실경로 recordRunStop 가 남긴 stop 한 줄(빨강 B 완료선 «원장 stop 1줄»).
+    const ledgerPath = join(root, 'run-ledger', 'r-sweep-r5-eisdir.jsonl');
+    const stopLines = readFileSync(ledgerPath, 'utf8').split('\n').filter(Boolean)
+      .map((line) => JSON.parse(line) as { event?: string }).filter((entry) => entry.event === 'stop');
+    expect(stopLines).toHaveLength(1);
+    // 카드 스토어 — 파일이 아니라 디렉터리: skip-note 를 못 붙였다(쓰기 실패 주입 원문 · EISDIR).
+    expect(statSync(statePath).isDirectory()).toBe(true);
+    // 뷰는 그대로 — 마커도 skip-note 도 없어 다음 스윕 재조정 대상 유지.
+    expect((seededView.history ?? []).some((entry) => (entry as { event?: string }).event === TA_SKIP_NOTE_EVENT)).toBe(false);
+    expect(findStalledLaunches([seededView], NOW + 60 * 60_000).map((c) => c.id)).toEqual(['ta-sweep-r5-eisdir']); // 실제 회수 아님 — 다음 스윕 재조정 대상 유지
+  } finally {
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+  }
+});
+
+// ── FU-39400 r5b — terra r5 mustFix 2: stop 기록 실패 ⊕ 카드 쓰기 실패가 동시에 난 행은 두 집계에서 모두 보존 ──
+// 출처: terra r5 mustFix 2 — #39574 · taSweepTick 은 동시 실패 행을 stopRecordFailed 에서 제외했다(둘 다 살려야 한다).
+test('simultaneous stop-record and card-write failures are preserved in both aggregates (terra r5 mustFix 2 · #39574)', () => {
+  const h = harness({ sweepEveryMinutes: 30 }, {
+    outcomes: [
+      { cardId: 'ta-r5b-both1', runId: 'r-r5b-both1', cause: 'grounding', minutesStalled: 30, // 출처: #39574 — 출처: JUD-C #129833 mustFix 2 관측값 — 원장 stop 기록 실패 ⊕ 카드 쓰기 실패 동시(launch-result-loop r5b 시험과 같은 상태), 15분 상한 초과 표본(30분) · 게이트 상한 아님
+        stopRecorded: false, skipNote: 'stop-record-failed/grounding: 정확 runId stop 기록 실패 — 재시도 대상 유지(15분 무진척 30분 · runId r-r5b-both1)', cardWriteFailed: true },
+      { cardId: 'ta-r5b-both2', runId: 'r-r5b-both2', cause: 'grounding', minutesStalled: 30, // 출처: #39574 — 출처: 동시 실패(재독 불명 갈래) — r3 terra r2 mustFix 1 관측값 · 게이트 상한 아님
+        stopRecorded: false, skipNote: 'stop-record-failed/grounding: …', cardWriteUnknown: true },
+      { cardId: 'ta-r5b-ok', runId: 'r-r5b-ok', cause: 'grounding', minutesStalled: 30, // 출처: #39574 — 정상 회수 — 이것만 recycled · 게이트 상한 아님
+        stopRecorded: true, skipNote: 'failed/recycled/grounding: …' },
+    ],
+  });
+  const result = taSweepTick(h.deps);
+  expect(result.recycled).toBe(1); // 정상 회수만
+  expect(result.stopRecordFailed).toBe(2); // 수리 전 빨강: 0 — 동시 실패 행이 stopRecordFailed 집계에서 소멸(terra r5 mustFix 2)
+  expect(cardWriteFailedCountOf(result)).toBe(2); // 카드 쓰기 실패·불명 집계도 보존 — 두 실패가 모두 살아 있다
+  expect(result.outcomes).toHaveLength(3); // 증거 목록은 그대로
+  expect(cardWriteFailedCountOf({ ...(h.logs.at(-1)?.data ?? {}) } as unknown as TaSweepTickResult)).toBe(2); // 관측 라인에도 두 집계 보존
+});
+
+// ── FU-39400 r6 — JUD-C HOLD #130489(#39574): stopRecordFailed 집계는 stopAttempted=false 미시도를 실제 stop 기록 실패와 구별 ──
+// 출처: JUD-C #130489 mustFix 1 — #39574 · ta-sweep-tick.ts 의 stopRecordFailed 필터는 !row.stopRecorded 만 검사해서
+// 잠금 진입 전 오류(launch-result-loop 가 stopRecorded=false·stopAttempted=false 로 남기는 미시도)까지 기록 실패로 집계했다.
+test('pre-lock error (stop not attempted) is not a stop-record failure; attempted failures with and without card-write failure are (JUD-C #130489 · #39574)', () => {
+  const h = harness({ sweepEveryMinutes: 30 }, {
+    outcomes: [
+      { cardId: 'ta-r6-prelock', runId: 'r-r6-prelock', cause: 'grounding', minutesStalled: 30, // 출처: #39574 — 출처: JUD-C #130489 관측값 — 잠금 획득·진입 전 오류(launch-result-loop r5b «잠금 전 오류» 시험과 같은 상태): stop 시도 없음(stopAttempted=false) ⊕ 카드 쓰기 실패, 15분 상한 초과 표본(30분) · 게이트 상한 아님
+        stopRecorded: false, stopAttempted: false, skipNote: 'stop-not-attempted/grounding: 잠금 전 오류 — stop 시도 없음(15분 무진척 30분 · runId r-r6-prelock)', cardWriteFailed: true },
+      { cardId: 'ta-r6-attempt', runId: 'r-r6-attempt', cause: 'grounding', minutesStalled: 20, // 출처: #39574 — 출처: JUD-C #130489 관측값 — stop «시도»는 했으나 원장 기록 실패(stopAttempted=true), 15분 상한 초과 표본(20분) · 게이트 상한 아님
+        stopRecorded: false, stopAttempted: true, skipNote: 'stop-record-failed/grounding: 정확 runId stop 기록 실패 — 재시도 대상 유지(15분 무진척 20분 · runId r-r6-attempt)' },
+      { cardId: 'ta-r6-both', runId: 'r-r6-both', cause: 'grounding', minutesStalled: 25, // 출처: #39574 — 출처: JUD-C #130489 관측값 — stop 시도 실패 ⊕ 카드 쓰기 실패 동반(terra r5 mustFix 2 동시 실패 계약 유지), 15분 상한 초과 표본(25분) · 게이트 상한 아님
+        stopRecorded: false, stopAttempted: true, skipNote: 'stop-record-failed/grounding: …', cardWriteFailed: true },
+      { cardId: 'ta-r6-ok', runId: 'r-r6-ok', cause: 'grounding', minutesStalled: 18, // 출처: #39574 — 정상 회수 — 이것만 recycled · 출처: #39483 fixture 관측값, 게이트 상한 아님
+        stopRecorded: true, stopAttempted: true, skipNote: 'failed/recycled/grounding: …' },
+    ],
+  });
+  const result = taSweepTick(h.deps);
+  expect(result.recycled).toBe(1); // 정상 회수만
+  expect(result.stopRecordFailed).toBe(2); // 수리 전 빨강: 3 — 잠금 전 오류 미시도(stopAttempted=false)까지 기록 실패로 집계(JUD-C #130489 mustFix 1)
+  expect(cardWriteFailedCountOf(result)).toBe(2); // 잠금 전 오류·동반 실패 행의 카드 쓰기 실패는 이 집계에 그대로 살아 있다
+  expect(result.outcomes).toHaveLength(4); // 증거 목록은 전부 보존 — 미시도 행도 관측에서 사라지지 않는다
+  const logData = { ...(h.logs.at(-1)?.data ?? {}) } as unknown as TaSweepTickResult;
+  expect(logData.stopRecordFailed).toBe(2); // 관측 라인에도 같은 구별
+  expect(cardWriteFailedCountOf(logData)).toBe(2); // 카드 쓰기 집계도 관측 라인 보존
 });

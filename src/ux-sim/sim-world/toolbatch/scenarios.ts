@@ -152,7 +152,8 @@ export const simWorldScenarios: readonly SimWorldScenario[] = [{
         child.on('message', (message: unknown) => {
           if (isRunShellApprovalCall(message)) {
             const r = message.request;
-            const expected = [join(bin, 'kubectl'), ...cluster.command.slice(1)];
+            // CEO 11-23 relax: kubectl get runs without a card; the grant child asks for a destructive eln verb.
+            const expected = [join(bin, 'eln'), 'memory', 'delete', 'sim-id'];
             const valid = r.callerSeat === 'sim-seat' && r.sessionId === 'sim-runshell-session'
               && r.cwd === root && JSON.stringify(r.argv) === JSON.stringify(expected)
               && r.bytesSha256 === createHash('sha256').update(readFileSync(expected[0]!)).digest('hex');
@@ -188,8 +189,8 @@ export const simWorldScenarios: readonly SimWorldScenario[] = [{
       return local.outcome === 'exit' && localKinds.join(',') === 'eln,hostname' && denied.outcome === 'denied'
         && noChannel.outcome === 'denied'
         && before === 'eln\nhostname\n' && ipcDenied.outcome === 'denied' && deniedAfter === before
-        && approved.outcome === 'exit' && approved.exitCode === 0 && clusterKind === 'kubectl'
-        && after === 'eln\nhostname\nkubectl\n' && refused && cards === 2
+        && approved.outcome === 'exit' && approved.exitCode === 0 && clusterKind === 'eln'
+        && after === 'eln\nhostname\neln\n' && refused && cards === 2
         ? { ok: true } : { ok: false, reason: 'read bundle dispatch boundary changed', diff: JSON.stringify(measured) };
     } finally {
       if (oldPath === undefined) delete process.env.PATH;

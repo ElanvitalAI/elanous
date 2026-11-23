@@ -287,6 +287,7 @@ async function fetchOpenAiCompat(
 ): Promise<LlmHostFetchResult> {
   const url = `${host.endpoint}/v1/models`;
   try {
+    // llm-ledger-exempt: model-listing
     const res = await fetch(url, { signal });
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
@@ -334,6 +335,7 @@ async function fetchOllamaTags(
 ): Promise<LlmHostFetchResult> {
   const url = `${host.endpoint}/api/tags`;
   try {
+    // llm-ledger-exempt: model-listing
     const res = await fetch(url, { signal });
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
@@ -395,6 +397,7 @@ async function fetchAnthropicModels(
   }
   const url = `${host.endpoint}/v1/models`;
   try {
+    // llm-ledger-exempt: model-listing
     const res = await fetch(url, {
       signal,
       headers: {

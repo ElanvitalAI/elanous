@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
-import { buildClosureGraph, type ClosureGraph, type ClosureTree } from './gate-closure.js';
+import { createRootedClosureGraph, type ClosureGraph, type ClosureTree } from './gate-closure.js';
+import { debug } from '../../src/debug/log.js';
 
-// A cut tree is immutable. One gate plans thousands of file receipts from that same tree;
-// rebuilding the whole import graph for every file stalls before the first Pod starts.
-const graphByTree = new WeakMap<ClosureTree, ClosureGraph>();
+// A cut tree is immutable. Extend its graph only from requested test roots, retaining
+// previously scanned edges without building an entire repository graph for one receipt.
+const graphByTree = new WeakMap<ClosureTree, { graph?: ClosureGraph; extend: (root: string) => ClosureGraph }>();
 
 export interface GateFileReceiptIdentity {
   file: string;
@@ -41,10 +42,26 @@ export interface GateFileReceiptEnvelope extends GateFileReceipt {
 /** Hash every tracked input reachable from one test, including literal non-code assets; opaque/missing inputs fail closed. */
 export function gateFileReceiptIdentityFromClosure(tree: ClosureTree, file: string, imageDigest: string): GateFileReceiptIdentity | null {
   if (!tree.files.includes(file) || !/^sha256:[a-f0-9]{64}$/i.test(imageDigest)) return null;
-  let graph = graphByTree.get(tree);
-  if (!graph) {
-    graph = buildClosureGraph(tree);
-    graphByTree.set(tree, graph);
+  let cached = graphByTree.get(tree);
+  if (!cached) {
+    cached = { extend: createRootedClosureGraph(tree) };
+    graphByTree.set(tree, cached);
+  }
+  let graph = cached.graph;
+  if (!graph || (!graph.forward.has(file) && !graph.opaque.has(file))) {
+    const started = Date.now();
+    const rssBefore = process.memoryUsage().rss;
+    debug.log('release-loop.gate', 'receipt-graph-build', { phase: 'started', files: tree.files.length, rssBytes: rssBefore });
+    try {
+      graph = cached.extend(file);
+    } catch (error) {
+      debug.log('release-loop.gate', 'receipt-graph-build', { phase: 'failed', files: tree.files.length,
+        elapsedMs: Date.now() - started, rssBytes: process.memoryUsage().rss });
+      throw error;
+    }
+    debug.log('release-loop.gate', 'receipt-graph-build', { phase: 'completed', files: tree.files.length,
+      elapsedMs: Date.now() - started, rssBeforeBytes: rssBefore, rssBytes: process.memoryUsage().rss });
+    cached.graph = graph;
   }
   const pending = [file];
   const closure = new Set<string>();

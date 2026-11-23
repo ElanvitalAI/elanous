@@ -92,3 +92,7 @@ test('distinct environments whose | -joined key would collide get distinct emitt
   const b = getAgentEventEmitter({ ELANOUS_EVENT_SOCKET: '/tmp/a', ELANOUS_EVENT_WS: 'b|c' });
   expect(b).not.toBe(a); // 출처: #38499 — '|' 문자열 키 충돌: ('/tmp/a|b','c','') 와 ('/tmp/a','b|c','') 가 같은 캐시 키로 남의 emitter 를 돌려주지 않는다
 });
+
+test('existing els pane environments can start a turn emitter', () => {
+  expect(getAgentEventEmitter({ ELANOUS_ELS_SOCKET: '/tmp/els.sock', ELANOUS_ELS_WS: 'HQ', ELANOUS_ELS_PANE: 'p', ELANOUS_ELS_PANE_TOKEN: 'token' })).toBeDefined();
+});

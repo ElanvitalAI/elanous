@@ -239,6 +239,13 @@ test('publish accepts measured TUI subchecks and mac warning, but rejects a miss
       expect(calls).toEqual([]);
     }
     context.outputs['auto-approve'] = auto;
+    // A hold added on resume must invalidate a previously measured automatic approval.
+    context.input.opApprovalMarker = 'publish requires human approval';
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    calls.length = 0;
+    expect(runPublish(run, root)).toMatchObject({ outcome: 'fail', summary: 'publish blocked: neither auto-approve nor approve-publish approved' });
+    expect(calls).toEqual([]);
+    delete context.input.opApprovalMarker;
 
     const results = (context.outputs.tui!.regress as { results: Array<{ id: string; ok: boolean }> }).results;
     context.outputs.tui!.regress = { pass: 4, fail: 3,

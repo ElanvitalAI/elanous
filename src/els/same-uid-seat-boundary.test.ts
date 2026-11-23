@@ -80,10 +80,19 @@ describe('제어 문 run() 배선', () => {
     expect(out.ok).toBe(true);
     expect(ran).toEqual(['ls']);
   });
-  test('자리 없는 principal 은 경계 영향 없음(기존 allow 규칙 판단 그대로 not in control-allow.json)', async () => {
-    const dir = stateDir(); const { control } = door(dir);
+  test('자리 없는 principal 은 경계 영향 없이 현 기본 정책대로 do 실행 및 감사', async () => {
+    const dir = stateDir(); const { control, ran } = door(dir);
     const out = await control.run({ principal: { id: 'local:501', kind: 'cli' }, action: 'do', target: owned('HAND-B'), text: 'ls' });
+    expect(out.ok).toBe(true);
+    expect(ran).toEqual(['ls']);
+    expect(rows(dir).at(-1)?.result).toBe('executed');
+  });
+  test('자리 없는 principal 도 확인 없는 close 는 거부', async () => {
+    const dir = stateDir(); const { control, ran } = door(dir);
+    const out = await control.run({ principal: { id: 'local:501', kind: 'cli' }, action: 'close', target: owned('HAND-B') });
     expect(out.ok).toBe(false);
-    if (!out.ok) expect(out.reason).toBe('not in control-allow.json');
+    if (!out.ok) expect(out.reason).toContain('confirm:true');
+    expect(ran).toEqual([]);
+    expect(rows(dir).at(-1)?.result).toBe('denied');
   });
 });

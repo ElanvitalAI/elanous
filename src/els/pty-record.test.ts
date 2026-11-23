@@ -53,24 +53,34 @@ const ask = (root: string, request: object, token?: string): Promise<{ exitCode:
     for (let at = data.indexOf('\n'); at >= 0; at = data.indexOf('\n')) { lines.push(data.slice(0, at)); data = data.slice(at + 1); }
     if (lines.length >= want) { socket.destroy(); resolve(JSON.parse(lines[want - 1] as string) as { exitCode: number; message: string }); }
   });
+  // A door that refuses the credential answers once and closes: that answer comes back instead of a hang.
+  socket.on('close', () => {
+    if (lines.length === 0) reject(new Error('els door closed without an answer'));
+    else resolve(JSON.parse(lines[lines.length - 1] as string) as { exitCode: number; message: string });
+  });
   socket.on('error', reject);
 });
 
-/** A server with one pane whose PTY shows `screen`; the pane id and the PTY's output trigger come back. */
+/**
+ * A server with one pane whose PTY shows `screen`; the pane id, the caller credential and the PTY's output trigger come back.
+ * The caller is the server owner: these tests judge what record/snapshot do to the pane's bytes, artifacts and the
+ * recording store. A pane credential is only honoured from that pane's own process tree, which a fake PTY in a TTY-less
+ * test process cannot be (peer-seat processIdentity needs a controlling terminal), so the owner speaks instead.
+ * The pane-credential door itself is judged by the «without a pane credential» tests below.
+ */
 const serverWithPane = async (screen: string, withTap = true): Promise<{ root: string; pane: string; token: string; emit: (data: string) => void; close: () => Promise<void> }> => {
   const root = state();
   const { pty, emit } = fakePty(screen, withTap);
-  const envs: Record<string, string>[] = [];
-  const started = await startElsServer({ stateRoot: root, spawn: (_c, _d, _t, env) => { envs.push({ ...env }); return pty; } });
+  const started = await startElsServer({ stateRoot: root, spawn: () => pty });
   if ('exitCode' in started) throw new Error(`startElsServer: ${started.message}`);
   let closed = false;
   const close = async (): Promise<void> => { if (!closed) { closed = true; await started.close(); } };
   cleanups.push(close);
-  // The owner registers the OP seat, then spawns the pane: its env token carries the OP role (the door's default rules).
+  // The owner registers the OP seat, then spawns the pane and keeps speaking as the server owner.
   const owner = process.env[AUTH_OWNER_TOKEN_ENV] as string;
   expect((await ask(root, { op: 'seat-set', seat: 'OP' }, owner)).exitCode).toBe(0);
   const made = JSON.parse((await ask(root, { op: 'new', ws: 'REC', cwd: '/tmp', command: ['sh'] }, owner)).message) as { pane: string };
-  return { root, pane: made.pane, token: envs[0]?.[AUTH_PANE_TOKEN_ENV] as string, emit, close };
+  return { root, pane: made.pane, token: owner, emit, close };
 };
 
 test('closed recording is stoppable by the same seat but not another seat', async () => {

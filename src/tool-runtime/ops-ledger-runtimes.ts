@@ -52,13 +52,13 @@ export const msgAckRuntime: ToolRuntime<Record<string, unknown>, MsgAckResult> =
     if (ctx.surface === 'mcp') {
       const seat = ctx.authenticatedSeat;
       if (!seat) throw new Error('MsgAck requires a host-authenticated seat');
-      if (Object.keys(req).some(key => key !== 'id')) throw new Error('MCP MsgAck accepts only id; recipient is bound by the host');
+      if (Object.keys(req).some(key => key !== 'id' && key !== 'ids' && key !== 'receipted')) throw new Error('MCP MsgAck accepts id, ids and receipted; recipient is bound by the host');
       const to = canonicalSeatId(seat);
       if (to === 'ALL') throw new Error('ALL is a topic, not an authenticated seat');
-      const bound = { to, id: req.id };
-      return observeLedgerCall('MsgAck', bound, () => dispatchMsgAck(bound), (a, r) => ({ to: a.to, id: a.id, ...(r ? { cursor: r.cursor } : {}) }));
+      const bound = { to, ...(req.id === undefined ? {} : { id: req.id }), ...(req.ids === undefined ? {} : { ids: req.ids }), ...(req.receipted === undefined ? {} : { receipted: req.receipted }) };
+      return observeLedgerCall('MsgAck', bound, () => dispatchMsgAck(bound), (a, r) => ({ to: a.to, id: a.id, ...(r ? { cursor: r.cursor, acked: r.acked.length } : {}) }));
     }
-    return observeLedgerCall('MsgAck', req, () => dispatchMsgAck(req), (a, r) => ({ to: a.to, id: a.id, ...(r ? { cursor: r.cursor } : {}) }));
+    return observeLedgerCall('MsgAck', req, () => dispatchMsgAck(req), (a, r) => ({ to: a.to, id: a.id, ...(r ? { cursor: r.cursor, acked: r.acked.length } : {}) }));
   },
 };
 

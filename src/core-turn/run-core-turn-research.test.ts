@@ -1455,3 +1455,54 @@ test('revise step carries the verified-source count and a model echoing the ledg
   const finalVerified = verifiedUrls.filter(url => result.finalText.includes(`](${url})`));
   expect(finalVerified).toEqual(verifiedUrls);
 });
+
+// ELN-RESEARCH-TURN-SEAT-REPLY: «look this up and reply to MK» on an eln seat must be able to reply by seat mail.
+async function runSeatMailResearchTurn(seat: string | null) {
+  const request = 'Research recent battery policy updates using current sources.';
+  let firstToolSet: string[] | undefined;
+  let postResult: unknown;
+  let ackResult: unknown;
+  const dispatched: string[] = [];
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers, options) => {
+    if (firstToolSet === undefined) {
+      firstToolSet = options?.tools?.map((item) => item.name) ?? [];
+      postResult = await handlers.dispatchTool('MsgPost', { from: 'SIMSEAT', to: 'MK', body: 'battery policy summary' });
+      ackResult = await handlers.dispatchTool('MsgAck', { to: 'SIMSEAT', id: 7 });
+    }
+    return 'answer';
+  });
+  const mailTool = (name: string): LLMToolSpec => ({ name, description: `${name} seat mail`, parameters: { type: 'object' } });
+  await runCoreTurn({
+    sessionId: `seat-mail-research-${seat ?? 'none'}`,
+    messages: [{ role: 'user', content: request }],
+    tools: [omniSearchTool, webSearchTool, webFetchTool, tool, mailTool('MsgList'), mailTool('MsgPost'), mailTool('MsgAck'), mailTool('Bash')],
+    dispatchTool: async (name) => { dispatched.push(name); return 'ok'; },
+    signal,
+    userText: request,
+  }, {
+    runResearch: async () => ({ ok: true, output: 'research evidence' }),
+    stallSeat: seat,
+    stallMailer: async () => {},
+  });
+  return { firstToolSet: firstToolSet ?? [], postResult, ackResult, dispatched };
+}
+
+test('a seat research turn keeps MsgPost and MsgAck and dispatches them', async () => {
+  const run = await runSeatMailResearchTurn('SIMSEAT');
+  expect(run.firstToolSet).toContain('MsgPost');
+  expect(run.firstToolSet).toContain('MsgAck');
+  expect(run.firstToolSet).not.toContain('Bash');
+  expect(run.postResult).toBe('ok');
+  expect(run.ackResult).toBe('ok');
+  expect(run.dispatched).toEqual(['MsgPost', 'MsgAck']);
+});
+
+test('a non-seat research turn still drops MsgPost and MsgAck', async () => {
+  const run = await runSeatMailResearchTurn(null);
+  expect(run.firstToolSet).not.toContain('Bash');
+  expect(run.firstToolSet).not.toContain('MsgPost');
+  expect(run.firstToolSet).not.toContain('MsgAck');
+  expect(run.postResult).toEqual({ error: 'This research turn may only use the research tool allowlist.' });
+  expect(run.ackResult).toEqual({ error: 'This research turn may only use the research tool allowlist.' });
+  expect(run.dispatched).toEqual([]);
+});

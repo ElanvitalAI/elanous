@@ -1,0 +1,70 @@
+{
+  "schema": 1,
+  "entries": {
+    "memory/M01": {
+      "expect": "green",
+      "reason": "memory world M01 through the real runGraph with D17 behind the GRAPH-MEMORY-SCOPES port",
+      "greenSince": "#39199 (GRAPH-MEMORY-SCOPES port wired into the runner)"
+    },
+    "memory/M02": {
+      "expect": "green",
+      "reason": "memory world M02 through the real runGraph with D17 behind the GRAPH-MEMORY-SCOPES port",
+      "greenSince": "#39199 (GRAPH-MEMORY-SCOPES port wired into the runner)"
+    },
+    "memory/M03": {
+      "expect": "green",
+      "reason": "memory world M03 through the real runGraph with D17 behind the GRAPH-MEMORY-SCOPES port",
+      "greenSince": "#39199 (GRAPH-MEMORY-SCOPES port wired into the runner)"
+    },
+    "memory/M04": {
+      "expect": "green",
+      "reason": "memory world M04 through the real runGraph with D17 behind the GRAPH-MEMORY-SCOPES port",
+      "greenSince": "#39199 (GRAPH-MEMORY-SCOPES port wired into the runner)"
+    },
+    "memory/M05": {
+      "expect": "green",
+      "reason": "memory world M05 through the real runGraph with D17 behind the GRAPH-MEMORY-SCOPES port",
+      "greenSince": "#39199 (GRAPH-MEMORY-SCOPES port wired into the runner)"
+    },
+    "memory/M06": {
+      "expect": "green",
+      "reason": "memory world M06 through the real runGraph with D17 behind the GRAPH-MEMORY-SCOPES port",
+      "greenSince": "#39199 (GRAPH-MEMORY-SCOPES port wired into the runner)"
+    },
+    "memory/M07": {
+      "expect": "green",
+      "reason": "memory world M07 through the real runGraph with D17 behind the GRAPH-MEMORY-SCOPES port",
+      "greenSince": "#39199 (GRAPH-MEMORY-SCOPES port wired into the runner)"
+    },
+    "memory/M08": {
+      "expect": "green",
+      "reason": "memory world M08 through the real runGraph with D17 behind the GRAPH-MEMORY-SCOPES port",
+      "greenSince": "#39199 (GRAPH-MEMORY-SCOPES port wired into the runner)"
+    },
+    "memory/M09": {
+      "expect": "red",
+      "reason": "supervisor tick n does not see tick n-1: instance reads are bound to the run id, no supervisor-scoped binding yet (GRAPH-MEMORY-SCOPES + SIM-WORLD-SUP)",
+      "redReason": "expectation-mismatch: tick2SeesTick1"
+    },
+    "memory/M10": {
+      "expect": "red",
+      "reason": "the verb-remember subgraph unit's memory request is not passed through the port: recall returns nothing and evidence carries no store id (ta-remember handler V8)",
+      "redReason": "expectation-mismatch: recalled"
+    },
+    "memory/M11": {
+      "expect": "green",
+      "reason": "memory world M11 through the real runGraph with D17 behind the GRAPH-MEMORY-SCOPES port",
+      "greenSince": "#39199 (GRAPH-MEMORY-SCOPES port wired into the runner)"
+    },
+    "memory/M12": {
+      "expect": "green",
+      "reason": "memory world M12 through the real runGraph with D17 behind the GRAPH-MEMORY-SCOPES port",
+      "greenSince": "#39199 (GRAPH-MEMORY-SCOPES port wired into the runner)"
+    },
+    "memory/M25": {
+      "expect": "green",
+      "reason": "memory world M25 through the real runGraph: seatKey TC promote lands in template key seat:TC, seat OP reads nothing, unapproved promote refused",
+      "greenSince": "#39199 (GRAPH-MEMORY-SCOPES port wired into the runner)"
+    }
+  }
+}

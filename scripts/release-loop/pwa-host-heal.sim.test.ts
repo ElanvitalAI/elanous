@@ -74,7 +74,7 @@ test('PWA host-heal simulation: actual PWA remote node moves from mshq no-Chrome
   expect(String(initial.output.error)).toContain('no-chrome-binary');
 
   const healed = await healPwaHostFailure({ runId: 'sim-pwa-host-heal-19-44', failedHost: 'mshq', initial,
-    candidates: { mshq: 2, gcp2: 2, 'host-c': 1, aws2: 2 }, maxLoadAverage: 20,
+    candidates: { 'mshq': 2, gcp2: 2, 'host-c': 1, aws2: 2 }, maxLoadAverage: 20,
     probe: async (host, slots) => ({ ...probes.find((item) => item.host === host)!, slots }),
     run: async (host) => invokePwaNode(host) });
 

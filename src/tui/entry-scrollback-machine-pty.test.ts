@@ -20,12 +20,12 @@ const settleResize = (label: string, cols: number, rows: number, open: boolean):
 // Remaining rows of 내부 문서 `next-tui-scrollback-state-machine` §4.
 const TRANSITIONS: { name: string; steps: SeatPtyStep[]; layoutChanges: string[]; resizeMarker: string | null }[] = [
   { name: 'sidetab width open-close-reopen', steps: [
-    { label: 'reply', text: 'long before side toggle', until: (screen: string) => screen.includes(reply.at(-1)!) && screen.includes("완료 ·") },
+    { label: 'reply', text: 'long before side toggle', until: (screen: string) => screen.includes(reply.at(-1)!) && screen.includes('● Turn done') },
     toggle('open', true), toggle('close', false), toggle('reopen', true),
   ], layoutChanges: ['open', 'close', 'reopen'], resizeMarker: null },
   { name: 'open sidetab physical width resize', steps: [
     toggle('open', true),
-    { label: 'reply', text: 'long before resize', until: (screen: string) => screen.includes(reply.at(-1)!) && screen.includes("완료 ·") },
+    { label: 'reply', text: 'long before resize', until: (screen: string) => screen.includes(reply.at(-1)!) && screen.includes('● Turn done') },
     settleResize('width 50', 50, 8, true),
   ], layoutChanges: ['open'], resizeMarker: '── resize 50x8 ──' },
   { name: 'reply settlement with sidetab toggle', steps: [
@@ -33,13 +33,13 @@ const TRANSITIONS: { name: string; steps: SeatPtyStep[]; layoutChanges: string[]
       until: (screen: string) => screen.includes('│') && screen.includes(reply.at(-1)!) },
   ], layoutChanges: ['reply and toggle'], resizeMarker: null },
   { name: 'compact-general-compact height roundtrip', steps: [
-    { label: 'reply', text: 'long before mode roundtrip', until: (screen: string) => screen.includes(reply.at(-1)!) && screen.includes("완료 ·") },
+    { label: 'reply', text: 'long before mode roundtrip', until: (screen: string) => screen.includes(reply.at(-1)!) && screen.includes('● Turn done') },
     settleResize('general 40x12', 40, 12, false),
     settleResize('compact 40x8', 40, 8, false),
   ], layoutChanges: [], resizeMarker: '── resize 40x8 ──' },
   { name: 'PageUp width resize then return to tail', steps: [
-    { label: 'reply', text: 'long before PageUp', until: (screen: string) => screen.includes(reply.at(-1)!) && screen.includes("완료 ·") },
-    { label: 'PageUp', keys: '\x1b[5~', until: (screen: string) => screen.includes('턴 로그') && !screen.includes(reply.at(-1)!) },
+    { label: 'reply', text: 'long before PageUp', until: (screen: string) => screen.includes(reply.at(-1)!) && screen.includes('● Turn done') },
+    { label: 'PageUp', keys: '\x1b[5~', until: (screen: string) => screen.includes('● log') && !screen.includes(reply.at(-1)!) },
     settleResize('resize while scrolled', 50, 8, false),
     { label: 'return to tail', chunks: Array.from({ length: 5 }, () => '\x1b[6~'), gapMs: 100,
       until: (screen: string) => screen.includes('❯') },
@@ -94,7 +94,7 @@ for (const scenario of TRANSITIONS) {
         for (const label of scenario.layoutChanges) {
           const frame = run.frames.find((item) => item.label === label);
           expect(frame).toBeDefined();
-          if (frame!.screen.includes('│')) expect(frame!.screen.split('\n')[0]).toContain('세션');
+          if (frame!.screen.includes('│')) expect(frame!.screen.split('\n')[0]).toContain('Sessions');
           const width = 40;
           const chatWidth = frame!.screen.includes('│') ? width - sidetabWidthForTerminal(width) - 1 : width;
           const marker = `── layout chat ${chatWidth}x8 ──`;

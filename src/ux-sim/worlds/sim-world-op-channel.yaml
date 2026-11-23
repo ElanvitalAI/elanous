@@ -1,6 +1,6 @@
 # SIM-WORLD op-channel pack (CEO-CHANNEL-FIRST-CLASS · OP-CHANNEL-INGRESS-1121 — SIM-WORLD-P0-SWEEP ②): the CEO
 # channel's three product-door axes (① ingress+dedupe · ③ receipt · ④ reply, and the storage-failure restart)
-# through the real createCeoChannel path. Expectations: worlds/sim-world-expect.json (kernel) + the pack-local
+# through the real createCeoChannel path. Expectations: worlds/expect/op-channel.json (kernel) + the pack-local
 # expect.json (bun test). Ids are OP-C*: capsule-events already owns C1/C2/C3 (precheck 5 refuses collisions).
 schema: 1
 world: op-channel

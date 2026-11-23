@@ -9,14 +9,15 @@
 // Every skip / refuse / infra branch becomes a summary event (and a debug.log row); none is a silent pass.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { debug } from '../../debug/log.js';
 import { getTestStateRoot, setTestStateRoot } from '../../nexus/paths.js';
 import { sandboxedRunnerCommand } from '../world.js';
 import { compareDeviceResponseShapes, deviceFidelityStatus } from '../device-fidelity.js';
-import { classifySimWorldOutcome, judgeSimWorldScenario, parseSimWorldExpectTable, resolveSimWorldExpectation, SIM_WORLD_RED_VERDICTS } from './expect.js';
+import { classifySimWorldOutcome, judgeSimWorldScenario, resolveSimWorldExpectation, SIM_WORLD_RED_VERDICTS } from './expect.js';
+import { readSimWorldExpectTable } from './expect-load.js';
 import { checkSimWorldRatchet } from './ratchet.js';
 import { canonicalJson, createSimWorldRecorder, SIM_WORLD_RECORD_FILES, type SimWorldRecorderOptions } from './recorder.js';
 import { SIM_WORLD_IDS, type SimWorldDeviceDef, type SimWorldEngine, type SimWorldEngineOption, type SimWorldExpectTable, type SimWorldPack,
@@ -81,7 +82,9 @@ function loadSimWorldPack(world: SimWorldPackId, packRoot: string): SimWorldPack
   return value as SimWorldPack;
 }
 
-const readTable = (file: string): SimWorldExpectTable => parseSimWorldExpectTable(readFileSync(file, 'utf8'));
+// #126458 P0 SIM-WORLD-REGISTRY-NO-SHARED-EDIT: 기대표는 월드별 조각 worlds/expect/<world>.json 이 원천.
+// 레거시 단일 sim-world-expect.json 이 그 자리에 있으면(테스트 fixture 등) 그것이 원천으로 이긴다.
+const readTable = (file: string): SimWorldExpectTable => readSimWorldExpectTable(file);
 const firstLine = (text: string) => text.split('\n').find((line) => line.trim())?.trim() ?? '(empty diff)';
 function seededRandom(key: string): () => number {
   let state = createHash('sha256').update(key).digest().readUInt32LE(0);
@@ -243,7 +246,17 @@ export function simWorldReplayOptions(stateRoot: string, replayOf: string):
   return { worldId, ...(worldId === 'all' ? { worlds: known } : {}), seed: recorded.seed!, engine: recorded.engine, only: recorded.only ?? null, expectBaseFile: recorded.expectBase?.path ?? null };
 }
 
-const fileSha256 = (path: string) => createHash('sha256').update(readFileSync(path)).digest('hex');
+// #126458 JUD-B #127000/#127050: hash the *resolved* expect table (legacy single file or discovered
+// fragments) — hashing the raw legacy path ENOENTs on a fragment-only tree.
+const tableSha256 = (file: string) => createHash('sha256').update(JSON.stringify(readSimWorldExpectTable(file))).digest('hex');
+
+// OP #127293 / JUD-C #127291/#127292: summaries written before `hashKind` recorded the RAW file hash (a legacy
+// single file only — fragment trees crashed before r8). Replay compares those against the raw bytes when the
+// base path is still a plain file; a fragment-only tree has none, so it falls back to the table hash.
+const rawFileSha256 = (file: string): string | null => {
+  if (!existsSync(file) || !statSync(file).isFile()) return null;
+  return createHash('sha256').update(readFileSync(file)).digest('hex');
+};
 
 function firstDiffLine(recorded: string, replayed: string): string {
   const left = recorded.split('\n');
@@ -338,7 +351,13 @@ export async function runSimWorlds(options: SimWorldRunOptions & { readonly repl
       }
     }
     const recordedBase = (JSON.parse(readFileSync(join(recordedRun, 'summary.json'), 'utf8')) as Partial<SimWorldSummary>).expectBase ?? null;
-    const replayBaseSha = options.expectBaseFile ? fileSha256(options.expectBaseFile) : null;
+    // OP #127293: an old record (no hashKind) hashed the raw file; a new one (hashKind 'table-sha256/1') hashes the
+    // resolved table. Compare like with like; a fragment-only base has no raw file, so an old record falls back to
+    // the table hash there (the only thing computable without ENOENT).
+    const replayTableSha = options.expectBaseFile ? tableSha256(options.expectBaseFile) : null;
+    const replayBaseSha = !options.expectBaseFile ? null
+      : recordedBase?.hashKind === 'table-sha256/1' ? replayTableSha
+      : rawFileSha256(options.expectBaseFile) ?? replayTableSha;
     if ((recordedBase?.sha256 ?? null) !== replayBaseSha)
       mismatches.push({ dir: '.', file: 'expect-base', firstDiff: `recorded ${recordedBase ? `${recordedBase.path} sha256 ${recordedBase.sha256}` : 'none'} · replayed ${options.expectBaseFile ? `${options.expectBaseFile} sha256 ${replayBaseSha}` : 'none'}` });
     if (scenarios.length !== recorded.length) mismatches.push({ dir: '.', file: 'summary.json', firstDiff: `recorded ${recorded.length} scenario runs · replayed ${scenarios.length}` });
@@ -352,7 +371,7 @@ export async function runSimWorlds(options: SimWorldRunOptions & { readonly repl
   if (mainSha === null) kernelEvent(events, 'main-sha-unmeasured', null, `refs/remotes/origin/main not found${sha.stderr?.trim() ? `: ${firstLine(sha.stderr)}` : ''}`);
   const fatal = events.some((event) => event.kind.startsWith('ratchet-') || ['only-matched-nothing', 'sandbox-failed', 'replay-mismatch', 'world-unmeasured'].includes(event.kind));
   const summary: SimWorldSummary = { schema: 'sim-world.summary/1', runId: options.runId, seed: options.seed, engine: options.engine, only: options.only,
-    worlds, mainSha, expectBase: options.expectBaseFile ? { path: resolve(options.expectBaseFile), sha256: fileSha256(options.expectBaseFile) } : null,
+    worlds, mainSha, expectBase: options.expectBaseFile ? { path: resolve(options.expectBaseFile), sha256: tableSha256(options.expectBaseFile), hashKind: 'table-sha256/1' } : null,
     counts, scenarios, worldWallMs, replay, events, ok: !fatal && !scenarios.some((row) => SIM_WORLD_RED_VERDICTS.includes(row.verdict)) };
   const summaryPath = join(runDir, 'summary.json');
   writeFileSync(summaryPath, `${canonicalJson(summary, 2)}\n`);

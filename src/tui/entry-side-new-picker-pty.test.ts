@@ -15,11 +15,11 @@ test('HERDR-C1-PICKER-FRICTION: typing on after «/side new» closes the picker 
       root, rows: 30, cols: 120,
       env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
         ELANOUS_CONFIG_DIR: root, ELANOUS_STATE_DIR: root },
-      ready: { label: 'boot', until: (screen) => /Ctrl\+Q (종료|quit)/.test(screen) },
+      ready: { label: 'boot', until: (screen) => /Ctrl\+Q quit/.test(screen) },
       steps: [
         { label: 'picker', text: '/side new', until: (screen) => { seen.picker = screen; return /s shell · e elanous/.test(screen); } },
         // The person keeps typing the next command; «/» closes the picker and the line reaches the composer.
-        { label: 'typed on', text: '/side all', until: (screen) => { seen.after = screen; return /All sidetab entries/.test(screen); } },
+        { label: 'typed on', text: '/side all', until: (screen) => { seen.after = screen; return /● Sidetab full list/.test(screen); } },
       ],
     });
     expect(run.exitCode).toBe(0);

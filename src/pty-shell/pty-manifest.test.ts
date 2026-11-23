@@ -130,7 +130,7 @@ describe('pty-manifest store (크로스-프로세스 관측)', () => {
     expect(sidetabRowsFromManifest([row!], 'project', undefined, {
       mode: 'workspaces', expandedWorkspaceIds: [],
     })).toMatchObject([{
-      id: 'workspace:legacy-space', label: '워크스페이스 · legacy-space', status: 'workspace-unclassified',
+      id: 'workspace:legacy-space', label: 'Workspace · legacy-space', status: 'workspace-unclassified',
     }]);
     expect(sidetabRowsFromManifest([row!], 'project', undefined, {
       mode: 'workspaces', expandedWorkspaceIds: ['workspace:legacy-space'],

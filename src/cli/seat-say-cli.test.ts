@@ -54,19 +54,17 @@ test('seat say → one ledger row from an agent seat · request · due · done, 
   expect(w.stdout.at(-1)).toBe('follow: eln msg receipts --from OP --follow --until seen');
 });
 
-test('A217: a request without due or done is refused before anything is stored or woken', async () => {
+test('A217 · MSG-FILTERS-RELAX: a request without due or done is stored and woken, with a warning', async () => {
   const w = world();
   await w.run('TC', '마감 없는 요청', '--from', 'OP');
-  expect(w.exits).toEqual([2]);
-  expect(w.stderr.join('\n')).toContain('--intent request needs --deadline <due> and --done <condition>');
-  expect(w.woke).toEqual([]);
-  // #38249 REVIEW-1 ①: a refused post prints no «follow» line (nothing was stored to follow).
-  expect(w.stdout.some(line => line.startsWith('follow:'))).toBe(false);
+  expect(w.exits).toEqual([]);
+  expect(w.stderr.join('\n')).toContain('msg post 경고: --intent request 에 --deadline <due> 와 --done <condition> 이 없다 (A217 요청 계약) — 그대로 저장한다');
+  expect(w.woke).toHaveLength(1);
   const store = new MsgStore(w.path);
-  try { expect(store.listByRecipient('TC')).toEqual([]); } finally { store.close(); }
+  try { expect(store.listByRecipient('TC').map(row => [row.body, row.intent])).toEqual([['마감 없는 요청', 'request']]); } finally { store.close(); }
   // info 는 계약 밖 — due 없이도 간다.
   await w.run('TC', '참고', '--from', 'OP', '--intent', 'info');
-  expect(w.woke).toHaveLength(1);
+  expect(w.woke).toHaveLength(2);
 });
 
 test('parseDue — ISO · HH:MM (next occurrence) · +n m|h · anything else refused', () => {

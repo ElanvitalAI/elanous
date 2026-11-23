@@ -81,6 +81,9 @@ function noticeJsonField(output: string, field: string): string {
 }
 
 describe('RunShell bg completion → turn notification queue', () => {
+  // #39630 · #39782: prepareRunnerRunShell denies an argv whose command[0] is not a real
+  // executable in the no-hold classes before the injected spawnFn runs. Fixtures therefore
+  // dispatch 'sleep' (same as the long-sleep suite); the fake spawn engine still simulates the run.
   beforeEach(() => {
     globalTaskNotificationQueue.clear();
   });
@@ -96,7 +99,7 @@ describe('RunShell bg completion → turn notification queue', () => {
       registry,
       fileEngine: createFileCaptureEngine({ spawnFn: fakeSpawnExit(0) }),
     });
-    const started = await dispatchRunShell({ command: ['bg-notify-ok'], mode: 'bg' });
+    const started = await dispatchRunShell({ command: ['sleep', '2'], mode: 'bg' });
     expect(started.outcome).toBe('started');
     expect(globalTaskNotificationQueue.size).toBe(0);
     const handleId = registry.list()[0]!.id;
@@ -123,7 +126,7 @@ describe('RunShell bg completion → turn notification queue', () => {
       registry,
       fileEngine: createFileCaptureEngine({ spawnFn: fakeSpawnExit(1, 'compile output', 'missing dependency') }),
     });
-    const started = await dispatchRunShell({ command: ['bg-notify-nonzero'], mode: 'bg' });
+    const started = await dispatchRunShell({ command: ['sleep', '2'], mode: 'bg' });
     expect(started.outcome).toBe('started');
     const handle = registry.list()[0]!;
     const result = await handle.result;
@@ -158,7 +161,7 @@ describe('RunShell bg completion → turn notification queue', () => {
     const registry = createShellRegistry();
     setShellRunnerDeps({ registry, fileEngine: createFileCaptureEngine({ spawnFn }) });
 
-    const started = await dispatchRunShell({ command: ['missing-command'], mode: 'bg' });
+    const started = await dispatchRunShell({ command: ['sleep', '2'], mode: 'bg' });
     expect(started.outcome).toBe('started');
     const handle = registry.list()[0]!;
     const result = await handle.result;
@@ -183,7 +186,7 @@ describe('RunShell bg completion → turn notification queue', () => {
       registry,
       fileEngine: { kind: 'file', run: () => handle },
     });
-    const started = await dispatchRunShell({ command: ['bg-notify-fail'], mode: 'bg' });
+    const started = await dispatchRunShell({ command: ['sleep', '2'], mode: 'bg' });
     expect(started.outcome).toBe('started');
     expect(globalTaskNotificationQueue.size).toBe(0);
     rejectResult(new Error('command failed'));
@@ -205,7 +208,7 @@ describe('RunShell bg completion → turn notification queue', () => {
       registry,
       fileEngine: createFileCaptureEngine({ spawnFn: fakeSpawnExit(0) }),
     });
-    const r = await dispatchRunShell({ command: ['inline-notify'], mode: 'inline' });
+    const r = await dispatchRunShell({ command: ['sleep', '2'], mode: 'inline' });
     expect(r.outcome).toBe('exit');
     expect(globalTaskNotificationQueue.size).toBe(0);
   });
@@ -316,14 +319,14 @@ describe('RunShell bg completion → turn notification queue', () => {
     const handles = [fakeBgHandle('reused-id', result), fakeBgHandle('reused-id', result)];
     const registry = createShellRegistry();
     setShellRunnerDeps({ registry, fileEngine: { kind: 'file', run: () => handles.shift()! } });
-    const first = await dispatchRunShell({ command: ['first'], mode: 'bg' });
+    const first = await dispatchRunShell({ command: ['sleep', '2'], mode: 'bg' });
     expect(first.outcome).toBe('started');
     await tick();
     const firstNotice = globalTaskNotificationQueue.drain();
     expect(firstNotice).toHaveLength(1);
     expect(firstNotice[0]?.output).toContain('handle=reused-id');
 
-    const second = await dispatchRunShell({ command: ['second'], mode: 'bg' });
+    const second = await dispatchRunShell({ command: ['sleep', '2'], mode: 'bg' });
     expect(second.outcome).toBe('started');
     await tick();
     const secondNotice = globalTaskNotificationQueue.drain();
@@ -340,7 +343,7 @@ describe('RunShell bg completion → turn notification queue', () => {
       fileEngine: createFileCaptureEngine({ spawnFn: fakeSpawnExit(0) }),
     });
     await dispatchRunShell({
-      command: ['bg-notify-label'],
+      command: ['sleep', '2'],
       mode: 'bg',
       description: 'label "quoted" & <tag>',
     });

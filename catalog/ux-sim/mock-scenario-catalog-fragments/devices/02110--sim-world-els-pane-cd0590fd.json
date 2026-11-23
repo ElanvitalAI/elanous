@@ -1,0 +1,27 @@
+{
+  "id": "sim-world-els-pane",
+  "name": "SIM-WORLD ELS pane devices (live cwd · steer pre-empt)",
+  "audience": "internal",
+  "implementation": [
+    "src/ux-sim/sim-world/els/live-cwd.ts",
+    "src/ux-sim/sim-world/els/steer-preempt.ts"
+  ],
+  "tests": [
+    "src/els/live-cwd.test.ts"
+  ],
+  "target": "synthetic PTY output at the real ELS core subscription boundary; no real shell is driven",
+  "inputs": [
+    "scripted PTY output frames",
+    "steer messages injected during a running turn"
+  ],
+  "observations": [
+    "the real ELS core reads the pane cwd from the synthetic output",
+    "the steer pre-empt verdict goes through the kernel expectation ratchet"
+  ],
+  "entryCommands": [
+    "eln --test=<isolated-state> sim world run els --seed 1"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

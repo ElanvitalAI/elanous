@@ -9,6 +9,10 @@ import { resetShellRunnerDeps, setShellRunnerDeps } from './dispatch.js';
 import { createShellRegistry } from './registry.js';
 
 
+// CEO 11-23 relax: only hold-class argv still take the signed grant. This argv is destructive by the guardian
+// (recursive rm) yet harmless: printf succeeds, so the `||` branch never runs.
+const GRANT_FIXTURE = ['/bin/sh', '-c', 'printf "approved\\n" || ngrok version'];
+
 test('runner uses signed IPC for each spawn, rejects replay and boolean-only approval', async () => {
   const old = { home: process.env.HOME, seat: process.env.ELANOUS_TRACK, key: process.env[RUNSHELL_PUBLIC_KEY_ENV], send: process.send };
   const connectedDescriptor = Object.getOwnPropertyDescriptor(process, 'connected');
@@ -18,15 +22,19 @@ test('runner uses signed IPC for each spawn, rejects replay and boolean-only app
   process.env[RUNSHELL_PUBLIC_KEY_ENV] = issuer.publicKey;
   let grant: ReturnType<typeof issuer.issue> | null = null;
   let state: 'issue' | 'replay' | 'deny' = 'issue';
+  let ipcCalls = 0;
   (process as any).send = (m: RunShellApprovalCall) => {
+    ipcCalls++;
     if (state === 'issue') grant = issuer.issue(m.request);
     queueMicrotask(() => process.emit('message', { type: RUNSHELL_APPROVAL_RESULT, callId: m.callId, approval: state === 'deny' ? null : grant }));
     return true;
   };
   setShellRunnerDeps({ registry: createShellRegistry() });
   try {
-    const args = { command: ['/bin/echo', 'approved'], cwd: '/tmp', mode: 'inline', approval: 'none' };
+    const args = { command: GRANT_FIXTURE, cwd: '/tmp', mode: 'inline', approval: 'none' };
     const opts = { sessionId: 'test-session', priorHumanApproval: true };
+    const relaxed = await dispatchRunShell({ command: ['/bin/echo', 'relaxed'], cwd: '/tmp', mode: 'inline', approval: 'none' }, opts);
+    expect([relaxed.outcome, relaxed.stdout, ipcCalls]).toEqual(['exit', 'relaxed\n', 0]);
     const first = await dispatchRunShell(args, opts);
     expect(first.outcome).toBe('exit');
     expect(first.stdout).toBe('approved\n');

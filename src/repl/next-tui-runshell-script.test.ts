@@ -109,7 +109,7 @@ test('Next TUI RunShell route accepts script and consumes both CLI results', asy
   expect(readFileSync(marker, 'utf8')).toBe('call\ncall\n');
 });
 
-test('an unlisted script argv requests human approval with default options and denial prevents CLI execution', async () => {
+test('CEO 11-23 relax: an unlisted non-destructive script argv runs; a destructive one needs the signed grant', async () => {
   root = mkdtempSync(join(tmpdir(), 'next-runshell-script-unlisted-'));
   const marker = join(root, 'calls');
   const cli = join(root, 'eln');
@@ -135,23 +135,23 @@ test('an unlisted script argv requests human approval with default options and d
   const result = await tools.dispatch('RunShell', { script: [
     { id: 'outside', command: ['eln', 'ops', 'status', '--output', '/tmp/unsafe'] },
   ] }) as { outcome: string };
-  expect(result.outcome).toBe('denied');
-  expect(approval.commands).toEqual(['eln ops status --output /tmp/unsafe']);
-  expect(existsSync(marker)).toBe(false);
+  expect(result.outcome).toBe('exit');
+  expect(approval.commands).toEqual([]);
+  expect(readFileSync(marker, 'utf8')).toBe('call\n');
 
   const write = await tools.dispatch('RunShell', { script: [
     { id: 'write', command: ['eln', 'memory', 'delete', 'synthetic-id'] },
   ] }) as { outcome: string };
   expect(write.outcome).toBe('denied');
-  expect(approval.commands).toEqual(['eln ops status --output /tmp/unsafe', 'eln memory delete synthetic-id']);
-  expect(existsSync(marker)).toBe(false);
+  expect(approval.commands).toEqual(['eln memory delete synthetic-id']);
+  expect(readFileSync(marker, 'utf8')).toBe('call\n');
 
   const network = await tools.dispatch('RunShell', { network: 'inherit', script: [
     { id: 'network', command: ['eln', 'ops', 'status'] },
   ] }) as { outcome: string };
-  expect(network.outcome).toBe('denied');
-  expect(approval.commands).toEqual(['eln ops status --output /tmp/unsafe', 'eln memory delete synthetic-id', 'eln ops status']);
-  expect(existsSync(marker)).toBe(false);
+  expect(network.outcome).toBe('exit');
+  expect(approval.commands).toEqual(['eln memory delete synthetic-id']);
+  expect(readFileSync(marker, 'utf8')).toBe('call\ncall\n');
 
   const granted = new ApprovalProcess(true);
   signedApprovals(granted.commands, () => true);
@@ -160,10 +160,10 @@ test('an unlisted script argv requests human approval with default options and d
   ] }) as { outcome: string; exitCode: number };
   expect([accepted.outcome, accepted.exitCode]).toEqual(['exit', 0]);
   expect(granted.commands).toEqual(['eln memory delete synthetic-id']);
-  expect(readFileSync(marker, 'utf8')).toBe('call\n');
+  expect(readFileSync(marker, 'utf8')).toBe('call\ncall\ncall\n');
 });
 
-test('git local read needs no prompt while gh GET needs approval and gh write never runs', async () => {
+test('git local read needs no prompt; CEO 11-23 relax runs worktree, ls-remote and gh GET reads without a grant', async () => {
   root = mkdtempSync(join(tmpdir(), 'next-runshell-git-gh-'));
   const gitCalls = join(root, 'git-calls');
   const gitArgs = join(root, 'git-args');
@@ -201,30 +201,22 @@ test('git local read needs no prompt while gh GET needs approval and gh write ne
   expect(readFileSync(gitEnv, 'utf8')).toBe('1:0');
 
   const worktree = await tools.dispatch('RunShell', { script: [{ id: 'worktree', command: ['git', 'status', '--short'] }] }) as { outcome: string };
-  expect(worktree.outcome).toBe('denied');
-  expect(approval.commands).toEqual(['git status --short']);
-  expect(readFileSync(gitCalls, 'utf8')).toBe('git\n');
+  expect(worktree.outcome).toBe('exit');
+  expect(readFileSync(gitCalls, 'utf8')).toBe('git\ngit\n');
 
   const remote = await tools.dispatch('RunShell', { script: [{ id: 'remote', command: ['git', 'ls-remote', '.'] }] }) as { outcome: string };
-  expect(remote.outcome).toBe('denied');
-  expect(approval.commands).toEqual(['git status --short', 'git ls-remote .']);
-  expect(readFileSync(gitCalls, 'utf8')).toBe('git\n');
+  expect(remote.outcome).toBe('exit');
+  expect(readFileSync(gitCalls, 'utf8')).toBe('git\ngit\ngit\n');
 
   const endpoint = 'repos/team/repo/issues?state=open&per_page=2';
-  const denied = await tools.dispatch('RunShell', { script: [{ id: 'gh', command: ['gh', 'api', endpoint] }] }) as { outcome: string };
-  expect(denied.outcome).toBe('denied');
-  expect(approval.commands).toEqual(['git status --short', 'git ls-remote .', `gh api ${endpoint}`]);
-  expect(existsSync(ghCalls)).toBe(false);
-
-  approval.approved = true;
   const gh = await tools.dispatch('RunShell', { script: [{ id: 'gh', command: ['gh', 'api', endpoint], select: ['kind'] }] }) as { outcome: string; stdout: string };
   expect(gh.outcome).toBe('exit');
   expect(JSON.parse(gh.stdout).steps[0].selected.kind).toBe('gh');
-  expect(approval.commands).toEqual(['git status --short', 'git ls-remote .', `gh api ${endpoint}`, `gh api ${endpoint}`]);
   expect(readFileSync(ghCalls, 'utf8')).toBe('gh\n');
+  expect(approval.commands).toEqual([]);
 });
 
-test('TUI script consumes eln and host reads while kubectl needs prior approval', async () => {
+test('TUI script consumes eln and host reads; CEO 11-23 relax runs kubectl get and df without a grant', async () => {
   root = mkdtempSync(join(tmpdir(), 'next-runshell-read-bundle-'));
   const marker = join(root, 'calls');
   for (const binary of ['eln', 'hostname', 'kubectl', 'df']) {
@@ -236,7 +228,7 @@ test('TUI script consumes eln and host reads while kubectl needs prior approval'
   process.env[NEXT_TUI_SHELL_APPROVAL_IPC_ENV] = '1';
   const channel = new EventEmitter() as EventEmitter & ShellApprovalIpcProcess;
   const requests: string[] = [];
-  let approved = false;
+  const approved = false;
   channel.send = (message: unknown) => {
     const call = message as { type: string; callId: string; command: string };
     if (call.type === 'elanous.shell-approval.call') {
@@ -254,23 +246,17 @@ test('TUI script consumes eln and host reads while kubectl needs prior approval'
   expect(local.outcome).toBe('exit');
   expect(JSON.parse(local.stdout).steps.map((step: { selected: { kind: string } }) => step.selected.kind)).toEqual(['eln', 'hostname']);
   expect(requests).toEqual([]);
-  const denied = await tools.dispatch('RunShell', { script: [
-    { id: 'cluster', command: ['kubectl', 'get', 'pods', '-n', 'default', '-o', 'json'] },
-  ] }) as { outcome: string };
-  expect(denied.outcome).toBe('denied');
-  expect(readFileSync(marker, 'utf8')).toBe('eln\nhostname\n');
+  const cluster = await tools.dispatch('RunShell', { script: [
+    { id: 'cluster', command: ['kubectl', 'get', 'pods', '-n', 'default', '-o', 'json'], select: ['kind'] },
+  ] }) as { outcome: string; stdout: string };
+  expect(cluster.outcome).toBe('exit');
+  expect(JSON.parse(cluster.stdout).steps[0].selected.kind).toBe('kubectl');
   const remoteMount = await tools.dispatch('RunShell', { script: [
     { id: 'mount', command: ['df', '-h'] },
   ] }) as { outcome: string };
-  expect(remoteMount.outcome).toBe('denied');
-  expect(readFileSync(marker, 'utf8')).toBe('eln\nhostname\n');
-  approved = true;
-  const accepted = await tools.dispatch('RunShell', { script: [
-    { id: 'cluster', command: ['kubectl', 'get', 'pods', '-n', 'default', '-o', 'json'], select: ['kind'] },
-  ] }) as { outcome: string; stdout: string };
-  expect(accepted.outcome).toBe('exit');
-  expect(JSON.parse(accepted.stdout).steps[0].selected.kind).toBe('kubectl');
-  expect(requests).toEqual(['kubectl get pods -n default -o json', 'df -h', 'kubectl get pods -n default -o json']);
+  expect(remoteMount.outcome).toBe('exit');
+  expect(readFileSync(marker, 'utf8')).toBe('eln\nhostname\nkubectl\ndf\n');
+  expect(requests).toEqual([]);
 });
 
 test('check uses the approval broker and denial prevents execution', async () => {

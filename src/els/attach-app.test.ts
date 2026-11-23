@@ -63,11 +63,11 @@ test('sidebar: workspace line with its rolled-up mark and «⎇n ●n», pane li
   const rows = parsePaneRows(listOf(row('w1', 'p1', 'build', 'working'), row('w1', 'p2', 'old', 'exited'), row('w2', 'p3', 'repl', 'idle')));
   const lines = buildSidebar(rows, 'p1', 28, 6);
   expect(lines).toHaveLength(6);
-  expect(lines.map(plain)).toEqual([' ▾ ● name-w1 ⎇2 ●1          ', '    ● build [build unknown] ', '    ✓ old [build unknown]   ', ' ▾ ○ name-w2                ', '    ○ repl [build unknown]  ', ' '.repeat(28)]);
+  expect(lines.map(plain)).toEqual([' ▾ 🟢 name-w1 ⎇2 🟢1        ', '    🟢 build [build unknown]', '    ✅ old [build unknown]  ', ' ▾ ⚪ name-w2               ', '    ⚪ repl [build unknown] ', ' '.repeat(28)]);
   expect(lines[1]).toContain('\u001b[7m');                     // the selected row is reverse video
-  expect(lines[1]).toContain('\u001b[32m●');                   // working = green mark
+  expect(lines[1]).toContain('\u001b[32m🟢');                   // working = green mark (OP #134199 이모지 표)
   expect(lines[2]).toContain('\u001b[2m');                     // exited = dim
-  expect(lines[4]).toContain('\u001b[2m○');                    // idle = dim mark
+  expect(lines[4]).toContain('\u001b[2m⚪');                    // idle = dim mark (OP #134199 이모지 표)
 });
 
 test('compose: sidebar | pane with the pane colours kept, the cursor placed at the pane cursor, the sidebar dropped under 60 columns', () => {
@@ -101,9 +101,11 @@ function harness(initial: string, size = { cols: 80, rows: 24 }, remembered: { s
   const writes: string[] = [];
   let created = 0;
   let newResponse: (() => Promise<ElsResult>) | undefined;
+  let moveResponse: ElsResult = { exitCode: 0, message: 'moved' };
   const app = createAttachApp({
     request: async (request): Promise<ElsResult> => {
       requests.push(request);
+      if (request.op === 'move-tab') return moveResponse;
       if (request.op === 'ls') return lsAway ? { exitCode: 1, message: lsAway } : { exitCode: 0, message: listing };
       if (request.op === 'new') {
         if (newResponse) return newResponse();
@@ -134,8 +136,26 @@ function harness(initial: string, size = { cols: 80, rows: 24 }, remembered: { s
     memory: { load: () => remembered, save: (state) => { saved.push(state); } },
     ...(sidebar === undefined ? {} : { sidebar }),
   });
-  return { app, saved, requests, attachments, writes, setNewResponse: (next: (() => Promise<ElsResult>) | undefined) => { newResponse = next; }, setListing: (next: string) => { listing = next; }, setLsAway: (message: string | undefined) => { lsAway = message; }, tick: () => { poll?.(); }, lastScreen: () => plain(writes.at(-1) ?? '') };
+  return { app, saved, requests, attachments, writes, setMoveResponse: (next: ElsResult) => { moveResponse = next; }, setNewResponse: (next: (() => Promise<ElsResult>) | undefined) => { newResponse = next; }, setListing: (next: string) => { listing = next; }, setLsAway: (message: string | undefined) => { lsAway = message; }, tick: () => { poll?.(); }, lastScreen: () => plain(writes.at(-1) ?? '') };
 }
+
+test('move tab picker sends the selected tab to the chosen space and reports coordinator denial', async () => {
+  const listing = listOf({ ...row('w1', 'p1', 'shell', 'working'), tab: 't1' }, { ...row('w2', 'p2', 'other', 'idle'), tab: 't2' }, { ...row('w3', 'p3', 'third', 'idle'), tab: 't3' });
+  const h = harness(listing);
+  await h.app.start('p1');
+  h.app.key('\u0002m');
+  expect(h.lastScreen()).toContain('Move tab to space');
+  expect(h.lastScreen()).toContain('name-w2');
+  h.app.key('\u001b[B'); h.app.key('\r');
+  await Bun.sleep(10);
+  expect(h.requests).toContainEqual({ op: 'move-tab', tab: 't1', ws: 'w3' });
+  expect(h.attachments[0]!.typed).toEqual([]);
+  h.setMoveResponse({ exitCode: 1, message: 'els: move-tab denied — OP authority required' });
+  h.app.key('\u0002m'); h.app.key('\r'); await Bun.sleep(10);
+  expect(h.lastScreen()).toContain('OP coordinator authority required');
+  h.app.key('\u0002m'); h.app.key('\u001b'); await Bun.sleep(60);
+  expect(h.requests.filter(r => r.op === 'move-tab')).toHaveLength(2);
+});
 
 test('automatic creation: a definitely unsent request recovers on the next poll', async () => {
   for (const initial of [listOf(), listOf(row('w1', 'p1', 'old', 'exited'))]) {
@@ -458,7 +478,7 @@ test('app: keys — input goes to the pane; ctrl+b j/k and 1-9 move between the 
   h.app.key('\u0002w');
   h.app.key('\u00022');                                           // the second tab of w1
   expect(h.attachments.at(-1)!.pane).toBe('p2');
-  expect(h.writes.at(-1) ?? '').toContain('│\u001b[100;37m 🛠 ONE \u001b[49;39m \u001b[44;37m 🛠 TWO \u001b[49;39m +');   // ELS-TAB-STYLE-HERDR: UPPERCASE padded tabs, focus blue, others gray
+  expect(h.writes.at(-1) ?? '').toContain('│\u001b[100;37m  ONE  \u001b[49;39m  \u001b[44;37m  TWO  \u001b[49;39m  +');   // ELS-TAB-STYLE-HERDR: UPPERCASE padded tabs, focus blue, others gray
   h.app.key('\u0002b');
   expect(h.attachments.at(-1)!.resizes.at(-1)).toEqual([80, 22]);
   expect(h.lastScreen()).not.toContain('new · menu');
@@ -663,7 +683,7 @@ test('app: herdr panes join the left list under «⇄herdr …»; selecting one 
   await Bun.sleep(20);
   expect(reads).toEqual(['herdr:w1/t2/p2']);
   expect(screens.at(-1)!).toContain('HERDR SCREEN of herdr:w1/t2/p2');
-  expect(screens.at(-1)!).toContain('│ 🌐 ⇄herdr MSHQ 주 OP  +');                             // the remote pane's tab (FU3 form)
+  expect(screens.at(-1)!).toContain('│  ⇄herdr MSHQ 주 OP    +');                             // the remote pane's tab (FU3 form)
   expect(screens.at(-1)!).toContain('읽기 전용');
   app.key('rm -rf x\r');
   await Bun.sleep(5);
@@ -788,16 +808,16 @@ test('app: a host reported down keeps its space and tab marked «✕»; they com
     panes: reach === 'up' ? [fedRow('node-b', 'wa', 'tb', 'pc', 'review', 'blocked')] : [] }) });
   const { app, screens, tick } = remoteApp({ list: async () => answer(), read: async () => ({ exitCode: 1, message: 'unreachable' }) });
   await app.start(); await Bun.sleep(20);
-  expect(screens.at(-1)!).toContain(' ◐ ⇄MSB1 WA');
+  expect(screens.at(-1)!).toContain(' ⇄MSB1 WA');
   app.key('\u0002w'); await Bun.sleep(20);                         // the node-b space: its pane is the tab
-  expect(screens.at(-1)!).toContain('│ 🌐 ⇄node-b REVIEW  +');
+  expect(screens.at(-1)!).toContain('│  ⇄node-b REVIEW 🟡    +');
   reach = 'down'; tick(); await Bun.sleep(30);
   expect(screens.at(-1)!).toContain('✕ ⇄MSB1 WA');             // the space stays, marked unreachable
-  expect(screens.at(-1)!).toContain('│ 🌐 ⇄node-b REVIEW ✕  +');                            // and so does its last known tab
+  expect(screens.at(-1)!).toContain('│  ⇄node-b REVIEW ✕    +');                            // and so does its last known tab
   expect(screens.at(-1)!).toContain('⇄node-b ✕');                    // the status line says so too (#38616)
   reach = 'up'; tick(); await Bun.sleep(30);
-  expect(screens.at(-1)!).toContain('│ 🌐 ⇄node-b REVIEW  +');
-  expect(screens.at(-1)!).not.toContain('🌐 ⇄node-b REVIEW ✕');
+  expect(screens.at(-1)!).toContain('│  ⇄node-b REVIEW 🟡    +');
+  expect(screens.at(-1)!).not.toContain('⇄node-b REVIEW ✕');
 });
 
 // ELS-REMOTE-MARKER: every surface (list · tab title · status line) × wide / narrow shows ⇄host, and a down host shows ✕ (not «?»).
@@ -811,7 +831,7 @@ for (const [cols, name] of [[120, 'wide'], [40, 'narrow']] as const) {
     app.key('\u0002w'); await Bun.sleep(20);
     const up = screens.at(-1)!;
     expect(up).toContain('⇄node-b wa');                    // list (wide: side list · narrow: dropdown line)
-    expect(up).toContain(cols >= 60 ? '│ 🌐 ⇄node-b REVIEW' : '⇄node-b REVIEW');   // tab title
+    expect(up).toContain(cols >= 60 ? '│  ⇄node-b REVIEW' : '⇄node-b REVIEW');   // tab title
     expect(up).toContain('⇄node-b wa ▸ review');            // status line
     expect(up).not.toContain('⇄node-b ✕');
     expect(up).not.toContain('✕ ⇄node-b');
@@ -819,7 +839,7 @@ for (const [cols, name] of [[120, 'wide'], [40, 'narrow']] as const) {
     const down = screens.at(-1)!;
     expect(down).toContain('⇄node-b ✕');  // status line host chip
     expect(down).not.toContain('⇄node-b ?');
-    if (cols >= 60) { expect(down).toContain('✕ ⇄MSB1 WA'); expect(down).toContain('│ 🌐 ⇄node-b REVIEW ✕'); }
+    if (cols >= 60) { expect(down).toContain('✕ ⇄MSB1 WA'); expect(down).toContain('│  ⇄node-b REVIEW ✕'); }
   });
 }
 
@@ -893,12 +913,12 @@ const P2_TAB_CLICK_X = 40;   // 사이드바 28칸 + 구분선 1칸 + 첫 탭 8�
 test('app: 마우스로 탭을 클릭하면 그 탭이 포커스된다 — attach 가 그 pane 으로, 입력이 그 pane 으로, 파랑(SGR 44) 표식이 그 탭으로 이동 (OP #101585 ③)', async () => {
   const h = harness(listOf(row('w1', 'p1', 'one', 'idle'), row('w1', 'p2', 'two', 'idle'), row('w2', 'p3', 'three', 'idle')));
   await h.app.start();
-  expect(h.writes.at(-1) ?? '').toContain('\u001b[44;37m 🛠 ONE \u001b[49;39m');        // 시작 표식은 첫 탭 p1
+  expect(h.writes.at(-1) ?? '').toContain('\u001b[44;37m  ONE  \u001b[49;39m');        // 시작 표식은 첫 탭 p1
   h.app.key(click(P2_TAB_CLICK_X, TAB_ROW_CLICK_Y));                        // 두 번째 탭 클릭(SGR press)
   expect(h.attachments.at(-1)!.pane).toBe('p2');                            // attach 가 클릭한 pane 으로
   expect(h.attachments[0]!.detached).toBe(true);                            // 예전 attach 는 해제
-  expect(h.writes.at(-1) ?? '').toContain('\u001b[44;37m 🛠 TWO \u001b[49;39m');      // 반전 표식이 그 탭으로
-  expect(h.writes.at(-1) ?? '').not.toContain('\u001b[44;37m 🛠 ONE \u001b[49;39m');  // 옛 탭에서는 사라진다
+  expect(h.writes.at(-1) ?? '').toContain('\u001b[44;37m  TWO  \u001b[49;39m');      // 반전 표식이 그 탭으로
+  expect(h.writes.at(-1) ?? '').not.toContain('\u001b[44;37m  ONE  \u001b[49;39m');  // 옛 탭에서는 사라진다
   h.app.key('ls\r');
   expect(h.attachments[1]!.typed).toEqual(['ls\r']);                        // 입력도 이제 그 탭(pane)으로
 });
@@ -908,10 +928,10 @@ test('app: sidebar clicks follow the drawn rows — a space row selects its firs
   const h = harness(listOf(row('w1', 'p1', 'one', 'idle'), row('w1', 'p2', 'two', 'idle'), row('w2', 'p3', 'three', 'idle')));
   await h.app.start();
   const screen = (): string[] => (h.lastScreen() ?? '').split('\r\n');
-  expect([screen()[0]!.slice(0, 7), screen()[1]!.slice(0, 11), screen()[2]!.slice(0, 11), screen()[22]!.slice(0, 11)]).toEqual([' spaces', ' ○ NAME-W1 ', ' ○ NAME-W2 ', ' new · menu']);
+  expect([screen()[0]!.slice(0, 7), screen()[1]!.slice(0, 11), screen()[2]!.slice(0, 11), screen()[22]!.slice(0, 11)]).toEqual([' spaces', ' NAME-W1   ', '   2 agents', ' new · menu']);
   h.app.key(click(5, 1)); h.app.key('\u001b[<0;5;1m');                         // the head: consumed, selects nothing
   expect(h.attachments.length).toBe(1);
-  h.app.key(click(5, 3)); h.app.key('\u001b[<0;5;3m');                         // second space row → its first pane p3
+  h.app.key(click(5, 4)); h.app.key('\u001b[<0;5;4m');                         // second space row (pushed one line down by the focused space's subtitle — OP #134227) → its first pane p3
   expect(h.attachments.at(-1)!.pane).toBe('p3');
   h.app.key(click(3, 23)); h.app.key('\u001b[<0;3;23m');                       // the word «new»
   expect(modalRow(h.writes.at(-1)!, 9)).toMatch(/╔ +새 탭 이름 +✕ ╗/);
@@ -974,8 +994,8 @@ test('narrow dropdown: width 120 keeps the side list; width 60 drops it for one 
   const h = harness(narrowList, size);
   await h.app.start();
   const screen = h.lastScreen().split('\r\n');
-  expect(screen[0]).toContain('🛠 SHELL  ▾');
-  expect(h.writes.at(-1) ?? '').toContain('\u001b[44;37m 🛠 SHELL \u001b[49;39m ▾');   // ELS-TAB-STYLE-HERDR: the current tab, UPPERCASE on blue
+  expect(screen[0]).toContain('  SHELL   ▾');
+  expect(h.writes.at(-1) ?? '').toContain('\u001b[44;37m  SHELL  \u001b[49;39m ▾');   // ELS-TAB-STYLE-HERDR: the current tab, UPPERCASE on blue
   expect(h.lastScreen()).not.toContain('NAME-W1');
   expect(h.attachments[0]!.size).toEqual({ cols: 60, rows: 22 });
 });
@@ -985,11 +1005,11 @@ test('narrow dropdown: ctrl+b s opens the list (spaces → tabs with status mark
   await h.app.start();
   h.app.key('\u0002s');
   const open = h.lastScreen().split('\r\n');
-  expect(open.slice(1, 6).map((line) => line.trim())).toEqual(['name-w1', expect.stringContaining('shell ○'), expect.stringContaining('build ●'), 'name-w2', expect.stringContaining('repl ')]);
+  expect(open.slice(1, 6).map((line) => line.trim())).toEqual(['name-w1', '🛠 shell ⚪', '🛠 build 🟢', 'name-w2', '🛠 repl 🟡']);
   h.app.key('j');
   h.app.key('\r');
   expect(h.attachments.map((a) => a.pane)).toEqual(['p1', 'p2']);
-  expect(h.lastScreen().split('\r\n')[0]).toContain('🛠 BUILD  ▾');
+  expect(h.lastScreen().split('\r\n')[0]).toContain('  BUILD   ▾');
   expect(h.lastScreen()).not.toContain('name-w2');
   h.app.key('\u0002s');
   expect(h.lastScreen()).toContain('name-w2');
@@ -1006,7 +1026,7 @@ test('narrow dropdown: a click on the top row opens the list, a click on a tab s
   expect(h.lastScreen()).toContain('name-w2');
   h.app.key(PRESS(10, 6)); h.app.key(RELEASE(10, 6));              // the «repl» line
   expect(h.attachments.map((a) => a.pane)).toEqual(['p1', 'p3']);
-  expect(h.lastScreen().split('\r\n')[0]).toContain('🛠 REPL  ▾');
+  expect(h.lastScreen().split('\r\n')[0]).toContain('  REPL 🟡   ▾');
   expect(h.lastScreen()).not.toContain('name-w2');
   h.app.key(PRESS(10, 1)); h.app.key(RELEASE(10, 1));
   h.app.key(PRESS(10, 20)); h.app.key(RELEASE(10, 20));            // below the list
@@ -1167,4 +1187,17 @@ test('new tab samples the selected pane cwd after a synthetic cd event, not the 
   h.app.key('\u0002c\r');
   await Bun.sleep(20);
   expect(h.requests.filter((r) => r.op === 'new').at(-1)).toMatchObject({ ws: 'name-w1', cwd: '/workspace/after' });
+});
+
+test('ctrl+b comma renames the selected tab without sending its name to the pane', async () => {
+  const listing = JSON.stringify({ workspaces: [], tabs: [{ id: 't1', label: 'Old' }], panes: [{ ...row('w1', 'p1', 'shell', 'idle'), tab: 't1' }] });
+  const h = harness(listing);
+  await h.app.start();
+  expect(h.lastScreen()).toContain('OLD');
+  h.app.key('\u0002,');
+  expect(h.lastScreen()).toContain('Rename tab');
+  h.app.key('New name\r');
+  await Bun.sleep(20);
+  expect(h.requests.filter(r => r.op === 'rename')).toEqual([{ op: 'rename', kind: 'tab', id: 't1', name: 'New name' }]);
+  expect(h.attachments[0]!.typed).toEqual([]);
 });

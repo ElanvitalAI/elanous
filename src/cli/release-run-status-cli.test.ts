@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
-import { registerReleaseRunStatusCommand } from './release-run-status-cli.js';
+import { registerReleaseRunStatusCommand, renderReleaseRunStatus } from './release-run-status-cli.js';
 
 test('release status reads immutable counts and reports missing or incompatible ledgers unknown', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-snapshot-')); roots.push(root);
@@ -157,4 +157,18 @@ test('release status CLI reports no full run instead of promoting an auxiliary r
   expect(lines.join('\n')).toContain('residual 실행 ?');
   expect(lines.join('\n')).toContain('실패 introduced ? / preexisting ? / 미판정 ?');
   expect(lines.join('\n')).toContain('ETA 미측정');
+});
+
+test('release status preserves a running release with no completed node records', () => {
+  const run = { runId: '9fdb6534-3481-47ea-b428-a139152b2306', status: 'running', startedAt: '2026-11-17T19:42:08.912Z', input: { version: '0.3.28' }, currentNode: { nodeId: 'version-release', startedAt: '2026-11-17T19:42:08.912Z' }, nodes: [] };
+  const checklist = { green: null, yellow: null, red: null, done: null };
+  const output = renderReleaseRunStatus('0.3.28', [run], [], checklist, Date.parse('2026-11-17T19:43:08.912Z'));
+  expect(output).toContain('run 9fdb6534-3481-47ea-b428-a139152b2306 · running · node version-release');
+  expect(output).not.toContain('run 없음');
+  const entry = { ...run, currentNode: { nodeId: 'traffic-prep' } };
+  expect(renderReleaseRunStatus('0.3.28', [entry], [], checklist)).toContain('node traffic-prep');
+  const entryComplete = { ...run, currentNode: { nodeId: 'cut-branch' }, nodes: [{ nodeId: 'traffic-prep', endedAt: '2026-11-17T19:42:09Z' }] };
+  expect(renderReleaseRunStatus('0.3.28', [entryComplete], [], checklist)).toContain('run 9fdb6534');
+  const auxiliary = { ...run, runId: 'aux', currentNode: { nodeId: 'rehearsal' } };
+  expect(renderReleaseRunStatus('0.3.28', [auxiliary], [], checklist)).toContain('run 없음');
 });

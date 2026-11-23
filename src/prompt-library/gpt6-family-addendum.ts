@@ -189,13 +189,11 @@ export function buildGpt6FamilyAddendum(): LLMMessage[] {
 }
 
 /**
- * SEAT-COORDINATOR-PROMPT-PROFILE — 조율 자리(OP)용. ⛔ «자율·지속(persist)»·«허락 시점(승인 흐름 넣지 마라)»과
- * 코딩 손 규율(시험 보정·범위)은 뺀다 — 조율자는 끝까지 밀어붙이는 구현 손이 아니라 위임·판정·짧은 보고 자리다
- * (진단 DIAG-ELN-OP-COORDINATOR-1122 §3·§4: persist 가 폴링을, «승인 흐름 금지»가 반대 승인을 키웠다).
- * 남는 것: 지시 우선순위(사람 지시 > 파일) ⊕ 진행 설명.
+ * 조율자는 계열 공통 자리 운행 계약으로 지속·대기를 받는다. GPT6_AUTONOMY 와 코딩 손 규율은 빼고 허락 시점·지시 우선순위·진행 설명을 싣는다.
  */
 export function buildGpt6CoordinatorAddendum(): LLMMessage[] {
   return [
+    { role: 'system', content: GPT6_PERMISSION_TIMING },
     { role: 'system', content: GPT6_INSTRUCTION_PRECEDENCE },
     { role: 'system', content: GPT6_PROGRESS_NARRATION },
   ];

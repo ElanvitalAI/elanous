@@ -299,6 +299,13 @@ test('`els workspace move` / `els tab move` change the order every list shows, a
   const tabs = (JSON.parse((await asPerson(['tab', 'list'])).stdout) as { result: { tabs: { tab_id: string }[] } }).result.tabs;
   const crossed = await asPerson(['tab', 'move', tabs[0]!.tab_id, '--before', tabs[1]!.tab_id]);
   expect([crossed.exitCode, crossed.stderr]).toEqual([2, expect.stringContaining('its own workspace')]);
+  const moved = await asPerson(['tab', 'move', tabs[0]!.tab_id, '--workspace', 'alpha']);
+  expect(moved.exitCode).toBe(0);
+  const workspaces = (JSON.parse((await asPerson(['workspace', 'list'])).stdout) as { result: { workspaces: { name: string; workspace_id: string }[] } }).result.workspaces;
+  const alphaId = workspaces.find(ws => ws.name === 'alpha')!.workspace_id;
+  const alphaTabs = (JSON.parse((await asPerson(['tab', 'list', '--workspace', alphaId])).stdout) as { result: { tabs: { tab_id: string }[] } }).result.tabs;
+  expect(alphaTabs.map(t => t.tab_id)).toContain(tabs[0]!.tab_id);
+  expect((await asPerson(['tab', 'move', tabs[0]!.tab_id, '--workspace', 'alpha', '--before', tabs[1]!.tab_id])).exitCode).toBe(2);
   first.kill();
   await first.exited;
   const second = await serve(state);
@@ -327,68 +334,35 @@ Elanous Side (els) — workspaces, tabs and panes in one screen; the command is
 \`els\`. In a terminal, bare \`els\` opens the whole screen.
 
 Options:
-  --list                         print the panes as lines instead of opening the
-                                 screen (also what a pipe gets)
-  --side                         open with the side list shown (remembered for
-                                 next time)
-  --no-side                      open with the side list hidden (remembered for
-                                 next time)
-  --skill                        print the usage guide for coding agents
-                                 (markdown) and exit
-  -h, --help                     display help for command
+  --list                                                   print the panes as lines instead of opening the screen (also what a pipe gets)
+  --side                                                   open with the side list shown (remembered for next time)
+  --no-side                                                open with the side list hidden (remembered for next time)
+  --skill                                                  print the usage guide for coding agents (markdown) and exit
+  -h, --help                                               display help for command
 
 Commands:
-  seat                           Seat registration: \`els seat set OP\`
-  supervisor                     The launchd user agent that keeps the els
-                                 server running: on · off · status
-  serve [options]                Run the els server: the one owner of the
-                                 journal and the pane PTYs (run once, by a
-                                 supervisor)
-  mcp                            els as an MCP server
-  acp                            els as an ACP agent
-  ls [options]                   List workspaces, tabs and panes as JSON: this
-                                 host and the hosts in els/hosts.json (a host
-                                 that does not answer is listed as down)
-  update-all                     Catch up this host to desiredSha, migrate local
-                                 ELS seat tabs at their turn boundary, and
-                                 print one result row per tab
-  new [options] [command...]     Open a pane: the server spawns a PTY and
-                                 records ws/tab/pane + cwd in the journal. No
-                                 command → $SHELL, no --cwd → this folder, no
-                                 --ws → the folder name. Options go BEFORE --
-  read <pane>                    Read a pane: a local pane id, ws/tab/pane, or
-                                 host:ws/tab/pane on a registered host
-  status [options] <pane>        What a pane is doing, from the PTY the server
-                                 owns: working/idle/exited/unknown (+ why) ·
-                                 input empty · last output ago · running tool
-  grep <pattern>                 Search the last screen of every pane — this
-                                 host, the registered hosts and the herdr rows —
-                                 for a literal pattern (hits as JSON: address ·
-                                 line · text)
-  send [options] <pane> <text>   Type text into a live pane and press Enter
-                                 (--no-enter: text only)
-  do [options] <pane> <text>     Type a line into a pane (local, ws/tab/pane or
-                                 host:ws/tab/pane): marked «⇢ from · text»,
-                                 queued while the pane's turn is running. A
-                                 local pane walks the control door first
-                                 (default deny).
-  snapshot <pane>                Save a pane's screen as an svg artifact (classic
-                                 capture engine): prints {path}
-  record <pane>                  Record a pane's PTY output: first call starts
-                                 (prints {recordingId}), the next call for the
-                                 pane (even after it was closed) stops and saves
-                                 the asciicast: prints {path}
-  input [options] <pane> <text>  Submit a direct operator line through the owner
-                                 control door
-  workspace                      Workspaces (herdr words): list · create · close
-                                 · move
-  tab                            Tabs (herdr words): list · close · move
-  attach <pane>                  Show one pane live in this terminal and type
-                                 into it (ctrl+b q detaches; the pane keeps
-                                 running)
-  pane                           Panes (herdr words): list · read · send-text ·
-                                 send-keys · run · close
-  import                         Bring another layout into els
+  seat [seat]                                              Open a seat tab, or register OP with \`els seat set OP\`
+  supervisor                                               The launchd user agent that keeps the els server running: on · off · status
+  serve [options]                                          Run the els server: the one owner of the journal and the pane PTYs (run once, by a supervisor)
+  mcp                                                      els as an MCP server
+  acp                                                      els as an ACP agent
+  ls [options]                                             List workspaces, tabs and panes as JSON: this host and the hosts in els/hosts.json (a host that does not answer is listed as down)
+  update-all [options]                                     Catch up registered ELS hosts to desiredSha, migrate seat tabs at their turn boundary, and print one result row per tab
+  new [options] [command...]                               Open a pane: the server spawns a PTY and records ws/tab/pane + cwd in the journal. No command → $SHELL, no --cwd → this folder, no --ws → the folder name. Options go BEFORE --
+  read <pane>                                              Read a pane: a local pane id, ws/tab/pane, or host:ws/tab/pane on a registered host
+  status [options] <pane>                                  What a pane is doing, from the PTY the server owns: working/idle/exited/unknown (+ why) · input empty · last output ago · running tool
+  grep <pattern>                                           Search the last screen of every pane — this host, the registered hosts and the herdr rows — for a literal pattern (hits as JSON: address · line · text)
+  send [options] <pane> <text>                             Type text into a live pane and press Enter (--no-enter: text only)
+  do [options] <pane> <text>                               Type a line into a pane (local, ws/tab/pane or host:ws/tab/pane): marked «⇢ from · text», queued while the pane's turn is running. A local pane walks the control door first (default deny).
+  snapshot <pane>                                          Save a pane's screen as an svg artifact (classic capture engine): prints {path}
+  record <pane>                                            Record a pane's PTY output: first call starts (prints {recordingId}), the next call for the pane (even after it was closed) stops and saves the asciicast: prints {path}
+  input [options] <pane> <text>                            Submit a direct operator line through the owner control door
+  workspace|ws                                             Workspaces: list · create · close · move · coordinator
+  tab                                                      Tabs (herdr words): list · close · move
+  attach <pane>                                            Show a local pane or registered host:ws/tab/pane live (ctrl+b q detaches)
+  attach-stdio <pane> <cols> <rows> [base-url] [ws] [tab]  SSH bridge (ELS-SSH-ATTACH-ANYWHERE): carry the attach wire on stdio, so a pane of this host can be attached from anywhere
+  pane                                                     Panes (herdr words): list · read · send-text · send-keys · run · close
+  import                                                   Bring another layout into els
 
 Agents: run \`els --skill\` for the usage guide (verbs, rules, what not to do).
 `;
@@ -606,6 +580,30 @@ test('els send submits a long bracketed paste through a real owned PTY and obser
   expect(readFileSync(captured, 'utf8')).toBe(`\x1b[200~${text}\x1b[201~\r`);
 }, 30000);
 
+test('workspace rename changes only the named workspace through the owner door', async () => {
+  const state = tempDir('els-ws-rename-');
+  const server = await serve(state);
+  expect(server.output()).toContain('listening on');
+  for (const ws of ['Alpha', 'Beta']) {
+    const created = await side(state, state, ['new', '--ws', ws, '--', 'sh']);
+    expect(created.exitCode, created.stderr).toBe(0);
+  }
+  const list = async () => JSON.parse((await side(state, state, ['ws', 'list'])).stdout) as { result: { workspaces: { workspace_id: string; name: string }[] } };
+  const before = await list();
+  const denied = await side(state, state, ['ws', 'rename', 'Alpha', 'Changed']);
+  expect(denied.exitCode).not.toBe(0);
+  expect(await list()).toEqual(before);
+  const owner = await asOwner(state);
+  const renamed = await side(state, state, ['ws', 'rename', 'Alpha', 'Changed'], owner);
+  expect(renamed.exitCode, renamed.stderr).toBe(0);
+  expect((await side(state, state, ['workspace', 'rename', 'missing', 'No'], owner)).exitCode).not.toBe(0);
+  expect((await side(state, state, ['ws', 'rename', 'Changed', '   '], owner)).exitCode).not.toBe(0);
+  const after = await list();
+  expect(JSON.stringify(after)).toContain('Changed');
+  expect(JSON.stringify(after)).toContain('Beta');
+  expect(JSON.stringify(after)).not.toContain('Alpha');
+}, 120_000);
+
 test('tab close removes only the named tab and preserves its workspace', async () => {
   const state = tempDir('els-tab-close-');
   const server = await serve(state);
@@ -634,4 +632,17 @@ test('tab close removes only the named tab and preserves its workspace', async (
   const remaining = JSON.parse((await side(state, state, ['tab', 'list'])).stdout) as { result: { tabs: { label: string }[] } };
   expect(remaining.result.tabs.map(t => t.label)).toEqual(['two']);
   expect((await side(state, state, ['tab', 'close', 'missing'], owner)).exitCode).toBe(2);
+}, 120_000);
+
+test('els rename tab resolves a unique name and stable id through the owner door', async () => {
+  const state = tempDir('els-tab-rename-');
+  await serve(state);
+  for (const title of ['one', 'two']) expect((await side(state, state, ['new', '--ws', 'W', '--title', title, '--', 'sh'])).exitCode).toBe(0);
+  const owner = await asOwner(state);
+  expect((await side(state, state, ['rename', 'tab', 'one', 'first'], owner)).exitCode).toBe(0);
+  const list = async () => JSON.parse((await side(state, state, ['tab', 'list'])).stdout) as { result: { tabs: { tab_id: string; label: string }[] } };
+  const before = await list();
+  expect(before.result.tabs.map(t => t.label)).toEqual(['first', 'two']);
+  expect((await side(state, state, ['rename', 'tab', before.result.tabs[1]!.tab_id, 'second'], owner)).exitCode).toBe(0);
+  expect((await list()).result.tabs.map(t => t.label)).toEqual(['first', 'second']);
 }, 120_000);

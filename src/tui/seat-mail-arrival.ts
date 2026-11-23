@@ -10,6 +10,7 @@ import type { TurnEventOutcome } from '../turn-capsule/contract.js';
 import type { MessageOrigin } from '../msg/msg-store.js';
 import { isDecisionMail } from './seat-mail-priority.js';
 import { createSeatMailAdapter, type SeatMailAdapter } from './turn-events/mail-adapter.js';
+import { isInfoSeatMail } from './seat-mail-digest.js';
 
 /**
  * ELN-CHILD-NOTICE-INTO-QUEUE — «자리 우편 도착» 생산 배선(3곳 중 1).
@@ -49,6 +50,15 @@ export function resolveSeatMailQueueCap(option?: number, env: NodeJS.ProcessEnv 
 }
 
 /** The one notice that stands for the mail over the cap (ids are the ledger's; the seat reads them with `msg list`). */
+/**
+ * MSG-RECEIPT-IMPLIES-ACK ② — the per-notice counter «[미읽음 총 N통]» counts mail that still needs this seat
+ * (`actionableTotal`); reads that predate the field keep the raw unread total.
+ */
+function noticeTotalField(read: SeatMailMessageRead): { unreadTotal?: number } {
+  const total = read.actionableTotal ?? read.unreadTotal;
+  return total === undefined ? {} : { unreadTotal: total };
+}
+
 export function seatMailOverflowNotice(seat: string, count: number, firstId: number, lastId: number, truncated: boolean, unreadTotal?: number): string {
   const howMany = count === 0 ? 'more unread mails beyond the read limit' : `${count}${truncated ? '+' : ''} more unread mails`;
   return `[seat-mail] ${howMany} for ${seat}, ids #${firstId}..#${lastId}${unreadTotal === undefined ? '' : ` · unread total ${unreadTotal}`} — not queued one by one; read them with: eln msg list --to ${seat}`;
@@ -108,6 +118,8 @@ export interface SeatMailArrivalInfo {
   readonly intent?: string | null;
   readonly crownDirective?: string | null;
   readonly createdAt?: string;
+  /** SEAT-MAIL-COALESCE-NOTICE — an info mail: it waits for the next digest (no mid-turn carry, no wake of its own). */
+  readonly passive?: boolean;
 }
 
 export function createSeatMailArrivalWatcher(
@@ -279,6 +291,10 @@ export function createSeatMailArrivalWatcher(
         source.receipts?.record({ messageId: mapped.msgId, recipient: mapped.seat, state: 'seen', queueItemId: itemId });
         // [seat-mail #16 wiring · S7 트리거] done 계기 — 턴이 이 우편에 답을 마친 순간(seen 정착 = answered).
         source?.receipts?.recordDone?.({ messageId: mapped.msgId, recipient: mapped.seat });
+        // SEAT-MAIL-COALESCE-NOTICE · MSG-FILTERS-RELAX — every mail whose body rode the completed turn (info AND request)
+        // is acked by id (never a cursor move) once the turn finished without error; the seat need not ack it by hand.
+        source.receipts?.ack?.({ messageId: mapped.msgId, recipient: mapped.seat });
+        log(isInfoSeatMail(mapped.message) ? 'seat-mail-info-acked' : 'seat-mail-turn-acked', { msgId: mapped.msgId, seat: mapped.seat });
       }
       else if (retry.has(mapped.msgId)) parked.set(mapped.msgId, { ...mapped, attempt: mapped.attempt + 1 });
       else if (settled.gaveUp.includes(mapped.msgId)) log('seat-mail-gave-up', { msgId: mapped.msgId, seat: mapped.seat, attempts: mapped.attempt });
@@ -372,7 +388,7 @@ export function createSeatMailArrivalWatcher(
           parked.set(message.id, { msgId: message.id, seat: read.seat, attempt: 1, message: { id: message.id, sender: message.from,
             body: message.body, kind: message.kind ?? null, ...headerFieldsOf(message),
             ...(message.origin ? { origin: message.origin } : {}),
-            ...(read.unreadTotal === undefined ? {} : { unreadTotal: read.unreadTotal }),
+            ...noticeTotalField(read),
             ...(message.createdAt === undefined ? {} : { createdAt: message.createdAt }) } });
         } else log('seat-mail-dedupe-hit', { seat: read.seat, msgId: message.id, owner: adapter.owner(message.id) });
       }
@@ -395,7 +411,7 @@ export function createSeatMailArrivalWatcher(
         kind: message.kind ?? null,
         ...headerFieldsOf(message),
         ...(message.origin ? { origin: message.origin } : {}),
-        ...(read.unreadTotal === undefined ? {} : { unreadTotal: read.unreadTotal }),
+        ...noticeTotalField(read),
         ...(message.createdAt === undefined ? {} : { createdAt: message.createdAt }),
       };
       const item = producers.seatMessageArrived(input);
@@ -404,7 +420,7 @@ export function createSeatMailArrivalWatcher(
       try { turnLifeLog('turn-life:event-arrived', { source: 'seat-mail', eventId: message.id, msgId: message.id, itemId: item.id, arrivedAt: Date.now() }); } catch { /* observability is fail-open */ }
       offered.add(message.id);
       msgIds.push(message.id);
-      arrivals.push({ msgId: message.id, seat: read.seat, sender: message.from, text: item.text,
+      arrivals.push({ msgId: message.id, seat: read.seat, sender: message.from, text: item.text, ...(item.passive ? { passive: true } : {}),
         ...(message.origin ? { origin: message.origin } : {}),
         ...(message.intent ? { intent: message.intent } : {}),
         ...(message.crownDirective ? { crownDirective: message.crownDirective } : {}),

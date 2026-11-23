@@ -2,7 +2,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BLOCKING_METRIC_NAMES, WARNING_ONLY } from './auto-approve-node.js';
+import { BLOCKING_METRIC_NAMES, WARNING_ONLY, publishApprovalHoldReasons } from './auto-approve-node.js';
 import { beginLandingMerge, landingFreezeMessage } from '../../src/release-loop/landing-freeze.js';
 import { debug } from '../../src/debug/log.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
@@ -119,7 +119,7 @@ export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: str
   const regress = validatedTuiRegress(context.outputs.tui?.regress);
   const approvedForRun = hasRecordedPublishApproval(context, approvalRoot);
   if (!approvedForRun &&
-    !(auto?.outcome === 'ok' && auto.decidedBy === 'release-loop metrics'
+    !(publishApprovalHoldReasons(context).length === 0 && auto?.outcome === 'ok' && auto.decidedBy === 'release-loop metrics'
       && !('unmeasured' in regress) && regress.pass === 7 && regress.fail === 0
       && typeof context.runId === 'string' && context.runId.length > 0 && auto.runId === context.runId
       && auto.tuiSubcheck && typeof auto.tuiSubcheck === 'object'

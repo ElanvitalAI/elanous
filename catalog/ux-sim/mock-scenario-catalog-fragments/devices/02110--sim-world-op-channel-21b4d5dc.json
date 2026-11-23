@@ -1,0 +1,27 @@
+{
+  "id": "sim-world-op-channel",
+  "name": "SIM-WORLD OP-channel pack (CEO channel ingress)",
+  "audience": "internal",
+  "implementation": [
+    "src/ux-sim/sim-world/op-channel/scenarios.ts"
+  ],
+  "tests": [
+    "src/ux-sim/sim-world/op-channel/scenarios.test.ts"
+  ],
+  "target": "replays the CEO channel product-door axes on the kernel contract with the real createCeoChannel boot on its own SQLite queue inside the scenario universe",
+  "inputs": [
+    "op-channel scenario rows",
+    "op-channel/expect.json verdicts",
+    "a throw-away universe per scenario"
+  ],
+  "observations": [
+    "the real allowlist and queue accept or refuse each injected message",
+    "each verdict goes through the kernel expectation ratchet"
+  ],
+  "entryCommands": [
+    "eln --test=<isolated-state> sim world run op-channel --seed 1"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

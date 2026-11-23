@@ -26,7 +26,7 @@ test('3 children: 3 tabs · 2 succeed and close after the delay · 1 fails and s
   expect(r.stored().tabs).toHaveLength(0); // nothing is 60 s old yet
   r.aged();
   expect(r.stored().tabs).toHaveLength(3);
-  expect(r.titles()[0]).toBe('↳ ⎇ harness · a ●');
+  expect(r.titles()[0]).toBe('↳ ⎇ harness · a 🟢');
   r.tabs.progress('a', 'step 1');
   expect(r.stored().panes[0]!.scrollback).toBe('step 1');
   r.tabs.pin('b');
@@ -37,10 +37,10 @@ test('3 children: 3 tabs · 2 succeed and close after the delay · 1 fails and s
   expect(r.stored().tabs).toHaveLength(3);
   expect(r.timers.map((t) => t.ms)).toEqual([10_000]); // only the unpinned success closes
   r.fire();
-  expect(r.titles()).toEqual(['↳ ⎇ harness · b ✓', '↳ ⎇ harness · c ✕']);
+  expect(r.titles()).toEqual(['↳ ⎇ harness · b ✅', '↳ ⎇ harness · c 🔴']);
   expect(r.stored().panes[1]!.state).toBe('done');
   r.tabs.unpin('b'); r.fire();
-  expect(r.titles()).toEqual(['↳ ⎇ harness · c ✕']);
+  expect(r.titles()).toEqual(['↳ ⎇ harness · c 🔴']);
   r.tabs.dismiss('c');
   expect(r.stored().tabs).toHaveLength(0);
 });
@@ -49,12 +49,12 @@ test('short-lived child: no tab, only the parent summary; shell never gets a tab
   const r = rig();
   start(r, 'quick');
   start(r, 's1', { source: 'shell' }); start(r, 's2', { source: 'shell' });
-  expect(r.tabs.summary('OP')).toBe('⎇3 ●3 ⌁2'.replace('⎇3 ●3 ', '⎇1 ●1 '));
+  expect(r.tabs.summary('OP')).toBe('⎇3 🟢3 ⌁2'.replace('⎇3 🟢3 ', '⎇1 🟢1 '));
   r.tabs.end('quick', true, 'ok');
   r.aged(); // quick's promotion timer was cancelled by its end
   expect(r.stored().tabs).toHaveLength(0);
   r.tabs.pin('s1');
-  expect(r.titles()).toEqual(['↳ ⌁ shell · s1 ●']);
+  expect(r.titles()).toEqual(['↳ ⌁ shell · s1 🟢']);
   expect(r.tabs.tree('OP').filter((row) => row.id.startsWith('s'))).toHaveLength(2); // the expandable list
 });
 
@@ -63,7 +63,7 @@ test('per-parent cap 4: the 5th long-lived child of one parent goes to the «⎇
   for (const id of ['a', 'b', 'c', 'd', 'e', 'f']) start(r, id);
   r.aged();
   expect(r.stored().tabs).toHaveLength(5); // 4 own tabs + 1 bundle
-  expect(r.titles()[4]).toBe('↳ ⎇ +2 more ●');
+  expect(r.titles()[4]).toBe('↳ ⎇ +2 more 🟢');
 });
 
 test('over the global cap: one bundle tab lists the rest and closes when all are done', () => {
@@ -71,7 +71,7 @@ test('over the global cap: one bundle tab lists the rest and closes when all are
   for (const id of ['a', 'b', 'c', 'd']) start(r, id);
   r.aged();
   expect(r.stored().tabs).toHaveLength(3);
-  expect(r.stored().panes[2]!.scrollback).toBe('● harness · c\n● harness · d');
+  expect(r.stored().panes[2]!.scrollback).toBe('🟢 harness · c\n🟢 harness · d');
   r.tabs.end('c', true, 'ok'); r.tabs.end('d', true, 'ok');
   expect(r.stored().panes[2]!.state).toBe('done');
   r.fire();
@@ -87,19 +87,19 @@ test('graph run: nodes inside the run tab, blocked node, harness under a node on
   r.tabs.end('grounding', true, '');
   r.tabs.progress('verify-repair', 'r6');
   r.tabs.status('materialize', 'blocked');
-  expect(r.stored().panes[0]!.scrollback).toBe('  ✓ grounding\n  ● verify-repair · r6\n  ◐ materialize · 승인 대기');
+  expect(r.stored().panes[0]!.scrollback).toBe('  ✅ grounding\n  🟢 verify-repair · r6\n  🟡 materialize · 승인 대기');
   expect(r.stored().tabs).toHaveLength(1); // nodes are not tabs
   r.tabs.start({ id: 'h', ws: 'OP', source: 'harness', label: 'repair', parent: 'verify-repair' });
   r.aged();
-  expect(r.titles()[1]).toBe('    ↳ ⎇ harness · repair ●'); // run depth 0 → node 1 → harness 2
+  expect(r.titles()[1]).toBe('    ↳ ⎇ harness · repair 🟢'); // run depth 0 → node 1 → harness 2
   expect(r.tabs.tree('OP').map((row) => [row.depth, row.text, row.state])).toEqual([
     [0, '↳ ⎔ graph · app-build · 891dc068', 'working'],
-    [1, '  ✓ grounding', 'done'], [1, '  ● verify-repair · r6', 'working'],
-    [2, '    ↳ ⎇ harness · repair', 'working'], [1, '  ◐ materialize · 승인 대기', 'blocked']]);
-  expect(r.tabs.summary('OP')).toBe('⎇1 ●1');
+    [1, '  ✅ grounding', 'done'], [1, '  🟢 verify-repair · r6', 'working'],
+    [2, '    ↳ ⎇ harness · repair', 'working'], [1, '  🟡 materialize · 승인 대기', 'blocked']]);
+  expect(r.tabs.summary('OP')).toBe('⎇1 🟢1');
   r.tabs.end('h', true, 'fixed');
   r.tabs.end('g', true, 'built');
-  expect(childSummary(['working', 'working', 'failed'])).toBe('⎇3 ●2 ✕1');
+  expect(childSummary(['working', 'working', 'failed'])).toBe('⎇3 🟢2 🔴1');
 });
 
 test('closing a graph run keeps its running harness: it moves up and stays in the tree', () => {

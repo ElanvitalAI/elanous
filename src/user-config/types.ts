@@ -1563,9 +1563,9 @@ export interface FinanceConfig {
   /** P5 PFC Layer-2 autonomous opportunity loop. DISARMED by default —
    *  when `enabled` is false the opportunity scan only REPORTS candidates;
    *  when true it auto-runs a bounded analysis for high-severity candidates
-   *  (still analysis-only — no trade tools; trades stay HITL). `maxPerScan`
-   *  is the budget furnace: at most this many analyses per scan. */
-  autoLoop?: { enabled?: boolean; maxPerScan?: number };
+   *  (still analysis-only — no trade tools; trades stay HITL).
+   *  Each scan runs at most two analyses. */
+  autoLoop?: { enabled?: boolean };
   /** R5 (ROADMAP-organic-signal-engine) — dig-engine v2: DigTrigger →
    *  auto-mode goal auto-setup driven by the ContinuationScheduler.
    *  DISARMED by default and double-gated: this section AND the root

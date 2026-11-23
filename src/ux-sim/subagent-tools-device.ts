@@ -1,5 +1,5 @@
 // N03 장치 — SUBAGENT-TOOLS-EMPTY (0.2.36 · 2026-10-22 · 대표 P0).
-// 진짜 classic TUI(`--legacy`) ⊕ fake LLM 이 Agent 도구를 «틀린 이름» tool_filter 로 부른다
+// 진짜 next TUI(`--tui next` · classic `--legacy` 는 은퇴) ⊕ fake LLM 이 Agent 도구를 «틀린 이름» tool_filter 로 부른다
 // (10-22 운영 실물: allow 5~12개를 줘도 49→0 · «0 tools · Blocked»). 판정은 같은 바이너리의 `logs --json`:
 //   mismatch  — allow 가 모르는 이름뿐 → tool-filter allowIgnored ⊕ dispatch noTools=false(도구 상속)
 //   deny-all  — 모든 도구를 deny → no-tools-refused(발사 거부 · 빈손 실행 0)
@@ -58,7 +58,7 @@ export async function runSubagentToolsDevice(spec: SubagentToolsSpec): Promise<S
     : { allow: ['Read'], deny: ['Read'] };
   const run = await mockSeatPtySequence({
     executable: spec.executable,
-    args: [spec.entry, '--legacy', '--config-dir', '{root}', '--test-state-dir', '{root}'],
+    args: [spec.entry, '--tui', 'next', '--config-dir', '{root}', '--test-state-dir', '{root}'],
     root,
     rows: 30,
     cols: 100,
@@ -71,14 +71,15 @@ export async function runSubagentToolsDevice(spec: SubagentToolsSpec): Promise<S
       ...(spec.scenario === 'zero-refused' ? { ELANOUS_SUBAGENT_HONOR_ALLOW: '1' } : {}),
       [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: '서브에이전트로', name: 'Agent', args: { description: '도구 확인', prompt: '파일 하나 읽어라', tool_filter: toolFilter } }),
     },
+    // 11-23 실측 next TUI 크롬: 부팅 = 제목 줄 «elanous» ⊕ «Ctrl+Q quit» · 턴 끝 = 푸터 «● Turn done».
     ready: {
       label: 'boot',
-      until: (s: string) => (s.includes('elanous | daemon') || s.includes('Opening web setup…') || s.includes('웹 화면을 여는 중…')) && s.includes('❯'),
+      until: (s: string) => s.split('\n').includes('elanous') && s.includes('Ctrl+Q quit') && s.includes('❯'),
       timeoutMs: 90_000,
     },
-    quitKeys: '/exit\r',
+    quitKeys: '\x11',
     exitTimeoutMs: 20_000,
-    steps: [{ label: 'delegated', text: '서브에이전트로 확인해줘', until: (s) => /✔ 완료|✘ 실패/.test(s), timeoutMs: 60_000 }],
+    steps: [{ label: 'delegated', text: '서브에이전트로 확인해줘', until: (s) => s.includes('Turn done') && s.includes('[fake-llm] 맡겼습니다'), timeoutMs: 60_000 }],
   });
   const logs = readLogs({ root, executable: spec.executable, entry: spec.entry }, 'agent.spawn');
   const rows: Row[] = logs.lines.map((l) => { try { return JSON.parse(l) as Row; } catch { return {}; } });

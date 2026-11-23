@@ -6,6 +6,10 @@ import { createRunShellApprovalIssuer, RUNSHELL_PUBLIC_KEY_ENV, RUNSHELL_APPROVA
 import { testRunShellIssuer as issuer } from '../../shell-primitive/runshell-test-issuer.js';
 import { dispatchRunShell } from './shell.js';
 
+// CEO 11-23 relax: only hold-class argv still take the signed grant. This argv is destructive by the guardian
+// (recursive rm) yet harmless: printf succeeds, so the `||` branch never runs.
+const GRANT_FIXTURE = ['/bin/sh', '-c', 'printf "approved\\n" || ngrok version'];  // held as public-tunnel exposure; harmless even if the fallback ever ran
+
 test('product dispatch signs via IPC, executes once, denies replay and denial', async () => {
   const prevHome = process.env.HOME, prevSeat = process.env.ELANOUS_TRACK, prevKey = process.env[RUNSHELL_PUBLIC_KEY_ENV];
   const prevSend = process.send;
@@ -24,7 +28,7 @@ test('product dispatch signs via IPC, executes once, denies replay and denial', 
     return true;
   };
   try {
-    const args = { command: ['/bin/echo', 'approved'], cwd: '/tmp', approval: 'none', sandbox: 'off' };
+    const args = { command: GRANT_FIXTURE, cwd: '/tmp', approval: 'none', sandbox: 'off' };
     const opts = { sessionId: 'test-session' };
     const first = await dispatchRunShell(args, opts);
     expect(first.outcome).toBe('exit');

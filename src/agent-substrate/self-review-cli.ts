@@ -489,36 +489,51 @@ function comparisonHasCompleteLinearHistory(
   return parent === currentHead.toLowerCase();
 }
 
-function deltaReviewIntent(base: SavedReviewForDelta, preserveUnmarkedNewFindings = false): string {
+export function deltaReviewIntent(base: SavedReviewForDelta, preserveUnmarkedNewFindings = false): string {
   const findings = base.mustFix.length
-    ? base.mustFix.map((finding, index) => `${index + 1}. ${finding}`).join('\n')
+    ? base.mustFix.map((finding, index) => `앞 지적(직전 head must #${index + 1}): ${finding}`).join('\n')
     : '(직전 mustFix 없음 — 새 정확성·안전·데이터 손실 문제만 확인)';
   const newFindingRule = preserveUnmarkedNewFindings
     ? '새 MUST-FIX는 현재 delta가 만든 정확성·안전·데이터 손실 문제만 허용한다. `[NEW-CORRECTNESS]`, `[NEW-SAFETY]`, `[NEW-DATA-LOSS]` 표기를 권장하지만, 표기가 없어도 결과의 mustFix에서 버리지 않는다.'
     : '새 MUST-FIX는 현재 delta가 만든 정확성·안전·데이터 손실 문제만 허용하며, 각 항목은 `[NEW-CORRECTNESS]`, `[NEW-SAFETY]`, `[NEW-DATA-LOSS]` 중 하나로 시작한다.';
   return [
     'DELTA REVIEW — 직전 저장 리뷰와 현재 head 사이의 변경만 판정한다.',
-    '직전 mustFix 각각을 REQUIREMENTS 항목에 `DELTA-FINDING <번호>: FIXED|OPEN` 형식으로 정확히 한 번 기록한다. OPEN에는 짧은 근거를 덧붙인다.',
+    '직전 mustFix 각각을 REQUIREMENTS 항목에 `DELTA-FINDING <번호>: FIXED|OPEN` 형식으로 정확히 한 번 기록한다. <번호>는 아래 목록의 앞 지적 번호와 같다.',
+    '각 항목은 앞 지적(직전 head must #<번호>)이므로 새 diff에서 해소 여부를 재판정한다. 해소되었으면 `DELTA-FINDING <번호>: FIXED` 한 줄로만 기록한다. 여전히 성립하면 `DELTA-FINDING <번호>: OPEN | <근거>` 형식으로, 새 diff에서 그 지적이 여전히 성립하는 구체적 근거(파일:줄 또는 코드 조각)를 같은 줄의 `| <근거>`에 반드시 적는다. 근거 없는 OPEN은 invalid로 분류되어 이월되지 않는다.',
     newFindingRule,
     '새 SHOULD-FIX나 스타일·범위 확장 지적은 만들지 않는다. 직전 findings를 다시 리뷰 전체로 확장하지 않는다.',
     '직전 mustFix:', findings,
   ].join('\n\n');
 }
 
-function assessDeltaReview(review: ReviewResult, previous: SavedReviewForDelta, preserveUnmarkedNewFindings = false):
-  | { valid: true; mustFix: string[]; deltaFindings: Array<{ finding: string; status: 'fixed' | 'open' }>; excludedNewFindings: number }
+export function assessDeltaReview(review: ReviewResult, previous: SavedReviewForDelta, preserveUnmarkedNewFindings = false):
+  | { valid: true; mustFix: string[]; deltaFindings: Array<{ finding: string; status: 'fixed' | 'open' }>; excludedNewFindings: number; deltaAssessmentInvalid: Array<{ n: number; raw: string }> }
   | { valid: false; reason: string } {
   const statuses = new Map<number, 'fixed' | 'open'>();
+  const rationales = new Map<number, string>();
+  const deltaAssessmentInvalid: Array<{ n: number; raw: string }> = [];
   for (const item of review.requirements ?? []) {
-    const match = /^DELTA-FINDING\s+(\d+):\s*(FIXED|OPEN)(?:\s+—.*)?$/i.exec(item.trim());
+    const raw = item.trim();
+    // `| <근거>`(새 diff 근거) 또는 종전의 `— <근거>` 형태만 근거로 인정한다.
+    const match = /^DELTA-FINDING\s+(\d+):\s*(FIXED|OPEN)(?:\s*[|—]\s*(.*?))?\s*$/i.exec(raw);
     if (!match) continue;
     const index = Number(match[1]);
     if (index < 1 || index > previous.mustFix.length || statuses.has(index)) return { valid: false, reason: 'delta-assessment-invalid' };
-    statuses.set(index, match[2]!.toLowerCase() as 'fixed' | 'open');
+    const status = match[2]!.toLowerCase() as 'fixed' | 'open';
+    statuses.set(index, status);
+    if (status === 'open') {
+      const rationale = (match[3] ?? '').trim();
+      if (rationale) rationales.set(index, rationale);
+      else deltaAssessmentInvalid.push({ n: index, raw }); // 근거 없는 OPEN — reopened에서 제외하고 invalid 분류만 남긴다.
+    }
   }
   if (statuses.size !== previous.mustFix.length) return { valid: false, reason: 'delta-assessment-incomplete' };
   const deltaFindings = previous.mustFix.map((finding, index) => ({ finding, status: statuses.get(index + 1)! }));
-  const openFindings = deltaFindings.filter((item) => item.status === 'open').map((item) => item.finding);
+  // ⛔ 원문 단독 이월 금지(칸74): 이월 must는 «앞 지적(직전 head must #<번호>): <직전 원문> — 근거: <새 diff 근거 줄>»로 조립한다.
+  const openFindings = previous.mustFix.flatMap((finding, index) => {
+    const rationale = rationales.get(index + 1);
+    return rationale === undefined ? [] : [`앞 지적(직전 head must #${index + 1}): ${finding} — 근거: ${rationale}`];
+  });
   const allowedPrefix = /^\[(?:NEW-CORRECTNESS|NEW-SAFETY|NEW-DATA-LOSS)\]\s*/i;
   const newFindings = review.mustFix.flatMap((finding) => {
     if (allowedPrefix.test(finding)) return [finding.replace(allowedPrefix, '')];
@@ -526,7 +541,7 @@ function assessDeltaReview(review: ReviewResult, previous: SavedReviewForDelta, 
     return preserveUnmarkedNewFindings && !duplicatesPrior ? [finding] : [];
   });
   const excludedNewFindings = review.mustFix.length - newFindings.length;
-  return { valid: true, mustFix: [...openFindings, ...newFindings], deltaFindings, excludedNewFindings };
+  return { valid: true, mustFix: [...openFindings, ...newFindings], deltaFindings, excludedNewFindings, deltaAssessmentInvalid };
 }
 
 export function classifyMainMergeOnlyCapExemptHead(
@@ -2461,7 +2476,6 @@ async function runSelfReviewCliCommandPinned(
       continue;
     }
     let deltaBase: SavedReviewForDelta | undefined;
-    let deltaFallbackReason: string | undefined;
     let fullDiffForContextualDelta = false;
     let deltaHeal = opts.deltaHeal;
     if (!opts.full) {
@@ -2494,23 +2508,38 @@ async function runSelfReviewCliCommandPinned(
     let diffResult = deltaBase
       ? fullDiffForContextualDelta ? { read: readDiffAtHead(pr, deps) } : readDeltaDiffAtHead(pr, deltaBase.headCommit, deps)
       : { read: readDiffAtHead(pr, deps) };
+    // ⭐ REVIEW-INTERDIFF-ONLY (0.3.34 P1-12 · OP #133536) — 기본 모드 재판정은 «정확 델타만»:
+    //    종전의 무음 전체 diff 폴백 3개를 없앤다. 저장 head 조상 불일치·20,562자 초과는
+    //    fail-closed 거부(전체 검사가 필요하면 운영자가 --full 을 명시하고), main 병합만
+    //    앞선 head 는 PR 저작 변경이 없으므로 저장 판정을 재사용한다.
     if (deltaBase && opts.sinceReview === undefined && 'error' in diffResult && diffResult.error === 'saved-review-head-not-ancestor') {
-      deltaFallbackReason = 'saved-review-head-not-ancestor';
-      deltaBase = undefined;
-      diffResult = { read: readDiffAtHead(pr, deps) };
+      const message = `PR ${pr}: 저장 리뷰 head 가 현재 head 의 조상이 아닙니다 — 기본 모드는 전체 diff 로 되돌아가지 않고 거부합니다 (saved-review-head-not-ancestor).`;
+      deps.error(message);
+      if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, verdict: null,
+        refusal: 'delta-base-invalid', deltaOutcome: 'refused', deltaRefusal: 'saved-review-head-not-ancestor' });
+      failed += 1;
+      continue;
     }
     if (deltaBase && opts.sinceReview === undefined && 'read' in diffResult && diffResult.read.diff.stdout.length > 20_562) {
-      deltaFallbackReason = 'delta-diff-over-20562-chars';
-      deltaBase = undefined;
-      diffResult = { read: readDiffAtHead(pr, deps) };
+      const message = `PR ${pr}: 델타 diff 가 20,562자 예산을 초과합니다 — 기본 모드는 전체 diff 로 되돌아가지 않고 거부합니다 (delta-diff-over-20562-chars). 전체 검사가 필요하면 --full 을 명시하십시오.`;
+      deps.error(message);
+      if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, verdict: null,
+        refusal: 'delta-base-invalid', deltaOutcome: 'refused', deltaRefusal: 'delta-diff-over-20562-chars' });
+      failed += 1;
+      continue;
     }
     // A head containing only clean main merges has no PR-authored delta.
-    // Review the complete SHA-pinned PR diff instead of treating that empty
-    // authored segment as a failed GitHub diff read.
+    // REVIEW-INTERDIFF-ONLY: the PR-authored change set is unchanged — reuse the
+    // saved verdict instead of silently re-reviewing the complete PR diff.
     if (deltaBase && opts.sinceReview === undefined && 'read' in diffResult && !diffResult.read.diff.stdout.trim()) {
-      deltaFallbackReason = 'delta-no-authored-change';
-      deltaBase = undefined;
-      diffResult = { read: readDiffAtHead(pr, deps) };
+      const reused = { ...deltaBase.result, headCommit: diffResult.read.headCommit,
+        deltaOutcome: 'reused',
+        deltaHeal: { cause: 'delta-no-authored-change', prescription: 'reuse-saved-verdict', result: 'verdict-reused' } };
+      deps.log('review.delta-heal', { pr, cause: 'delta-no-authored-change', prescription: 'reuse-saved-verdict',
+        result: 'verdict-reused', headCommit: diffResult.read.headCommit }, { level: 'info' });
+      if (opts.json || opts.save !== undefined) results.push(reused);
+      else deps.print(`\n━━ PR ${pr} (${String(deltaBase.result.model ?? 'saved review')}) ━━\n${deps.renderReview(reused as unknown as ReviewResult)}\n판정 재사용: ${deltaBase.headCommit}`);
+      continue;
     }
     if ('error' in diffResult) {
       if (diffResult.error === 'no-new-head-since-review' && deltaBase) {
@@ -3199,20 +3228,14 @@ async function runSelfReviewCliCommandPinned(
         review = retryReview;
         deltaHeal = { cause: 'no-verdict-line', prescription: 'retry-delta-once' };
       } else {
+        // ⭐ REVIEW-INTERDIFF-ONLY (0.3.34 P1-12 · OP #133536) — 재시도 소진은 이 라운드의
+        //    실패로 끝난다: 전체 재검 재귀(full:true) 없이 bounded 실패 사유와 함께 거부로
+        //    기록한다. 전체 검사가 필요하면 운영자가 --full 을 명시한다.
         const retryResult = safeLogText(retryReview.failureReason === NO_VERDICT_LINE_REASON
           ? 'no-verdict-line' : `retry-failed-${retryReview.failureReason || 'reviewed-false'}`, 400);
-        deps.log('review.delta-heal', { pr, cause: 'no-verdict-line', prescription: 'retry-delta-once',
-          result: retryResult, headCommit: diffRead.headCommit }, { level: 'warn' });
-        reviewPin?.remove();
-        const fallback = await runSelfReviewCliCommandPinned([pr], {
-          ...opts, full: true, sinceReview: undefined,
-          reviewerMixCapClaimed: opts.reviewerMixCapClaimed || Boolean(claimedCapPath),
-          deltaHeal: { cause: 'no-verdict-line', prescription: 'full-review-once-after-delta-retry' },
-        }, deps, pins);
-        results.push(...fallback.results);
-        failed += fallback.failed;
-        releaseCapClaim();
-        continue;
+        review = { ...retryReview, reviewed: false, verdict: 'fail', mustFix: [], shouldFix: [],
+          failureReason: retryResult };
+        deltaHeal = { cause: 'no-verdict-line', prescription: 'retry-delta-once' };
       }
     }
     const reviewDurationMs = Math.max(0, deps.now() - startedAt);
@@ -3513,7 +3536,6 @@ async function runSelfReviewCliCommandPinned(
     const resultOutput = { pr, model: selectedModel, ...jsonReview, ...loopBreakerOutput,
       reviewCapPolicy: loopBreakerOutput.reviewCapPolicy ?? loopPolicy, reviewInputChars, reviewDurationMs,
       ...(deltaBase ? deltaReceipt : {}), ...deltaHealOutput, ...(designTransition ? { designTransition } : {}), ...reviewProvenance, ...respondedOutput, ...reviewerSelection,
-      ...(deltaFallbackReason ? { deltaFallbackReason } : {}),
       ...reviewCwdOutput, ...provenance, ...contextOutput, ...refusalOverride, ...landingGateFields, ...engineValidityFields,
       ...(mainMergeCapExempt ? { mainMergeOnlyCapExempt: true } : {}),
       findingPathHeadChecks, pathWarnings, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles,

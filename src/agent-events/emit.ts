@@ -4,11 +4,13 @@
 // Fail-soft: no host, a refused frame or a throw never reaches the producer.
 import { randomUUID } from 'node:crypto';
 import { debug } from '../debug/log.js';
-import { ENV_EVENT_PANE, ENV_EVENT_SOCKET, ENV_EVENT_WS, EVENT_PROTOCOL_VERSION, type AgentEvent, type AgentEventFrame, type AgentState, type ChildSourceName } from './protocol.js';
+import { ENV_EVENT_PANE, ENV_EVENT_SOCKET, ENV_EVENT_WS, EVENT_PROTOCOL_VERSION, type AgentEvent, type AgentEventFrame, type AgentState, type BlockReason, type ChildSourceName, legacyAgentState, type SeatState } from './protocol.js';
 import { sendFrameOverSocket, type SendFrame } from './transport.js';
 
 export interface AgentEventEmitter {
   state(state: AgentState, message?: string): void;
+  /** SEAT-STATE-ENUM: the seat state as a code (plus the v1 word for older readers). BLOCKED / WAITING_* need `reason`. */
+  seatState(input: { state: SeatState; reason?: BlockReason; detail?: string }): void;
   turn(phase: 'start' | 'end', id: string): void;
   meta(meta: { model?: string; queue?: number; plan?: string; elapsed?: string; title?: string }): void;
   notice(level: 'info' | 'warn' | 'alert', text: string): void;
@@ -76,6 +78,8 @@ export function createAgentEventEmitter(opts: AgentEventEmitterOpts): AgentEvent
   return {
     flush: async () => { await tail; },
     state: (state, message) => guarded('state', () => post({ kind: 'state', state, ...(message ? { message: oneLine(message, 200) } : {}) })),
+    seatState: (input) => guarded('seatState', () => post({ kind: 'state', state: legacyAgentState(input.state), code: input.state,
+      ...(input.reason ? { reason: input.reason } : {}), ...(input.detail ? { detail: oneLine(input.detail, 200) } : {}) })),
     turn: (phase, id) => guarded('turn', () => post({ kind: 'turn', phase, id: oneLine(id, 80) })),
     meta: (meta) => guarded('meta', () => post({ kind: 'meta', ...meta })),
     notice: (level, text) => guarded('notice', () => post({ kind: 'notice', level, text: oneLine(text, 200) })),
@@ -91,14 +95,16 @@ export function createAgentEventEmitter(opts: AgentEventEmitterOpts): AgentEvent
 }
 
 /** The emitter for this process, or undefined when no frame launched it. Created once per environment. */
-let cached: { socketPath: string; ws: string; pane: string; emitter: AgentEventEmitter | undefined } | undefined;
+let cached: { socketPath: string; ws: string; pane: string; token: string | undefined; emitter: AgentEventEmitter | undefined } | undefined;
 export function getAgentEventEmitter(env: NodeJS.ProcessEnv = process.env): AgentEventEmitter | undefined {
-  const socketPath = env[ENV_EVENT_SOCKET]?.trim() ?? '';
-  const ws = env[ENV_EVENT_WS]?.trim() ?? '';
-  const pane = env[ENV_EVENT_PANE]?.trim() ?? '';
+  const socketPath = env[ENV_EVENT_SOCKET]?.trim() || env.ELANOUS_ELS_SOCKET?.trim() || '';
+  const ws = env[ENV_EVENT_WS]?.trim() || env.ELANOUS_ELS_WS?.trim() || '';
+  const pane = env[ENV_EVENT_PANE]?.trim() || env.ELANOUS_ELS_PANE?.trim() || '';
   // 출처: #38499 — 튜플 성분 비교로 교체: '|' 문자열 키는 성분에 '|'가 있으면 충돌해 남의 emitter 를 돌려줬다
-  if (cached && cached.socketPath === socketPath && cached.ws === ws && cached.pane === pane) return cached.emitter;
-  const emitter = socketPath && ws ? createAgentEventEmitter({ ws, socketPath, ...(pane ? { pane } : {}) }) : undefined;
-  cached = { socketPath, ws, pane, emitter };
+  const token = env.ELANOUS_ELS_PANE_TOKEN;
+  if (cached && cached.socketPath === socketPath && cached.ws === ws && cached.pane === pane && cached.token === token) return cached.emitter;
+  const emitter = socketPath && ws ? createAgentEventEmitter({ ws, socketPath, ...(pane ? { pane } : {}),
+    ...(token ? { send: (path, frame) => sendFrameOverSocket(path, frame, { paneAuth: { token, pid: process.pid } }) } : {}) }) : undefined;
+  cached = { socketPath, ws, pane, token, emitter };
   return emitter;
 }

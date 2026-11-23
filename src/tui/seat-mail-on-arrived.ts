@@ -11,6 +11,7 @@
 
 import { emitTurnLife } from '../debug/turn-life.js';
 import type { SeatMailArrivalInfo } from './seat-mail-arrival.js';
+import { SEAT_MAIL_COALESCE_MS } from './seat-mail-digest.js';
 
 export interface SeatMailOnArrivedDeps {
   busy: () => boolean;
@@ -23,9 +24,22 @@ export interface SeatMailOnArrivedDeps {
   enqueueMidTurn?: (event: { kind: string; id: string; text: string; from?: string; intent?: string | null }, onDrained?: () => void) => boolean;
   /** OP #106762 ⓐ — 배수된 사건의 대기 큐 노티스를 지운다(fail-open · 지운 건수를 돌려준다). */
   removeQueuedNotice?: (match: { source: string; msgId?: number; text?: string }) => number;
+  /**
+   * SEAT-MAIL-COALESCE-NOTICE — the idle-door debounce. Given, an idle arrival knocks once after
+   * {@link SEAT_MAIL_COALESCE_MS}; every arrival inside that window rides the same knock (one bundle · one turn).
+   * Absent = knock at once (unit seams).
+   */
+  schedule?: (fn: () => void, ms: number) => unknown;
 }
 
 export function seatMailOnArrived(deps: SeatMailOnArrivedDeps): (arrivals?: readonly SeatMailArrivalInfo[]) => void {
+  let knockPending = false;
+  const knock = (): void => {
+    if (!deps.schedule) { deps.injectKey(deps.queueWake); return; }
+    if (knockPending) return;
+    knockPending = true;
+    deps.schedule(() => { knockPending = false; deps.injectKey(deps.queueWake); }, SEAT_MAIL_COALESCE_MS);
+  };
   return (arrivals) => {
     if (deps.busy()) {
       // OBSERVE-TURN-EVENT-LIFECYCLE — 바쁜 턴: 원문은 이벤트함에, 큐 노티스는 배수 때 지운다(이 모듈은 관측만).
@@ -36,6 +50,8 @@ export function seatMailOnArrived(deps: SeatMailOnArrivedDeps): (arrivals?: read
       for (const arrival of arrivals ?? []) {
         // 수 모드 노티스엔 msgId 가 없다 — 세션 1회 계약을 못 세우니 턴 끝 노크에 맡긴다.
         if (arrival.msgId === undefined) continue;
+        // SEAT-MAIL-COALESCE-NOTICE — info mail is not carried into the running turn: it waits for the next digest.
+        if (arrival.passive === true) continue;
         // JUD security HOLD: no sender (OP · 대표) preempts — `--from` is not authenticated. Every mail, decisions
         // included, rides the same mid-turn event box in arrival (msgId) order.
         deps.enqueueMidTurn?.(
@@ -46,6 +62,8 @@ export function seatMailOnArrived(deps: SeatMailOnArrivedDeps): (arrivals?: read
       }
       return;
     }
-    deps.injectKey(deps.queueWake);
+    // SEAT-MAIL-COALESCE-NOTICE — info mail alone opens no turn (it rides the next digest or the passive wake window).
+    if (arrivals !== undefined && arrivals.length > 0 && arrivals.every((arrival) => arrival.passive === true)) return;
+    knock();
   };
 }

@@ -8,7 +8,8 @@ import { mockSeatPtySequence } from '../ux-sim/mock-seat-pty-sequence.js';
 
 const BIN = join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
 const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
-const promptAtBottom = (screen: string): boolean => screen.split('\n').slice(-2).some((line) => line.includes('❯'));
+// The composer sits just above the bottom status line and its rule (#38392 · DESIGN §2b): the prompt is within the last three rows.
+const promptAtBottom = (screen: string): boolean => screen.split('\n').slice(-3).some((line) => line.includes('❯'));
 
 test('open side tab first PTY frame retains pre-TUI shell history across repaint and toggle', async () => {
   const root = mkdtempSync(join(tmpdir(), 'next-sidetab-shell-history-'));

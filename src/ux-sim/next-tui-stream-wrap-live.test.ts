@@ -15,8 +15,8 @@ test('next TUI header rule fills a wide real PTY', async () => {
       // Source: 내부 문서 `next-tui-stream-polish-2` reproduces OP's wide PTY header observation.
       rows: 36, cols: 120,
       env: { ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1' },
-      ready: { label: 'boot', until: 'Ctrl+Q 종료' },
-      steps: [{ label: 'turn', text: '넓은 화면 질문', until: '응답 완료' }],
+      ready: { label: 'boot', until: 'Ctrl+Q quit' },
+      steps: [{ label: 'turn', text: '넓은 화면 질문', until: 'Turn done' }],
     });
     // Source: 내부 문서 `next-tui-stream-polish-2` compares 80-column baseline with 120-column PTY.
     expect(run.frames[0]?.screen.split('\n')[1]).toBe('─'.repeat(120));

@@ -4,7 +4,7 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { MAX_ACTIVE_PLAN_ITEMS } from '../dashboard/input/seat-task-decompose.js';
+import { MAX_ACTIVE_PLAN_ITEMS } from '../seat/seat-task-decompose.js';
 import { debug } from '../debug/log.js';
 import { MsgStore } from '../msg/msg-store.js';
 import type { Message } from '../msg/msg-store.js';

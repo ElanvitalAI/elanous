@@ -16,7 +16,7 @@ import type { CompactProvider } from '../compact/provider.js';
 import * as actualUserIntent from '../user-intent/index.js';
 import { appendMessage, createSession, loadSession, rewriteSessionMessages, type SerializedMessage } from './index.js';
 import { runTurn, toLLM } from './chat.js';
-import { resolveTurnCompactTrigger } from './long-session-compact.js';
+import { shouldFireTurnStartCompact, TURN_COMPACT_HISTORY_TOKENS, TURN_COMPACT_FULL_INPUT_TOKENS } from './long-session-compact.js';
 import { compactSessionHistory } from './compact-session.js';
 
 // ── fixture parameters (not product constants) ───────────────────────────────
@@ -85,19 +85,15 @@ const turnStart = (log: { mock: { calls: unknown[][] } }) => log.mock.calls
   .filter((call: unknown[]) => call[0] === 'compact.session' && call[1] === 'turn-start')
   .map((call: unknown[]) => call[2] as { fired: boolean; usedTokens: number; triggerTokens: number });
 
-describe('O4 core — trigger = min(existing threshold, input cap)', () => {
-  test('a small working budget keeps the existing threshold ratio × min(window, workingBudget)', () => {
-    const window = resolveAutoCompactWindow(MODEL);
-    const existing = Math.floor(SMALL.triggerRatio * Math.min(window, SMALL.workingBudgetTokens));
-    expect(existing < DEFAULT_TOKEN_BUDGET).toBe(true);
-    expect(resolveTurnCompactTrigger(MODEL, SMALL, DEFAULT_TOKEN_BUDGET)).toBe(existing);
+describe('O4 core — the turn-start trigger measures the record (ELN-COMPACT-REAL §4-4①)', () => {
+  test('the record basis fires at 16k stored tokens — fixed prefix excluded (§4-4①)', () => {
+    expect(shouldFireTurnStartCompact(TURN_COMPACT_HISTORY_TOKENS, 0)).toBe(true);
+    expect(shouldFireTurnStartCompact(TURN_COMPACT_HISTORY_TOKENS - 1, 0)).toBe(false);
   });
 
-  test('an existing threshold above the input cap is clamped to the cap (the D1 case)', () => {
-    const window = resolveAutoCompactWindow(MODEL);
-    const cfg = CHAT_DEFAULTS.autoCompact;
-    expect(Math.floor(cfg.triggerRatio * Math.min(window, cfg.workingBudgetTokens)) > DEFAULT_TOKEN_BUDGET).toBe(true);
-    expect(resolveTurnCompactTrigger(MODEL, cfg, DEFAULT_TOKEN_BUDGET)).toBe(DEFAULT_TOKEN_BUDGET);
+  test('the full measured input valve fires at 60k even with a small record (§4-4①)', () => {
+    expect(shouldFireTurnStartCompact(0, TURN_COMPACT_FULL_INPUT_TOKENS)).toBe(true);
+    expect(shouldFireTurnStartCompact(0, TURN_COMPACT_FULL_INPUT_TOKENS - 1)).toBe(false);
   });
 
   test('reproduction (D1): the 24k trim dropped the seat instruction before the old threshold was reached', () => {
@@ -136,18 +132,22 @@ describe('O4 core — turn-start compaction fires before the trim (real runTurn)
     }
   });
 
-  test('small working budget: a long session compacts at the existing threshold and the prompt stays first', async () => {
+  test('small working budget: the turn-start fires on the record (16k) and the prompt stays first (§4-4①)', async () => {
     const { requests, provider } = recorder('o4-core-small');
     const session = createSession({ source: 'cli', provider: provider.name, model: MODEL });
-    const trigger = resolveTurnCompactTrigger(MODEL, SMALL, DEFAULT_TOKEN_BUDGET);
-    const replyTokens = estimateMessagesTokens([{ role: 'assistant', content: 'r'.repeat(REPLY_CHARS) }]);
-    // Enough turns to cross the trigger at least twice from an empty session.
-    const turns = 2 * Math.ceil(trigger / replyTokens) + 2;
+    appendMessage(session.id, { role: 'user', content: SEAT_INSTRUCTION, ts: new Date(Date.UTC(2026, 10, 17)).toISOString() });
+    // §4-4① — the config working budget no longer lowers the turn-start trigger: it measures the
+    // STORED record (fixed prefix excluded). Grow the store past the 16k record basis directly.
+    const recordTokens = () => estimateMessagesTokens(toLLM(loadSession(session.id)!.messages));
+    let at = 1;
+    while (recordTokens() < TURN_COMPACT_HISTORY_TOKENS + 1_000) { // 출처: #135458 §4-4① — 기록 16k + 여유 1k
+      for (const row of conversation(2, at)) appendMessage(session.id, row);
+      at += 2;
+    }
     const log = spyOn(debug, 'log');
     try {
-      for (let n = 0; n < turns; n++) await turn(provider, session.id, `turn ${n}: continue`, SMALL);
-      expect(turnStart(log).filter(event => event.fired).length).not.toBe(0);
-      for (const event of turnStart(log)) expect(event.usedTokens >= event.triggerTokens).toBe(true);
+      await turn(provider, session.id, 'current request', SMALL);
+      expect(turnStart(log).map(event => event.fired)).toEqual([true]);
       for (const request of requests) {
         expect(request[0]).toEqual({ role: 'system', content: SYSTEM_PROMPT });
         expect(estimateMessagesTokens(request)).toBeLessThanOrEqual(DEFAULT_TOKEN_BUDGET);
@@ -157,23 +157,21 @@ describe('O4 core — turn-start compaction fires before the trim (real runTurn)
     }
   });
 
-  test('the trigger is measured on the request as sent — an attached image can cross it', async () => {
+  test('the full-input valve counts attached image blocks — 300 images cross 60k with a small record (§4-4①)', async () => {
     const { provider } = recorder('o4-core-image');
     const session = createSession({ source: 'cli', provider: provider.name, model: MODEL });
-    const trigger = resolveTurnCompactTrigger(MODEL, SMALL, DEFAULT_TOKEN_BUDGET);
-    const image: ContentBlock = { type: 'image', mediaType: 'image/png', base64: 'aW1hZ2U=' };
-    const imageTokens = estimateMessagesTokens([{ role: 'user', content: [image] }]) - estimateMessagesTokens([{ role: 'user', content: '' }]);
-    // Grow with small rows until the text-only request sits just under the trigger, within one image.
     appendMessage(session.id, { role: 'user', content: SEAT_INSTRUCTION, ts: new Date(Date.UTC(2026, 10, 17)).toISOString() });
-    let at = 1;
-    while (wireTokens(session.id, 'look') + imageTokens / 2 < trigger) {
-      appendMessage(session.id, { ...conversation(1, at, 8)[0]!, role: 'assistant' });
-      at++;
-    }
-    expect(wireTokens(session.id, 'look') < trigger).toBe(true);
+    for (const row of conversation(6, 1)) appendMessage(session.id, row);
+    // tokens.ts weighs each image block at a flat 200 tok: 300 blocks = 60k, so the full-input
+    // valve fires with a small record — where the old request-as-sent trigger (clamped to the
+    // 24k input cap) could not see this turn at all.
+    const images: ContentBlock[] = Array.from({ length: 300 }, (): ContentBlock => ({ type: 'image', mediaType: 'image/png', base64: 'aW1hZ2U=' })); // 출처: #135458 §4-4① — 200 tok/이미지 × 300 = 전체 60k 밸브
+    expect(estimateMessagesTokens([{ role: 'user', content: images }])).toBeGreaterThanOrEqual(TURN_COMPACT_FULL_INPUT_TOKENS);
     const log = spyOn(debug, 'log');
     try {
-      await turn(provider, session.id, 'look', SMALL, { userImages: [image] });
+      // The 60k image input alone exceeds the 24k trim cap: the valve fires first, then the
+      // turn stops with ✗ per the D1 contract (nothing fits) — the compaction still happened.
+      await expect(turn(provider, session.id, 'look', SMALL, { userImages: images })).rejects.toThrow('문맥 예산 초과');
       expect(turnStart(log).map(event => event.fired)).toEqual([true]);
     } finally {
       log.mockRestore();
@@ -225,7 +223,9 @@ const interimRow = (n: number): SerializedMessage => ({
 const seedWithAudit = (sessionId: string) => {
   appendMessage(sessionId, { role: 'user', content: SEAT_INSTRUCTION, ts: new Date(Date.UTC(2026, 10, 17)).toISOString() });
   let n = 0;
-  for (let at = 1; at < 17; at += 2) {
+  // §4-4① — the turn-start valve now fires on the record (16k): grow the audit universe past
+  // the record basis (8 pairs ≈ 8.4k could not fire; 32 pairs ≈ 20k can).
+  for (let at = 1; at < 65; at += 2) { // 출처: #135458 §4-4① — 32쌍 ≈ 20k 기록 > 16k 임계
     for (const row of conversation(2, at)) appendMessage(sessionId, row);
     appendMessage(sessionId, at % 4 === 1 ? auditRow(n) : interimRow(n));
     n++;
@@ -279,8 +279,7 @@ describe('O4 core — compaction keeps audit rows as they are (Terra #38156)', (
     const { requests, provider } = recorder('o4-core-audit');
     const session = createSession({ source: 'cli', provider: provider.name, model: MODEL });
     seedWithAudit(session.id);
-    const trigger = resolveTurnCompactTrigger(MODEL, SMALL, DEFAULT_TOKEN_BUDGET);
-    expect(wireTokens(session.id, 'current request') >= trigger).toBe(true);
+    expect(estimateMessagesTokens(toLLM(loadSession(session.id)!.messages))).toBeGreaterThanOrEqual(TURN_COMPACT_HISTORY_TOKENS); // 출처: #135458 §4-4① — 기록 16k 기준으로 발화 보장
     const before = loadSession(session.id)!.messages;
     const log = spyOn(debug, 'log');
     try {

@@ -4,7 +4,7 @@ import { buildTabDropdown, buildTabRow, dropdownOrder, layoutSpaceList } from '.
 import { createAttachApp } from './attach-app.js';
 
 const pane = (ws: string, id: string) => ({ address: `${ws}/t/${id}`, workspace: ws, pane: id, title: id, state: 'idle' });
-const local = (id: string) => JSON.stringify({ workspaces: [{ id: 'a' }, { id: 'b', role: id === 'b' ? 'coordinator' : undefined }, { id: 'c', role: id === 'c' ? 'coordinator' : undefined }], panes: [pane('a', 'a1'), pane('b', 'b1'), pane('c', 'c1'), pane('b', 'b2')] });
+const local = (id: string) => JSON.stringify({ workspaces: [{ id: 'a' }, { id: 'b', role: id === 'b' ? 'coordinator' : undefined }, { id: 'c', role: id === 'c' ? 'coordinator' : undefined }], panes: [pane('a', 'a1'), { ...pane('b', 'b1'), spaceCoordinator: true }, pane('c', 'c1'), pane('b', 'b2')] });
 const plain = (s: string) => s.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '');
 
 test('coordinator workspace is first, all its panes retain their order; marker follows role not OP name', () => {
@@ -13,11 +13,11 @@ test('coordinator workspace is first, all its panes retain their order; marker f
   expect(rows.map(r => r.role)).toEqual(['coordinator', 'coordinator', undefined, undefined]);
   const list = layoutSpaceList(rows, 'b1', 28, 8);
   expect(list.spaces.map(s => s.pane)).toEqual(['b1', 'a1', 'c1']);
-  expect(plain(list.lines[1]!)).toContain('🎼 B');
-  expect(plain(buildTabRow(rows, 'b1', 80).line!)).toContain('🎼 🛠 B1');
+  expect(plain(list.lines[1]!)).toContain('⭐ B');
+  expect(plain(buildTabRow(rows, 'b1', 80).line!)).toContain('⭐ B1');
   const dropdown = buildTabDropdown(rows, 'b1', 'b1', 60, 12);
-  expect(plain(dropdown.line)).toContain('🎼 🛠 B1');
-  expect(plain(dropdown.list[0]!)).toContain('🎼 b');
+  expect(plain(dropdown.line)).toContain('⭐ B1');
+  expect(plain(dropdown.list[0]!)).toContain('⭐ b');
   expect(dropdownOrder(rows)).toEqual(['b1', 'b2', 'a1', 'c1']);
   expect(parsePaneRows(JSON.stringify({ workspaces: [{ id: 'a', name: 'OP' }], panes: [pane('a', 'a1')] }))[0]!.role).toBeUndefined();
 });
@@ -27,7 +27,7 @@ test('remote coordinators are first within each host, not globally; old hosts ha
   const rows = parseRemoteRows(JSON.stringify({ panes: [remote('one', 'a', 'a'), remote('two', 'a', 'a'), remote('one', 'b', 'b', 'coordinator'), remote('two', 'b', 'b', 'coordinator'), remote('one', 'c', 'c')] }));
   expect(rows.map(r => r.wsId)).toEqual(['one:b', 'one:a', 'one:c', 'two:b', 'two:a']);
   expect(rows.map(r => r.role)).toEqual(['coordinator', undefined, undefined, 'coordinator', undefined]);
-  expect(plain(layoutSpaceList(rows, 'one:b/t/b', 28, 10).lines[1]!)).toContain('🎼 ⇄ONE B');
+  expect(plain(layoutSpaceList(rows, 'one:b/t/b', 28, 10).lines[1]!)).toContain('⭐ ⇄ONE B');
 });
 
 test('local coordinator precedes an empty remote coordinator', () => {
@@ -36,7 +36,7 @@ test('local coordinator precedes an empty remote coordinator', () => {
     { wsId: 'remote:chief', name: '⇄remote chief', remote: 'remote' },
   ]);
   const lines = list.lines.map(plain);
-  expect(lines.findIndex(line => line.includes('🎼 B'))).toBeLessThan(lines.findIndex(line => line.includes('🎼 ⇄REMOTE CHIEF')));
+  expect(lines.findIndex(line => line.includes('⭐ B'))).toBeLessThan(lines.findIndex(line => line.includes('⭐ ⇄REMOTE CHIEF')));
 });
 
 test('empty coordinator is selectable without inventing an attachable pane', async () => {
@@ -48,11 +48,11 @@ test('empty coordinator is selectable without inventing an attachable pane', asy
     write: s => screens.push(plain(s)), size: () => ({ cols: 100, rows: 12 }), cwd: '/x', env: {},
     setInterval: () => 0, clearInterval() {}, pollMs: 1000, chatCommand: [], memory: { load: () => ({}), save() {} } });
   await app.start('a1');
-  expect(screens.at(-1)!.split('\r\n')[1]).toContain('🎼 CHIEF');
+  expect(screens.at(-1)!.split('\r\n')[1]).toContain('⭐ CHIEF');
   app.key('\u001b[<0;5;2M');
   expect(attached).toEqual(['a1']);
   expect(screens.at(-1)!).toContain('빈 작업공간');
-  expect(screens.at(-1)!).not.toContain('🛠 A1');
+  expect(screens.at(-1)!).not.toContain('  A1  ');
   app.key('\u0002q');
 });
 
@@ -68,15 +68,15 @@ test('empty remote coordinator survives repeated host failure and clears on auth
     write: s => screens.push(plain(s)), size: () => ({ cols: 100, rows: 12 }), cwd: '/x', env: {},
     setInterval: cb => { tick = cb; return 0; }, clearInterval() {}, pollMs: 1000, chatCommand: [], memory: { load: () => ({}), save() {} } });
   await app.start('a1'); await Bun.sleep(20);
-  expect(screens.at(-1)!).toContain('🎼 ⇄OTHER CHIEF');
+  expect(screens.at(-1)!).toContain('⭐ ⇄OTHER CHIEF');
   remote = JSON.stringify({ hosts: [{ name: 'other', reach: 'down' }], panes: [] });
   for (let i = 0; i < 2; i++) {
     tick(); await Bun.sleep(20);
-    expect(screens.at(-1)!).toContain('✕ 🎼 ⇄OTHER CHIEF');
+    expect(screens.at(-1)!).toContain('✕ ⭐ ⇄OTHER CHIEF');
   }
   remote = JSON.stringify({ hosts: [{ name: 'other', reach: 'up' }], panes: [], remoteWorkspaces: [] });
   tick(); await Bun.sleep(20);
-  expect(screens.at(-1)!).not.toContain('🎼 ⇄OTHER CHIEF');
+  expect(screens.at(-1)!).not.toContain('⭐ ⇄OTHER CHIEF');
   app.key('\u0002q');
 });
 
@@ -88,7 +88,7 @@ test('folded HERDR keeps its coordinator visible before ordinary HERDR spaces', 
   const ordinary = parsePaneRows(JSON.stringify({ workspaces: [{ id: 'local' }], panes: [pane('local', 'l1')] }));
   const list = layoutSpaceList([...rows, ...ordinary], 'l1', 28, 8);
   expect(list.spaces.map(s => s.ws)).toEqual(['herdr:chief', 'local']);
-  expect(plain(list.lines[1]!)).toContain('🎼 ⇄HERDR CHIEF');
+  expect(plain(list.lines[1]!)).toContain('⭐ ⇄HERDR CHIEF');
   expect(list.lines.join('\n')).toContain('HERDR · 1');
 });
 
@@ -104,10 +104,10 @@ test('attach repaints a changed coordinator without changing the selected pane o
     setInterval: cb => { tick = cb; return 0; }, clearInterval() {}, pollMs: 1000, chatCommand: [], memory: { load: () => ({}), save() {} },
   });
   await app.start('a1');
-  expect(screens.at(-1)!.split('\r\n')[1]).toContain('🎼 B');
+  expect(screens.at(-1)!.split('\r\n')[1]).toContain('⭐ B');
   listing = local('c'); tick(); await Bun.sleep(20);
-  expect(screens.at(-1)!.split('\r\n')[1]).toContain('🎼 C');
-  expect(screens.at(-1)!).not.toContain('🎼 B');
+  expect(screens.at(-1)!.split('\r\n')[1]).toContain('⭐ C');
+  expect(screens.at(-1)!).not.toContain('⭐ B');
   expect(attached.at(-1)).toBe('a1');
   app.key('\u001b[<0;5;2M');
   expect(attached.at(-1)).toBe('c1');
@@ -126,15 +126,15 @@ test('selecting empty remote coordinator detaches local pane without attaching o
   await app.start('a1'); await Bun.sleep(20);
   expect(attached).toEqual(['a1']); expect(detached).toBe(0);
   const lines = screens.at(-1)!.split('\r\n');
-  const y = lines.findIndex(line => plain(line).includes('🎼 ⇄OTHER CHIEF')) + 1;
+  const y = lines.findIndex(line => plain(line).includes('⭐ ⇄OTHER CHIEF')) + 1;
   expect(y).toBeGreaterThan(0);
   const beforeDetach = detached; const beforeAttach = [...attached];
   expect(beforeAttach.at(-1)).toBe('a1');
   app.key(`\u001b[<0;5;${y}M`);
   expect(detached).toBe(beforeDetach + 1); expect(attached).toEqual(beforeAttach); expect(reads).toEqual([]);
   expect(screens.at(-1)!).toContain('빈 작업공간');
-  expect(screens.at(-1)!).not.toContain('🛠 A1');
-  expect(screens.at(-1)!.split('\r\n').find(line => plain(line).includes('🎼 ⇄OTHER CHIEF'))).toContain('\u001b[7m');
+  expect(screens.at(-1)!).not.toContain('  A1  ');
+  expect(screens.at(-1)!.split('\r\n').find(line => plain(line).includes('⭐ ⇄OTHER CHIEF'))).toContain('\u001b[7m');
   app.key('\u0002q');
 });
 
@@ -187,7 +187,7 @@ test('polling does not automatically create a local pane while viewing an empty 
     setInterval: cb => { tick = cb; return 0; }, clearInterval() {}, pollMs: 1000, chatCommand: [], memory: { load: () => ({}), save() {} } });
   await app.start(); await Bun.sleep(20);
   expect(creates).toBe(1);
-  const y = screens.at(-1)!.split('\r\n').findIndex(line => line.includes('🎼 ⇄OTHER CHIEF')) + 1;
+  const y = screens.at(-1)!.split('\r\n').findIndex(line => line.includes('⭐ ⇄OTHER CHIEF')) + 1;
   expect(y).toBeGreaterThan(0);
   app.key(`\u001b[<0;5;${y}M`);
   expect(screens.at(-1)!).toContain('빈 작업공간');

@@ -72,11 +72,26 @@ test('a build.sh that exits 7 names the build stage with exit 7 after clone/deps
   expect(receipt.stages[4]!.reason).toContain('build.sh exited 7: dependency layer broke');
 }, 60_000);
 
-test('the real build.sh packs a tree without apps/pwa/out and pack-pwa names the missing path', () => {
+test('the real gate-layer build accepts a package archive without the optional PWA', () => {
   const receipt = probeWithPath(cutTree({ pwa: false }));
-  expect(receipt.failedStage).toBe('pack-pwa');
-  expect(receipt.stages.at(-1)).toEqual({ stage: 'pack-pwa', exit: 1, ok: false, reason: 'package archive has no package/apps/pwa/out/index.html' });
+  expect(receipt.outcome).toBe('ok');
+  expect(receipt.stages.find((row) => row.stage === 'pack-pwa')).toEqual({
+    stage: 'pack-pwa', exit: 0, ok: true, reason: 'gate layer archive verified; PWA optional and absent',
+  });
+  expect(receipt.stages.at(-1)?.stage).toBe('push');
 }, 120_000);
+
+test('a successful pack child that wrote an unreadable archive still fails the gate-layer probe', () => {
+  const receipt = probeWithPath(cutTree({ buildBody: 'printf "invalid archive" > "$ELANOUS_BUILD_PACK_ONLY"' }));
+  expect(receipt.failedStage).toBe('pack-pwa');
+  expect(receipt.stages.at(-1)?.reason).toContain('package archive unreadable');
+}, 60_000);
+
+test('a readable archive without the gate package manifest is rejected', () => {
+  const receipt = probeWithPath(cutTree({ buildBody: 'mkdir package; tar -czf "$ELANOUS_BUILD_PACK_ONLY" package' }));
+  expect(receipt.failedStage).toBe('pack-pwa');
+  expect(receipt.stages.at(-1)?.reason).toBe('gate layer archive has no package/package.json');
+}, 60_000);
 
 test('success walks all seven stages with the real build.sh pack and the push is probed, not performed', () => {
   const receipt = probeWithPath(cutTree());

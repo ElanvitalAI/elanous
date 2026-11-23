@@ -5,9 +5,13 @@
   "checklistCells": ["RUNSHELL-RECIPE-SIGNED"],
   "implementation": [
     "src/skills/tools/run-shell-recipe-ledger.ts",
-    "src/ux-sim/sim-world/toolbatch/scenarios.ts"
+    "src/ux-sim/sim-world/toolbatch/scenarios.ts",
+    "src/ux-sim/sim-world/toolbatch/graph-proof.ts",
+    "src/ux-sim/sim-world/toolbatch/runshell-approval-child.ts",
+    "src/ux-sim/sim-world/toolbatch/runshell-pr1-preservation.ts",
+    "src/ux-sim/sim-world/toolbatch/runshell-pr2-ingress-prep.ts"
   ],
-  "tests": ["src/skills/tools/run-shell-recipe-ledger.test.ts"],
+  "tests": ["src/skills/tools/run-shell-recipe-ledger.test.ts", "src/ux-sim/sim-world/toolbatch/scenarios.test.ts"],
   "target": "Only a trusted Ed25519 key authorizes an exact recipe hash; no execution is connected",
   "inputs": ["fake JUD Ed25519 key", "missing trust", "forged signature", "changed recipe", "signed revoke"],
   "observations": ["Four invalid grant paths deny and one exact grant verifies", "No command is dispatched"],

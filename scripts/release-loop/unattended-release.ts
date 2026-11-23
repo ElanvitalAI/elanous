@@ -266,6 +266,8 @@ export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDep
   if (method.executor === 'pod' && !method.pool) throw new Error('release.loop.gatePodPool is required by release ops policy');
   return {
     ...config,
+    // Every new release run requires an explicit publish decision, including RC rehearsals.
+    opApprovalMarker: config.opApprovalMarker?.trim() || 'publish requires human approval',
     // Pin the selected route explicitly, even when the config omits the legacy default.
     graphCutover,
     ...(config.graphCutoverEvidenceId === undefined ? {} : { graphCutoverEvidenceId: config.graphCutoverEvidenceId }),
@@ -298,6 +300,8 @@ function assertReleaseResumeCompatible(savedInput: unknown, requestedInput: Rele
   const requested = requestedInput as unknown as Record<string, unknown>;
   // Older cuts omitted this pin; the resume patch below repairs only that known legacy omission.
   if (saved.gateImagePin === undefined && requested.gateImagePin === "cut-commit") saved.gateImagePin = "cut-commit";
+  // Older runs omitted the default hold; resume patches it before the graph proceeds.
+  if (saved.opApprovalMarker === undefined && requested.opApprovalMarker === 'publish requires human approval') saved.opApprovalMarker = requested.opApprovalMarker;
   // Runs started before the cutover switch had the old gate route implicitly.
   if (saved.graphCutover === undefined && requested.graphCutover === 'legacy') saved.graphCutover = 'legacy';
   const keys = [...new Set([...Object.keys(saved), ...Object.keys(requested)])].sort();
@@ -411,7 +415,7 @@ async function runUnattendedReleaseLocked(
   const macrophage = createMacrophageRuntime({ runId, root, inventory: () => safeCleanup.inventory(), liveCleanup: safeCleanup.cleanup });
   let state: GraphRunState;
   try { state = await (deps.graph ?? runGraph)(deps.graphPath ?? GRAPH, resumable
-    ? { resumeRunId: runId, fromNodeId: resumeFromNodeId, useCurrentGraph: true, input, resumeInputPatch: { ...(input.gateImagePin ? { gateImagePin: input.gateImagePin } : {}) },
+    ? { resumeRunId: runId, fromNodeId: resumeFromNodeId, useCurrentGraph: true, input, resumeInputPatch: { ...(input.gateImagePin ? { gateImagePin: input.gateImagePin } : {}), opApprovalMarker: input.opApprovalMarker },
       pinChildUniverse: true, eventBus: macrophage.eventBus, deps: { root, dispatchGraphSubscription: createIncidentPolicyHandler() } }
     : { runId, input, pinChildUniverse: true, eventBus: macrophage.eventBus, deps: { root, dispatchGraphSubscription: createIncidentPolicyHandler() } }); }
   finally { macrophage.dispose(); }

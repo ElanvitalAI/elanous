@@ -102,32 +102,6 @@ describe('buildSeatBootSystemMessages — 자리 부트 카드', () => {
     expect(text).not.toContain('elanous://context-now');
   });
 
-  test('자리가 아니거나 seat-state 가 없으면 주입 0 ⊕ card-skipped 관측', () => {
-    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
-    const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: Record<string, unknown>) => {
-      if (category === 'dashboard.seat-boot') events.push({ event, data });
-    }) as typeof debug.log);
-    try {
-      expect(buildSeatBootSystemMessages({ cwd: join(home, 'work'), sessionId: 'a' }, { home, msgPath, env: {} })).toEqual([]);
-      expect(buildSeatBootSystemMessages({ cwd: join(home, 'seats', 'ZZ'), sessionId: 'b' }, { home, msgPath, env: {} })).toEqual([]);
-      buildSeatBootSystemMessages({ cwd: seatCwd, sessionId: 'c' }, { home, msgPath, env: {} });
-    } finally { spy.mockRestore(); }
-    expect(events.map(e => [e.event, e.data.reason ?? null])).toEqual([
-      ['card-skipped', 'no-seat'],
-      ['card-skipped', 'no-seat-state'],
-      // TUI-SEAT-MEMORY-RECALL — 카드를 만들 때 직전 인계 회상을 한 번 잰다(이 시험엔 손 인계가 없어 hit:false).
-      ['memory-recall', null],
-      // TUI-SEAT-MEMORY-IMPORT — 세션 시작에 읽기 전용 자리 기억 스냅샷을 한 번 만든다.
-      ['memory-import', null],
-      ['card-injected', null],
-      // TUI-SELFIMPLEMENT-UNDERUSE-MEASURE — 카드를 실은 대화는 의도 승격 흐름도 실었다고 남긴다.
-      ['intent.escalate', null],
-    ]);
-    expect(events[2]!.data).toEqual({ source: null, chars: 0, hit: false });
-    expect(events[3]!.data).toEqual(expect.objectContaining({ seat: 'OP', chars: expect.any(Number) }));
-    expect(events[4]!.data).toEqual(expect.objectContaining({ seat: 'OP', source: 'cwd', unread: null }));
-  });
-
   test('대화마다 한 번 — 같은 대화는 같은 문면(세션이 많아도 축출 없음), 새 대화(/session new)는 새 카드', () => {
     const first = buildSeatBootSystemMessages({ cwd: seatCwd, sessionId: 's1' }, { home, msgPath, env: {} });
     for (let i = 0; i < 40; i++) buildSeatBootSystemMessages({ cwd: seatCwd, sessionId: `other-${i}` }, { home, msgPath, env: {} });

@@ -106,7 +106,7 @@ interface ControlRow {
 
 const ROW_COLUMNS = 'request_id, pty_id, action, payload_json, actor, requester_run_id, owner_pid, status, result_json';
 
-const PTY_CONTROL_STALE_MS = 30_000;
+export const PTY_CONTROL_STALE_MS = 30_000;
 const PTY_CONTROL_PROCESSING_STALE_MS = 120_000;
 const DEFAULT_PTY_TAKEOVER_TTL_MS = 30 * 60_000;
 let database: Database | null = null;

@@ -1,10 +1,12 @@
 import { afterEach, expect, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Database } from 'bun:sqlite';
-import { writePeerEdit, type PeerEditRecord } from '../nexus/api/graph-peer-edit.js';
+	import { writePeerEdit, type PeerEditRecord } from '../nexus/api/graph-peer-edit.js';
 import { graphTick } from './graph-tick.js';
+import { runScheduledGraphTick } from './graph-cli.js';
+import { createScheduleSource } from '../workflow-runtime/triggers/schedule-source.js';
 import { decideGraphApproval, latestGraphRun, runGraph } from './runner.js';
 import { claimGraphTriggerDispatchLease } from '../loops/graph-trigger-dispatch-lease.js';
 import type { DecisionEntry } from '../decisions/decision-ledger.js';
@@ -507,6 +509,82 @@ test('a concurrent recovery cannot reclaim a lock held under flock', async () =>
   expect(await active).toEqual({ action: 'idle' });
   expect(existsSync(lock)).toBe(false);
   expect(await tick(graph, { deps: { root } })).toEqual({ action: 'idle' });
+});
+
+test('the same schedule occurrence starts one run and a restart does not start another', async () => {
+  const { graph, root } = fixture();
+  const calls: string[] = [];
+  const fire = {
+    startIfIdle: true,
+    triggerId: 'schedule:schedule:0',
+    dedupeKey: 'schedule:0@2026-11-17T15:00:00.000Z',
+    deps: { root, runBash: async (body: string) => { calls.push(body); return ok(); } },
+  };
+  const first = await tick(graph, fire);
+  expect(first.action).toBe('started');
+  expect(calls).toEqual(['printf a']);
+  const again = await tick(graph, fire);
+  expect(again.action).toBe('waiting');
+  expect(again.runId).toBe(first.runId);
+  expect(calls).toEqual(['printf a']);
+});
+
+test('a schedule source keys one graph start to the occurrence even when two callbacks drift inside the minute', async () => {
+  const { graph, root } = fixture();
+  writeFileSync(graph, [
+    'graph_id: tick-test',
+    'version: 1',
+    'entry_node: a',
+    'terminal_nodes: [done, failed]',
+    'triggers:',
+    '  schedule: { type: cron, cron: "0 15 * * *" }',
+    'nodes:',
+    '  - { node_id: a, kind: agent, recipe: \'cmd:a\', max_visits: 1 }',
+    '  - { node_id: done, kind: gate, max_visits: 1 }',
+    '  - { node_id: failed, kind: gate, max_visits: 1 }',
+    'edges:',
+    '  - { from: a, to: done }',
+    '',
+  ].join('\n'));
+  const calls: string[] = [];
+  const keys: string[] = [];
+  const started: string[] = [];
+  let clock = Date.parse('2026-11-17T15:00:00.250Z');
+  let callback: (() => Promise<void>) | null = null;
+  const source = createScheduleSource({
+    now: () => clock,
+    cronSchedule: (_expr, cb) => {
+      callback = () => Promise.resolve(cb());
+      return { stop: () => {} };
+    },
+  });
+  source.subscribeGraph(graph, async fire => {
+    keys.push(`${fire.nodeId}@${new Date(fire.scheduledAt).toISOString()}`);
+    try {
+      const result = await runScheduledGraphTick(graph, fire, {
+        root, runBash: async (body: string) => { calls.push(body); return ok(); },
+      }, tick);
+      started.push(JSON.stringify(result));
+    } catch (error) {
+      started.push('ERR ' + (error instanceof Error ? error.stack ?? error.message : String(error)));
+    }
+  });
+  await source.start();
+  try {
+    await callback!();
+    clock = Date.parse('2026-11-17T15:00:00.900Z');
+    await callback!();
+    expect(keys).toEqual(['schedule:0@2026-11-17T15:00:00.000Z', 'schedule:0@2026-11-17T15:00:00.000Z']);
+    const first = JSON.parse(started[0] ?? '{}') as { action?: string; runId?: string; status?: string };
+    const second = JSON.parse(started[1] ?? '{}') as { action?: string; runId?: string; status?: string };
+    expect(first).toEqual({ action: 'started', runId: expect.any(String), status: 'done' });
+    expect(second).toEqual({ action: 'idle', runId: first.runId, status: 'done' });
+    const saved = JSON.parse(readFileSync(join(root, 'graph-runs', 'tick-test', `${first.runId}.json`), 'utf8')) as {
+      status?: string; nodes?: Array<{ nodeId?: string; ok?: boolean; executed?: boolean }>;
+    };
+    expect(saved.status).toBe('done');
+    expect(saved.nodes?.filter(node => node.nodeId === 'a' && node.ok === true && node.executed === true)).toHaveLength(1);
+  } finally { await source.stop(); }
 });
 
 test('a lock left by a crashed tick (dead owner pid) is taken over; a live owner still excludes', async () => {

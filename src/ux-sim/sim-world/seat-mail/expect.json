@@ -40,6 +40,11 @@
       "expect": "green",
       "reason": "ELN-SEAT-LIVE 11-18 10:36 HAND-ELN-ELS-API · fixed by #38449 (MERGED) · regression lock",
       "greenSince": "2026-11-18"
+    },
+    "seat-mail/M8": {
+      "expect": "green",
+      "reason": "ELN-RESEARCH-TURN-SEAT-REPLY 11-23 · a seat research turn could not MsgPost its reply (research allowlist) · fixed by this PR · regression lock",
+      "greenSince": "2026-11-23"
     }
   }
 }

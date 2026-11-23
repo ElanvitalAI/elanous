@@ -1,5 +1,5 @@
 # SIM-WORLD graph pack — SCHEDULE-GRAPH-S1 (Slice A · MVP-B): 장치 ①⑤⑦ 시나리오 SC1~SC5 · SP1~SP5 · SB1~SB5.
-# 정본: seat-state/MVP-B/SCHEDULE-GRAPH-S1-PLAN-1120.md §2~§4 · 기대표: src/ux-sim/worlds/sim-world-expect.json graph/* ·
+# 정본: seat-state/MVP-B/SCHEDULE-GRAPH-S1-PLAN-1120.md §2~§4 · 기대표: src/ux-sim/worlds/expect/graph.json graph/* ·
 # 장치·시나리오: src/ux-sim/sim-world/graph/schedule-devices.ts (커널 없는 시험: schedule-devices.test.ts).
 schema: 1
 world: graph

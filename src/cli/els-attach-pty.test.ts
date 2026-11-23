@@ -147,7 +147,7 @@ test('real terminal: inside the els app on pane A, `els attach <B>` shows B and 
       { label: 'typed-into-B', text: 'echo B_NEST_$((20+22))_OK', until: (screen) => line(screen, 'B_NEST_42_OK') && !line(screen, '│A_SCREEN_42_MARK'), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «attach» — 150 frame polls
       { label: 'detach-through-app', keys: '\u0002\u0002q', until: (screen) => line(screen, '│A_SCREEN_42_MARK') && !screen.includes('ctrl+b q 분리') && !line(screen, 'B_NEST_42_OK'), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «attach» — 150 frame polls
       { label: 'app-still-answers', text: 'echo AFTER_$((8*8))_OK', until: (screen) => line(screen, '│AFTER_64_OK') && line(screen, '│A_SCREEN_42_MARK'), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
-      { label: 'app-second-pane', keys: '\u0002c\r', until: (screen) => ((screen.split('\n')[0] ?? '').split('⌨').length - 1) === 3, timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
+      { label: 'app-second-pane', keys: '\u0002c\r', until: (screen) => (((screen.split('\n')[0] ?? '').split('│').slice(1).join('│').match(/ SH /g) ?? []).length) === 3, timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
     ],
     quitKeys: '\u0002q',
   });

@@ -191,7 +191,7 @@ export interface SimWorldSummary {
   readonly worlds: readonly SimWorldPackId[];
   readonly mainSha: string | null;
   /** The base expectation table this run was judged against (--expect-base), so --replay judges against the same one. */
-  readonly expectBase: { readonly path: string; readonly sha256: string } | null;
+  readonly expectBase: { readonly path: string; readonly sha256: string; /** OP #127293: 'table-sha256/1' = resolved-table hash; absent = legacy raw-file hash. */ readonly hashKind?: 'table-sha256/1' } | null;
   readonly counts: Readonly<Record<SimWorldVerdict, number>>;
   readonly scenarios: readonly (SimWorldVerdictRecord & { readonly dir: string; readonly wallMs: number })[];
   /** Wall time per world in ms (quality bar 5: budget 180000 ms per world on minim5; over budget = warning event). */

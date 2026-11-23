@@ -8,7 +8,7 @@
  *
  * Failures back off per path (D10): a failed turn parks its mail until the path's back-off time; after
  * {@link MAIL_CIRCUIT_AFTER} failed turns in a row the path's circuit opens and new mail waits too (no turn every 15s
- * against a dead provider). A cancelled or stopped turn is not a failure (contract v1.1): its mail is due again at once.
+ * against a dead provider). A cancelled or stopped turn is not a failure (contract v1.1): its mail is due again at once (it still spends one attempt: at most one re-injection).
  * A ledger read error (database is locked) is retried soon with its own short back-off, not after a whole poll period.
  *
  * Pure module: no ledger, no queue, no timers. The watcher and the plan share it.
@@ -136,7 +136,9 @@ export function createSeatMailAdapter(deps: SeatMailAdapterDeps = {}): SeatMailA
       }
       for (const id of mine) {
         const held = owned.get(id)!;
-        if (outcome === 'failed') held.attempts += 1;
+        // SEAT-MAIL-COALESCE-NOTICE — every unanswered turn spends an attempt (failed · cancelled · stopped): a mail is
+        // re-injected at most once (11-23 live: #135347 re-injected 7 turns in a row). Cancel/stop still skip the back-off.
+        held.attempts += 1;
         if (held.attempts >= MAIL_TURN_ATTEMPTS) {
           owned.delete(id);
           done.add(id); // given up for this process: no path offers it again; the ledger keeps it unseen

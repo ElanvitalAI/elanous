@@ -3,7 +3,7 @@
 //   • the folded space list (left): a «spaces» head, one line per workspace — the most urgent status dot inside it and the
 //     UPPERCASE name (the selected one reverse video, its path on the line under it) — and «new · menu» last; no pane
 //     lines, no category headings, no pane count;
-//   • the tab row (top of the centre): the selected workspace's panes as «emoji title mark» tabs, ‹ › when they do not
+//   • the tab row (top of the centre): the selected workspace's panes as «title [glyph]» tabs, ‹ › when they do not
 //     fit, no row at all when the workspace has no panes.
 // Input = the `els ls` rows (attach-view parsePaneRows) plus each pane's command, for the emoji. Plain text: colour and
 // reverse video are the composer's (attach-view). Nothing here imports eln.
@@ -17,9 +17,15 @@ export interface SpaceTabRow extends PaneRow {
   readonly agent?: string;
   /** ELS-TAB-STATE-BADGE: the server's stall verdict for the pane (a working pane with no event for the window). */
   readonly stalled?: boolean;
+  /** ELS-POD-TAB: the pane's physical place from the ls answer ({ host, runtime }); a pod runtime draws the tab badge. */
+  readonly place?: { readonly host?: string; readonly runtime: 'process' | 'pod' };
+  /** ELS-AGENTS-HIDE-SHELL: the server says the pane runs a bare shell now (kind «shell», or a shell command with no agent in front). */
+  readonly bareShell?: boolean;
 }
 
 const STALL_MARK = '⏸';
+/** ELS-POD-TAB: the explicit place.runtime=pod badge. The 📦 emoji stays WHAT the pane runs (kubectl); «[pod]» marks WHERE — a pod place under the host. */
+const POD_BADGE = '[pod]';
 
 /** `els ls` rows with each pane's command (for its emoji); same order and the same skips as parsePaneRows. */
 export function withCommands(rows: readonly PaneRow[], listJson: string): SpaceTabRow[] {
@@ -28,21 +34,30 @@ export function withCommands(rows: readonly PaneRow[], listJson: string): SpaceT
   const commands = new Map<string, readonly string[]>();
   const agents = new Map<string, string>();
   const stalled = new Set<string>();
+  const places = new Map<string, { host?: string; runtime: 'process' | 'pod' }>();
+  const bareShells = new Set<string>();
   if (Array.isArray(panes)) {
     for (const raw of panes) {
-      const row = raw as { pane?: unknown; command?: unknown; kind?: unknown; fgCommand?: unknown; stalled?: unknown };
+      const row = raw as { pane?: unknown; command?: unknown; kind?: unknown; fgCommand?: unknown; stalled?: unknown; place?: unknown };
       if (!raw || typeof row.pane !== 'string') continue;
       if (row.stalled === true) stalled.add(row.pane);
+      // ELS-POD-TAB: the server's place rides the same lane as command/stalled — validated, then passed through.
+      const place = row.place as { host?: unknown; runtime?: unknown } | undefined;
+      const runtime = place?.runtime === 'pod' ? 'pod' as const : place?.runtime === 'process' ? 'process' as const : undefined;
+      if (place && runtime) places.set(row.pane, { ...(typeof place.host === 'string' ? { host: place.host } : {}), runtime });
       if (Array.isArray(row.command)) commands.set(row.pane, row.command.map(String));
       // ELS-PANE-AGENT-DETECT: an agent in the foreground now decides the emoji and the name; a shell (again) or any
       // other program keeps the pane's own.
       if (typeof row.kind === 'string' && AGENT_KINDS.has(row.kind) && Array.isArray(row.fgCommand)) {
         commands.set(row.pane, row.fgCommand.map(String));
         agents.set(row.pane, row.kind);
+      } else if (row.kind === 'shell' || (row.kind === undefined && Array.isArray(row.command) && isShellCommand(row.command.map(String)))) {
+        // ELS-AGENTS-HIDE-SHELL: an agent that exited leaves its tab at a plain prompt — kept in the tab bar, not an agent.
+        bareShells.add(row.pane);
       }
     }
   }
-  return rows.map((row) => ({ ...row, ...(commands.has(row.pane) ? { command: commands.get(row.pane)! } : {}), ...(agents.has(row.pane) ? { agent: agents.get(row.pane)! } : {}), ...(stalled.has(row.pane) ? { stalled: true } : {}) }));
+  return rows.map((row) => ({ ...row, ...(bareShells.has(row.pane) ? { bareShell: true } : {}), ...(commands.has(row.pane) ? { command: commands.get(row.pane)! } : {}), ...(agents.has(row.pane) ? { agent: agents.get(row.pane)! } : {}), ...(stalled.has(row.pane) ? { stalled: true } : {}), ...(places.has(row.pane) ? { place: places.get(row.pane)! } : {}) }));
 }
 
 const AGENT_KINDS = new Set(['eln', 'codex', 'claude', 'grok']);
@@ -54,6 +69,33 @@ const CHATS = new Set(['eln', 'elanous', 'elanous.mjs']);
 // chat names are matched against that executable only, never against arguments (ssh claude, kubectl exec <pod>…).
 const WRAPPERS = new Set(['bun', 'bunx', 'node', 'npm', 'npx', 'pnpm', 'yarn', 'deno']);
 const baseName = (part: string) => part.split('/').pop() ?? part;
+const isShellCommand = (command: readonly string[]): boolean => {
+  let at = 0;
+  while (at + 1 < command.length && WRAPPERS.has(baseName(command[at]!))) at++;
+  return command.length > 0 && SHELLS.has(baseName(command[at]!).replace(/^-/, ''));
+};
+/** ELS-AGENTS-HIDE-SHELL: a local pane with no agent that runs a bare shell or has exited — never an agents row of its own. */
+const isBareShell = (row: SpaceTabRow): boolean => !row.agent && !row.remote && (row.bareShell === true || row.state === 'exited');
+const EXITED_MARK = '⏹';
+
+/**
+ * ELS-AGENTS-HIDE-SHELL (OP 11-23 screenshot: «OP · eln» and «OP ✅ · shell» both under agents): the agents panel lists
+ * agent panes only. A bare-shell pane is dropped; when its seat has no other pane left in the list, the seat gets one
+ * «⏹ SEAT exited» row instead (one per seat, however many dead tabs it has). A shell pane without a seat shows nothing.
+ */
+export function agentPanelRows<T extends { readonly row: SpaceTabRow }>(entries: readonly T[], all: readonly SpaceTabRow[]): { readonly entry: T; readonly exited: boolean }[] {
+  const liveSeats = new Set(all.filter((row) => row.seat && !isBareShell(row)).map((row) => `${row.remote ?? ''}|${row.seat}`));
+  const exitedShown = new Set<string>();
+  const out: { entry: T; exited: boolean }[] = [];
+  for (const entry of entries) {
+    if (!isBareShell(entry.row)) { out.push({ entry, exited: false }); continue; }
+    const seat = entry.row.seat;
+    if (!seat || liveSeats.has(`|${seat}`) || exitedShown.has(seat)) continue;
+    exitedShown.add(seat);
+    out.push({ entry, exited: true });
+  }
+  return out;
+}
 
 /** The tab emoji, from what the pane runs: no command = a harness child, a shell, an agent CLI, or eln's chat. */
 export function paneEmoji(row: SpaceTabRow): string {
@@ -71,7 +113,7 @@ export function paneEmoji(row: SpaceTabRow): string {
   return '⌨️';
 }
 
-const URGENCY: readonly StatusWord[] = ['failed', 'blocked', 'working', 'idle', 'done'];
+const URGENCY: readonly StatusWord[] = ['failed', 'blocked', 'working', 'unknown', 'idle', 'done'];
 /**
  * The stalled badge (ELS-TAB-STATE-BADGE), kept apart from markOf so it composes with the other precedence edits to it. Most urgent
  * state wins (WORKER-MIGRATION-PHASE1-1119): an unreachable space (every pane stale), then failed and blocked (approval wait) outrank
@@ -141,21 +183,26 @@ const homePath = (cwd: string, home: string | undefined): string => home && (cwd
  * workspace «● NAME» (the name UPPERCASE for display only, one status dot = the most urgent state inside it), the selected
  * space's path on one dim line under it (home as «~», cut by cells), «new · menu» pinned to the last line. No pane count.
  */
-export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: string | undefined, width: number, height: number, home?: string, ceoPendingRed = 0, emptyCoordinators: readonly { wsId: string; name: string; remote?: string; stale?: boolean }[] = [], selectedEmpty?: string): SpaceListLayout {
+export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: string | undefined, width: number, height: number, home?: string, ceoPendingRed = 0, emptyCoordinators: readonly { wsId: string; name: string; remote?: string; stale?: boolean }[] = [], selectedEmpty?: string, agentsOrder: 'grouped' | 'status' = 'grouped', actingSeat?: string): SpaceListLayout {
   const chosen = selectedEmpty ?? selectedSpace(rows, selectedPane);
-  type Item = { readonly text: string; readonly ws?: string; readonly pane?: string; readonly mode?: 'focus' | 'dim' };
-  const nameOf = (space: Space): string => `${markOf(space.panes)} ${space.panes.some((row) => row.role === 'coordinator') ? '🎼 ' : ''}${space.name.toLocaleUpperCase()}`;
+  type Item = { readonly text: string; readonly ws?: string; readonly pane?: string; readonly mode?: 'focus' | 'dim'; readonly bold?: boolean };
+  // 출처: OP #134199/#134203 — 스페이스 줄에는 동작 상태를 표시하지 않는다(조율자 ⭐ 표식과 원격 사망 ✕만).
+  const isActing = (row: SpaceTabRow): boolean => !!actingSeat && !row.remote && row.seat === actingSeat;
+  const nameOf = (space: Space): string => `${space.panes.some(isActing) ? '[OP 대행] ' : ''}${space.panes.some((row) => row.stale) ? `${UNREACHABLE_MARK} ` : ''}${space.panes.some((row) => row.role === 'coordinator') ? '⭐ ' : ''}${space.name.toLocaleUpperCase()}${actingSeat && space.panes.some(row => !row.remote && row.seat === 'OP') ? ` → ${actingSeat} acting` : ''}`;
   const items: Item[] = [];
   const pendingEmpty = emptyCoordinators.filter((space) => !rows.some((row) => row.wsId === space.wsId));
   const addEmpty = (space: typeof pendingEmpty[number]): void => {
-    items.push({ text: headCells(` ${space.stale ? UNREACHABLE_MARK : STATUS.done.mark} 🎼 ${space.name.toLocaleUpperCase()}`, width), ws: space.wsId, ...(chosen === space.wsId ? { mode: 'focus' as const } : {}) });
+    const baton = actingSeat && !space.remote && space.name.toLocaleUpperCase() === 'OP' ? ` → ${actingSeat} acting` : '';
+    items.push({ text: headCells(` ${space.stale ? `${UNREACHABLE_MARK} ` : ''}⭐ ${space.name.toLocaleUpperCase()}${baton}`, width), ws: space.wsId, ...(chosen === space.wsId ? { mode: 'focus' as const } : {}) });
   };
   for (const space of pendingEmpty.filter((space) => !space.remote)) addEmpty(space);
   const spaceLine = (space: Space, indent: string): void => {
     const selected = space.wsId === chosen;
     items.push({ text: headCells(` ${indent}${nameOf(space)}`, width), ws: space.wsId, pane: space.panes[0]!.pane, ...(selected ? { mode: 'focus' as const } : {}) });
+    // 출처: OP #134227 — 포커스된 스페이스만 2줄(부제 «N agents · 가지»), 그 어떤 스페이스도 2줄을 넘지 않는다.
     const cwd = space.panes[0]!.cwd;
-    if (selected && cwd) items.push({ text: `   ${indent}${tailCells(homePath(cwd, space.panes[0]!.remote ? undefined : home), Math.max(1, width - 3 - indent.length))}`, mode: 'dim' });
+    const branch = cwd ? (baseName(cwd) || cwd) : space.name;
+    if (selected) items.push({ text: `   ${indent}${tailCells(`${space.panes.length} agent${space.panes.length === 1 ? '' : 's'} · ${branch}`, Math.max(1, width - 3 - indent.length))}`, mode: 'dim' });
   };
   // ELS-FIRST-RUN-FU3 ③: herdr's seat panes are one bundle under a «herdr» head, folded unless one of its spaces is selected.
   const all = spacesOf(rows);
@@ -178,6 +225,33 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
     if (herdrOpen) for (const space of herdr) spaceLine(space, '  ');
   }
   for (const space of pendingEmpty) addHostEmpty(space.remote);
+  // 출처: OP #134199/#134203/#134223 — 아래 칸 «agents»: herdr 식 2단 행(1줄 = 상태 이모지 ⊕ 이름 · 2줄 = 흐린 부제
+  // «런타임 · 소속 스페이스»)·머리 단어가 정렬 모드다 — «grouped» = 스페이스별 묶음 안에서 상태순(working →
+  // blocked → stalled → idle → failed → offline), «status» = 스페이스를 평탄해 전체 상태순. width < 20 이면 1단으로 줄인다(OP #134220 «좁으면 상태 이모지 + 탭 이름만»).
+  const agentSpaces = [...visible, ...(herdrOpen ? herdr : [])];
+  const rankOf = (row: SpaceTabRow): number => row.stale ? 6    // 출처: OP #134223 — 상태순 정렬 계수(working 0 → offline 6, 미지 word 5)
+    : { working: 0, blocked: 1, stalled: 2, idle: 3, failed: 4, done: 5, unknown: 5 }[wordOfState(row.state)] ?? 5; // done = 스펙 순서 밖(완료·dim) — 미지 폴백(5)과 동급
+  const twoLine = width >= 20;
+  if (agentSpaces.length > 0) {
+    items.push({ text: '─'.repeat(width) });
+    // ELS-AGENTS-GROUPED-TOGGLE-FU (OP #134722 ②): the head word is the mode — «grouped» keeps herdr's
+    // 스페이스별 묶음, «status» flattens every space's panes into one rank order(같은 계수 — OP #134223).
+    const orderWord = agentsOrder === 'status' ? 'status' : 'grouped';
+    items.push({ text: ` agents${' '.repeat(Math.max(1, width - 7 - orderWord.length))}${orderWord}` });
+    const ordered: readonly { readonly space: Space; readonly row: SpaceTabRow }[] = agentsOrder === 'status'
+      ? agentSpaces.flatMap((space) => space.panes.map((row) => ({ space, row }))).sort((a, b) => rankOf(a.row) - rankOf(b.row))
+      : agentSpaces.flatMap((space) => [...space.panes].sort((a, b) => rankOf(a) - rankOf(b)).map((row) => ({ space, row })));
+    for (const { entry: { space, row }, exited } of agentPanelRows(ordered, rows)) {
+      if (exited) {
+        items.push({ text: headCells(` ${EXITED_MARK} ${row.seat} exited`, width), pane: row.pane, ws: space.wsId, ...(row.pane === selectedPane ? { mode: 'focus' as const } : {}) });
+        if (twoLine) items.push({ text: `       shell · ${space.name}`, mode: 'dim' });
+        continue;
+      }
+      const mark = row.stale ? UNREACHABLE_MARK : STATUS[wordOfState(row.state)].mark;
+      items.push({ text: headCells(` ${mark} ${isActing(row) ? '[OP 대행] ' : ''}${row.remote ? `⇄${row.remote} ` : ''}${labelName(row)}`, width), pane: row.pane, ws: space.wsId, ...(row.spaceCoordinator ? { bold: true } : {}), ...(row.pane === selectedPane ? { mode: 'focus' as const } : {}) });
+      if (twoLine) items.push({ text: `       ${row.agent ?? 'shell'} · ${space.name}`, mode: 'dim' });
+    }
+  }
   const head = height >= 3;
   const foot = height >= 2;
   const room = height - (head ? 1 : 0) - (foot ? 1 : 0);
@@ -195,7 +269,8 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
       if (item.pane !== undefined) spaces.push({ y: lines.length + 1, ws: item.ws, pane: item.pane });
       else emptySpaces.push({ y: lines.length + 1, ws: item.ws });
     }
-    const text = fitCells(item.text, width);
+    const fitted = fitCells(item.text, width);
+    const text = item.bold ? `\u001b[1m${fitted}\u001b[22m` : fitted;
     lines.push(item.mode === 'focus' ? `${FOCUS_ON}${text}${FOCUS_OFF}` : item.mode === 'dim' ? `\u001b[2m${text}\u001b[22m` : text);
   }
   while (lines.length < height - (foot ? 1 : 0)) lines.push(' '.repeat(width));
@@ -223,12 +298,14 @@ export interface TabRow {
   readonly plus?: { readonly from: number; readonly to: number };
 }
 
-// ELS-FIRST-RUN-FU3 (OP #101592 · #101606): the tab row reads like herdr's — «emoji name» per tab, two spaces between,
-// «+» (new tab) last. No command path (a path keeps its last name), no build badge, no status dot, no ▸.
+// ELS-FIRST-RUN-FU3 (OP #101592 · #101606): the tab row reads like herdr's — one name per tab, «+» (new tab) last.
+// ELS-AGENT-STATUS-UNKNOWN-AND-TAB-BAR (OP 11-23): no runtime emoji on a tab (the agents list shows the runtime); ⭐ marks the
+// space's coordinator tab; one status glyph only when the tab is not plainly working or idle; two cells of padding inside
+// each tab and two between tabs. A narrow row cuts the name, never the glyphs. No command path (a path keeps its last name), no build badge, no status dot, no ▸.
 // ELS-TAB-STYLE-HERDR (decision 11-21): herdr's look — names UPPERCASE (display only; the stored title is untouched), each tab a padded
 // block: the focused one on a blue background (SGR 44;37), every other one on a gray background (SGR 100;37). Basic 16-colour SGR.
-const TAB_SEP = ' ';
-const TAB_PAD = ' ';
+const TAB_SEP = '  ';
+const TAB_PAD = '  ';
 const NEW_TAB = '+';
 const FOCUS_ON = '\u001b[7m';
 const FOCUS_OFF = '\u001b[27m';
@@ -269,7 +346,7 @@ const DIM_OFF = '\u001b[22m';
 /**
  * ELS-TAB-NAME-LABEL-FIRST: the tab reads the seat/tab name (its title) first; the agent kind (eln · codex · claude · grok)
  * names it only when the title is empty or just a default command name (a shell, an agent or chat CLI, a runtime wrapper).
- * The kind stays visible as the 💬/🤖 emoji. 출처: #39040 put the kind over every title («JUD-B» read «ELN»).
+ * The kind stays visible in the agents list and the dropdown's emoji. 출처: #39040 put the kind over every title («JUD-B» read «ELN»).
  */
 const DEFAULT_COMMAND_NAMES = new Set([...SHELLS, ...AGENTS, ...CHATS, ...WRAPPERS, ...AGENT_KINDS]);
 const labelName = (row: SpaceTabRow): string => {
@@ -278,14 +355,33 @@ const labelName = (row: SpaceTabRow): string => {
   return name === '' || DEFAULT_COMMAND_NAMES.has(name.replace(/^-/, '').toLowerCase()) ? row.agent : name;
 };
 
-/** «emoji [⇄host ]name»: a pane of another host carries ⇄host in its tab title (the local host has no mark). */
-const remoteLabel = (row: SpaceTabRow, upper = false): string => {
+/** The dropdown list's «emoji [⇄host ]name» line: a pane of another host carries ⇄host (the local host has no mark). */
+const remoteLabel = (row: SpaceTabRow): string => {
   const name = labelName(row);
   // Keyboard emoji presentation has terminal-dependent width (xterm renders ⌨️ as one cell while Bun counts two).
   // Force its text presentation and explicitly pad it to two cells, keeping drawing and hitboxes aligned.
   const icon = paneEmoji(row);
   const emoji = icon === '⌨️' ? '⌨︎ ' : icon;
-  return `${row.role === 'coordinator' ? '🎼 ' : ''}${emoji} ${row.remote ? `⇄${row.remote} ` : ''}${upper ? name.toUpperCase() : name}`;   // ELS-TAB-STYLE-HERDR: UPPERCASE name only (host and emoji as they are)
+  return `${row.spaceCoordinator ? '⭐ ' : ''}${emoji} ${row.remote ? `⇄${row.remote} ` : ''}${name}`;
+};
+
+/** The one glyph a tab carries after its name: down host ✕, exited or failed 🔴, waiting on a person 🟡, stalled ⏸; none otherwise. */
+const tabStatusGlyph = (row: SpaceTabRow): string =>
+  row.stale ? UNREACHABLE_MARK : row.state === 'exited' || row.state === 'failed' ? STATUS.failed.mark
+    : row.state === 'blocked' ? STATUS.blocked.mark : row.stalled ? STATUS.stalled.mark : '';
+
+/** A tab in three parts, so a narrow row can cut the name and keep the ⭐ and the status glyph. */
+const tabParts = (row: SpaceTabRow): { head: string; name: string; tail: string } => {
+  const glyph = tabStatusGlyph(row);
+  // ELS-POD-TAB: «[pod]» badges the tab row right after the name (the 📦 emoji stays in the dropdown — WHAT the pane
+  // runs; «[pod]» is WHERE, a pod place under the host), inside the name part so a narrow row cuts it as the name gives way.
+  return { head: `${TAB_PAD}${row.spaceCoordinator ? '⭐ ' : ''}`, name: `${row.remote ? `⇄${row.remote} ` : ''}${labelName(row).toUpperCase()}${row.place?.runtime === 'pod' ? ` ${POD_BADGE}` : ''}`, tail: `${glyph ? ` ${glyph}` : ''}${TAB_PAD}` };
+};
+
+/** A tab drawn into `room` cells: the name gives way first; ⭐, the status glyph and the padding stay while they fit at all. */
+const fitTab = ({ head, name, tail }: { head: string; name: string; tail: string }, room: number): string => {
+  const nameRoom = room - Bun.stringWidth(head) - Bun.stringWidth(tail);
+  return nameRoom >= 0 ? head + clipCells(name, nameRoom) + tail : fitCells(head + name + tail, room);
 };
 
 /** The selected workspace's panes as tabs; the focused one in reverse video. Overflow keeps the focused tab and shows ‹ / ›. */
@@ -294,7 +390,7 @@ export function buildTabRow(rows: readonly SpaceTabRow[], selectedPane: string |
   const panes = rows.filter((row) => row.wsId === chosen);
   if (panes.length === 0 || width < 3) return { tabs: [] };
   // ELS-REMOTE-MARKER: a tab of a host that is down keeps its «✕» (unreachable is not a status dot).
-  const labels = panes.map((row) => ({ pane: row.pane, text: `${TAB_PAD}${remoteLabel(row, true)}${row.stale ? ` ${UNREACHABLE_MARK}` : row.stalled ? ` ${STALL_MARK}` : ''}${TAB_PAD}` }));
+  const labels = panes.map((row) => { const parts = tabParts(row); return { pane: row.pane, parts, text: parts.head + parts.name + parts.tail }; });
   const cells = (text: string) => Bun.stringWidth(text);
   const chosenAt = Math.max(0, labels.findIndex((label) => label.pane === selectedPane));
   const total = labels.reduce((sum, label) => sum + cells(label.text) + cells(TAB_SEP), 0) + cells(NEW_TAB);
@@ -320,8 +416,9 @@ export function buildTabRow(rows: readonly SpaceTabRow[], selectedPane: string |
   if (tabs.length === 0 && chosenAt < labels.length) {
     const room = width - cells(line);
     if (room > 0) {
-      tabs.push({ from: cells(line), to: cells(line) + Math.min(cells(labels[chosenAt]!.text), room), pane: labels[chosenAt]!.pane });
-      line += fitCells(labels[chosenAt]!.text, room);
+      const text = fitTab(labels[chosenAt]!.parts, room);
+      tabs.push({ from: cells(line), to: cells(line) + Math.min(cells(text), room), pane: labels[chosenAt]!.pane });
+      line += fitCells(text, room);
     }
   } else if (last < labels.length - 1) line += '›';
   else { plus = { from: cells(line), to: cells(line) + cells(NEW_TAB) }; line += NEW_TAB; }
@@ -350,7 +447,7 @@ function dropdownLines(rows: readonly SpaceTabRow[], empty: readonly EmptyDropdo
   const pending = empty.filter((space) => !rows.some((row) => row.wsId === space.wsId));
   const hosts = new Set<string>();
   const addEmpty = (space: EmptyDropdownSpace): void => {
-    lines.push({ text: `  🎼 ${space.name}${space.stale ? ` ${UNREACHABLE_MARK}` : ''}`, target: { ws: space.wsId } });
+    lines.push({ text: `  ⭐ ${space.name}${space.stale ? ` ${UNREACHABLE_MARK}` : ''}`, target: { ws: space.wsId } });
   };
   for (const space of pending.filter((space) => !space.remote)) addEmpty(space);
   const addHost = (host: string | undefined): void => {
@@ -360,7 +457,7 @@ function dropdownLines(rows: readonly SpaceTabRow[], empty: readonly EmptyDropdo
   };
   for (const space of spacesOf(rows)) {
     addHost(space.panes[0]?.remote);
-    lines.push({ text: `${DIM_ON} ${space.panes.some((row) => row.role === 'coordinator') ? '🎼 ' : ''}${space.name}${DIM_OFF}` });
+    lines.push({ text: `${DIM_ON} ${space.panes.some((row) => row.role === 'coordinator') ? '⭐ ' : ''}${space.name}${DIM_OFF}` });
     for (const row of space.panes) lines.push({ text: `  ${remoteLabel(row)} ${markOf([row])}`, target: { pane: row.pane } });
   }
   for (const space of pending) addHost(space.remote);
@@ -385,7 +482,8 @@ export function buildTabDropdown(rows: readonly SpaceTabRow[], selectedPane: str
   const at = Math.max(0, lines.findIndex((line) => sameTarget(line.target, target)));
   const start = lines.length <= maxLines ? 0 : Math.max(0, Math.min(at - Math.floor(maxLines / 2), lines.length - maxLines));
   const shown = lines.slice(start, start + maxLines);
-  const upper = currentEmpty ? ` 🎼 ${currentEmpty.name} ` : now ? ` ${remoteLabel(now, true)} ` : '';
+  // The narrow header is the tab row in one tab: the same rule (cut the name, keep ⭐ · glyph · padding), with room left for « ▾».
+  const upper = currentEmpty ? ` ⭐ ${currentEmpty.name} ` : now ? fitTab(tabParts(now), Math.max(0, width - 2)) : '';
   return {
     line: upper ? markCells(fitCells(`${upper} ▾`, width), [{ at: 0, text: TAB_ACTIVE_ON }, { at: Bun.stringWidth(clipCells(upper, width)), text: TAB_OFF }]) : fitCells('▾', width),
     list: shown.map((line) => sameTarget(line.target, target) ? `${FOCUS_ON}${fitCells(line.text, width)}${FOCUS_OFF}` : fitCells(line.text, width)),

@@ -73,7 +73,7 @@ test('④ (OP #101592 · #101606) focus marker: the tab row is padded UPPERCASE 
     { address: 'op/t1/p2', workspace: 'op', pane: 'p2', title: '/bin/zsh', state: 'idle', command: ['/bin/zsh'] },
   ] });
   const rows = withCommands(parsePaneRows(LS), LS);
-  expect(buildTabRow(rows, 'p1', 20).line).toBe('\u001b[44;37m 💬 OP \u001b[49;39m \u001b[100;37m ⌨︎  ZSH \u001b[49;39m +  ');
-  expect(buildTabRow(rows, 'p2', 20).line).toBe('\u001b[100;37m 💬 OP \u001b[49;39m \u001b[44;37m ⌨︎  ZSH \u001b[49;39m +  ');
+  expect(buildTabRow(rows, 'p1', 20).line).toBe('\u001b[44;37m  OP  \u001b[49;39m  \u001b[100;37m  ZSH  \u001b[49;39m  +  ');
+  expect(buildTabRow(rows, 'p2', 20).line).toBe('\u001b[100;37m  OP  \u001b[49;39m  \u001b[44;37m  ZSH  \u001b[49;39m  +  ');
   expect(buildSpaceList(rows, 'p2', 12, 3)[1]).toBe('\u001b[7m ● OP       \u001b[27m');
 });

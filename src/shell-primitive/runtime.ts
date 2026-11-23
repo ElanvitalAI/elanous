@@ -21,13 +21,13 @@ import { createHash } from 'node:crypto';
 import { delimiter, resolve } from 'node:path';
 import { requestRunShellApproval, RUNSHELL_PUBLIC_KEY_ENV } from '../tui-client/next-runshell-approval.js';
 import type { SignedRunShellApproval } from './runshell-approval.js';
-import { isLocalRead, spawnGateway } from './spawn-gateway.js';
+import { isLocalRead, isRelaxedNonDestructive, runShellGrantRouteAvailable, spawnGateway } from './spawn-gateway.js';
 import {
   commandKey,
   getCachedDecision,
   rememberDecision,
 } from './approval-cache.js';
-import { recordAudit } from './audit-log.js';
+import { recordAudit, recordRelaxedAudit } from './audit-log.js';
 import { terminateTree } from './terminate-tree.js';
 import { applySandbox, SandboxUnavailableError } from './sandbox.js';
 import { getSessionCwd } from '../session/working-dir.js';
@@ -78,7 +78,11 @@ export async function gateShellCommand(req: ShellRequest, priorHumanApproval = f
     return withGuardian(result);
   };
   if (priorHumanApproval) return req.signal?.aborted ? audit(aborted(key)) : null;
-  if (policy !== 'none') {
+  // CEO 11-23 15:3x 완화(ELS-ELN-SECURITY-RELAX): with no approver to ask (e.g. a seat TUI with no prompt route), a
+  // non-destructive command runs instead of failing closed; destructive ones (guardian) still need a real approver.
+  if (policy !== 'none' && !guardian && !approverRef) {
+    recordAudit({ type: 'approval', ts: new Date().toISOString(), approvalKey: key, decision: 'allow-once', source: 'no-approver-non-destructive', command: req.command, cwd });
+  } else if (policy !== 'none') {
     const decision = await resolveApproval(policy, key, req, cwd);
     if (req.signal?.aborted) return audit(aborted(key));
     if (decision === 'deny-once' || decision === 'deny-session') return audit(denied(key));
@@ -195,17 +199,25 @@ export async function runShell(req: ShellRequest, priorHumanApproval = false): P
   }
 
   const localRead = isLocalRead(sandboxedCommand[0]!, sandboxedCommand.slice(1), cwd);
+  // CEO 11-23 ELS-ELN-SECURITY-RELAX — with or without a seat identity, an argv outside the hold classes
+  // (destructive · secret · exposure, see relax-hold.ts) runs without the signed y/n card; an explicit
+  // approval 'always' still asks when there is a grant route to ask on. A seat would otherwise have needed
+  // the grant, so that skip is audited.
+  const grantRoute = runShellGrantRouteAvailable();
+  const relaxed = !localRead && (req.approval !== 'always' || !grantRoute)
+    && isRelaxedNonDestructive(sandboxedCommand[0]!, sandboxedCommand.slice(1), cwd);
+  if (relaxed && grantRoute) recordRelaxedAudit(req.command, cwd, key);
   // Local reads retain the ordinary approval policy (including explicit
   // 'always'); non-local executions still require the signed spawn grant.
-  if (localRead) {
-    const gateResult = await gateShellCommand(req, priorHumanApproval);
+  if (localRead || relaxed) {
+    const gateResult = await gateShellCommand(relaxed && grantRoute ? { ...req, approval: 'none' } : req, priorHumanApproval);
     if (gateResult) return gateResult;
   }
   let approval: SignedRunShellApproval | null = null;
   const publicKeyPem = trustedRunShellPublicKey;
   const callerSeat = process.env.ELANOUS_TRACK;
   const sessionId = req.runShellSessionId;
-  if (!localRead) {
+  if (!localRead && !relaxed) {
     if (!publicKeyPem || !callerSeat || !sessionId) return withG(denied(key));
     try {
       const bytesSha256 = createHash('sha256').update(readFileSync(originalExecutable)).digest('hex');

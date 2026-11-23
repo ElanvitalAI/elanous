@@ -31,7 +31,7 @@ export type AuditEvent =
       ts: string;               // ISO-8601 UTC
       approvalKey: string;
       decision: string;         // ApprovalDecision union — stringified for NDJSON stability
-      source: 'cache' | 'approver' | 'fail-closed';
+      source: 'cache' | 'approver' | 'fail-closed' | 'no-approver-non-destructive' | 'relaxed-non-destructive';
       command: string[];
       cwd: string;
     }
@@ -102,3 +102,9 @@ export function recordAudit(ev: AuditEvent): void {
 }
 
 export { defaultRoot as _auditRootForTesting, todayFile as _auditFileForTesting };
+
+/** CEO 11-23 ELS-ELN-SECURITY-RELAX — the audit row for a seat argv that ran without the signed grant. */
+export function recordRelaxedAudit(command: readonly string[], cwd: string, approvalKey: string): void {
+  recordAudit({ type: 'approval', ts: new Date().toISOString(), approvalKey, decision: 'allow-once',
+    source: 'relaxed-non-destructive', command: [...command], cwd });
+}

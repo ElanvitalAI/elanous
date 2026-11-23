@@ -18,6 +18,28 @@ import { KNOWN_ISSUE_ROUTE } from './release-known-issue-waiver.js';
 import { resolveGraphCliVerifiedOwner } from './graph-cli-owner.js';
 import { ApprovalPresentationUnavailableError, withCliAppBuildApprovalProvider } from './app-build/cli-publish-approval-provider.js';
 import { genericResumeApprovalRefusal, savedAppBuildApprovalResumeInput, savedAppBuildApprovalStartInput } from './app-build/cli-publish-approval-resume.js';
+import { graphTick, type GraphTickOptions, type GraphTickResult } from './graph-tick.js';
+
+/** One scheduled occurrence starts one graph. The key is the scheduler node plus the occurrence boundary. */
+export function scheduledGraphTickOptions(fire: { nodeId: string; scheduledAt: number }, deps: GraphTickOptions['deps']): GraphTickOptions {
+  const scheduledAt = new Date(fire.scheduledAt).toISOString();
+  return {
+    startIfIdle: true,
+    triggerId: `schedule:${fire.nodeId}`,
+    dedupeKey: `${fire.nodeId}@${scheduledAt}`,
+    input: { schedule: { nodeId: fire.nodeId, scheduledAt } },
+    deps,
+  };
+}
+
+export async function runScheduledGraphTick(
+  graphFile: string,
+  fire: { nodeId: string; scheduledAt: number },
+  deps: GraphTickOptions['deps'],
+  tick: (path: string, options: GraphTickOptions) => Promise<GraphTickResult> = graphTick,
+): Promise<GraphTickResult> {
+  return tick(graphFile, scheduledGraphTickOptions(fire, deps));
+}
 
 
 
@@ -419,7 +441,7 @@ export function registerGraphCommands(program: Command, runsDeps: {
           const cutEventSubscribed = graphDocument.graph_id === 'release-loop'
             && graphDocument.loop?.trigger?.events?.includes('release.cut.due') === true;
           // The CLI tick callback is the graph counterpart of the workflow scheduler's onEmit.
-          const onScheduledTick = async () => {
+          const onScheduledTick = async (fire: { nodeId: string; scheduledAt: number }) => {
             try {
               const { notifyGraphEvents } = await import('./graph-notify.js');
               if (cutEventSubscribed) {
@@ -440,7 +462,7 @@ export function registerGraphCommands(program: Command, runsDeps: {
                 else if (resumed.status === 'failed') console.error(`graph tick: ${resumed.runId}: failed`);
                 return;
               }
-              const result = await graphTick(graphFile, { startIfIdle: true, deps: { notify: async () => { await notifyGraphEvents(); } } });
+              const result = await runScheduledGraphTick(graphFile, fire, { notify: async () => { await notifyGraphEvents(); } });
               if (result.status === 'refused') console.error(`graph tick: refused: ${result.reason}`);
               else if (result.status === 'failed') console.error(`graph tick: ${result.runId}: failed`);
             } catch (error) {

@@ -31,7 +31,8 @@
 
 import { requirePosixShell } from '../platform/default-shell.js';
 import { shellChildEnv } from './child-env.js';
-import { terminateTree } from '../shell-primitive/terminate-tree.js';
+import { debug } from '../debug/log.js';
+import { terminateTree, TERMINATE_TREE_GRACE_MS, TERMINATE_TREE_KILL_WAIT_MS } from '../shell-primitive/terminate-tree.js';
 import {
   type ChildProcessWithoutNullStreams,
   type SpawnOptions,
@@ -63,6 +64,8 @@ import {
 
 const DEFAULT_MAX_MEMORY_BYTES = 8 * 1024 * 1024;   // 8 MiB — claude-code default
 const CIRCULAR_LINE_LIMIT = 1000;
+// Preserve the former file-engine timeout fallback as slack after the shared tree budget.
+const TERMINATION_DEADLINE_MS = TERMINATE_TREE_GRACE_MS + TERMINATE_TREE_KILL_WAIT_MS + 3000;
 
 export interface FileEngineOpts {
   now?: () => number;
@@ -113,6 +116,7 @@ function startRun(req: ShellRequest, ctx: RunCtx, opts: FileEngineOpts): ShellHa
   const aggregatedEntries: Array<{ bytes: string; ts: number }> = [];
 
   let settled = false;
+  let terminating = false;
   let timedOut = false;
   let interrupted = false;
   let outcome: ShellResult['outcome'] = 'exit';
@@ -123,12 +127,12 @@ function startRun(req: ShellRequest, ctx: RunCtx, opts: FileEngineOpts): ShellHa
   const unsubs: Unsubscribe[] = [];
   const child = spawnChild(req, spawnFn);
   let exitCode: number | undefined;
-  let spawnError: string | undefined;
+  let failureReason: string | undefined;
 
   // spawn-error path: caller sees a settled-without-exit handle.
   child.once('error', (err) => {
-    spawnError = String((err as Error)?.message ?? err);
-    outcome = 'spawn-error';
+    failureReason = String((err as Error)?.message ?? err);
+    if (!terminating) outcome = 'spawn-error';
     finalize({ source: 'exit' });
   });
 
@@ -164,36 +168,53 @@ function startRun(req: ShellRequest, ctx: RunCtx, opts: FileEngineOpts): ShellHa
     });
   });
 
-  // Hard timeout — SIGTERM first, escalate to SIGKILL after 2s.
-  const hardTimer = setTimeout(() => {
-    if (settled) return;
-    timedOut = true;
-    interrupted = true;
-    outcome = 'timeout';
-    void terminateTree(child, { group: true });
-    // Let 'exit' finalize. But if the child somehow refuses even
-    // SIGKILL, force-resolve here after one more second so the
-    // Promise is never orphaned.
-    setTimeout(() => {
-      if (!settled) finalize({ source: 'exit' });
-    }, 3000);
-  }, timeoutMs);
+  const hardTimer = setTimeout(() => stop('timeout', 'SIGTERM'), timeoutMs);
   unsubs.push(() => clearTimeout(hardTimer));
 
-  // AbortSignal support.
   if (req.signal) {
-    const onAbort = () => {
+    const signal = req.signal;
+    const onAbort = () => stop('aborted', 'SIGTERM');
+    if (signal.aborted) onAbort();
+    else {
+      signal.addEventListener('abort', onAbort, { once: true });
+      unsubs.push(() => signal.removeEventListener('abort', onAbort));
+    }
+  }
+
+  function stop(reason: 'timeout' | 'aborted', firstSignal: 'SIGTERM' | 'SIGKILL') {
+    if (settled || terminating) return;
+    terminating = true;
+    clearTimeout(hardTimer);
+    timedOut = reason === 'timeout';
+    interrupted = true;
+    outcome = reason;
+    const stoppedAt = now();
+
+    const finishTermination = (errors: readonly string[]) => {
       if (settled) return;
-      interrupted = true;
-      outcome = 'aborted';
-      void terminateTree(child, { group: true });
+      clearTimeout(deadline);
+      if (errors.length > 0) {
+        failureReason = `Process tree termination unconfirmed: ${errors.join('; ')}`;
+        debug.log('shell.file.termination-unconfirmed', id, {
+          pid: child.pid, group: process.platform !== 'win32', outcome, elapsedMs: now() - stoppedAt, errors,
+        });
+      }
+      terminating = false;
+      finalize({ source: 'exit' });
     };
-    if (req.signal.aborted) onAbort();
-    else req.signal.addEventListener('abort', onAbort, { once: true });
+    const deadline = setTimeout(
+      () => finishTermination(['termination deadline exceeded']), TERMINATION_DEADLINE_MS,
+    );
+    void terminateTree(child, { group: true, firstSignal }).then(
+      ({ terminated, errors }) => finishTermination(
+        terminated || errors.length > 0 ? errors : ['process tree still present'],
+      ),
+      (error: unknown) => finishTermination([String(error)]),
+    );
   }
 
   function finalize(end: { source: BoundaryEvent['source'] }) {
-    if (settled) return;
+    if (settled || terminating) return;
     settled = true;
     for (const u of unsubs) { try { u(); } catch { /* ignore */ } }
     stdout.close();
@@ -204,7 +225,6 @@ function startRun(req: ShellRequest, ctx: RunCtx, opts: FileEngineOpts): ShellHa
       } catch { /* isolate */ }
     }
     setStatus(interrupted && !timedOut ? 'killed' : 'completed');
-    try { ctx.onSettled?.(undefined as never); } catch { /* ignore */ }
     const r = buildResult(
       stdout,
       stderr,
@@ -216,7 +236,7 @@ function startRun(req: ShellRequest, ctx: RunCtx, opts: FileEngineOpts): ShellHa
         outcome,
         timedOut,
         interrupted,
-        spawnError,
+        failureReason,
         maxOutputBytes,
         bookmark,
       },
@@ -231,11 +251,7 @@ function startRun(req: ShellRequest, ctx: RunCtx, opts: FileEngineOpts): ShellHa
     get status() { return status; },
     bookmark,
     kill(signal) {
-      if (settled) return;
-      interrupted = true;
-      outcome = 'aborted';
-      // Both allowed signals (SIGTERM|SIGKILL) address the whole detached group.
-      void terminateTree(child, { group: true, firstSignal: signal === 'SIGKILL' ? 'SIGKILL' : 'SIGTERM' });
+      stop('aborted', signal === 'SIGKILL' ? 'SIGKILL' : 'SIGTERM');
     },
     background() {
       if (settled || status !== 'running') return false;
@@ -355,7 +371,7 @@ function buildResult(
     outcome: ShellResult['outcome'];
     timedOut: boolean;
     interrupted: boolean;
-    spawnError?: string;
+    failureReason?: string;
     maxOutputBytes: number;
     bookmark: BufferMark;
   },
@@ -367,7 +383,7 @@ function buildResult(
   const aggCapped = capString(agg, meta.maxOutputBytes);
   const r: ShellResult = {
     ...(meta.exitCode !== undefined ? { exitCode: meta.exitCode } : {}),
-    ...(meta.spawnError !== undefined ? { failureReason: meta.spawnError } : {}),
+    ...(meta.failureReason !== undefined ? { failureReason: meta.failureReason } : {}),
     stdout: stdout.toStream(meta.maxOutputBytes),
     stderr: stderr.toStream(meta.maxOutputBytes),
     aggregated: aggCapped,

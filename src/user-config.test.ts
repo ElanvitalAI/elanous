@@ -35,6 +35,16 @@ function writeConfig(value: unknown): void {
   writeFileSync(configPath, JSON.stringify(value));
 }
 
+test('retired autoLoop scan limit is ignored while arming survives save', () => {
+  writeConfig({ finance: { autoLoop: { enabled: true, maxPerScan: 5 } } }); // 출처: #3204 기존 상한
+  const cfg = buildUserConfig(configPath);
+  expect(cfg.finance.autoLoop).toEqual({ enabled: true });
+  saveUserConfig(cfg, configPath);
+  expect(buildUserConfig(configPath).finance.autoLoop).toEqual({ enabled: true });
+  const saved = JSON.parse(readFileSync(configPath, 'utf8'));
+  expect(saved.finance.autoLoop).toEqual({ enabled: true });
+});
+
 test('removing a roleLlm entry survives save and reload', () => {
   writeConfig({ roleLlm: {
     classify: { provider: 'openrouter', model: 'openrouter/upstage/solar-mini4' },

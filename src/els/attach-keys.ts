@@ -7,7 +7,7 @@ import type { MouseReport } from './attach-mouse.js';
 
 export type KeyAction =
   | 'detach' | 'next' | 'previous' | 'next-workspace' | 'toggle-sidebar' | 'new' | 'new-workspace'
-  | 'new-chat' | 'close' | 'close-workspace' | 'help' | 'goto' | 'scroll-up' | 'scroll-down';
+  | 'new-chat' | 'rename-tab' | 'close' | 'close-workspace' | 'help' | 'goto' | 'scroll-up' | 'scroll-down' | 'move-tab' | 'toggle-agents-order';
 
 export type KeyEvent =
   | { readonly kind: 'input'; readonly bytes: string }
@@ -22,8 +22,8 @@ const ESCAPE = '\u001b';
 // herdr words: h/j/k/l move between panes, n/p tabs, w workspaces, c/N new, x/D close, b sidebar, q detach, ? help.
 // With one pane per tab (stage 3) j/l/n step down the list and k/h/p step up.
 const AFTER_PREFIX: Readonly<Record<string, KeyAction>> = {
-  q: 'detach', j: 'next', l: 'next', n: 'next', k: 'previous', h: 'previous', p: 'previous', w: 'next-workspace',
-  b: 'toggle-sidebar', s: 'toggle-sidebar', c: 'new', a: 'new-chat', N: 'new-workspace', x: 'close', D: 'close-workspace', '?': 'help', '[': 'scroll-up', ']': 'scroll-down',
+  ',': 'rename-tab', q: 'detach', j: 'next', l: 'next', n: 'next', k: 'previous', h: 'previous', p: 'previous', w: 'next-workspace',
+  b: 'toggle-sidebar', s: 'toggle-sidebar', g: 'toggle-agents-order', c: 'new', a: 'new-chat', N: 'new-workspace', x: 'close', D: 'close-workspace', m: 'move-tab', '?': 'help', '[': 'scroll-up', ']': 'scroll-down',
 };
 
 export function createKeyRouter(): { resetPrefix: () => void; feed: (text: string, literalPrefix?: boolean | (() => boolean), dispatch?: (event: KeyEvent) => void) => KeyEvent[] } {

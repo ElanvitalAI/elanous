@@ -15,7 +15,7 @@ function diskPath(): string {
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('message identity and envelope', () => {
-  test('canonicalizes direct pane, session, and seat/pane recipients while keeping sender seat-only', () => {
+  test('canonicalizes direct pane, session, and seat/pane recipients; a pane may send too (MSG-FILTERS-RELAX)', () => {
     expect(canonicalMessageAddress('wJ:p4')).toBe('pane:wJ:p4');
     expect(canonicalMessageAddress('session:abc-123')).toBe('session:abc-123');
     expect(canonicalMessageAddress('tc/p4')).toBe('TC/p4');
@@ -24,7 +24,8 @@ describe('message identity and envelope', () => {
       const direct = store.post({ from: 'OP', to: 'wJ:p4', body: 'panel recipient' });
       expect(store.listByRecipient('pane:wJ:p4')).toEqual([direct]);
       expect(store.unreadCount('pane:wJ:p4')).toBe(1);
-      expect(() => store.post({ from: 'pane:wJ:p4', to: 'OP', body: 'invalid sender' })).toThrow('sender must be a seat');
+      expect(store.post({ from: 'pane:wJ:p4', to: 'OP', body: 'pane sender' }).from).toBe('pane:wJ:p4');
+      expect(() => store.post({ from: 'group:ops', to: 'OP', body: 'group sender' })).toThrow('sender must be a seat');
     } finally { store.close(); }
   });
 
@@ -90,19 +91,22 @@ describe('message identity and envelope', () => {
     expect(() => canonicalSeatId(12 as unknown as string)).toThrow();
   });
 
-  test('rejects invalid or extra envelope data without modifying an existing log', () => {
+  test('rejects invalid envelope data without modifying an existing log; extra data is ignored', () => {
     const store = new MsgStore(':memory:');
     try {
       for (const invalid of [null, [], {}, { from: 'S', to: 'T', body: '' },
         { from: 'S', to: 'T', body: 4 }, { from: '../S', to: 'T', body: 'hi' },
-        { from: 'S', to: 'T', body: 'hi', kind: 'BAD!' },
-        { from: 'S', to: 'T', body: 'hi', id: 9 },
         { from: 'S', to: 'T', body: 'hi', replyTo: 0 },
         { from: 'S', to: 'T', body: 'hi', replyTo: 1.5 },
         { from: 'S', to: 'T', body: 'hi', replyTo: 'one' }]) {
         expect(() => store.append(invalid as never)).toThrow();
       }
       expect(store.unreadRecipients()).toEqual([]);
+      // MSG-FILTERS-RELAX: any kind tag is stored (lowercased); an unknown field is ignored, not a refusal.
+      expect(validateMessageEnvelope({ from: 'S', to: 'T', body: 'hi', kind: 'BAD!' })).toEqual({ from: 'OP', to: 'MK', body: 'hi', kind: 'bad!' });
+      expect(validateMessageEnvelope({ from: 'S', to: 'T', body: 'hi', id: 9 } as never)).toEqual({ from: 'OP', to: 'MK', body: 'hi' });
+      expect(validateMessageEnvelope({ from: 'S', to: 'T', body: 'hi', refs: [], doneWhen: 'x'.repeat(2000) }))
+        .toEqual({ from: 'OP', to: 'MK', body: 'hi', doneWhen: 'x'.repeat(2000) });
       expect(validateMessageEnvelope({ from: 'coo', to: 'cmo', body: '  hi  ', kind: 'memo' }))
         .toEqual({ from: 'OP', to: 'MK', body: '  hi  ', kind: 'memo' });
     } finally { store.close(); }
@@ -160,7 +164,7 @@ describe('durable message log and cursor', () => {
     } finally { store.close(); }
   });
 
-  test('MSG-CHANNELS: group:all enforces two posts per sender per UTC hour and folds overflow into one summary', () => {
+  test('MSG-FILTERS-RELAX: group:all stores every broadcast (no hourly cap folding bodies into a summary)', () => {
     let now = new Date('2026-10-29T12:00:00.000Z');
     const store = new MsgStore(':memory:', { now: () => now });
     try {
@@ -169,10 +173,10 @@ describe('durable message log and cursor', () => {
       const event = store.appendWithProvenance({ from: 'OP', to: 'ALL', body: 'provenance event' }, 'coord:group-all-test:ALL');
       expect(store.appendWithProvenance({ from: 'OP', to: 'ALL', body: 'different retry text' }, 'coord:group-all-test:ALL').id)
         .toBe(event.id);
-      const summary = store.post({ from: 'OP', to: 'group:all', body: 'three' });
-      const folded = store.post({ from: 'OP', to: 'ALL', body: 'four' });
-      expect(folded.id).toBe(summary.id);
-      expect(store.list('MK').map(row => row.body)).toEqual(['one', 'two', 'provenance event', expect.stringContaining('시간당 상한')]);
+      const third = store.post({ from: 'OP', to: 'group:all', body: 'three' });
+      const fourth = store.post({ from: 'OP', to: 'ALL', body: 'four' });
+      expect(fourth.id).not.toBe(third.id);
+      expect(store.list('MK').map(row => row.body)).toEqual(['one', 'two', 'provenance event', 'three', 'four']);
       expect(store.list('OP')).toEqual([]);
       now = new Date('2026-10-29T13:00:00.000Z');
       store.post({ from: 'OP', to: 'group:all', body: 'new hour' });
@@ -305,7 +309,10 @@ describe('durable message log and cursor', () => {
           { provenance_key: 'release-event:run_node_state:OP' }, { provenance_key: 'rla-command-reply:1:OP' },
           { provenance_key: 'rla-held-event:run_node_state:RLA' }, { provenance_key: 'rla-question-reply:2:OP' }]);
       expect(() => store.appendWithProvenance(input, 'coord:65001:UX')).toThrow('provenance recipient does not match message recipient');
-      expect(() => store.appendWithProvenance(input, 'coord:65001')).toThrow('invalid message provenance key');
+      expect(() => store.appendWithProvenance(input, 'coord 65001')).toThrow('invalid message provenance key');
+      // MSG-FILTERS-RELAX: a key outside the known families is accepted and stays idempotent.
+      const free = store.appendWithProvenance(input, 'custom-mirror/42');
+      expect(store.appendWithProvenance({ ...input, body: 'retry' }, 'custom-mirror/42').id).toBe(free.id);
     } finally { store.close(); }
   });
 

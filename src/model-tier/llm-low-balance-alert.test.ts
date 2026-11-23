@@ -70,6 +70,24 @@ describe('저잔액 알림 — 크레딧 3단계', () => {
     expect(w.orMails().map((m) => m.level)).toEqual(['balance-insufficient', 'balance-empty', 'balance-insufficient']);
   });
 
+  test('크레딧 잔액 부족 → 정책상 다음 구독 행 전환 영수증 + 우편 1통', async () => {
+    const w = setup();
+    // 명시적 정책 순서: 크레딧이 먼저이고 구독이 대체 행이다. 기본 정책은 바꾸지 않는다.
+    w.deps.readPolicy = async () => ({ ...defaultSpendPolicyDoc(), fallbackOrder: ['openrouter', 'codex-default'], returnOnReset: false });
+    w.s.subPct = 10;
+    const initial = await w.call();
+    expect(initial.outcome === 'go' && initial.row).toBe('openrouter');
+    expect(w.orMails()).toHaveLength(0);
+
+    w.s.balanceUsd = 2; // 잔액 2 < 호출 추정 5
+    const low = await w.call();
+    expect(low.outcome === 'go' && low.row).toBe('codex-default');
+    expect(low.outcome === 'go' && low.ledgerLines.map((l) => [l.action, l.from, l.to])).toEqual([['switch', 'openrouter', 'codex-default']]);
+    expect(w.orMails().map((m) => m.level)).toEqual(['balance-insufficient']);
+    await w.call();
+    expect(w.orMails()).toHaveLength(1);
+  });
+
   test('비밀 0 — 우편 본문에 행·레벨·수치만(임대 id 없음)', async () => {
     const w = setup();
     w.s.balanceUsd = 0;

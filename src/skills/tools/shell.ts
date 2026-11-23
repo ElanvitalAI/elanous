@@ -251,9 +251,9 @@ function rejectedCdResult(): RunShellDispatchResult {
 const LEDGER_CLI_BIN = /(?:^|[/\\])(?:elanous|elanous\.mjs|elanous\.cjs|eln)$/;
 const LEDGER_ENV_BIN = /(?:^|[/\\])env$/;
 export const LEDGER_CLI_NATIVE_TOOL: Readonly<Record<string, string>> = {
+  // MSG-FILTERS-RELAX: `msg post` / `msg ack` run as asked — the CLI carries flags the native tools do not
+  // (--intent · --needs-ack · --deadline · --priority · --origin-key · --through), so refusing it lost them.
   'msg list': 'MsgList',
-  'msg post': 'MsgPost',
-  'msg ack': 'MsgAck',
   'release checklist list': 'ChecklistList',
   'release checklist add': 'ChecklistAdd',
   'release checklist set': 'ChecklistSet',
@@ -649,6 +649,8 @@ export interface ShellCompletionNoticeInput {
   errorMessage?: string;
   /** Caller-supplied free-form label (RunShell's `description` arg). */
   label?: string;
+  /** ELN-CAPSULE-COMPLETION-SCOPED — the session that started the bg run; scopes the notice to that session's drain. */
+  parentSessionId?: string;
 }
 
 /** Per-handle dedup guard — module-local, keyed by the handle OBJECT.
@@ -719,6 +721,7 @@ export function enqueueShellCompletionNotice(
   ].join(' ');
   queue.enqueue({
     taskId,
+    ...(input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}),
     agentName: 'RunShell',
     ...(input.label ? { label: input.label } : {}),
     state: input.ok ? 'done' : 'error',
@@ -845,7 +848,7 @@ export async function dispatchRunShell(
     let prepared: Awaited<ReturnType<typeof prepareRunnerRunShell>>;
     try {
       prepared = await prepareRunnerRunShell({ command, cwd: effectiveCwd, sessionId: opts.sessionId,
-        signal: opts.signal, sandbox, network });
+        signal: opts.signal, sandbox, network, approval });
     } catch { prepared = null; }
     if (!prepared) {
       return { output: 'RunShell approval denied or unavailable', exitCode: null,
@@ -1064,6 +1067,7 @@ async function dispatchViaRunner(args: {
           ...(!ok ? { errorMessage: result.exitCode !== undefined
             ? `exitCode=${result.exitCode}` : result.failureReason ?? `outcome=${result.outcome}` } : {}),
           ...(args.description !== undefined ? { label: args.description } : {}),
+          ...(args.ownerSessionId ? { parentSessionId: args.ownerSessionId } : {}),
         });
       },
       (err: unknown) => {
@@ -1080,6 +1084,7 @@ async function dispatchViaRunner(args: {
           durationMs: Date.now() - bgStartedAt,
           errorMessage: err instanceof Error ? err.message : String(err),
           ...(args.description !== undefined ? { label: args.description } : {}),
+          ...(args.ownerSessionId ? { parentSessionId: args.ownerSessionId } : {}),
         });
       },
     );

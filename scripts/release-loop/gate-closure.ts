@@ -5,7 +5,7 @@
 //
 // Read from the tip commit's git objects, never from the working tree (the resume can run from any checkout).
 import { createHash } from 'node:crypto';
-import { createCutSnapshot } from './gate-cut-snapshot.js';
+import { createCutSnapshot, type CutSnapshot } from './gate-cut-snapshot.js';
 import { dirname, join, normalize } from 'node:path/posix';
 import ts from 'typescript';
 import { sourceCandidates } from '../../src/self-implement/importer-test-index.js';
@@ -642,9 +642,37 @@ export interface ClosureGraph {
 
 /** Forward dependency edges of every code file at the tip ⊕ the files whose dependencies we cannot fully name. */
 export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {}): ClosureGraph {
+  return buildClosureGraphImpl(tree, options);
+}
+
+/** Incrementally scan only files reachable from requested roots in this immutable tree. */
+export function createRootedClosureGraph(tree: ClosureTree): (root: string) => ClosureGraph {
+  let current: ClosureGraph | undefined;
+  const transpilers = makeClosureTranspilers();
+  const index = makeClosureTreeIndex(tree);
+  return (root) => {
+    if (current && (current.forward.has(root) || current.opaque.has(root))) return current;
+    // Build from copies; an exception must not leave a partially scanned graph cached.
+    const next = buildClosureGraphImpl({ ...tree, roots: [root] }, {}, current, transpilers, index);
+    current = next;
+    return next;
+  };
+}
+
+function makeClosureTranspilers() {
+  return { ts: new Bun.Transpiler({ loader: 'ts' }), tsx: new Bun.Transpiler({ loader: 'tsx' }), js: new Bun.Transpiler({ loader: 'js' }) };
+}
+
+function makeClosureTreeIndex(tree: ClosureTree) {
   const tracked = new Set(tree.files);
   const dirs = new Set<string>();
   for (const file of tree.files) for (let at = file.indexOf('/'); at > 0; at = file.indexOf('/', at + 1)) dirs.add(file.slice(0, at));
+  return { tracked, dirs };
+}
+
+function buildClosureGraphImpl(tree: ClosureTree, options: ClosureOptions = {}, seed?: ClosureGraph,
+  sharedTranspilers?: ReturnType<typeof makeClosureTranspilers>, sharedIndex?: ReturnType<typeof makeClosureTreeIndex>): ClosureGraph {
+  const { tracked, dirs } = sharedIndex ?? makeClosureTreeIndex(tree);
   const resolveFrom = (from: string, spec: string): string | undefined => {
     for (const candidate of sourceCandidates(from, spec)) if (tracked.has(candidate)) return candidate;
     const base = normalize(join(dirname(from), spec.replace(/[?#].*$/, '')));
@@ -669,14 +697,14 @@ export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {
     for (const suffix of SUFFIXES) if (tracked.has(`${base}${suffix}`)) return `${base}${suffix}`;
     return undefined;
   };
-  const transpilers = { ts: new Bun.Transpiler({ loader: 'ts' }), tsx: new Bun.Transpiler({ loader: 'tsx' }), js: new Bun.Transpiler({ loader: 'js' }) };
-  const forward = new Map<string, string[]>();
-  const staticImports = new Map<string, string[]>();
-  const selfStaticImports = new Set<string>();
-  const opaque = new Map<string, string>();
+  const transpilers = sharedTranspilers ?? makeClosureTranspilers();
+  const forward = new Map<string, readonly string[]>(seed?.forward);
+  const staticImports = new Map<string, readonly string[]>(seed?.staticImports);
+  const selfStaticImports = new Set(seed?.selfStaticImports);
+  const opaque = new Map(seed?.opaque);
   const blindAs = (file: string, why: string): void => { if (!opaque.has(file)) opaque.set(file, why); };
   const scanQueue = [...(tree.roots ?? tree.files)];
-  const scanned = new Set<string>();
+  const scanned = new Set<string>([...forward.keys(), ...opaque.keys()]);
   for (let scanIndex = 0; scanIndex < scanQueue.length; scanIndex++) {
     const file = scanQueue[scanIndex]!;
     if (scanned.has(file)) continue;
@@ -1039,16 +1067,25 @@ export function bunfigPreload(text: string | undefined): string[] | null {
 /** Tip-tree planning always goes through the shared immutable snapshot; a cache miss creates it once. */
 export function gitClosureTree(repo: string, commit: string): ClosureTree {
   if (!/^[0-9a-f]{40}$/i.test(commit)) throw new Error(`not a full sha: ${commit}`);
-  const snapshot = createCutSnapshot(repo, commit);
+  return closureTreeFromSnapshot(createCutSnapshot(repo, commit));
+}
+
+/** Decode config eagerly, but source text only when a graph consumer requests it. */
+export function closureTreeFromSnapshot(snapshot: CutSnapshot): ClosureTree {
+  const tracked = new Set(snapshot.files);
+  const isConfig = (file: string) => file === 'bunfig.toml' || /(?:^|\/)tsconfig[\w.-]*\.json$/.test(file);
   const contents = new Map<string, string>();
   for (const file of snapshot.files) {
+    if (!isConfig(file)) continue;
     const content = snapshot.read(file);
-    if (content !== undefined && (CODE_FILE.test(file) || file === 'bunfig.toml' || /(?:^|\/)tsconfig[\w.-]*\.json$/.test(file)))
-      contents.set(file, content);
+    if (content !== undefined) contents.set(file, content);
   }
   const preload = bunfigPreload(contents.get('bunfig.toml'));
   if (preload === null) throw new Error('bunfig.toml [test].preload is unreadable');
-  return { files: [...snapshot.files], read: (path) => contents.get(path), preload, aliases: tsconfigAliases(contents) };
+  return { files: [...snapshot.files], read: (path) => {
+    if (!tracked.has(path) || (!CODE_FILE.test(path) && !isConfig(path))) return undefined;
+    return contents.get(path) ?? snapshot.read(path);
+  }, preload, aliases: tsconfigAliases(contents) };
 }
 
 /** `compilerOptions.paths` entries of the form `"<prefix>*": ["<dir>/*"]` — scoped to the tsconfig's directory. */

@@ -95,16 +95,17 @@ describe('shell-primitive audit-log: programmatic sink', () => {
     expect(sources).toEqual(['approver', 'cache']);
   });
 
-  test('missing approver → approval(fail-closed) + run(denied)', async () => {
+  // 대표 11-23 ELS-ELN-SECURITY-RELAX — no approver: a non-destructive command runs, and the audit says why.
+  test('missing approver → approval(no-approver-non-destructive) + run(exit)', async () => {
     await runShell({ command: ['echo', 'x'], cwd, approval: 'first-time' });
     expect(events.length).toBe(2);
     const approval = events[0];
     if (approval?.type !== 'approval') throw new Error('expected approval event');
-    expect(approval.source).toBe('fail-closed');
-    expect(approval.decision).toBe('deny-once');
+    expect(approval.source).toBe('no-approver-non-destructive');
+    expect(approval.decision).toBe('allow-once');
     const run = events[1];
     if (run?.type !== 'run') throw new Error('expected run event');
-    expect(run.outcome).toBe('denied');
+    expect(run.outcome).toBe('exit');
   });
 
   test('run event includes truncated when output exceeds budget', async () => {

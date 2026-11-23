@@ -228,7 +228,7 @@ test('r2 MF1: a group: address — two processes retrying the same send leave ON
   expect(rows(path).map(row => [row.recipient, row.body])).toEqual([['group:crew', 'group retry']]);
 });
 
-test('r2 MF1: ALL — two processes retrying the same broadcast leave ONE row and spend ONE budget slot', async () => {
+test('r2 MF1: ALL — two processes retrying the same broadcast leave ONE row (MSG-FILTERS-RELAX: no broadcast budget)', async () => {
   const dir = tempDir();
   const path = join(dir, 'messages.db');
   const results = await racePost(dir, path, '', "{ from: 'JUD', to: 'ALL', body: 'broadcast retry' }");
@@ -236,7 +236,7 @@ test('r2 MF1: ALL — two processes retrying the same broadcast leave ONE row an
   expect(results.filter(r => r.deduped)).toHaveLength(1);
   expect(rows(path).map(row => [row.recipient, row.body])).toEqual([['ALL', 'broadcast retry']]);
   const db = new Database(path, { readonly: true });
-  try { expect(db.query('SELECT broadcast_count FROM msg_group_all_budget').all()).toEqual([{ broadcast_count: 1 }]); }
+  try { expect(db.query('SELECT broadcast_count FROM msg_group_all_budget').all()).toEqual([]); }
   finally { db.close(); }
 });
 

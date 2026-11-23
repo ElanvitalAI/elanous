@@ -35,8 +35,8 @@ const auditLines = (dir: string): { result: string; danger: string; reason?: str
 test('socket audit separates observed and claimed PID on all door outcomes', async () => {
   const dir = stateDir();
   const { control } = door(dir);
-  await control.run({ principal: cli, action: 'do', target: agent, text: 'private', socketAudit: { peerPid: 42, claimedPid: 99 } });
-  allow(dir, [{ principal: 'OP', workspace: 'HQ', pane: 'p1', actions: ['do'] }]);
+  // CEO 11-23 relaxation: a seatless caller passes the door; close without confirm is the remaining denied outcome.
+  await control.run({ principal: cli, action: 'close', target: agent, socketAudit: { peerPid: 42, claimedPid: 99 } });
   await control.run({ principal: cli, action: 'do', target: agent, text: 'private', socketAudit: { peerPid: undefined, claimedPid: 99 } });
   const raw = readFileSync(join(dir, 'control-audit.jsonl'), 'utf8');
   const rows = raw.trim().split('\n').map(line => JSON.parse(line));
@@ -69,17 +69,20 @@ test('structural payload reaches the authorized executor intact', async () => {
   ]);
 });
 
-test('default deny: a missing allow list authorizes nobody and never executes', async () => {
+test('missing allow list: seatless caller allowed and audited; close without confirm denied', async () => {
   const dir = stateDir();
   const { control, ran } = door(dir);
-  const denied = await control.run({ principal: cli, action: 'do', target: shell, text: 'echo hi' });
+  const done = await control.run({ principal: cli, action: 'do', target: shell, text: 'echo hi' });
+  expect(done).toEqual({ ok: true, exitCode: 0, message: 'delivered', danger: 'safe' });
+  expect(ran).toEqual(['echo hi']);
+  expect(loadAllowList(dir)).toEqual([]);
+  const denied = await control.run({ principal: cli, action: 'close', target: agent });
   expect(denied.ok).toBe(false);
   if (denied.ok) return;
   expect(denied.code).toBe('denied');
-  expect(denied.message).toBe('els do: denied for OP (not in control-allow.json)');
-  expect(ran).toEqual([]);
-  expect(loadAllowList(dir)).toEqual([]);
-  expect(auditLines(dir).map((row) => row.result)).toEqual(['denied']);
+  expect(denied.reason).toBe('close needs confirm:true (human confirmation)');
+  expect(ran).toEqual(['echo hi']);
+  expect(auditLines(dir).map((row) => row.result)).toEqual(['executing', 'executed', 'denied']);
 });
 
 test('default deny: an empty list, a broken file, and a row that is not a rule all authorize nobody', () => {
@@ -278,17 +281,23 @@ test('an agent pane is not danger-classified: the same text is typed, not held',
   expect(ran).toEqual(['rm -rf /tmp/x']);
 });
 
-test('read and status pass the same door: denied without a rule, executed with one', async () => {
+test('read and status pass the same door: seatless allowed, a seated caller is denied without a rule and executed with one', async () => {
   const dir = stateDir();
   const closed = door(dir);
-  const denied = await closed.control.run({ principal: cli, action: 'read', target: agent });
+  const seatless = await closed.control.run({ principal: cli, action: 'read', target: agent });
+  expect(seatless.ok).toBe(true);
+  const mk: Principal = { id: 'MK', kind: 'cli', seat: 'MK' };
+  const denied = await closed.control.run({ principal: mk, action: 'read', target: agent });
   expect(denied.ok).toBe(false);
-  allow(dir, [{ principal: 'OP', workspace: '*', pane: '*', actions: ['read', 'status'] }]);
+  if (!denied.ok) expect(denied.reason).toBe('not in control-allow.json');
+  allow(dir, [{ principal: 'MK', workspace: '*', pane: '*', actions: ['read', 'status'] }]);
   const open = door(dir);
-  const read = await open.control.run({ principal: cli, action: 'read', target: agent });
+  const read = await open.control.run({ principal: mk, action: 'read', target: agent });
   expect(read.ok).toBe(true);
-  const status = await open.control.run({ principal: { id: 'watcher', kind: 'eln' }, action: 'status', target: agent });
+  const status = await open.control.run({ principal: { id: 'watcher', kind: 'eln', seat: 'MK' }, action: 'status', target: agent });
   expect(status.ok).toBe(false);
+  const watcher = await open.control.run({ principal: { id: 'watcher', kind: 'eln' }, action: 'status', target: agent });
+  expect(watcher.ok).toBe(true);
 });
 
 test('an audit intent line that cannot be written stops the execution', async () => {
@@ -388,26 +397,30 @@ test('a495bddd8d review (pin fail): a pin whose write fails denies the name row 
   } finally { chmodSync(dir, 0o700); }
 });
 
-test('list passes the same door: denied without a rule, executed with one, audited — and a list rule grants no read', async () => {
+test('list passes the same door: seatless allowed and audited; a seated caller is denied without a rule — and a list rule grants no read', async () => {
   const dir = stateDir();
   const every = { workspace: '*', pane: '*', shell: false };
   const closed = door(dir);
-  const denied = await closed.control.run({ principal: cli, action: 'list', target: every });
+  const seatless = await closed.control.run({ principal: cli, action: 'list', target: every });
+  expect(seatless.ok).toBe(true);
+  expect(closed.ran).toEqual(['']);
+  const mk: Principal = { id: 'MK', kind: 'cli', seat: 'MK' };
+  const denied = await closed.control.run({ principal: mk, action: 'list', target: every });
   expect(denied.ok).toBe(false);
   if (denied.ok) return;
   expect(denied.code).toBe('denied');
-  expect(denied.message).toBe('els list: denied for OP (not in control-allow.json)');
-  expect(closed.ran).toEqual([]);
-  allow(dir, [{ principal: 'OP', workspace: '*', pane: '*', actions: ['list'] }]);
+  expect(denied.message).toBe('els list: denied for MK (not in control-allow.json)');
+  expect(closed.ran).toEqual(['']);
+  allow(dir, [{ principal: 'MK', workspace: '*', pane: '*', actions: ['list'] }]);
   const open = door(dir);
-  const listed = await open.control.run({ principal: cli, action: 'list', target: every });
+  const listed = await open.control.run({ principal: mk, action: 'list', target: every });
   expect(listed.ok).toBe(true);
   expect(open.ran).toEqual(['']);
-  const read = await open.control.run({ principal: cli, action: 'read', target: every });
+  const read = await open.control.run({ principal: mk, action: 'read', target: every });
   expect(read.ok).toBe(false);
   const rows = readFileSync(join(dir, 'control-audit.jsonl'), 'utf8').trim().split('\n')
     .map((row) => JSON.parse(row) as { action: string; result: string; text?: string });
-  expect(rows.map((row) => [row.action, row.result])).toEqual([['list', 'denied'], ['list', 'executing'], ['list', 'executed'], ['read', 'denied']]);
+  expect(rows.map((row) => [row.action, row.result])).toEqual([['list', 'executing'], ['list', 'executed'], ['list', 'denied'], ['list', 'executing'], ['list', 'executed'], ['read', 'denied']]);
   expect(rows.every((row) => row.text === undefined)).toBe(true);
 });
 
@@ -450,7 +463,7 @@ test('els input: an input row does not open the door to other principals', async
   expect(audit).toContain('"result":"denied"');
 });
 
-test('input built-in: authenticated seats only, explicit deny wins, other actions unchanged', async () => {
+test('input built-in: authenticated seats only, explicit deny wins, other actions follow the seatless default', async () => {
   const dir = stateDir();
   allow(dir, []);
   const { control, ran } = door(dir);
@@ -458,7 +471,7 @@ test('input built-in: authenticated seats only, explicit deny wins, other action
   const run = (principal: Principal, action: 'input' | 'read' = 'input', from = 'OP') => control.run({ principal, action, target: agent, text: 'secret', from });
   expect((await run(op)).ok).toBe(true);
   expect((await run({ ...op, callerSeat: 'RES-INFRA' })).ok).toBe(true);
-  expect((await run(op, 'read')).ok).toBe(false);
+  expect((await run(op, 'read')).ok).toBe(true); // CEO 11-23: no vouched seat → seatless default allows read
   for (const forged of [
     { ...op, callerSeat: undefined }, { ...op, callerPane: undefined },
     { ...op, callerSeat: 'HAND-X' }, { ...op, kind: 'http-token' as const },
@@ -466,7 +479,7 @@ test('input built-in: authenticated seats only, explicit deny wins, other action
   ]) expect((await run(forged)).ok).toBe(false);
   allow(dir, [{ principal: 'local:501', workspace: 'HQ', pane: 'p1', actions: ['input'], effect: 'deny' }]);
   expect((await run(op)).ok).toBe(false);
-  expect(ran).toEqual(['secret', 'secret']);
+  expect(ran).toEqual(['secret', 'secret', 'secret']);
   const rows = readFileSync(join(dir, 'control-audit.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
   expect(rows.slice(0, 4).every(row => row.authorization === 'builtin-input')).toBe(true);
   expect(rows.at(-1).reason).toBe('explicit input deny');
@@ -501,11 +514,13 @@ test('input deny survives pinning and does not grant other actions', async () =>
   expect(authorize(rules, { id: 'local:501', kind: 'cli' }, { workspace: 'ws-1', pane: 'pn-1', shell: false }, 'read')).toBe(false);
 });
 
-test('input default spans file presence; non-input revocation remains effective', async () => {
+test('input default spans file presence; non-input revocation remains effective for a seated caller', async () => {
   const dir = stateDir();
   const { control } = door(dir);
-  const principal: Principal = { id: 'local:501', kind: 'cli', callerPane: 'w1:p2', callerSeat: 'OP' };
+  // A vouched non-OP seat keeps file rules authoritative for read (the 11-23 seatless default does not apply).
+  const principal: Principal = { id: 'local:501', kind: 'cli', callerPane: 'w1:p2', callerSeat: 'RES-INFRA', seat: 'RES-INFRA' };
   const run = (action: 'input' | 'read') => control.run({ principal, action, target: agent });
+  expect((await control.run({ principal: { id: 'local:501', kind: 'cli', callerPane: 'w1:p2', callerSeat: 'OP' }, action: 'read', target: agent })).ok).toBe(true);
   expect((await run('input')).ok).toBe(true);
   expect((await run('read')).ok).toBe(false);
   allow(dir, [{ principal: 'local:501', workspace: '*', pane: '*', actions: ['read'] }]);

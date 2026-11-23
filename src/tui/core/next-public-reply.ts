@@ -1,4 +1,4 @@
-import { classifyTurnFailure } from '../chat/error-card.js';
+import { classifyTurnFailure, TURN_FAILURE_CAUSE_LABELS } from '../chat/error-card.js';
 import { NEXT_TUI_AUTH_FAILURE_TEXT, type NextTuiAuthFailureKind } from '../../tui-client/next-auth-preflight.js';
 /** Next basic chat projects public turn text without transport or tool payloads. */
 const clean = (text: string): string => text.replace(/\r\n?/g, '\n')
@@ -34,6 +34,13 @@ export function turnReplyFailureMessage(
   // Class of cause only (never the raw error text): provider failure vs cut stream vs timeout, etc.
   const cause = classifyTurnFailure(error);
   return cause ? `${streamReplyFailure(turnId)} (${cause})` : streamReplyFailure(turnId);
+}
+
+/** NEXT-TUI-FEATURE-COMPLETE ② — the cause label of a saved failure notice, so a reloaded session does not fall back to
+ *  the bare «요청을 처리하지 못했습니다». Only an exact known label is accepted: saved text is never shown as is. */
+export function savedFailureCause(content: string): string | null {
+  const match = /\(([^()]+)\)\s*$/u.exec(content);
+  return match && TURN_FAILURE_CAUSE_LABELS.includes(match[1]!) ? match[1]! : null;
 }
 
 /** A trailing action-shaped line inside an open code fence remains answer text. */

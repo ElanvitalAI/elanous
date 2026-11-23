@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "entries": {
+    "graph/SC1": {
+      "expect": "green",
+      "greenSince": "#39267 (SCHEDULE-GRAPH-S1 Slice A — main c304956c36)",
+      "reason": "03:00 정시 발화: previousLoopFire('0 3 * * *') 가 2026-11-24T03:00:00.000Z 를 구하고 dispatchGraphTriggerRun 이 dedupeKey time:memory-lifecycle:<분 ISO> 로 런 1회를 시작한다(main 실측)."
+    },
+    "graph/SC2": {
+      "expect": "red",
+      "reason": "그래프 문법(graph-yaml)이 loop.trigger 를 cron·events 만 검증해 window 를 보존·평가하지 않는다 — 창 밖(05:30) 깨움에도 발화가 시작된다. Slice B 가 문법·평가를 심는다.",
+      "redReason": "그래프 문법이 loop.trigger.window 를 받지 않는다 — 창 안·창 밖 깨움이 구분 없이 취급된다"
+    },
+    "graph/SC3": {
+      "expect": "red",
+      "reason": "놓친 발화 합치기·missed 기록 경로가 엔진에 없다 — 마지막 예정 발화 1회 실행(previousLoopFire·dispatch)은 되지만 missed: 3 기록이 없다(계획 §9: 합치기·missed 는 Slice B).",
+      "redReason": "놓친 발화 합치기·missed 기록 경로가 엔진에 없다 — 마지막 예정 발화 1회 실행만 관측된다"
+    },
+    "graph/SC4": {
+      "expect": "green",
+      "greenSince": "#39267 (SCHEDULE-GRAPH-S1 Slice A — main c304956c36)",
+      "reason": "동일 분 두 번 평가: 같은 dedupeKey 가 같은 runId 로 묶이고 두 번째 깨움은 claimed:false 로 런을 늘리지 않는다(등록부 binding·lease 실측)."
+    },
+    "graph/SC5": {
+      "expect": "red",
+      "reason": "국면 금지 결합(시계축): phase.json 원천 읽기·skip 경로가 엔진에 없어 gate-window 에도 03:00 발화가 시작된다(계획 §9: 국면 원천은 Slice B).",
+      "redReason": "03:00 발화가 gate-window 국면에도 시작된다 — 국면 원천(phase.json) 읽기·skip 경로가 엔진에 없다"
+    },
+    "graph/SP1": {
+      "expect": "green",
+      "greenSince": "#39267 (SCHEDULE-GRAPH-S1 Slice A — main c304956c36)",
+      "reason": "phase.json 부재 — 엔진이 국면을 읽지 않아 런이 시작된다: «unknown → 지금 동작 취급 → 실행» 관측과 일치. 원천 판정 경로 부재는 SP3~SP5 빨강이 입증한다."
+    },
+    "graph/SP2": {
+      "expect": "green",
+      "greenSince": "#39267 (SCHEDULE-GRAPH-S1 Slice A — main c304956c36)",
+      "reason": "phase dev-normal — 런이 시작된다: 기대(실행)와 관측이 일치(엔진이 국면을 안 읽어 우연히 통과 · SP3~SP5 참조)."
+    },
+    "graph/SP3": {
+      "expect": "red",
+      "reason": "phase.json hard-rehearsal 이 런 시작을 막지 못한다 — 국면 원천 읽기·skip 경로가 엔진에 없다(§7-1 후보: 상태 루트 phase.json · 원천은 Slice B).",
+      "redReason": "phase.json hard-rehearsal 이 런 시작을 막지 않는다 — 국면 원천·skip 경로가 엔진에 없다"
+    },
+    "graph/SP4": {
+      "expect": "red",
+      "reason": "phase.json gate-window 가 런 시작을 막지 못한다 — 국면 원천 읽기·skip 경로가 엔진에 없다(§7-1 후보: 상태 루트 phase.json · 원천은 Slice B).",
+      "redReason": "phase.json gate-window 가 런 시작을 막지 않는다 — 국면 원천·skip 경로가 엔진에 없다"
+    },
+    "graph/SP5": {
+      "expect": "red",
+      "reason": "phase.json publish 가 런 시작을 막지 못한다 — 국면 원천 읽기·skip 경로가 엔진에 없다(§7-1 후보: 상태 루트 phase.json · 원천은 Slice B).",
+      "redReason": "phase.json publish 가 런 시작을 막지 않는다 — 국면 원천·skip 경로가 엔진에 없다"
+    },
+    "graph/SB1": {
+      "expect": "green",
+      "greenSince": "#39267 (SCHEDULE-GRAPH-S1 Slice A — main c304956c36)",
+      "reason": "런 진행 중 같은 dedupeKey 재발화: 같은 runId · 두 번째 claimed:false · 런 1개(등록부 binding·lease 실측)."
+    },
+    "graph/SB2": {
+      "expect": "red",
+      "reason": "등록부(GraphTriggerDispatchBinding)가 본문을 기록하지 않아 같은 dedupeKey·다른 본문이 거부되지 않는다(GRAPH-API-TRIGGER-DEDUP-FU — 등록부 본문 기록은 Slice B).",
+      "redReason": "같은 dedupeKey·다른 본문이 거부되지 않는다 — 등록부가 본문(payload)을 기록하지 않는다"
+    },
+    "graph/SB3": {
+      "expect": "red",
+      "reason": "lease 가 그래프 단위가 아니라 (triggerId,dedupeKey) 단위라 런 진행 중 새 키가 별도 lease 를 얻어 두 번째 런을 시작한다 — busy 기록 후 버림(적체 금지)이 없다(Slice B).",
+      "redReason": "런 진행 중 새 dedupeKey 가 busy 로 기록·버려지지 않고 두 번째 런이 시작된다"
+    },
+    "graph/SB4": {
+      "expect": "green",
+      "greenSince": "#39267 (SCHEDULE-GRAPH-S1 Slice A — main c304956c36)",
+      "reason": "중단(lease 상실) 런 재깨움: abort 후 같은 runId 가 mode:resume 으로 이어붙어 done · 런 1개 — 이어붙음은 설계상 정상 거동(심장박동·abort 기계는 dispatchGraphTriggerRun 안에 있다)."
+    },
+    "graph/SB5": {
+      "expect": "green",
+      "greenSince": "#39267 (SCHEDULE-GRAPH-S1 Slice A — main c304956c36)",
+      "reason": "두 그래프(memory-lifecycle·release-loop) 동시 발화: lease 가 (triggerId,dedupeKey) 단위라 서로를 막지 않고 둘 다 실행된다 — 그래프 간 상한 새로 없음."
+    }
+  }
+}

@@ -7,8 +7,11 @@ import { buttonsLayout, hitButton } from './attach-buttons.js';
 import { planVoice, type VoiceDoor } from './voice-control.js';
 import { createVoicePopup } from './voice-popup.js';
 import { createNewTabPrompt } from './new-tab-prompt.js';
+import { createMoveTabPicker } from './move-tab-picker.js';
 import { tabName } from './space-tabs-view.js';
-import { basename } from 'node:path';
+import { basename, dirname } from 'node:path';
+import { elsJournalPath } from './journal.js';
+import { readActiveBaton } from './baton.js';
 import { isServerAway, noteAfterFrame, RECONNECT_NOTE, type AttachFrame, type AttachHandlers, type Attached } from './attach-client.js';
 import { createKeyRouter, type KeyAction } from './attach-keys.js';
 import { composeView, emptyCoordinatorSpaces, emptyRemoteCoordinators, FIRST_RUN_HINT, NARROW_BELOW_COLS, parsePaneRows, parseRemoteRows, SIDEBAR_HELP, sidebarWidthFor, UNREACHABLE_MARK, type PaneRow } from './attach-view.js';
@@ -25,6 +28,8 @@ export interface AttachAppDeps {
   readonly size: () => { cols: number; rows: number };
   readonly cwd: string;
   readonly buildLabel?: string;
+  /** Override the local active baton lookup for isolated view tests. */
+  readonly actingSeat?: () => string | undefined;
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly setInterval: (callback: () => void, ms: number) => unknown;
   readonly clearInterval: (handle: unknown) => void;
@@ -75,9 +80,11 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   let ceoSideUnavailable = false;
   const remembered = deps.memory.load();
   let sidebarOpen = deps.sidebar ?? remembered.sidebar ?? true;
+  let agentsGrouped = true;                                     // ELS-AGENTS-GROUPED-TOGGLE-FU (OP #134722 ②): the agents panel's order — session-only (영속화 없음, 첫 판 최소 리스크)
   let frame = '';
   let note = '';
   let confirm: Confirm | undefined;
+  let movePicker: { picker: ReturnType<typeof createMoveTabPicker>; tab: string } | undefined;
   let attached: Attached | undefined;
   let generation = 0;
   let timer: unknown;
@@ -86,6 +93,9 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   let discardEscapeSuffix = false;
   let escapeTimer: ReturnType<typeof setTimeout> | undefined;
   let awaitingServer = false;                                    // D1a: ONLY a server-away end arms the re-attach — a refused/unknown-pane attach never retries
+  let focusWrite: Promise<void> = Promise.resolve();
+  let emptyFocusInFlight = false;
+  let emptyFocusPending: string | undefined;
   let automaticCreateAttempted = false;
   let everListed = false;                                        // D1a: a server lost AFTER a good list is waited out, not the end
   let resolveDone: (result: { code: number; message: string }) => void = () => {};
@@ -117,6 +127,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   const narrow = (): boolean => deps.size().cols < NARROW_BELOW_COLS;
   let mouseLayout: MouseLayout = { cols: 0, rows: 0, sidebarWidth: 0, sidebar: [], tabs: [] };
   let scroll = 0;                // lines the shown frame is above the live bottom (told by the server's frame)
+  let wheelPassthrough = false;   // ELS-WHEEL-SCROLLBACK (OP #136704): this frame's pane takes the wheel as bytes (alternate screen + its own mouse)
   // ELS-MOUSE-RELEASE (JUD-B #111750): a release follows its press. The press the app consumed (tab/list/⏏✕ click, wheel
   // excluded — it has no release) is answered by swallowing its release; a press that went to the pane program is answered by
   // passing its release to the pane too, wherever the pointer is let go — the pane saw the press and waits for the release.
@@ -151,9 +162,11 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     const action = interpretMouse(report, mouseLayout);
     pressConsumed = !wheel && action?.kind !== 'passthrough';
     if (!action) return;
-    if (action.kind === 'new-tab') { dropdown = false; if (!current()?.remote && !selectedEmptySpace()?.remote) newTab.openPrompt(); }
+    if (action.kind === 'new-tab') { renameTarget = undefined; dropdown = false; if (!current()?.remote && !selectedEmptySpace()?.remote) newTab.openPrompt(); }
     else if (action.kind === 'select') select(action.pane);
-    else if (action.kind === 'scroll') scrollPane(action.lines);
+    // ELS-WHEEL-SCROLLBACK (OP #136704): a wheel over a pane that tracks its own mouse on an alternate screen belongs to
+    // the pane program as bytes — the els scrollback lane is empty there, so scrolling it only eats the wheel.
+    else if (action.kind === 'scroll') { if (wheelPassthrough && attached) attached.input(report.bytes); else scrollPane(action.lines); }
     else if (attached) attached.input(action.bytes);
     else { note = '원격 pane은 마우스 통과 불가'; render(); }
   };
@@ -195,7 +208,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     const shown = withCommands(everyRow(), lsAnswer);
     if (cols >= NARROW_BELOW_COLS) dropdown = false;             // widened: back to the side list
     const empty = selectedEmptySpace();
-    let tabs: ReturnType<typeof buildTabRow> = empty ? { line: ` 🎼 ${empty.name} `, tabs: [] } : buildTabRow(shown, selected, Math.max(10, cols - (width ? width + 1 : 0)));
+    let tabs: ReturnType<typeof buildTabRow> = empty ? { line: ` ⭐ ${empty.name} `, tabs: [] } : buildTabRow(shown, selected, Math.max(10, cols - (width ? width + 1 : 0)));
     let overlay: readonly string[] | undefined;
     dropHits = [];
     if (cols < NARROW_BELOW_COLS && (shown.length > 0 || emptySpaces().length > 0)) {
@@ -203,13 +216,16 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       tabs = { line: down.line, tabs: [] };
       if (dropdown) { overlay = down.list; dropHits = down.hits; }
     }
-    const list = width ? layoutSpaceList(shown, selected, width, height - 1, deps.env.HOME, ceoSideUnavailable ? -1 : ceoPendingRed, [...emptyCoordinatorSpaces(lsAnswer, rows), ...remoteEmpty], selectedEmpty) : undefined;
+    // Read at every paint so return/expiry removes the badge on the next poll, without trusting a pane title.
+    let actingSeat: string | undefined;
+    try { actingSeat = deps.actingSeat ? deps.actingSeat() : readActiveBaton(dirname(elsJournalPath()), Date.now())?.acting; } catch { /* unavailable is not an active badge */ }
+    const list = width ? layoutSpaceList(shown, selected, width, height - 1, deps.env.HOME, ceoSideUnavailable ? -1 : ceoPendingRed, [...emptyCoordinatorSpaces(lsAnswer, rows), ...remoteEmpty], selectedEmpty, agentsGrouped ? 'grouped' : 'status', actingSeat) : undefined;
     emptyHits = list?.emptySpaces ?? [];
     mouseLayout = { cols, rows: height, sidebarWidth: width, sidebar: list?.spaces ?? [], ...(list?.newBox ? { sidebarNew: list.newBox } : {}), tabs: tabs.tabs, ...(tabs.plus ? { plus: tabs.plus } : {}) };
     const screen = composeView({ cols, rows: height, sidebar: list ? list.lines : null, frame, status: statusText(), buttons: buttonsLayout(cols).text,
       ...(tabs.line !== undefined ? { tabRow: tabs.line } : {}), ...(overlay ? { overlay } : {}),
       // ELS-APP-RENDER-SINGLE-FRAME: the dialog is spliced into the same frame — one write, never a second overlay pass.
-      ...(newTab.isOpen() ? { dialog: newTab.box(cols, height, width ? width + 1 : 0) } : {}) });
+      ...(newTab.isOpen() ? { dialog: newTab.box(cols, height, width ? width + 1 : 0) } : movePicker ? { dialog: movePicker.picker.box(cols, height, width ? width + 1 : 0) } : {}) });
     deps.write(screen);
   };
   const finish = (code: number, message: string): void => {
@@ -226,12 +242,20 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   /** One attach wiring for one selection generation. D1a(ELS-SERVER-RESTART-SURVIVE): a server-away end keeps the
    *  screen as it was and waits for the poll to re-attach — the view does not end while the els server restarts. */
   const wire = (mine: number): Attached => deps.attach(selected!, paneSize(), {
+    onFocus: (pane, acknowledge) => {
+      void refresh(true).then(listed => {
+        const accepted = listed && !finished && mine === generation && rows.some(row => row.pane === pane && row.state !== 'exited');
+        acknowledge(accepted);
+        if (accepted) select(pane);
+      }, () => acknowledge(false));
+    },
     onFrame: (next: AttachFrame) => {
       if (mine !== generation) return;
       note = noteAfterFrame(note);
       awaitingServer = false;
       frame = next.screen;
       scroll = next.back;                // the server tells how far this frame is above the live bottom
+      wheelPassthrough = next.wheelPassthrough === true;   // ELS-WHEEL-SCROLLBACK: the frame carries the pane's own wheel lane
       render();
     },
     onError: (message) => { if (mine === generation) { note = message; render(); } },   // typing refused (view-only attach): said, not swallowed
@@ -261,15 +285,34 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     },
   });
 
+  const flushEmptyFocus = (): void => {
+    if (!emptyFocusPending || emptyFocusInFlight) return;
+    emptyFocusInFlight = true;
+    focusWrite = focusWrite.then(async () => {
+      const ws = emptyFocusPending;
+      if (!ws) return;
+      const result = await deps.request({ op: 'focus-empty', ws });
+      if (result.exitCode === 0 && emptyFocusPending === ws) emptyFocusPending = undefined;
+      // A later pane selection must win over a delayed empty-space write.
+      if (!finished && selected && !current()?.remote && attached) {
+        generation++; attached.detach(); attached = wire(generation);
+      }
+    }).catch(() => {}).finally(() => { emptyFocusInFlight = false; });
+  };
   const selectEmpty = (ws: string): void => {
-    generation++; attached?.detach(); attached = undefined; selected = undefined;
-    selectedEmpty = ws; wrapped = false; frame = ''; scroll = 0; readError = ''; note = '';
+    if (emptyCoordinatorSpaces(lsAnswer, rows).some(space => space.wsId === ws)) {
+      emptyFocusPending = ws;
+      flushEmptyFocus();
+    }
+    generation++; attached?.detach(); attached = undefined; selected = undefined; awaitingServer = false;
+    selectedEmpty = ws; wrapped = false; frame = ''; scroll = 0; wheelPassthrough = false; readError = ''; note = '';
     render();
   };
 
   const select = (pane: string | undefined): void => {
     if (finished || (pane === selected && attached)) return;      // after the app ended nothing attaches or is remembered
     selectedEmpty = undefined;
+    emptyFocusPending = undefined;
     wrapped = false;                                             // any move other than the wrap itself ends the wrap
     generation++;
     const mine = generation;
@@ -278,6 +321,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     selected = pane;
     frame = '';
     scroll = 0;
+    wheelPassthrough = false;
     readError = '';
     remember();
     if (pane && remoteRows.some((row) => row.pane === pane)) {
@@ -315,11 +359,12 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   };
   /** The other hosts' panes are gone (the list failed or threw): no stale rows, and a remote selection moves to a local pane. */
   const dropRemote = (): void => {
+    const wasRemote = remoteRows.some(row => row.pane === selected);
     remoteRows = [];
     remoteEmpty = [];
     if (selectedEmpty && !emptyCoordinatorSpaces(lsAnswer, rows).some((space) => space.wsId === selectedEmpty)) { select(rows[0]?.pane); return; }
     readError = '';
-    if (selected && !everyRow().some((row) => row.pane === selected)) select(rows.find((row) => row.state !== 'exited')?.pane ?? rows[0]?.pane);
+    if (wasRemote && selected && !everyRow().some((row) => row.pane === selected)) select(rows.find((row) => row.state !== 'exited')?.pane ?? rows[0]?.pane);
     else render();
   };
   /** Re-read the other hosts' panes (own guard and cadence: a host that is down for 2 s must not slow the local list). */
@@ -347,6 +392,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       } catch { remoteStatus = '원격 목록 확인 불가'; }
       // ELS-REMOTE-MARKER: a host reported down keeps its last known panes in the list (dimmed «?»), so they do not
       // silently vanish; they are replaced as soon as the host answers again. A failed list as a whole still drops them.
+      const wasRemote = remoteRows.some(row => row.pane === selected);
       const fresh = parseRemoteRows(answer.message);
       remoteEmpty = [...emptyRemoteCoordinators(answer.message, fresh), ...remoteEmpty
         .filter((space) => downHosts.has(space.remote) && !fresh.some((row) => row.wsId === space.wsId))
@@ -359,7 +405,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
         const next = everyRow().find((row) => row.wsId === selectedEmpty)?.pane ?? rows[0]?.pane;
         select(next); return;
       }
-      if (selected && !everyRow().some((row) => row.pane === selected)) { select(rows.find((row) => row.state !== 'exited')?.pane ?? rows[0]?.pane); return; }
+      if (wasRemote && selected && !everyRow().some((row) => row.pane === selected)) { select(rows.find((row) => row.state !== 'exited')?.pane ?? rows[0]?.pane); return; }
       if (current()?.remote) await showRemote(generation); else render();
     } finally { remoteBusy = false; }
   };
@@ -378,6 +424,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       finish(1, answer.message); return false;
     }
     everListed = true;
+    if (selectedEmpty && selectedEmpty === emptyFocusPending) flushEmptyFocus();
     const before = rows;
     rows = parsePaneRows(answer.message);
     lsAnswer = answer.message;
@@ -388,15 +435,26 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
         ? Math.min(side.pendingRed, 99) : 0;
     } catch { ceoPendingRed = 0; ceoSideUnavailable = true; }
     // ELS-FIRST-RUN-LIVE-PANE (OP #102204): an exited pane stays in the list, dimmed — it is never closed automatically.
-    if (selected && !everyRow().some((row) => row.pane === selected)) {
+    if (selected && (!everyRow().some((row) => row.pane === selected) || (awaitingServer && current()?.state === 'exited'))) {
+      const old = before.find(row => row.pane === selected);
+      const sameSpace = rows.filter(row => row.wsId === old?.wsId && row.state !== 'exited');
+      const empty = emptyCoordinatorSpaces(lsAnswer, rows).find(space => space.wsId === old?.wsId);
+      awaitingServer = false;
+      if (empty) { selectEmpty(empty.wsId); return true; }
       const was = before.findIndex((row) => row.pane === selected);
-      select(rows[Math.min(Math.max(was, 0), rows.length - 1)]?.pane);
+      select((sameSpace.find(row => row.spaceCoordinator) ?? sameSpace[0] ?? rows[Math.min(Math.max(was, 0), rows.length - 1)])?.pane);
       return true;
     }
     if (selectedEmpty && ![...emptyCoordinatorSpaces(lsAnswer, rows), ...remoteEmpty].some((space) => space.wsId === selectedEmpty)) {
       const next = everyRow().find((row) => row.wsId === selectedEmpty && row.state !== 'exited');
       if (next) { select(next.pane); return true; }
       selectedEmpty = undefined;
+    }
+    if (!selected && !selectedEmpty && !initialPane) {
+      let workspaceId: string | undefined;
+      try { workspaceId = (JSON.parse(lsAnswer) as { lastFocus?: { workspaceId?: string } }).lastFocus?.workspaceId; } catch { /* legacy */ }
+      const empty = emptyCoordinatorSpaces(lsAnswer, rows).find(space => space.wsId === workspaceId);
+      if (empty) { selectEmpty(empty.wsId); return true; }
     }
     if (!selected && !selectedEmpty && rows.length > 0) {
       // First view (ELS-FIRST-RUN-LIVE-PANE): the live pane it was left on, else the first live one in this folder's space,
@@ -407,7 +465,15 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
         return true;
       }
       const folder = basename(deps.cwd) || 'els';
-      select((live.find((row) => row.pane === initialPane) ?? live.find((row) => row.pane === remembered.lastPane) ?? live.find((row) => row.workspace === folder) ?? live[0]!).pane);
+      let focus: { workspaceId?: string; tabId?: string; paneId?: string } | undefined;
+      try { focus = (JSON.parse(lsAnswer) as { lastFocus?: typeof focus }).lastFocus; } catch { /* legacy listing */ }
+      const restored = focus && live.find(row => row.wsId === focus!.workspaceId && row.tabId === focus!.tabId && row.pane === focus!.paneId);
+      // A stale target stays in its original space, preferring that space's coordinator.
+      const inSpace = focus && live.filter(row => row.wsId === focus!.workspaceId);
+      const fallback = inSpace && (inSpace.find(row => row.spaceCoordinator) ?? inSpace[0]);
+      select((live.find((row) => row.pane === initialPane) ?? restored ?? fallback
+        ?? (!focus ? live.find((row) => row.pane === remembered.lastPane) : undefined)
+        ?? live.find((row) => row.workspace === folder) ?? live[0]!).pane);
       return true;
     }
     if (awaitingServer && !attached && selected && !current()?.remote) reattach();   // D1a(ELS-SERVER-RESTART-SURVIVE): the server is back
@@ -513,6 +579,15 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
         case 'tab.close': case 'pane.close': { const row = findTab(a.tab ?? a.pane ?? ''); return row && !row.remote ? answer({ op: 'close', pane: row.pane, confirmed: true }) : { ok: false, message: `${a.tab ?? a.pane} 탭 없음` }; }
         case 'workspace.close': { const row = findSpace(a.workspace ?? ''); return row ? answer({ op: 'close-workspace', ws: row.wsId, confirmed: true }) : { ok: false, message: `${a.workspace} 공간 없음` }; }
         case 'workspace.move': { const row = findSpace(a.workspace ?? ''); const before = a.before ? findSpace(a.before)?.wsId : undefined; return row ? answer({ op: 'reorder', kind: 'workspace', id: row.wsId, ...(before ? { before } : {}) }) : { ok: false, message: `${a.workspace} 공간 없음` }; }
+        case 'tab.move': {
+          const row = a.tab ? findTab(a.tab) : current();
+          const target = [...rows.map(r => ({ wsId: r.wsId, name: r.workspace })), ...emptyCoordinatorSpaces(lsAnswer, rows)]
+            .find(ws => ws.wsId === a.workspace || ws.name === a.workspace);
+          if (!row || row.remote || !target) return { ok: false, message: '탭 또는 공간 없음' };
+          const listed = JSON.parse(lsAnswer) as { panes?: { pane: string; tab: string }[] };
+          const tab = listed.panes?.find(p => p.pane === row.pane)?.tab;
+          return tab ? answer({ op: 'move-tab', tab, ws: target.wsId }) : { ok: false, message: '탭 없음' };
+        }
         case 'pane.focus': { const row = findTab(a.pane ?? a.tab ?? ''); if (!row) return { ok: false, message: `${a.pane ?? a.tab} 없음` }; select(row.pane); return { ok: true, message: '' }; }
         default: return { ok: false, message: '아직 없는 동작 (ELS-DOOR-STRUCT-OPS)' };
       }
@@ -525,9 +600,19 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   });
 
   // ELS-NEW-TAB-NAME-WIDGET: the typed name goes to the `new` request's title ONLY (cleaned and capped in the prompt); never to the pane.
+  let renameTarget: string | undefined;
   let unresolvedTabTarget: { workspace: string | undefined } | undefined;
   const newTab = createNewTabPrompt({
+    title: () => renameTarget ? 'Rename tab' : '새 탭 이름',
     save: async (name) => {
+      if (renameTarget) {
+        if (!name.trim()) { note = 'Enter a tab name'; return false; }
+        try {
+          const answer = await deps.request({ op: 'rename', kind: 'tab', id: renameTarget, name });
+          if (answer.exitCode !== 0) { note = answer.message; return false; }
+          renameTarget = undefined; await refresh(); return true;
+        } catch { note = 'Rename failed'; return false; }
+      }
       const target = unresolvedTabTarget ?? { workspace: localCreationTarget() };
       const result = await create(target.workspace, { command: [], title: name });
       if (result === 'unknown') unresolvedTabTarget = target;
@@ -549,7 +634,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     const row = current();
     if (selectedEmpty && action === 'next-workspace') { nextWorkspace(); return; }
     if (selectedEmpty && ['next', 'previous'].includes(action)) { select(everyRow()[0]?.pane); return; }
-    if (selectedEmpty && !['detach', 'toggle-sidebar', 'help', 'new', 'new-chat', 'new-workspace', 'close-workspace'].includes(action)) { note = '빈 작업공간에는 pane이 없습니다'; render(); return; }
+    if (selectedEmpty && !['detach', 'toggle-sidebar', 'help', 'new', 'new-chat', 'new-workspace', 'close-workspace', 'toggle-agents-order'].includes(action)) { note = '빈 작업공간에는 pane이 없습니다'; render(); return; }
     switch (action) {
       case 'detach': finish(0, ''); return;
       case 'next': move(1); return;
@@ -557,9 +642,21 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       case 'next-workspace': nextTab(); return;
       case 'goto': { const tabs = spaceTabs(); if (n !== undefined && tabs[n - 1]) select(tabs[n - 1]!.pane); return; }
       case 'toggle-sidebar': if (narrow()) { if (dropdown) { dropdown = false; render(); } else openDropdown(); return; } sidebarOpen = !sidebarOpen; remember(); attached?.resize(paneSize().cols, paneSize().rows); render(); return;
+      case 'toggle-agents-order': agentsGrouped = !agentsGrouped; render(); return;   // ELS-AGENTS-GROUPED-TOGGLE-FU: the panel flips, nothing else moves
       case 'new-chat': void create(localCreationTarget(), { command: deps.chatCommand, title: 'elanous' }); return;
-      case 'new': if (!row?.remote && !selectedEmptySpace()?.remote) newTab.openPrompt(); else void create(undefined); return;   // ELS-NEW-TAB-NAME-WIDGET: the name prompt first; Enter on an empty name = the default tab
+      case 'rename-tab': if (row && !row.remote && row.tabId) { renameTarget = row.tabId; newTab.openPrompt(); } else { note = 'Select a local tab to rename'; render(); } return;
+      case 'new': renameTarget = undefined; if (!row?.remote && !selectedEmptySpace()?.remote) newTab.openPrompt(); else void create(undefined); return;   // ELS-NEW-TAB-NAME-WIDGET: the name prompt first; Enter on an empty name = the default tab
       case 'new-workspace': void create(freshWorkspaceName()); return;
+      case 'move-tab': {
+        if (!row || row.remote) { note = 'Only local tabs can be moved'; render(); return; }
+        let tab: string | undefined;
+        try { tab = (JSON.parse(lsAnswer) as { panes?: { pane: string; tab: string }[] }).panes?.find(p => p.pane === row.pane)?.tab; } catch { /* stale listing */ }
+        if (!tab) { note = 'Cannot identify selected tab'; render(); return; }
+        const spaces = [...rows.map(r => ({ id: r.wsId, name: r.workspace })), ...emptyCoordinatorSpaces(lsAnswer, rows).map(s => ({ id: s.wsId, name: s.name }))];
+        const destinations = [...new Map(spaces.filter(s => s.id !== row.wsId).map(s => [s.id, s])).values()];
+        if (!destinations.length) { note = 'No other local spaces'; render(); return; }
+        movePicker = { picker: createMoveTabPicker(destinations), tab }; render(); return;
+      }
       case 'close': if (row?.remote) { note = `⇄${row.remote} pane 은 여기서 닫을 수 없음 (그 호스트에서)`; render(); return; } if (row) { confirm = { what: 'close', target: row.pane, prompt: `pane «${row.title}» 닫기?` }; render(); } return;
       case 'close-workspace': {
         const empty = selectedEmptySpace();
@@ -601,6 +698,22 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       if (finished) return;
       if (wasSavingAtInput && !newTab.isSaving()) router.resetPrefix();
       router.feed(text, () => newTab.isOpen() && !newTab.isSaving(), (event) => {
+        if (movePicker) {
+          if (event.kind === 'input') {
+            const pending = movePicker;
+            const result = pending.picker.feed(event.bytes);
+            if (result.kind === 'cancel') movePicker = undefined;
+            if (result.kind === 'select') {
+              const tab = pending.tab; movePicker = undefined;
+              void deps.request({ op: 'move-tab', tab, ws: result.id }).then(async answer => {
+                note = answer.exitCode === 0 ? 'Tab moved' : answer.message.includes('OP authority required') ? 'Cannot move tab: OP coordinator authority required' : answer.message;
+                await refresh();
+              }, () => { note = 'Move failed; check the tab before retrying'; render(); });
+            }
+            render();
+          }
+          return;
+        }
         if (voice.isOpen()) { if (event.kind === 'input') void voice.feed(event.bytes); return; }
         if (newTab.isOpen()) {                                     // keys (and clicks) belong to the prompt: nothing reaches the pane
           if (newTab.isSaving() && event.kind === 'action' && event.action === 'detach') { finish(0, ''); return; }
@@ -633,7 +746,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   // sequences go through the ordinary router, including mouse ownership.
   const frameModalInput = (text: string): void => {
     let remaining = text;
-    if (!newTab.isOpen() && (escapePending || discardEscapeSuffix)) {
+    if (!newTab.isOpen() && !movePicker && (escapePending || discardEscapeSuffix)) {
       if (escapeTimer) clearTimeout(escapeTimer);
       escapeTimer = undefined;
       escapePending = '';
@@ -653,7 +766,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
         const at = remaining.indexOf('\u001b');
         if (at < 0) { routeInput(remaining); return; }
         if (at > 0) { routeInput(remaining.slice(0, at)); remaining = remaining.slice(at); }
-        if (!newTab.isOpen()) { routeInput(remaining); return; }
+        if (!newTab.isOpen() && !movePicker) { routeInput(remaining); return; }
         escapePending = '\u001b';
         remaining = remaining.slice(1);
       }
@@ -661,7 +774,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       if (escapePending === '\u001b' && remaining && remaining[0] !== '[' && remaining[0] !== 'O') {
         escapePending = ''; routeInput('\u001b');
         // The entire terminal read belonged to the modal at cancellation.
-        if (!newTab.isOpen()) return;
+        if (!newTab.isOpen() && !movePicker) return;
         remaining = remaining.slice(1);
         continue;
       }
@@ -678,8 +791,8 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
           escapeTimer = undefined;
           if (escapePending !== captured) return;
           escapePending = '';
-          if (captured === '\u001b' && newTab.isOpen() && !finished) routeInput(captured);
-          else if (captured !== '\u001b' && newTab.isOpen() && !finished) discardEscapeSuffix = true;
+          if (captured === '\u001b' && (newTab.isOpen() || movePicker) && !finished) routeInput(captured);
+          else if (captured !== '\u001b' && (newTab.isOpen() || movePicker) && !finished) discardEscapeSuffix = true;
         // Legacy terminals cannot distinguish a lone Esc from an arbitrarily delayed sequence.
         // Give ordinary transport/scheduling jitter 40ms; longer gaps can still be misclassified.
         }, captured === '\u001b' ? 40 : 250);
@@ -705,7 +818,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
         void refreshRemote();                                      // the other hosts join the list when they answer
         if (finished) return;
         if (pane) select(pane);
-        else if (rows.length === 0 && !automaticCreateAttempted) {
+        else if (rows.length === 0 && !selectedEmpty && !automaticCreateAttempted) {
           automaticCreateAttempted = true;
           await create(undefined, undefined, true);             // an empty server opens with one shell, like herdr's first workspace
         }

@@ -21,7 +21,7 @@ export type SendCeoFrame = (socketPath: string, frame: CeoIngressFrame) => Promi
  * JUD hold #122410) passes its own bound: the default 10 s would cut a busy session's honest
  * consumption receipt off long before the idle boundary ever drains the queued frame.
  */
-export interface SendFrameOpts { readonly answerTimeoutMs?: number }
+export interface SendFrameOpts { readonly answerTimeoutMs?: number; readonly paneAuth?: { readonly token: string; readonly pid: number } }
 
 /** Direction-agnostic wire client: accepts either frame kind; each caller's seam stays narrow. */
 export const sendFrameOverSocket = <F extends AgentEventFrame | CeoIngressFrame>(
@@ -29,6 +29,7 @@ export const sendFrameOverSocket = <F extends AgentEventFrame | CeoIngressFrame>
 ): Promise<FrameAnswer> => new Promise((resolve) => {
   let buffered = '';
   let settled = false;
+  let awaitingAuth = !!opts.paneAuth;
   const socket = createConnection(socketPath);
   const done = (answer: FrameAnswer): void => {
     if (settled) return;
@@ -43,15 +44,21 @@ export const sendFrameOverSocket = <F extends AgentEventFrame | CeoIngressFrame>
   socket.on('connect', () => {
     // terra must 3 (#38499): a frame that cannot serialize (BigInt in meta, a cycle) fails THIS frame only — never an
     // uncaught throw out of the socket callback that would escape the promise chain.
-    try { socket.write(`${JSON.stringify(frame)}\n`); } catch { done({ exitCode: 1, message: 'event frame failed to serialize' }); }
+    try {
+      if (opts.paneAuth) socket.write(`${JSON.stringify({ op: 'auth', ...opts.paneAuth })}\n`);
+      socket.write(`${JSON.stringify(frame)}\n`);
+    } catch { done({ exitCode: 1, message: 'event frame failed to serialize' }); }
   });
   socket.on('data', (chunk: string) => {
     buffered += chunk;
-    const end = buffered.indexOf('\n');
-    if (end < 0) return;
-    try { const answer = JSON.parse(buffered.slice(0, end)) as { exitCode?: unknown; message?: unknown };
-      done({ exitCode: typeof answer.exitCode === 'number' ? answer.exitCode : 1, message: String(answer.message ?? '') }); }
-    catch { done({ exitCode: 1, message: 'event host answered with a malformed line' }); }
+    let end: number;
+    while ((end = buffered.indexOf('\n')) >= 0) {
+      const line = buffered.slice(0, end); buffered = buffered.slice(end + 1);
+      try { const answer = JSON.parse(line) as { exitCode?: unknown; message?: unknown };
+        if (awaitingAuth) { awaitingAuth = false; if (answer.exitCode !== 0) { done({ exitCode: 1, message: 'event authentication failed' }); return; } continue; }
+        done({ exitCode: typeof answer.exitCode === 'number' ? answer.exitCode : 1, message: String(answer.message ?? '') }); return;
+      } catch { done({ exitCode: 1, message: 'event host answered with a malformed line' }); return; }
+    }
   });
   socket.on('error', (error) => done({ exitCode: 1, message: error.message }));
   socket.on('close', () => done({ exitCode: 1, message: 'event host closed the connection' }));

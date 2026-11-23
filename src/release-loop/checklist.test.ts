@@ -363,8 +363,8 @@ describe('release checklist ledger', () => {
     addItem('9.9.9', { id: 'SCREEN', title: 'screen', kind: 'screen', dispatchKind: 'ops' });
     addItem('9.9.9', { id: 'POST', title: 'postpub', kind: 'postpub', dispatchKind: 'measure', priority: 'P0' });
     addItem('9.9.9', { id: 'CODE', title: 'code', dispatchKind: 'code' });
-    setItem('9.9.9', 'SCREEN', { status: 'green' }, 'MK');
-    setItem('9.9.9', 'CODE', { status: 'green' }, 'MK');
+    setItem('9.9.9', 'SCREEN', { status: 'green' }, 'JUD-3'); // 출처: #134310 ② — green 씨앗은 판정자 by
+    setItem('9.9.9', 'CODE', { status: 'green' }, 'JUD-3'); // 출처: #134310 ② — green 씨앗은 판정자 by
     const rows = listChecklist('9.9.9').items;
     expect(rows.find((item) => item.id === 'SCREEN')).toMatchObject({ kind: 'screen', dispatchKind: 'ops' });
     expect(rows.find((item) => item.id === 'POST')).toMatchObject({ kind: 'postpub', dispatchKind: 'measure' });
@@ -644,7 +644,7 @@ describe('release checklist ledger', () => {
     expect(parityGap('짝: PWA ⏳ (칸 K2) · 데스크톱 ✅ · 폴드 ✅ · 아이폰 ✅ · 아이패드 ✅')).toBeNull();
     expect(parityGap(valid)).toBeNull();
     addItem('9.9.9', { id: 'K1', title: 'screen', kind: 'screen' });
-    setItem('9.9.9', 'K1', { status: 'green' }, 'TC');
+    setItem('9.9.9', 'K1', { status: 'green' }, 'JUD-3'); // 출처: #134310 ② — green 씨앗은 판정자 by
     expect(checklistGate('9.9.9')).toMatchObject({ ok: true, parity: [{ id: 'K1', why: '근거에 짝: 줄이 없다' }] });
     setItem('9.9.9', 'K1', { evidence: valid }, 'TC');
     expect(checklistGate('9.9.9')).toMatchObject({ ok: true, parity: [] });
@@ -655,7 +655,7 @@ describe('release checklist ledger', () => {
     const version = '9.9.9';
     addItem(version, { id: 'POSTPUB-VERIFY', title: '발행 뒤 실측', kind: 'postpub', priority: 'P0' });
     addItem(version, { id: 'READY', title: '발행 전 준비' });
-    setItem(version, 'READY', { status: 'green' }, 'MK');
+    setItem(version, 'READY', { status: 'green' }, 'JUD-3'); // 출처: #134310 ② — green 씨앗은 판정자 by
     const logs: unknown[] = [];
     const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
       if (category === 'release-loop.checklist' && event === 'gate-postpub-excluded') logs.push(data);
@@ -689,7 +689,7 @@ describe('release checklist ledger', () => {
     }
     addItem(version, { id: 'NORMAL', title: 'ordinary', priority: 'P1' });
     addItem(version, { id: 'SCREEN', title: 'five surfaces', kind: 'screen' });
-    setItem(version, 'SCREEN', { status: 'green' }, 'MK');
+    setItem(version, 'SCREEN', { status: 'green' }, 'JUD-3'); // 출처: #134310 ② — green 씨앗은 판정자 by
     const gate = checklistGate(version);
     expect(gate).toMatchObject({
       ok: false, postpub: ['POST-RED', 'POST-BLOCK', 'POST-MOVE', 'POST-ISSUE', 'POST-AUTO'],
@@ -715,7 +715,7 @@ describe('release checklist ledger', () => {
       if (status !== 'yellow' || disposition !== undefined) setItem(version, id, { status, disposition, evidence: id }, 'MK');
     }
     addItem(version, { id: 'SCREEN', title: 'screen', kind: 'screen' });
-    setItem(version, 'SCREEN', { status: 'green' }, 'MK');
+    setItem(version, 'SCREEN', { status: 'green' }, 'JUD-3'); // 출처: #134310 ② — green 씨앗은 판정자 by
     expect(checklistGate(version)).toMatchObject({
       ok: false, postpub: [], red: ['RED'], undecided: ['UNDECIDED'], blocked: ['BLOCK'], moved: ['MOVE'],
       knownIssues: [{ id: 'ISSUE', title: 'ISSUE', evidence: 'ISSUE' }], parity: [{ id: 'SCREEN', why: '근거에 짝: 줄이 없다' }],
@@ -758,13 +758,13 @@ describe('release checklist ledger', () => {
     expect(seeded.items.find((i) => i.id === 'K2')?.status).toBe('done');
     expect(seeded.items.find((i) => i.id === 'K3')?.status).toBe('yellow');
     const before = summarize('0.2.5');
-    setItem('0.2.5', 'K4', { status: 'green', evidence: '#99999' }, 'T');
+    setItem('0.2.5', 'K4', { status: 'green', evidence: '#99999' }, 'JUD-3'); // 출처: #134310 ② — green 씨앗은 판정자 by
     const after = summarize('0.2.5');
     expect(after.green).toBe(before.green + 1);
     expect(after.red).toBe(before.red - 1);
     expect(listChecklist('0.2.5').history.slice(-2)).toMatchObject([
-      { by: 'T', id: 'K4', field: 'evidence', to: '#99999' },
-      { by: 'T', id: 'K4', field: 'status', from: 'red', to: 'green', dev: devVersion() },
+      { by: 'JUD-3', id: 'K4', field: 'evidence', to: '#99999' },
+      { by: 'JUD-3', id: 'K4', field: 'status', from: 'red', to: 'green', dev: devVersion() },
     ]);
     seedFromRoadmap('0.2.5', markdown);
     expect(listChecklist('0.2.5').items.find((i) => i.id === 'K4')).toMatchObject({ status: 'green', evidence: '#99999' });

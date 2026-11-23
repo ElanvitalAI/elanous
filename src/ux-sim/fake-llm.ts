@@ -19,6 +19,8 @@ export const TEST_FAKE_LLM_RESPONSE_RULES_ENV = 'ELANOUS_TEST_FAKE_LLM_RESPONSE_
 export const TEST_FAKE_LLM_FAIL_WHEN_ENV = 'ELANOUS_TEST_FAKE_LLM_FAIL_WHEN';
 /** Optional maximum Unicode code points per emitted text delta (unset = one delta). */
 export const TEST_FAKE_LLM_CHUNK_SIZE_ENV = 'ELANOUS_TEST_FAKE_LLM_CHUNK_SIZE';
+/** 시험 seam — 스트리밍 델타 사이 실시간 간격(ms). 미지정/0 = 종래 몰아내기. 칠 절奏 시험이 실사용 도착 간격을 모사한다. 출처: #132091 */
+export const TEST_FAKE_LLM_CHUNK_DELAY_MS_ENV = 'ELANOUS_TEST_FAKE_LLM_CHUNK_DELAY_MS';
 /** TUI-400-AUTOHEAL-FALLBACK — 호출별 결함 스크립트(쉼표 목록 · `400` | `400codex` | `ok`). 예: `400,ok,ok`.
  *  `400` 칸은 실측 «대화 기록 어긋남» 꼴(`LLM API 400: … No tool call found for function call output …`)을 던진다.
  *  스크립트가 끝나면 `ok`. 칸 소비는 이 프로세스 안 호출 순서다(라이브 TUI 격리 무대용 — 생산은 이 env 를 안 본다). */
@@ -45,6 +47,17 @@ export function testFakeLlmUniverse(env: NodeJS.ProcessEnv = process.env): boole
 /** `test-fake-llm` 은 시험·시뮬 우주에서만 «아는 공급자»다(llm.ts 등록 관문이 이것을 먼저 본다). */
 export function isTestUniverseFakeProviderName(name: string, env: NodeJS.ProcessEnv = process.env): name is typeof TEST_FAKE_LLM_PROVIDER_NAME {
   return name === TEST_FAKE_LLM_PROVIDER_NAME && testFakeLlmUniverse(env);
+}
+
+/** TEST-FAKE-LLM-RESPECT-INJECTED — does a fake switch outrank a provider the caller passed in (`provider`·`initialProvider`)?
+ *  Explicit fake mode, ux-sim runs, the sim universe and the isolated live-TUI stage (`ELANOUS_TEST_FAKE_LLM_AS_PROVIDER=1`)
+ *  fence every injection. A bare `ELANOUS_TEST_FAKE_LLM=1` — the gate pod baseline (scripts/lib/gate-test-env.ts) — only
+ *  replaces the default provider resolution: an injected fixture provider still owns its turn, the same as outside the pod. */
+export function testFakeLlmFencesInjectedProvider(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.ELANOUS_LLM_MODE === 'fake'
+    || (env[TEST_FAKE_LLM_ENV] === '1' && env.ELANOUS_TEST_FAKE_LLM_AS_PROVIDER === '1')
+    || Boolean(env.ELANOUS_UX_SIM_RUN_ID?.trim())
+    || env.ELANOUS_SIM_UNIVERSE === '1';
 }
 
 /** Test and simulated code default to the fake provider. A live `--test` CLI
@@ -326,7 +339,31 @@ export const testFakeLlmProvider: LLMProvider = {
     const failWhen = process.env[TEST_FAKE_LLM_FAIL_WHEN_ENV];
     if (failWhen && (lastHumanText(messages) ?? '').includes(failWhen)) throw new Error(`fake LLM failure for ${failWhen}`);
     const step = consumeScriptStep(messages);
-    if (!await scriptedDelay(messages, _opts?.signal)) return;
+    // Simulation-only active streaming: model output proves a long worker is
+    // alive without triggering the production stream-idle watchdog.
+    const tickMs = Number(process.env.ELANOUS_TEST_FAKE_LLM_HEARTBEAT_MS ?? 0);
+    const durationMs = Number(process.env[TEST_FAKE_LLM_DELAY_MS_ENV] ?? 0);
+    const when = process.env[TEST_FAKE_LLM_DELAY_WHEN_ENV];
+    if (Number.isFinite(tickMs) && tickMs > 0 && Number.isFinite(durationMs) && durationMs > 0
+      && (!when || (lastHumanText(messages) ?? '').includes(when))) {
+      const deadline = Date.now() + durationMs;
+      while (Date.now() < deadline) {
+        if (_opts?.signal?.aborted) return;
+        yield { type: 'text', delta: '.' };
+        if (_opts?.signal?.aborted) return;
+        const completed = await new Promise<boolean>(resolve => {
+          const finish = (ok: boolean) => {
+            clearTimeout(timer);
+            _opts?.signal?.removeEventListener('abort', onAbort);
+            resolve(ok);
+          };
+          const onAbort = () => finish(false);
+          const timer = setTimeout(() => finish(true), Math.min(tickMs, Math.max(0, deadline - Date.now())));
+          _opts?.signal?.addEventListener('abort', onAbort, { once: true });
+        });
+        if (!completed) return;
+      }
+    } else if (!await scriptedDelay(messages, _opts?.signal)) return;
     if (step?.startsWith('stall:')) {
       yield { type: 'text', delta: step.slice('stall:'.length) };
       const signal = _opts?.signal;
@@ -338,7 +375,14 @@ export const testFakeLlmProvider: LLMProvider = {
     if (parallelBatch) { for (const batchCall of parallelBatch) yield batchCall; return; }
     const call = scriptedToolCall(messages);
     if (call) { yield call; return; }
-    for (const delta of responseChunks(testFakeLlmResponse(messages))) yield { type: 'text', delta };
+    const chunks = responseChunks(testFakeLlmResponse(messages));
+    const rawChunkDelay = process.env[TEST_FAKE_LLM_CHUNK_DELAY_MS_ENV];
+    // 출처: #132091 — 미지정 0ms = 종래 동작(델타 몰아내기). 양수면 델타 사이에 실시간 간격만큼 쉰다.
+    const chunkDelayMs = rawChunkDelay === undefined || rawChunkDelay.trim() === '' ? 0 : Number(rawChunkDelay);
+    for (const [index, delta] of chunks.entries()) {
+      if (index > 0 && chunkDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, chunkDelayMs));
+      yield { type: 'text', delta };
+    }
     // Explicit device telemetry, supplied by the test world rather than
     // estimated from the answer. Ordinary fake turns report no usage.
     const measured = process.env.ELANOUS_TEST_FAKE_LLM_MEASURED_USAGE;

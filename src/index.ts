@@ -1598,6 +1598,7 @@ seatCmd.command('answer <askId> <answer>').description('자리 질문에 답을 
         let sent = false;
         await deliverSeatAnswers({ askId, channel: 'telegram', botId, send: async (target, text) => {
           if (target.channel !== 'telegram') throw new Error('seat ask belongs to another surface');
+          // llm-ledger-exempt: telegram-send
           const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
             method: 'POST', headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ chat_id: target.chatId, text, reply_to_message_id: target.messageId,
@@ -10258,6 +10259,7 @@ localCmd
     const { models } = resolveLocalEndpoints(url);
     const t0 = Date.now();
     try {
+      // llm-ledger-exempt: model-listing
       const res = await fetch(models, { signal: AbortSignal.timeout(10_000) });
       const ms = Date.now() - t0;
       if (!res.ok) {
@@ -10287,6 +10289,7 @@ localCmd
     const { resolveLocalEndpoints } = await import('./local-llm-test.js');
     const { models } = resolveLocalEndpoints(url);
     try {
+      // llm-ledger-exempt: model-listing
       const res = await fetch(models, { signal: AbortSignal.timeout(15_000) });
       if (!res.ok) {
         ui.error(`HTTP ${res.status} from ${models}`);
@@ -10941,6 +10944,7 @@ program
               if (!httpUrl) {
                 console.log('(daemon has no --http-port — cannot list sessions)');
               } else {
+                // llm-ledger-exempt: file-download
                 const fetchRes = await fetch(httpUrl, { headers });
                 if (fetchRes.ok) {
                   const body = await fetchRes.json() as {
@@ -13359,23 +13363,53 @@ export interface TuiSelfRestartDeps {
   /** 관측 전용 — «전역 최신»이 무엇이든 재기동 id 는 여기서 고르지 않는다(로그·사유 문면에만 적는다). */
   readonly globalLatestSessionId?: () => string | null;
   readonly spawnChild?: (command: string, argv: readonly string[], env: Record<string, string>) => Promise<number>;
+  /** The session-scoped provider choice to carry into the child — default = this process's `/provider` selection. */
+  readonly sessionProvider?: (sessionId: string) => { readonly provider: string; readonly model?: string } | undefined;
   /** The old TUI no longer owns the screen while its replacement runs on the same PTY. */
   readonly retireCurrentTui?: () => void;
+  /** The script to fall back to when the relaunched child fails fast — default = this process's own entry (`process.argv[1]`). */
+  readonly fallbackScriptPath?: string;
+  /** Clock for the restart-loop window and the fast-fail check — default = `Date.now`. */
+  readonly now?: () => number;
   readonly log?: (event: string, detail: Record<string, unknown>) => void;
 }
 
 /** 한 런의 재기동 세대 상한 — 재기동한 자식이 또 낡아도 여기서 멈춘다(무한 재기동 방지). */
 const TUI_SELF_RESTART_MAX_GENERATION = 3;
+/**
+ * ELS-UPDATE-ALL-MIGRATE-EXITS: only relaunches that follow each other within this window count as a loop.
+ * A seat that lived through several `els update-all` runs in one evening used to carry generation 3 and the
+ * next migration was refused, leaving the tab exited.
+ */
+export const TUI_SELF_RESTART_LOOP_WINDOW_MS = 60_000;
+/** A relaunched child that exits non-zero this fast never came up; the original command is relaunched once instead. */
+export const TUI_SELF_RESTART_FAST_FAIL_MS = 15_000;
+
+/** The restart generation that still counts toward the loop limit — 0 when the previous relaunch is older than the window. */
+export function readTuiRestartGeneration(env: Readonly<Record<string, string | undefined>>, nowMs: number): number {
+  const generation = Number.parseInt(env.ELANOUS_TUI_RESTART_GEN ?? '0', 10) || 0;
+  const at = Number.parseInt(env.ELANOUS_TUI_RESTART_AT ?? '', 10);
+  if (!Number.isFinite(at) || nowMs - at > TUI_SELF_RESTART_LOOP_WINDOW_MS) return 0;
+  return generation;
+}
 
 /** 재기동 자식에게 넘길 argv — 이 TUI 의 활성 대화만 `--resume` 으로 싣는다. */
 export function planTuiRestartArgv(input: {
   readonly scriptPath: string;
   readonly args: readonly string[];
   readonly sessionId: string;
+  /** ELS-SEAT-MODEL-DECLARE: the session's live provider choice (`/provider` or launch flags) replaces the launch flags. */
+  readonly provider?: { readonly provider: string; readonly model?: string };
 }): string[] {
   const kept: string[] = [];
   for (let i = 0; i < input.args.length; i += 1) {
     const arg = input.args[i]!;
+    if (input.provider && (arg === '--provider' || arg === '--model')) {
+      const next = input.args[i + 1];
+      if (next !== undefined && !next.startsWith('-')) i += 1;
+      continue;
+    }
+    if (input.provider && (arg.startsWith('--provider=') || arg.startsWith('--model='))) continue;
     if (arg === '--resume') {
       // 값 없는 `--resume` 뒤에 오는 플래그는 값이 아니다 — 삼키지 않는다.
       const next = input.args[i + 1];
@@ -13385,7 +13419,11 @@ export function planTuiRestartArgv(input: {
     if (arg === '--continue' || arg.startsWith('--resume=') || arg.startsWith('--continue=')) continue;
     kept.push(arg);
   }
-  return [input.scriptPath, ...kept, '--resume', input.sessionId];
+  // Root launch flags must stay in the root prefix, so the provider choice leads.
+  const provider = input.provider
+    ? ['--provider', input.provider.provider, ...(input.provider.model ? ['--model', input.provider.model] : [])]
+    : [];
+  return [input.scriptPath, ...provider, ...kept, '--resume', input.sessionId];
 }
 
 /**
@@ -13404,7 +13442,8 @@ export async function runTuiSelfRestartOnStaleBuild(deps: TuiSelfRestartDeps = {
     report('skip', { reason: staleness.reason });
     return { outcome: 'skip', reason: staleness.reason };
   }
-  const generation = Number.parseInt(process.env.ELANOUS_TUI_RESTART_GEN ?? '0', 10) || 0;
+  const now = deps.now ?? Date.now;
+  const generation = readTuiRestartGeneration(process.env, now());
   const tuiReport = await import('./capture/tui-self-report.js');
   const store = await import('./session/index.js');
   const owned = (deps.owned ?? tuiReport.getTuiOwnedSession)();
@@ -13446,14 +13485,18 @@ export async function runTuiSelfRestartOnStaleBuild(deps: TuiSelfRestartDeps = {
     report('blocked', { reason: 'migration-current-missing' });
     return { outcome: 'blocked', reason: 'migration-current-missing' };
   }
+  const sessionProvider = (deps.sessionProvider
+    ?? (await import('./tui-client/session-provider.js')).getSessionProvider)(decision.sessionId);
   const argv = planTuiRestartArgv({
     scriptPath: deps.scriptPath ?? (deps.migrateSessionId !== undefined ? currentScript : process.argv[1] ?? ''),
     args: deps.args ?? process.argv.slice(2),
     sessionId: decision.sessionId,
+    ...(sessionProvider ? { provider: sessionProvider } : {}),
   });
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) if (typeof value === 'string') env[key] = value;
   env.ELANOUS_TUI_RESTART_GEN = String(generation + 1);
+  env.ELANOUS_TUI_RESTART_AT = String(now());
   report('relaunch', {
     sessionId: decision.sessionId,
     claimedAt: decision.claimedAt,
@@ -13475,7 +13518,23 @@ export async function runTuiSelfRestartOnStaleBuild(deps: TuiSelfRestartDeps = {
     report('blocked', { reason: 'owner-retire-failed', error: String(error).slice(0, 200) });
     return { outcome: 'blocked', reason: 'owner-retire-failed' };
   }
-  const exitCode = await (deps.spawnChild ?? defaultTuiSelfRestartSpawn)(process.execPath, argv, env);
+  const spawnChild = deps.spawnChild ?? defaultTuiSelfRestartSpawn;
+  const startedAt = now();
+  const exitCode = await spawnChild(process.execPath, argv, env);
+  const livedMs = now() - startedAt;
+  if (exitCode !== 0 && livedMs < TUI_SELF_RESTART_FAST_FAIL_MS) {
+    // Fail-safe: the new TUI never came up. Relaunch the command this tab was started with (its own entry and
+    // its own launch flags, no provider rewrite) on the same session, once, instead of leaving the tab exited.
+    const fallbackArgv = planTuiRestartArgv({
+      scriptPath: deps.fallbackScriptPath ?? process.argv[1] ?? argv[0] ?? '',
+      args: deps.args ?? process.argv.slice(2),
+      sessionId: decision.sessionId,
+    });
+    report('fallback', { reason: 'child-fast-exit', exitCode, livedMs, argv, fallbackArgv, sessionId: decision.sessionId });
+    console.error(`elanous: 새 TUI 가 ${Math.round(livedMs / 1000)}초 만에 종료 코드 ${exitCode} 로 끝났다 — 원래 명령으로 이 대화(${decision.sessionId})를 다시 띄운다.`);
+    const fallbackExitCode = await spawnChild(process.execPath, fallbackArgv, env);
+    return { outcome: 'relaunch', reason: 'fallback-after-child-fast-exit', sessionId: decision.sessionId, argv: fallbackArgv, exitCode: fallbackExitCode };
+  }
   return { outcome: 'relaunch', reason: staleness.reason, sessionId: decision.sessionId, argv, exitCode };
 }
 

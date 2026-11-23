@@ -4,7 +4,6 @@
 // closing the panel leaves the server and every pane running. A server that does not answer yields no rows (the
 // panel stays what it was); a remote host that does not answer is one row marked ✕.
 import { parseAddress } from '../../els/address.js';
-import { STATUS } from '../../els/status-vocab.js';
 import type { SidetabAgentState, SidetabRow } from '../../sidetab-core/model.js';
 import { safeElsErrorStatus } from './els-error.js';
 
@@ -111,7 +110,8 @@ export function elsRowsFromList(listJson: string, localHost: string): SidetabRow
     const name = text(raw.name);
     // This host being down means no local server: the panel's normal «els off», not a broken remote.
     if (!name || name === localHost) continue;
-    rows.push({ id: `els-host:${name}`, kind: 'els', label: `${STATUS.failed.mark} ⇄${name} · 연결 끊김`, badge: 'stale', remoteHost: name, host: name,
+    // 출처: OP #134199 — 접속 끊김 ✕ 는 상태 마크(STATUS.failed.mark)와 별개인 이 패널 자기 계약(파일 머리 주석): 이모지 어휘 갱신에 함께 바뀌지 않는다.
+    rows.push({ id: `els-host:${name}`, kind: 'els', label: `✕ ⇄${name} · 연결 끊김`, badge: 'stale', remoteHost: name, host: name,
       status: safeElsErrorStatus(raw.reason) });
   }
   return rows;

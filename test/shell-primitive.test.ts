@@ -155,10 +155,12 @@ describe('shell-primitive: approval cache', () => {
     expect(_snapshotApprovalCacheForTesting()).toEqual({});
   });
 
-  test('approval policy with no approver wired → fail-closed (denied)', async () => {
+  // 대표 11-23 ELS-ELN-SECURITY-RELAX — no approver to ask: a non-destructive command runs.
+  test('approval policy with no approver wired → non-destructive command runs', async () => {
     setShellApprover(null);
     const res = await runShell({ command: ['echo', 'x'], cwd, approval: 'first-time' });
-    expect(res.outcome).toBe('denied');
+    expect(res.outcome).toBe('exit');
+    expect(res.stdout).toBe('x\n');
   });
 
   test('manual rememberDecision + getCachedDecision round-trip', () => {

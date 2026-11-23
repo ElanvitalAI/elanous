@@ -23,7 +23,7 @@ test('next TUI acknowledges /now before the ledger answer arrives in a real PTY'
       rows: 24,
       cols: 100,
       env: { ELANOUS_SESSION_ROOT: join(root, 'sessions') },
-      ready: { label: 'ready', timeoutMs: 30_000, until: screen => screen.includes('elanous') && screen.includes('Ctrl+Q 종료') && screen.includes('❯ ') }, // Source: #36749 compact header; #36701 PTY boot deadline.
+      ready: { label: 'ready', timeoutMs: 30_000, until: screen => screen.includes('elanous') && screen.includes('Ctrl+Q quit') && screen.includes('❯ ') }, // Source: #36749 compact header; #36701 PTY boot deadline.
       steps: [{
         label: 'acknowledged',
         text: '/now',

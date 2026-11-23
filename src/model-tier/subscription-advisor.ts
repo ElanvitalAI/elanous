@@ -25,9 +25,10 @@ export interface SubscriptionWindow {
 export interface SubscriptionUsage {
   readonly provider: string;
   readonly account: string | null;  /** 최근 7일 창 소진(마찰 지점 수 — 창 리밋 도달 횟수). */
-  readonly weeklyWindowExhaustions: number;
-  /** 최근 30일 창 소진 횟수. */
-  readonly monthlyWindowExhaustions: number;
+  /** 최근 7일 창 소진 — null = 미귀속(계정 미구분 관측)이라 미측정(terra r1 mustFix ② · PR 39662 r2). */
+  readonly weeklyWindowExhaustions: number | null;
+  /** 최근 30일 창 소진 횟수 — null = 미귀속(계정 미구분 관측)이라 미측정. */
+  readonly monthlyWindowExhaustions: number | null;
   /** 월 구독가 — 미관측(null). 등급간 가격표는 비공개(JUD-B #125712 estRatio=null 과 같은 계약 · 제안 금액은 비율만). */
   readonly monthlyPriceUsd: number | null;
   /** 이 구독 경유 호출 수(최근 30일). */

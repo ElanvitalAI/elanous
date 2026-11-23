@@ -1,7 +1,7 @@
 // 모델 오케스트레이션 코어 — 계약 시험. 가짜 사다리 · 가짜 ADVISOR 규칙 · 가짜 창 선택기를 «인터페이스로만» 끼운다.
 // 숫자는 모듈 상수에서 유도한다(NUMGUARD) · 시계·네트워크·LLM 0.
 import { describe, expect, test } from 'bun:test';
-import { ACTIVE_ACCOUNT_SELECTOR, CORE_BASE_TIER, DEFAULT_CORE_MODULES, createModelOrchestrationCore } from './model-orchestration.js';
+import { ACTIVE_ACCOUNT_SELECTOR, CORE_BASE_TIER, DEFAULT_CORE_MODULES, createModelOrchestrationCore, installCoreModules, modelOrchestrationCore } from './model-orchestration.js';
 import { classifyWorkRisk } from './work-risk-router.js';
 import { RED_ROUNDS_ESCALATE_AT, SAME_ERROR_ESCALATE_AT, STRONG_OUTPUT_MAX_TOKENS, WORK_TIER_LADDER_CELL } from './work-tier-policy.js';
 import { ADVISOR_ESCALATE_RULE } from './advisor-checkpoints.js';
@@ -134,9 +134,27 @@ describe('decision ledger record', () => {
     const prose = 'PROSE-MARKER-hdr';
     const record = c.decisionRecord({ ...decision, prompt: prose } as never, { ...i, userText: prose } as never,
       { mode: 'shadow', applied: false, skip: 'shadow', launched: { provider: 'fake', model: 'fake-current', text: prose } as never });
-    expect(Object.keys(record).sort()).toEqual(['account', 'accountApplied', 'applied', 'appliedAccount', 'bloom', 'cell', 'kind', 'launched', 'level', 'mode',
+    expect(Object.keys(record).sort()).toEqual(['account', 'accountApplied', 'applied', 'appliedAccount', 'bloom', 'cell', 'decisionId', 'kind', 'launched', 'level', 'mode',
       'model', 'moment', 'provider', 'reason', 'riskCategories', 'runId', 'skip', 'tier', 'trigger', 'unmeasured'].sort());
     expect(JSON.stringify(record)).not.toContain(prose);
     expect(record).not.toHaveProperty('round');
+  });
+});
+
+// terra r1 mustFix ①(PR 39662 r2) — 발급 순번은 runId 스코프(런 수명)에 결속: 코어 재생성·기본 코어 교체로
+// 같은 runId#d1 중복이 불가능해야 한다. r1 의 발급기는 코어 인스턴스마다 카운터를 초기화했다(재생성 사례 시험).
+describe('decisionId 발급 — 런 수명(runId 스코프) 유일성', () => {
+  test('코어 재생성·installCoreModules 기본 코어 교체 후에도 같은 runId 의 순번은 이어진다', () => {
+    const seqInput = (runId: string) => input('design', RISKY, { runId });
+    const first = core().decide(seqInput('run-issuer-a'));
+    const regenerated = core().decide(seqInput('run-issuer-a')); // 같은 runId, 새 코어 인스턴스(재생성)
+    expect(first.decisionId).toBe('run-issuer-a#d1');
+    expect(regenerated.decisionId).toBe('run-issuer-a#d2'); // r1: 인스턴스 카운터 초기화로 #d1 중복
+    const otherRun = core().decide(seqInput('run-issuer-b'));
+    expect(otherRun.decisionId).toBe('run-issuer-b#d1'); // runId 별 독립 순번
+    installCoreModules(DEFAULT_CORE_MODULES); // 기본 코어 교체(프로세스 기본 발급 경로)
+    const afterSwap = modelOrchestrationCore().decide(seqInput('run-issuer-a'));
+    expect(afterSwap.decisionId).toBe('run-issuer-a#d3');
+    installCoreModules(DEFAULT_CORE_MODULES); // 원상 복구(다음 modelOrchestrationCore() 는 새 인스턴스)
   });
 });

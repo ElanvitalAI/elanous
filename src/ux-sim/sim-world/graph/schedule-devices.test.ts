@@ -11,7 +11,7 @@ import {
   SCHEDULE_S1_EXPECT_GREEN, SCHEDULE_S1_RED_REASONS, ScheduleGraphHarness,
   simWorldDevices, simWorldScenarios,
 } from './schedule-devices.js';
-import expectTable from '../../worlds/sim-world-expect.json';
+import expectTable from '../../worlds/expect/graph.json';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });

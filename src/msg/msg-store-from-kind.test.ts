@@ -132,10 +132,13 @@ describe('SEAT-INBOX-PROTOCOL B1-A mf2: SCHEMA-V2 columns, origin range, envelop
     } finally { store.close(); }
   });
 
-  test('(c) invalid intent is rejected', () => {
+  test('(c) MSG-FILTERS-RELAX: an unknown intent is stored as info and the word is kept as an intent: ref', () => {
     const store = new MsgStore(':memory:');
-    try { expect(() => store.post({ from: 'OP', to: 'TC', body: 'x', intent: 'urgent' as never })).toThrow(); }
-    finally { store.close(); }
+    try {
+      const posted = store.post({ from: 'OP', to: 'TC', body: 'x', intent: 'Urgent' as never });
+      const read = store.getMessage(posted.id)!;
+      expect([read.intent, read.refs]).toEqual(['info', ['intent:urgent']]);
+    } finally { store.close(); }
   });
 
   test('(d) needsAck defaults: request/decision true, info/alert false, absent intent false', () => {
@@ -178,7 +181,7 @@ describe('SEAT-INBOX-PROTOCOL B1-A mf2: SCHEMA-V2 columns, origin range, envelop
     } finally { store.close(); }
   });
 
-  test('(g) CLI post rejects a --crown-directive id missing from the directive ledger', async () => {
+  test('(g) MSG-FILTERS-RELAX: CLI post stores a --crown-directive id missing from the ledger, with a warning', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'elanous-msg-fromkind-cli-'));
     dirs.push(dir);
     const stateDir = join(dir, 'state');
@@ -199,9 +202,10 @@ describe('SEAT-INBOX-PROTOCOL B1-A mf2: SCHEMA-V2 columns, origin range, envelop
         wake: async (address, msgId) => ({ wake: 'none', source: 'unresolved', address, msgId, result: 'skipped' }),
         setExitCode: code => exits.push(code),
       });
-      await program.parseAsync(['msg', 'post', '--from', 'OP', '--to', 'TC', '--crown-directive', '999'], { from: 'user' });
-      expect(exits[0]).toBe(2);
-      expect(stderr.some(line => line.includes('crown-directive'))).toBe(true);
+      await program.parseAsync(['msg', 'post', '--from', 'OP', '--to', 'TC', '--crown-directive', '999', '--json'], { from: 'user' });
+      expect(exits).toEqual([]);
+      expect(stderr.some(line => line.includes('--crown-directive: 지시 원장을 찾을 수 없습니다'))).toBe(true);
+      expect((JSON.parse(stdout.at(-1)!) as { crownDirective: string }).crownDirective).toBe('999');
 
       // Same CLI accepts the id once a fake ledger has it (rowid 1).
       mkdirSync(join(stateDir, 'directives'), { recursive: true });
@@ -213,13 +217,13 @@ describe('SEAT-INBOX-PROTOCOL B1-A mf2: SCHEMA-V2 columns, origin range, envelop
       registerMsgCommands(program2, {
         openStore: () => new MsgStore(join(dir, 'messages.db')),
         out: { log: line => stdout.push(line), error: line => stderr.push(line) },
-        readStdin: async () => 'body', sleep: async () => undefined,
+        readStdin: async () => 'second body', sleep: async () => undefined,
         registerLogSink: async () => undefined,
         wake: async (address, msgId) => ({ wake: 'none', source: 'unresolved', address, msgId, result: 'skipped' }),
         setExitCode: code => exits.push(code),
       });
       await program2.parseAsync(['msg', 'post', '--from', 'OP', '--to', 'TC', '--crown-directive', '1', '--json'], { from: 'user' });
-      expect(stderr.filter(line => line.includes('crown-directive')).length).toBe(1); // no new rejection
+      expect(stderr.filter(line => line.includes('crown-directive')).length).toBe(1); // no new warning
       const saved = JSON.parse(stdout.at(-1)!) as { id: number };
       const reopen = new MsgStore(join(dir, 'messages.db'));
       try {
@@ -309,10 +313,11 @@ describe('SEAT-INBOX-PROTOCOL B1-A mf2: SCHEMA-V2 columns, origin range, envelop
     } finally { v1.close(); }
   });
 
-  test('origin.seat must match the sender, an omitted seat still roundtrips, and crownDirective sets the flag', () => {
+  test('MSG-FILTERS-RELAX: origin.seat may differ from the sender (the real caller), an omitted seat still roundtrips, and crownDirective sets the flag', () => {
     const store = new MsgStore(':memory:');
     try {
-      expect(() => store.post({ from: 'OP', to: 'TC', body: 'other seat', origin: { kind: 'agent', seat: 'MK' } })).toThrow(/origin\.seat/);
+      const other = store.post({ from: 'OP', to: 'TC', body: 'other seat', origin: { kind: 'agent', seat: 'MK' } });
+      expect(store.getMessage(other.id)!.origin).toEqual({ kind: 'agent', seat: 'MK' });
       const omitted = store.post({ from: 'OP', to: 'TC', body: 'same seat', origin: { kind: 'human' } });
       expect(omitted.origin).toEqual({ kind: 'human', seat: 'OP' });
       expect(store.getMessage(omitted.id)!.origin).toEqual(omitted.origin);

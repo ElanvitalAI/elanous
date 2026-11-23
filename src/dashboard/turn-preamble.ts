@@ -375,7 +375,7 @@ function buildDashboardTurnPreambleUnmeasured(
       const notificationOnlyWake = /(?:^|\n)(?:Question: )?\[자동 재개\] 위임 끝: .+ \((?:done|error|aborted)\) — <task-notification> 의 결과를 읽고 이어서 처리$/u
         .test(ctx.userText);
       if (notificationOnlyWake) {
-        preamble.push({ role: 'system', content: '[알림 전용 턴] 이것은 완료 알림을 전달한 비요청 status receipt다. 작업 요청으로 취급하지 말고 Agent 또는 SelfImplement 위임을 시작하지 않는다. 포함된 결과를 바탕으로 한 번의 간결한 상태 요약만 답하고 멈춘다. 결과가 전달되지 않았다면 결과가 아직 제공되지 않았다고 알리고 내용을 추측하지 않는다.' });
+        preamble.push({ role: 'system', cacheVolatile: true, content: '[알림 전용 턴] 이것은 완료 알림을 전달한 비요청 status receipt다. 작업 요청으로 취급하지 말고 Agent 또는 SelfImplement 위임을 시작하지 않는다. 포함된 결과를 바탕으로 한 번의 간결한 상태 요약만 답하고 멈춘다. 결과가 전달되지 않았다면 결과가 아직 제공되지 않았다고 알리고 내용을 추측하지 않는다.' });
       }
       const pendingNotifications = ctx.sessionId
         ? globalTaskNotificationQueue.drainForParentSessionOrUnscoped(ctx.sessionId)

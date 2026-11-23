@@ -13,9 +13,12 @@ export interface CatchUpDeps extends SelfUpdateDeps {
   desired?: () => string | undefined;
   railAllowed?: () => boolean | Promise<boolean>;
   recordHandoff?: (text: string, now: Date) => void | Promise<void>;
+  /** Background hold notice: a seat-decision row plus OP seat mail. Never a CEO decision card. */
   raiseHitl?: (text: string, seat: string) => boolean | void | Promise<boolean | void>;
   /** Interactive OP approval for this run only; background catch-up leaves this absent. */
   approveOp?: (text: string) => boolean | Promise<boolean>;
+  /** Trace of an approved interactive OP update (seat-decision row decided by the seat). Best effort; never a gate. */
+  recordOpDecision?: (text: string, seat: string) => boolean | void | Promise<boolean | void>;
 }
 
 export function parseRailAllowed(stdout: string): boolean {
@@ -34,16 +37,35 @@ function defaultHandoff(text: string, now: Date): void {
   const stamp = now.toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
   writeFileSync(join(dir, `HANDOFF-op-${stamp}.md`), `# HANDOFF (auto, catch-up)\n\n${text}\n`, { flag: 'wx' });
 }
-/** Real `decisions raise` contract (decisions-cli.ts): --agent/--title/--category/--s/--c/--option x2/--pending-question/--skip-recommend/--no-xcheck. */
-export function raiseHitlArgs(seat: string, text: string): string[] {
-  return ['decisions', 'raise', '--agent', seat, '--title', 'OP 자리 자동 갱신 보류 — 승인 필요', '--category', 'other',
-    '--s', 'dev 호스트가 desiredSha 를 따라잡아야 하는데 OP 자리(Claude Code)에 영향이 간다.', '--c', '자동 설치·재시작은 하지 않는다(OPS-RULES §31).',
-    '--option', 'a=승인:OP 가 핸드오프를 쓴 뒤 수동으로 갱신한다', '--option', 'b=보류:현재 판을 유지한다',
-    '--skip-recommend', '자동 갱신 보류 알림', '--no-xcheck', '자동 알림',
-    '--pending-question', `근거: ${text}\n무엇이 바뀌나: 승인 시 OP 가 핸드오프 뒤 수동 갱신\n기본값 시 결과: 현재 판 유지(보류)`];
+/** A held OP-seat update is a seat-level matter: it is recorded as a seat decision (`decisions record-seat`, not a CEO card) keyed by host+desired so a retry is idempotent. */
+export function holdRecordArgs(seat: string, text: string, host: string, desired: string): string[] {
+  return ['decisions', 'record-seat', '--seat', seat, '--title', 'OP seat self-update held', '--decision', `hold: ${text}`,
+    '--delegation', 'self-update catch-up: OP seat is never restarted unattended', '--ref', `catch-up:${host}:${desired.slice(0, 12)}`];
 }
-function defaultRaise(text: string, seat: string): boolean {
-  try { return spawnElanousSync(raiseHitlArgs(seat, text), { timeout: 30_000 }).status === 0; } catch { return false; }
+export function holdMailArgs(seat: string, text: string): string[] {
+  return ['msg', 'post', '--from', seat, '--to', 'OP', '--kind', 'alert', '--body', `[self-update] OP seat update held; run els update-all from the OP seat to apply. ${text}`];
+}
+export function opDecisionArgs(seat: string, text: string, host: string, desired: string): string[] {
+  return ['decisions', 'record-seat', '--seat', seat, '--title', 'OP seat self-update approved', '--decision', `update: ${text}`,
+    '--delegation', 'OP started this update and confirmed it on its terminal', '--ref', `catch-up-approved:${host}:${desired.slice(0, 12)}`];
+}
+/** A record-seat retry whose row already exists (same ref) is a success, not a failure. */
+export function recordSeatSucceeded(status: number | null, stderr: string): boolean {
+  return status === 0 || stderr.includes('seat decision source already recorded');
+}
+function spawnRecord(args: string[]): boolean {
+  try { const r = spawnElanousSync(args, { timeout: 30_000 }); return recordSeatSucceeded(r.status, String(r.stderr ?? '')); } catch { return false; }
+}
+function spawnOk(args: string[]): boolean {
+  try { return spawnElanousSync(args, { timeout: 30_000 }).status === 0; } catch { return false; }
+}
+/** Both the row and the OP mail must succeed; otherwise the notice is retried (the row is idempotent by ref). */
+function defaultHold(host: string, desired: string) {
+  return (text: string, seat: string): boolean => {
+    const recorded = spawnRecord(holdRecordArgs(seat, text, host, desired));
+    const mailed = spawnOk(holdMailArgs(seat, text));
+    return recorded && mailed;
+  };
 }
 interface HitlMarker { sha: string; handoff: boolean; raised: boolean }
 function readMarker(file: string): HitlMarker | null {
@@ -201,20 +223,21 @@ async function runCatchUpLocked(options: SelfUpdateOptions, deps: CatchUpDeps): 
     const prior = readMarker(marker);
     const state: HitlMarker = { sha: desired, handoff: prior?.sha === desired && prior.handoff, raised: prior?.sha === desired && prior.raised };
     if (options.dryRun) return done(0, plan.reason);
-    const text = `${plan.reason}. host ${host}, installed ${record.commit.slice(0, 12)}, desired ${desired.slice(0, 12)}. Update/restart held until HITL approval.`;
+    const text = `${plan.reason}. host ${host}, installed ${record.commit.slice(0, 12)}, desired ${desired.slice(0, 12)}. Update/restart held until OP runs it from its seat.`;
     // Two independent actions: one failing never skips the other; each success is remembered so a retry repeats only what is missing.
     const failures: string[] = [];
     const attempt = async (name: string, act: () => Promise<boolean | void> | boolean | void): Promise<boolean> => {
       try { if ((await act()) === false) throw new Error('reported failure'); return true; } catch (e) { failures.push(`${name}: ${String(e).slice(0, 200)}`); return false; }
     };
     if (!state.handoff) state.handoff = await attempt('handoff', () => (deps.recordHandoff ?? defaultHandoff)(text, now));
-    if (!state.raised) state.raised = await attempt('decisions raise', () => (deps.raiseHitl ?? defaultRaise)(text, options.seat ?? 'OP'));
+    // OP started an interactive run and answers on its own terminal: that answer is the decision, so no hold notice is sent.
+    if (!deps.approveOp && !state.raised) state.raised = await attempt('hold notice', () => (deps.raiseHitl ?? defaultHold(host, desired))(text, options.seat ?? 'OP'));
     if (!prior || state.handoff !== prior.handoff || state.raised !== prior.raised) {
       try { writeFileSync(marker, JSON.stringify(state)); } catch (e) { failures.push(`marker: ${String(e).slice(0, 200)}`); }
     }
     if (failures.length) {
-      (deps.alert ?? out.error)(`HITL notice incomplete (will retry the missing part): ${failures.join(' | ')} — ${text}`);
-      return done(1, `${plan.reason}; HITL notice incomplete: ${failures.join(' | ')}`);
+      (deps.alert ?? out.error)(`hold notice incomplete (will retry the missing part): ${failures.join(' | ')} — ${text}`);
+      return done(1, `${plan.reason}; hold notice incomplete: ${failures.join(' | ')}`);
     }
     if (!deps.approveOp) return done(0, plan.reason);
     if (!rail) return refuse(1, 'rail not allowed by current phase');
@@ -225,6 +248,8 @@ async function runCatchUpLocked(options: SelfUpdateOptions, deps: CatchUpDeps): 
     const railAfterApproval = await (async () => (deps.railAllowed ?? defaultRailAllowed)())().catch(() => false);
     if (!railAfterApproval) return refuse(1, 'rail not allowed after OP approval');
     if (!shaMatches(readDesired() ?? '', desired)) return refuse(1, 'desired sha changed after OP approval');
+    const approvedText = `OP approved on its terminal. host ${host}, installed ${record.commit.slice(0, 12)}, desired ${desired.slice(0, 12)}.`;
+    try { await (deps.recordOpDecision ?? ((t: string, seat: string) => spawnRecord(opDecisionArgs(seat, t, host, desired))))(approvedText, options.seat ?? 'OP'); } catch { /* trace only */ }
   }
   if (options.dryRun) return done(0, `${plan.reason} (dry run)`);
   if (approved !== undefined && readDesired()?.toLowerCase() !== approved.toLowerCase()) return refuse(1, 'approved desired sha changed before install');

@@ -748,13 +748,17 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
       case 'snapshot':
         alive = message.alive;
         bracketedPaste = message.bracketedPaste;
-        lastOutputAt = message.lastOutputAt ?? undefined;
+        // The holder's own output time; never move it back behind an output broadcast this client already saw.
+        lastOutputAt = Math.max(lastOutputAt ?? 0, message.lastOutputAt ?? 0) || undefined;
         pidNow = message.pid;
         pending.shift()?.resolve(message.screen);
         // exit 방송을 놓친 채 grace 창에 붙었다: 살아 있지 않음을 이제 알았으니 종료로 기록한다.
         if (!message.alive) fireExit();
         return;
       case 'output':
+        // ELS-AGENT-STATUS-UNKNOWN: a broadcast chunk is output now — without this the time stayed unset until a screen read,
+        // so every holder-backed agent pane listed as unknown.
+        lastOutputAt = Date.now();
         for (const cb of [...outputCbs]) { try { cb(message.chunk); } catch { /* a listener */ } }
         return;
       case 'exit':

@@ -11,6 +11,8 @@ export interface LLMToolRouteMetadata {
 /** JSONSchema-shaped tool definition sent to the provider (no handler). */
 export interface LLMToolSpec {
   name: string;
+  /** Session-local coordinator profile: defer this searchable schema. */
+  coordinatorDefer?: boolean;
   description: string;
   parameters: Record<string, unknown>;   // JSONSchema
   /** Present only for manifest-declared plugin routes. */

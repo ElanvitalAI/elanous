@@ -41,6 +41,7 @@ function uploadToS3(localPath: string, key: string): string {
 }
 
 async function download(url: string, path: string): Promise<void> {
+  // llm-ledger-exempt: file-download
   const res = await fetch(url);
   if (!res.ok) throw new Error(`download ${res.status}`);
   writeFileSync(path, Buffer.from(await res.arrayBuffer()));

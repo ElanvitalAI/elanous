@@ -88,6 +88,39 @@ describe('ops-ledger msg tools (우편)', () => {
     await expect(dispatchMsgList({}, msgDeps)).rejects.toThrow("'to' must be a nonempty string");
   });
 
+  test('MSG-FILTERS-RELAX: MsgAck clears a batch in one call — ids (per id) · receipted · a foreign id is reported, not thrown', async () => {
+    const ids: number[] = [];
+    for (const body of ['하나', '둘', '셋', '넷', '다섯', '여섯']) ids.push((await dispatchMsgPost({ from: 'OP', to: 'TC', body }, msgDeps)).message.id);
+    const foreign = (await dispatchMsgPost({ from: 'OP', to: 'UX', body: 'UX 몫' }, msgDeps)).message.id;
+    const store = msgDeps.openStore!();
+    try {
+      // a legacy decided mail: terminal receipt but no ack row (the backfill case `receipted` covers).
+      store.recordReceipt({ messageId: ids[5]!, recipient: 'TC', state: 'accepted', source: 'cli' });
+      store.db.query('DELETE FROM msg_message_acks WHERE message_id = ? AND recipient = ?').run(ids[5]!, 'TC');
+    } finally { store.close(); }
+    const result = await dispatchMsgAck({ to: 'TC', ids: [ids[2], ids[0], ids[1], ids[3], ids[4], foreign], receipted: true }, msgDeps);
+    expect(result.acked).toEqual(ids);
+    expect(result.missing).toEqual([foreign]);
+    expect(result.cursor).toBe(0);
+    expect(result.output).toBe(`MsgAck TC acknowledged 6 by id (#${ids.join(' #')}) · not TC's mail: #${foreign}`);
+    expect((await dispatchMsgList({ to: 'TC' }, msgDeps)).count).toBe(0);
+    expect((await dispatchMsgList({ to: 'UX' }, msgDeps)).count).toBe(1);
+    // the old single `id` (through) still works and still moves the cursor.
+    expect((await dispatchMsgAck({ to: 'TC', id: ids[5] }, msgDeps)).cursor).toBe(ids[5]);
+    await expect(dispatchMsgAck({ to: 'TC' }, msgDeps)).rejects.toThrow("MsgAck needs 'ids', 'id' or 'receipted: true'");
+  });
+
+  test('MSG-FILTERS-RELAX: MsgPost stores an unknown kind; MsgList reads another seat and a sub-seat mailbox', async () => {
+    const posted = await dispatchMsgPost({ from: 'OP', to: 'MK/graphics', body: '배너 시안', kind: 'Design.Review 2' }, msgDeps);
+    expect(posted.message.kind).toBe('design.review 2');
+    const sub = await dispatchMsgList({ to: 'mk/graphics' }, msgDeps);
+    expect(sub.recipient).toBe('MK/graphics');
+    expect(sub.messages.map(message => [message.from, message.body, message.kind])).toEqual([['OP', '배너 시안', 'design.review 2']]);
+    await dispatchMsgPost({ from: 'TC', to: 'UX', body: '다른 자리 우편' }, msgDeps);
+    const other = await dispatchMsgList({ to: 'UX' }, msgDeps);
+    expect(other.messages.map(message => message.body)).toEqual(['다른 자리 우편']);
+  });
+
   test('MsgAsk는 같은 원장에 질문을 쓰고 replyTo로 연결된 첫 답만 돌려준다', async () => {
     const store = msgDeps.openStore!();
     try {
@@ -125,8 +158,11 @@ describe('ops-ledger msg tools (우편)', () => {
       await expect(dispatchMsgAsk({ from: 'OP', to: 'TC', question: '취소' }, { ...msgDeps, signal: abort.signal })).rejects.toThrow('before posting');
       await expect(dispatchMsgAsk({ from: 'ALL', to: 'TC', question: '거부' }, msgDeps)).rejects.toThrow('ALL cannot send');
       await expect(dispatchMsgAsk({ from: 'OP', to: 'ALL', question: '거부' }, msgDeps)).rejects.toThrow('one recipient seat');
-      await expect(dispatchMsgAsk({ from: 'OP', to: 'TC', question: 'bad', waitSeconds: 301 }, msgDeps)).rejects.toThrow('waitSeconds');
       expect(store.list('TC')).toHaveLength(1);
+      // MSG-FILTERS-RELAX: an out-of-range wait is clamped (-5 → 0 s), the question is posted, never refused.
+      const clamped = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '음수 대기', waitSeconds: -5 }, msgDeps);
+      expect(clamped.output).toBe(`MsgAsk #${clamped.question.id} posted; no linked reply within 0s`);
+      expect(store.list('TC')).toHaveLength(2);
     } finally { store.close(); }
   });
 
@@ -491,52 +527,13 @@ describe('ops-ledger checklist tools (판)', () => {
 });
 
 describe('ops-ledger RunShell 스티어링', () => {
-  test('TUI dashboard 진입점은 명시한 msg list CLI를 실행한다', async () => {
-    registerAllDefaultToolRuntimes();
-    const tools = buildSessionRuntimeToolSpecs({
-      userText: 'TC 우편 msg list 확인',
-      hostTools: [],
-      runtimeTools: listToolRuntimes('tui'),
-    });
-    expect(tools.map(tool => tool.name)).toContain('RunShell');
-    expect(tools.map(tool => tool.name)).toContain('MsgList');
-
-    const spawn = spyOn(childProcess, 'spawn');
-    try {
-      // Control proves this spy sees the shell primitive's actual subprocess boundary.
-      await dispatchRunShell({ command: ['true'] });
-      expect(spawn).toHaveBeenCalledTimes(1);
-      spawn.mockClear();
-      const result = await dispatchDashboardSessionRuntimeTool(
-        'RunShell', { command: ['elanous', 'msg', 'list', '--to', 'TC'] }, {
-          contextUserText: 'TC 우편 msg list 확인',
-          turnRefUserText: null,
-          muted: line => line,
-          pushChatLine: () => {},
-          draw: () => {},
-          getToolRuntime,
-          dispatchToolRuntime: (name, args) => dispatchToolByName(name, args, {
-            surface: 'tui', agentHostTools: tools,
-          }),
-          dispatchPluginTool: async () => ({ ok: false, error: 'unexpected plugin dispatch' }),
-        },
-      ) as { approvalKey?: string };
-      expect(result.approvalKey).not.toBe('rejected:ops-ledger-cli');
-      expect(spawn).toHaveBeenCalledTimes(1);
-    } finally {
-      spawn.mockRestore();
-    }
-  });
-
-  test('명시한 msg list CLI는 통과하고 덮은 쓰기 명령은 네이티브 툴로 안내한다', async () => {
+  test('msg CLI(list·post·ack)는 통과하고 덮은 판 명령은 네이티브 툴로 안내한다', async () => {
     const availableToolNames = ALL_OPS_LEDGER_RUNTIMES.map(runtime => runtime.spec.name);
     const steer = (command: string[]) => rejectedLedgerCliResult(command, availableToolNames);
     const msgListPass = steer(['elanous', 'msg', 'list', '--to', 'OP', '--json']);
     expect(msgListPass).toBeNull();
-    const privateBody = 'private-message-body-token';
-    const postReject = steer(['elanous', 'msg', 'post', '--from', 'TC', '--to', 'OP', '--body', privateBody]);
-    expect(postReject?.output).toContain('MsgPost');
-    expect(postReject?.output).not.toContain(privateBody);
+    // MSG-FILTERS-RELAX: msg post / msg ack CLI run as asked (the CLI carries flags the native tools do not).
+    expect(steer(['elanous', 'msg', 'post', '--from', 'TC', '--to', 'OP', '--intent', 'request', '--body', 'hi'])).toBeNull();
 
     const setReject = await dispatchRunShell(
       { command: ['bun', 'bin/elanous.mjs', 'release', 'checklist', 'set', 'K1', '--status', 'green', '--version', '9.9.9'] },
@@ -545,8 +542,8 @@ describe('ops-ledger RunShell 스티어링', () => {
     expect(setReject.output).toContain('ChecklistSet');
 
     expect(steer(['eln', 'release', 'checklist', 'move', 'K1', '--from', '0.2.9', '--to', '0.2.10', '--reason', 'next'])?.output).toContain('ChecklistMove');
-    expect(steer(['/usr/local/bin/elanous', 'msg', 'post', '--from', 'OP', '--to', 'TC', '--body', 'hi'])?.output).toContain('MsgPost');
-    expect(steer(['elanous', 'msg', 'ack', '7', '--to', 'TC'])?.output).toContain('MsgAck');
+    expect(steer(['/usr/local/bin/elanous', 'msg', 'post', '--from', 'OP', '--to', 'TC', '--body', 'hi'])).toBeNull();
+    expect(steer(['elanous', 'msg', 'ack', '7', '--to', 'TC'])).toBeNull();
     expect(steer(['elanous', 'release', 'checklist', 'list', '--version', '9.9.9'])?.output).toContain('ChecklistList');
     expect(steer(['elanous', 'release', 'checklist', 'add', 'K9', 'title'])?.output).toContain('ChecklistAdd');
     expect(steer(['env', 'elanous', 'msg', 'list', '--to', 'OP'])).toBeNull();
@@ -748,12 +745,13 @@ describe('#122460 ①② (CX-16 postland 실측) — the agent MsgAck tool moves
   test('real tool registry (tui surface) · MsgAck through #2 → cursor 2 · no seen rows («seen» is the answered turn\'s receipt)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ops-ledger-ack-seen-'));
     const oldState = process.env.ELANOUS_STATE_DIR;
-    process.env.ELANOUS_STATE_DIR = dir;
-    setElanousConfigDir(dir);
-    registerAllDefaultToolRuntimes();
     try {
+      // AUTHOR-PRECHECK 5: global state is changed INSIDE try, so a throwing setup still restores it.
+      process.env.ELANOUS_STATE_DIR = dir;
+      setElanousConfigDir(dir);
+      registerAllDefaultToolRuntimes();
       const ids: number[] = [];
-      for (const body of ['하나', '둘', '셋']) ids.push((await dispatchMsgPost({ from: 'RES-INFRA', to: 'HAND-ELN-ELS-API', body, intent: 'request' })).message.id);
+      for (const body of ['하나', '둘', '셋']) ids.push((await dispatchMsgPost({ from: 'RES-INFRA', to: 'HAND-ELN-ELS-API', body, intent: 'request' }, { followUp: async (message) => ({ commitmentId: 'c-test', wakerId: 'w-test', condition: `mail-reply:${message.id}`, merged: false }) })).message.id);
       const result = await dispatchToolByName('MsgAck', { to: 'HAND-ELN-ELS-API', id: ids[1] }, { surface: 'tui' }) as Record<string, unknown>;
       expect(result).toMatchObject({ ok: true, cursor: ids[1] });
       const store = new MsgStore(join(dir, 'msg', 'messages.db'));

@@ -25,6 +25,7 @@ import type {
 import { isRiskyLevel } from './work-risk-router.js';
 import { ADVISOR_ESCALATE_RULE } from './advisor-checkpoints.js';
 import { WINDOW_AWARE_ACCOUNT_SELECTOR, accountIdHash } from './window-account-selector.js';
+import { windowAwareTierAssignment } from './window-tier-optimizer.js';
 import { ROUTER_MIX_ACCOUNT_SELECTOR } from './router-mix-selector.js';
 import { createSmartRouterTierGate, authorizeRouterFeature, envMembershipResolver } from '../plugins/smart-router/consumer.js';
 import {
@@ -72,6 +73,18 @@ function oneStepUp(tier: WorkTierClass): WorkTierClass {
   return WORK_TIER_CLASSES[Math.min(WORK_TIER_CLASSES.indexOf(tier) + 1, WORK_TIER_CLASSES.length - 1)]!;
 }
 
+/** ROUTER-OR-CODEX-MIX-CHOKEPOINT(OP #132227) — 결정 id 발급기: 같은 runId 안에서만 증가(runId 파생이라 프로세스 재시작 없이 유일·결정적). */
+// terra r1 mustFix ①(PR 39662 r2) — 발급 순번은 runId 의 런 수명(프로세스 생애)에 결속한다.
+// r1 은 코어 인스턴스마다 카운터를 초기화해 같은 runId 로 코어를 재생성하면 서로 다른 결정에
+// 같은 runId#d1 이 중복 발급됐다. 발급 상태를 모듈 스코프에 두면 코어 재생성·installCoreModules
+// 기본 코어 교체에도 순번이 이어진다(런 수명 유일성 — orchestration-core.test.ts 재생성 사례).
+const decisionIdSequences = new Map<string, number>();
+function nextDecisionId(runId: string): string {
+  const seq = (decisionIdSequences.get(runId) ?? 0) + 1;
+  decisionIdSequences.set(runId, seq);
+  return `${runId}#d${seq}`;
+}
+
 export function createModelOrchestrationCore(modules: CoreModules = {}): ModelOrchestrationCore {
   // 모듈 규칙(ADVISOR — checkpoint 가 있을 때만 제안) 먼저, 내장 섞기 정책 표가 마지막.
   const rules: readonly EscalateRule[] = [...(modules.escalate ?? []), MIX_POLICY_RULE];
@@ -105,7 +118,6 @@ export function createModelOrchestrationCore(modules: CoreModules = {}): ModelOr
           trigger = 'base';
         }
       }
-      const cell = WORK_TIER_LADDER_CELL[tier];
       // jud-39528 mustFix ②(r13 — JUD-2 HOLD 8929e2809624 · OP #132044): 구독 창 인식 계정 전환은 router.subscription_window_aware(프로+).
       // 거부 시 창 인식 선택기 «자체»를 건너뛴다 — ROUTER_MIX 만 막으면 기본 WINDOW_AWARE_ACCOUNT_SELECTOR 가
       // selection=on 에서 계정을 전환한다. 거부 = 창 인식 없는 선택기(활성 계정 고정 · 전환 0).
@@ -119,8 +131,15 @@ export function createModelOrchestrationCore(modules: CoreModules = {}): ModelOr
           accountSelector = ACTIVE_ACCOUNT_SELECTOR;
         } else if (input.accounts?.routerMix) {
           accountSelector = ROUTER_MIX_ACCOUNT_SELECTOR;
+        } else {
+          // COST-OPTIMIZER-WINDOW-AWARE(ROSTER-0334 P2-11) — 등급 배정도 창을 본다(계정 전환과 같은 프로+ 게이트 안).
+          // 배정 칸의 구독 창이 말라 있으면 쓸 수 있는 창이 있는 아래 등급으로 «한 번» 내리고, 어디에도 없으면
+          // 크레딧 보유에 따라 그대로/최하(약)로. routerMix(openrouter 혼합 배선)는 이 반영 바깥.
+          const step = windowAwareTierAssignment(tier, input.accounts?.active?.provider ?? input.provider, input.accounts);
+          if (step) { reason.push(step.reason); tier = step.to; }
         }
       }
+      const cell = WORK_TIER_LADDER_CELL[tier];
       let picked: ReturnType<AccountSelector['select']>;
       try { picked = accountSelector.select({ input, tier, cell }); } catch {
         picked = ACTIVE_ACCOUNT_SELECTOR.select({ input, tier, cell });
@@ -132,6 +151,7 @@ export function createModelOrchestrationCore(modules: CoreModules = {}): ModelOr
       const ladder = ladderOf(picked.provider);
       if (!ladder) reason.push('no-tier-ladder');
       return {
+        decisionId: nextDecisionId(input.runId),
         tier, cell, provider: picked.provider, model: ladder ? ladder[cell].model : null, account: picked.account,
         trigger, reason, ...(tier === 'strong' ? { maxOutputTokens: STRONG_OUTPUT_MAX_TOKENS } : {}),
         ...(picked.unmeasured?.length ? { unmeasured: [...picked.unmeasured] } : {}),
@@ -141,7 +161,7 @@ export function createModelOrchestrationCore(modules: CoreModules = {}): ModelOr
     decisionRecord(decision, input, applied): CoreDecisionLedgerRecord {
       // 허용 칸만 — 호출측이 문면을 넘겨도 들어가지 않는다.
       return {
-        kind: 'decision', runId: input.runId, moment: input.moment,
+        kind: 'decision', runId: input.runId, decisionId: decision.decisionId, moment: input.moment,
         level: input.work.level, bloom: input.work.bloom, riskCategories: [...input.work.riskCategories],
         tier: decision.tier, cell: decision.cell, provider: decision.provider, model: decision.model,
         // COST-OPTIMIZER-WINDOW-AWARE: 원장에는 원 계정 이름 대신 해시만.

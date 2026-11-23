@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
+import { llmNetworkFetch } from '../../../src/session-runtime/llm-call-gateway.js';
 
 const KEY = process.env.ELEVENLABS_API_KEY?.trim();
 const scriptPath = resolve(process.argv[2] ?? 'script.json');
@@ -24,11 +25,11 @@ export function beatKeys(s: any): { key: string; vo: string }[] {
 type Alignment = { characters: string[]; character_start_times_seconds: number[]; character_end_times_seconds: number[] };
 
 async function elevenlabs(vo: string): Promise<{ mp3: Buffer; alignment: Alignment }> {
-  const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${script.voice.id}/with-timestamps?output_format=mp3_44100_192`, {
+  const res = await llmNetworkFetch(`https://api.elevenlabs.io/v1/text-to-speech/${script.voice.id}/with-timestamps?output_format=mp3_44100_192`, {
     method: 'POST',
     headers: { 'xi-api-key': KEY!, 'content-type': 'application/json' },
     body: JSON.stringify({ text: vo, model_id: script.voice.model, language_code: 'ko' }),
-  });
+  }, { provider: 'elevenlabs', model: script.voice.model, role: 'aux', requestedBy: 'explainer-vo' });
   if (!res.ok) throw new Error(`ElevenLabs HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
   const data = await res.json() as { audio_base64: string; alignment: Alignment };
   return { mp3: Buffer.from(data.audio_base64, 'base64'), alignment: data.alignment };

@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "entries": {
+    "seat-mail-roundtrip/R1-urgent-band": {
+      "expect": "red",
+      "reason": "긴급 띠 탐색: 우편 알림 큐 배출이 FIFO라 urgent(alert)가 보통(info)을 앞서지 못한다 — 결함 확정 아님(탐색 관측)",
+      "redReason": "R1-urgent-not-first:queue:1:[from SEAT-A · info]\nmsg|2:[from SEAT-A · alert]\nms drain0:[from SEAT-A · info]\nmsg drain1:[from SEAT-A · alert]\nms"
+    },
+    "seat-mail-roundtrip/R2-receipt-stages": {
+      "expect": "green",
+      "reason": "#14 수동 단계 기록(#38869 API) — 원장 recordReceipt seen→accepted→done(evidence) 순서 실측 GREEN(착지 판)",
+      "greenSince": "4e4397eb9f205533b93188386c4920c9dbda04e2"
+    },
+    "seat-mail-roundtrip/R3-repoll-dedupe": {
+      "expect": "green",
+      "reason": "같은 우편 재폴링 시 알림 1회로 억제된다(수취 확인 후 재폴링 무통지)",
+      "greenSince": "a331fa3429633da1084f6b9cb22207301376c3ea"
+    },
+    "seat-mail-roundtrip/R4-expired-mail": {
+      "expect": "green",
+      "reason": "만료(expiresAt 과거) 우편은 알림을 일으키지 않는다",
+      "greenSince": "a331fa3429633da1084f6b9cb22207301376c3ea"
+    },
+    "seat-mail-roundtrip/R5-auto-receipts": {
+      "expect": "green",
+      "reason": "#14 자동 배선(#38881) — poll→delivered·턴 인계→started(clock)·턴 끝→seen 실측 GREEN(착지 판)",
+      "greenSince": "a331fa3429633da1084f6b9cb22207301376c3ea"
+    },
+    "seat-mail-roundtrip/R6-send-dedupe": {
+      "expect": "green",
+      "reason": "#16 송신 억제(#38958) — 송신 입구 dedupe로 같은 받는이·본문 재송신 첫 행 접기 실측 GREEN(착지 판)",
+      "greenSince": "d3f43c3fec284d58901f1ac58f3adba586acb18c"
+    },
+    "seat-mail-roundtrip/R7-address-book": {
+      "expect": "green",
+      "reason": "#22 주소록(#38900) — updateSeatPaneDirectory 등록·재등록 1행 갱신 실측 GREEN(착지 판)",
+      "greenSince": "6187820fe9464fd66fa72ce9da24c53d81cfdd12"
+    },
+    "seat-mail-roundtrip/R8-list-cut": {
+      "expect": "green",
+      "reason": "#29 «+N 더 · --after <id>» 꼬리·남은 안 읽은 수 표시는 main msg-list-cli에 착지 — 시험 리터럴(140 → 100행 + «+40 더»)",
+      "greenSince": "main: src/cli/msg-list-cli.ts (+N 더 · --after 줄 · unreadCountAfter)"
+    }
+  }
+}

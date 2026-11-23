@@ -52,10 +52,14 @@ export function validJournal(raw: unknown): SpaceJournal {
   const workspaces = raw.workspaces.map((ws, index): Workspace => {
     if (!isRecord(ws) || ![ws.id, ws.name, ws.rootCwd, ws.purpose, ws.host].every(isString) || !ws.id) throw bad('workspaces', index);
     if (ws.role !== undefined && ws.role !== 'coordinator') throw bad('workspaces', index);
+    if (ws.coordinatorSeat !== undefined && (typeof ws.coordinatorSeat !== 'string' || !/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(ws.coordinatorSeat))) throw bad('workspaces', index);
     return { id: ws.id as string, name: ws.name as string, rootCwd: ws.rootCwd as string, purpose: ws.purpose as string, host: ws.host as string,
-      ...(ws.role === 'coordinator' ? { role: 'coordinator' as const } : {}) };
+      ...(ws.role === 'coordinator' ? { role: 'coordinator' as const } : {}),
+      ...(typeof ws.coordinatorSeat === 'string' ? { coordinatorSeat: ws.coordinatorSeat } : {}) };
   });
   if (workspaces.filter(ws => ws.role === 'coordinator').length > 1) throw new Error('journal has multiple coordinators');
+  const assigned = workspaces.flatMap(ws => ws.coordinatorSeat ? [ws.coordinatorSeat] : []);
+  if (new Set(assigned).size !== assigned.length) throw new Error('journal has duplicate coordinator seats');
   const tabs = raw.tabs.map((tab, index): Tab => {
     if (!isRecord(tab) || ![tab.id, tab.workspaceId, tab.label, tab.focusPaneId].every(isString) || !tab.id) throw bad('tabs', index);
     return { id: tab.id as string, workspaceId: tab.workspaceId as string, label: tab.label as string, focusPaneId: tab.focusPaneId as string };
@@ -65,9 +69,18 @@ export function validJournal(raw: unknown): SpaceJournal {
       || !Array.isArray(pane.command) || !pane.command.every(isString)
       || (pane.exitedAt !== undefined && (!Number.isSafeInteger(pane.exitedAt) || (pane.exitedAt as number) < 0))
       || (pane.ownerSeat !== undefined && (typeof pane.ownerSeat !== 'string' || !pane.ownerSeat.trim()))
+      || (pane.seatIdentity !== undefined && (typeof pane.seatIdentity !== 'string' || !/^[A-Z][A-Z0-9_-]{0,63}$/.test(pane.seatIdentity)))
       || (pane.cwdOsc7 !== undefined && pane.cwdOsc7 !== true)
       || (pane.cwdOscPending !== undefined && (!Array.isArray(pane.cwdOscPending) || pane.cwdOscPending.length > 65
         || !pane.cwdOscPending.every((path: unknown) => isString(path) && path.startsWith('/') && !path.includes('\0') && path.length <= 8192)))
+      // ELS-POD-TAB: place, when present, is { host, runtime: process|pod } — anything else is a damaged journal.
+      || (pane.place !== undefined && !(isRecord(pane.place) && isString(pane.place.host)
+        && (pane.place.runtime === 'process' || pane.place.runtime === 'pod')))
+      // ELS-POD-TAB: inbox, when present, is the pod pane's bounded control inbox — anything else is a damaged journal.
+      || (pane.inbox !== undefined && !(Array.isArray(pane.inbox) && pane.inbox.length <= 32
+        && pane.inbox.every((memo: unknown) => isRecord(memo) && isString(memo.from) && memo.from.length > 0 && memo.from.length <= 64
+          && Number.isSafeInteger(memo.at) && (memo.at as number) >= 0
+          && isString(memo.text) && memo.text.length > 0 && !memo.text.includes('\0'))))
       || !PANE_STATES.has(pane.state as string) || !PANE_KINDS.has(pane.kind as string) || !RESTORE_POLICIES.has(pane.restore as string)) {
       throw bad('panes', index);
     }
@@ -77,7 +90,10 @@ export function validJournal(raw: unknown): SpaceJournal {
       ...(pane.exitedAt !== undefined ? { exitedAt: pane.exitedAt as number } : {}),
       ...(pane.cwdOsc7 === true ? { cwdOsc7: true as const } : {}),
       ...(Array.isArray(pane.cwdOscPending) ? { cwdOscPending: pane.cwdOscPending as string[] } : {}),
-      ...(typeof pane.ownerSeat === 'string' ? { ownerSeat: pane.ownerSeat } : {}) };
+      ...(typeof pane.ownerSeat === 'string' ? { ownerSeat: pane.ownerSeat } : {}),
+      ...(typeof pane.seatIdentity === 'string' ? { seatIdentity: pane.seatIdentity } : {}),
+      ...(isRecord(pane.place) ? { place: pane.place as unknown as Pane['place'] } : {}),
+      ...(Array.isArray(pane.inbox) ? { inbox: pane.inbox as unknown as Pane['inbox'] } : {}) };
   });
   const ids = [...workspaces, ...tabs, ...panes].map((row) => row.id);
   if (new Set(ids).size !== ids.length) throw new Error('journal ids are not unique');
@@ -90,8 +106,15 @@ export function validJournal(raw: unknown): SpaceJournal {
       && (row.peerPid === undefined || (Number.isSafeInteger(row.peerPid) && (row.peerPid as number) > 0))))) {
     throw new Error('coordinator audit is malformed');
   }
+  if (raw.hqCoordinatorSeat !== undefined && (typeof raw.hqCoordinatorSeat !== 'string' || !/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(raw.hqCoordinatorSeat))) throw new Error('HQ coordinator seat is malformed');
+  if (raw.hqAuthorityLocation !== undefined && (typeof raw.hqAuthorityLocation !== 'string' || !raw.hqAuthorityLocation.trim() || raw.hqAuthorityLocation.includes('\0'))) throw new Error('HQ authority location is malformed');
+  const focus = raw.lastFocus;
+  if (focus !== undefined && (!isRecord(focus) || !(isString(focus.workspaceId) && focus.workspaceId.length > 0 && ((focus.tabId === undefined && focus.paneId === undefined) || ([focus.tabId, focus.paneId].every(v => isString(v) && v.length > 0)))))) throw new Error('last focus is malformed');
+  const lastFocus = focus as SpaceJournal['lastFocus'];
   const coordinatorAudit = raw.coordinatorAudit as SpaceJournal['coordinatorAudit'];
-  return { version: 1, workspaces, tabs, panes, ...(coordinatorAudit !== undefined ? { coordinatorAudit } : {}) };
+  return { version: 1, workspaces, tabs, panes, ...(lastFocus ? { lastFocus } : {}), ...(coordinatorAudit !== undefined ? { coordinatorAudit } : {}),
+    ...(typeof raw.hqCoordinatorSeat === 'string' ? { hqCoordinatorSeat: raw.hqCoordinatorSeat } : {}),
+    ...(typeof raw.hqAuthorityLocation === 'string' ? { hqAuthorityLocation: raw.hqAuthorityLocation } : {}) };
 }
 
 let saveSequence = 0;

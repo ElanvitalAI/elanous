@@ -173,6 +173,8 @@ export function workTierClassForModel(provider: string | undefined, model: strin
 export interface WorkTierContext {
   readonly tier: WorkTierClass;
   readonly trigger: WorkTierTrigger;
+  /** ROUTER-OR-CODEX-MIX-CHOKEPOINT(OP #132227) — 이 호출을 낸 코어 결정의 id. 같은 id 가 llm.usage 줄(routeDecisionId)까지 이어진다. */
+  readonly decisionId?: string;
 }
 
 const tierContextStore = new AsyncLocalStorage<WorkTierContext>();
@@ -189,7 +191,7 @@ export function workTierContext(): WorkTierContext | null {
 /** `llm-usage` 한 줄에 덧붙일 칸 — 등급·계기·출처만(문면 0). 토큰·비용은 그 줄의 기존 칸이다. */
 export function workTierUsageFields(provider: string | undefined, model: string): Partial<CoreCallLedgerFields> {
   const context = workTierContext();
-  if (context) return { workTier: context.tier, workTierTrigger: context.trigger, workTierSource: 'context' };
+  if (context) return { workTier: context.tier, workTierTrigger: context.trigger, workTierSource: 'context', ...(context.decisionId ? { routeDecisionId: context.decisionId } : {}) };
   const tier = workTierClassForModel(provider, model);
   return tier ? { workTier: tier, workTierTrigger: 'base', workTierSource: 'model-lookup' } : {};
 }
@@ -220,6 +222,8 @@ export interface TierShareRow {
 export interface TierShareReport {
   readonly rows: readonly TierShareRow[];
   readonly strongShare: number | null;
+  /** 약 몫 — WEAK_SHARE_MIN 아래면 status 가 GREEN 이 아니다(HARNESS-DIFFICULTY-ROUTER-WEAK70-FU). */
+  readonly weakShare: number | null;
   readonly status: 'GREEN' | 'YELLOW' | 'UNMEASURED';
   readonly targets: { readonly weakMin: number; readonly mid: { readonly min: number; readonly max: number }; readonly strongYellowAbove: number };
 }
@@ -258,10 +262,16 @@ export function summarizeTierShares(inputs: readonly TierShareInput[]): TierShar
     }];
   });
   const strongShare = classified === 0 ? null : (buckets.get('strong')?.tokens ?? 0) / classified;
+  const weakShare = classified === 0 ? null : (buckets.get('weak')?.tokens ?? 0) / classified;
+  // P2-13 HARNESS-DIFFICULTY-ROUTER-WEAK70-FU(ROSTER-0334): WEAK_SHARE_MIN 은 표시만이 아니라 status 에도 반영된다 —
+  // 약 몫이 하한 아래면 GREEN 이 아니다(기존 상태 어휘 'YELLOW' 재사용 · 새 상수·새 상태값 0).
   return {
     rows,
     strongShare,
-    status: strongShare === null ? 'UNMEASURED' : strongShare > STRONG_SHARE_YELLOW_ABOVE ? 'YELLOW' : 'GREEN',
+    weakShare,
+    status: strongShare === null ? 'UNMEASURED'
+      : strongShare > STRONG_SHARE_YELLOW_ABOVE || (weakShare !== null && weakShare < WEAK_SHARE_MIN) ? 'YELLOW'
+      : 'GREEN',
     targets: { weakMin: WEAK_SHARE_MIN, mid: { ...MID_SHARE_TARGET }, strongYellowAbove: STRONG_SHARE_YELLOW_ABOVE },
   };
 }
@@ -269,7 +279,7 @@ export function summarizeTierShares(inputs: readonly TierShareInput[]): TierShar
 export function formatTierShareReport(report: TierShareReport): string[] {
   const pct = (value: number | null) => (value === null ? '-' : `${(value * 100).toFixed(1)}%`);
   const lines = [
-    `등급별 몫·비용 — ${report.status} (강 ${pct(report.strongShare)} · 목표 약 ≥${pct(report.targets.weakMin)} · 중 ${pct(report.targets.mid.min)}~${pct(report.targets.mid.max)} · 강 ≤${pct(report.targets.strongYellowAbove)})`,
+    `등급별 몫·비용 — ${report.status} (약 ${pct(report.weakShare)} · 강 ${pct(report.strongShare)} · 목표 약 ≥${pct(report.targets.weakMin)} · 중 ${pct(report.targets.mid.min)}~${pct(report.targets.mid.max)} · 강 ≤${pct(report.targets.strongYellowAbove)})`,
   ];
   for (const row of report.rows) {
     lines.push(`  ${row.tier}  calls=${row.calls}  tokens=${row.tokens}  share=${pct(row.share)}  usdKnown=${row.usdKnown}  apiEquivalentUsd=${row.apiEquivalentUsd}  runs=${row.runs}`);

@@ -77,7 +77,10 @@ export function subscriptionUsageFromLedgerRows(
     if (age >= 0 && age <= WEEK_WINDOW_MS) weekly += 1;
   }
   if (monthly === 0) return []; // 30일 관측 0 = 사용량 행 없음(0으로 합성하지 않는다)
-  return [{ provider, account: null, weeklyWindowExhaustions: 0, monthlyWindowExhaustions: 0, monthlyPriceUsd: null, monthlyCalls: monthly }];
+  // terra r1 mustFix ②(PR 39662 r2) — 이 행은 provider급 총량(계정 미구분 관측)이다: 계정 창 소진을
+  // 관측한 적이 없으므로 소진 수에 0을 심지 않고 null(미측정)로 낸다. 0을 심으면 조언자가 «창 소진 0»
+  // 실측으로 하향을 권고한다(0 오판 — subscription-advisor-ledger.test.ts 종단 단언).
+  return [{ provider, account: null, weeklyWindowExhaustions: null, monthlyWindowExhaustions: null, monthlyPriceUsd: null, monthlyCalls: monthly }];
 }
 
 /** harness.window-account refused(all-exhausted) 공급자별 선택 거절 수 — 관측된 거절마다 1(전환이 아님 · 계정 소진 수 아님). */

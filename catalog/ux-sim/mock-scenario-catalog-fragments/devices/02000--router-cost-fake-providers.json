@@ -7,7 +7,8 @@
     "src/ux-sim/sim-world/router-cost/scenarios.ts",
     "src/ux-sim/sim-world/router-cost/mix-scenarios.ts",
     "src/model-tier/router-mix-selector.ts",
-    "src/llm.ts"
+    "src/llm.ts",
+    "src/ux-sim/sim-world/router-cost/quality-scenarios.ts"
   ],
   "tests": [
     "src/llm-usage-attribution.test.ts",

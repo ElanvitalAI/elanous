@@ -15,6 +15,7 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 
 import { inferProviderFromModel, isModelCompatible, resolveDefaultProvider, streamLLMWithTools, type LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
+import { createRequestSizeGuard } from '../session/request-size-guard.js';
 import { buildUniversalPreamble } from '../prompt-library/universal-preamble.js';
 import { getModelFamily } from '../models/prompts.js';
 import { resolveModelAlias } from '../intelligence-map/model-alias.js';
@@ -545,6 +546,10 @@ export async function* runAgent(
       signal: task.controller.signal,
       provider: opts.provider,
       maxTurns: opts.maxTurns,
+      // Match the seat turn: spill large tool results and guard serialized Codex requests.
+      // OP 11-24 cache audit: a child sent >1.4M chars and consumed >600k uncached tokens.
+      toolResultInlineLimitBytes: 50 * 1024,
+      requestSizeGuard: createRequestSizeGuard({ compactOptions: () => ({ sessionId: task.id, ...(modelResolution.model ? { activeModelId: modelResolution.model } : {}) }) }),
     },
   );
   const runPromise = runEncapsulated(task, runOnce, stepBuffer);

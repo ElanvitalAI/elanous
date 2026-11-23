@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 /** A158: exercise the installed package, never a checkout or the operator's Nexus. */
 import { parseInstalledVersionLine } from '../../src/version/installed-version-line.js';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
@@ -77,7 +78,7 @@ export async function verifyNexusFirstRun(binary: string, expectedVersion?: stri
   let exited = false;
   let exitPromise: Promise<void> | undefined;
   try {
-    const version = spawnSync(resolve(binary), ['--version'], { cwd: workspace, env, encoding: 'utf8', timeout: 15_000 });
+    const version = spawnSync(resolve(binary), ['--version'], { cwd: workspace, env, encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     receipt.versionLine = (version.stdout ?? '').trim();
     const installed = parseInstalledVersionLine(receipt.versionLine);
     if (version.status !== 0 || !installed || expectedVersion && installed.version !== expectedVersion

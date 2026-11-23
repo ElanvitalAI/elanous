@@ -76,7 +76,7 @@ describe('watchCapsuleDone (child side, B1)', () => {
     registry.notifyTaskDone(task);
   };
 
-  test('one done frame per background root task of this session; foreground, nested, supplement, other session: none', () => {
+  test('one done frame per background root task of this session (supplement included); foreground, nested, other session: none', () => {
     const registry = new AgentRegistry();
     const lines: string[] = [];
     const known = new Set<string>();
@@ -95,11 +95,14 @@ describe('watchCapsuleDone (child side, B1)', () => {
     expect(done).toEqual([{
       type: 'capsule-done', capsuleId: bg.id, kind: 'agent', sessionId: 's-1',
       startedAt: 1_000, endedAt: 4_000, status: 'ok', summary: 'scan · ok · 3s',
+    }, {
+      type: 'capsule-done', capsuleId: supplement.id, kind: 'agent', sessionId: 's-1',
+      startedAt: 1_000, endedAt: 4_000, status: 'ok', summary: 'general · ok · 3s',
     }]);
     watch.dispose();
     const later = spawnTask(registry, { background: true, parentSessionId: 's-1' });
     finish(registry, later, 'error');
-    expect(lines.filter((line) => line.includes('"capsule-done"')).length).toBe(1);
+    expect(lines.filter((line) => line.includes('"capsule-done"')).length).toBe(2);
   });
 });
 

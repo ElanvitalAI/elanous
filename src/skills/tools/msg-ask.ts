@@ -27,7 +27,7 @@ export function buildMsgAskTool(): LLMToolSpec {
         from: { type: 'string', description: 'Asking seat (ALL cannot send).' },
         to: { type: 'string', description: 'Recipient seat.' },
         question: { type: 'string', description: 'Nonempty question body.' },
-        waitSeconds: { type: 'integer', description: 'Wait 0–300 seconds; default 60.' },
+        waitSeconds: { type: 'integer', description: 'Wait 0–300 seconds (clamped); default 60.' },
       },
       required: ['from', 'to', 'question'],
       additionalProperties: false,
@@ -36,10 +36,9 @@ export function buildMsgAskTool(): LLMToolSpec {
 }
 
 export async function dispatchMsgAsk(rawArgs: Record<string, unknown>, deps: MsgAskDeps = {}): Promise<MsgAskResult> {
-  const waitRaw = rawArgs.waitSeconds ?? 60;
-  if (typeof waitRaw !== 'number' || !Number.isSafeInteger(waitRaw) || waitRaw < 0 || waitRaw > 300) {
-    throw new Error("'waitSeconds' must be an integer between 0 and 300");
-  }
+  // MSG-FILTERS-RELAX: an out-of-range or non-integer wait is clamped to 0–300 s, never a refused question.
+  const waitNumber = Number(rawArgs.waitSeconds ?? 60);
+  const waitRaw = Number.isFinite(waitNumber) ? Math.min(300, Math.max(0, Math.round(waitNumber))) : 60;
   const envelope = validateMessageEnvelope({
     from: rawArgs.from,
     to: rawArgs.to,

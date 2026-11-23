@@ -8,9 +8,10 @@
 //   done      → every step completed: the caller may pick the next task
 //   gap       → the model did not touch the plan this turn (or never wrote one): one structural nudge, then old behaviour
 import type { PlanState, PlanStep, PlanWake } from './plan-tool.js';
+import type { BlockReason } from '../agent-events/protocol.js';
 
 export type PlanTurnOutcome =
-  | { kind: 'blocked'; step: string; reason: string }
+  | { kind: 'blocked'; step: string; reason: string; code?: BlockReason }
   | { kind: 'continue'; step: string }
   | { kind: 'waiting'; step: string; wake: PlanWake }
   | { kind: 'done' }
@@ -32,7 +33,7 @@ export function planTurnOutcome(input: PlanOutcomeInput): PlanTurnOutcome {
   if (state.steps.length === 0) return { kind: 'gap', why: 'no-plan' };
   if (state.version === versionAtTurnStart) return { kind: 'gap', why: 'plan-not-updated' };
   const blocked = firstOf(state.steps, 'blocked');
-  if (blocked) return { kind: 'blocked', step: blocked.step, reason: blocked.reason ?? '' };
+  if (blocked) return { kind: 'blocked', step: blocked.step, reason: blocked.reason ?? '', ...(blocked.code ? { code: blocked.code } : {}) };
   const active = firstOf(state.steps, 'in_progress');
   if (active) return { kind: 'continue', step: active.step };
   // Open work beats a wait: a pending step still has something to run now, so the turn continues; only when nothing

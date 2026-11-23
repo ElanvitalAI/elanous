@@ -19,19 +19,19 @@ test('a failed real next TUI turn shows one clear receipt and a usable retry hin
       root, rows: 24, cols: 85,
       env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
         ELANOUS_TEST_FAKE_LLM_RESPONSE: 'SHOULD-NOT-REPLY', ELANOUS_TEST_FAKE_LLM_FAIL_WHEN: 'ERRORUX-FAIL' },
-      ready: { label: 'boot', until: (screen) => screen.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: (screen) => screen.includes('Ctrl+Q quit') },
       steps: [
-        { label: firstSendLabel, text: 'ERRORUX-FAIL', until: (screen) => screen.includes('턴 응답 실패') && screen.includes('✘ 요청을 처리하지 못했습니다.') },
+        { label: firstSendLabel, text: 'ERRORUX-FAIL', until: (screen) => screen.includes('● reply failed') && screen.includes('✘ 요청을 처리하지 못했습니다.') },
         { label: 'recall', keys: '\x1b[A', until: (screen) => screen.includes('❯ ERRORUX-FAIL') },
         { label: resendLabel, keys: '\r', until: (screen) => screen.split(sentTurnMarker).slice(1).length >= expectedSentTurns
-          && screen.includes('턴 응답 실패') },
+          && screen.includes('● reply failed') },
       ],
     });
     const failed = run.frames.find((frame) => frame.label === 'failed')?.screen ?? '';
     expect(run.exitCode).toBe(0);
     expect(failed).toContain('✘ 요청을 처리하지 못했습니다.');
-    expect(failed).toContain('↑ 입력 불러오기 → Enter 재전송 · /provider 확인');
-    expect(failed).toContain('턴 응답 실패');
+    expect(failed).toContain('↑ recall input → Enter resend · check /provider');
+    expect(failed).toContain('● reply failed');
     expect(failed).not.toContain('  요청을 처리하지 못했습니다.');
     expect(failed).not.toContain('SHOULD-NOT-REPLY');
     expect(run.frames.find((frame) => frame.label === 'recall')?.screen).toContain('❯ ERRORUX-FAIL');

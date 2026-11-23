@@ -30,6 +30,14 @@ const DOOR_ACTION: Record<ElsControlAction, ControlAction | null> = {
 };
 
 /** ELANOUS_ELS_SOCKET gate — '' when the daemon is not running inside an els pane. */
+/** ELS-ORCH-PEER-IDENTITY 최소판: this process's seat from the env els set when it opened the seat tab. */
+export function elsControlSeat(env: Record<string, string | undefined> = process.env): { readonly name: string; readonly workspaces?: readonly string[] } | undefined {
+  const name = (env.ELANOUS_TRACK || env.ELANOUS_SEAT || '').trim();
+  if (!name) return undefined;
+  const ws = (env.ELANOUS_ELS_WS || '').trim();
+  return ws ? { name, workspaces: [ws] } : { name };
+}
+
 export function elsControlSocketPath(env: Record<string, string | undefined> = process.env): string {
   const socket = env.ELANOUS_ELS_SOCKET ?? '';
   return typeof socket === 'string' && socket.trim() ? socket : '';
@@ -38,6 +46,8 @@ export function elsControlSocketPath(env: Record<string, string | undefined> = p
 export interface ElsControlDeps {
   readonly socketPath: string;
   readonly stateDir: string;
+  /** ELS-ORCH-PEER-IDENTITY 최소판(CEO 11-23 15:1x): the calling seat — the door's coded default rules key on it (OP → all panes · HAND-* → own workspaces). Absent ⇒ anonymous eln:tool (file rules only). */
+  readonly seat?: { readonly name: string; readonly workspaces?: readonly string[] };
   /** Human confirmation channel — used only for close. Absent ⇒ close stays denied (door default). */
   readonly ask?: (question: string) => Promise<boolean>;
 }
@@ -233,7 +243,7 @@ export async function runElsControl(args: unknown, deps: ElsControlDeps): Promis
     },
   });
   const outcome = await control.run({
-    principal: { id: 'eln:tool', kind: 'eln' },
+    principal: { id: 'eln:tool', kind: 'eln', ...(deps.seat?.name ? { seat: deps.seat.name, callerSeat: deps.seat.name, ...(deps.seat.workspaces ? { workspaces: deps.seat.workspaces } : {}) } : {}) },
     from: action === 'stop' ? `${ELS_CONTROL_TOOL_NAME}:stop` : ELS_CONTROL_TOOL_NAME,
     action: doorAction,
     // stop sends a fixed Escape, not a shell command; it still needs the do allow rule and server input gate.
@@ -284,7 +294,8 @@ export async function dispatchElsControl(args: unknown): Promise<string> {
       message: 'ElsControl: ELANOUS_ELS_SOCKET is not set — the tool is not available.',
     });
   }
-  return JSON.stringify(await runElsControl(args, { socketPath, stateDir: dirname(socketPath) }));
+  const seat = elsControlSeat();
+  return JSON.stringify(await runElsControl(args, { socketPath, stateDir: dirname(socketPath), ...(seat ? { seat } : {}) }));
 }
 
 export function buildElsControlTool(): LLMToolSpec {

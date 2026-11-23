@@ -133,6 +133,25 @@ test('JUD #39053 ⓒ1 E2E: direct-socket and env-spoofed writes are denied at th
   expect(legit.exitCode, `legit close answer: ${JSON.stringify(legit)}`).toBe(0);
 });
 
+test('workspace rename socket door resolves the actual target and denies outsiders and unknown targets', async () => {
+  const root = state();
+  const fake = (): ElsPty => ({ id: `pty_${Math.random().toString(16).slice(2)}`, isAlive: () => true, write: () => {}, renderScreen: async () => '', onExit: () => {}, kill: () => {} });
+  const started = await startElsServer({ stateRoot: root, spawn: fake });
+  if ('exitCode' in started) throw new Error(started.message);
+  cleanups.push(() => started.close());
+  await ask(root, { op: 'new', ws: 'Alpha', cwd: '/tmp', command: ['sh'] });
+  await ask(root, { op: 'new', ws: 'Beta', cwd: '/tmp', command: ['sh'] });
+  const list = async () => JSON.parse((await askRaw(root, { op: 'ls' })).message) as { workspaces: { id: string; name: string }[] };
+  const before = await list();
+  const alpha = before.workspaces.find(w => w.name === 'Alpha')!;
+  const beta = before.workspaces.find(w => w.name === 'Beta')!;
+  expect((await askRaw(root, { op: 'rename', kind: 'workspace', id: beta.id, name: 'bad', at: { ws: 'Alpha' } })).exitCode).not.toBe(0);
+  expect(await list()).toEqual(before);
+  expect((await ask(root, { op: 'rename', kind: 'workspace', id: 'missing', name: 'bad' })).exitCode).not.toBe(0);
+  expect((await ask(root, { op: 'rename', kind: 'workspace', id: alpha.id, name: 'Changed' })).exitCode).toBe(0);
+  expect((await list()).workspaces).toEqual(expect.arrayContaining([{ ...alpha, name: 'Changed' }, beta]));
+});
+
 test('tab close over the socket reaps an exited own tab, rejects a foreign tab and requires confirmation even with a file rule', async () => {
   const root = state();
   const minted: Record<string, string>[] = [];
@@ -481,4 +500,55 @@ test('JUD #39096 ⓒ — els pane 프로세스의 무토큰 요청은 문에서 
   expect(answer).toContain('present the pane token');
   client.destroy(); serverSide.destroy();
   await new Promise<void>((resolve) => relay.close(() => resolve()));
+});
+
+test('tab rename socket resolves id and unique label, rejects ambiguous labels and outsiders', async () => {
+  const root = state();
+  const fake = (): ElsPty => ({ id: `pty_${Math.random()}`, isAlive: () => true, write: () => {}, renderScreen: async () => '', onExit: () => {}, kill: () => {} });
+  const server = await startElsServer({ stateRoot: root, spawn: fake });
+  if ('exitCode' in server) throw new Error(server.message);
+  cleanups.push(() => server.close());
+  await ask(root, { op: 'new', ws: 'Alpha', cwd: '/tmp', command: ['sh'], title: 'First' });
+  await ask(root, { op: 'new', ws: 'Beta', cwd: '/tmp', command: ['sh'], title: 'Second' });
+  const list = async () => JSON.parse((await askRaw(root, { op: 'ls' })).message) as { tabs: { id: string; label: string }[] };
+  const before = await list();
+  expect((await askRaw(root, { op: 'rename', kind: 'tab', id: 'First', name: 'Stolen', at: { ws: 'Alpha' } })).exitCode).toBe(1);
+  expect((await ask(root, { op: 'rename', kind: 'tab', id: 'First', name: 'Renamed' })).exitCode).toBe(0);
+  expect((await list()).tabs.map(t => t.label)).toEqual(['Renamed', 'Second']);
+  expect((await ask(root, { op: 'rename', kind: 'tab', id: before.tabs[1]!.id, name: 'Renamed' })).exitCode).toBe(0);
+  expect((await ask(root, { op: 'rename', kind: 'tab', id: 'Renamed', name: 'Ambiguous' })).exitCode).toBe(1);
+  expect((await list()).tabs.map(t => t.label)).toEqual(['Renamed', 'Renamed']);
+});
+
+test('assigned coordinator renames tabs only in the assigned workspace', async () => {
+  if (!process.env.ELS_RENAME_PRIVATE_TTY) {
+    const child = Bun.spawn(['/usr/bin/script', '-q', '/dev/null', process.execPath, 'test', import.meta.path, '-t', 'assigned coordinator renames'], { env: { ...process.env, ELS_RENAME_PRIVATE_TTY: '1', NO_COLOR: '1' }, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    expect({ code, output: out + err }).toMatchObject({ code: 0, output: expect.stringContaining('1 pass') });
+    return;
+  }
+  const root = state();
+  const identity = processIdentity(process.pid);
+  if (!identity) throw new Error('no process identity');
+  const tokens: string[] = [];
+  const server = await startElsServer({ stateRoot: root, spawn: (_cmd, _cwd, _title, env) => {
+    tokens.push(env[AUTH_PANE_TOKEN_ENV]!);
+    return { id: `pty_${tokens.length}`, ...(tokens.length === 1 ? { pid: process.pid, processBinding: { pid: process.pid, start: identity.start, generation: 'coord-fixture' } } : {}), isAlive: () => true, write: () => {}, renderScreen: async () => '', onExit: () => {}, kill: () => {} };
+  } });
+  if ('exitCode' in server) throw new Error(server.message);
+  cleanups.push(() => server.close());
+  server.core.newPane({ ws: 'Alpha', cwd: '/tmp/elanous-hq/seats/LEAD', command: ['sh'], title: 'Leader', parent: { kind: 'hand', seat: 'LEAD', workspaces: ['Alpha'] } });
+  server.core.newPane({ ws: 'Alpha', cwd: '/tmp/elanous-hq/seats/OTHER', command: ['sh'], title: 'Team' });
+  server.core.newPane({ ws: 'Beta', cwd: '/tmp', command: ['sh'], title: 'Other' });
+  expect(server.core.setSpaceCoordinator('Alpha', 'LEAD').exitCode).toBe(0);
+  const auth = { op: 'auth', token: tokens[0] };
+  const renamed = await askRaw(root, { op: 'rename', kind: 'tab', id: 'Team', name: 'Team renamed' }, auth);
+  expect(renamed.exitCode, renamed.message).toBe(0);
+  expect((await askRaw(root, { op: 'rename', kind: 'tab', id: 'Other', name: 'Stolen', at: { ws: 'Alpha' } }, auth)).exitCode).toBe(1);
+  expect(server.core.setSpaceCoordinator('Alpha', 'OTHER').exitCode).toBe(0);
+  const denied = await askRaw(root, { op: 'rename', kind: 'tab', id: 'Team renamed', name: 'Not allowed' }, auth);
+  expect(denied.exitCode).toBe(1);
+  expect(denied.message).toBe('els: tab rename denied — only OP or the workspace coordinator may rename tabs');
+  const listed = JSON.parse((await askRaw(root, { op: 'ls' })).message) as { tabs: { label: string }[] };
+  expect(listed.tabs.map(tab => tab.label)).toEqual(['Leader', 'Team renamed', 'Other']);
 });

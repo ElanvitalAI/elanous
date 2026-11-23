@@ -89,20 +89,22 @@ describe('CAPSULE-C3 notice watcher ⊕ adapter — failed turns back off', () =
     expect(f.notices()).toEqual([]); // parked for the back-off, not re-queued at once
   });
 
-  test('a cancelled turn is not a failure: the mail is back at once, and three cancels never give it up', () => {
+  test('a cancelled turn is not a failure: the mail is back at once — once; a second cancel gives it up (SEAT-MAIL-COALESCE-NOTICE)', () => {
     const f = fixture();
     f.watcher.poll();
     const posted = f.store.post({ from: 'OP', to: SEAT, body: '지시' });
     f.watcher.poll();
-    for (let round = 0; round < 3; round += 1) {
-      expect(f.queue.dequeue().kind).toBe('submit');
-      f.watcher.noteTurnFinished(false, 'cancelled');
-      expect(f.notices()).toEqual([posted.id]);
-    }
     expect(f.queue.dequeue().kind).toBe('submit');
-    f.watcher.noteTurnFinished(true);
-    expect(f.states(posted.id)).toEqual(['posted', 'delivered', 'seen']);
+    f.watcher.noteTurnFinished(false, 'cancelled');
+    expect(f.notices()).toEqual([posted.id]);
+    expect(f.queue.dequeue().kind).toBe('submit');
+    f.watcher.noteTurnFinished(false, 'cancelled');
+    expect(f.notices()).toEqual([]);
+    f.watcher.poll();
+    expect(f.notices()).toEqual([]);
+    expect(f.states(posted.id)).toEqual(['posted', 'delivered']);
     expect(f.adapter.owner(posted.id)).toBe('done');
+    expect(f.logs.filter(([event]) => event === 'seat-mail-gave-up').map(([, data]) => data.msgId)).toEqual([posted.id]);
   });
 
   // 출처: JUD-B #113185 (ack on cancel) · #114295 (the receipts fixture had no recordDone, so «no done» was never asserted).
@@ -210,9 +212,9 @@ describe('CAPSULE-C3 one owner across the watcher and the plan (D9 · #87012)', 
     expect(f.adapter.owner(posted.id)).toBe('plan');
     const planNotices = f.queue.items.filter((item) => item.kind === 'notice').length;
     expect(planNotices).toBe(1); // the active plan item
-    expect(f.watcher.poll()).toEqual({ kind: 'messages', msgIds: [] });
+    expect(f.watcher.poll()).toEqual({ kind: 'baseline', unread: 1 });
     expect(f.queue.items.filter((item) => item.kind === 'notice')).toHaveLength(1);
-    expect(f.logs).toContainEqual(['seat-mail-dedupe-hit', { seat: SEAT, msgId: posted.id, owner: 'plan' }]);
+    expect(f.logs).toContainEqual(['seat-mail-dedupe-hit', { seat: SEAT, msgId: posted.id }]);
   });
 
   test('JUD #38580 ⓐ — the watcher queued the notice, then the plan absorbs BEFORE that turn: no second item, one notice', () => {
@@ -251,5 +253,16 @@ describe('CAPSULE-C3 one owner across the watcher and the plan (D9 · #87012)', 
     f.plan.absorb();
     expect(f.plan.plan()).toEqual([]);
     expect(f.queue.items.filter((item) => item.kind === 'notice')).toEqual([]);
+  });
+
+  test('CC-4 ask ① — boot with 25 unread: the plan absorbs all 25, the watcher queues no duplicate mail notice', () => {
+    const f = planFixture();
+    const posted = Array.from({ length: 25 }, (_, i) =>
+      f.store.post({ from: 'TC', to: SEAT, body: `칸 CAPSULE-C3 구현 후 시험하고 보고 — 부트 25통 ${i + 1}` }));
+    f.plan.absorb();
+    expect(posted.map((message) => f.adapter.owner(message.id))).toEqual(Array.from({ length: 25 }, () => 'plan'));
+    expect(f.watcher.poll()).toEqual({ kind: 'messages', msgIds: [] });
+    expect(f.queue.items.filter((item) => item.kind === 'notice' && item.msgId != null)).toHaveLength(1);
+    expect(f.logs).toContainEqual(['seat-mail-dedupe-hit', { seat: SEAT, msgId: posted[0]!.id }]); // the active plan item's notice rides the queuedIds path (no owner field); the other 24 log claim-deny owner 'plan'
   });
 });

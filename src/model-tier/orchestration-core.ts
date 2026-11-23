@@ -60,6 +60,8 @@ export interface AccountCandidate {
   readonly mustLastUntilMs?: number;
   /** API 계정의 «결과당 비용» 순위(작을수록 싸다) — 값(가격)이 아니라 순위만. 생략 = 모름. */
   readonly costRank?: number;
+  /** COST-OPTIMIZER-WINDOW-AWARE(ROSTER-0334 P2-11) — 이 계정의 크레딧 «보유 여부». 잔액 숫자 아님(가격 숫자 금지 — 회전 판정의 몫). 생략 = 모름. */
+  readonly credits?: { readonly available: boolean };
 }
 
 export interface AccountState {
@@ -96,6 +98,8 @@ export type AdvisorMoment = 'plan' | 'same-error' | 'pre-complete';
 // ── 출력 ─────────────────────────────────────────────────────────────────
 
 export interface CoreDecision {
+  /** ROUTER-OR-CODEX-MIX-CHOKEPOINT(OP #132227) — 결정 id(`${runId}#d${seq}` · decide 가 발행). 원장 결정 줄·호출 문맥에 같은 id 로 이어진다. */
+  readonly decisionId: string;
   readonly tier: WorkTierClass;
   /** 실제로 푼 사다리 칸 — 모델 id 는 이 칸에서만 나온다. */
   readonly cell: ModelTier;
@@ -171,6 +175,8 @@ export interface CoreModules {
 export interface CoreDecisionLedgerRecord {
   readonly kind: 'decision';
   readonly runId: string;
+  /** ROUTER-OR-CODEX-MIX-CHOKEPOINT(OP #132227) — 이 결정의 id(`${runId}#d${seq}`). 같은 id 가 llm.usage 줄(routeDecisionId)까지 이어진다. 선택칸 = 기존 원장 하위호환. */
+  readonly decisionId?: string;
   readonly moment: WorkMoment;
   readonly level: WorkLevel;
   readonly bloom: BloomStage;
@@ -201,6 +207,8 @@ export interface CoreCallLedgerFields {
   readonly workTierTrigger: WorkTierTrigger;
   /** context = 코어 결정 문맥 · model-lookup = 문맥 없이 사다리에서 역산. */
   readonly workTierSource: 'context' | 'model-lookup';
+  /** ROUTER-OR-CODEX-MIX-CHOKEPOINT(OP #132227) — 이 호출을 낸 결정의 id. 결정 문맥(context)일 때만 붙는다(지어 내지 않는다). */
+  readonly routeDecisionId?: string;
 }
 
 /** 코어 한 대. eln 하니스는 발사마다 `decide`, 모델 호출마다 `callFields` 를 부른다. */

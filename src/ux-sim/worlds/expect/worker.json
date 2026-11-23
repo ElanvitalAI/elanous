@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "entries": {
+    "worker/WORKER-STALL": {
+      "expect": "red",
+      "reason": "S1 injection device only (WORKER-UNIFY 6-2): silent worker is never judged stalled; the nexus registry/watch consumer is not on main — red means unobserved, not a claimed defect",
+      "redReason": "worker consumer not connected"
+    },
+    "worker/WORKER-DEATH": {
+      "expect": "red",
+      "reason": "S1 injection device only (WORKER-UNIFY 6-2): dead worker never becomes terminal; the nexus registry/watch consumer is not on main — red means unobserved, not a claimed defect",
+      "redReason": "worker consumer not connected"
+    },
+    "worker/WORKER-APPROVAL": {
+      "expect": "red",
+      "reason": "S1 injection device only (WORKER-UNIFY 6-2): approval wait is never shown as a badge; the nexus registry/watch consumer is not on main — red means unobserved, not a claimed defect",
+      "redReason": "worker consumer not connected"
+    },
+    "worker/WORKER-REORDER": {
+      "expect": "red",
+      "reason": "S1 injection device only (WORKER-UNIFY 6-2): duplicate and late frames are never checked against state; the nexus registry/watch consumer is not on main — red means unobserved, not a claimed defect",
+      "redReason": "worker consumer not connected"
+    },
+    "worker/WORKER-FLOOD": {
+      "expect": "red",
+      "reason": "S1 injection device only (WORKER-UNIFY 6-2): output burst is never observed; the nexus registry/watch consumer is not on main — red means unobserved, not a claimed defect",
+      "redReason": "worker consumer not connected"
+    },
+    "worker/WORKER-MIXED": {
+      "expect": "red",
+      "reason": "S1 injection device only (WORKER-UNIFY 6-2): mixed-kind fanout has no single nexus watch; the nexus registry/watch consumer is not on main — red means unobserved, not a claimed defect",
+      "redReason": "worker consumer not connected"
+    },
+    "worker/WORKER-BINDINGS": {
+      "expect": "red",
+      "reason": "S1 injection device only: this scenario injects an EMPTY event list — it did not measure equal semantics across the three bindings; binding consumers are not connected, so it is unmeasured (red = unobserved, not a defect)",
+      "redReason": "worker consumer not connected"
+    },
+    "worker/WORKER-WIRE-ACCEPT": {
+      "expect": "green",
+      "reason": "S1 normal path: device frames survive one JSON line and the production v1 frame reader (parseEventFrame) accepts them in order; registry/watch consumer axis unmeasured",
+      "greenSince": "2026-11-20"
+    },
+    "worker/WORKER-WIRE-REJECT": {
+      "expect": "green",
+      "reason": "S1 refusal path: v2, contract-only event kind result, contract-only state needs-approval and seq 0 are refused with a stated reason (ignore vs reject) — shows the wire v1 cannot yet carry the contract vocabulary",
+      "greenSince": "2026-11-20"
+    }
+  }
+}

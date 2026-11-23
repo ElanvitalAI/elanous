@@ -306,7 +306,11 @@ function logMcpToolsList(
 
 function runtimeToMcpTool(rt: ToolRuntime, surface: ToolSurface) {
   const inputSchema = surface === 'mcp' && rt.id === 'msg_ack'
-    ? { type: 'object', properties: { id: { type: 'integer', description: 'Acknowledge every message through this ID for the authenticated seat.' } }, required: ['id'], additionalProperties: false }
+    ? { type: 'object', properties: {
+        ids: { type: 'array', items: { type: 'integer' }, description: 'Acknowledge exactly these message IDs for the authenticated seat (per id).' },
+        id: { type: 'integer', description: 'Acknowledge every message through this ID for the authenticated seat.' },
+        receipted: { type: 'boolean', description: 'true = also acknowledge every message that already has a terminal receipt.' },
+      }, additionalProperties: false }
     : rt.id === 'msg_inbox'
       ? rt.spec.parameters
       : surface === 'mcp' && rt.id === 'agent'

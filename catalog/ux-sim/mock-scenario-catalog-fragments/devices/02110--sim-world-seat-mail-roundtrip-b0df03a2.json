@@ -1,0 +1,23 @@
+{
+  "id": "sim-world-seat-mail-roundtrip",
+  "name": "SIM-WORLD seat-mail-roundtrip pack (S7 · two-seat round trip)",
+  "audience": "internal",
+  "implementation": [
+    "src/ux-sim/sim-world/seat-mail-roundtrip/scenarios.ts"
+  ],
+  "tests": ["src/ux-sim/sim-world/kernel.test.ts"],
+  "target": "replays a two-seat (A·B) mail round trip; scenarios see the world only through the D-RT device",
+  "inputs": [
+    "seat-mail-roundtrip scenario rows",
+    "sim-world-expect.json verdicts"
+  ],
+  "observations": [
+    "each round trip is judged through the kernel expectation ratchet"
+  ],
+  "entryCommands": [
+    "eln --test=<isolated-state> sim world run seat-mail-roundtrip --seed 1"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

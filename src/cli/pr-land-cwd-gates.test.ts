@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveTscScript, runGate } from '../../scripts/ci-typecheck-changed.js';
 import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-gate.js';
-import { runPrLand, runPrLandTypecheckGate, runPrLandTypecheckWithReceipt, shouldRefusePrLandLocalHeavySteps } from './pr-cli.js';
+import { runPrLand, runPrLandMockModuleRestoreGate, runPrLandTypecheckGate, runPrLandTypecheckWithReceipt, shouldRefusePrLandLocalHeavySteps } from './pr-cli.js';
 
 setDefaultTimeout(60_000);
 
@@ -121,6 +121,26 @@ function git(cwd: string, args: string[]): void {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
   if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
 }
+
+test('pr land compares mock violations against the actual main tree', () => {
+  const root = mkdtempSync(join(tmpdir(), 'prland-mock-main-'));
+  try {
+    git(root, ['init', '-q']); git(root, ['config', 'user.email', 'test@example.invalid']); git(root, ['config', 'user.name', 'Test']);
+    mkdirSync(join(root, 'test'));
+    writeFileSync(join(root, 'test/old.test.ts'), "mock.module('old', () => ({}));\n");
+    git(root, ['add', '.']); git(root, ['commit', '-qm', 'main']);
+    git(root, ['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    const errors: string[] = [];
+    const out = { log: (_: string) => {}, error: (s: string) => errors.push(s) };
+    expect(runPrLandMockModuleRestoreGate(out, root)).toBe(true);
+    writeFileSync(join(root, 'test/new.test.ts'), "mock.module('new', () => ({}));\n");
+    expect(runPrLandMockModuleRestoreGate(out, root)).toBe(false);
+    expect(errors.join('\n')).toContain('test/new.test.ts: new');
+    git(root, ['update-ref', '-d', 'refs/remotes/origin/main']);
+    expect(runPrLandMockModuleRestoreGate(out, root)).toBe(false);
+    expect(errors.join('\n')).toContain('기준 측정 불가');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 /** A repo whose only change since the root commit is a markdown file — zero .ts. */
 function docsOnlyTree(parent = tmpdir()): { dir: string; base: string; head: string } {

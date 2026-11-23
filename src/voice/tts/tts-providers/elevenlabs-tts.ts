@@ -15,6 +15,7 @@
 // Reference: ROADMAP §2.5 · elevenlabs.io/docs/api-reference/text-to-speech/convert-as-stream.
 
 import { debug } from '../../../debug/log.js';
+import { llmNetworkFetch } from '../../../session-runtime/llm-call-gateway.js';
 import { isVoiceCostId } from '../../../models/voice-costs.js';
 import { globalVoiceCostTracker } from '../../cost-tracker.js';
 import {
@@ -105,7 +106,7 @@ export class ElevenLabsTTSProvider implements TTSProvider {
         url, modelId: this.modelId, voiceId, chars: text.length,
       });
     const t0 = Date.now();
-    const response = await fetch(url, {
+    const response = await llmNetworkFetch(url, {
       method: 'POST',
       headers: {
         'xi-api-key': this.apiKey,
@@ -113,7 +114,7 @@ export class ElevenLabsTTSProvider implements TTSProvider {
         Accept: 'audio/pcm',
       },
       body: JSON.stringify(body),
-    });
+    }, { provider: 'elevenlabs', model: this.modelId, role: 'aux', requestedBy: 'voice-tts' });
     const latencyMs = Date.now() - t0;
     if (!response.ok) {
       const errBody = await response.text().catch(() => '');

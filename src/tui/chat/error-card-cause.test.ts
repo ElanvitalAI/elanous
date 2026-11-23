@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { classifyTurnFailure, nextTuiErrorCard } from './error-card.js';
+import { classifyTurnFailure, nextTuiErrorCard, TURN_FAILURE_CAUSE_LABELS } from './error-card.js';
 import { turnReplyFailureMessage } from '../core/next-public-reply.js';
 
 test('failure causes read as classes, never as raw error text', () => {
@@ -12,6 +12,8 @@ test('failure causes read as classes, never as raw error text', () => {
     ['401 Unauthorized', 'Authentication was denied'],
   ];
   for (const [raw, expected] of cases) expect(classifyTurnFailure(raw)).toContain(expected);
+  // ② a reloaded session accepts only these labels — every class the classifier returns is one of them.
+  expect(cases.map(([raw]) => TURN_FAILURE_CAUSE_LABELS.includes(classifyTurnFailure(raw)!))).toEqual([true, true, true, true, true, true]);
   expect(classifyTurnFailure('something odd')).toBeNull();
   expect(classifyTurnFailure(undefined)).toBeNull();
 });

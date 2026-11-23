@@ -1,5 +1,5 @@
 // One append-only observation per gate shard transition. The live board is a projection, not evidence for reuse.
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { releaseLedgerRoot } from '../instance/resolve.js';
@@ -106,9 +106,19 @@ export function gateShardLedgerPath(version: string, root = releaseLedgerRoot())
 }
 
 function assertLedgerAppendable(path: string): void {
-  if (!existsSync(path)) return;
-  const prior = readFileSync(path, 'utf8');
-  if (prior.length > 0 && !prior.endsWith('\n')) throw new Error('existing shard ledger has unterminated JSONL row');
+  let fd: number;
+  try { fd = openSync(path, 'r'); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  try {
+    const size = fstatSync(fd).size;
+    if (size === 0) return;
+    const lastByte = Buffer.alloc(1);
+    if (readSync(fd, lastByte, 0, 1, size - 1) !== 1 || lastByte[0] !== 0x0a)
+      throw new Error('existing shard ledger has unterminated JSONL row');
+  } finally { closeSync(fd); }
 }
 
 /** Each newline is a complete event, so an observer can read while the gate is running. */

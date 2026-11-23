@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "entries": {
+    "capsule-events/SEAT-STEER-PREEMPT-137": {
+      "expect": "green",
+      "greenSince": "0.3.33 SEAT-STEER-PREEMPT",
+      "reason": "137 concurrent capsule completion frames, three failures and a replay collapse into one queued summary with no result-only wake; the next person turn consumes it."
+    },
+    "capsule-events/SEAT-CAPSULE-NO-REPEAT-REPORT": {
+      "expect": "green",
+      "greenSince": "0.3.34 ELN-CAPSULE-RESULT-NO-REPEAT-REPORT",
+      "reason": "ELN-CAPSULE-RESULT-NO-REPEAT-REPORT (OP 0.3.34 P1-4): a capsule result absorbed into its original work item (mid-turn drain, next-turn passive carry, carried-with-turn summary) is a closed cell — replaying the same capsule-done (re-publish, reconnect) re-reports nothing while a fresh capsule still reports exactly once."
+    },
+    "capsule-events/C1": {
+      "expect": "green",
+      "reason": "C1 done-event wake axes (flag removed — capsule behavior always on, CAPSULE-FLAGS-REMOVE-DEFAULT): the background Agent end delivery passes here (exactly one wake turn within 20s, duplicates 0) and the harness child end frame is green in capsule-events/C1-HARNESS (B4/B5 queue-bridge); the mail axis keeps its own red row capsule-events/C1-MAIL",
+      "greenSince": "2026-11-21 pool4-capsule-c1-harness"
+    },
+    "capsule-events/C1-HARNESS": {
+      "expect": "green",
+      "reason": "C1 harness child end axis (CAPSULE-B4-HARNESS-DONE-FRAME · B5 queue-bridge): a RunShell mode:'bg' harness child finishes while the seat is idle, its task-notification crosses as one capsule-done frame and opens exactly one next turn within 20s with duplicates 0 — self-implement-stop ('harness' kind) and graph frames remain unmeasured: sim probes at a 20s window (probe-c1-harness-selfimpl-221754) and a 60s window (probe-b-c1-harness-60s-223600) both record stopCount 0, so the axis stays unmeasured (JUD-B #122985)",
+      "greenSince": "2026-11-21 pool4-capsule-c1-harness"
+    },
+    "capsule-events/C3": {
+      "expect": "green",
+      "reason": "C3 shell axis: a real Next TUI Bash past the 10s cap detaches and its capsule-done opens exactly one next turn; Esc, mail/person and three-at-once axes unmeasured",
+      "greenSince": "#38673 (main with R1 #38713 no switch · B1 wiring #38676)"
+    },
+    "capsule-events/C3-TRIO": {
+      "expect": "green",
+      "greenSince": "2026-11-21 (A2 완료선 PR — 이 PR로 신규 착지)",
+      "reason": "A2 완료선(정본 §3.6 C3:805) — 한 assistant 배치의 10분(시뮬 25s) Bash 3개가 분리 배경 캡슐로 모두 살아남고: 메인 턴 idle 복귀 ≤20s · 그 틈 우편·사람 입력이 각각 자기 턴을 즉시 열며 · Bash 완료 3건이 고유 셸 id 로 정확히 한 번씩 사건 턴을 연다(중복 송달 없음 · Esc 생존 축은 정본 C3 에 그대로)"
+    },
+    "capsule-events/C7": {
+      "expect": "red",
+      "reason": "C7 partial MCP axis; provider, harness, and deadline event remain unmeasured",
+      "redReason": "silent MCP holds the main turn"
+    },
+    "capsule-events/C1-MAIL": {
+      "expect": "red",
+      "reason": "C1 mail axis (원천 1a·1b) partial: watcher and plan compete for one unseen mail — scenario id renamed from C3 (sim-owner adjudication · TC-H-CC-3 #90220 → #90474): 정본 §3.6 C3 는 10분 Bash·우편·사람·Esc 축(#38673 이 측정) · 생산 단계 토큰 C3(C3-b 우편 어댑터)는 그대로",
+      "redReason": "C3 remaining mail routes unmeasured"
+    },
+    "capsule-events/C2": {
+      "expect": "red",
+      "reason": "C2 partial: mail during a short real tool is delivered once; model-roundtrip and tool-duration budgets unmeasured — redReason follows the scenario's partial-red reason (was the catch reason since #38695)",
+      "redReason": "C2 remaining timing axes unmeasured"
+    },
+    "capsule-events/C5": {
+      "expect": "red",
+      "reason": "C5 wakeup partial: busy-turn defer and restart axes held (#38725); the takePending gate-decline (D6) and pty axes remain unmeasured",
+      "redReason": "C5 gate-declined and pty axes unmeasured"
+    },
+    "capsule-events/C6": {
+      "expect": "green",
+      "greenSince": "#38725",
+      "reason": "C6 boot backlog: unread turn-life rows at boot re-open as one backlog window judged on the real turn timeline",
+      "redReason": "boot backlog drops unread turn-start"
+    },
+    "capsule-events/C4": {
+      "expect": "green",
+      "greenSince": "#39444 seed-7 Next TUI scenario",
+      "reason": "C4 urgent mail opens within 20s while a background Agent is active; the Agent completion opens one later turn and a progress line is visible. The fake provider compresses the 20-minute hold to 40s."
+    },
+    "capsule-events/C3-ESC": {
+      "expect": "green",
+      "greenSince": "#39444 seed-7 Next TUI scenario",
+      "reason": "C3 Esc axis: a Bash with a 10-minute timeout remains alive after Esc cancels another turn, then writes its completion marker. The wall-clock hold is bounded to 32s."
+    },
+    "capsule-events/C9-SESSION-SCOPED": {
+      "expect": "green",
+      "greenSince": "ELN-CAPSULE-COMPLETION-SCOPED",
+      "reason": "C9 session scope: two seat sessions built from the tree REPL tools run background RunShell capsules at once and each drain takes only its own completion; an idle seat's supplement Agent completion becomes one queued notice and opens no turn. The shared persisted queue file across REPL processes stays unmeasured (FU)."
+    }
+  }
+}

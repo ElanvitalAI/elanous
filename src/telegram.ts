@@ -193,6 +193,8 @@ export interface TelegramBotOpts {
   pollTimeoutSec?: number;
   /** Chunk size for outbound messages. Telegram caps at 4096. */
   maxMessageChars?: number;
+  /** Test seam for independent conflict alert delivery. */
+  conflictAlert?: () => Promise<boolean>;
   /** Optional logger. */
   log?: (msg: string) => void;
   /** Test seam — override sleep implementation for retry/throttle paths. */
@@ -331,6 +333,7 @@ export class TelegramBot {
   private readonly apiBase: string;
   private readonly errorBackoffMs: number;
   private readonly pollTimeoutSec: number;
+  private readonly conflictAlert: () => Promise<boolean>;
   private readonly maxChars: number;
   private readonly log: (msg: string) => void;
   private readonly sleepImpl: (ms: number) => Promise<void>;
@@ -417,6 +420,10 @@ export class TelegramBot {
     this.apiBase = opts.apiBase ?? 'https://api.telegram.org';
     this.errorBackoffMs = opts.errorBackoffMs ?? DEFAULT_ERROR_BACKOFF;
     this.pollTimeoutSec = opts.pollTimeoutSec ?? DEFAULT_POLL_TIMEOUT;
+    this.conflictAlert = opts.conflictAlert ?? (async () => {
+      const { sendOutbound } = await import('./domains/outbound-alert.js');
+      return sendOutbound('텔레그램 수신기 409 충돌 3회 연속 — 중복 폴러 확인 필요', 'alert');
+    });
     this.maxChars = opts.maxMessageChars ?? DEFAULT_MAX_CHARS;
     // LF2(2026-07-13) — 기본 no-op 이던 봇 코어 로거를 debug.log 브릿지로:
     // env(ELANOUS_DAEMON_MIRROR_VERBOSE) 없이도 프로덕션 봇 라인이 파일
@@ -1283,6 +1290,7 @@ export class TelegramBot {
     // conflict clears. Log the first hit and every 10th subsequent
     // so the operator sees the state without being flooded.
     let conflictCount = 0;
+    let conflictAlerted = false;
     let conflictBackoffMs = 5_000;
     const CONFLICT_BACKOFF_CAP = 60_000;
     while (this.running) {
@@ -1306,6 +1314,7 @@ export class TelegramBot {
         if (conflictCount > 0) {
           this.log(`telegram: conflict cleared after ${conflictCount} retries`);
           conflictCount = 0;
+          conflictAlerted = false;
           conflictBackoffMs = 5_000;
         }
         for (const u of updates) {
@@ -1436,6 +1445,14 @@ export class TelegramBot {
         if (ec === 409) {
           // 409 Conflict — another poller is active. Exponential backoff.
           conflictCount++;
+          if (conflictCount >= 3 && !conflictAlerted) {
+            try {
+              conflictAlerted = await this.conflictAlert();
+              if (!conflictAlerted) this.log('telegram: conflict alert delivery failed');
+            } catch {
+              this.log('telegram: conflict alert delivery failed');
+            }
+          }
           if (conflictCount === 1 || conflictCount % 10 === 0) {
             this.log(
               `telegram: 409 Conflict (another poller active) — ` +
@@ -1447,6 +1464,8 @@ export class TelegramBot {
           conflictBackoffMs = Math.min(CONFLICT_BACKOFF_CAP, conflictBackoffMs * 2);
           continue;
         }
+        conflictCount = 0;
+        conflictAlerted = false;
         this.log(`telegram poll error: ${err?.message ?? String(err)}`);
         if (!this.running) break;
         // Non-conflict errors use the existing plain backoff.

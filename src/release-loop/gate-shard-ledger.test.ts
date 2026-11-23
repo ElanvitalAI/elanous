@@ -1,11 +1,32 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, ftruncateSync, mkdtempSync, openSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendGateShardLedger, appendGateShardLedgerBatch, appendGateShardLedgerForGate, appendGateShardLifecycleState, gateShardFilesCovered, gateShardLedgerBatchComplete, gateShardLedgerBatchReusable, gateShardLedgerPath, latestGateShardLedger, latestGateShardLedgerAttempts, readGateShardLedger, type GateShardLedgerRow } from './gate-shard-ledger.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+
+test('a large ledger is checked at its end before each append', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-ledger-large-')); roots.push(root);
+  const path = join(root, 'ledger.jsonl');
+  const size = 256 * 1024 * 1024; // 출처: #134519 — large-ledger collector memory regression fixture
+  const fd = openSync(path, 'w');
+  try { ftruncateSync(fd, size); } finally { closeSync(fd); }
+  const row: GateShardLedgerRow = {
+    v: 1, version: '0.3.34', phase: 'cut', shardId: 'pod-0', files: ['src/a.test.ts'],
+    host: null, executor: 'pod', imageDigest: null, commit: 'a'.repeat(40), envFingerprint: 'b'.repeat(64),
+    startedAt: null, endedAt: null, observedAt: '2026-11-24T00:00:00Z', state: 'pending', rc: null,
+    pass: null, fail: null, errors: null, ran: null, failureIds: null, errorIds: null,
+    attribution: 'unmeasured', logPath: null, junitPath: null, stopReason: null, attemptId: null,
+  };
+  expect(() => appendGateShardLedger(path, row)).toThrow('unterminated JSONL row');
+  expect(statSync(path).size).toBe(size);
+  const writable = openSync(path, 'r+');
+  try { writeSync(writable, Buffer.from('\n'), 0, 1, size - 1); } finally { closeSync(writable); }
+  appendGateShardLedger(path, row);
+  expect(statSync(path).size).toBeGreaterThan(size);
+});
 
 test('a recovered parent is complete only when retry shards cover its exact file map', () => {
   expect(gateShardFilesCovered(['src/a.test.ts', 'src/b.test.ts'], ['src/a.test.ts', 'src/b.test.ts'])).toBe(true);

@@ -1,4 +1,8 @@
 import { describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { runMockModuleRestoreGate, scanMockModuleRestoreCandidates } from './ci-mock-module-restore-gate.js';
 
 const entry = (...modules: string[]) => ({ count: modules.length, modules });
@@ -12,6 +16,30 @@ const expandedRestore = [
 ].join('\n');
 
 describe('ci-mock-module-restore-gate', () => {
+  test('compares actual base tree debt and fails closed when the base is unavailable', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mock-restore-base-'));
+    const git = (...args: string[]) => {
+      const r = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+      if (r.status !== 0) throw new Error(r.stderr);
+    };
+    try {
+      git('init', '-q'); git('config', 'user.email', 'test@example.invalid'); git('config', 'user.name', 'Test');
+      mkdirSync(join(root, 'test'));
+      writeFileSync(join(root, 'test/old.test.ts'), "mock.module('old', () => ({}));\n");
+      git('add', '.'); git('commit', '-qm', 'base');
+      const errors: string[] = [];
+      const run = (ref: string) => runMockModuleRestoreGate({ cwd: root, compareRef: ref, args: [], log: () => {}, error: s => errors.push(s) });
+      expect(run('HEAD')).toBe(0);
+      writeFileSync(join(root, 'test/new.test.ts'), "mock.module('new', () => ({}));\n");
+      expect(run('HEAD')).toBe(1);
+      expect(errors.join('\n')).toContain('test/new.test.ts: new');
+      writeFileSync(join(root, 'test/new.test.ts'), '');
+      writeFileSync(join(root, 'test/old.test.ts'), "mock.module('different', () => ({}));\n");
+      expect(run('HEAD')).toBe(1); // Equal counts must not hide a different new mock.
+      expect(run('missing-baseline-ref')).toBe(1);
+      expect(errors.join('\n')).toContain('기준 측정 불가');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   test('accepts R-TST23 expanded-snapshot afterAll restoration and createRequire originals', () => {
     expect(scanMockModuleRestoreCandidates(expandedRestore)).toEqual([]);
     expect(scanMockModuleRestoreCandidates([

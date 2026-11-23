@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DASHBOARD_PREFIX = 'src/dashboard/';
 // R-CTR4 — 공유 8개(classic 밖 참조가 있어 classic 은퇴와 별개). classic 밖 경로는 개별 명시.
+// TEST-FAILURE-CLEARING(11-23): seat-local-instructions · seat-task-decompose 정본을 src/seat/ 로 이동(dashboard 경로는 재수출 shim).
 // ① 2단계(2026-11-21): turn-outcome-shadow 정본 src/commitment/turn-outcome-shadow.ts 이동 — 목록 경로 갱신(dashboard 경로는 얇은 재수출 shim).
 const SHARED_PRESERVE_COUNT = 8;
 const SHARED_PRESERVE = [
@@ -19,9 +20,9 @@ const SHARED_PRESERVE = [
   'src/dashboard/plugin-route-adapter.ts',
   'src/dashboard/input/commitment-ledger.ts',
   'src/dashboard/seat-boot-preamble.ts',
-  'src/dashboard/seat-local-instructions.ts',
+  'src/seat/seat-local-instructions.ts',
   'src/commitment/turn-outcome-shadow.ts',
-  'src/dashboard/input/seat-task-decompose.ts',
+  'src/seat/seat-task-decompose.ts',
   'src/capture/tui-self-report.ts',
 ];
 

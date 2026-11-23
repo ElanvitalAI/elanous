@@ -47,7 +47,9 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { canonicalSeatId, openMsgStore, validateMessageEnvelope, type Message, type MsgStore } from '../../msg/msg-store.js';
+import { ackDigestInputs, recordAckDigest, type AckDigestInput, type AckDigestPorts } from '../../msg/msg-ack-digest.js';
+import { canonicalMessageAddress, canonicalSeatId, openMsgStore, validateMessageEnvelope, type Message, type MsgStore } from '../../msg/msg-store.js';
+import { armMessageFollowUp } from '../../msg/msg-follow-up.js';
 import {
   addItem,
   devVersion,
@@ -202,6 +204,10 @@ export async function observeLedgerCall<T extends Record<string, unknown>>(
 export interface MsgLedgerDeps {
   /** Message-ledger opener; overridden by tests with a temp path. */
   openStore?: () => MsgStore;
+  followUp?: typeof armMessageFollowUp;
+  /** MSG-FILTERS-RELAX bulk-ack digest saver (default: the `eln memory add` store). */
+  saveAckDigest?: AckDigestPorts['save'];
+  now?: () => Date;
 }
 
 export interface ChecklistLedgerDeps {
@@ -242,7 +248,8 @@ export interface MsgListResult extends Record<string, unknown> {
 }
 
 export async function dispatchMsgList(rawArgs: Record<string, unknown>, deps: MsgLedgerDeps = {}): Promise<MsgListResult> {
-  const to = canonicalSeatId(requiredString(rawArgs.to, 'to'));
+  // MSG-FILTERS-RELAX: any seat's mailbox (sub-seat · pane · session included) can be read — reading never acks.
+  const to = canonicalMessageAddress(requiredString(rawArgs.to, 'to'));
   const limit = rawArgs.limit === undefined || rawArgs.limit === null || rawArgs.limit === 0 ? 100 : integerArg(rawArgs.limit, 'limit', 1, 1000);
   // A filled `after: 0` means «not set» (the model fills every property);
   // reading acknowledged history is the explicit includeAcknowledged flag.
@@ -282,8 +289,11 @@ export function buildMsgPostTool(): LLMToolSpec {
         from: { type: 'string', description: 'Sender seat (ALL cannot send).' },
         to: { type: 'string', description: 'Recipient seat: OP · MK · TC · UX · ALL or another canonical seat id.' },
         body: { type: 'string', description: 'Message body (nonempty).' },
-        kind: { type: 'string', description: 'Optional lowercase tag (letters, digits, -, _).' },
+        kind: { type: 'string', description: 'Optional tag (any text; stored lowercased).' },
         replyTo: { type: 'integer', description: 'Question message ID this reply points at.' },
+        intent: { type: 'string', enum: ['request', 'decision', 'info', 'alert'], description: 'Request and decision messages automatically receive a 30-minute follow-up.' },
+        waitForPr: { type: 'integer', description: 'Optional PR number to watch for merge instead of waiting for a reply.' },
+        doneWhen: { type: 'string', description: 'Optional completion condition for the request.' },
       },
       required: ['from', 'to', 'body'],
       additionalProperties: false,
@@ -295,6 +305,7 @@ export interface MsgPostResult extends Record<string, unknown> {
   output: string;
   ok: true;
   message: Message;
+  followUp?: { commitmentId: string; wakerId: string; condition: string; merged: boolean } | { error: string };
 }
 
 export async function dispatchMsgPost(rawArgs: Record<string, unknown>, deps: MsgLedgerDeps = {}): Promise<MsgPostResult> {
@@ -305,7 +316,12 @@ export async function dispatchMsgPost(rawArgs: Record<string, unknown>, deps: Ms
     ...(filledString(rawArgs.kind, 'kind') === undefined ? {} : { kind: requiredString(rawArgs.kind, 'kind') }),
     ...(rawArgs.replyTo === undefined || rawArgs.replyTo === null || rawArgs.replyTo === 0
       ? {} : { replyTo: integerArg(rawArgs.replyTo, 'replyTo', 1, Number.MAX_SAFE_INTEGER) }),
+    ...(filledString(rawArgs.intent, 'intent') === undefined ? {} : { intent: requiredString(rawArgs.intent, 'intent') }),
+    ...(filledString(rawArgs.doneWhen, 'doneWhen') === undefined ? {} : { doneWhen: requiredString(rawArgs.doneWhen, 'doneWhen') }),
   });
+  const waitForPr = rawArgs.waitForPr === undefined || rawArgs.waitForPr === null || rawArgs.waitForPr === 0
+    ? undefined : integerArg(rawArgs.waitForPr, 'waitForPr', 1, Number.MAX_SAFE_INTEGER);
+  if (waitForPr !== undefined && envelope.intent !== 'request' && envelope.intent !== 'decision') throw new Error('waitForPr requires request or decision intent');
   // #38516 r2 MF3: recovery names THIS attempt's commit by its token — never an older identical row.
   const attemptToken = randomUUID();
   const store = deps.openStore?.() ?? openMsgStore();
@@ -324,10 +340,16 @@ export async function dispatchMsgPost(rawArgs: Record<string, unknown>, deps: Ms
   } finally {
     try { store.close(); } catch { /* the write already committed or already failed; closing never changes that */ }
   }
+  let followUp: MsgPostResult['followUp'];
+  if (envelope.intent === 'request' || envelope.intent === 'decision') {
+    try { followUp = await (deps.followUp ?? armMessageFollowUp)(posted, waitForPr); }
+    catch (error) { followUp = { error: error instanceof Error ? error.message : String(error) }; }
+  }
   return {
-    output: `MsgPost #${posted.id} ${posted.from} → ${posted.to}${posted.deduped ? ' · deduped: already stored, no new row' : ''}`,
+    output: `MsgPost #${posted.id} ${posted.from} → ${posted.to}${posted.deduped ? ' · deduped: already stored, no new row' : ''}${followUp ? 'error' in followUp ? ' · follow-up failed; retry or schedule manually' : ` · follow-up ${followUp.condition}` : ''}`,
     ok: true,
     message: posted,
+    ...(followUp ? { followUp } : {}),
   };
 }
 
@@ -337,15 +359,19 @@ export function buildMsgAckTool(): LLMToolSpec {
   return {
     name: 'MsgAck',
     description:
-      'Acknowledge durable messages for one recipient through an ID — the same SQLite ledger as `elanous msg ack`, in-process. ' +
-      'The recipient’s cursor advances so later MsgList calls start after the acknowledged messages.',
+      'Acknowledge durable messages for one recipient — the same SQLite ledger as `elanous msg ack`, in-process. ' +
+      'One call clears a batch: `ids` acks exactly those messages (per id, no cursor move), `id` acks every message through that ID ' +
+      '(the cursor advances), `receipted: true` acks every message that already has an accepted/rejected/done/expired receipt. ' +
+      'Give any combination; at least one.',
     parameters: {
       type: 'object',
       properties: {
-        to: { type: 'string', description: 'Recipient seat whose cursor advances.' },
-        id: { type: 'integer', description: 'Acknowledge every message through this ID.' },
+        to: { type: 'string', description: 'Recipient seat whose mail is acknowledged.' },
+        ids: { type: 'array', items: { type: 'integer' }, description: 'Acknowledge exactly these message IDs (per id).' },
+        id: { type: 'integer', description: 'Acknowledge every message through this ID (cursor).' },
+        receipted: { type: 'boolean', description: 'true = also acknowledge every message that already has a terminal receipt.' },
       },
-      required: ['to', 'id'],
+      required: ['to'],
       additionalProperties: false,
     },
   };
@@ -356,26 +382,62 @@ export interface MsgAckResult extends Record<string, unknown> {
   ok: true;
   recipient: string;
   cursor: number;
+  /** MSG-FILTERS-RELAX: ids acked one by one (`ids` · `receipted`). */
+  acked: number[];
+  /** `ids` entries that are not this recipient's mail — reported, never a failed call. */
+  missing: number[];
+  /** Bulk-ack digest (2+ mails): summary ⊕ meaningful lines ⊕ the memory entry name when one was saved. */
+  digest?: { summary: string; lines: string[]; memory?: string };
 }
 
 export async function dispatchMsgAck(rawArgs: Record<string, unknown>, deps: MsgLedgerDeps = {}): Promise<MsgAckResult> {
-  const to = canonicalSeatId(requiredString(rawArgs.to, 'to'));
-  const cursor = integerArg(rawArgs.id, 'id', 0, Number.MAX_SAFE_INTEGER);
+  const to = canonicalMessageAddress(requiredString(rawArgs.to, 'to'));
+  // MSG-FILTERS-RELAX: a batch in one call — ids (per id) · id (through) · receipted (terminal receipts).
+  const ids = rawArgs.ids === undefined || rawArgs.ids === null ? []
+    : (Array.isArray(rawArgs.ids) ? rawArgs.ids : [rawArgs.ids]).map(value => Number(value));
+  if (ids.some(value => !Number.isSafeInteger(value) || value < 1)) throw new Error("'ids' must be positive message IDs");
+  const through = rawArgs.id === undefined || rawArgs.id === null ? undefined : integerArg(rawArgs.id, 'id', 0, Number.MAX_SAFE_INTEGER);
+  const receipted = rawArgs.receipted === true;
+  if (ids.length === 0 && through === undefined && !receipted) throw new Error("MsgAck needs 'ids', 'id' or 'receipted: true'");
   const store = deps.openStore?.() ?? openMsgStore();
+  let digestInputs: AckDigestInput[] = [];
+  let result: MsgAckResult;
   try {
-    // #122460 (CX-16 postland 실측): the tool's ack moves the cursor only — a tool call is not processing; «seen» is the
-    // answered turn's receipt (tui-queue, queueItemId-bound). The 11-18 tool-ack seen was stamped before the answer and
-    // pushed the queue-bound seen to not-forward.
-    const acknowledged = store.ackThroughSeen(to, cursor, 'tool-ack');
-    return {
-      output: `MsgAck ${to} acknowledged through #${acknowledged}`,
+    const acked: number[] = [];
+    const missing: number[] = [];
+    const passing = through === undefined ? []
+      : (() => { try { return store.list(to, store.getCursor(to), 1000).filter(message => message.id <= through).map(message => message.id); } catch { return []; } })();
+    // #122460 (CX-16 postland 실측): the tool's ack moves the cursor / ack rows only — a tool call is not processing;
+    // «seen» is the answered turn's receipt (tui-queue, queueItemId-bound).
+    for (const id of [...new Set(ids)].sort((a, b) => a - b)) {
+      try { store.ackMessage(to, id, 'acked'); acked.push(id); }
+      catch { missing.push(id); }
+    }
+    const cursor = through === undefined ? store.getCursor(to) : store.ackThroughSeen(to, through, 'tool-ack');
+    if (receipted) for (const id of store.ackReceipted(to)) if (!acked.includes(id)) acked.push(id);
+    const parts = [
+      ...(through === undefined ? [] : [`through #${cursor}`]),
+      ...(acked.length === 0 ? [] : [`${acked.length} by id (#${acked.join(' #')})`]),
+      ...(missing.length === 0 ? [] : [`not ${to}'s mail: #${missing.join(' #')}`]),
+    ];
+    digestInputs = ackDigestInputs(store, to, [...new Set([...passing, ...acked])].sort((a, b) => a - b));
+    result = {
+      output: `MsgAck ${to} acknowledged ${parts.length === 0 ? 'nothing new' : parts.join(' · ')}`,
       ok: true,
       recipient: to,
-      cursor: acknowledged,
+      cursor,
+      acked,
+      missing,
     };
   } finally {
     store.close();
   }
+  // MSG-FILTERS-RELAX: a bulk ack leaves a compact digest (one seat memory entry) — never fails the ack.
+  const recorded = await recordAckDigest(to, digestInputs, { ...(deps.saveAckDigest ? { save: deps.saveAckDigest } : {}), ...(deps.now ? { now: deps.now } : {}) });
+  if (recorded === null) return result;
+  const digest = { summary: recorded.digest.summary, lines: recorded.digest.lines, ...(recorded.saved ? { memory: recorded.memory.name } : {}) };
+  return { ...result, digest,
+    ...(recorded.saved ? { output: [result.output, `digest (memory ${recorded.memory.name}): ${recorded.digest.summary}`, ...recorded.digest.lines].join('\n') } : {}) };
 }
 
 // ── ChecklistList ───────────────────────────────────────────────────────────

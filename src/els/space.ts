@@ -5,6 +5,25 @@ export type PaneKind = 'pty' | 'agent' | 'harness-child' | 'graph-view' | 'remot
 export type PaneState = 'working' | 'idle' | 'blocked' | 'done' | 'exited';
 export type RestorePolicy = 'none' | 'cwd' | 'command' | 'resume';
 
+// ELS-POD-TAB (출처: seat-state/OP/orders/WORKER-MIGRATION-PHASE1-1119.md 40행): the physical side of a pane —
+// WHERE it runs. A pod is an execution place under a host (the host's own els reaches it through kubectl), never
+// a workspace or a host of its own.
+export type PaneRuntime = 'process' | 'pod';
+export interface PanePlace {
+  /** The host whose els placed the pane; a pod's credentials stay on exactly this host. */
+  readonly host: string;
+  readonly runtime: PaneRuntime;
+}
+
+/** ELS-POD-TAB (order 45행): one soft memo of a pod pane's control inbox — accepted by `els do`, never PTY-injected. */
+export interface PaneMemo {
+  /** Verified sender identity of the `els do` (`from`), at most 64 chars. */
+  readonly from: string;
+  /** Server clock (ms since epoch) when the memo was accepted into the inbox — never client-trusted. */
+  readonly at: number;
+  readonly text: string;
+}
+
 export interface Workspace {
   readonly id: string;
   readonly name: string;
@@ -13,6 +32,8 @@ export interface Workspace {
   readonly host: string;
   /** Explicit coordinator assignment; absent on ordinary and legacy workspaces. */
   readonly role?: 'coordinator';
+  /** Seat coordinating this workspace, separate from the legacy host-wide workspace role. */
+  readonly coordinatorSeat?: string;
 }
 
 export interface Tab {
@@ -44,6 +65,13 @@ export interface Pane {
   readonly exitedAt?: number;
   /** Verified creator seat; absent on legacy or unverified panes. */
   readonly ownerSeat?: string;
+  /** Seat launched by `els seat`, distinct from the verified creator's authority. */
+  readonly seatIdentity?: string;
+  /** ELS-POD-TAB: the physical place; absent = the stage-1 default, a process on its own host. */
+  readonly place?: PanePlace;
+  /** ELS-POD-TAB: a pod pane's control inbox — soft memos, newest last, bounded (POD_INBOX_MAX); persisted in the
+   * journal (survives a restart) and surfaced by `ls`; never rendered into the pod's own stream. */
+  readonly inbox?: readonly PaneMemo[];
 }
 
 export interface CoordinatorAudit {
@@ -53,9 +81,17 @@ export interface CoordinatorAudit {
   readonly peerPid?: number;
 }
 
+export interface LastFocus { readonly workspaceId: string; readonly tabId?: string; readonly paneId?: string }
+
 export interface SpaceJournal {
+  /** Last local pane selected by an authenticated owner view; stale references are allowed. */
+  readonly lastFocus?: LastFocus;
   /** Authoritative coordinator audit; committed in the same journal replacement as the assignment. */
   readonly coordinatorAudit?: CoordinatorAudit[];
+  /** HQ seat is independent of workspace coordinator assignments. */
+  readonly hqCoordinatorSeat?: string;
+  /** Reserved for a future federated authority; not used for local arbitration. */
+  readonly hqAuthorityLocation?: string;
   readonly version: 1;
   readonly workspaces: Workspace[];
   readonly tabs: Tab[];

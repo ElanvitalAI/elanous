@@ -267,9 +267,15 @@ export function createWorkflowRuntimeDaemon(
   return {
     async start() {
       if (started) return;
-      for (const file of opts.graphFiles ?? []) scheduleSource.subscribeGraph(file, async () => {
+      for (const file of opts.graphFiles ?? []) scheduleSource.subscribeGraph(file, async fire => {
         const { graphTick } = await import('../graph-runner/graph-tick.js');
-        await graphTick(file, { startIfIdle: true });
+        const scheduledAt = new Date(fire.scheduledAt).toISOString();
+        await graphTick(file, {
+          startIfIdle: true,
+          triggerId: `schedule:${fire.nodeId}`,
+          dedupeKey: `${fire.nodeId}@${scheduledAt}`,
+          input: { schedule: { nodeId: fire.nodeId, scheduledAt } },
+        });
       });
       for (const file of opts.graphFiles ?? []) webhookSource.subscribeGraph(file, async request => {
         const { handlePluginGraphWebhook } = await import('../graph-runner/plugin-graph-entry.js');

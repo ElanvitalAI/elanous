@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { recipeHash, recipeSigningBytes } from './run-shell-recipe-ledger.js';
 import { testRunShellIssuer } from '../../shell-primitive/runshell-test-issuer.js';
 import { setTestStateRoot } from '../../nexus/paths.js';
+import type { SpawnFunction } from '../../shell-primitive/spawn-gateway.js';
 
 const home = mkdtempSync(join(tmpdir(), 'signed-recipe-product-'));
 setTestStateRoot(home);
@@ -94,8 +95,15 @@ test('local-read signed recipe runs without a card', async () => {
   expect(result.outcome).toBe('exit'); expect(result.exitCode).toBe(0);
 });
 
-test('gateway denies signed non-local recipe without card and refuses altered argv', () => {
+test('gateway admits a non-destructive signed recipe without a card (CEO 11-23 relax) and refuses altered argv', () => {
   const envelope = parseRecipeJson(readFileSync(path)) as any;
-  expect(() => spawnGateway('/bin/echo', ['signed-only'], { cwd: home }, undefined, undefined, envelope)).toThrow('approval required');
-  expect(() => spawnGateway('/bin/echo', ['altered'], { cwd: home }, undefined, undefined, envelope)).toThrow('invocation mismatch');
+  const prevTrack = process.env.ELANOUS_TRACK;
+  process.env.ELANOUS_TRACK = 'test-seat'; // grant route present; echo is outside the destructive/secret/exposure holds
+  const spawned: string[][] = [];
+  const spawnFn = ((command: string, args: readonly string[]) => { spawned.push([command, ...args]); return {} as never; }) as unknown as SpawnFunction;
+  try { expect(() => spawnGateway('/bin/echo', ['signed-only'], { cwd: home }, spawnFn, undefined, envelope)).not.toThrow(); }
+  finally { if (prevTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = prevTrack; }
+  expect(spawned).toEqual([['/bin/echo', 'signed-only']]);
+  expect(() => spawnGateway('/bin/echo', ['altered'], { cwd: home }, spawnFn, undefined, envelope)).toThrow('invocation mismatch');
+  expect(spawned).toHaveLength(1);
 });

@@ -28,6 +28,7 @@ import { setTuiForegroundSessionId } from '../capture/tui-self-report.js';
 import { createNextTuiQueue, type NextTuiSettledTurn, type NextTuiQueueInterruptReason } from './core/queue.js';
 import { stripQueueModelContext, withInterruptedOnPurposeContext, withQueueNoticeContext, withReplacementCandidateContext } from '../chat/interjection.js';
 import { preparePassiveResultCarry } from './passive-result-turn.js';
+import { seatMailBundleText } from './seat-mail-digest.js';
 import { replacementCandidateContextLine, replacementCandidateScreenLine } from '../chat/queue-supersede.js';
 import { isTurnTypeaheadSteerable } from '../chat/turn-typeahead.js';
 import { agentDisplayLine, agentDisplayLines, applyAgentEvent, reconcileAgentOutputStatuses, reconcileNestedAgentSnapshot, type AgentDisplay } from './core/agents.js';
@@ -58,7 +59,6 @@ import { createNextTuiCoreInput } from './core/input.js';
 import { formatInlinePanel } from './input/inline-panel.js';
 import { QUEUE_PANEL_HINT, queueFullTextView, queuePanelKey, queuePanelMove, queuePanelOrder, queuePanelSpec, queueWaitRows, type QueuePanelAction, type QueuePanelViewing } from './input/queue-panel.js';
 import { NextTuiQueueConflictError } from './core/queue.js';
-import { startMissionWatch as startMissionWatchLoop } from './mission-watch.js';
 import { createChildNoticeProducers } from './core/notice-producers.js'; // #38031 CHILD-NOTICE
 import { createSeatMailArrivalWatcher } from './seat-mail-arrival.js'; // #38031 자리 우편 도착 감시
 import { createIdleEventWake, graphNodeEndNotice, graphRunIdleNotice, idleChildLabel } from './idle-event-wake.js';
@@ -66,6 +66,7 @@ import { createIdleWakeDoor } from './idle-wake-door.js';
 import { QUEUE_IDLE_STALL_MS, QUEUE_IDLE_TICK_MS, createQueueIdleWatchdog } from './core/queue-idle-watchdog.js';
 import { seatMailOnArrived } from './seat-mail-on-arrived.js';
 import { offerSeatMailSteer, type SeatMailMidTurnEvent } from './seat-mail-midturn-steer.js';
+import { isNextTuiSlashCommandDraft } from './slash/during-turn.js'; // TUI-SLASH-DURING-TURN
 import { enqueueMidTurnEvent } from '../session/mid-turn-events.js';
 // OP-EVENT-WATCH-WAKE: event-watch-runner 는 동적 import (entry 는 훅만).
 import { createLedgerReceiptWriter, readSeatMailMessages } from './seat-message-receipts.js'; // SEAT-INBOX B1-C 메시지 단위 notice ⊕ 영수증
@@ -102,11 +103,18 @@ import { createSeatMailAdapter, type SeatMailAdapter } from './turn-events/mail-
 import { createTurnEventBus } from './turn-events/bus.js';
 import { getAgentEventEmitter } from '../agent-events/emit.js';
 import { createAgentEventBridge } from './agent-event-bridge.js';
+import { wireNoticeEvents } from './agent-event-notice-wire.js';
 import { createWakeupBusConsumer, openLateWakeupTurn, type WakeupBusConsumer } from './turn-events/wakeup-consumer.js';
 
 let nextTuiRouteRegistry: typeof import('./core/registry.js') | undefined;
 /** Full picker chrome: title + four candidates + hint (the previous fixed default). */
 const INLINE_PANEL_MAX_ROWS = 6;
+/**
+ * ELN-QUEUE-PANEL-CTRLC-RACE (2026-11-18): the auto-submit Enter the queue drain replays after a turn ends
+ * (dispatchQueued §8.6). It is the door's own handoff, not the person's key — the queue panel must not read
+ * it as «edit the selected item»; it falls through to the ordinary submit path, its only purpose.
+ */
+const syntheticEnterKey: Key = { name: 'enter', ctrl: false, shift: false, raw: '\r' };
 
 async function loadNextTuiRouteRegistry(): Promise<typeof import('./core/registry.js')> {
   nextTuiRouteRegistry ??= await import('./core/registry.js');
@@ -324,12 +332,12 @@ interface SlashPickerCandidate { readonly value: string; readonly description: s
 /** Local chat entry: history and input are TUI-owned; turn execution stays shared. */
 export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   if (!process.stdin.isTTY) throw new Error('elanous --tui next requires stdin TTY');
-  try { (await import('../dashboard/seat-local-instructions.js')).ensureSeatLocalInstructions(process.cwd()); }
+  try { (await import('../seat/seat-local-instructions.js')).ensureSeatLocalInstructions(process.cwd()); }
   catch (error) { debug.log('tui.local-instructions', 'next-start-skipped', { error: error instanceof Error ? error.message : String(error) }); }
   if ((process.stdout.columns || 0) < 20 || (process.stdout.rows || 0) < 6) {
     throw new Error('elanous --tui next requires at least 20 columns and 6 rows');
   }
-  const { readNextTuiStatusModel } = await import('./chat/status-model.js');
+  const { readNextTuiStatusModel, nextTuiFooterModel } = await import('./chat/status-model.js');
   const dashboardRuntime = await (await import('../tui-client/next-dashboard-runtime.js')).loadNextTuiDashboardRuntime();
   const { appendMessage, createSession, loadSession, resolveSessionId, setActiveSessionId, updateSessionMeta } = await import('../session/index.js');
   const simWorldId = process.env.ELANOUS_SIM_WORLD_ID?.trim();
@@ -399,7 +407,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // ⌨️ TUI-TYPING-LAG-OBS — compact 칠도 실제 화면 write 이므로 칠 훅을 건다(full-screen paintScreen
   // 의 훅과 같은 계약. 없으면 compact 모드에서 키가 쌓이고 1000ms ABANDON 로 버려져 줄이 0건이 된다).
   const compactPainter = createNextTuiCompactPainter((text) => { process.stdout.write(text); noteInputLagPaint(); });
-  const missionWatchCancellation: { cancel?: () => void } = {};
   let busy = false;
   const activeShellCapsules = new Set<string>();
   const agentEvents = createAgentEventBridge(getAgentEventEmitter()); // ELN-AGENT-EVENT-PROTOCOL: no ELANOUS_EVENT_SOCKET → no-op
@@ -537,6 +544,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       };
     },
   });
+  // SEAT-STATE-ENUM: an approval prompt on screen = WAITING_APPROVAL/APPROVAL_PENDING for els, reported from the prompt's own
+  // lifecycle (open → settled), not from the prompt text. A second request while one is up does not open a prompt.
+  const reportedApprovalDecision: typeof shellApproval.beginDecision = (command, callId, kind, windowMs) => {
+    const opens = !shellApproval.active();
+    const decision = shellApproval.beginDecision(command, callId, kind, windowMs);
+    if (!opens || !shellApproval.active()) return decision;
+    agentEvents.approval(true);
+    return decision.finally(() => { if (!shellApproval.active()) agentEvents.approval(false); });
+  };
   // Owner publish approval (public URL screen): the child sends the URL as a structured field; Enter hands «acknowledged» back and the
   // screen closes — the owner's decision itself is polled in the child. Logic and tests live in ./publish-approval-session.js.
   const publishApproval = createPublishApprovalHost({
@@ -673,6 +689,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // leaves one item per settle. A200: a chat line is also handed to the running turn as a steer (joins the
   // next model request); Esc leaves what is still queued as the next turn by itself, not back in the prompt.
   const queue = createNextTuiQueue({ turnLifeLog: emitTurnLife });
+  // ELN-AGENT-EVENT-PROTOCOL residual (0.3.34 P0 · OP 결정 #136151): main wired only the busy flip — notice production
+  // never reached the bridge (the cell's JUD-B HOLD note). Every producer funnels into queue.enqueueNotice, so one
+  // wrap wires the whole real path (seat-mail, capsule-done, event-watch, ceo-ingress, sidetab, harness-child, graph-node).
+  wireNoticeEvents(queue, agentEvents);
   let activeTurnRunId: string | null = null;
   const ceoNoticeRefs = new Map<string, CeoTurnRef>();
   // OP #122919 / JUD hold #122913 — the ACTUAL-INTAKE acknowledgements for dequeued notices:
@@ -844,6 +864,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     heartbeat: { getSessionId: () => id },
     onArrived: seatMailOnArrived({
       busy: () => busy, injectKey: () => { idleWakeDoor.knock('seat-mail'); }, queueWake,
+      // SEAT-MAIL-COALESCE-NOTICE — arrivals within 3s share one knock (one digest turn).
+      schedule: (fn, ms) => { const t = setTimeout(fn, ms); t.unref?.(); return t; },
       enqueueMidTurn: (event, onDrained) => {
         if (event.kind === 'seat-mail' && steerRequest.current) {
           // SEAT-STEER-PREEMPT ② (OP #132479 ②): 결정 우편(구조화 intent)은 urgent steer 로 제안돼 실행 중
@@ -1168,6 +1190,30 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     bgRunning: number, bgPending: number, welcome: number, badge: string): string =>
     `${columns}│${rows}│${chatColumns}│${statusText}│${messagesLength}│${noticesJoined}│${internalJoined}│${activityJoined}│${queueCount}│${queueItems}│${bgRunning}│${bgPending}│${welcome}│${badge}`;
 
+  // ⌨️ TUI-NEXT-KEYSTROKE-COST (OP #132091 PR-2): busy 칠 60fps 프레임 상한.
+  // 스트리밍 델타(onPreview)·250ms 턴 타이머·상태줄 변경이 저마다 곧바로 render() 를
+  // 부르면 한 프레임 안에 칠이 겹쳐 나간다(합성 실측 node-b · /tmp/fps-diag3-out.log: 최소 간격 2.8ms·8ms).
+  // busy 중 칠은 이 게이트를 지난다: 마지막 칠로부터 한 프레임(16.7ms)이 지나지 않았으면
+  // 프레임 경계로 미루고, 이미 예약된 칠이 있으면 합친다(마지막 상태로 한 번).
+  // 턴 시작 첫 칠(A207 즉시)·종결 칠(onSettled)·idle 입력줄 칠(PR-1)은 게이트 밖 그대로다.
+  const BUSY_FRAME_MS = 1_000 / 60; // 60fps 프레임 창(ms) = 1000/60 (출처: #132091)
+  let busyFrameLastPaintAt = 0;
+  let busyFrameScheduled = false;
+  const renderBusyCapped = (): void => {
+    const sinceLast = performance.now() - busyFrameLastPaintAt;
+    if (sinceLast >= BUSY_FRAME_MS) {
+      busyFrameLastPaintAt = performance.now();
+      render();
+      return;
+    }
+    if (busyFrameScheduled) return;
+    busyFrameScheduled = true;
+    setTimeout(() => {
+      busyFrameScheduled = false;
+      busyFrameLastPaintAt = performance.now();
+      render();
+    }, BUSY_FRAME_MS - sinceLast);
+  };
   const render = (): void => {
     slashPickerVisible = false;
     const nextCompactMode = (process.stdout.rows || 24) <= compactHeight;
@@ -1354,7 +1400,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const withAttachmentFooter = (lines: string[]): string[] => [...attachmentFooter, ...lines];
     const livenessView = busy && id === telemetrySessionId ? nodeLivenessTui.view(Date.now()) : null;
     const graphFooterLine = nodeLivenessFooterLine(livenessView, graphProgressLine, chatColumns);
-    const compactStatusInput = { ...statusInput, ...(executionModelBadge ? { model: executionModelBadge } : {}), width: chatColumns };
+    const compactStatusInput = { ...statusInput, model: nextTuiFooterModel(id ?? undefined, statusInput.model, executionModelBadge), width: chatColumns };
     // DESIGN §2b (대표 11-18): the status line sits under the input, the last row, by default (`position: bottom`); the
     // progress row above the input says the turn, so while one runs the bottom line drops its turn clause.
     const statusAtBottom = footerStatusline.position === 'bottom';
@@ -1667,39 +1713,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     }
   };
 
-  const startMissionWatch = (
-    kind: 'ready' | 'run',
-    missionId: string,
-    poll: () => Promise<{ message: string; outcome: 'pending' | 'complete' | 'error' }>,
-    onReady?: (isActive: () => boolean) => Promise<void>,
-  ): void => {
-    missionWatchCancellation.cancel?.();
-    status = kind === 'ready' ? `미션 준비 관찰 중 · ${missionId}` : `미션 실행 관찰 중 · ${missionId}`;
-    render();
-    const watcher = startMissionWatchLoop({
-      poll,
-      onUpdate: (message) => {
-        activity.push(`  ${message}`);
-        if (activity.length > 30) activity.splice(0, activity.length - 30);
-        render();
-      },
-      onError: (message) => {
-        activity.push(`  미션 관찰 실패: ${message}`);
-        status = `미션 관찰 오류 · ${missionId}`;
-        render();
-      },
-      onComplete: async (isActive) => {
-        if (kind === 'ready') await onReady?.(isActive);
-        if (!isActive()) return;
-        status = kind === 'ready' ? `미션 준비 완료 · ${missionId}` : `미션 종결 · ${missionId}`;
-        render();
-        // #38031 — 실행('run') 관찰 종결을 입력 큐 notice 로: 종결 상태 줄이 대기열에 남는다.
-        if (kind === 'run') childNotices.sidetabResult({ mission: missionId, status: '완료' });
-      },
-    });
-    missionWatchCancellation.cancel = watcher.cancel;
-  };
-
   const ensureSidetabAttachments = async (): Promise<void> => {
     if (sidetabAttachments) return;
     const installer = await import('../agent-mission/tool-install.js') as unknown as {
@@ -2005,9 +2018,17 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       status = 'Response cancelled · sent text restored to the prompt · Enter to send';
       debug.log('tui.next', 'cancel-restore-original', { chars: result.text.length });
     } else if (result.kind === 'resubmit') {
-      status = `응답 취소됨 · 대기 ${result.count}건 다음 턴으로 자동 제출`;
-      debug.log('tui.next', 'queue-resubmit-after-interrupt', { count: result.count });
-      injectKey(queueWake);
+      if (queuePanel) {
+        // ELN-QUEUE-PANEL-CTRLC-RACE (2026-11-18): the queue panel is open, so the person is managing the queue.
+        // Ctrl+C stops the turn and the items stay in the panel — the auto-drain must not race them (its synthetic
+        // Enter would read as a panel action) and the stopped state stays on screen.
+        status = `응답 중단됨 · 큐 ${result.count}건은 패널에 남음`;
+        debug.log('tui.next', 'queue-resubmit-held-by-panel', { count: result.count });
+      } else {
+        status = `응답 취소됨 · 대기 ${result.count}건 다음 턴으로 자동 제출`;
+        debug.log('tui.next', 'queue-resubmit-after-interrupt', { count: result.count });
+        injectKey(queueWake);
+      }
     } else if (result.kind === 'wake') injectKey(queueWake);
   };
 
@@ -2069,6 +2090,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
 
   /** Sends the head of the queue through the ordinary idle submit path (slash commands included). */
   const dispatchQueued = (): void => {
+    // ELN-QUEUE-PANEL-CTRLC-RACE (2026-11-23 r2): the one funnel every auto-drain knock reaches — the idle watchdog's
+    // own doc (core/queue-idle-watchdog.ts): «the wake goes through the same key and the same dispatchQueued path as
+    // every other knock» — so the settle's resubmit, the queue's turn-end knock (#38590) and the watchdog's stall wake
+    // all land here. While the queue panel is open the person owns the queue: no auto-drain may open a turn over the
+    // panel. Items stay put; the watchdog re-knocks after the panel closes. A person's own submit never passes here.
+    if (queuePanel) {
+      debug.log('tui.next', 'queue-dispatch-held-by-panel', { queued: queue.count });
+      return;
+    }
     if (queue.count > 0 && queue.autoDispatchCount === 0 && heldNotices.length === 0) {
       openLateWakeup();
       return;
@@ -2094,7 +2124,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       const bundle = queue.drainNotices();
       if (bundle.kind === 'notices' && bundle.notices.length > 0) {
         const head = bundle.notices[0]!;
-        const joined = bundle.notices.map((notice) => notice.text).join('\n\n');
+        // SEAT-MAIL-COALESCE-NOTICE — the bundle's seat mail is ONE digest (count + one line per mail · action bodies).
+        const joined = seatMailBundleText(bundle.notices);
         turnStartLabel = { door: 'queue-notice', text: joined, source: head.source ?? undefined, eventId: head.msgId ?? head.id }; // 출처: #38804 — eventId = msgId ?? id
         // OP #129546 ① — 묶음 30통이면 30통 전체가 이 dispatch 한 번에 결속된다(머리만이 아니라):
         // 각 항목은 제 id/msgId 사슬(#38804)을 그대로 가지고 plan link 에 제 본문으로 각각 닿는다.
@@ -2149,7 +2180,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     focus = 'input';
     input.clearHistory();
     debug.log('tui.next', 'queue-dispatched', { length: handoff.text.length, remaining: handoff.remaining });
-    replay.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+    replay.push(syntheticEnterKey);
   };
 
   /** Apply the execution-side snapshot captured when Esc was pressed. */
@@ -2295,7 +2326,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         turnAbort.abort('stall');
         status = `No output for ${stallMinutes(verdict.idleMs)} min · turn stopped${queue.count > 0 ? ' · queued input is sent next' : ''}`;
       }
-      render();
+      renderBusyCapped();
     }, 250);
     // herdr pane 이면 턴 시작·끝을 working → idle 로 신고한다(`eln herdr prompt --wait` 가 이것을 기다린다).
     // 녹음기는 startTuiSelfReport 가 이미 열었다 — 없으면 아무것도 안 한다.
@@ -2367,7 +2398,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           turnOpenPainted = true;
           if (!banner || internalTurnOriginOfText(turnText)) return;
           pushNotice(banner);
-          render();
+          renderBusyCapped();
         };
         const opened = runLocalChatTurn(sessionId, childText, signal, undefined, undefined, (...args) => {
           const [delta, replace, source] = args;
@@ -2381,7 +2412,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             onMeasuredUsage: (usage) => {
               if (id !== turnSessionId || !busy) return;
               measuredUsage = usage;
-              render();
+              renderBusyCapped();
             } }, attachments, onStatus, onAgent,
           (event) => {
             turnStallWatch.touch();
@@ -2421,8 +2452,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
               render();
             } else if (event.phase === 'finish' && event.name !== 'Bash' && event.name !== 'RunShell') {
               status = '응답 중 · Esc 취소';
-              render();
-            } else render();
+              renderBusyCapped();
+            } else renderBusyCapped();
           }, (event) => applyPushNowDecision(event.requestId, event.outcome, event.activeTools),
           (event) => {
             if (!busy || id !== turnSessionId) return;
@@ -2450,7 +2481,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         streamPreview = { sessionId: turnSessionId, text: preview, assistantText: source === 'assistant-text' };
         const progress = preview ? streamReplyProgress(turnSessionId) : null;
         activity = progress ? streamReplyLines(progress, process.stdout.columns || 80) : [];
-        render();
+        renderBusyCapped();
       },
       onCompact: (compactStatus) => {
         turnStallWatch.touch();
@@ -2469,7 +2500,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         if (isNextTuiContextCountStatus(line)) return;
         turnStallWatch.touch();
         status = projectUserReplyStatus(line);
-        render();
+        renderBusyCapped();
       },
       onAgent: (event) => {
         turnStallWatch.touch();
@@ -2758,13 +2789,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       setNextTuiWakeupTool(wakeup.tool);
       // ELN-SEAT-APPROVAL-POLICY: an unattended seat auto-approves its allowlist and asks OP by mail for the rest (keyboard stays up).
       const approvalSeat = (() => { try { return detectSeatTui(process.cwd())?.seat ?? null; } catch { return null; } })();
-      setNextTuiShellApprovalHandler(approvalSeat === null ? shellApproval.beginDecision : createSeatApprovalHandler({
-        seat: approvalSeat, local: shellApproval.beginDecision, cancelLocal: (callId) => shellApproval.cancel(callId, 'host-cancelled'),
+      setNextTuiShellApprovalHandler(approvalSeat === null ? reportedApprovalDecision : createSeatApprovalHandler({
+        seat: approvalSeat, local: reportedApprovalDecision, cancelLocal: (callId) => shellApproval.cancel(callId, 'host-cancelled'),
         ...seatApprovalLedgerPorts(approvalSeat, { log: (event, data) => { try { debug.log('seat.approval', event, data, { level: 'warn' }); } catch { /* fail-open */ } } }),
         setStatus: (line) => { status = line; render(); },
         log: (event, data) => { try { debug.log('seat.approval', event, data, event.endsWith('-failed') ? { level: 'warn' } : undefined); } catch { /* fail-open */ } },
       }));
-      setNextRunShellCardHandler((command, callId) => shellApproval.beginDecision(command, callId, 'bash'));
+      setNextRunShellCardHandler((command, callId) => reportedApprovalDecision(command, callId, 'bash'));
       setNextTuiPublishApprovalHandler(publishApproval.begin);
       setNextTuiShellApprovalCancelHandler((callId, reason) => {
         if (!publishApproval.cancel(callId)) shellApproval.cancel(callId, reason);
@@ -2814,6 +2845,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       goalContinue = dashboardRuntime.createGoalContinue({
         startTurnIfIdle: (text, opts) => gate.startTurnIfIdle(text, opts),
         notify: (line) => { pushNotice(line); render(); },
+        // SEAT-STATE-ENUM: the block goes to els as a code (BLOCKED + one reason), never as the notice sentence.
+        onBlocked: (reason, detail) => agentEvents.blocked(reason, detail),
         planNudge: true,
         // The gate only parks the turn. Watch until this loop takes it; otherwise withdraw and say stop.
         confirmSeatCapTurnStarted: (turnId) => wakeup!.confirmSeatCapTurnStarted(turnId),
@@ -2935,6 +2968,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       if ((key === queueWake || key === internalWake) && seatStopRef.current && !seatStopRef.current.allowsNewTurn()) {
         if (key === internalWake) wakeup?.gate.port.declined?.('seat-stopping');
         debug.log('seat-stop', 'turn-held', { source: key === queueWake ? 'queue' : 'internal', queued: queue.count });
+        render();
+        continue;
+      }
+      // ELN-QUEUE-PANEL-CTRLC-RACE (2026-11-23 r2): same rule as the seat-stop hold above — with the queue panel
+      // open the person is managing the queue, so every knock that uses this key (the settle's resubmit, the queue's
+      // turn-end door #38590, the idle watchdog's stall wake) is consumed without knocking the door. The watchdog
+      // retries after the panel closes, and the settle's «응답 중단됨 · 큐 N건은 패널에 남음» stays on screen.
+      if (key === queueWake && queuePanel) {
+        debug.log('tui.next', 'queue-wake-held-by-panel', { queued: queue.count });
         render();
         continue;
       }
@@ -3499,7 +3541,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           slashNavigated = false;
         }
       }
-      if (queuePanel) {
+      // ELN-QUEUE-PANEL-CTRLC-RACE (2026-11-18): the drain's synthetic auto-Enter is the door's own handoff, not
+      // the person's key — the panel (and its «Editing queued item» Enter branch) reads real keys only, so the
+      // handoff falls through to the ordinary submit path, which is its only purpose.
+      if (queuePanel && key !== syntheticEnterKey) {
         const items = queue.items;
         // r3: explicit panel-action union breaks the circular inferred initializer at this line
         // (TS7022 — pregate r2 RED, receipt PREGATE-RED/39556-44919e10b3c9-node-b).
@@ -3574,7 +3619,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         render();
         continue;
       }
-      if (busy) {
+      // TUI-SLASH-DURING-TURN — a plain Enter on a «/명령» draft is not conversation input: it skips
+      // the busy branch below (which would queue or steer it until the turn ends) and falls through to
+      // the ordinary submit dispatch, which executes the command locally right now — turn-scoped targets
+      // answer «다음 턴부터», unknown ones get the unknown-command notice. Commands that must keep the
+      // busy branch (turn/session-scoped or busy-swapping) and non-command «/…» drafts stay queued as before.
+      const slashCommandEnter = busy && (key.name === 'enter' || key.name === 'return') && !key.shift && !key.ctrl && !key.alt
+        && input.editor.text.trim().startsWith('/')
+        && isNextTuiSlashCommandDraft(input.editor.text, await loadNextTuiRouteRegistry());
+      if (busy && !slashCommandEnter) {
         if (key.name === 'up' && key.ctrl && !key.alt && !key.shift && !key.meta) {
           if (pushNowCommitting()) {
             status = '지금 제출 중 · 응답 전환 뒤 입력 가능';
@@ -4280,28 +4333,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           render();
           continue;
         }
-        if (route?.branchHost === 'mission' && route.branchModule) {
-          const branch = await import(route.branchModule) as typeof import('./slash/mission.js');
-          await branch.runNextTuiMissionBranchRoute(submitted, {
-            chatLines: activity,
-            setChatScrollOffset: (value) => { scroll = Math.max(0, Math.min(value, maxScroll)); },
-            muted: (text) => text,
-            accent: (text) => text,
-            text: (text) => text,
-            error: (text) => text,
-            success: (text) => text,
-            warning: (text) => text,
-            info: (text) => text,
-            subtext: (text) => text,
-            missionTui: {
-              startReadyWatch: (missionId, poll, onReady) => startMissionWatch('ready', missionId, poll, onReady),
-              startRunWatch: (missionId, poll) => startMissionWatch('run', missionId, poll),
-            },
-          });
-          status = status || 'Enter 전송';
-          render();
-          continue;
-        }
         if (route?.action === 'command' && slashHandlers.has(submitted.slice(1).trim().split(/\s+/)[0] ?? '')) {
           slashContext.chatLines = activity;
           const [command = '', ...args] = submitted.slice('/'.length).trim().split(/\s+/);
@@ -4357,8 +4388,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     eventWatchStop.current?.();
     // #38260 REVIEW-2 ②: the fleet poller ends with this TUI (a re-entry creates its own; no second poller keeps asking).
     fleetSegment.stop();
-    missionWatchCancellation.cancel?.();
-    delete missionWatchCancellation.cancel;
     if (simWatchTimer !== null) clearInterval(simWatchTimer);
     if (sidetabRefreshTimer !== null) clearInterval(sidetabRefreshTimer);
     stopElsFeed();

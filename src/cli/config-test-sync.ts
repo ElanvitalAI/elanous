@@ -38,9 +38,6 @@ export function prodConfigDir(): string {
 
 /** 그대로 복사할 부속 파일 (운영 config dir 상대). 없는 파일은 조용히 스킵. */
 export const TEST_SYNC_AUX_FILES: readonly string[] = [
-  'secrets.json',      // LLM/서비스 키 — 에이전트 턴에 필요 (아웃바운드·앱 인증 자격은 뺀다 — testSyncExcludedSecretIds)
-  'llm-fallback.json', // 모델 폴백 체인
-  'auth.json',         // oauth 자격 (LLM provider)
   'identity.json',     // self identity — 무해·자기인식 일관
   // POL1 (10-01): the LLM policy (credit use · pace · grants). Without it a tree's test universe resolved «fallback»
   // while production said «credits», and every harness run from a work tree went to grok.
@@ -49,6 +46,9 @@ export const TEST_SYNC_AUX_FILES: readonly string[] = [
 
 /** 의도적 제외 (복사 금지 — 이유 명시. 목록 변경 시 반드시 사유와 함께). */
 export const TEST_SYNC_EXCLUDED: ReadonlyArray<{ file: string; reason: string }> = [
+  { file: 'auth.json', reason: '운영 OAuth 자격은 시험 우주에 복사하지 않는다' },
+  { file: 'secrets.json', reason: '운영 비밀 저장소는 시험 우주에 복사하지 않는다' },
+  { file: 'llm-fallback.json', reason: '운영 공급자 설정에 자격이 포함될 수 있다' },
   { file: 'apns.p8', reason: '실기기 푸시 발송 자격 — 테스트 아웃바운드 금지' },
   { file: 'pushcut.json', reason: '실기기 푸시 발송 자격 — 테스트 아웃바운드 금지' },
   { file: 'autopilot.json', reason: '자율 무장 — 부재=fail-closed(DISARMED)가 테스트 기본' },
@@ -179,6 +179,12 @@ export function syncTestConfig(testDir: string, srcDir: string = prodConfigDir()
     ? JSON.parse(readFileSync(srcPath, 'utf-8')) as Record<string, unknown>
     : {};
   const transformed = buildTestSafeRawConfig(raw); // 운영 비밀을 제거한 뒤에만 사본을 저장한다.
+  // No real test-channel token is safe to inherit from the operating config.
+  // Explicit fake credentials may be installed directly in the test universe.
+  const telegram = transformed.telegram as Record<string, unknown>;
+  delete telegram.botToken;
+  delete telegram.testChannel;
+  telegram.enabled = false;
   transformed._testSyncedFrom = srcPath;
   transformed._testSyncedAt = new Date().toISOString();
   const testConfigPath = join(testDir, 'config.json');
@@ -191,23 +197,6 @@ export function syncTestConfig(testDir: string, srcDir: string = prodConfigDir()
     const from = join(srcDir, f);
     if (!existsSync(from)) { skippedMissing.push(f); continue; }
     const to = join(testDir, f);
-    if (f === 'secrets.json') {
-      const store = JSON.parse(readFileSync(from, 'utf-8')) as { secrets?: Record<string, unknown> } & Record<string, unknown>;
-      const all = store.secrets && typeof store.secrets === 'object' ? store.secrets : {};
-      const excluded = new Set(testSyncExcludedSecretIds(raw, Object.keys(all)));
-      const kept: Record<string, unknown> = {};
-      for (const [sid, v] of Object.entries(all)) if (!excluded.has(sid)) kept[sid] = v;
-      const body = JSON.stringify(store.secrets && typeof store.secrets === 'object' ? { ...store, secrets: kept } : store, null, 2);
-      debug.log('config.test-sync', 'secrets-file-filtered', { kept: Object.keys(kept).length, excluded: [...excluded] });
-      if (existsSync(to) && readFileSync(to, 'utf-8') === body) { chmodSync(to, 0o600); skippedIdentical.push(f); continue; }
-      mkdirSync(dirname(to), { recursive: true });
-      const tmp = `${to}.tmp-${process.pid}`;
-      writeFileSync(tmp, body, { mode: 0o600 });
-      renameSync(tmp, to);
-      chmodSync(to, 0o600);
-      copied.push(excluded.size ? `${f}(아웃바운드 자격 ${excluded.size}개 뺌)` : f);
-      continue;
-    }
     // 🩸 2026-09-24: 대상 `llm-fallback.json` 이 읽기 전용(0444)이라 copyFileSync 가 EACCES 로 던졌고,
     //   목록 뒤의 `auth.json`(codex 로그인)이 복사되지 않아 격리 우주의 자식이 codex 를 못 썼다.
     //   ⇒ 이미 같은 바이트면 건너뛴다(멱등) — 다르면 종전처럼 복사한다(실패는 그대로 드러난다).

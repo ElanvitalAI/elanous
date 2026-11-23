@@ -42,17 +42,19 @@ test('next TUI echoes a sent question before the delayed model and paints stream
         args: [entry, '--test={root}', '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', 'next'],
         root, rows: 36, cols: 120,
         env: { ELANOUS_CONFIG_DIR: root, ELANOUS_STATE_DIR: root },
-        ready: { label: 'boot', until: 'Ctrl+Q 종료' },
+        ready: { label: 'boot', until: 'Ctrl+Q quit' },
         steps: [{
           // Source: seat-state/OP/evidence/20261110/STREAM-UX-DIAG.md streaming PTY turn timeout.
           label: 'stream', text: 'STREAM-POLISH-ECHO 질문', timeoutMs: 30_000, // Source: 내부 문서 `next-tui-stream-polish-1`
-          until: (screen) => screen.includes('STREAM-POLISH-ANSWER') && screen.includes('응답 완료'),
+          until: (screen) => screen.includes('STREAM-POLISH-ANSWER') && screen.includes('Turn done'),
         }],
         onStepInput: (_label, atMs) => { submittedAt = atMs; },
         onOutput: (chunk, atMs) => {
           if (submittedAt === null) return;
           raw += chunk;
-          if (echoAt === null && raw.includes('❯ STREAM-POLISH-ECHO')) echoAt = atMs;
+          // 11-23 next TUI: the submit clears the composer and the question is echoed as the transcript user row
+          // «> STREAM-POLISH-ECHO …» (bold «>» between SGR codes), so match on the SGR-stripped stream.
+          if (echoAt === null && raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').includes('> STREAM-POLISH-ECHO')) echoAt = atMs;
         },
       });
       expect(receipt.exitCode).toBe(0);

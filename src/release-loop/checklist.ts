@@ -484,8 +484,14 @@ export function validateCeoLoad(input: { ceoMinutes?: number; ceoDate?: string }
   if (input.ceoDate !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(input.ceoDate) || !Number.isFinite(Date.parse(`${input.ceoDate}T00:00:00Z`)) || new Date(`${input.ceoDate}T00:00:00Z`).toISOString().slice(0, 10) !== input.ceoDate)) throw new CliUserError('대표 손 날짜는 YYYY-MM-DD 이어야 한다');
 }
 
+/** CHECKLIST-ID-TRIM (OP #134563) — a cell id with leading or trailing whitespace is refused outright in English, never auto-trimmed: auto-trimming would silently alias the padded id to its trimmed twin. */
+function assertNoOuterWhitespaceCellId(id: string): void {
+  if (id !== id.trim()) throw new CliUserError('checklist id must not carry leading or trailing whitespace', '칸 id 앞뒤 공백을 직접 없애 준다 — 자동 손질은 조용한 별칭(aliasing)이 된다');
+}
+
 export function addItem(v: string, input: { id: string; title: string; refs?: string[]; owner?: string; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean }, options: { allowDuplicateId?: boolean } = {}): Checklist {
   if (!input.id.trim()) throw new CliUserError('칸 id 가 비었다');
+  assertNoOuterWhitespaceCellId(input.id);
   if (!input.title.trim()) throw new CliUserError('칸 제목이 비었다');
   if (input.kind !== undefined && !CHECKLIST_KINDS.includes(input.kind)) throw new CliUserError(`잘못된 종류: ${input.kind}`, 'screen|postpub');
   if (input.dispatchKind !== undefined && !CHECKLIST_DISPATCH_KINDS.includes(input.dispatchKind)) throw new CliUserError(`잘못된 발사 종류: ${input.dispatchKind}`, 'code|ops|measure|decision|umbrella');
@@ -587,6 +593,7 @@ export function setItemIfSnapshot(v: string, id: string, patch: Parameters<typeo
 }
 
 function setItemGuarded(v: string, id: string, patch: Parameters<typeof setItem>[2], by: string, expected?: Pick<ChecklistItem, 'title' | 'status' | 'evidence'>): Checklist {
+  assertNoOuterWhitespaceCellId(id);
   return mutate(v, (data, otherItems) => {
     const item = data.items.find((i) => i.id === id);
     if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
@@ -594,6 +601,22 @@ function setItemGuarded(v: string, id: string, patch: Parameters<typeof setItem>
       throw new CliUserError(`판정 중 칸 변경: ${id}`, '현재 칸으로 다시 측정한다');
     if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new CliUserError(`잘못된 상태: ${patch.status}`);
     if (patch.disposition !== undefined && !['move', 'known-issue', 'block'].includes(patch.disposition)) throw new CliUserError(`잘못된 처분: ${patch.disposition}`);
+    // #134310 ②(JUD-2 보안 HOLD) — green 전환의 가드는 CLI 가 아니라 원장 공통 전환 문에 둔다: 다른 명령 경로
+    // (ops-ledger ChecklistSet 등)·직접 호출도 같은 검사를 받는다. 허용 집합은 종전 정책의 합집합 — 판정자
+    // JUD*·REVIEW*(CLI 가드 #133987) ⊕ OP·OPC(release-cli 판정국 [GREEN-REQ]) ⊕ 코드 고정 자동화 신원
+    // 'harness'(merged-pr-checklist 병합 자동 green)·'tasks-green-sweep'(green-sweep 판정 스윕) — 이 둘은
+    // 호출부 코드가 정하는 값이지 호출자 입력(ELANOUS_TRACK·'cli' 등)이 아니며, 자동화 행위자의 인증 신원
+    // 통합은 CX-3 ELS-ORCH-PEER-IDENTITY 가 다룬다(FU). 서명자 출처 인증(#134310 ①)은 CLI 경로의 몫이고,
+    // 직접 파일 쓰기는 이번 범위 밖 FU(파일 권한 · OP #134310).
+    if (patch.status === 'green') {
+      const seat = (by ?? '').trim();
+      const codeFixedAutomation = seat === 'harness' || seat === 'tasks-green-sweep';
+      if (!(seat === 'OP' || seat === 'OPC' || seat.startsWith('JUD') || seat.startsWith('REVIEW') || codeFixedAutomation))
+        throw new CliUserError(
+          `checklist green flip is judge-only — store write by "${seat || 'cli'}" refused (judges: JUD-* / REVIEW-*; owner: OP/OPC)`,
+          'JUD-* · REVIEW-* · OP/OPC — 판정자만 green 전환 가능',
+        );
+    }
     if (patch.kind !== undefined && !CHECKLIST_KINDS.includes(patch.kind)) throw new CliUserError(`잘못된 종류: ${patch.kind}`, 'screen|postpub');
     if (patch.dispatchKind !== undefined && !CHECKLIST_DISPATCH_KINDS.includes(patch.dispatchKind)) throw new CliUserError(`잘못된 발사 종류: ${patch.dispatchKind}`, 'code|ops|measure|decision|umbrella');
     if (patch.priority !== undefined && !['P0', 'P1', 'P2'].includes(patch.priority)) throw new CliUserError(`잘못된 우선순위: ${patch.priority}`);

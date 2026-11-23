@@ -9,10 +9,12 @@ import { simWorldScenarios } from './scenarios.js';
 test('capsule-events registers one default C1 and the other scenes with literal reasons', () => {
   const world = join(import.meta.dir, '../../worlds');
   const pack = parseYaml(readFileSync(join(world, 'sim-world-capsule-events.yaml'), 'utf8'));
-  const table = parseSimWorldExpectTable(readFileSync(join(world, 'sim-world-expect.json'), 'utf8'));
+  const table = parseSimWorldExpectTable(readFileSync(join(world, 'expect', 'capsule-events.json'), 'utf8'));
   expect(isReservedSimWorldId('capsule-events')).toBe(true);
   expect(pack.world).toBe('capsule-events');
-  expect(pack.scenarios).toEqual([{ id: 'C1', module: 'src/ux-sim/sim-world/capsule-events/scenarios.ts' },
+  expect(pack.scenarios).toEqual([{ id: 'SEAT-STEER-PREEMPT-137', module: 'src/ux-sim/sim-world/capsule-events/steer-preempt.ts' },
+    { id: 'SEAT-CAPSULE-NO-REPEAT-REPORT', module: 'src/ux-sim/sim-world/capsule-events/c8-no-repeat.ts' },
+    { id: 'C1', module: 'src/ux-sim/sim-world/capsule-events/scenarios.ts' },
     { id: 'C7', module: 'src/ux-sim/sim-world/capsule-events/c7-mcp.ts' },
     { id: 'C3', module: 'src/ux-sim/sim-world/capsule-events/c3-shell.ts' },
     { id: 'C3-TRIO', module: 'src/ux-sim/sim-world/capsule-events/c3-trio.ts' },
@@ -22,7 +24,8 @@ test('capsule-events registers one default C1 and the other scenes with literal 
     { id: 'C6', module: 'src/ux-sim/sim-world/capsule-events/c6-boot-backlog.ts' },
     { id: 'C4', module: 'src/ux-sim/sim-world/capsule-events/c4-agent-background.ts' },
     { id: 'C3-ESC', module: 'src/ux-sim/sim-world/capsule-events/c3-esc-cancel.ts' },
-    { id: 'C1-HARNESS', module: 'src/ux-sim/sim-world/capsule-events/c1-harness.ts' }]);
+    { id: 'C1-HARNESS', module: 'src/ux-sim/sim-world/capsule-events/c1-harness.ts' },
+    { id: 'C9-SESSION-SCOPED', module: 'src/ux-sim/sim-world/capsule-events/c9-session-scoped.ts' }]);
   expect(simWorldScenarios.map(row => row.id)).toEqual(['C1', 'C5', 'C6']);
   expect(table.entries['capsule-events/C1']).toEqual({ expect: 'green',
     reason: "C1 done-event wake axes (flag removed — capsule behavior always on, CAPSULE-FLAGS-REMOVE-DEFAULT): the background Agent end delivery passes here (exactly one wake turn within 20s, duplicates 0) and the harness child end frame is green in capsule-events/C1-HARNESS (B4/B5 queue-bridge); the mail axis keeps its own red row capsule-events/C1-MAIL",
@@ -59,4 +62,7 @@ test('capsule-events registers one default C1 and the other scenes with literal 
   expect(table.entries['capsule-events/C3-ESC']).toEqual({ expect: 'green',
     reason: 'C3 Esc axis: a Bash with a 10-minute timeout remains alive after Esc cancels another turn, then writes its completion marker. The wall-clock hold is bounded to 32s.',
     greenSince: '#39444 seed-7 Next TUI scenario' });
+  expect(table.entries['capsule-events/C9-SESSION-SCOPED']).toEqual({ expect: 'green',
+    reason: "C9 session scope: two seat sessions built from the tree REPL tools run background RunShell capsules at once and each drain takes only its own completion; an idle seat's supplement Agent completion becomes one queued notice and opens no turn. The shared persisted queue file across REPL processes stays unmeasured (FU).",
+    greenSince: 'ELN-CAPSULE-COMPLETION-SCOPED' });
 });

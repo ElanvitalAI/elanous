@@ -152,10 +152,10 @@ test('incident 0306: a new request resumes the saved same-version failed run id'
     expect(observed).toHaveLength(2);
     rmSync(unreadablePath);
     expect(observed).toHaveLength(2);
-    expect(observed[0]).toMatchObject({ resumeRunId: runId, fromNodeId: 'gate', useCurrentGraph: true, resumeInputPatch: { gateImagePin: 'cut-commit' } });
+    expect(observed[0]).toMatchObject({ resumeRunId: runId, fromNodeId: 'gate', useCurrentGraph: true, resumeInputPatch: { gateImagePin: 'cut-commit', opApprovalMarker: 'publish requires human approval' } });
     expect(typeof (observed[0]?.deps as { dispatchGraphSubscription?: unknown } | undefined)?.dispatchGraphSubscription).toBe('function');
     expect(observed[0]).not.toHaveProperty('runId');
-    expect(observed[1]).toMatchObject({ resumeRunId: runId, fromNodeId: 'gate', useCurrentGraph: true, resumeInputPatch: { gateImagePin: 'cut-commit' } });
+    expect(observed[1]).toMatchObject({ resumeRunId: runId, fromNodeId: 'gate', useCurrentGraph: true, resumeInputPatch: { gateImagePin: 'cut-commit', opApprovalMarker: 'publish requires human approval' } });
     expect(typeof (observed[1]?.deps as { dispatchGraphSubscription?: unknown } | undefined)?.dispatchGraphSubscription).toBe('function');
     expect(first.state?.runId).toBe(runId);
     expect(second.state?.runId).toBe(runId);
@@ -288,7 +288,7 @@ test('release.loop config builds the full graph input with ledger previousVersio
   const loop = { gatePodPool: 'gate-pool', gatePodBunCache: '/var/cache/elanous-bun', gatePodShards: 4, gatePodShardTimeoutSeconds: 240, autoAppendRepair: true,
     gateRemote: 'node-b', gateRemoteMirror: '/mirror/repo.git', opsHosts: ['local', 'node-b'], internalDist: '~/dist', opsRestart: true };
   writeFileSync(configPath, JSON.stringify({ release: { loop } }));
-  expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, configPath })).toEqual({ version: '0.11.0', previousVersion: '0.10.0', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', ...loop });
+  expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, configPath })).toEqual({ version: '0.11.0', previousVersion: '0.10.0', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', ...loop, opApprovalMarker: 'publish requires human approval' });
 }));
 
 test('cold shard opt-in reaches pod runs only', () => fixture((root) => {
@@ -446,9 +446,9 @@ test('RELEASE-BRANCH: the default run cuts a release branch; --cut-commit and --
     await runUnattendedRelease({ version: '0.2.4', cutCommit: 'abc1234' }, deps);
     await runUnattendedRelease({ version: '0.2.4', mainCut: true }, deps);
     expect(inputs).toEqual([
-      { gatePodPool: 'pool', graphCutover: 'legacy', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.4', previousVersion: '0.2.3', branchCut: true },
-      { gatePodPool: 'pool', graphCutover: 'legacy', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.4', previousVersion: '0.2.3', cutCommit: 'abc1234' },
-      { gatePodPool: 'pool', graphCutover: 'legacy', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.4', previousVersion: '0.2.3' },
+      { gatePodPool: 'pool', graphCutover: 'legacy', gateExecutor: 'pod', gateImagePin: 'cut-commit', opApprovalMarker: 'publish requires human approval', version: '0.2.4', previousVersion: '0.2.3', branchCut: true },
+      { gatePodPool: 'pool', graphCutover: 'legacy', gateExecutor: 'pod', gateImagePin: 'cut-commit', opApprovalMarker: 'publish requires human approval', version: '0.2.4', previousVersion: '0.2.3', cutCommit: 'abc1234' },
+      { gatePodPool: 'pool', graphCutover: 'legacy', gateExecutor: 'pod', gateImagePin: 'cut-commit', opApprovalMarker: 'publish requires human approval', version: '0.2.4', previousVersion: '0.2.3' },
     ]);
     enableLandingFreeze({ reason: 'emergency', by: 'OP' }, root);
     await expect(runUnattendedRelease({ version: '0.2.4' }, deps)).rejects.toThrow('동결 중 · emergency');
@@ -469,7 +469,7 @@ test('RELEASE-REHEARSAL-RC: --prerelease rc numbers the next free rc, skips the 
       checklist: () => { checklists++; return { ok: false, red: ['K1'], undecided: [], blocked: [], moved: [], knownIssues: [] }; },
       graph: async (_p: string, o: { input?: unknown }) => { inputs.push(o.input as Record<string, unknown>); return { status: 'done' } as never; } };
     const preview = await runUnattendedRelease({ version: '0.2.18', prerelease: 'rc', dryRun: true }, deps);
-    expect(preview.input).toEqual({ gatePodPool: 'pool', graphCutover: 'legacy', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.18-rc.2', previousVersion: '0.2.17', branchCut: true });
+    expect(preview.input).toEqual({ gatePodPool: 'pool', graphCutover: 'legacy', gateExecutor: 'pod', gateImagePin: 'cut-commit', opApprovalMarker: 'publish requires human approval', version: '0.2.18-rc.2', previousVersion: '0.2.17', branchCut: true });
     await runUnattendedRelease({ version: '0.2.18', prerelease: 'rc' }, deps);
     expect(inputs[0]!.version).toBe('0.2.18-rc.2');
     expect(checklists).toBe(0);
@@ -606,3 +606,12 @@ test('an injected ledger root different from the OP-seat root still locks the on
     rmSync(ledger, { recursive: true, force: true });
   }
 });
+
+test('release run input requires a publish decision even without a configured marker', () => fixture((root) => {
+  record(root, '0.10.0', { version: '0.10.0', publishedAt: 'now' });
+  for (const version of ['0.11.0', '0.11.0-rc.1']) {
+    expect(buildReleaseRunInput(version, { ledgerRoot: root, config: { gatePodPool: 'pool' } }).opApprovalMarker).toBe('publish requires human approval');
+    expect(buildReleaseRunInput(version, { ledgerRoot: root, config: { gatePodPool: 'pool', opApprovalMarker: '  ' } }).opApprovalMarker).toBe('publish requires human approval');
+    expect(buildReleaseRunInput(version, { ledgerRoot: root, config: { gatePodPool: 'pool', opApprovalMarker: 'operator hold' } }).opApprovalMarker).toBe('operator hold');
+  }
+}));

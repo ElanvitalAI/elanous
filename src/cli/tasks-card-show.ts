@@ -1,7 +1,7 @@
 import { debug } from '../debug/log.js';
 import { cardPrNumber, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, nextMoveFor, readTaskAgentState, readTaskCard, shellQuote, taskAgentStatePath as taskStatePathDefault, taskCardLabelContext, type TaskCard } from '../task-agent/task-hand.js';
 import { RUN_TAG_KEYS, runIdentityFieldText, runPriorityClass } from '../task-agent/run-identity.js';
-import { recycleStalledLaunches, runLedgerReasonCodeFor, taLaunchLine } from '../task-agent/launch-result-loop.js';
+import { recycleStalledLaunches, runLedgerReasonCodeFor, taLaunchLine, type TaRecycleOutcome } from '../task-agent/launch-result-loop.js';
 import { readCardSalvageBranch, refreshCardRunBinding } from '../task-agent/card-evidence.js';
 import { captureReviewResults } from '../task-agent/review-result-capture.js';
 import type { TasksCliDeps } from './tasks-cli.js';
@@ -31,6 +31,25 @@ export async function mirrorRemoteCardLedger(cardId: string, deps: TasksCliDeps)
 function moveLine(card: TaskCard): string {
   const move = nextMoveFor(card);
   return `${move.kind}${move.command ? ` — elanous ${move.command.map(shellQuote).join(' ')}` : ''} (${move.reason})`;
+}
+
+/** TA 회수 outcome 한 줄 — skip-note 부착 상태는 stopRecorded 뿐 아니라 «카드 쓰기 결과»로 판정한다:
+ * 쓰기 실패(cardWriteFailed)·재독 불명(cardWriteUnknown)인 회수는 skip-note 가 디스크에 없다/모른다 —
+ * stopRecorded=true 만으로 «skip-note=칸 history» 로 오표시하지 않는다(JUD-C #129833 mustFix 1 · FU-39400 r5). */
+export function taRecycleOutcomeLine(outcome: TaRecycleOutcome): string {
+  // 출처: terra r5 mustFix 1 — #39574 · stopAttempted=false(잠금 획득·진입 전 오류로 stop 시도 자체가 없음)는
+  // «실패» 가 아니라 «시도 안 함» 으로 구분한다. undefined(관측 없음 · spy 경로)와 true(시도했으나 실패)는 기존 «실패».
+  const stopText = outcome.stopRecorded
+    ? '기록됨'
+    : outcome.stopAttempted === false
+      ? `시도 안 함 — 재시도 대상 유지(${outcome.skipNote})`
+      : `실패 — 재시도 대상 유지(${outcome.skipNote})`;
+  const noteText = outcome.cardWriteUnknown
+    ? 'skip-note 부착 불명 — 카드 쓰기 실패 뒤 재독 실패(다음 스윕 재조정)'
+    : outcome.cardWriteFailed
+      ? 'skip-note 미부착 — 카드 쓰기 실패(다음 스윕 재조정)'
+      : outcome.stopRecorded ? 'skip-note=칸 history' : '마커=칸 history(회수 아님)';
+  return `TA 회수: runId=${outcome.runId} · 원인=${outcome.cause} · 무진척 ${outcome.minutesStalled}분 · 정확 runId stop=${stopText} · ${noteText}`;
 }
 
 const GOAL_BODY_SUMMARY_LIMIT = 8_000;
@@ -196,7 +215,7 @@ export async function showTaskCard(id: string, opts: { json?: boolean }, deps: T
   if (opts.json) out(JSON.stringify({ card, nextMove: nextMoveFor(card), ...cardGoalEvidence(card, deps), salvageBranch: salvage.salvageBranch, ...(salvageUnread ? { salvageBranchUnread: true } : {}), ...(recycled.length ? { taRecycled: recycled } : {}) }));
   else {
     for (const line of taskCardLines(card)) out(line);
-    for (const outcome of recycled) out(`TA 회수: runId=${outcome.runId} · 원인=${outcome.cause} · 무진척 ${outcome.minutesStalled}분 · 정확 runId stop=${outcome.stopRecorded ? '기록됨' : `실패 — 재시도 대상 유지(${outcome.skipNote})`} · ${outcome.stopRecorded ? 'skip-note=칸 history' : '마커=칸 history(회수 아님)'}`);
+    for (const outcome of recycled) out(taRecycleOutcomeLine(outcome)); // 부착 상태 네 갈래 표시(JUD-C #129833 mustFix 1)
     if (card.parentHost) out(`부모 호스트: ${card.parentHost.host}${card.parentHost.pid ? ` (pid ${card.parentHost.pid})` : ''} · PR 까지만 — 병합은 HQ${card.parentHost.log ? ` · 로그 ${card.parentHost.host}:${card.parentHost.log}` : ''}`);
     if (salvage.salvageBranch) out(`수확 가지: ${salvage.salvageBranch} (draft PR 대신)`);
     else if (salvageUnread) out('수확 가지: 못 읽음(원장 읽기 실패)');

@@ -24,6 +24,9 @@ import {
 import { lookupLlmTierSpec } from './llm-tier-map.js';
 import { registerUsageCommand } from '../cli/usage-cli.js';
 import type { LogStoreRow } from '../mss/logging/log-store.js';
+import { createModelOrchestrationCore, DEFAULT_CORE_MODULES } from './model-orchestration.js';
+import { classifyWorkRisk, workRiskInputFromFields } from './work-risk-router.js';
+import type { TierShareInput } from './work-tier-policy.js';
 
 const TRIGGERS: ReadonlyArray<[EscalationTrigger, EscalationSignals]> = [
   ['same-error-twice', { sameErrorCount: SAME_ERROR_ESCALATE_AT }],
@@ -119,6 +122,21 @@ describe('usage runs --by role tier shares', () => {
     expect(summarizeTierShares([{ model: 'not-on-the-ladder', inputTokens: SCALE }]).status).toBe('UNMEASURED');
   });
 
+  // P2-13 HARNESS-DIFFICULTY-ROUTER-WEAK70-FU(ROSTER-0334) — 약 몫 하한 WEAK_SHARE_MIN 이 status 에 반영되는가.
+  it('weak below WEAK_SHARE_MIN is not GREEN — 약 하한 미달(합성 fixture)', () => {
+    // 합성 fixture(칸 증거 우주 = 시뮬 · 실측·원장 데이터 아님): 약 몫이 하한의 절반에 그친 모집단.
+    const weak = WEAK_SHARE_MIN / 2;
+    const mid = 1 - weak;
+    const report = summarizeTierShares([
+      { runId: 'run-weak-short', workTier: 'weak', inputTokens: weak * SCALE },
+      { runId: 'run-weak-short', workTier: 'mid', inputTokens: mid * SCALE },
+    ]);
+    const byTier = Object.fromEntries(report.rows.map((row) => [row.tier, row]));
+    expect(byTier.weak!.share).toBeLessThan(WEAK_SHARE_MIN); // 전건: 약 몫이 실제로 하한 아래
+    expect(report.weakShare).toBeCloseTo(weak);
+    expect(report.status).toBe('YELLOW'); // GREEN — 구현 후 약 하한 미달은 GREEN 이 아니다
+  });
+
   it('the view appears only with --tier-share; the default text and JSON stay as before', async () => {
     const run = async (args: string[]) => {
       const lines: string[] = [];
@@ -141,5 +159,43 @@ describe('usage runs --by role tier shares', () => {
     const withShare = JSON.parse((await run(['runs', '--by', 'role', '--json', '--tier-share']))[0]!);
     expect(withShare.tierShare.status).toBe('YELLOW');
     expect(withShare.tierShare.targets.strongYellowAbove).toBe(STRONG_SHARE_YELLOW_ABOVE);
+  });
+});
+
+// ── P2-13 HARNESS-DIFFICULTY-ROUTER-WEAK70-FU 시뮬 증명(ROSTER-0334 · 증거 우주 = 시뮬) ──
+// 합성 골 모집단(plain L1~L3 다수 + risky L4+ 소수 · «구조 칸» 줄머리 형식)에서 코어 decide(CORE_BASE_TIER 배정)가
+// 고른 등급의 토큰 몫이 약 하한 WEAK_SHARE_MIN(표 ≥70%) 에 닿는다. 실제 원장·실측 데이터 아님 — 문면 전부 합성 fixture.
+// 골 산문에 정규식을 걸지 않는다(A205 · R-SIG) — 구조 칸 줄머리 일치(workRiskInputFromFields)만 읽는다.
+describe('weak ≥70% over a synthetic routed population — 칸 시뮬', () => {
+  // 합성 모집단 규모(정책 상수 아님 — 시나리오 fixture 크기): plain 12 · risky 2.
+  const plainPaths = (count: number, group: string) =>
+    Array.from({ length: count }, (_, index) => `synth/${group}/file-${index}.ts`); // 문서(.md) 경로 아님
+  const plainGold = [
+    ...Array.from({ length: 4 }, (_, index) => `대상 경로: ${plainPaths(1, `ui-${index}`).join(' · ')}`), // 경로 1 = L1
+    ...Array.from({ length: 4 }, () => `대상 경로: ${plainPaths(3, 'text').join(' · ')}`), // 경로 3 = L2
+    ...Array.from({ length: 4 }, () => `대상 경로: ${plainPaths(4, 'view').join(' · ')}`), // 경로 4 = L3
+  ];
+  const riskyGold = [
+    '대상 경로: synth/auth/vault.ts\n위험 범주: security', // 선언 범주 1개 → L4
+    '대상 경로: synth/store/cart.ts', // 경로 토큰 store → persistence L4
+  ];
+
+  it('core decide over a plain-majority gold population reaches weak share ≥ WEAK_SHARE_MIN (GREEN)', () => {
+    const core = createModelOrchestrationCore(DEFAULT_CORE_MODULES);
+    const rows: TierShareInput[] = [];
+    for (const [index, doc] of [...plainGold, ...riskyGold].entries()) {
+      const work = classifyWorkRisk(workRiskInputFromFields(doc));
+      for (const moment of ['design', 'judge', 'implement'] as const) {
+        // 계기 없는 손일 결정 — CORE_BASE_TIER: plain 전 순간 약 · risky 설계·판정 강 · 구현 중.
+        const decision = core.decide({ runId: `sim-weak70-${index}`, provider: 'grok', work, moment });
+        rows.push({ runId: `sim-weak70-${index}`, workTier: decision.tier, inputTokens: SCALE });
+      }
+    }
+    const report = summarizeTierShares(rows);
+    // 분포 산출: 약 36/42 ≈ 85.7% ≥ WEAK_SHARE_MIN · 강 4/42 ≈ 9.5% ≤ STRONG_SHARE_YELLOW_ABOVE.
+    expect(report.weakShare).not.toBeNull();
+    expect(report.weakShare!).toBeGreaterThanOrEqual(WEAK_SHARE_MIN);
+    expect(report.strongShare!).toBeLessThanOrEqual(STRONG_SHARE_YELLOW_ABOVE);
+    expect(report.status).toBe('GREEN');
   });
 });

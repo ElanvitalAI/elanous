@@ -16,6 +16,7 @@
 // Reference: ROADMAP §2.3 · OpenAI API docs platform.openai.com/docs/api-reference/audio/createSpeech.
 
 import { debug } from '../../../debug/log.js';
+import { llmNetworkFetch } from '../../../session-runtime/llm-call-gateway.js';
 import { isVoiceCostId, type VoiceCostId } from '../../../models/voice-costs.js';
 import { globalVoiceCostTracker } from '../../cost-tracker.js';
 import {
@@ -107,14 +108,14 @@ export class OpenAITTSProvider implements TTSProvider {
         url, model: this.model, voice, chars: text.length,
       });
     const t0 = Date.now();
-    const response = await fetch(url, {
+    const response = await llmNetworkFetch(url, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
-    });
+    }, { provider: 'openai', model: this.model, role: 'aux', requestedBy: 'voice-tts' });
     const latencyMs = Date.now() - t0;
     if (!response.ok) {
       const errBody = await response.text().catch(() => '');

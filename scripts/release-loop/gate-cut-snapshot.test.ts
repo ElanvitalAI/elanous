@@ -5,13 +5,42 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gateAssignableTestsAtCommit, gateSourcePins } from './gate-baseline-receipt.js';
-import { createCutSnapshot } from './gate-cut-snapshot.js';
+import { createCutSnapshot, cutSnapshotBatches } from './gate-cut-snapshot.js';
 import { gitClosureTree } from './gate-closure.js';
 import { gateReceiptHashesByShard } from './gate-receipt-hash.js';
 import { gateLockfileHashAtCommit, gateTestedFileHashesAtCommit } from './gate-reuse-identity.js';
 
 const roots: string[] = [];
 afterEach(() => { delete process.env.GIT_TRACE; for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+
+test('cut snapshot partitions large blobs without dropping or truncating any content', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'gate-cut-large-')); roots.push(repo);
+  const trace = join(repo, 'git-trace.log');
+  const data = ['a', 'b', 'c'].map((prefix, index) => prefix.repeat((index === 2 ? 17 : 9) * 1024 * 1024)); // 출처: #134519 — multi-batch and oversized synthetic blobs
+  for (const [index, value] of data.entries()) writeFileSync(join(repo, `large${index}.ts`), value);
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr);
+    return result.stdout.trim();
+  };
+  git('init', '-q'); git('config', 'user.name', 'Cut snapshot test'); git('config', 'user.email', 'cut-snapshot@example.invalid');
+  git('add', '.'); git('commit', '-qm', 'large snapshot');
+  const commit = git('rev-parse', 'HEAD');
+  process.env.GIT_TRACE = trace;
+  const snapshot = createCutSnapshot(repo, commit);
+  for (const [index, value] of data.entries()) {
+    const file = `large${index}.ts`;
+    expect(snapshot.read(file)).toBe(value);
+    expect(snapshot.entries.get(file)?.sha256).toBe(createHash('sha256').update(value).digest('hex'));
+  }
+  expect((readFileSync(trace, 'utf8').match(/git cat-file --batch(?:\s|$)/g) ?? []).length).toBe(3);
+});
+
+test('snapshot batch grouping rejects invalid sizes and retains an oversized blob alone', () => {
+  const rows = [{ size: 10 }, { size: 10 }, { size: 500 }, { size: 1 }]; // 출처: #134519 — byte-budget fixture
+  expect(cutSnapshotBatches(rows, 200)).toEqual([[rows[0], rows[1]], [rows[2]], [rows[3]]]);
+  expect(() => cutSnapshotBatches([{ size: -1 }], 200)).toThrow();
+});
 
 test('GATE-CUT-SNAPSHOT sim: repeated planning consumers share one ls-tree and one cat-file batch', () => {
   const repo = mkdtempSync(join(tmpdir(), 'gate-cut-snapshot-')); roots.push(repo);

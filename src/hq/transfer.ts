@@ -18,7 +18,7 @@ export interface TransferDeps {
   reallocatePools: (fromHost: string, toHost: string) => number | null;
 }
 
-const aliases: Record<string, string[]> = { mbp: ['mbp', 'MacBookProM5'], 'node-b': ['node-b', 'MacStudioB1'] };
+const aliases: Record<string, string[]> = { 'mbp': ['mbp', 'MacBookProM5'], 'node-b': ['node-b', 'MacStudioB1'] };
 const valid = (alias: string, holder: string) => aliases[alias]?.includes(holder) ?? false;
 const leaseCommand = (action: 'release' | 'acquire', expected?: { holder: string; generation: number }) =>
   `elanous hq lease ${action}${expected ? ` --expected-holder '${expected.holder}' --expected-generation ${expected.generation}` : ''} --json`;

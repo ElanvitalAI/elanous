@@ -3,40 +3,29 @@ import { TURN_EVENT_SOURCES } from '../../turn-capsule/contract.js';
 import { emitTurnLife } from '../../debug/turn-life.js';
 import { detectReplacementCandidate, type ReplacementCandidate, type ReplacementDetection } from '../../chat/queue-supersede.js';
 import { pushNowToolDecision } from './tool-interrupt-class.js';
-
-export type NextTuiQueueInterruptReason = 'interrupt' | 'esc' | 'timeout-15m' | 'stream-stall';
-
-export type NextTuiQueueSettle =
-  | { kind: 'none' }
-  | { kind: 'wake' }
-  /** A200: after Esc the queued input leaves as the next turn by itself (not restored to the draft). */
-  | { kind: 'resubmit'; count: number }
-  /** ELN-CANCEL-RESTORE-RULE: Esc with nothing queued and no response at all gives the sent text back to the prompt. */
-  | { kind: 'restore-original'; text: string };
-
-/** What the just-ended turn looked like, for the Esc rule. `responded` = any reply text or tool activity happened. */
-export interface NextTuiSettledTurn { readonly text: string; readonly responded: boolean }
-
-export type NextTuiQueueDequeue =
-  | { kind: 'none' }
-  /** SEAT-INBOX B1-C — dequeue 뒤에도 ledger msgId(우편 영수 키)가 떨어지지 않는다(#38804 eventId 사슬). */
-  | { kind: 'submit'; id: string; text: string; remaining: number; afterInterrupt: boolean; interruptReason?: NextTuiQueueInterruptReason; itemKind: NextTuiQueueItemKind; source?: NextTuiQueueNoticeSource; occurredAt?: number; msgId?: number };
-
-/**
- * ELN-QUEUE-ITEM-STATE (CONDUCTOR ELN-STEER-AND-TOOL-WATCHDOG §6 «입력 큐 항목»).
- * `steer` joins the running turn at its next tool-result boundary; `queue` waits for the idle boundary.
- */
-export type NextTuiQueueDelivery = 'steer' | 'queue';
-/** §6 transitions: `queued → delivered` (terminal), `queued → cancelled`, `queued → superseded`. */
-export type NextTuiQueueItemStatus = 'queued' | 'delivered' | 'cancelled' | 'superseded';
-export type NextTuiQueueBoundary = 'tool-result' | 'idle';
-/**
- * 대표 addendum C: a queue item is either something the person typed (`user`) or a completion notice
- * (`notice`: sidetab result · harness child finished · seat mail arrived). Producers of notices are
- * ELN-CHILD-NOTICE-INTO-QUEUE; this file only owns their place in the order.
- */
-export type NextTuiQueueItemKind = 'user' | 'notice';
-export type NextTuiQueueNoticeSource = 'sidetab' | 'harness-child' | 'seat-mail' | 'seat-mail-guide' | 'graph-node' | 'event-watch' | 'capsule-done' | 'ceo-ingress';
+import {
+  type NextTuiQueueInterruptReason,
+  type NextTuiQueueSettle,
+  type NextTuiSettledTurn,
+  type NextTuiQueueDequeue,
+  type NextTuiQueueDelivery,
+  type NextTuiQueueItemStatus,
+  type NextTuiQueueBoundary,
+  type NextTuiQueueItemKind,
+  type NextTuiQueueNoticeSource,
+  type NextTuiQueueMode,
+  nextTuiQueueMode,
+  type NextTuiQueueItem,
+  type NextTuiPassiveResultSnapshot,
+  type NextTuiQueueOp,
+  NextTuiQueueConflictError,
+  type NextTuiQueueLog,
+  type NextTuiQueueTransitionListener,
+  type NextTuiQueueDrain,
+  type NextTuiQueueNoticeDrain,
+} from './queue-contract.js';
+// Queue contract types live in queue-contract.ts (size-contract: 600-line module limit); importers keep this path.
+export * from './queue-contract.js';
 
 const passiveResultSource = (source?: NextTuiQueueNoticeSource): boolean =>
   source === 'capsule-done' || source === 'sidetab' || source === 'harness-child';
@@ -45,76 +34,8 @@ const passiveResultSource = (source?: NextTuiQueueNoticeSource): boolean =>
  * with no person must not hold them forever: once the oldest has waited this long they become actionable together,
  * and the idle door drains them all as one notice bundle (one turn). While a turn runs the idle door stays shut.
  */
-export const PASSIVE_RESULT_IDLE_WAKE_MS = 120_000;/** Input mode decides batching: a slash command or `!` shell line never travels with ordinary chat. */
-export type NextTuiQueueMode = 'chat' | 'command' | 'shell';
+export const PASSIVE_RESULT_IDLE_WAKE_MS = 120_000;
 
-export function nextTuiQueueMode(text: string): NextTuiQueueMode {
-  const trimmed = text.trimStart();
-  if (trimmed.startsWith('/')) return 'command';
-  if (trimmed.startsWith('!')) return 'shell';
-  return 'chat';
-}
-
-export interface NextTuiQueueItem {
-  readonly id: string;
-  /** Monotonic per queue (= per TUI session); never renumbered, not even when an item is superseded. */
-  readonly seq: number;
-  /** When this queue accepted the item, in epoch milliseconds. */
-  readonly enqueuedAt?: number;
-  readonly kind: NextTuiQueueItemKind;
-  readonly mode: NextTuiQueueMode;
-  readonly delivery: NextTuiQueueDelivery;
-  readonly status: NextTuiQueueItemStatus;
-  /** Original text — kept as typed even after cancel/supersede. */
-  readonly text: string;
-  /** Child-side steer handle while the item waits as «조향 대기» (A200). */
-  readonly steerId?: string;
-  readonly supersededBy?: string;
-  /** Set only for `kind: 'notice'`. */
-  readonly source?: NextTuiQueueNoticeSource;
-  /** SEAT-INBOX B1-C: the ledger message a `seat-mail` notice carries — the receipt key (never parsed from text). */
-  readonly msgId?: number;
-  /** Why a `cancelled` item was cancelled (the `cancel` reason) — a watcher tells «carried into the running turn» from a drop. */
-  readonly cancelReason?: string;
-  readonly urgent?: boolean;
-  /**
-   * When a notice existed, if the producer knows. Absent means unknown.
-   * The zero-miss receipt must not treat unknown as a zero wait.
-   */
-  readonly occurredAt?: number;
-  /** A coalesced capsule completion notice keeps one queue row for all pending results. */
-  readonly capsuleCount?: number;
-  readonly capsuleFailed?: number;
-  /**
-   * Hint only (§6 invariant 10): this item may replace `replacementCandidateFor`. It is context for the model
-   * and the person — status does not change until an explicit {@link supersede} call.
-   */
-  readonly replacementCandidateFor?: string;
-  /** The first item resubmitted after Esc carries the interrupted-on-purpose line. */
-  readonly afterInterrupt?: boolean;
-  readonly interruptReason?: NextTuiQueueInterruptReason;
-}
-
-/** Snapshot identity for result carry: a coalesced row may gain more completions before commit. */
-export type NextTuiPassiveResultSnapshot = NextTuiQueueItem & { readonly capsuleIds?: readonly string[] };
-
-export type NextTuiQueueOp = 'deliver' | 'cancel' | 'supersede';
-
-/** §6 invariant 2 (opencode LifecycleConflict): an op on an item that is no longer `queued` changes nothing. */
-export class NextTuiQueueConflictError extends Error {
-  readonly code = 'queue-lifecycle-conflict';
-  constructor(
-    readonly itemId: string,
-    readonly op: NextTuiQueueOp,
-    readonly status: NextTuiQueueItemStatus | 'unknown',
-  ) {
-    super(`queue item ${itemId} is ${status}; ${op} needs a queued item`);
-    this.name = 'NextTuiQueueConflictError';
-  }
-}
-
-/** Observation sink — category `queue` so `eln logs --category queue` shows the lifecycle. */
-export type NextTuiQueueLog = (event: string, data: Record<string, unknown>) => void;
 
 const defaultQueueLog: NextTuiQueueLog = (event, data) => debug.log('queue', event, data);
 
@@ -133,6 +54,8 @@ interface MutableItem {
   msgId?: number;
   cancelReason?: string;
   urgent?: boolean;
+  passive?: boolean;
+  digest?: string;
   occurredAt?: number;
   capsuleCount?: number;
   capsuleFailed?: number;
@@ -141,8 +64,6 @@ interface MutableItem {
   interruptReason?: NextTuiQueueInterruptReason;
 }
 
-/** SEAT-INBOX B1-C: told after an item leaves `queued` (delivered · cancelled · superseded). */
-export type NextTuiQueueTransitionListener = (item: NextTuiQueueItem) => void;
 
 function snapshot(item: MutableItem): NextTuiQueueItem {
   return { ...item };
@@ -162,39 +83,6 @@ function deliveryOrder(a: MutableItem, b: MutableItem): number {
   }
   if (a.delivery !== b.delivery) return a.delivery === 'steer' ? -1 : 1;
   return a.seq - b.seq;
-}
-
-export interface NextTuiQueueBatchItem {
-  readonly id: string;
-  readonly kind: NextTuiQueueItemKind;
-  readonly text: string;
-  readonly afterInterrupt: boolean;
-  readonly interruptReason?: NextTuiQueueInterruptReason;
-}
-
-/**
- * Several items taken at one idle boundary. Each entry is its own message — texts are never joined.
- * All entries share one kind and one mode; a command or shell line always travels alone.
- */
-export type NextTuiQueueDrain =
-  | { kind: 'none' }
-  | { kind: 'batch'; mode: NextTuiQueueMode; itemKind: NextTuiQueueItemKind; items: readonly NextTuiQueueBatchItem[]; remaining: number };
-
-/**
- * SEAT-NOTICE-BUNDLE-DRAIN (OP #128938) — the WHOLE waiting notice run taken at one idle boundary
- * as ONE bundle: every notice keeps its own id/source/msgId chain (#38804), order preserved.
- */
-export type NextTuiQueueNoticeDrain =
-  | { kind: 'none' }
-  | { kind: 'notices'; notices: readonly NextTuiQueueNoticeEntry[]; remaining: number };
-
-/** One bundled notice as it leaves the queue — the msgId chain survives (#38804). */
-export interface NextTuiQueueNoticeEntry {
-  readonly id: string;
-  readonly text: string;
-  readonly source?: NextTuiQueueNoticeSource;
-  readonly occurredAt?: number;
-  readonly msgId?: number;
 }
 
 /** Owns submissions made while a Next TUI turn is running. The input layer owns key interpretation. */
@@ -217,6 +105,13 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
   /** Waiting items in seq order (display / recall order); render reads `count` every frame, so it is kept, not scanned. */
   let waiting: MutableItem[] = [];
   let capsulePending: { item: MutableItem; completions: Map<string, { text: string; failed: boolean }> } | null = null;
+  /**
+   * ELN-CAPSULE-RESULT-NO-REPEAT-REPORT (OP 0.3.34 P1-4) — capsule results already absorbed into their original
+   * work item (mid-turn drain · carried-with-turn · delivered summary row). Closed cells never re-report: a replay
+   * of the same capsule-done (re-publish · reconnect) is a duplicate of the same event, not a new result.
+   * Kept per queue (= per TUI session); bounded by the session's own capsule count.
+   */
+  const consumedCapsuleIds = new Set<string>();
   const transitionListeners = new Set<NextTuiQueueTransitionListener>();
   /** #38510 r1 MF2: observers of the queued-count rising (the idle watchdog starts its clock at the real transition). */
   const enqueueListeners = new Set<() => void>();
@@ -231,11 +126,18 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
   const queued = (): MutableItem[] => waiting;
   const ordered = (): MutableItem[] => [...waiting].sort(deliveryOrder);
   /** Passive rows join the automatic door once the oldest one has waited {@link PASSIVE_RESULT_IDLE_WAKE_MS}. */
-  const passiveRipe = (): boolean => waiting.some((item) => passiveResultSource(item.source) && Date.now() - item.enqueuedAt >= PASSIVE_RESULT_IDLE_WAKE_MS);
-  const actionable = (): MutableItem[] => (passiveRipe() ? ordered() : ordered().filter((item) => !passiveResultSource(item.source)));
+  // SEAT-MAIL-COALESCE-NOTICE — an info seat mail (`passive`) waits like a passive result: no turn of its own.
+  const passiveItem = (item: MutableItem): boolean => passiveResultSource(item.source) || item.passive === true;
+  const passiveRipe = (): boolean => waiting.some((item) => passiveItem(item) && Date.now() - item.enqueuedAt >= PASSIVE_RESULT_IDLE_WAKE_MS);
+  const actionable = (): MutableItem[] => (passiveRipe() ? ordered() : ordered().filter((item) => !passiveItem(item)));
   const leave = (item: MutableItem): void => {
     waiting = waiting.filter((other) => other !== item);
-    if (capsulePending?.item === item) capsulePending = null;
+    if (capsulePending?.item === item) {
+      // ELN-CAPSULE-RESULT-NO-REPEAT-REPORT — the summary row left the queue (delivered or cancelled): every
+      // completion it carried has now been reported once, so those capsule ids close (a replay re-reports nothing).
+      for (const capsuleId of capsulePending.completions.keys()) consumedCapsuleIds.add(capsuleId);
+      capsulePending = null;
+    }
     if (waiting.length === 0) resumeReason = undefined;
   };
 
@@ -418,7 +320,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
      * A completion notice. It always waits behind user utterances and never steers the running turn:
      * seat mail that lands during a turn stays `queue` until the idle door opens the next turn.
      */
-    enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta: { msgId?: number; occurredAt?: number; urgent?: boolean } = {}): NextTuiQueueItem {
+    enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string } = {}): NextTuiQueueItem {
       return accept({
         kind: 'notice',
         mode: 'chat',
@@ -427,11 +329,15 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
         source,
         ...(meta.msgId === undefined ? {} : { msgId: meta.msgId }),
         ...(meta.urgent ? { urgent: true } : {}),
+        ...(meta.passive ? { passive: true } : {}), ...(meta.digest === undefined ? {} : { digest: meta.digest }),
         ...(meta.occurredAt === undefined ? {} : { occurredAt: meta.occurredAt }),
       });
     },
     /** Keep at most one queued capsule notice; the child notification drain owns the individual result bodies. */
     enqueueCapsuleDoneNotice(text: string, capsuleId: string, status: string, occurredAt?: number): NextTuiQueueItem | null {
+      // ELN-CAPSULE-RESULT-NO-REPEAT-REPORT — a capsule result already absorbed into its original work item is a
+      // closed cell: a replay (re-publish · reconnect) of the same capsule-done is not a new report.
+      if (consumedCapsuleIds.has(capsuleId)) return null;
       if (capsulePending?.completions.has(capsuleId)) return null;
       if (!capsulePending) {
         const accepted = this.enqueueNotice(text, 'capsule-done', occurredAt === undefined ? {} : { occurredAt });
@@ -447,6 +353,8 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
     removeCapsuleDoneNotice(capsuleId: string): boolean {
       const pending = capsulePending;
       if (!pending?.completions.delete(capsuleId)) return false;
+      // ELN-CAPSULE-RESULT-NO-REPEAT-REPORT — mid-turn drain carried this result into the busy turn: closed cell.
+      consumedCapsuleIds.add(capsuleId);
       if (pending.completions.size === 0) cancel(pending.item, 'mid-turn-carried');
       else refreshCapsuleSummary(pending);
       return true;
@@ -664,6 +572,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
           ...(item.source === undefined ? {} : { source: item.source }),
           ...(item.occurredAt === undefined ? {} : { occurredAt: item.occurredAt }),
           ...(item.msgId === undefined ? {} : { msgId: item.msgId }),
+          ...(item.passive ? { passive: true } : {}), ...(item.digest === undefined ? {} : { digest: item.digest }),
         })),
         remaining: queued().length,
       };

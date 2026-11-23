@@ -14,11 +14,36 @@ export const ENV_EVENT_WS = 'ELANOUS_EVENT_WS';
 
 export type AgentState = 'working' | 'idle' | 'blocked' | 'waiting-input' | 'done' | 'exited';
 export const AGENT_STATES: readonly AgentState[] = ['working', 'idle', 'blocked', 'waiting-input', 'done', 'exited'];
+// SEAT-STATE-ENUM — what a seat is doing, as a code (never a screen sentence). One value per pane; BLOCKED and WAITING_*
+// carry exactly one BlockReason. Coordinators, sweeps and the agents column read these codes, so the human-visible wording
+// of a notice can change without changing any verdict. 출처: seat-state/OP/orders/SEAT-STATE-ENUM-1123.md 표.
+export const SEAT_STATES = ['WORKING', 'IDLE', 'WAITING_REPLY', 'WAITING_APPROVAL', 'BLOCKED', 'STALLED', 'EXITED'] as const;
+export type SeatState = typeof SEAT_STATES[number];
+export const BLOCK_REASONS = ['OWNER_UNKNOWN', 'APPROVAL_PENDING', 'TOOL_DENIED', 'PROVIDER_ERROR', 'NO_WORK', 'DEPENDENCY_WAIT', 'HUMAN_DECISION'] as const;
+export type BlockReason = typeof BLOCK_REASONS[number];
+/** The states that must name one reason. */
+export const SEAT_STATES_WITH_REASON: readonly SeatState[] = ['BLOCKED', 'WAITING_APPROVAL', 'WAITING_REPLY'];
+export const isSeatState = (value: unknown): value is SeatState => SEAT_STATES.some((state) => state === value);
+export const isBlockReason = (value: unknown): value is BlockReason => BLOCK_REASONS.some((reason) => reason === value);
+export const seatStateNeedsReason = (state: SeatState): boolean => SEAT_STATES_WITH_REASON.includes(state);
+/** The v1 `state` word an older frame reader understands for a seat state (sent alongside the code). */
+export function legacyAgentState(state: SeatState): AgentState {
+  switch (state) {
+    case 'WORKING': case 'STALLED': return 'working';
+    case 'IDLE': case 'WAITING_REPLY': return 'idle';
+    case 'WAITING_APPROVAL': return 'waiting-input';
+    case 'BLOCKED': return 'blocked';
+    case 'EXITED': return 'exited';
+  }
+}
+
 export type ChildSourceName = 'subagent' | 'harness' | 'graph' | 'mission' | 'shell' | 'graph-node';
 export const CHILD_SOURCES: readonly ChildSourceName[] = ['subagent', 'harness', 'graph', 'mission', 'shell', 'graph-node'];
 
 export type AgentEvent =
-  | { readonly kind: 'state'; readonly state: AgentState; readonly message?: string }
+  | { readonly kind: 'state'; readonly state: AgentState; readonly message?: string;
+      /** SEAT-STATE-ENUM: the seat state code; `reason` is present exactly when the code needs one. */
+      readonly code?: SeatState; readonly reason?: BlockReason; readonly detail?: string }
   | { readonly kind: 'turn'; readonly phase: 'start' | 'end'; readonly id: string }
   | { readonly kind: 'meta'; readonly model?: string; readonly queue?: number; readonly plan?: string; readonly elapsed?: string; readonly title?: string }
   | { readonly kind: 'notice'; readonly level: 'info' | 'warn' | 'alert'; readonly text: string }
@@ -80,7 +105,13 @@ function readFrame(raw: unknown): ParsedFrame {
     case 'state': {
       const state = AGENT_STATES.find((candidate) => candidate === e.state);
       if (!state) return { ok: false, ignore: false, reason: 'state: unknown state' };
-      return { ok: true, frame: { ...base, event: { kind: 'state', state, ...optional('message', text(e.message, 200)) } } };
+      if (e.code === undefined) return { ok: true, frame: { ...base, event: { kind: 'state', state, ...optional('message', text(e.message, 200)) } } };
+      if (!isSeatState(e.code)) return { ok: false, ignore: false, reason: 'state: unknown code' };
+      const code = e.code;
+      const needs = seatStateNeedsReason(code);
+      if (needs && !isBlockReason(e.reason)) return { ok: false, ignore: false, reason: `state: ${code} needs one reason` };
+      return { ok: true, frame: { ...base, event: { kind: 'state', state, ...optional('message', text(e.message, 200)), code,
+        ...(needs && isBlockReason(e.reason) ? { reason: e.reason } : {}), ...optional('detail', text(e.detail, 200)) } } };
     }
     case 'turn': {
       if (e.phase !== 'start' && e.phase !== 'end') return { ok: false, ignore: false, reason: 'turn: phase must be start|end' };

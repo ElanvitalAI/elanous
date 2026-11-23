@@ -30,3 +30,10 @@ export function readNextTuiStatusModel(
   const { provider, model } = resolveNextTuiSelection(sessionId, session);
   return `${provider}/${model}`;
 }
+
+/** ELS-SEAT-MODEL-DECLARE: the footer model. A session-scoped choice (`/provider` or launch `--provider`) is what the
+ *  next request uses, so it wins over the last route badge — that badge still names the model before the switch. */
+export function nextTuiFooterModel(sessionId: string | undefined, statusModel: string, routeBadge: string | undefined): string {
+  if (sessionId && getSessionProvider(sessionId)) return statusModel;
+  return routeBadge || statusModel;
+}

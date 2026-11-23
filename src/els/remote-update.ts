@@ -2,6 +2,7 @@
 import { spawn } from 'node:child_process';
 import { lstatSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import type { FederatedHost } from './hosts.js';
 import type { UpdatePane, UpdateResultRow } from './update-all.js';
 
@@ -39,10 +40,32 @@ export function remoteUpdateCommand(host: FederatedHost, desired: string): { arg
     '-o', 'GlobalKnownHostsFile=/dev/null', '-o', `HostName=${targetHost}`, '-o', 'ConnectTimeout=10', update.sshTarget, 'sh', '-s'], script };
 }
 
-export async function runRemoteUpdate(host: FederatedHost, panes: readonly UpdatePane[], desired: string): Promise<{
-  result: UpdateResultRow['result']; detail: string; panes: UpdateResultRow[];
+export function remoteProgressLines(host: string, emit: (message: string) => void) {
+  const decoder = new StringDecoder('utf8');
+  let pending = ''; let discarding = false;
+  const flush = (text: string) => {
+    for (const char of text) {
+      if (char === '\n') {
+        if (!discarding) {
+          const match = /^ELS_UPDATE_PROGRESS remaining=([0-9]{1,6}) eta=([0-9]{1,6})$/.exec(pending);
+          if (match) emit(`[${host}] Remaining seats: ${Number(match[1])} · ${Number(match[2])}s remaining`);
+        }
+        pending = ''; discarding = false;
+      } else if (!discarding) {
+        pending += char;
+        if (pending.length > 128) { pending = ''; discarding = true; }
+      }
+    }
+  };
+  return { write: (chunk: Buffer) => flush(decoder.write(chunk)), end: () => { flush(decoder.end()); } };
+}
+
+export async function runRemoteUpdate(host: FederatedHost, panes: readonly UpdatePane[], desired: string, progress?: (message: string) => void): Promise<{
+  result: UpdateResultRow['result']; detail: string; panes: UpdateResultRow[]; requested?: number;
 }> {
   if (!SHA.test(desired)) throw new Error('invalid desired sha');
+  // Older or malformed federation responses cannot prove that an OP pane is absent.
+  if (panes.some(pane => pane.seat === undefined)) throw new Error(`${host.name}: remote seat identity unavailable`);
   if (host.update?.catchUpSeat === 'OP' || panes.some(pane => pane.seat === 'OP'))
     throw new Error(`${host.name}: remote OP seat requires its own approved HITL path`);
   const { argv, script } = remoteUpdateCommand(host, desired);
@@ -51,6 +74,7 @@ export async function runRemoteUpdate(host: FederatedHost, panes: readonly Updat
     child.stdin.on('error', reject);
     child.stdin.end(script);
     let stdout = ''; let stderr = ''; let bytes = 0;
+    const lines = progress ? remoteProgressLines(host.name, progress) : undefined;
     const timer = setTimeout(() => child.kill('SIGKILL'), REMOTE_TIMEOUT_MS);
     const append = (chunk: Buffer, channel: 'stdout' | 'stderr') => {
       bytes += chunk.length;
@@ -58,32 +82,39 @@ export async function runRemoteUpdate(host: FederatedHost, panes: readonly Updat
       if (channel === 'stdout') stdout += chunk.toString(); else stderr += chunk.toString();
     };
     child.stdout.on('data', (chunk: Buffer) => append(chunk, 'stdout'));
-    child.stderr.on('data', (chunk: Buffer) => append(chunk, 'stderr'));
+    child.stderr.on('data', (chunk: Buffer) => { append(chunk, 'stderr'); lines?.write(chunk); });
     child.on('error', reject);
-    child.on('close', code => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
+    child.on('close', code => { clearTimeout(timer); lines?.end(); resolve({ code, stdout, stderr }); });
   });
-  if (output.code !== 0) throw new Error(`${host.name}: SSH/local catch-up failed (${output.code}): ${output.stderr.slice(-240)} ${output.stdout.slice(-240)}`);
+  if (output.code !== 0 && output.code !== 1) throw new Error(`${host.name}: SSH/local catch-up failed (${output.code}); remote output omitted`);
   const oldLine = output.stdout.split(/\r?\n/).find(row => row.startsWith(beforeMarker));
   if (!oldLine) throw new Error(`${host.name}: remote installed-build before receipt absent`);
   const old = JSON.parse(oldLine.slice(beforeMarker.length)) as { commit?: unknown };
   if (typeof old.commit !== 'string' || !SHA.test(old.commit)) throw new Error(`${host.name}: invalid remote installed-build before receipt`);
   const line = output.stdout.split(/\r?\n/).find(row => row.startsWith(marker));
   if (!line) throw new Error(`${host.name}: remote update receipt absent`);
-  const receipt = JSON.parse(line.slice(marker.length)) as { ok?: unknown; desired?: unknown; installed?: unknown; rows?: unknown };
-  if (receipt.desired !== desired || receipt.installed !== desired || receipt.ok !== true || !Array.isArray(receipt.rows))
+  const receipt = JSON.parse(line.slice(marker.length)) as { ok?: unknown; desired?: unknown; installed?: unknown; rows?: unknown; requested?: unknown };
+  if (receipt.desired !== desired || receipt.installed !== desired || typeof receipt.ok !== 'boolean' || receipt.ok !== (output.code === 0) || !Array.isArray(receipt.rows))
     throw new Error(`${host.name}: remote desired/install/result mismatch`);
-  const localRows = receipt.rows as UpdateResultRow[];
+  const translated = translateRemoteRows(host.name, panes, receipt.rows as UpdateResultRow[]);
+  const result = translated.some(row => row.result === 'failed') ? 'failed' : translated.some(row => row.result === 'waiting') ? 'waiting' : receipt.ok ? 'updated' : 'failed';
+  const requested = typeof receipt.requested === 'number' && Number.isSafeInteger(receipt.requested) && receipt.requested >= 0 && receipt.requested <= translated.length ? receipt.requested : undefined;
+  return { result, detail: `${old.commit.slice(0, 12)}→${desired.slice(0, 12)}; SSH pinned`, panes: translated, ...(requested === undefined ? {} : { requested }) };
+}
+
+export function translateRemoteRows(host: string, panes: readonly UpdatePane[], localRows: readonly UpdateResultRow[]): UpdateResultRow[] {
   const wanted = new Map(panes.map(pane => [pane.address.slice(pane.address.indexOf(':') + 1), pane]));
   const translated: UpdateResultRow[] = [];
   for (const row of localRows) {
-    if (!row || typeof row.tab !== 'string' || !['updated', 'skipped'].includes(row.result) || typeof row.detail !== 'string')
-      throw new Error(`${host.name}: invalid remote pane receipt`);
+    if (!row || typeof row.tab !== 'string' || !['updated', 'skipped', 'waiting', 'failed'].includes(row.result) || typeof row.detail !== 'string'
+      || (row.runtime !== undefined && typeof row.runtime !== 'string'))
+      throw new Error(`${host}: invalid remote pane receipt`);
     const suffix = row.tab.slice(row.tab.indexOf(':') + 1);
     const pane = wanted.get(suffix);
-    if (!pane) throw new Error(`${host.name}: unexpected remote pane ${row.tab}`);
+    if (!pane || row.seat !== (pane.seat ?? '')) throw new Error(`${host}: unexpected remote pane or seat ${row.tab}`);
     wanted.delete(suffix);
-    translated.push({ tab: pane.address, seat: pane.seat ?? '', result: row.result, detail: row.detail });
+    translated.push({ tab: pane.address, seat: pane.seat ?? '', result: row.result, detail: row.detail, ...(row.runtime === undefined ? {} : { runtime: row.runtime }) });
   }
-  if (wanted.size) throw new Error(`${host.name}: remote pane receipt incomplete`);
-  return { result: 'updated', detail: `${old.commit.slice(0, 12)}→${desired.slice(0, 12)}; SSH pinned`, panes: translated };
+  if (wanted.size) throw new Error(`${host}: remote pane receipt incomplete`);
+  return translated;
 }

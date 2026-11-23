@@ -11,7 +11,7 @@ import { runDirectiveAudit, type DirectiveAuditDeps } from '../../steward/direct
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { getUserConfig, ORCHESTRATOR_DEFAULTS, resolveConfiguredAgentRoleLlm, type OrchestratorLoopConfig } from '../../user-config.js';
 import { rubricPriority } from '../../release-loop/rubric.js';
-import { debug } from '../../debug/log.js';
+import { debug, debugLogDir } from '../../debug/log.js';
 import { emitLoopHeartbeat } from '../neighbor-runtime.js';
 import { ConsensusEngine } from '../consensus.js';
 import { listSelfDevRuns, runSummaryLine, selfDevRunsDir } from '../../self-dev/run-store.js';
@@ -33,6 +33,7 @@ import type { KnowhowOptions } from './knowhow-pack.js';
 import { loadAgentRolePack, type AgentReplyInput } from '../agent-reply.js';
 import type { LLMProvider } from '../../llm.js';
 import { runSimImpactAudit, type SimImpactGap } from './sim-impact-audit.js';
+import { selfHealAfterChildExit } from '../../cli/ta-oom-self-heal.js';
 
 export type Window = '08' | '12' | '18';
 export type Node = 'intake' | 'split' | 'place' | 'delegate' | 'launch' | 'reconcile' | 'report';
@@ -1188,6 +1189,8 @@ function scheduleSimImpactAuditInBackground(window: Window, root: string, runId:
     try { appendFileSync(logPath, `${JSON.stringify(result)}\n`); } catch { /* child worker records its own result too */ }
     try { debug.log('loop.orchestrator', 'sim-impact-audit-child-exit', { ...result, logPath }, { level: code === 0 ? 'info' : 'error' }); }
     catch { /* the detached worker writes its own final debug event */ }
+    // r3(OP #134414) 배선 1곳: 실제 생산자(child-exit 기록) 뒤 자가 치유 — 원인 분류 → 한 단계 재배치 → 배치 요청 파일 기록.
+    void selfHealAfterChildExit(root, debugLogDir()); // fire-and-forget — self-heal 실패는 종료 처리를 막지 않는다
   });
   child.unref();
   return { scheduled: true, ...(child.pid ? { pid: child.pid } : {}), logPath };

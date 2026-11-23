@@ -66,6 +66,7 @@ test('classic dashboard has one named root launcher seam and no other production
   // CLASSIC-TUI-RETIRE-SWEEP ② — next-mail-wake 의 seat-boot seam 을 정본 src/seat/seat-boot-preamble 으로 전환해 목록에서 제거.
   // #39242 ELN-SEAT-AUTOWAKE-BUDGET — next-mail-wake 의 budget seam 등록 누락 보충: fbd9c03ade 착지가 이 목록을 갱신하지 않아 main known-fail.
   // CLASSIC-TUI-RETIRE-SWEEP ① 2단계 — goal-continue 의 turn-outcome-shadow seam 을 정본 src/commitment/turn-outcome-shadow 로 전환해 목록에서 제거.
+  // TEST-FAILURE-CLEARING(11-23) — next TUI 의 seat-local-instructions · seat-task-decompose seam 을 정본 src/seat/ 로 전환해 목록에서 제거.
   expect(edges.sort()).toEqual([
     'src/graph-runner/graph-cli-owner.ts dynamic ../dashboard/plugin-route-adapter.js',
     'src/index.ts dynamic ./dashboard/index.js',
@@ -74,8 +75,6 @@ test('classic dashboard has one named root launcher seam and no other production
     'src/repl/index.ts dynamic ../dashboard/plugin-route-adapter.js',
     'src/repl/index.ts dynamic ../dashboard/plugin-route-adapter.js',
     'src/tui-client/next-mail-wake.ts static ../dashboard/input/seat-autowake-budget.js',
-    'src/tui/entry.ts dynamic ../dashboard/seat-local-instructions.js',
-    'src/tui/seat-mail-boot.ts static ../dashboard/input/seat-task-decompose.js',
   ]);
 }, 60_000); // 출처: #38824 — 스캔 6.8s > bun 기본 5s(부하 호스트 실측) · 저장소 관례 숫자 인자
 

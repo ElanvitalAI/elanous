@@ -11,7 +11,7 @@ test('suggestions come only from active next routes and rank classic-style', () 
   expect(candidates('/mo').map((candidate) => candidate.text)).toEqual(['/model', '/memory', '/status']);
   // Aliases fold into their route's row: /sidetab under /side, /sessions under /session;
   // /app matches its English summary word «simulation».
-  expect(candidates('/si').map((candidate) => candidate.text)).toEqual(['/side', '/signals', '/mission', '/session', '/app']);
+  expect(candidates('/si').map((candidate) => candidate.text)).toEqual(['/side', '/signals', '/session', '/app']);
   expect(candidates('/').some((candidate) => candidate.text === '/run-skill')).toBe(false);
   expect(candidates('/help ').length).toBe(0);
   expect(candidates('please /help').length).toBe(0);

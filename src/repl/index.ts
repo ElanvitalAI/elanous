@@ -69,6 +69,7 @@ import type { PendingTaskNotification } from '../agent/task-notification.js';
 import { dispatchReplMessageTool, isReplMessageTool } from './ops-msg-bridge.js';
 import { buildSeatBootSystemMessages, buildSeatMemoryIndexSystemMessages, detectSeatTui, resolveSeatMemoryContext, type SeatBootDeps } from '../seat/seat-boot-preamble.js';
 import { seatRole, type SeatRole } from '../seat/seat-role.js';
+import { coordinatorReasoningConfig } from '../seat/coordinator-reasoning.js';
 import { lookupSeatOwners, type SeatOwnerReaders } from '../core-turn/seat-owner-lookup.js';
 import type { WorkReference } from '../core-turn/seat-owner-check.js';
 import { listChecklist } from '../release-loop/checklist.js';
@@ -226,13 +227,15 @@ type CapsuleRegistry = Pick<import('../agent/registry.js').AgentRegistry, 'onTas
 
 /** CAPSULE-B1 — one `capsule-done` frame per background root task of this session (start: one progress line).
  *  `background` is flipped back to foreground on completion (task-notification), so membership is also read from
- *  `knownBackground` (filled by the status bridge and the Agent tool result). Supplements never reopen a turn. */
+ *  `knownBackground` (filled by the status bridge and the Agent tool result). Supplements get a frame too (a notice, never a turn). */
 export function watchCapsuleDone(
   sessionId: string, registry: CapsuleRegistry, knownBackground: ReadonlySet<string>,
   write: (line: string) => void = (line) => { process.stderr.write(line); },
 ): { dispose(): void } {
   const emitted = new Set<string>();
-  const ours = (task: AgentTask): boolean => !task.parentTaskId && task.completionDelivery !== 'supplement'
+  // ELN-CAPSULE-COMPLETION-SCOPED ②: supplements also leave a capsule-done frame — the TUI turns it into a queued
+  // notice (capsule-done-knock never opens a turn), so an idle seat sees the result instead of nothing.
+  const ours = (task: AgentTask): boolean => !task.parentTaskId
     && (task.parentSessionId === undefined || task.parentSessionId === sessionId)
     && (task.background === true || knownBackground.has(task.id));
   const started = registry.onTaskStart((task) => {
@@ -393,9 +396,35 @@ export async function resolveSeatMemoryAudience(
   }
 }
 
+// OP's coding tools remain searchable; only their full schemas leave the session prefix.
+const COORDINATOR_DEFERRED_TOOLS = new Set(['Edit', 'Write', 'Grep', 'Glob', 'ListDir', 'AgentList', 'AgentOutput', 'AgentStop', 'memory_delete', 'memory_search', 'update_plan']);
+const COORDINATOR_MAIL_PAGE_SIZE = 10;
+const COORDINATOR_PANE_LINES = 20;
+
+export function coordinatorMsgListArgs(args: Record<string, unknown>): Record<string, unknown> {
+  if (args.limit === undefined || args.limit === null || args.limit === 0) return { ...args, limit: COORDINATOR_MAIL_PAGE_SIZE };
+  if (typeof args.limit !== 'number' || !Number.isInteger(args.limit) || args.limit < 1 || args.limit > 1000) return args;
+  return { ...args, limit: Math.min(args.limit, COORDINATOR_MAIL_PAGE_SIZE) };
+}
+
+export function coordinatorElsReadResult(args: Record<string, unknown>, result: string): string {
+  if (args.action !== 'read') return result;
+  try {
+    const parsed = JSON.parse(result) as { ok?: boolean; message?: unknown };
+    if (!parsed.ok || typeof parsed.message !== 'string') return result;
+    const lines = parsed.message.split('\n');
+    if (lines.at(-1) === '') lines.pop();
+    if (lines.length <= COORDINATOR_PANE_LINES) return result;
+    parsed.message = `[showing last ${COORDINATOR_PANE_LINES} lines]\n${lines.slice(-COORDINATOR_PANE_LINES).join('\n')}`;
+    return JSON.stringify(parsed);
+  } catch { return result; }
+}
+
 export function buildReplTools(options: {
   /** Only the structured Next TUI child can advertise the els tool. */
   readonly nextTui?: boolean;
+  /** Explicit role for isolated profile tests; production resolves the registered seat. */
+  readonly seatRole?: SeatRole;
   readonly onGraphProgress?: (event: GraphProgressObservation) => void;
   readonly sessionId?: string;
   /** One trusted user request/turn, distinct from the lifetime of the sticky REPL session. */
@@ -426,6 +455,7 @@ export function buildReplTools(options: {
       runner.setShellRunnerDeps({ registry: getShellRegistry() });
     }
   }
+  const coordinator = options.nextTui === true && (options.seatRole ?? replSeatRole(getSessionCwd(), undefined)) === 'coordinator';
   const specs: LLMToolSpec[] = [];
   /** Either signal aborts; undefined when neither exists (callers keep their «no signal» path). */
   const combineSignals = (a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined =>
@@ -436,7 +466,10 @@ export function buildReplTools(options: {
     if (els.elsControlSocketPath()) {
       const spec = els.buildElsControlTool();
       specs.push(spec);
-      dispatchByName.set(spec.name, args => els.dispatchElsControl(args));
+      dispatchByName.set(spec.name, async args => {
+        const result = await els.dispatchElsControl(args);
+        return coordinator ? coordinatorElsReadResult(args, result) : result;
+      });
     }
   }
   const packQuery = buildInstalledPackQueryTool();
@@ -666,6 +699,11 @@ export function buildReplTools(options: {
     dispatchByName.set(wakeup.spec.name, wakeup.dispatch);
   }
   (require('../tui/sidetab/nl-tool.js') as typeof import('../tui/sidetab/nl-tool.js')).registerNextSidetabReplTool(specs, dispatchByName, process as unknown as import('../tui/sidetab/nl-tool.js').NextSidetabIpcProcess);
+  if (coordinator) {
+    for (let i = 0; i < specs.length; i++) {
+      if (COORDINATOR_DEFERRED_TOOLS.has(specs[i]!.name)) specs[i] = { ...specs[i]!, coordinatorDefer: true };
+    }
+  }
   const planner = sr.createSearchPlannerState({ maxAutoNarrowCandidates: 2 });
   // APP-BUILD-DECLINE-NO-BYPASS-DEPLOY: after a declined app_build, shell deploy/host exposure in the same request is refused.
   const declineGuard = (require('../plugins/core/app-build-decline-guard.js') as typeof import('../plugins/core/app-build-decline-guard.js'))
@@ -678,8 +716,10 @@ export function buildReplTools(options: {
       if (isToolSearchCall(name)) return routeToolSearch(args, specs, { surface: 'tui-next', requireQueryCoverage: name === CAPABILITY_SEARCH_NAME });
       const direct = dispatchByName.get(name);
       if (direct) return await direct(args, dctx?.signal);
-      if (isReplMessageTool(name)) return await dispatchReplMessageTool(name, args);
+      if (isReplMessageTool(name)) return await dispatchReplMessageTool(name, coordinator && name === 'MsgList' ? coordinatorMsgListArgs(args) : args);
       return await sr.dispatchSessionRuntimeTool(name, args, {
+        // ELN-CAPSULE-COMPLETION-SCOPED ①: background Agent receipts carry this session (was unscoped → any session drained them).
+        ...(options.sessionId ? { sessionId: options.sessionId } : {}),
         // ELN-SEAT-TURN-HARD-CAP ④: Agent and the other session tools stop on the cap or Esc (was undefined).
         signal: callSignal,
         userText: '',
@@ -691,9 +731,22 @@ export function buildReplTools(options: {
         // catalog and dispatcher so children can actually use inherited tools.
         agentHostTools: specs,
         agentDispatchTool: dispatch,
+        // ELN-SUBAGENT-INHERIT-SEAT-TOOLS: a seat's general-purpose child gets the seat's catalog, not the 5-tool CLI
+        // allowlist. CLI specs (cwd-bound to the child) win on a name clash; seat-only tools (Msg*, RunShell, ElsControl, …)
+        // route back through this parent dispatch, so mail is sent by the parent seat and RunShell keeps its capsule hold.
+        inheritGeneralPurposeToolCatalog: true,
         buildChildToolCatalog: (childCwd: string) => {
           const cli = require('../cli/agent-cli.js') as typeof import('../cli/agent-cli.js');
-          return cli.buildCliAgentTools(undefined, undefined, childCwd, {});
+          const child = cli.buildCliAgentTools(undefined, undefined, childCwd, {});
+          const childNames = new Set(child.specs.map(spec => spec.name));
+          const seatOnly = specs.filter(spec => !childNames.has(spec.name));
+          const seatOnlyNames = new Set(seatOnly.map(spec => spec.name));
+          return {
+            ...child,
+            specs: [...child.specs, ...seatOnly],
+            dispatch: (toolName: string, toolArgs: Record<string, unknown>) => seatOnlyNames.has(toolName)
+              ? dispatch(toolName, toolArgs) : child.dispatch(toolName, toolArgs),
+          };
         },
         getToolRuntime: () => undefined,
         dispatchToolRuntime: async (n) => ({ error: `runtime unavailable in REPL: ${n}` }),
@@ -754,6 +807,8 @@ function buildAgentSystemPrompt(
       ...(modelFamily !== undefined ? { modelFamily } : {}),
       enabledTools: [...enabledToolNames],
       ...(role !== undefined ? { seatRole: role } : {}),
+      // ELN-PROMPT-CACHE-PIN — built once per session; the els block travels in the turn's volatile context.
+      sessionPinned: true,
     });
     const joined = universal
       .map(m => (typeof m.content === 'string' ? m.content : ''))
@@ -776,7 +831,13 @@ function buildAgentSystemPrompt(
  * 자리 판정이 서면 카드 한 장(대화마다 한 번 만든 같은 문면) · 자리가 아니면 빈 배열이라 주입 0건이다.
  * 도구 표면이 꺼져 있으면(`enabledToolNames === undefined`) 종전처럼 범용 preamble 은 빠지고 카드만 남는다.
  */
-export function buildReplSystemPrompt(ctx: {
+export function buildReplSystemPrompt(ctx: ReplSystemPromptContext): string | undefined {
+  const parts = buildReplSystemPromptParts(ctx);
+  const joined = [parts.stable ?? '', ...parts.volatile].filter(part => part.length > 0);
+  return joined.length > 0 ? joined.join('\n\n') : undefined;
+}
+
+export interface ReplSystemPromptContext {
   cfg: UserConfig;
   /** 도구 표면이 꺼져 있으면 undefined — 그때도 자리 부트 카드는 실린다. */
   enabledToolNames: readonly string[] | undefined;
@@ -789,7 +850,17 @@ export function buildReplSystemPrompt(ctx: {
   skillCatalogContextWindow?: number | null | undefined;
   workReferences?: unknown;
   ownerReaders?: SeatOwnerReaders;
-}): string | undefined {
+}
+
+/** ELN-PROMPT-CACHE-PIN — the repl system prompt split by lifetime.
+ *  `stable` = the cached prefix (skill catalog · universal preamble · app hint · seat boot card · seat memory index):
+ *  the same bytes for the whole session. `volatile` = per-turn blocks («my els location» · owner check of this
+ *  turn's work references) that go AFTER the history as the turn's volatile context, never into the instructions. */
+export function buildReplSystemPromptParts(ctx: ReplSystemPromptContext): { stable: string | undefined; volatile: string[] } {
+  return { stable: buildReplStableSystemPrompt(ctx), volatile: buildReplVolatileContext(ctx) };
+}
+
+function buildReplStableSystemPrompt(ctx: ReplSystemPromptContext): string | undefined {
   // SEAT-COORDINATOR-PROMPT-PROFILE — 자리 성격은 부트 카드와 같은 자리 판정(detectSeatTui) ⊕ 자리 원장 role 로 정한다.
   //   조율 자리(OP)면 코딩 lifecycle·트리·GPT-6 persist·앱 빌더 힌트 대신 조율자 프로필. 손 자리·비자리는 종전 그대로.
   const role = replSeatRole(ctx.cwd, ctx.seatBootDeps);
@@ -799,7 +870,7 @@ export function buildReplSystemPrompt(ctx: {
   const skillToolsEnabled = ctx.enabledToolNames?.includes('skill_exec') === true
     && ctx.enabledToolNames.includes('elanous_skills_list');
   let skillCatalogText = '';
-  if (skillToolsEnabled) {
+  if (skillToolsEnabled && role !== 'coordinator') {
     try {
       const catalog = ctx.skillCatalog ?? (() => {
         const skills = require('../skills/index.js') as typeof import('../skills/index.js');
@@ -828,23 +899,73 @@ export function buildReplSystemPrompt(ctx: {
     ).map((message) => (typeof message.content === 'string' ? message.content : '')).join('\n\n');
   } catch { /* 색인만 빠진다 */ }
   const appCapabilityHint = ctx.enabledToolNames === undefined || role === 'coordinator' ? '' : '사용자가 시스템 설계·만들기·배포를 요청하면 엘라누스의 등록 도구로 요구사항, 아키텍처 문서·구성도·설계 PDF/도식, 프론트엔드·백엔드 API·DB 스키마/시드 코드와 로컬 실행·시험을 진행하라. 실제 배포는 제공된 app.publish@1/app-publish.action@1 capability와 소유자 검증·게시 승인을 사용하라. 회원 연결이 없거나 app.publish를 쓸 수 없으면 생성 서버를 127.0.0.1의 빈 31500~31599 포트에서 백그라운드 실행하고 tailscale serve status --json으로 해당 포트의 기존 매핑이 없는지 확인한 뒤 tailscale serve --bg --tls-terminated-tcp <선택포트> tcp://127.0.0.1:<선택포트>로 그 포트만 tailnet에 공유하라(443의 루트 경로와 기존 Serve 설정 변경 금지, 공개 인터넷 노출 금지). 실제 URL의 HTTP 200과 앱 화면을 확인한 뒤 URL·프로세스·serve 설정과 되돌리기 명령을 보고하고, 제공되지 않은 실행 기능은 가정하지 마라. 단계별 실제 파일·시험 결과·영수증과 반환된 tailnet URL을 보여 주고, URL의 실제 동작 확인 전 배포 완료를 주장하지 말라. app.publish 되돌리기는 해당 배포 ID·영수증 범위로, 로컬 운영자 배포 되돌리기는 tailscale serve --tls-terminated-tcp <선택포트> off와 보고한 프로세스 종료만 수행하라(serve reset 금지). app_build 실행 확인을 사용자가 거절했거나 응답이 없으면(APP_BUILD_DECLINED) 그 턴에서는 Bash 빌드·tailscale serve/funnel·공개 리스너·배포 CLI 등 다른 경로로 빌드·배포하지 말고 사용자에게 다음 행동을 물어라.';
+  const parts = [skillCatalogText, base ?? '', appCapabilityHint, card, seatMemoryIndex].filter(part => part.length > 0);
+  return parts.length > 0 ? parts.join('\n\n') : undefined;
+}
+
+function buildReplVolatileContext(ctx: ReplSystemPromptContext): string[] {
+  const out: string[] = [];
+  // ELN-ELS-SELF-CONTEXT — «my els location» changes while the session runs; every turn carries the current block.
+  try {
+    const els = (require('../els/els-self-context.js') as typeof import('../els/els-self-context.js')).elsSelfContextVolatileText(ctx.cwd);
+    if (els) out.push(els);
+  } catch { /* the els block only drops out */ }
   // Every ordinary seat turn receives this reminder, not just the initial boot turn.
   // No work reference or owner is inferred from the user's prose or the seat name.
   let ownerCheck = '';
   try {
     const seatContext = resolveSeatMemoryContext(ctx.cwd, ctx.seatBootDeps ?? {});
     if (seatContext) {
-      ownerCheck = '## 조사 전 주인 확인\n일반 조사·구현을 시작하기 전에 현재 일의 구조화된 칸·PR·우편 참조와 최신 주인 정본을 확인하라. 참조가 없거나 주인 조회가 실패·불완전·상충하면 추측하지 말고 unknown이라고 알리고 참조 또는 주인 확인을 요청하라. 다른 자리의 일이면 주인에게 조율하고 중복 조사를 시작하지 마라. 이 지침은 인가 판정이 아니다.';
+      // SEAT-OWNER-CHECK-NO-BLOCK — a missing/unknown reference is not a reason to stop for a person.
+      // The seat finds its own work; only a confirmed foreign owner leads to a handoff.
+      const seat = seatContext.seat;
+      ownerCheck = '## 조사 전 주인 확인\n일반 조사·구현을 시작하기 전에 현재 일의 구조화된 칸·PR·우편 참조와 최신 주인 정본을 확인하라. '
+        + `참조가 없거나 주인 조회가 unknown이면 멈추거나 사람을 부르지 말고 내 일을 직접 찾는다: \`eln release checklist status --version <현재 판> --owner ${seat} --json\` 의 내 노랑 칸과 \`eln msg list --to ${seat}\` 의 미읽음 우편을 읽고 맨 위 일로 바로 진행하라. `
+        + '내 칸·우편이 모두 0건이면 «일감 0»이라고 한 줄로 알리고 기다린다(막힘 아님). 다른 자리가 주인으로 확인된 일이면 주인에게 조율하고 중복 조사를 시작하지 마라. 이 지침은 인가 판정이 아니다.';
       ownerCheck += '\n' + buildTurnOwnerResult(seatContext.seat, ctx.workReferences, ctx.ownerReaders);
     }
   } catch { /* seat detection unavailable: do not invent an identity */ }
-  const parts = [skillCatalogText, base ?? '', appCapabilityHint, card, seatMemoryIndex, ownerCheck].filter(part => part.length > 0);
-  return parts.length > 0 ? parts.join('\n\n') : undefined;
+  if (ownerCheck) out.push(ownerCheck);
+  return out;
+}
+
+/** ELN-PROMPT-CACHE-PIN — one session's pinned system prompt. The stable part is built on the first turn of a
+ *  session and reused byte-for-byte until the session id, cwd or tool roster changes (a new session). Instruction
+ *  files (AGENTS.md · AGENTS.local.md · DESIGN.md) are therefore read once per session; an edit made mid-session is
+ *  logged as deferred and applies in the next session. The volatile part is rebuilt every turn. */
+export function createReplSystemPromptPin(
+  fingerprint: (cwd: string) => string = (cwd) => (require('../prompt-library/universal-preamble.js') as typeof import('../prompt-library/universal-preamble.js')).projectAnchorFingerprint(cwd),
+): (ctx: ReplSystemPromptContext) => { stable: string | undefined; volatile: string[] } {
+  let pinned: { key: string; stable: string | undefined; anchors: string; deferredLogged: string | null } | null = null;
+  return (ctx) => {
+    const key = [ctx.sessionId ?? '', ctx.cwd, (ctx.enabledToolNames ?? ['<no-tools>']).join(',')].join('\u0000');
+    if (pinned === null || pinned.key !== key) {
+      const anchors = safeFingerprint(fingerprint, ctx.cwd);
+      const stable = buildReplStableSystemPrompt(ctx);
+      pinned = { key, stable, anchors, deferredLogged: null };
+      debug.log('repl.prompt-cache', 'stable-prefix-pinned', {
+        sessionId: ctx.sessionId ?? null, cwd: ctx.cwd, stableChars: stable?.length ?? 0,
+      });
+      return { stable, volatile: buildReplVolatileContext(ctx) };
+    }
+    const anchors = safeFingerprint(fingerprint, ctx.cwd);
+    if (anchors !== pinned.anchors && anchors !== pinned.deferredLogged) {
+      pinned.deferredLogged = anchors;
+      debug.log('repl.prompt-cache', 'anchor-change-deferred', {
+        sessionId: ctx.sessionId ?? null, cwd: ctx.cwd, appliesAt: 'next-session',
+      });
+    }
+    return { stable: pinned.stable, volatile: buildReplVolatileContext(ctx) };
+  };
+}
+
+function safeFingerprint(fingerprint: (cwd: string) => string, cwd: string): string {
+  try { return fingerprint(cwd); } catch { return ''; }
 }
 
 /** Turn references are explicit JSON data. A cell additionally requires its exact release version. */
 export function buildTurnOwnerResult(seat: string, input: unknown, readers?: SeatOwnerReaders): string {
-  const unknown = '[주인 조회 결과] unknown — 구조화된 참조 또는 최신 주인 확인 필요.';
+  const unknown = '[주인 조회 결과] unknown — 확인된 다른 주인 없음 · 막힘 아님. 내 노랑 칸·미읽음 우편에서 맨 위 일을 직접 골라 진행.';
   if (!Array.isArray(input) || input.length === 0 || input.length > 32) return unknown;
   const refs: WorkReference[] = [];
   const versions = new Map<string, string>();
@@ -854,7 +975,7 @@ export function buildTurnOwnerResult(seat: string, input: unknown, readers?: Sea
     if (r.kind === 'cell' && typeof r.id === 'string' && /^[A-Za-z0-9_.-]{1,128}$/.test(r.id)
       && typeof r.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+$/.test(r.version)) {
       if (versions.has(r.id) && versions.get(r.id) !== r.version) return unknown;
-      versions.set(r.id, r.version); refs.push({ kind: 'cell', id: r.id });
+      versions.set(r.id, r.version); refs.push({ kind: 'cell', id: r.id, version: r.version });
     } else if (r.kind === 'pr' && typeof r.repository === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(r.repository)
       && typeof r.number === 'number' && Number.isSafeInteger(r.number) && r.number > 0) {
       refs.push({ kind: 'pr', repository: r.repository, number: r.number });
@@ -975,8 +1096,22 @@ async function runOneTurn(
   from?: import('../session/index.js').MessageSource,
   /** SEAT-HUMAN-GOAL-PIN ④ — 부모(TUI) 소유 핀(payload) — child 교체/재기동 뒤 복구. */
   parentPinnedGoal?: string,
+  workReferences?: unknown,
+  /** ELN-PROMPT-CACHE-PIN — this turn's volatile context (els location · owner check · self-health): sent after
+   *  the history, outside the cached system prefix. */
+  turnVolatileContext?: readonly string[],
 ): Promise<{ reply: string; provider: string; model: string | null; durationMs: number; logPath: string | null; measuredUsage?: MeasuredTurnUsage; goalComplete?: boolean; goalStopReason?: string; goalCompletionVia?: string }> {
   const startedAt = Date.now();
+  const seatContext = resolveSeatMemoryContext(getSessionCwd());
+  if (seatContext && workReferences !== undefined) {
+    const { handoffForeignOwner } = await import('./seat-owner-handoff.js');
+    const handoff = await handoffForeignOwner({ seat: seatContext.seat, workReferences, evidence: userText,
+      lookup: buildTurnOwnerResult,
+      post: async args => { await dispatchReplMessageTool('MsgPost', args); },
+    });
+    if (handoff) return { reply: handoff, provider: cfg.llm.provider, model: cfg.llm.model ?? null,
+      durationMs: Date.now() - startedAt, logPath: null };
+  }
   let memorySaveFailed = false;
   (require('../tui/persistent-user-memory.js') as typeof import('../tui/persistent-user-memory.js'))
     .rememberExplicitTuiUserFact(userText, undefined, () => { memorySaveFailed = true; });
@@ -1060,9 +1195,11 @@ async function runOneTurn(
     })
     : undefined;
   let result: Awaited<ReturnType<typeof runTurn>>;
+  const coordinator = nextTui && replSeatRole(getSessionCwd(), undefined) === 'coordinator';
   try {
     result = await runTurn({
-    userConfig: cfg,
+    userConfig: coordinatorReasoningConfig(cfg, coordinator),
+    disableSimpleQuestionFastRoute: coordinator,
     sessionId,
     // SEAT-HUMAN-GOAL-PIN ④: 부모(TUI) 소유 핀(payload) — child 저장소보다 우선, 교체/재기동 뒤 복구.
     ...(parentPinnedGoal !== undefined ? { parentPinnedGoal } : {}),
@@ -1071,6 +1208,9 @@ async function runOneTurn(
     utteranceSurface: 'tui',
     ...(from ? { from } : {}),
     systemPrompt,
+    ...(turnVolatileContext && turnVolatileContext.length > 0 ? { turnVolatileContext } : {}),
+    // ELN-PROMPT-CACHE-PIN — one tool set per session: no per-message warm preload of deferred tools.
+    stableToolSet: true,
     userImages: userImages.length > 0 ? userImages : undefined,
     ...(process.env.ELANOUS_TEST_FAKE_LLM === '1' && Number.isFinite(Number(process.env.ELANOUS_TEST_FAKE_LLM_IDLE_TIMEOUT_MS))
       && Number(process.env.ELANOUS_TEST_FAKE_LLM_IDLE_TIMEOUT_MS) > 0
@@ -1392,7 +1532,9 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       return result;
     },
   } : baseTools;
-  const systemPromptForTurn = (workReferences?: unknown) => buildReplSystemPrompt({
+  // ELN-PROMPT-CACHE-PIN — stable part pinned per session · volatile part rebuilt per turn (sent after history).
+  const replSystemPromptPin = createReplSystemPromptPin();
+  const systemPromptForTurn = (workReferences?: unknown) => replSystemPromptPin({
     cfg,
     enabledToolNames: tools?.specs.map(s => s.name),
     cwd: getSessionCwd(),
@@ -1467,16 +1609,20 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         console.log(`  ❯ ${turn.prompt}`);
       }
       backgroundBridge?.beginTurn();
+      const scenarioPrompt = systemPromptForTurn(turn.workReferences);
       const result = await runOneTurn(
         cfg,
         sessionIdRef.current,
         turn.prompt,
         turnAttachments,
         tools,
-        systemPromptForTurn(turn.workReferences),
+        scenarioPrompt.stable,
         opts.jsonOutput,
         opts.nextTui === true,
         nextTuiDelivery,
+        ...Array(12).fill(undefined) as [undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined],
+        turn.workReferences,
+        scenarioPrompt.volatile,
       );
       backgroundBridge?.emit();
       const failures = applyAsserts(result.reply, turn.asserts, sc.defaults?.asserts, turnId);
@@ -1555,8 +1701,10 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       if (selfHealth && typeof turn.id === 'string') {
         process.stdout.write(`${JSON.stringify({ event: 'self-health', turnId: turn.id, sessionId: sessionIdRef.current, selfHealth })}\n`);
       }
-      const systemPrompt = systemPromptForTurn(turn.workReferences);
-      const turnSystemPrompt = selfHealth ? `${systemPrompt}\n\n${selfHealth.line}` : systemPrompt;
+      const turnPrompt = systemPromptForTurn(turn.workReferences);
+      // ELN-PROMPT-CACHE-PIN — the self-health line changes per turn: volatile context, not the instructions.
+      const turnSystemPrompt = turnPrompt.stable;
+      const turnVolatileContext = selfHealth ? [...turnPrompt.volatile, selfHealth.line] : turnPrompt.volatile;
       let result: Awaited<ReturnType<typeof runOneTurn>>;
       const turnAbort = new AbortController();
       const pushNowReady = new Set<string>();
@@ -1635,6 +1783,8 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
           typeof (turn as { parentPinnedGoal?: string }).parentPinnedGoal === 'string'
             ? (turn as { parentPinnedGoal?: string }).parentPinnedGoal
             : undefined,
+          turn.workReferences,
+          turnVolatileContext,
         );
       } catch (error) {
         if (streamTurn) process.off('SIGTERM', onTerminate);
@@ -1775,16 +1925,21 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
     // Ordinary prompt.
     const turnAttachments = pendingAttachments.splice(0);
     backgroundBridge?.beginTurn();
+    const replPrompt = systemPromptForTurn();
     await runOneTurn(
       cfg,
       sessionIdRef.current,
       trimmed,
       turnAttachments,
       tools,
-      systemPromptForTurn(),
+      replPrompt.stable,
       opts.jsonOutput,
       opts.nextTui === true,
       nextTuiDelivery,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined,
+      undefined, // workReferences (main #seat-owner-handoff) — this plain chat path carries none
+      replPrompt.volatile,
     );
     backgroundBridge?.emit();
     if (exitRequested) break;

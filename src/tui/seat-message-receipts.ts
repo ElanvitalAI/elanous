@@ -31,6 +31,11 @@ export interface SeatMailMessageRead {
   /** Actual ledger unread total, independent of the bounded message page. */
   unreadTotal?: number;
   /**
+   * MSG-RECEIPT-IMPLIES-ACK ② — the part of {@link unreadTotal} that still needs this seat (MsgStore.actionableUnreadCount:
+   * needsAck or request · decision · alert, no terminal receipt). The notice counter «[미읽음 총 N통]» shows this one.
+   */
+  actionableTotal?: number;
+  /**
    * ELN-SEAT-MAIL-REPLAY (11-18 live: REL «Queue 3641», JUD «Queue 3225» with 8 and 2 unread): taken in the SAME
    * snapshot as `messages`. `latestId` = newest ledger id (the watcher's next floor, so it never pages history);
    * `cursor` = the recipient's ack cursor (`msg ack` — nothing at or below it is offered); `seenSkipped` = rows above the
@@ -56,6 +61,8 @@ export interface SeatReceiptWriter {
   recordStarted?(input: SeatReceiptStartedWrite): void;
   /** [seat-mail #16 wiring · S7 트리거] done 계기 — 턴이 우편에 답을 마친 순간(noteTurnFinished seen 정착). 옵셔널: 구형 writer 무시. */
   recordDone?(input: SeatReceiptDoneWrite): void;
+  /** SEAT-MAIL-COALESCE-NOTICE — ack exactly one info mail after the digest turn that listed it (per id · never a cursor). */
+  ack?(input: SeatReceiptDoneWrite): void;
 }
 
 export interface SeatReceiptDoneWrite {
@@ -129,7 +136,7 @@ export function readSeatMailMessages(
         after = rows.at(-1)!.id;
         if (page + 1 >= SEAT_MESSAGE_SCAN_PAGES) { truncated = true; break; }
       }
-      return { seat, messages, unreadTotal: store.unreadCount(seat), latestId: store.latestId(), cursor, seenSkipped: skipped, truncated };
+      return { seat, messages, unreadTotal: store.unreadCount(seat), actionableTotal: store.actionableUnreadCount(seat), latestId: store.latestId(), cursor, seenSkipped: skipped, truncated };
     }).deferred();
   } finally { store.close(); }
 }
@@ -181,6 +188,20 @@ export function createLedgerReceiptWriter(msgPath: string = join(elanousStateRoo
       } catch (error) {
         try {
           debug.log('msg.receipt-writer', 'record-done-failed', { msgId: input.messageId, recipient: input.recipient,
+            error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+        } catch { /* observability is fail-open */ }
+      }
+    },
+    ack(input: SeatReceiptDoneWrite) {
+      try {
+        const mod = require('../msg/msg-store.js') as typeof import('../msg/msg-store.js');
+        const store = new mod.MsgStore(msgPath);
+        // Only a still-open mail: never rewinds a `done` ack (the §4c seen compat write may already have acked it).
+        try { if (store.messageStatus(input.recipient, input.messageId) === 'delivered') store.ackMessage(input.recipient, input.messageId, 'acked'); }
+        finally { store.close(); }
+      } catch (error) {
+        try {
+          debug.log('msg.receipt-writer', 'ack-failed', { msgId: input.messageId, recipient: input.recipient,
             error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
         } catch { /* observability is fail-open */ }
       }

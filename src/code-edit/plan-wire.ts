@@ -2,12 +2,13 @@
 // (a singleton); the TUI host reads the turn's outcome from this snapshot, never from reply text.
 import { planTurnOutcome, type PlanTurnOutcome } from './plan-outcome.js';
 import type { PlanState, PlanStep, PlanStepStatus, PlanWake } from './plan-tool.js';
+import { isBlockReason, type BlockReason } from '../agent-events/protocol.js';
 
 const STEP_MAX = 120;
 const REASON_MAX = 200;
 const STATUSES: ReadonlySet<string> = new Set(['pending', 'in_progress', 'completed', 'blocked', 'waiting']);
 
-export interface PlanWireStep { status: PlanStepStatus; step: string; reason?: string; wake?: PlanWake }
+export interface PlanWireStep { status: PlanStepStatus; step: string; reason?: string; code?: BlockReason; wake?: PlanWake }
 export interface PlanWire { version: number; versionAtTurnStart: number; steps: PlanWireStep[] }
 
 const clip = (text: string, max: number): string => (text.length <= max ? text : `${text.slice(0, max - 1)}…`);
@@ -21,6 +22,7 @@ export function planWireFromState(state: PlanState, versionAtTurnStart: number):
     steps: state.steps.map((step: PlanStep): PlanWireStep => ({
       status: step.status, step: clip(step.step, STEP_MAX),
       ...(step.reason ? { reason: clip(step.reason, REASON_MAX) } : {}),
+      ...(step.code ? { code: step.code } : {}),
       ...(step.wake ? { wake: { kind: clip(step.wake.kind, 40), target: clip(step.wake.target, 120), ...(step.wake.until ? { until: clip(step.wake.until, 40) } : {}) } } : {}),
     })),
   };
@@ -40,6 +42,7 @@ export function parsePlanWire(value: unknown): PlanWire | undefined {
     steps.push({
       status: step.status as PlanStepStatus, step: clip(step.step, STEP_MAX),
       ...(typeof step.reason === 'string' && step.reason ? { reason: clip(step.reason, REASON_MAX) } : {}),
+      ...(step.status === 'blocked' && isBlockReason(step.code) ? { code: step.code } : {}),
       ...(typeof wake?.kind === 'string' && typeof wake.target === 'string'
         ? { wake: { kind: clip(wake.kind, 40), target: clip(wake.target, 120), ...(typeof wake.until === 'string' ? { until: clip(wake.until, 40) } : {}) } } : {}),
     });

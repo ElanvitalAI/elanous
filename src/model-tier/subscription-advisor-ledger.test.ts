@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'bun:test';
 import { Command } from 'commander';
 import { registerUsageCommand, type UsageCliDeps } from '../cli/usage-cli.js';
+import { subscriptionUsageFromLedgerRows } from './subscription-advisor-ledger.js'; // 정적 import — interference-ratchet 본문 동적 import 금지(PREGATE-RED 39662-9c72761b6365-node-b)
 import type { LogStoreRow } from '../mss/logging/log-store.js';
 
 function row(data: unknown, category = 'llm.usage', event = 'llm-usage', ageMs = 0, id = 1): LogStoreRow {
@@ -28,6 +29,7 @@ async function runAdvisorCli(rows: LogStoreRow[], readSnapshot?: UsageCliDeps['a
     out: { log: (line) => lines.push(line) },
     exit: (code) => { throw new Error(`exit ${code}`); },
     advisorMembership: () => 'pro', // jud-39528 mustFix ③ — 종단은 pro 등급 경로(free 거부는 usage-cli.test.ts 신규 2건)
+    advisorNow: () => FIXED_NOW, // terra r2 mustFix ①③ — 헬퍼 전체 CLI 호출에 고정 시계 주입(행 시각 2026-11-22 기준) — 실행 날짜 무관
     ...(readSnapshot ? { advisorReadSnapshot: readSnapshot } : {}),
   });
   await command.parseAsync(['usage', 'advisor'], { from: 'user' });
@@ -123,7 +125,7 @@ describe('usage advisor (subscription-advisor-ledger 종단 — r7 JUD-B #126547
     ];
     const lines: string[] = [];
     const command = new Command();
-    registerUsageCommand(command, { readRunLogs: () => rows, out: { log: (line) => lines.push(line) }, exit: (code) => { throw new Error(`exit ${code}`); }, advisorMembership: () => 'pro' }); // jud-39528 mustFix ③ — pro 경로
+    registerUsageCommand(command, { readRunLogs: () => rows, out: { log: (line) => lines.push(line) }, exit: (code) => { throw new Error(`exit ${code}`); }, advisorMembership: () => 'pro', advisorNow: () => FIXED_NOW }); // jud-39528 mustFix ③ + terra r2 mustFix ①③ — pro 경로·고정 시계
     await command.parseAsync(['usage', 'advisor', '--json'], { from: 'user' });
     const parsed = JSON.parse(lines.join('\n'));
     expect(parsed.observed).toMatchObject({ weeklyCalls: 1, monthlyCalls: 1, weeklyAllExhaustedRefusals: 1, monthlyAllExhaustedRefusals: 1 });
@@ -143,5 +145,52 @@ describe('usage advisor (subscription-advisor-ledger 종단 — r7 JUD-B #126547
     expect(text).toContain('사용량 미관측(제안 제외) 0건');
     expect(text).toContain('계정 미구분 관측');
     expect(text).toContain('하향');
+  });
+});
+
+// terra r1 mustFix ②(PR 39662 r2) — 미귀속(account=null) 소진 수는 정확 일치 여부와 무관하게 미측정(null).
+// r1 은 weeklyWindowExhaustions: 0 을 심어 adviseSubscriptions 가 하향을 권고했다(0 오판). 어댑터→조언자 종단.
+describe('미귀속 소진 0 오판 방지 — subscriptionUsageFromLedgerRows 종단(terra r1 mustFix ②)', () => {
+  it('provider급 미귀속 사용량 행은 소진 수를 null(미측정)로 내놓고 하향 이유에 «창 소진 0»이 안 뜬다', async () => {
+    const rows = [
+      row({ billingProvider: 'openai-codex', billing: 'subscription' }, 'llm.usage', 'llm-usage', 1 * HOUR),
+    ];
+    const lines = await runAdvisorCli(rows, snapshotStub([
+      { provider: 'openai-codex', account: null, billing: 'subscription', window: { remaining: 0.8 } },
+    ]));
+    const text = lines.join('\n');
+    expect(text).toContain('계정 미구분 관측');      // 폴백(사용량 행 1개·계정 창 1개)은 유지
+    expect(text).not.toContain('창 소진 0');          // r1: 가짜 0 → «월 1호출·창 소진 0» 하향
+    expect(text).toContain('창 소진 미측정(계정 미구분 관측)'); // 미측정 이유로 하향(소진 수는 재판정 대기)
+  });
+  it('import subscriptionUsageFromLedgerRows 직접 — 미귀속 행의 exhaustions 칸은 null 이다(0 아님)', () => {
+    // interference-ratchet(PREGATE-RED 39662-9c72761b6365-node-b-052007) — 시험 본문 저장소 모듈 동적 import 신규 위반 → 정적 import 로 수리.
+    const rows = [
+      row({ billingProvider: 'openai-codex', billing: 'subscription' }, 'llm.usage', 'llm-usage', 1 * HOUR),
+    ];
+    const usage = subscriptionUsageFromLedgerRows(rows, FIXED_NOW);
+    expect(usage).toHaveLength(1);
+    expect(usage[0]!.weeklyWindowExhaustions).toBeNull();   // r1: 0 — 0 오판의 근원
+    expect(usage[0]!.monthlyWindowExhaustions).toBeNull();  // r1: 0
+    expect(usage[0]!.monthlyCalls).toBe(1);                 // 호출 수는 실측 그대로
+  });
+});
+
+// terra r1 mustFix ③(PR 39662 r2) — 제품 CLI(usage advisor)에 시계 주입: 시험과 같은 고정 시계로 돈다.
+// r1 은 행 시각을 2026-11-22 고정·CLI 는 실시간 시계 → 실행 날짜에 따라 주간 집계 단언이 무너졌다.
+describe('usage advisor 시계 주입 — CLI 도 고정 시계(terra r1 mustFix ③)', () => {
+  it('advisorNow deps 로 CLI 주간 집계가 고정 시계를 따른다(실행 날짜 무관)', async () => {
+    const rows = [
+      row({ billingProvider: 'openai-codex', billing: 'subscription' }, 'llm.usage', 'llm-usage', 1 * HOUR),
+      row({ billingProvider: 'openai-codex', billing: 'subscription' }, 'llm.usage', 'llm-usage', 2 * DAY),
+      row({ billingProvider: 'openai-codex', billing: 'subscription' }, 'llm.usage', 'llm-usage', 10 * DAY),
+    ];
+    const lines: string[] = [];
+    const command = new Command();
+    registerUsageCommand(command, { readRunLogs: () => rows, out: { log: (line) => lines.push(line) },
+      exit: (code) => { throw new Error(`exit ${code}`); }, advisorMembership: () => 'pro',
+      advisorNow: () => FIXED_NOW }); // 시계 주입 — deps 없으면 실시간(r1: 시계 없음)
+    await command.parseAsync(['usage', 'advisor'], { from: 'user' });
+    expect(lines.join('\n')).toContain('최근 7일 구독 호출 2건 · 30일 3건'); // 시각 2026-11-22 고정 기준
   });
 });

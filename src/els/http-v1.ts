@@ -26,7 +26,7 @@ import {
   type HitlAsk,
   type Principal,
 } from './control.js';
-import { routeElsHook } from './webhook-in.js';
+import { routeElsHook, type HookDeps } from './webhook-in.js';
 
 export interface HttpV1Request {
   readonly method: string;
@@ -65,6 +65,8 @@ export interface HttpV1Deps {
    * per-request Map would forget a replay, so a direct `routeElsHttpV1` caller owns one as well.
    */
   readonly nonces: Map<string, number>;
+  /** GRAPH-SCHEDULER §1-3 — person gate for the first firing of a write/external-send graph hook (absent = held). */
+  readonly askGraphFirstFiring?: HookDeps['askGraphFirstFiring'];
 }
 
 const PATH_ACTION: Readonly<Record<string, ControlAction>> = {
@@ -133,6 +135,7 @@ async function routeHook(deps: HttpV1Deps, req: HttpV1Request, name: string): Pr
     ...(deps.paneIsShell ? { paneIsShell: deps.paneIsShell } : {}),
     ...(deps.hitl ? { hitl: deps.hitl } : {}),
     ...(deps.now ? { now: deps.now } : {}),
+    ...(deps.askGraphFirstFiring ? { askGraphFirstFiring: deps.askGraphFirstFiring } : {}),
   }, {
     name: hookName,
     body: req.body ?? '',

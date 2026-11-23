@@ -136,7 +136,8 @@ export function createCoreAdvisor(options: CoreAdvisorOptions): CoreAdvisor {
     let reply: Awaited<ReturnType<AdvisorClient['advise']>>;
     try {
       // 상담 한 번만 강·advisor:<순간> 문맥 — 감싼 비동기 사슬이 끝나면 자동으로 내려온다(즉시 내림).
-      reply = await runWithWorkTierContext({ tier: decision.tier, trigger: decision.trigger }, () => options.client!.advise({
+      // ROUTER-OR-CODEX-MIX-CHOKEPOINT(OP #132227) — 결정 id 를 호출 문맥에 실어 보낸다: 같은 id 가 llm.usage 줄(routeDecisionId)까지 결속된다.
+      reply = await runWithWorkTierContext({ tier: decision.tier, trigger: decision.trigger, decisionId: decision.decisionId }, () => options.client!.advise({
         runId: options.runId, moment, provider: decision.provider, model: decision.model!, maxOutputTokens, prompt,
       }));
     } catch (error) {

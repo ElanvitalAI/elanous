@@ -79,7 +79,13 @@ const facts = {
 };
 /** 근거 없음 — 집계기의 미grounded 산출. */
 const noFacts = { grounded: false, context: '', files: [], codeFacts: [], skillFacts: [], memoryFacts: [], documentFacts: [], refFacts: [], ptyFacts: [] };
+/** Synthetic clarification self-resolver: «no answer», the same outcome the default resolver gives when no
+ *  provider answers. Without it writeAuthoredGoal falls back to the default resolver, which makes a real
+ *  role-LLM request from a unit test (measured on minim5: a cli-chat-proxy.grok.com call per clarification,
+ *  ~5–10 s each, past the 5 s test budget). */
+const noLlmSelfResolve: NonNullable<GoalAuthorDeps['selfResolveClarification']> = async () => ({});
 const deps: GoalAuthorDeps = {
+  selfResolveClarification: noLlmSelfResolve,
   ground: async () => facts,
   enhance: async (raw) => ({
     original: raw,
@@ -1258,6 +1264,7 @@ console.log(result.authored.document);`;
     const directory = mkdtempSync(join(tmpdir(), 'goal-author-default-help-probe-non-repository-'));
     temporaryDirectories.push(directory);
     const result = await writeAuthoredGoal('Run `bun bin/elanous.mjs self author`.', directory, {
+      selfResolveClarification: noLlmSelfResolve,
       ground: async () => facts,
       enhance: deps.enhance,
       slugFn: deps.slugFn,

@@ -16,7 +16,11 @@ const NO_SERVER = 'els: no els server is running — start it with `els serve` (
 
 /** The inherited pane credential — a pane's env carries the server-minted token, so the door can judge the request. */
 function paneAuth(socketPath: string, credential?: string): ElsRequest | undefined {
-  const token = process.env.ELANOUS_ELS_PANE_TOKEN ?? process.env.ELANOUS_ELS_OWNER_TOKEN ?? credential;
+  let token = process.env.ELANOUS_ELS_PANE_TOKEN ?? process.env.ELANOUS_ELS_OWNER_TOKEN ?? credential;
+  // An owner view survives a server restart; its generation token changes on disk.
+  if (!process.env.ELANOUS_ELS_PANE_TOKEN && process.env.ELANOUS_ELS_OWNER_TOKEN) {
+    try { token = readFileSync(join(dirname(socketPath), 'owner-token'), 'utf8').trim() || token; } catch { /* retain inherited credential */ }
+  }
   let runtimeToken: string | undefined;
   const path = process.env.ELANOUS_ELS_RUNTIME_TOKEN_FILE || join(dirname(socketPath), 'runtime-token');
   if (path) {

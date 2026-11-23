@@ -1,4 +1,5 @@
-// Registered tool runtime descendants must not read another seat's pane via the human socket.
+// Registered tool runtime descendants follow seat scope on the human socket. CEO 11-23 (ELS-ELN-SECURITY-RELAX):
+// the OP seat may read every pane, so a registered OP runtime now reads another seat's pane too.
 import { expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -28,7 +29,7 @@ test.skipIf(process.env.ELS_READ_OWNER_TTY === '1' || !!process.stdin.isTTY)('un
   } finally { await server.close(); rmSync(root, { recursive: true, force: true }); }
 }, 60000);
 
-test.skipIf(process.platform !== 'darwin')('human socket read enforces runtime seat ownership', async () => {
+test.skipIf(process.platform !== 'darwin')('human socket read lets a registered OP runtime observe another seat pane', async () => {
   const root = mkdtempSync('/tmp/els-read-owner-');
   const oldOwner = process.env.ELANOUS_ELS_OWNER_TOKEN;
   let n = 0;
@@ -49,9 +50,9 @@ test.skipIf(process.platform !== 'darwin')('human socket read enforces runtime s
     while (!existsSync(other)) { if (Date.now() > end) throw new Error('fixture timeout'); await Bun.sleep(25); }
     expect(JSON.parse(readFileSync(registration, 'utf8')).exitCode).toBe(0);
     expect(JSON.parse(readFileSync(own, 'utf8')).exitCode).toBe(0);
-    const denied = JSON.parse(readFileSync(other, 'utf8'));
-    expect(denied.exitCode).toBe(1);
-    expect(denied.message).not.toContain('screen-2');
+    const observed = JSON.parse(readFileSync(other, 'utf8'));
+    expect(observed.exitCode).toBe(0);
+    expect(observed.message).toContain('screen-2');
   } finally {
     runtime.kill(); await runtime.exited;
     await server.close();

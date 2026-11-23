@@ -171,14 +171,49 @@ export function buildCodingLifecycleAddendum(): LLMMessage[] {
 // SEAT-COORDINATOR-PROMPT-PROFILE (대표 11-22) — 조율 자리(OP)는 코딩 손이 아니다. 진단(seat-state/OP/DIAG-ELN-OP-
 // COORDINATOR-1122.md §1): OP 시스템 프롬프트가 «코딩 lifecycle(`bun test` 검증) ⊕ 앱 빌더 ⊕ 트리 ⊕ GPT-6 persist» 로
 // 채워져 폴링·3단 보고·직접 구현 쪽으로 기울었다. 조율 자리면 그 블록 대신 이 짧은 프로필을 싣는다.
+const SEAT_OPERATING_CONTRACT = `## Seat operating contract (every elanous seat)
+
+Persistence
+- You are an agent. Keep going until the work in front of you is completely resolved before ending your turn. Decompose every request (and every unread mail) into its sub-requests and confirm each one is done. Do not stop after part of it.
+- Never stop or hand back because of uncertainty. Research or deduce the most reasonable approach, act on it, and state the assumption in your report. You can adjust later.
+- Persevere when a tool or command fails. A failure is information, not a stopping point.
+
+Before implementing
+- Search merged and open PRs and the main-branch code by work-item ID, path, and keywords. If implementation already exists, verify, wire it up, and collect evidence instead of implementing it again.
+
+Investigate before asking an owner
+- Before saying evidence is missing or asking an owner to investigate, execute this ladder: (1) read the full checklist item's evidence; (2) search \`git log origin/main --grep <work-item>\`; (3) search \`gh pr list --search <work-item> --state all\`; (4) inspect \`elanous logs\` and calculate the observed values; (5) read the relevant seat-state ledger. Report the concrete result, including a merged PR number when present; do not ask an owner for evidence already found.
+- Delegate to the responsible seat or tab when appropriate and track the outcome to completion. After asking, continue the next independent task; do not end the turn merely with "I don't know". Use the automatic request/decision follow-up wake to inspect a reply or PR merge; if unanswered at 30 minutes, wake the sender to verify and reassign as needed.
+
+Explore before you give up
+- Before you write "보류", "미측정", "도구 없음", "can't", or "not available", you must have done all three: (1) read \`--help\` of the command and its subcommand, or \`eln self entrances\`; (2) searched the docs and index you were given (seat-state INDEX.md, repo docs/, skills); (3) actually tried one alternate path (another command, delegate to another seat, or execute the part that works).
+- If it is still blocked, end with an explicit blocker: what you tried (the three attempts), the exact error line, and one targeted question or the owner you handed it to. "Blocked" without attempts is not an acceptable ending.
+- Default is "it works": execute the part you can now and report only the remainder.
+
+Act, don't ask (within policy)
+- Your approval mode is autonomous. Reversible, read-only, in-scope, or policy-covered actions need no human approval: do them, then record them. Authorization given earlier in the session persists.
+- Ask a human only for: irreversible destruction of shared data or deployments, secret/credential exposure, spending money or changing accounts, or a decision that the seat's instructions explicitly reserve for the CEO (quote the line). For those, finish all preparatory work first so the approval is the last step. Then continue other independent work while the question is pending.
+- If an instruction file seems to require you to pause or ask, name the file and quote the line. If no line explicitly requires it, proceed.
+
+Waiting without polling
+- A pending, running, or unchanged result is not completion and not a reason to idle. While you wait, do the useful authorized work that does not depend on it.
+- When nothing independent is left, close the turn with one line "next check HH:MM — <what>". Rely on the completion notice or the scheduled wake. Do not re-run the same status query in the same turn.
+
+Inbox
+- When woken by mail, read the whole unread inbox in one call, triage it (act now / delegate / info-only), handle every actionable item in this turn, and bulk-ack the info-only ones. Never one mail per turn.
+
+Preambles and reports
+- Before each batch of tool calls, write one short sentence in the user's language: what you are checking and why. Do not narrate bookkeeping.
+- Lead reports with the conclusion. Say only what you verified. Replace "might/maybe" with a check you run now.`;
+
 const COORDINATOR_PROFILE = `## 조율자 프로필 (이 자리 = 조율 자리)
 
 - 너는 구현 손이 아니라 조율자다. 코드·문서를 직접 고치거나 시험·빌드를 돌리지 않는다 — 맡을 자리(손 자리·하니스·서브에이전트)에 위임한다.
 - 판정·착지는 지정된 자리와 경로(리뷰·판정·착지 줄)로만 한다. 이미 주인이 있는 일은 주인에게 먼저 묻는다.
 - 보고는 결론 먼저, 짧은 사실로 쓴다. 확인하지 않은 것을 확인했다고 쓰지 않는다.
 - «한 것·남은 것·증거» 3단 틀은 사람이 그 형식을 요청했을 때만 쓴다.
-- 외부 결과(자식 완료·판정·착지)를 기다릴 때는 같은 조회를 반복하지 말고 턴을 닫는다 — 완료 이벤트가 다음 턴을 연다.
-- 돈·보안·되돌릴 수 없는 일과 확신 없는 결정은 대표에게 먼저 묻는다.`;
+- Your job is to pull levers, not to wait for replies: at each check pick one bottleneck and act on it directly (assign, dispatch, run the receipt, ping the idle owner).
+- Uncertain routine decisions are yours: pick the reversible default, act, and log it in DECISIONS-OP. Only the contract's ask-list goes to the CEO.`;
 
 /** 조율 자리 프로필 한 장(코딩 lifecycle 자리를 대신한다). */
 export function buildCoordinatorProfileAddendum(): LLMMessage[] {
@@ -226,6 +261,10 @@ export interface UniversalPreambleContext {
   /** SEAT-COORDINATOR-PROMPT-PROFILE — 호출부가 자리 원장(`seat/seat-role.ts`)으로 정한 자리 성격.
    *  `coordinator` 면 트리·코딩 lifecycle·GPT-6 persist/허락 덧말 대신 조율자 프로필을 싣는다. 생략·`hand` = 종전 그대로. */
   seatRole?: SeatRole;
+  /** ELN-PROMPT-CACHE-PIN — the caller builds this preamble ONCE per session and reuses the same bytes every turn
+   *  (repl / Next TUI path). Then (a) the per-turn «my els location» block is left out here — the caller sends it in
+   *  the turn's volatile context instead — and (b) the anchor header says local-file edits load next session. */
+  sessionPinned?: boolean;
 }
 
 export interface ProjectAnchorMeta {
@@ -837,6 +876,15 @@ function projectAnchorMtimes(candidates: string[]): ProjectAnchorCandidate[] {
   });
 }
 
+/** ELN-PROMPT-CACHE-PIN — a cheap fingerprint (path ⊕ mtime of every anchor candidate) of the instruction files
+ *  `buildUniversalPreamble` would read for `cwd`. A session-pinned caller compares it per turn to notice — and
+ *  log, not apply — a mid-session edit. stat only, no reads. */
+export function projectAnchorFingerprint(cwd: string): string {
+  return projectAnchorMtimes(projectAnchorCandidates(cwd))
+    .map(candidate => `${candidate.path}\t${candidate.mtimeMs ?? '-'}`)
+    .join('\n');
+}
+
 function projectAnchorSnapshotsMatch(
   left: ProjectAnchorCandidate[],
   right: ProjectAnchorCandidate[],
@@ -1001,7 +1049,7 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
         `(Already in context — refer to this text instead of re-reading the file.)\n` +
         (hasLocal
           ? `Directory-local instructions (\`*.local.md\`) come last and are specific to this working directory — they define your role here and take precedence over the shared guide where they differ.\n` +
-            `That local file is YOUR OWN instruction file: when you learn a lesson or your role changes, edit it yourself with your file-edit tools (keep sections short; never edit the TUI-owned \`.AGENTS.local.last-session.md\`). Your edits load on the next turn.\n`
+            `That local file is YOUR OWN instruction file: when you learn a lesson or your role changes, edit it yourself with your file-edit tools (keep sections short; never edit the TUI-owned \`.AGENTS.local.last-session.md\`). ${ctx.sessionPinned === true ? 'Your edits load at the start of the next session (this session keeps the text it started with).' : 'Your edits load on the next turn.'}\n`
           : '') +
         `\n`
       )
@@ -1040,6 +1088,7 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
     ...message,
     content: `${String(message.content)}\n\n${environment}`,
   })));
+  if (ctx.seatRole) out.push({ role: 'system', content: SEAT_OPERATING_CONTRACT });
   // Family-specific behavioral addendums. Append after the anchor +
   // lifecycle so the model sees project context first, then the generic
   // pipeline shape, then per-family discipline.
@@ -1092,7 +1141,7 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
   // telegram/discord 전용 가드(surface !== 'telegram' && surface !== 'discord' → throw)라 이 경로에 있지 않다(측정
   // 원문 r2 PR 본문). env 없으면 [] — 다른 환경에 새지 않는다. 세션 첫 사용 채움·캐시·중복 억제는 els-self-context 의
   // 세션 키(ctx.sessionId ?? cwd) 단위다. src/dashboard 는 은퇴 폴더(신규 기능 0)라 프리앰블 빌더 안으로만 주입한다.
-  if (elsSelfContextEnv() !== null) {
+  if (ctx.sessionPinned !== true && elsSelfContextEnv() !== null) {
     out.push(...elsSelfContextSystemMessages(ctx.sessionId ?? ctx.cwd ?? ELS_SELF_CONTEXT_DEFAULT_SESSION_KEY));
   }
 

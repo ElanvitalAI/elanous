@@ -474,10 +474,32 @@ test('실물 argv — `--facts` 로 접지를 «건네주면» blocked 가 풀�
     expect(blocked.text).toContain('blocked');
     expect(blocked.text).not.toContain('Approve BRIEF_OK');
 
-    // ✅ 주면 «진짜» 체크리스트가 돌고 게이트가 열린다
-    const wired = await spawn([SAMPLE_FACTS.url, '--facts', factsPath], 'y\ny\ny\ny\n');
-    expect(wired.text).toContain('Approve BRIEF_OK');
-    expect(wired.text).not.toContain('blocked');
+    // ✅ 주면 «진짜» 체크리스트가 돌고 게이트가 열린다 — 첫 게이트 BRIEF_OK 가 «물어지고 승인되는» 것까지가 이 판정이다.
+    //    그 뒤 게이트(MASTER_PICK…)는 이 시험의 대상이 아니다: 파이프 stdin 이 첫 readline 에 다 먹혀 두 번째 질문이
+    //    EOF 에서 돌아오지 않으므로(제품 FU), 승인 줄을 본 즉시 그 자식 하나만 끝낸다.
+    const proc = Bun.spawn(['bun', 'bin/elanous.mjs', 'ad', SAMPLE_FACTS.url, '--facts', factsPath], {
+      cwd, stdin: new TextEncoder().encode('y\n'), stdout: 'pipe', stderr: 'pipe',
+    });
+    const stderr = new Response(proc.stderr).text();
+    let wired = '';
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    const deadline = Date.now() + 60_000; // 출처: 단독 실행 실측 ~1s · 부하 여유 60s.
+    try {
+      while (!wired.includes('BRIEF_OK 승인됨') && Date.now() < deadline) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        wired += decoder.decode(chunk.value, { stream: true });
+      }
+    } finally {
+      reader.releaseLock();
+      proc.kill();
+    }
+    await proc.exited;
+    wired += `\n${await stderr}`;
+    expect(wired).toContain('Approve BRIEF_OK');
+    expect(wired).toContain('BRIEF_OK 승인됨');
+    expect(wired).not.toContain('blocked');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

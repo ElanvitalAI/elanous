@@ -1,5 +1,6 @@
 import type { NextTuiQueueItem, NextTuiQueueNoticeSource } from './queue.js';
 import { isUrgentSeatMail } from '../seat-mail-priority.js';
+import { isInfoSeatMail, seatMailDigestLine } from '../seat-mail-digest.js';
 import { seatMessageContextBlock, type ContextHeaderInput } from '../../msg/msg-context-header.js';
 import type { MessageOrigin } from '../../msg/msg-store.js';
 
@@ -11,7 +12,7 @@ import type { MessageOrigin } from '../../msg/msg-store.js';
 
 /** 큐에서 생산자가 쓰는 표면만 — 단위시험은 가짜 없이 진짜 큐를 그대로 쓴다. */
 export interface ChildNoticeQueue {
-  enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta?: { msgId?: number; occurredAt?: number; urgent?: boolean }): NextTuiQueueItem;
+  enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta?: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string }): NextTuiQueueItem;
   enqueueCapsuleDoneNotice?(text: string, capsuleId: string, status: string, occurredAt?: number): NextTuiQueueItem | null;
   readonly items: readonly NextTuiQueueItem[];
 }
@@ -147,6 +148,9 @@ export function createChildNoticeProducers(queue: ChildNoticeQueue) {
       return queue.enqueueNotice(seatMessageNotice(message), 'seat-mail', {
         msgId: message.id,
         ...(isUrgentSeatMail(message) ? { urgent: true } : {}),
+        // SEAT-MAIL-COALESCE-NOTICE — info mail waits for the next digest; every mail carries its one digest line.
+        ...(isInfoSeatMail(message) ? { passive: true } : {}),
+        digest: seatMailDigestLine(message),
         ...(occurredAt === undefined || Number.isNaN(occurredAt) ? {} : { occurredAt }),
       });
     },

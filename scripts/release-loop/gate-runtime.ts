@@ -1784,7 +1784,7 @@ type GateFileReceiptRun = { rc: number; pass: number; fail: number; errors: numb
 /** @internal Kept exportable so the gate-flow simulation can assert receipt completeness without a live Pod. */
 export function savePassingGateFileReceipts(input: { repo: string; root: string; files: readonly string[]; commit: string;
   sourceHead40?: string; imageDigest: string; runs: readonly GateFileReceiptRun[]; shardId: string; attempt: number;
-  host: string; runtimeIdentity?: unknown; graphRunId?: string; closureTree?: ClosureTree }): number {
+  host: string; runtimeIdentity?: unknown; graphRunId?: string; closureTree?: ClosureTree; closureTreeFactory?: () => ClosureTree }): number {
   if (!input.runs.length || input.runs.some((run) => run.rc !== 0 || run.fail !== 0 || run.errors !== 0)) return 0;
   const files = [...new Set(input.files)];
   if (files.length !== input.files.length) return 0;
@@ -1807,7 +1807,7 @@ export function savePassingGateFileReceipts(input: { repo: string; root: string;
   }
   const sourceHead40 = input.sourceHead40 ?? input.commit;
   if (!/^[a-f0-9]{40}$/i.test(sourceHead40) || !/^[a-f0-9]{40}$/i.test(input.commit)) return 0;
-  const closure = input.closureTree ?? gitClosureTree(input.repo, input.commit);
+  const closure = input.closureTree ?? input.closureTreeFactory?.() ?? gitClosureTree(input.repo, input.commit);
   const receipts: Array<{ file: string; closureFiles: string[]; closureDigest: string; imageDigest: string; key: string;
     sourceHead40: string; carriedToHead40?: string; opaqueReasons?: string[];
     evidence: { shardId: string; attempt: number; host: string; runtimeIdentity?: unknown; runId?: string; testIds: string[] } }> = [];
@@ -1834,8 +1834,33 @@ export function savePassingGateFileReceipts(input: { repo: string; root: string;
   return receipts.length;
 }
 
+/** One immutable tree per runner and cut; failed builds are never cached. */
+export function createGateReceiptClosureCache(repo: string, build: typeof gitClosureTree = gitClosureTree): (commit: string) => ClosureTree {
+  let current: { commit: string; tree: ClosureTree } | undefined;
+  return (commit) => {
+    if (current?.commit === commit) return current.tree;
+    const started = Date.now();
+    const rssBefore = process.memoryUsage().rss;
+    debug.log('release-loop.gate', 'receipt-tree-build', { phase: 'started', commit, rssBytes: rssBefore });
+    let tree: ClosureTree;
+    try { tree = build(repo, commit); }
+    catch (error) {
+      debug.log('release-loop.gate', 'receipt-tree-build', { phase: 'failed', commit,
+        elapsedMs: Date.now() - started, rssBytes: process.memoryUsage().rss });
+      throw error;
+    }
+    debug.log('release-loop.gate', 'receipt-tree-build', { phase: 'completed', commit, files: tree.files.length,
+      elapsedMs: Date.now() - started, rssBeforeBytes: rssBefore, rssBytes: process.memoryUsage().rss });
+    current = { commit, tree };
+    return tree;
+  };
+}
+
 export function createGateRunner(repo: string, remote?: string, commandOverride?: GateRunner['command'], podCommand: (options: RunPodCommandOptions) => Promise<PodCommandResult> = runPodCommand, poolOverride?: PodPoolScheduler, podLogTail?: (job: PodCommandResult) => string, tools: GateTools = {}): GateRunner {
   const activePoolOverride = poolOverride ?? tools.poolOverride;
+  // All passing shards in one runner use the same immutable cut. Reuse the tree identity so
+  // the receipt writer's WeakMap also reuses its expensive whole-repo import graph.
+  const receiptClosure = createGateReceiptClosureCache(repo);
   let invocationRunId = tools.runId ?? null;
   const ledgerRunId = () => invocationRunId ?? tools.graphRunId ?? null;
   const observedPrewarmCuts = new Set<string>();
@@ -3391,7 +3416,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
             if (receiptRoot && expected.receipt.imageDigest && done.runs.every((run) => run.rc === 0 && run.fail === 0 && run.errors === 0)) {
               const savedFiles = savePassingGateFileReceipts({ repo, root: receiptRoot, files: item.files, commit,
                 sourceHead40: expected.receipt.head40, imageDigest: expected.receipt.imageDigest, runs: done.runs,
-                shardId, attempt: expected.receipt.attempt, host: expected.receipt.host, runtimeIdentity: expected.receipt.runtimeIdentity });
+                shardId, attempt: expected.receipt.attempt, host: expected.receipt.host, runtimeIdentity: expected.receipt.runtimeIdentity,
+                closureTreeFactory: () => receiptClosure(commit) });
               if (savedFiles !== item.files.length) debug.log('release-loop.gate', 'file-receipts-partial', { shard: shardId,
                 expected: item.files.length, saved: savedFiles, reused: true });
             }
@@ -3468,7 +3494,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
                   && failures.length === 0 && item.files.every((file) => testedFiles.has(file))) {
                   const savedFiles = savePassingGateFileReceipts({ repo, root: receiptRoot, files: item.files, commit, imageDigest,
                     runs: done.runs, shardId, attempt: receiptAttempt, host: executedHost, runtimeIdentity,
-                    graphRunId: tools.graphRunId ?? undefined });
+                    graphRunId: tools.graphRunId ?? undefined, closureTreeFactory: () => receiptClosure(commit) });
                   if (savedFiles !== item.files.length) debug.log('release-loop.gate', 'file-receipts-partial', { shard: shardId,
                     expected: item.files.length, saved: savedFiles });
                 } else debug.log('release-loop.gate', 'file-receipts-not-saved', { shard: shardId, reason: 'shard-or-file-evidence-incomplete' });

@@ -32,6 +32,7 @@ export interface NewTabPromptDeps {
   readonly save: (name: string) => void | Promise<boolean | 'unknown'>;
   /** The row changed: repaint. */
   readonly changed: () => void;
+  readonly title?: () => string;
 }
 
 export function createNewTabPrompt(deps: NewTabPromptDeps) {
@@ -143,7 +144,8 @@ export function createNewTabPrompt(deps: NewTabPromptDeps) {
         requiredSize: (size: Size) => size,
         takeFocus: () => input.takeFocus(),
       };
-      const dialog = new Dialog({ title: NEW_TAB_TITLE, body, buttons: [], onSubmit: () => {}, ...confirmPopupDialogChrome(NEW_TAB_TITLE, DEFAULT_THEME_TOKENS) });
+      const title = deps.title?.() ?? NEW_TAB_TITLE;
+      const dialog = new Dialog({ title, body, buttons: [], onSubmit: () => {}, ...confirmPopupDialogChrome(title, DEFAULT_THEME_TOKENS) });
       dialog.layout({ width, height });
       const printer = Printer.create({ width, height, focused: true });
       dialog.draw(printer);

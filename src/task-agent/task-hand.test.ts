@@ -1025,7 +1025,7 @@ test('TA-LIVE-LAND-2: task hand --ta-land --live writes card taLand and marks th
   expect(calls).toHaveLength(1);
   expect(calls[0]!.args).toEqual(['harness', 'say', '--substrate', 'pod', '--merge-by-host', text]);
   const cards = Object.values(readTaskAgentState<{ tasks: Record<string, { id: string; taLand?: boolean; runId?: string }> }>(path).tasks);
-  expect(calls[0]!.context!.env).toEqual({ ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: cards[0]!.id, ELANOUS_POD_DISTRIBUTOR_ENTRY: 'tasks-hand', ELANOUS_TA_LAND: '1' });
+  expect(calls[0]!.context!.env).toEqual({ ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: cards[0]!.id, ELANOUS_TASK_STATE_PATH: path, ELANOUS_POD_DISTRIBUTOR_ENTRY: 'tasks-hand', ELANOUS_TA_LAND: '1' });
   expect(cards).toHaveLength(1);
   expect(cards[0]).toMatchObject({ taLand: true, runId: calls[0]!.context!.runId });
   expect(lines.join('\n')).toContain('ELANOUS_TA_LAND=1');
@@ -1040,7 +1040,7 @@ test('TA-LIVE-LAND-2: without --ta-land the card has no taLand but keeps the tas
   });
   expect(code).toBe(0);
   const cards = Object.values(readTaskAgentState<{ tasks: Record<string, { id: string; taLand?: boolean }> }>(path).tasks);
-  expect(calls[0]!.context!.env).toEqual({ ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: cards[0]!.id, ELANOUS_POD_DISTRIBUTOR_ENTRY: 'tasks-hand' });
+  expect(calls[0]!.context!.env).toEqual({ ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: cards[0]!.id, ELANOUS_TASK_STATE_PATH: path, ELANOUS_POD_DISTRIBUTOR_ENTRY: 'tasks-hand' });
   expect(Object.hasOwn(cards[0]!, 'taLand')).toBe(false);
 });
 
@@ -1822,7 +1822,9 @@ test('COORD-ENTRANCE-FOLD: 중첩 cwd의 실제 tasks hand 진입은 주입 없�
   const orderFile = join(temp, 'nested.work-order.json');
   mkdirSync(nested, { recursive: true });
   execFileSync('git', ['init', '-q', repoRoot]);
-  const order = buildWorkOrder({ cellId: 'COORD-NESTED-CWD', version: '0.2.42', priority: 'P0', boundary: 'src/loops/orchestrator/tick.ts' });
+  // A live hand refuses a work order whose critical fields (boundary · budget · contract · escalation) are «모름».
+  const order = buildWorkOrder({ cellId: 'COORD-NESTED-CWD', version: '0.2.42', priority: 'P0', boundary: 'src/loops/orchestrator/tick.ts',
+    budget: 'time=6900s usd=1 tier=low pod=aws1 rework=1', contract: 'coordinator-shadow 원문 hash 행', escalation: 'OP' });
   writeFileSync(orderFile, `${JSON.stringify(order)}\n`);
   const modulePath = join(import.meta.dir, '../cli/tasks-cli.ts');
   const commanderModule = import.meta.resolve('commander');

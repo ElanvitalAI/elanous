@@ -1,0 +1,36 @@
+{
+  "id": "op-on-eln-world",
+  "name": "OP-on-eln simulation world (six-axis OP replacement score)",
+  "audience": "internal",
+  "implementation": [
+    "src/ux-sim/op-on-eln-world.ts",
+    "src/ux-sim/op-on-eln-run.ts",
+    "src/ux-sim/fixtures/op-on-eln-fake-eln.ts",
+    "src/ux-sim/op-world-decision-fixtures.ts",
+    "src/ux-sim/op-world-evaluator.ts",
+    "src/ux-sim/op-world-replay.ts",
+    "src/ux-sim/op-world-score.ts"
+  ],
+  "tests": [
+    "src/ux-sim/op-on-eln-world.test.ts",
+    "src/ux-sim/op-on-eln-run.test.ts",
+    "src/ux-sim/op-world-evaluator.test.ts",
+    "src/ux-sim/op-world-score.test.ts"
+  ],
+  "target": "runs an isolated Elanous OP against an in-memory ledger (no production mail, PR or clock adapter) and scores six axes from ELN-SEAT-RUNTIME-OP-REPLACEMENT",
+  "inputs": [
+    "sanitized replay cases (op-world-replay.ts · op-world-decision-fixtures.ts)",
+    "a fake eln agent boundary (fixtures/op-on-eln-fake-eln.ts · correct/wrong/silent modes)"
+  ],
+  "observations": [
+    "choice decoding, world application and receipt verdict run on the real path",
+    "dispositions come only from structured choice fields, not reason prose",
+    "the receipt file, not stdout, carries the verdict"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/op-on-eln-run.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

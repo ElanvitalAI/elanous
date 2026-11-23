@@ -1,0 +1,50 @@
+{
+  "id": "sim-world-capsule-events",
+  "name": "SIM-WORLD capsule-events pack (C1–C8 · steer pre-empt)",
+  "audience": "internal",
+  "implementation": [
+    "src/ux-sim/sim-world/capsule-events/c1-harness.ts",
+    "src/ux-sim/sim-world/capsule-events/c2-mail-tool.ts",
+    "src/ux-sim/sim-world/capsule-events/c3-esc-cancel.ts",
+    "src/ux-sim/sim-world/capsule-events/c3-mail.ts",
+    "src/ux-sim/sim-world/capsule-events/c3-shell.ts",
+    "src/ux-sim/sim-world/capsule-events/c3-trio.ts",
+    "src/ux-sim/sim-world/capsule-events/c4-agent-background.ts",
+    "src/ux-sim/sim-world/capsule-events/c5-wakeup.ts",
+    "src/ux-sim/sim-world/capsule-events/c6-boot-backlog.ts",
+    "src/ux-sim/sim-world/capsule-events/c7-mcp.ts",
+    "src/ux-sim/sim-world/capsule-events/c8-no-repeat.ts",
+    "src/ux-sim/sim-world/capsule-events/scenarios.ts",
+    "src/ux-sim/sim-world/capsule-events/steer-preempt.ts"
+  ],
+  "tests": [
+    "src/ux-sim/sim-world/capsule-events/c1-harness.test.ts",
+    "src/ux-sim/sim-world/capsule-events/c3-esc-cancel.test.ts",
+    "src/ux-sim/sim-world/capsule-events/c3-mail.test.ts",
+    "src/ux-sim/sim-world/capsule-events/c3-shell.test.ts",
+    "src/ux-sim/sim-world/capsule-events/c4-agent-background.test.ts",
+    "src/ux-sim/sim-world/capsule-events/c5-wakeup.test.ts",
+    "src/ux-sim/sim-world/capsule-events/c6-boot-backlog.test.ts",
+    "src/ux-sim/sim-world/capsule-events/c7-mcp-cleanup.test.ts",
+    "src/ux-sim/sim-world/capsule-events/c7-mcp.test.ts",
+    "src/ux-sim/sim-world/capsule-events/cx18-registration.test.ts",
+    "src/ux-sim/sim-world/capsule-events/registration.test.ts"
+  ],
+  "target": "replays capsule result events (background agent, harness child, mail, shell, Esc cancel, wake-up, boot backlog, MCP, no-repeat) into an isolated seat universe and judges each against the kernel expectation table",
+  "inputs": [
+    "capsule-events scenario rows (scenarios.ts)",
+    "sim-world-expect.json verdicts",
+    "a throw-away universe per scenario"
+  ],
+  "observations": [
+    "the real queue bridge and wake path consume each injected capsule event",
+    "the LLM is the external fake device",
+    "each verdict goes through the kernel expectation ratchet"
+  ],
+  "entryCommands": [
+    "eln --test=<isolated-state> sim world run capsule-events --seed 1"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

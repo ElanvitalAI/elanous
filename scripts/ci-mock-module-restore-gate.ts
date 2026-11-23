@@ -11,6 +11,7 @@
  * 관측값을 재스냅샷하여 수복 뒤 baseline을 낮춘다.
  */
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join, relative } from 'node:path';
 import ts from 'typescript';
 
@@ -22,6 +23,7 @@ type RestoreScanEntry = { count: number; modules: string[] };
 type MockModuleRestoreGateIo = {
   args?: string[];
   cwd?: string;
+  compareRef?: string;
   scan?: () => Map<string, RestoreScanEntry>;
   loadBaseline?: () => Map<string, number>;
   writeBaseline?: (entries: Map<string, RestoreScanEntry>) => void;
@@ -244,6 +246,27 @@ function parseChangedFiles(args: readonly string[]): Set<string> | null {
   return new Set(files);
 }
 
+/** Read the actual baseline tree, not a possibly stale debt snapshot in the candidate. */
+function scanBaselineRef(root: string, ref: string, files: Iterable<string>): Map<string, RestoreScanEntry> {
+  const env = { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined, GIT_COMMON_DIR: undefined, GIT_NO_LAZY_FETCH: '1' };
+  const git = (args: string[]) => spawnSync('git', args, { cwd: root, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const resolved = git(['rev-parse', '--verify', `${ref}^{commit}`]);
+  const sha = resolved.stdout?.trim();
+  if (resolved.status !== 0 || !sha || !/^[a-f0-9]{40}$/i.test(sha)) throw new Error('기준 커밋을 확인할 수 없습니다');
+  const listing = git(['ls-tree', '-r', '-z', '--name-only', sha]);
+  if (listing.status !== 0) throw new Error('기준 트리 파일을 읽을 수 없습니다');
+  const tracked = new Set(listing.stdout.split('\0').filter(Boolean));
+  const result = new Map<string, RestoreScanEntry>();
+  for (const file of files) {
+    if (!tracked.has(file)) continue;
+    const show = git(['show', `${sha}:${file}`]);
+    if (show.status !== 0) throw new Error(`기준 파일을 읽을 수 없습니다: ${file}`);
+    const modules = scanMockModuleRestoreCandidates(show.stdout);
+    if (modules.length) result.set(file, { count: modules.length, modules });
+  }
+  return result;
+}
+
 export function runMockModuleRestoreGate(io: MockModuleRestoreGateIo = {}): number {
   const log = io.log ?? console.log;
   const error = io.error ?? console.error;
@@ -262,6 +285,26 @@ export function runMockModuleRestoreGate(io: MockModuleRestoreGateIo = {}): numb
     (io.writeBaseline ?? writeBaseline)(current);
     log(`[mock-module-restore-gate] baseline 갱신 — ${current.size} 파일 · ${total} 미복구 mock.module.`);
     return 0;
+  }
+  if (io.compareRef) {
+    try {
+      const baseline = scanBaselineRef(root, io.compareRef, current.keys());
+      const violations = [...current].flatMap(([file, entry]) => {
+        const prior = new Set(baseline.get(file)?.modules ?? []);
+        const introduced = entry.modules.filter(module => !prior.has(module));
+        return introduced.length ? [{ file, introduced }] : [];
+      });
+      if (violations.length) {
+        error('[mock-module-restore-gate] FAIL — 기준 커밋에 없는 미복구 mock.module 감지.');
+        for (const { file, introduced } of violations) error(`  ${file}: ${introduced.join(', ')}`);
+        return 1;
+      }
+      log('[mock-module-restore-gate] PASS — 기준 커밋 대비 신규 미복구 mock.module 없음.');
+      return 0;
+    } catch (cause) {
+      error(`[mock-module-restore-gate] FAIL — 기준 측정 불가: ${cause instanceof Error ? cause.message : String(cause)}`);
+      return 1;
+    }
   }
   const loadedBaseline = io.loadBaseline ? io.loadBaseline() : loadBaseline(root);
   const baseline = changedFiles === null

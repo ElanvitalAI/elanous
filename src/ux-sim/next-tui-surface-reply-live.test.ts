@@ -32,14 +32,14 @@ test.each([18, 35])('installed Next TUI keeps tool output in explicit log and on
         }),
         ELANOUS_CONFIG_DIR: root, ELANOUS_STATE_DIR: root,
       },
-      ready: { label: 'boot', until: (screen) => screen.includes('Ctrl+Q 종료') && screen.includes('❯') },
+      ready: { label: 'boot', until: (screen) => screen.includes('Ctrl+Q quit') && screen.includes('❯') },
       steps: [
         { label: 'basic answer', text: 'PLUGIN-LIVE 제안 적용해줘', timeoutMs: TURN_TIMEOUT_MS,
-          until: (screen) => screen.includes('턴 완료') && screen.includes('[fake-llm] done') },
+          until: (screen) => screen.includes('Turn done') && screen.includes('[fake-llm] done') },
         { label: 'explicit log', keys: '\x1b[5~', timeoutMs: LOG_TIMEOUT_MS,
-          until: (screen) => screen.includes('도구: suggest_accept · 오류') },
+          until: (screen) => screen.includes('● log') && screen.includes('tool · suggest_accept') },
         { label: 'back to basic', keys: '\x1b', timeoutMs: LOG_TIMEOUT_MS,
-          until: (screen) => screen.includes('[fake-llm] done') && !screen.includes('로그 탐색') && !screen.includes('도구:') },
+          until: (screen) => screen.includes('[fake-llm] done') && !screen.includes('● log') && !screen.includes('tool · ') },
       ],
       ...(process.env.ELANOUS_SURFACE_REPLY_PTY_ARTIFACT
         ? { artifactPath: process.env.ELANOUS_SURFACE_REPLY_PTY_ARTIFACT.replace(/\.json$/, `-${rows}.json`) } : {}),
@@ -48,11 +48,12 @@ test.each([18, 35])('installed Next TUI keeps tool output in explicit log and on
     const log = run.frames.find((frame) => frame.label === 'explicit log')?.screen ?? '';
     const returned = run.frames.find((frame) => frame.label === 'back to basic')?.screen ?? '';
     expect(basic).toContain('[fake-llm] done');
-    expect(basic).not.toContain('도구:');
+    expect(basic).not.toContain('tool · ');
     expect(basic).not.toContain('graph route requires a verified owner context');
-    expect(log).toContain('도구: suggest_accept · 오류');
+    // 11-23 next TUI log view: tool rows fold as «▸ tool · <name> 결과» under the «● log» footer.
+    expect(log).toContain('▸ tool · suggest_accept');
     expect(returned).toContain('[fake-llm] done');
-    expect(returned).not.toContain('도구:');
+    expect(returned).not.toContain('tool · ');
     expect(returned).not.toContain('graph route requires a verified owner context');
     const sessionFile = readdirSync(join(root, 'sessions')).find((file) => file.endsWith('.jsonl'));
     expect(sessionFile).toBeDefined();
@@ -86,9 +87,9 @@ test('installed Next TUI renders authored final actions in order through public 
         }),
         ELANOUS_CONFIG_DIR: root, ELANOUS_STATE_DIR: root,
       },
-      ready: { label: 'boot', until: (screen) => screen.includes('Ctrl+Q 종료') && screen.includes('❯') },
+      ready: { label: 'boot', until: (screen) => screen.includes('Ctrl+Q quit') && screen.includes('❯') },
       steps: [{ label: 'public final actions', text: '정리해줘', timeoutMs: TURN_TIMEOUT_MS,
-        until: (screen) => screen.includes('턴 완료') && screen.includes(`할 일: ${goldenReply.actions[1]}`) }],
+        until: (screen) => screen.includes('Turn done') && screen.includes(`할 일: ${goldenReply.actions[1]}`) }],
       ...(process.env.ELANOUS_SURFACE_REPLY_ACTION_PTY_ARTIFACT
         ? { artifactPath: process.env.ELANOUS_SURFACE_REPLY_ACTION_PTY_ARTIFACT } : {}),
     });
@@ -96,7 +97,7 @@ test('installed Next TUI renders authored final actions in order through public 
     expect(screen).toContain(goldenReply.answer);
     expect(screen.indexOf('할 일: 검토하세요.')).toBeGreaterThan(screen.indexOf(goldenReply.answer));
     expect(screen.indexOf('할 일: 공유하세요.')).toBeGreaterThan(screen.indexOf('할 일: 검토하세요.'));
-    expect(screen).not.toContain('도구:');
+    expect(screen).not.toContain('tool · ');
     expect(screen).not.toContain(goldenReply.internalMarker);
     const publicLines = screen.split('\n').map((line) => line.trim())
       .filter((line) => line === goldenReply.answer || line.startsWith('할 일: '));

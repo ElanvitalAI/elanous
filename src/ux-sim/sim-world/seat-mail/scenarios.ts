@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { Command } from 'commander';
 import { registerMsgCommands } from '../../../cli/msg-cli.js';
 import { MsgStore } from '../../../msg/msg-store.js';
-import { dispatchMsgAck } from '../../../skills/tools/ops-ledger.js';
+import { dispatchMsgAck, dispatchMsgPost } from '../../../skills/tools/ops-ledger.js';
 import { createNextTuiQueue } from '../../../tui/core/queue.js';
 import { noticeOneDispatch, openExternalEventOne, resetExternalEventOneWire } from '../../../tui/external-event-one-wire.js';
 import { createIdleWakeDoor } from '../../../tui/idle-wake-door.js';
@@ -258,4 +258,50 @@ const m1b: SimWorldScenario = {
   },
 };
 
-export const simWorldScenarios: readonly SimWorldScenario[] = [m1, m1b, m2, m3, m4, m5, m6, m7];
+/** M8 · 11-23 ELN-RESEARCH-TURN-SEAT-REPLY: a seat mail «look this up and reply to MK» became a research turn, and the
+ * research allowlist stripped MsgPost — the seat researched but could not reply. The turn runs the real core turn with a
+ * fake LLM (research evidence faked); its MsgPost goes through the real tool into this universe's ledger. */
+const m8: SimWorldScenario = {
+  id: 'M8',
+  title: 'a seat research turn from seat mail replies by MsgPost into the ledger',
+  async run(ctx) {
+    const u = seatUniverse(ctx);
+    const request = u.withStore((store) => store.post({ from: 'MK', to: SEAT, body: 'Research recent battery policy updates using current sources.', intent: 'request' }));
+    const replyBody = `battery policy summary for #${request.id}`;
+    const offered: string[][] = [];
+    let replyDispatched = false;
+    const replier: LLMProvider = {
+      name: 'sim-seat-researcher', defaultModel: 'sim-seat-researcher-model', available: () => true,
+      async *chat() { yield 'unused'; },
+      async *streamChat(_messages, opts) {
+        const names = (opts?.tools ?? []).map((tool) => tool.name);
+        offered.push(names);
+        if (!replyDispatched && names.includes('MsgPost')) {
+          yield { type: 'tool_call', id: 'sim-m8-reply', name: 'MsgPost', args: { from: SEAT, to: 'MK', body: replyBody, replyTo: request.id } };
+          return;
+        }
+        yield { type: 'text', delta: 'replied to MK' };
+      },
+    };
+    const mailTool = (name: string) => ({ name, description: `${name} seat mail`, parameters: { type: 'object', properties: {} } });
+    const previous = setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm, provider: 'auto', fallbackChain: [] } }));
+    try {
+      await runCoreTurn({
+        sessionId: 'sim-m8', messages: [{ role: 'user', content: `[seat-mail] MK → ${SEAT} #${request.id}: ${request.body}` }], userText: request.body,
+        tools: [mailTool('WebSearch'), mailTool('WebFetch'), mailTool('MsgList'), mailTool('MsgPost'), mailTool('MsgAck')],
+        dispatchTool: async (name, args) => {
+          if (name !== 'MsgPost') return { ok: true };
+          replyDispatched = true;
+          return dispatchMsgPost(args as Record<string, unknown>, { openStore: () => new MsgStore(u.msgPath) });
+        },
+        signal: new AbortController().signal, initialProvider: replier,
+      }, { runResearch: async () => ({ ok: true, output: 'research evidence' }), stallSeat: SEAT, stallMailer: async () => {} });
+    } finally { setUserConfigOverlay(previous); }
+    const rows = u.withStore((store) => store.db.query('SELECT sender, recipient FROM msg_messages WHERE body = ?').all(replyBody) as Array<{ sender: string; recipient: string }>);
+    ctx.recorder.event('m8-reply', { rows: rows.length, offered: offered[0] ?? [] });
+    if (rows.length === 1 && rows[0]!.recipient === 'MK') return { ok: true };
+    return fail('seat research turn could not reply', `reply rows ${JSON.stringify(rows)} · first tool set ${JSON.stringify(offered[0] ?? [])}`);
+  },
+};
+
+export const simWorldScenarios: readonly SimWorldScenario[] = [m1, m1b, m2, m3, m4, m5, m6, m7, m8];

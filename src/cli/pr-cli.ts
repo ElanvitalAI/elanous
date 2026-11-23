@@ -827,10 +827,10 @@ function runPrLandDocsCliCheck(root: string): (docFiles: readonly string[]) => D
   return (docFiles) => checkCommands(docFiles.flatMap((f) => extractElanousCommands(f, readFileSync(join(root, f), 'utf8'))));
 }
 
-function runPrLandMockModuleRestoreGate(out: { log: (message: string) => void; error: (message: string) => void }, cwd: string = process.cwd()): boolean {
+export function runPrLandMockModuleRestoreGate(out: { log: (message: string) => void; error: (message: string) => void }, cwd: string = process.cwd()): boolean {
   const top = runGitCommand(cwd, ['rev-parse', '--show-toplevel'], { encoding: 'utf-8', env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined, GIT_COMMON_DIR: undefined } as NodeJS.ProcessEnv });
   const root = top.status === 0 && String(top.stdout ?? '').trim() ? String(top.stdout).trim() : cwd;
-  return runMockModuleRestoreGate({ args: [], cwd: root, log: out.log, error: out.error }) === 0;
+  return runMockModuleRestoreGate({ args: [], cwd: root, compareRef: 'origin/main', log: out.log, error: out.error }) === 0;
 }
 
 // 🚨 안드로이드 축 — `bun test` 우주 «밖»이라 다른 게이트가 원리상 못 본다.
@@ -2041,6 +2041,53 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     return 1;
   }
   record('same-branch', true);
+
+  // ⛔⭐ LAND-SCOPE-REVERT-GUARD — `upsertPr()` 의 `git add -A` 가 «PR 범위 밖» 되돌림까지
+  //   그대로 커밋하는 것을 커밋 «전»에 막는다(2026-08-24 사고 원형: `git checkout <ref> -- <file>` 이
+  //   index+worktree 를 되돌렸고 착지 커밋이 그 되돌림을 흡수했다). same-branch 가드와 같은 자리·같은 성격으로 거부한다.
+  //   📏 판정: S = PR 범위(`base...HEAD`), T = 이번에 커밋될 작업트리/index 변경(추적 대상만 — untracked 는
+  //     untracked-files 경고의 영역이다). T∖S 의 경로 p 가 `git diff --name-only <base> -- p` 로
+  //     «차이 없음»이면 p 는 PR head 내용이 아니라 base 내용으로 되돌린 것이다 ⇒ 거부.
+  //     diff 조회 실패는 fail-closed 로 착지를 막는다.
+  {
+    const scopeDiff = run('git', ['diff', '--name-only', '--no-renames', `${base}...HEAD`], { cwd });
+    if (!scopeDiff.ok) {
+      record('scope-revert-guard', false, { status: 'scope-diff-unreadable' });
+      out.error('✗ scope-revert-guard: PR 범위(diff base...HEAD) 조회 실패 — 되돌림 검사를 못 했으므로 착지를 막습니다(fail-closed). ⛔ 아무것도 커밋하지 않았습니다.');
+      return 1;
+    }
+    const prScope = new Set(scopeDiff.out.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+    const treeDiff = run('git', ['diff', '--name-only', 'HEAD'], { cwd });
+    if (!treeDiff.ok) {
+      record('scope-revert-guard', false, { status: 'tree-diff-unreadable' });
+      out.error('✗ scope-revert-guard: 작업트리 변경(diff HEAD) 조회 실패 — 되돌림 검사를 못 했으므로 착지를 막습니다(fail-closed). ⛔ 아무것도 커밋하지 않았습니다.');
+      return 1;
+    }
+    const candidatePaths = new Set(treeDiff.out.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+    for (const entry of stagedPaths(run, cwd) ?? []) {
+      if (entry.xy === '??') continue; // 추적되지 않던 파일은 되돌림이 아니다 — untracked-files 경고가 따로 잡는다.
+      candidatePaths.add(entry.path);
+      if (entry.originalPath) candidatePaths.add(entry.originalPath);
+    }
+    const revertedPaths: string[] = [];
+    for (const path of candidatePaths) {
+      if (prScope.has(path)) continue;
+      const againstBase = run('git', ['diff', '--name-only', '--no-renames', base, '--', path], { cwd });
+      if (!againstBase.ok) {
+        record('scope-revert-guard', false, { status: 'path-diff-unreadable', path });
+        out.error(`✗ scope-revert-guard: 경로 ${path} 의 base 대비 diff 조회 실패 — 되돌림 검사를 못 했으므로 착지를 막습니다(fail-closed). ⛔ 아무것도 커밋하지 않았습니다.`);
+        return 1;
+      }
+      // 차이 없음 = 트리/index 내용이 base 커밋 내용 그대로다 — PR head 내용을 되돌린 형태.
+      if (againstBase.out.trim() === '') revertedPaths.push(path);
+    }
+    if (revertedPaths.length > 0) {
+      record('scope-revert-guard', false, { paths: revertedPaths });
+      out.error(`✗ scope-revert-guard: PR 범위 밖 경로를 base 내용으로 되돌린 것이 이번 커밋에 포함됩니다 — ${revertedPaths.join('; ')}. 작업트리/index 를 PR head 내용으로 복원한 뒤 다시 치십시오. ⛔ 아무것도 커밋하지 않았습니다.`);
+      return 1;
+    }
+    record('scope-revert-guard', true, { candidatePathCount: candidatePaths.size, scopePathCount: prScope.size });
+  }
 
   // `upsertPr()` performs `git add -A`; observe every path it would stage before that write.
   let activeRunConflicts: Array<{ path: string; runIds: string[] }> = [];

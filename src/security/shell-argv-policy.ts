@@ -191,6 +191,15 @@ export type SeatAllowListParse
 const FILE_VALUE = /^(?!-).+$/;
 const SLOT_SYNTAX = /^<([\w-]+)>$/;
 const REP_SYNTAX = /^<([\w-]+)\.\.\.>$/;
+// Path templates match exactly one argv token. Dynamic segments cannot encode slashes,
+// dot traversal, query strings, or options; numeric ids are explicitly typed.
+function pathTemplate(word: string): RegExp | null {
+  if (!word.includes('/') || !word.includes('<')) return null;
+  const parts = word.split('/');
+  if (parts.some(part => !/^(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|<segment>|<number>)$/.test(part))) return null;
+  if (!parts.some(part => part === '<segment>' || part === '<number>')) return null;
+  return new RegExp('^' + parts.map(part => part === '<segment>' ? '[A-Za-z0-9_][A-Za-z0-9_.-]*' : part === '<number>' ? '[0-9]+' : part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('/') + '$');
+}
 const ITEM_ID = /^[a-z0-9][a-z0-9-]*$/;
 const LOCK_HEX_LENGTH = 64; // Source: a SHA-256 digest is 256 bits encoded as two hexadecimal characters per byte.
 
@@ -198,6 +207,7 @@ const LOCK_HEX_LENGTH = 64; // Source: a SHA-256 digest is 256 bits encoded as t
  * 목록 파일 해석 — 줄 문법(앞뒤 공백 다듬음):
  *   version <단조 증가 정수>      — 목록의 세대. 정확히 한 줄.
  *   allow <항목ID> <argv 모양…>   — 모양: 낱말 그대로 · `<이름>` 슬롯 · `<이름...>` 반복(마지막 토큰만).
+ *     경로 토큰은 예: `repos/<segment>/<segment>/pulls/<number>`; segment 는 안전한 단일 구간, number 는 숫자만.
  *   revoke <항목ID> <버전>        — 철회(tombstone). 되살리면 거부.
  *   lock <sha256 64hex>          — 그 외 모든 줄(주석·빈 줄 제외)을 '\n' 으로 이은 것의 sha256. 정확히 한 줄.
  * `#` 줄은 주석. 문법을 벗어나면 목록 전체가 거부된다(ok:false — 읽는 쪽이 무시하고 보고한다).
@@ -234,7 +244,11 @@ export function parseSeatAllowList(text: string, fileRuleName = 'seat-file'): Se
         const repMatch = REP_SYNTAX.exec(word);
         if (slotMatch !== null) tokens.push({ slot: slotMatch[1]!, re: FILE_VALUE });
         else if (repMatch !== null) { tokens.push({ rep: repMatch[1]!, re: FILE_VALUE }); repSeen = true; }
-        else tokens.push({ lit: word });
+        else if (word.includes('/') && word.includes('<')) {
+          const re = pathTemplate(word);
+          if (re === null) return fail('invalid path template');
+          tokens.push({ slot: 'path', re });
+        } else tokens.push({ lit: word });
       }
       if (tokens.length === 0) return fail(`allow ${id} has no argv shape`);
       // SHELL-POLICY-REDACT-EDGE-FU (Terra #38524 ⓒ allow any): the program is fixed — a slot or repeat in the first

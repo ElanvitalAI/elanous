@@ -26,6 +26,7 @@ const num = (name: string): number | undefined => {
 // startHolder 가 이들을 홀더 메모리에만 남기고 pane 자식 env 에서는 걷어낸다(비밀이 자식에게 내려가면
 // pane 안의 임의 코드가 입양 비밀을 읽는다).
 const PANE_ENV_KEYS = ['ELANOUS_ELS_WS', 'ELANOUS_ELS_PANE', 'ELANOUS_ELS_SOCKET', 'ELANOUS_ELS_PANE_TOKEN',
+  'ELANOUS_EVENT_WS', 'ELANOUS_EVENT_PANE', 'ELANOUS_EVENT_SOCKET',
   'ELANOUS_ELS_ADOPTION_SECRET', 'ELANOUS_ELS_SERVER_PID', 'ELANOUS_ELS_SERVER_START'] as const;
 const paneEnv = (): Record<string, string> => Object.fromEntries(PANE_ENV_KEYS.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key] as string]]));
 

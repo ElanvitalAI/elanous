@@ -86,7 +86,7 @@
   "src/context-bus/external-events.test.ts": 1,
   "src/context-bus/session-events.test.ts": 3,
   "src/dashboard/first-screen-band-wiring.test.ts": 2,
-  "src/dashboard/index.test.ts": 6,
+  "src/dashboard/index.test.ts": 3,
   "src/decisions/decision-linear-projection.test.ts": 1,
   "src/domains/fleet.test.ts": 1,
   "src/domains/outbound-alert.test.ts": 2,

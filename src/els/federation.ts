@@ -3,6 +3,7 @@
 // window (`els serve --http`). This module writes nothing (only the owner of each host saves its own journal); a host
 // that does not answer stays in the list as down (`?`).
 
+import { parsePaneSeatStatus, type PaneSeatStatus } from './seat-status.js';
 import { formatAddress, parseAddress } from './address.js';
 import type { ElsResult } from './core.js';
 import type { FederatedHost, HostRegistry } from './hosts.js';
@@ -20,9 +21,11 @@ export interface FederationDeps {
   readonly postJson?: (host: FederatedHost, path: string, payload: unknown) => Promise<{ status: number; body: unknown }>;
 }
 
-interface RemotePane { ws: string; tab: string; pane: string; title: string; cwd: string; state: string; build?: unknown; role?: 'coordinator';
+interface RemotePane { ws: string; tab: string; pane: string; title: string; cwd: string; state: string; seat?: string | null; spaceCoordinator?: boolean; activityState?: string; kind?: string; build?: unknown; role?: 'coordinator';
   /** ELS-TAB-STATE-BADGE: decided once at the origin server; absent when that server is older (state then reads as before). */
-  badge?: string; badgeLabel?: string; stalled?: boolean; lastEventAtMs?: number }
+  badge?: string; badgeLabel?: string; stalled?: boolean; lastEventAtMs?: number;
+  /** SEAT-STATE-ENUM: the origin server's status codes, validated. */
+  status?: PaneSeatStatus }
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
@@ -40,10 +43,15 @@ function remotePanes(body: unknown, hostName: string): RemotePane[] | undefined 
     if (!reparsed || reparsed.ws !== parts.ws || reparsed.tab !== parts.tab || reparsed.pane !== parts.pane) return undefined;
     rows.push({ ws: parts.ws, tab: parts.tab, pane: parts.pane,
       title: String(pane.title ?? ''), cwd: String(pane.cwd ?? ''), state: String(pane.state ?? ''), build: pane.build,
+      ...(pane.seat === null || (typeof pane.seat === 'string' && /^[A-Z][A-Z0-9_-]{0,63}$/.test(pane.seat)) ? { seat: pane.seat } : {}),
+      ...(typeof pane.kind === 'string' && ['eln', 'codex', 'claude', 'grok', 'shell', 'other'].includes(pane.kind) ? { kind: pane.kind } : {}),
       ...(pane.role === 'coordinator' ? { role: 'coordinator' } : {}),
+      ...(pane.spaceCoordinator === true ? { spaceCoordinator: true } : {}),
+      ...(typeof pane.activityState === 'string' && ['working', 'idle', 'blocked', 'exited', 'done', 'unknown'].includes(pane.activityState) ? { activityState: pane.activityState } : {}),
       ...(typeof pane.badge === 'string' ? { badge: pane.badge } : {}),
       ...(typeof pane.badgeLabel === 'string' ? { badgeLabel: pane.badgeLabel } : {}),
       ...(typeof pane.stalled === 'boolean' ? { stalled: pane.stalled } : {}),
+      ...(parsePaneSeatStatus(pane.status) ? { status: parsePaneSeatStatus(pane.status) } : {}),
       ...(typeof pane.lastEventAtMs === 'number' && Number.isFinite(pane.lastEventAtMs) ? { lastEventAtMs: pane.lastEventAtMs } : {}) });
   }
   return rows;
@@ -60,7 +68,7 @@ export function createFederation(deps: FederationDeps) {
     async list(): Promise<ElsResult> {
       const local = await deps.askLocal({ op: 'ls' });
       const hostRows: { name: string; reach: HostReach; reason?: string }[] = [];
-      let localBody: { workspaces: unknown[]; tabs: unknown[]; panes: Record<string, unknown>[] } = { workspaces: [], tabs: [], panes: [] };
+      let localBody: { workspaces: unknown[]; tabs: unknown[]; panes: Record<string, unknown>[]; hqCoordinatorSeat?: string } = { workspaces: [], tabs: [], panes: [] };
       if (local.exitCode === 0) {
         localBody = JSON.parse(local.message) as typeof localBody;
         hostRows.push({ name: deps.localHost, reach: 'local' });
@@ -102,7 +110,8 @@ export function createFederation(deps: FederationDeps) {
         }
       }
       return { exitCode: 0, message: JSON.stringify({ hosts: hostRows, ...registryNotes(),
-        workspaces: localBody.workspaces, remoteWorkspaces, tabs: localBody.tabs, panes }, null, 2) };
+        workspaces: localBody.workspaces, remoteWorkspaces, tabs: localBody.tabs, panes,
+        ...(typeof localBody.hqCoordinatorSeat === 'string' ? { hqCoordinatorSeat: localBody.hqCoordinatorSeat } : {}) }, null, 2) };
     },
 
     /** `els do <address> <text>`: local → this host's owner; remote → the owner on that host (never written from here). */

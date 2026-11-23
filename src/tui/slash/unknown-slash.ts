@@ -2,7 +2,8 @@
 // Only a bare command-shaped first token (`/foo`, `/foo bar`) is treated as a mistyped command; a path
 // (`/Users/x`), `//text` and prose that merely contains a slash still go to the model unchanged.
 
-const COMMAND_SHAPE = /^\/[A-Za-z][\w-]*$/;
+// TUI-SLASH-DURING-TURN — during-turn 즉시 실행 판정기(slash/during-turn.ts)가 같은 모양 규칙을 쓴다.
+export const COMMAND_SHAPE = /^\/[A-Za-z][\w-]*$/;
 
 function distance(a: string, b: string): number {
   const row = Array.from({ length: b.length + 1 }, (_, i) => i);

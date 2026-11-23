@@ -3,7 +3,8 @@
 // status-vocab. Pure functions: the terminal itself is wired in src/cli/els-cli.ts.
 
 import { StringDecoder } from 'node:string_decoder';
-import { childSummary, STATUS, type StatusColor, type StatusWord } from './status-vocab.js';
+import { childSummary, STATUS, wordOfSeatState, type StatusColor, type StatusWord } from './status-vocab.js';
+import { parsePaneSeatStatus } from './seat-status.js';
 
 const ESC = '\u001b';
 const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
@@ -177,13 +178,16 @@ export const SIDEBAR_COLS = 28;
 export const MIN_COLS_FOR_SIDEBAR = 60;
 
 export interface PaneRow {
-  readonly pane: string; readonly wsId: string; readonly workspace: string; readonly title: string; readonly state: string;
+  readonly pane: string; readonly tabId?: string; readonly wsId: string; readonly workspace: string; readonly title: string; readonly state: string;
   /** Set on a pane of another host (a registered els host or `herdr`): `pane` is then its full address `host:ws/tab/pane`. */
   readonly remote?: string;
   /** ELS-REMOTE-MARKER: its host is reported down — the last known row stays in the list, dimmed and marked «✕». */
   readonly stale?: boolean;
   /** Authoritative role from the workspace listing (never inferred from the title). */
   readonly role?: 'coordinator';
+  readonly spaceCoordinator?: boolean;
+  /** Seat reported by the local server, not inferred from a mutable tab title. */
+  readonly seat?: string;
   /** ELS-SIDEBAR-HERDR-CLEAN: the pane's working folder (the selected space's path line). */
   readonly cwd?: string;
 }
@@ -252,13 +256,14 @@ export function parsePaneRows(listJson: string): PaneRow[] {
   if (Array.isArray(workspaces)) for (const raw of workspaces) {
     if (raw && typeof raw === 'object' && raw.role === 'coordinator' && typeof raw.id === 'string') coordinators.add(raw.id);
   }
+  const tabs = (parsed as { tabs?: Array<{ id: string; label: string }> }).tabs ?? [];
   const rows: PaneRow[] = [];
   for (const raw of panes) {
     if (!raw || typeof raw !== 'object') continue;
     const row = raw as Record<string, unknown>;
     if (typeof row.pane !== 'string' || typeof row.address !== 'string') continue;
     const wsId = row.address.split('/')[0] ?? '';
-    rows.push({ pane: row.pane, wsId, ...(coordinators.has(wsId) ? { role: 'coordinator' as const } : {}), workspace: String(row.workspace ?? ''), title: `${String(row.title ?? row.pane)} ${buildBadge(row.build)}`, state: String(row.state ?? ''), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
+    rows.push({ pane: row.pane, ...(typeof row.tab === 'string' ? { tabId: row.tab } : {}), wsId, ...(coordinators.has(wsId) ? { role: 'coordinator' as const } : {}), ...(row.spaceCoordinator === true ? { spaceCoordinator: true } : {}), ...(typeof row.seat === 'string' && row.seat ? { seat: row.seat } : {}), workspace: String(row.workspace ?? ''), title: `${String(tabs.find(tab => tab.id === row.tab)?.label ?? row.title ?? row.pane)} ${buildBadge(row.build)}`, state: rowState(row), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
   }
   return coordinatorFirst(rows);
 }
@@ -284,15 +289,23 @@ export function parseRemoteRows(listJson: string): PaneRow[] {
     const space = Array.isArray(spaces) ? spaces.find((ws) => ws && typeof ws === 'object' && ws.host === row.host && ws.id === row.ws && typeof ws.name === 'string') : undefined;
     const label = split > 0 ? title.slice(0, split) : space?.name ?? row.ws;
     rows.push({ pane: row.address, wsId: `${row.host}:${row.ws}`, workspace: `⇄${row.host} ${label}`, title: `${split > 0 ? title.slice(split + 3) : title || String(row.pane ?? row.address)} ${buildBadge(row.build)}`,
-      state: String(row.state ?? ''), remote: row.host, ...(row.role === 'coordinator' ? { role: 'coordinator' as const } : {}), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
+      state: rowState(row), remote: row.host, ...(row.role === 'coordinator' ? { role: 'coordinator' as const } : {}), ...(row.spaceCoordinator === true ? { spaceCoordinator: true } : {}), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
   }
   return coordinatorFirst(rows);
+}
+
+/** SEAT-STATE-ENUM: a row's state word from its status code when the server sent one (WAITING_APPROVAL/BLOCKED 🟡, STALLED ⏸),
+ *  else the activity state as before. The code decides; the pane's screen is never read for it. */
+function rowState(row: Record<string, unknown>): string {
+  const status = parsePaneSeatStatus(row.status);
+  return status ? wordOfSeatState(status.state) : String(row.activityState ?? row.state ?? '');
 }
 
 /** Pane state → the shared status word (`exited` reads as done: the screen it left is still there). */
 export function wordOfState(state: string): StatusWord {
   // `failed` is a contract word no PaneState carries today; a list that says it (or a future server) must read as failed, not done.
-  return state === 'working' ? 'working' : state === 'blocked' ? 'blocked' : state === 'idle' ? 'idle' : state === 'failed' ? 'failed' : 'done';
+  // 출처: OP #134199 — `stalled`(ELS-TAB-STATE-BADGE 판정)도 상태 단어로 읽는다(마크 ⏸, #134208 어휘).
+  return state === 'working' ? 'working' : state === 'blocked' ? 'blocked' : state === 'stalled' ? 'stalled' : state === 'idle' ? 'idle' : state === 'failed' ? 'failed' : state === 'unknown' ? 'unknown' : 'done';
 }
 
 const COLOR_SGR: Readonly<Record<StatusColor, string>> = { green: `${ESC}[32m`, yellow: `${ESC}[33m`, dim: `${ESC}[2m`, red: `${ESC}[31m` };
@@ -410,4 +423,4 @@ export function createAppFrameWriter(write: (text: string) => void): (screen: st
   };
 }
 
-export const SIDEBAR_HELP = 'ctrl+b: j/k 이동 · w 작업공간 · 1-9 · c 새 pane · a 엘라누스 채팅 · N 새 작업공간 · x 닫기 · D 작업공간 닫기 · s 사이드바 · q 분리';
+export const SIDEBAR_HELP = 'ctrl+b: m move tab · , rename tab · j/k 이동 · w 작업공간 · 1-9 · c 새 pane · a 엘라누스 채팅 · N 새 작업공간 · x 닫기 · D 작업공간 닫기 · s 사이드바 · g agents 정렬 · q 분리';

@@ -95,7 +95,7 @@ export function createChildTabs(deps: ChildTabsDeps) {
     // A node's start/progress/status is its last observed event, not proof that it is still active forever.
     const quietMs = Math.max(0, now() - node.lastAt);
     const mark = node.status !== 'working' ? STATUS[node.status].mark
-      : quietMs <= 300_000 ? '●' : quietMs <= 1_500_000 ? '◐' : '✕';
+      : quietMs <= 300_000 ? STATUS.working.mark : quietMs <= 1_500_000 ? STATUS.stalled.mark : STATUS.failed.mark;  // 출처: OP #134199/#134208 — 마크 이모지를 한 어휘로
     return `${'  '.repeat(level)}${mark} ${node.label}${note ? ` · ${note}` : ''}`;
   };
   /** A graph run's tab text: its own lines, then its nodes one level in (siblings in start order). */
@@ -169,7 +169,7 @@ export function createChildTabs(deps: ChildTabsDeps) {
       return opened;
     }
     if (!bundles.has(child.ws)) {
-      const opened = deps.core.openVirtual({ ws: child.ws, cwd: child.cwd ?? '/', title: `${indent(0)}⎇ +1 more ●`, text: '' });
+      const opened = deps.core.openVirtual({ ws: child.ws, cwd: child.cwd ?? '/', title: `${indent(0)}⎇ +1 more ${STATUS.working.mark}`, text: '' });
       if (opened.exitCode !== 0) return opened;
       bundles.set(child.ws, (JSON.parse(opened.message) as { pane: string }).pane);
     }

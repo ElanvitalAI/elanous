@@ -8,7 +8,7 @@
 // Behaviour:
 //   • finance.autoLoop.enabled = false (default) → REPORT candidates only.
 //   • finance.autoLoop.enabled = true  → auto-run analysis for the top
-//     `maxPerScan` high-severity candidates, append to the report.
+//     two high-severity candidates, append to the report.
 //   • --arm-once overrides config to run exactly ONE analysis (operator
 //     validation of the autonomous path without arming the cron).
 // The report goes to the L5 report channel (unless --dry).
@@ -17,13 +17,13 @@ import { evaluateOpportunities, renderOpportunities } from '../src/domains/finan
 import { runOpportunityAnalysis, renderOpportunityAnalysis } from '../src/domains/opportunity-analysis.js';
 import { sendTelegramReport } from '../src/telegram-report.js';
 import { getUserConfig } from '../src/user-config.js';
+import { opportunityAnalysisCount } from '../src/domains/opportunity-analysis-count.js';
 
 const dry = process.argv.includes('--dry');
 const armOnce = process.argv.includes('--arm-once');
 
 const cfg = getUserConfig();
 const armed = cfg.finance.autoLoop?.enabled === true;
-const maxPerScan = cfg.finance.autoLoop?.maxPerScan ?? 2;
 
 const signals = evaluateOpportunities();
 const candidates = signals.filter(s => s.warrantsAnalysis);
@@ -35,9 +35,9 @@ const parts: string[] = [
   renderOpportunities(signals),
 ];
 
-// Decide how many analyses to run: armed → up to maxPerScan; --arm-once → 1;
+// Decide how many analyses to run: armed → up to two; --arm-once → 1;
 // otherwise → 0 (report only).
-const runN = armOnce ? Math.min(1, candidates.length) : armed ? Math.min(maxPerScan, candidates.length) : 0;
+const runN = opportunityAnalysisCount(candidates.length, { armOnce, armed });
 
 if (runN > 0) {
   console.error(`[opportunity-scan] running ${runN} autonomous ${runN === 1 ? 'analysis' : 'analyses'}…`);

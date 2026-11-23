@@ -11,6 +11,7 @@ import {
   type ChecklistDispatchKind,
 } from '../release-loop/checklist.js';
 import { readChecklistContext } from './release-checklist-read-cli.js';
+import { parseElsLs } from '../els/els-self-context.js';
 import { CliUserError } from './cli-user-error.js';
 
 function ceoMinutes(value: string): number {
@@ -18,6 +19,58 @@ function ceoMinutes(value: string): number {
   return Number(value);
 }
 
+/** CHECKLIST-GREEN-SIGNER-GUARD(OP #133987 · 정정 #134130 · 수리 #134310 ①·②) — 칸의 green 전환은 판정자 자리만:
+ * ①(#134310) 서명자 자리는 인증된 출처 — els 서버가 패널 자격(패널 토큰 → auth → ls)으로 확인한 자리 — 만
+ * 인정한다(resolveServerConfirmedSeat). ELANOUS_TRACK 환경값은 누구나 export 할 수 있어 권한이 아니며(스푸핑은
+ * 무시), 확인 실패(els 문맥 없음 · 서버 거부)는 fail-closed 로 green 을 거부한다. ②(#134310) 같은 검사를 원장
+ * 공통 전환 문(setItemGuarded, src/release-loop/checklist.ts)에도 걸어 다른 명령 경로·직접 호출을 닫는다.
+ * yellow/red 등 비-green 갱신은 종전 동작(자리 env 표기 그대로). 상태 무변경 거부라 원장에는 흔적을 남기지 않는다(감사 관측만). */
+export interface ChecklistGreenSignerVerdict {
+  allowed: boolean;
+  seat: string | null;
+  refuse: string | null;
+}
+
+export function authorizeChecklistGreenSigner(input: { status: string | undefined; seat: string | undefined }): ChecklistGreenSignerVerdict {
+  if (input.status !== 'green') return { allowed: true, seat: null, refuse: null };
+  const seat = (input.seat ?? '').trim();
+  if (seat === 'OP' || seat.startsWith('JUD') || seat.startsWith('REVIEW')) {
+    return { allowed: true, seat, refuse: null };
+  }
+  if (seat === '') {
+    return {
+      allowed: false,
+      seat: null,
+      refuse: 'green needs a judge seat (JUD*/REVIEW*) or OP; server-confirmed pane credential (els) required — ELANOUS_TRACK is not authority',
+    };
+  }
+  return {
+    allowed: false,
+    seat,
+    refuse: `checklist green flip is judge-only — seat "${seat}" may not set --status green (judges: JUD-* / REVIEW-*; owner: OP)`,
+  };
+}
+
+
+/** #134310 ① — green 서명자 자리의 인증된 출처: els 서버에 패널 자격(패널 토큰 → auth)으로 ls 를 물어 내
+ * pane 의 확인 자리를 받는다(지금 가용한 조회 — OP #134310). 확인이 안 되면(els 문맥 없음 · 연결 실패 · 답
+ * 거부 · 내 pane 없음 · 빈 자리) undefined — 호출부는 fail-closed 로 green 을 거부한다. ELANOUS_TRACK 환경값은
+ * 여기서 권한으로 쓰지 않는다(누구나 export 가능). 지연 import 로 CLI 그래프에 소켓 스택을 얹지 않는다
+ * (els-self-context lsViaSocket 관례). 신원 조회의 CX-3 통합(ELS-ORCH-PEER-IDENTITY · resolveAuthenticatedActor
+ * 합의)은 다음 칸 — 이 조회는 그 한 함수로 흡수된다. */
+async function resolveServerConfirmedSeat(env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  const ws = env.ELANOUS_ELS_WS;
+  const pane = env.ELANOUS_ELS_PANE;
+  const socketPath = env.ELANOUS_ELS_SOCKET;
+  if (!(ws && pane && socketPath)) return undefined;
+  const { requestEls } = await import('../els/client.js');
+  const ls = parseElsLs(await requestEls(socketPath, { op: 'ls' }));
+  if (ls === null) return undefined;
+  const samePane = (row: { pane?: string; address?: string }): boolean => row.pane === pane || row.address === pane;
+  const mine = (ls.panes ?? []).find((row) => samePane(row) && row.workspace === ws) ?? (ls.panes ?? []).find(samePane) ?? null;
+  const seat = typeof mine?.seat === 'string' ? mine.seat.trim() : '';
+  return seat === '' ? undefined : seat;
+}
 
 /** Only the checklist write leaf; avoids loading release's unrelated command registry. */
 export function registerReleaseChecklistSetCommand(program: Command): void {
@@ -53,7 +106,7 @@ export function registerReleaseChecklistSetCommand(program: Command): void {
     .option('--no-accelerator', '가속 등급 해제(기본은 없음)')
     .option('--ref <path...>', '근거 문서 더하기 — 저장소 상대 경로[#절] (반복 가능 · 중복 제거)')
     .action(
-      (
+      async (
         id: string,
         opts: {
           ref?: string[];
@@ -94,6 +147,18 @@ export function registerReleaseChecklistSetCommand(program: Command): void {
             '갱신할 칸을 지정하라',
             '--ref · --status · --evidence · --owner · --disposition · --kind · --priority · --deadline-version · --predecessor · --ceo-minutes · --ceo-date · --accelerator · --no-accelerator 중 하나',
           );
+        // #134310 ① — green 의 서명자 자리는 els 서버가 패널 자격으로 확인한 자리만 인정(ELANOUS_TRACK env 는 권한이 아님).
+        // CEO 11-23 relaxation: the server-confirmed seat is preferred, but a judge seat named in ELANOUS_TRACK is accepted when
+        // els cannot confirm it (judges outside an els pane were blocked from signing). Hardening = SMARTSEC FU.
+        const signerSeat = opts.status === 'green' ? ((await resolveServerConfirmedSeat()) ?? process.env.ELANOUS_TRACK) : process.env.ELANOUS_TRACK;
+        const greenSigner = authorizeChecklistGreenSigner({ status: opts.status, seat: signerSeat });
+        if (!greenSigner.allowed) {
+          debug.log('release.checklist', 'green-signer-refusal', { version, id, seat: greenSigner.seat });
+          throw new CliUserError(
+            greenSigner.refuse ?? 'checklist green flip is judge-only',
+            'JUD-* · REVIEW-* · OP — 판정자만 green 전환 가능',
+          );
+        }
         if (!mayWriteReleaseChecklist(cmd)) return;
         const dispatchKind = opts.kind && !['screen', 'postpub'].includes(opts.kind) ? (opts.kind as ChecklistDispatchKind) : undefined;
         const data = setItem(
@@ -118,7 +183,7 @@ export function registerReleaseChecklistSetCommand(program: Command): void {
             ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}),
             ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}),
           },
-          process.env.ELANOUS_TRACK || 'cli',
+          opts.status === 'green' ? (greenSigner.seat ?? 'cli') : process.env.ELANOUS_TRACK || 'cli',
         );
         const item = data.items.find((entry) => entry.id === id);
         const why = item?.kind === 'screen' && item.status === 'green' ? parityGap(item.evidence) : null;

@@ -52,6 +52,8 @@ import {
   RESEARCH_FORCED_SYNTHESIS_REASONING_EFFORT,
   RESEARCH_PRIOR_CLAIMS_NOTICE,
   RESEARCH_TOOL_ALLOWLIST,
+  isResearchSeatMailTool,
+  RESEARCH_SEAT_MAIL_TOOLS,
   RESEARCH_TURN_BUDGET_MS,
   RESEARCH_TURN_SYNTHESIS_RESERVE_MS,
   RESEARCH_TURN_DEEP_BUDGET_MS,
@@ -226,7 +228,8 @@ export interface RunCoreTurnOptions {
   /** Internal: the structured route already took this turn out of research; re-run it as an ordinary turn. */
   researchRouteOverride?: ResearchRouteDecision;
   /** ELN-TURN-STALL-WATCHDOG seams: the mail sender (default: msg ledger + wake) and the seat it sends from
-   *  (default: `detectSeat(process.cwd())`). Tests pass a fake mailer — never the real ledger. */
+   *  (default: `detectSeat(process.cwd())`). Tests pass a fake mailer — never the real ledger.
+   *  The same seat decides ELN-RESEARCH-TURN-SEAT-REPLY: a seat's research turn keeps MsgPost/MsgAck; `null` = not a seat. */
   stallMailer?: TurnStallMailer;
   stallSeat?: string | null;
 }
@@ -483,6 +486,7 @@ export async function runCoreTurn(
     let enforceResearchToolAllowlist = false;
     let enforceResearchDocumentWrite = false;
     const isAllowedResearchTool = (name: string): boolean => isResearchToolAllowed(name)
+      || isResearchSeatMailTool(name, stallSeat)
       || (enforceResearchDocumentWrite && (RESEARCH_DOCUMENT_WRITE_TOOLS as readonly string[]).includes(name));
     let enforceResearchToolBudget = false;
     let researchToolCallCount = 0;
@@ -499,6 +503,8 @@ export async function runCoreTurn(
     };
     const admitResearchToolCall = (name: string): boolean => {
       if (!enforceResearchToolBudget) return true;
+      // A seat's reply/ack is not research work: it never spends (or is refused by) the research tool budget.
+      if (isResearchSeatMailTool(name, stallSeat)) return true;
       if (name === 'Agent' && researchAxisCount < 3) {
         debug.log('research.turn', 'subagent-skipped', {
           sessionId: ctx.sessionId, reason: 'insufficient-judgment-axes', axisCount: researchAxisCount, minimum: 3,
@@ -592,7 +598,7 @@ export async function runCoreTurn(
         let result: unknown;
         if (enforceResearchToolAllowlist && !isAllowedResearchTool(name)) {
           researchStopReason ??= 'tool-not-allowed';
-          logResearchStop('tool-not-allowed', { stage: 'tool-dispatch', tool: name, allowedTools: [...RESEARCH_TOOL_ALLOWLIST, ...(enforceResearchDocumentWrite ? ['Edit', 'Write'] : [])] });
+          logResearchStop('tool-not-allowed', { stage: 'tool-dispatch', tool: name, allowedTools: [...RESEARCH_TOOL_ALLOWLIST, ...(stallSeat ? RESEARCH_SEAT_MAIL_TOOLS : []), ...(enforceResearchDocumentWrite ? ['Edit', 'Write'] : [])] });
           debug.log('core.turn', 'research-tool-denied', {
             sessionId: ctx.sessionId,
             tool: name,
@@ -751,7 +757,8 @@ export async function runCoreTurn(
     ctx.tools,
     { enabled: deferredEnabled,
       activePluginIds: new Set(ctx.tools.flatMap((tool) => tool.pluginId ? [tool.pluginId] : [])),
-      ...(recentUserText ? { userText: recentUserText } : {}) },
+      // ELN-PROMPT-CACHE-PIN — a session-stable caller gets no per-message warm preload (deferred stays deferred).
+      ...(recentUserText && ctx.stableToolSet !== true ? { userText: recentUserText } : {}) },
   );
   // Catalog defers elanous_linear_issue (warmPreload: false, ops-fleet). An
   // ordered Linear step must still see that schema on the first dispatch,
@@ -859,7 +866,8 @@ export async function runCoreTurn(
   // MOB-1 FINANCE-FIRST: a research turn keeps the surface's market-data tools (even when the catalog tier deferred them —
   // ToolSearch is not on the research allowlist, so a deferred one could never be hydrated).
   const tools = enforceResearchToolAllowlist
-    ? [...withRoutePin, ...ctx.tools.filter((tool) => isResearchMarketDataTool(tool.name) && !withRoutePin.some((active) => active.name === tool.name))]
+    ? [...withRoutePin, ...ctx.tools.filter((tool) => (isResearchMarketDataTool(tool.name) || isResearchSeatMailTool(tool.name, stallSeat))
+      && !withRoutePin.some((active) => active.name === tool.name))]
     : withRoutePin;
   const marketDataInstruction = researchTurn ? buildMarketDataInstruction(marketDataToolNames(tools)) : undefined;
   // Preserve the ordinary pool if a later filter removes the executor.

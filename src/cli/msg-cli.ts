@@ -22,6 +22,7 @@ import { configuredMirrorTarget, runMsgMirrorTick, type MirrorTarget, type MsgMi
 import { JsonMsgMirrorStateStore } from '../msg/msg-mirror-state.js';
 import { startMsgSseServer } from '../msg/msg-sse-server.js';
 import { debug } from '../debug/log.js';
+import { ackDigestInputs, recordAckDigest, type AckDigestInput, type AckDigestPorts } from '../msg/msg-ack-digest.js';
 
 /** OP 승인 #106323(2026-11-19) — TTY 가 아닌데도 닫히지 않는 파이프 stdin(테스트·데몬이 fd 0 을 붙잡은 경우)에
  *  hook 이 영구 블록되지 않게 하는 읽기 상한. 상한 초과 시 빈 입력 폴백 + 원장 'stdin-timeout' 1줄. */
@@ -115,6 +116,13 @@ export interface MsgCliDeps {
   sendMemo?: typeof import('../harness/control-inbox.js').enqueueControlMemo;
   sendStop?: typeof import('../harness/control-inbox.js').enqueueSoftStop;
   screenAlive?: (spaceId: string) => boolean;
+  /** MSG-FILTERS-RELAX: the seat actually running this CLI (default: ELANOUS_TRACK). A different `--from` is stored with
+   *  this seat in `origin.seat`, never refused. */
+  callerSeat?: () => string | null;
+  /** Working directory for the `--from` default (seat folder). */
+  cwd?: () => string;
+  /** MSG-FILTERS-RELAX bulk-ack digest saver (default: the `eln memory add` store). */
+  saveAckDigest?: AckDigestPorts['save'];
 }
 
 type CommonOptions = { json?: boolean };
@@ -134,11 +142,14 @@ function messageRecipient(raw: string | undefined, flag: string): string {
 
 const PRIORITY_LEVELS: Record<string, number> = { urgent: 2, p0: 1, normal: 0 };
 
-function cliPriorityLevel(raw: string | undefined, flag: string): number | undefined {
+/** MSG-FILTERS-RELAX: a word level or any integer; anything else is a warning and the message is stored without it. */
+function cliPriorityLevel(raw: string | undefined, flag: string, warn: (line: string) => void): number | undefined {
   if (raw === undefined) return undefined;
   const level = PRIORITY_LEVELS[raw.trim().toLowerCase()];
-  if (level === undefined) throw new Error(`${flag} must be one of: urgent(2), p0(1), normal(0)`);
-  return level;
+  if (level !== undefined) return level;
+  if (/^-?\d{1,6}$/.test(raw.trim())) return Number(raw.trim());
+  warn(`msg post 경고: ${flag} ${raw} 를 모른다 (urgent · p0 · normal · 정수) — 우선순위 없이 저장한다`);
+  return undefined;
 }
 
 /**
@@ -146,17 +157,22 @@ function cliPriorityLevel(raw: string | undefined, flag: string): number | undef
  * resolve against the directive ledger (directives.db rowid); a missing ledger or unknown id is a
  * human-readable rejection — the post must not silently drop the delegation link.
  */
-function requireCrownDirective(crownDirective: string | undefined): void {
+function checkCrownDirective(crownDirective: string | undefined, warn: (line: string) => void): void {
   if (crownDirective === undefined) return;
-  const dbPath = directiveDbPath();
-  if (!existsSync(dbPath)) throw new Error(`--crown-directive: 지시 원장을 찾을 수 없습니다 (${dbPath}) — 먼저 elanous directives sync 실행`);
-  const id = Number(crownDirective);
-  if (!Number.isSafeInteger(id) || id < 1) throw new Error(`--crown-directive: 올바른 지시 ID가 아닙니다: ${crownDirective}`);
-  const db = new Database(dbPath, { readonly: true });
+  // MSG-FILTERS-RELAX: an unresolved directive id is a warning — the message and its link are stored as written.
   try {
-    const hit = db.query('SELECT 1 FROM directives WHERE rowid = ? LIMIT 1').get(id);
-    if (hit === null || hit === undefined) throw new Error(`--crown-directive: 존재하지 않는 지시 ID입니다: ${crownDirective} — elanous directives search 로 ID를 확인하세요`);
-  } finally { db.close(); }
+    const dbPath = directiveDbPath();
+    if (!existsSync(dbPath)) { warn(`msg post 경고: --crown-directive: 지시 원장을 찾을 수 없습니다 (${dbPath}) — 링크는 그대로 저장`); return; }
+    const id = Number(crownDirective);
+    if (!Number.isSafeInteger(id) || id < 1) { warn(`msg post 경고: --crown-directive: 올바른 지시 ID가 아닙니다: ${crownDirective} — 링크는 그대로 저장`); return; }
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const hit = db.query('SELECT 1 FROM directives WHERE rowid = ? LIMIT 1').get(id);
+      if (hit === null || hit === undefined) warn(`msg post 경고: --crown-directive: 존재하지 않는 지시 ID입니다: ${crownDirective} — 링크는 그대로 저장 (elanous directives search 로 확인)`);
+    } finally { db.close(); }
+  } catch (error) {
+    warn(`msg post 경고: --crown-directive 확인 실패: ${error instanceof Error ? error.message : String(error)} — 링크는 그대로 저장`);
+  }
 }
 
 function integer(raw: string | undefined, flag: string, fallback: number, min: number, max: number): number {
@@ -524,11 +540,27 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .option('--no-dedupe', 'store even when the same from/to/body was posted within the dedupe window (default 30 min)')
     .option('--json')
     .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; bodyFile?: string; replyTo?: string; originKey?: string; agentReply?: string; rejectUndeclared?: boolean; intent?: string; ref?: string[]; deadline?: string; done?: string; needsAck?: boolean; crownDirective?: string; priority?: string; dedupe?: boolean }) => run(async () => {
-      const from = seat(opts.from, '--from');
-      // A217 — a request names when it is due and what «done» means, before anything is stored or woken.
+      const warn = (line: string) => out.error(line);
+      // MSG-FILTERS-RELAX: the seat actually running this CLI. `--from` defaults to it; a different `--from` is stored
+      // with the caller in origin.seat instead of being refused.
+      const caller = (() => {
+        try {
+          const raw = (deps.callerSeat ?? (() => process.env.ELANOUS_TRACK?.trim() || null))();
+          return raw ? canonicalSeatId(raw) : null;
+        } catch { return null; }
+      })();
+      const fromRaw = opts.from ?? caller ?? seatFromCwd((deps.cwd ?? (() => process.cwd()))()) ?? undefined;
+      if (fromRaw === undefined) throw new Error('--from is required (or run from a seat folder / set ELANOUS_TRACK)');
+      const from = canonicalMessageAddress(fromRaw);
+      const origin = caller !== null && caller !== from ? { origin: { kind: 'agent' as const, seat: caller } } : {};
+      // A217 — a request names when it is due and what «done» means. MSG-FILTERS-RELAX: a missing part is a warning.
       if (opts.intent === 'request' && (opts.deadline === undefined || !opts.done?.trim()))
-        throw new Error('--intent request needs --deadline <due> and --done <condition> (A217 request contract)');
-      const deadlineAt = opts.deadline === undefined ? undefined : parseDue(opts.deadline, (deps.now ?? (() => new Date()))());
+        warn('msg post 경고: --intent request 에 --deadline <due> 와 --done <condition> 이 없다 (A217 요청 계약) — 그대로 저장한다');
+      const deadlineAt = (() => {
+        if (opts.deadline === undefined) return undefined;
+        try { return parseDue(opts.deadline, (deps.now ?? (() => new Date()))()); }
+        catch (error) { warn(`msg post 경고: ${error instanceof Error ? error.message : String(error)} — 기한 없이 저장한다`); return undefined; }
+      })();
       const unsupported = opts.to === undefined ? null : unsupportedLoopAddressNotice(opts.to);
       if (unsupported) out.error(unsupported);
       if (opts.to === undefined) throw new Error('--to is required');
@@ -553,9 +585,9 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         : opts.bodyFile === '-' ? await readStdin() : await readFile(opts.bodyFile, 'utf8');
       for (const warning of postBodyWarnings(text))
         out.error(`msg post 경고: ${warning} — 본문을 확인하고 다음 보고는 --body-file 또는 stdin 사용`);
-      requireCrownDirective(opts.crownDirective);
-      const priority = cliPriorityLevel(opts.priority, '--priority');
-      const envelope = { from, to, body: text,
+      checkCrownDirective(opts.crownDirective, warn);
+      const priority = cliPriorityLevel(opts.priority, '--priority', warn);
+      const envelope = { from, to, body: text, ...origin,
         ...(opts.kind === undefined ? {} : { kind: opts.kind }),
         ...(opts.replyTo === undefined ? {} : { replyTo: integer(opts.replyTo, '--reply-to', 0, 1, Number.MAX_SAFE_INTEGER) }),
         ...(priority === undefined ? {} : { priority }),
@@ -785,25 +817,56 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       if (output !== null) out.log(output);
     })());
 
-  msg.command('ack [id]').description('Acknowledge one message with --id, or acknowledge through --through')
-    .option('--to <seat>').option('--id <id>', 'acknowledge exactly one message').option('--through <id>', 'acknowledge all messages through this ID').option('--json')
-    .action((positional: string | undefined, opts: CommonOptions & { to?: string; id?: string; through?: string }) => run(() => {
+  msg.command('ack [id]').description('Acknowledge selected messages; --through acknowledges every message up to and including that ID')
+    .option('--to <seat>').option('--id <id>', 'acknowledge exactly one message').option('--ids <ids>', 'acknowledge selected comma-separated IDs').option('--through <id>', 'WARNING: acknowledge ALL messages through this ID, including earlier unread messages')
+    .option('--receipted', 'acknowledge every message that already has an accepted, rejected, done or expired receipt (idempotent)').option('--json')
+    .action((positional: string | undefined, opts: CommonOptions & { to?: string; id?: string; ids?: string; through?: string; receipted?: boolean }) => run(async () => {
       const to = messageRecipient(opts.to, '--to');
-      if (Number(Boolean(opts.id)) + Number(Boolean(opts.through)) + Number(Boolean(positional)) !== 1) throw new Error('choose exactly one of positional ID, --id, or --through');
-      if (opts.id !== undefined) {
-        const id = integer(opts.id, '--id', 1, 1, Number.MAX_SAFE_INTEGER);
-        withStore(store => {
-          store.ackMessage(to, id);
-          // §8 — 손 ack 는 영수증 seen 으로 남는다(accepted 이상은 만들지 않는다). 영수증 실패는 ack 를 바꾸지 않는다.
-          recordHandSeen(store, to, id);
-        });
-        emit({ recipient: to, id, status: 'acked' }, opts.json, () => out.log(`${to} acknowledged #${id}`));
+      // MSG-FILTERS-RELAX: a bulk ack (2+ mails) leaves a compact digest — printed and saved as one seat memory entry.
+      const digestOf = async (inputs: AckDigestInput[]) => recordAckDigest(to, inputs, {
+        ...(deps.saveAckDigest ? { save: deps.saveAckDigest } : {}), ...(deps.now ? { now: deps.now } : {}), warn: line => out.error(line) });
+      const printDigest = (recorded: Awaited<ReturnType<typeof digestOf>>) => {
+        if (recorded === null || opts.json) return;
+        out.log(`digest${recorded.saved ? ` (memory ${recorded.memory.name})` : ''}: ${recorded.digest.summary}`);
+        for (const line of recorded.digest.lines) out.log(line);
+      };
+      const digestJson = (recorded: Awaited<ReturnType<typeof digestOf>>) => recorded === null ? {}
+        : { digest: { ...(recorded.saved ? { memory: recorded.memory.name } : {}), summary: recorded.digest.summary, lines: recorded.digest.lines } };
+      if (Number(opts.id !== undefined) + Number(opts.ids !== undefined) + Number(opts.through !== undefined) + Number(positional !== undefined) + Number(Boolean(opts.receipted)) !== 1) throw new Error('choose exactly one of positional ID, --id, --ids, --through, or --receipted');
+      if (opts.receipted) {
+        // MSG-RECEIPT-IMPLIES-ACK ③ — backfill for mail decided before a terminal receipt implied the ack.
+        const { ids, inputs } = withStore(store => { const acked = store.ackReceipted(to); return { ids: acked, inputs: ackDigestInputs(store, to, acked) }; });
+        const recorded = await digestOf(inputs);
+        emit({ recipient: to, receipted: ids.length, ids, ...digestJson(recorded) }, opts.json, () => out.log(`${to} acknowledged ${ids.length} receipted message${ids.length === 1 ? '' : 's'}${ids.length === 0 ? '' : `: #${ids.join(' #')}`}`));
+        printDigest(recorded);
         return;
       }
-      const through = integer(opts.through ?? positional, opts.through === undefined ? 'message ID' : '--through', 0, 0, Number.MAX_SAFE_INTEGER);
+      if (opts.id !== undefined || positional !== undefined || opts.ids !== undefined) {
+        const ids = [...new Set((opts.ids !== undefined ? opts.ids.split(',') : [opts.id ?? positional!]).map(raw => integer(raw.trim(), 'message ID', 1, 1, Number.MAX_SAFE_INTEGER)))];
+        if (opts.ids !== undefined && (!opts.ids.trim() || opts.ids.split(',').some(raw => !raw.trim()))) throw new Error('--ids requires comma-separated positive message IDs');
+        let inputs: AckDigestInput[] = [];
+        withStore(store => {
+          store.ackMessages(to, ids);
+          // §8 — 손 ack 는 영수증 seen 으로 남는다(accepted 이상은 만들지 않는다). 영수증 실패는 ack 를 바꾸지 않는다.
+          for (const id of ids) recordHandSeen(store, to, id);
+          inputs = ackDigestInputs(store, to, ids);
+        });
+        const recorded = await digestOf(inputs);
+        emit(ids.length === 1 ? { recipient: to, id: ids[0], status: 'acked' } : { recipient: to, ids, status: 'acked', ...digestJson(recorded) }, opts.json, () => out.log(`${to} acknowledged #${ids.join(' #')}`));
+        printDigest(recorded);
+        return;
+      }
+      const through = integer(opts.through, '--through', 0, 0, Number.MAX_SAFE_INTEGER);
       // MSG-RECEIPTS-FOLLOWUP ① (#84659 A①): positional and --through leave «seen» like --id — same store path as the MsgAck tool.
-      const acknowledged = withStore(store => store.ackThroughSeen(to, through, 'cli-ack'));
-      emit(opts.through === undefined ? { recipient: to, cursor: acknowledged } : { recipient: to, through: acknowledged }, opts.json, () => out.log(`${to} acknowledged through #${acknowledged}`));
+      const { acknowledged, inputs } = withStore(store => {
+        // The unread set this ack moves past, read before the cursor moves (the digest's input).
+        const passing = (() => { try { return store.list(to, store.getCursor(to), 1000).filter(message => message.id <= through).map(message => message.id); } catch { return []; } })();
+        const moved = store.ackThroughSeen(to, through, 'cli-ack');
+        return { acknowledged: moved, inputs: ackDigestInputs(store, to, passing) };
+      });
+      const recorded = await digestOf(inputs);
+      emit({ recipient: to, through: acknowledged, ...digestJson(recorded) }, opts.json, () => out.log(`${to} acknowledged through #${acknowledged}`));
+      printDigest(recorded);
     })());
 
   msg.command('count').description('Read one recipient’s unread count as JSON without reading message bodies')

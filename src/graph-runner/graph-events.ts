@@ -281,3 +281,53 @@ export async function dispatchDeclaredGraphExternalEvent(graphPath: string, even
   return { disposition, graphId, eventId: delivery.eventId, runId: result.registration.runId,
     ...(result.state ? { state: result.state } : {}) };
 }
+
+// ─── ④ webhook trigger (GRAPH-SCHEDULER §1-1 ④, §1-3, §6-1 SCHEDULE-TRIGGER-HOOK-IN) ───
+
+/** §1-1 ④: the event type a graph declares in loop.trigger.events to receive els HOOK-IN firings. */
+export const HOOK_IN_EVENT_TYPE = 'hook.in';
+
+/** §1-3: risk class of a hook's graph target — the els door holds the first firing of write/external-send for a person. */
+export type HookInGraphTriggerDanger = 'read' | 'write' | 'external-send';
+
+/** A HOOK-IN envelope that already passed the els door's signature, nonce and window proof (#39168). */
+export interface HookInGraphTriggerEnvelope {
+  readonly hookName: string;
+  readonly nonce: string;
+  /** ISO time of the verified webhook request. */
+  readonly at: string;
+  /** Parsed JSON object body of the verified webhook. */
+  readonly body: Readonly<Record<string, unknown>>;
+  /** Graph yaml the hook fires; its loop.trigger.events must declare hook.in. */
+  readonly graphPath: string;
+  /** §1-3 risk class; it travels with the envelope so the door and the dispatch registry share one contract. */
+  readonly danger: HookInGraphTriggerDanger;
+}
+
+/** §1-1 ④: dedupeKey = `hook:<hookName>:<nonce>` — the door's nonce ledger and the dispatch registry share the key. */
+export function hookInGraphEventEnvelope(envelope: HookInGraphTriggerEnvelope): GraphExternalTriggerEvent {
+  const eventId = `hook:${envelope.hookName}:${envelope.nonce}`;
+  return { eventId, type: HOOK_IN_EVENT_TYPE, dedupeKey: eventId, at: envelope.at, payload: { ...envelope.body } };
+}
+
+/** §5 one entrance: the verified HOOK-IN envelope becomes a graph event envelope and goes through
+ *  dispatchDeclaredGraphExternalEvent — the graph's own loop.trigger.events declaration decides, and the
+ *  shared dispatch registry owns idempotency. Direct HTTP→runGraph paths stay forbidden. */
+export async function dispatchHookInGraphTrigger(
+  envelope: HookInGraphTriggerEnvelope,
+  options: Parameters<typeof dispatchDeclaredGraphExternalEvent>[2] = {},
+): Promise<GraphExternalTriggerDispatchResult> {
+  if (typeof envelope.hookName !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(envelope.hookName))
+    throw new Error('hook.in trigger requires a hook name');
+  if (typeof envelope.nonce !== 'string' || !/^[A-Za-z0-9_-]{8,128}$/.test(envelope.nonce))
+    throw new Error('hook.in trigger requires a nonce');
+  if (typeof envelope.at !== 'string' || !Number.isFinite(Date.parse(envelope.at)))
+    throw new Error('hook.in trigger requires a valid at timestamp');
+  if (!envelope.body || typeof envelope.body !== 'object' || Array.isArray(envelope.body))
+    throw new Error('hook.in trigger requires an object body');
+  if (envelope.danger !== 'read' && envelope.danger !== 'write' && envelope.danger !== 'external-send')
+    throw new Error('hook.in trigger requires a danger class');
+  if (typeof envelope.graphPath !== 'string' || !envelope.graphPath.trim())
+    throw new Error('hook.in trigger requires a graph path');
+  return dispatchDeclaredGraphExternalEvent(envelope.graphPath, hookInGraphEventEnvelope(envelope), options);
+}

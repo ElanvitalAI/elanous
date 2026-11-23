@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "entries": {
+    "router-cost/ROUTER-OR-CODEX-MIX-CHOKEPOINT": {
+      "expect": "green",
+      "greenSince": "0.3.33 ROUTER-OR-CODEX-MIX-CHOKEPOINT",
+      "reason": "Core and advisor choose OpenRouter for implementation, fresh Codex subscription for strong checkpoints, reject stale windows after restart, and bound an unresponsive fake provider"
+    },
+    "router-cost/ROUTER-COST-LEDGER": {
+      "expect": "green",
+      "greenSince": "0.3.33 LLM-CALL-COST-LEDGER",
+      "reason": "Real streamLLM calls with fake providers preserve measured tokens, mark missing usage and timeout as unknown cost, and survive concurrency plus a fresh provider after restart"
+    },
+    "router-cost/ROUTER-COST-LOCK-RECOVERY": {
+      "expect": "green",
+      "greenSince": "0.3.33 LLM-CALL-COST-LEDGER",
+      "reason": "Real streamLLM usage rows persist through a killed SQLite write-lock holder and a new writer connection; the savings ledger reader sees both calls"
+    },
+    "router-cost/ROUTER-QUALITY-GUARD-95": {
+      "expect": "green",
+      "greenSince": "2026-11-23 PR #39641 (ROUTER-QUALITY-GUARD-95 mustFix ①②③ — 이 PR로 신규 착지)",
+      "reason": "lightweight-first guarded routing: per-task premium shadow comparison (exactly one premium evaluation per task, reused as the delivered score on gate failure), per-task-type floors (chat 0.90, unregistered fallback 0.95) and the daily ledger recalc surface land together (jud-39614 mustFix ①②③)"
+    }
+  }
+}

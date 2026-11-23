@@ -412,6 +412,38 @@ test('process runner captures spawn errors while the pid state write is pending'
   await expect(createProcessAgentRunner(root, fakeSpawn)(record, 'prompt')).rejects.toThrow('spawn ENOENT');
 });
 
+test('claude and codex subprocesses receive their own mission seat, not the parent seat', async () => {
+  const root = makeRoot();
+  const store = createMissionOutStore(root);
+  const previous = process.env.ELANOUS_TRACK;
+  process.env.ELANOUS_TRACK = 'PARENT-SEAT';
+  try {
+    for (const [agent, missionId] of [
+      ['claude', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
+      ['codex', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'],
+    ] as const) {
+      const record = store.create({ missionId, agent, prompt: 'work', cwd: root, outputPath: join(root, `${agent}.tmp`), targetOutputPath: join(root, `${agent}.md`) });
+      let actualCommand = '';
+      let childTrack: string | undefined;
+      const fakeSpawn = ((command: string, _args: readonly string[], options: { env?: NodeJS.ProcessEnv }) => {
+        actualCommand = command;
+        childTrack = options.env?.ELANOUS_TRACK;
+        const child = Object.assign(new EventEmitter(), { stderr: new PassThrough(), stdin: { end: () => undefined } });
+        queueMicrotask(() => child.emit('close', 0));
+        return child;
+      }) as unknown as typeof spawn;
+      expect(await createProcessAgentRunner(root, fakeSpawn)(record, 'prompt')).toEqual({ code: 0, stderr: '' });
+      expect(actualCommand).toBe(agent);
+      expect(childTrack).toBe(`MISSION-${missionId}`);
+      expect(process.env.ELANOUS_TRACK).toBe('PARENT-SEAT');
+    }
+    expect(missionChildEnv(root, 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', {}).ELANOUS_TRACK)
+      .toBe('MISSION-cccccccc-cccc-4ccc-8ccc-cccccccccccc');
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = previous;
+  }
+});
+
 test('agent subprocess receives a paired mission ID and store root', async () => {
   const root = makeRoot();
   const store = createMissionOutStore(root, { id: () => '12345678-1234-4234-8234-123456789abc' });

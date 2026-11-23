@@ -111,7 +111,8 @@ test('500 unacknowledged with cap 20 → 20 notices; the rest stay pending and c
   expect(watcher.poll()).toEqual({ kind: 'messages', msgIds: Array.from({ length: 20 }, (_, i) => i + 1) });
   const seatMail = queue.items.filter((item) => item.source === 'seat-mail');
   expect(seatMail).toHaveLength(20);
-  expect(seatMail[0]!.text).toContain('[미읽음 총 500통]');
+  // MSG-RECEIPT-IMPLIES-ACK ② — the counter counts mail that still needs the seat; 500 info mails need nothing.
+  expect(seatMail[0]!.text).toContain('[미읽음 총 0통]');
   // OP #130302/#130531 합의 — 초과든 truncated든 안내는 «seat-mail-guide» 별도 종류 한 줄(msgId 없음 · poll당 1줄).
   // #129667 ②의 «안내도 사건도 없다»는 이 합의로 대체된다: 큐 알림 상한(20)도 함께 차므로 그 한 방은
   // 큐의 overflow guide 가 쓰고, 상한 밖 480통은 pending → 다음 poll 이 21..40을 다시 제공한다(아래).

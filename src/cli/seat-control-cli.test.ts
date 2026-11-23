@@ -1,12 +1,12 @@
 import { expect, test } from 'bun:test';
-import { runSeatControl } from './seat-control-cli.js';
+import { runSeatControl, SEAT_STOP_OWNER_WINDOW_MS } from './seat-control-cli.js';
 
 test('seat control uses one live local TUI and a transport-derived sender', async () => {
   const calls: unknown[] = [];
   const deps = { sender: () => 'OP', rows: () => [{ id: 'tui:123', kind: 'tui', seat: 'TC', alive: true }],
     send: async (...args: unknown[]) => { calls.push(args); return { status: 'success' as const, reason: 'waiting' }; } };
   expect(await runSeatControl('TC', 'migrate', deps)).toEqual({ status: 'success', reason: 'waiting' });
-  expect(calls).toEqual([['tui:123', 'seat-stop', { mode: 'migrate', sender: 'OP' }]]);
+  expect(calls).toEqual([['tui:123', 'seat-stop', { mode: 'migrate', sender: 'OP' }, { timeoutMs: SEAT_STOP_OWNER_WINDOW_MS }]]);
 });
 
 test('unknown sender, unauthorized caller, invalid mode and ambiguous targets never send', async () => {
@@ -44,4 +44,18 @@ test('a live TUI whose build predates seat control (no seat on its row) is named
     policy: 'restart JUD-B: its TUI (tui:51820, pid 51820) runs a build from before seat control and cannot take migrate' });
   expect(await runSeatControl('JUD-B', 'migrate', { sender: () => 'OP', rows, send, seatOfPid: () => 'OTHER' })).toEqual({ status: 'unknown-pty', reason: 'seat-not-running' });
   expect(calls).toBe(0);
+});
+
+test('seat-stop passes the owner-pickup window (RFC 30s pending contract) to send — the 2s default misclassifies live TUIs as owner-unreachable (#133752)', async () => {
+  let sentOptions: unknown = undefined;
+  const deps = {
+    sender: () => 'OP',
+    rows: () => [{ id: 'tui:485', kind: 'tui', seat: 'TC', alive: true }],
+    send: async (_id: unknown, _action: unknown, _payload: unknown, options?: unknown) => { sentOptions = options; return { status: 'success' as const, reason: 'waiting' }; },
+  };
+  expect(await runSeatControl('TC', 'migrate', deps)).toEqual({ status: 'success', reason: 'waiting' });
+  const timeoutMs = (sentOptions as { timeoutMs?: number } | undefined)?.timeoutMs;
+  expect(typeof timeoutMs).toBe('number');
+  expect(timeoutMs!).toBeGreaterThanOrEqual(25_000);  // 출처: #133752 — 창 하한 = RFC 30s − 5s 여유
+  expect(timeoutMs!).toBeLessThanOrEqual(30_000);  // 출처: #133752 — RFC PTY_CONTROL_STALE_MS 상한
 });

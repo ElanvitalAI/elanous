@@ -22,6 +22,12 @@ export function nextTuiErrorCard(
 
 /** NEXT-TUI-UX-ERROR-CARD: a short, secret-free cause label so a provider failure, a cut stream and a timeout do
  *  not all read as «요청을 처리하지 못했습니다». Matches only the error's class of wording; the raw text is never shown. */
+/** Every label {@link classifyTurnFailure} can return (NEXT-TUI-FEATURE-COMPLETE ② · a reloaded failure may keep only these). */
+export const TURN_FAILURE_CAUSE_LABELS: readonly string[] = [
+  'Authentication was denied', 'Rate limit exceeded or provider overloaded', 'Provider server error',
+  'No response; timed out', 'Response stream was cut', 'Network connection failed',
+];
+
 export function classifyTurnFailure(error: string | undefined): string | null {
   const text = (error ?? '').toLowerCase();
   if (!text) return null;

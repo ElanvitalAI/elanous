@@ -176,3 +176,16 @@ test('unclosed tilde and indented backtick fences never turn code lists into act
   ];
   expect(nextTuiPublicHistory(messages)[1]?.content).toContain('할 일: 검토');
 });
+
+test('NEXT-TUI-FEATURE-COMPLETE ② — a reloaded failure keeps its known cause label; anything else stays the bare notice', () => {
+  const failed = (content: string): SerializedMessage[] => [
+    { role: 'user', content: '질문', ts: '1' },
+    { role: 'assistant', content, ts: '2', replyFinal: false, replyFailure: true },
+  ];
+  expect(nextTuiPublicHistory(failed('요청을 처리하지 못했습니다. (Rate limit exceeded or provider overloaded)'))[1]!.content)
+    .toBe('요청을 처리하지 못했습니다. (Rate limit exceeded or provider overloaded)');
+  expect(nextTuiPublicHistory(failed('요청을 처리하지 못했습니다. (Response stream was cut)'))[1]!.content)
+    .toBe('요청을 처리하지 못했습니다. (Response stream was cut)');
+  expect(nextTuiPublicHistory(failed('PRIVATE raw error (sk-SECRET123456)'))[1]!.content).toBe('요청을 처리하지 못했습니다.');
+  expect(nextTuiPublicHistory(failed('요청을 처리하지 못했습니다.'))[1]!.content).toBe('요청을 처리하지 못했습니다.');
+});

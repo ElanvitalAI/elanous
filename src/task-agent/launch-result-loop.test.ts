@@ -1,15 +1,18 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, expect, test } from 'bun:test';
 import type { TaskCard } from './task-hand.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { readTaskCard, writeTaskCards } from './task-card-state.js';
-import { showTaskCard } from '../cli/tasks-card-show.js';
+import { showTaskCard, taRecycleOutcomeLine } from '../cli/tasks-card-show.js';
 import type { TasksCliDeps } from '../cli/tasks-cli.js';
+import type { TaRecycleOutcome } from './launch-result-loop.js';
 import {
   TA_LAUNCH_STAGES,
   TA_SKIP_NOTE_EVENT,
+  TA_STOP_FAILED_EVENT,
   NO_PROGRESS_MS,
   NO_PROGRESS_CAUSES,
   classifyNoProgressCause,
@@ -19,6 +22,8 @@ import {
   recycleStalledLaunches,
   taLaunchLine,
 } from './launch-result-loop.js';
+// 출처: terra r5 mustFix 3 — #39574 · export 존재/부재를 namespace 관측으로 검사한다(이름 import 는 부재 시 모듈 적재가 깨진다).
+import * as launchResultLoopModule from './launch-result-loop.js';
 
 /**
  * TA-LAUNCH-RESULT-LOOP(칸 0.3.32 · P1) — 대표 승인 TA 시범의 관측 고리.
@@ -632,4 +637,512 @@ test('recycleStalledLaunches — 죽은 프로세스의 stop 줄 뒤 별도 프�
     if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = priorStateDir;
   }
+});
+
+// ═══ FU-39400-CARD-WRITE-FAIL — 카드 쓰기 실패(EACCES) ⊕ 프로세스 사망 종단 → 재시작 1회 원장·카드 정합 ═══
+// 출처: OP #119367(EACCES 시 카드 미갱신 = FU-39400-CARD-WRITE-FAIL 로 분리 — #39400 에서 고치지 않음) ·
+// 승계 #124063(완료 경계: «격리 장애 주입 2종 뒤 재시작 1회 카드 정합 시험») · OP 승인 #124064 ·
+// 재현 원문 15286b6d(빨강 B: chmod 444 → EACCES 가 recycleStalledLaunches 밖으로 전파 — launch-result-loop.ts:225
+// updateTaskCard 호출부 무방어 / 빨강 A: «원장 stop append 뒤·카드 writeFileSync 앞» 사망 → .lock 잔존 →
+// 즉시 재시도가 잠금 6초 타임아웃 throw 로 전파). #39483 MERGED 로 ta-sweep-tick.ts 충돌은 해소 —
+// 수정 범위는 launch-result-loop.ts 로 최소화(조사 §56-60).
+
+/** FU-39400 — outcome 의 cardWriteFailed 관측치(수리 전 타입에도 컴파일되는 관측 접근 — 원장은 diff 로 증명). */
+const cardWriteFailedOf = (outcome: TaRecycleOutcome): boolean =>
+  Boolean((outcome as unknown as Record<string, unknown>)['cardWriteFailed']);
+
+/** FU-39400 r2(terra mustFix 2) — outcome 의 cardWriteUnknown 관측치(재독 실패 = 부착 여부 미확인 · 관측 접근). */
+const cardWriteUnknownOf = (outcome: TaRecycleOutcome): boolean =>
+  Boolean((outcome as unknown as Record<string, unknown>)['cardWriteUnknown']);
+
+/** FU-39400 사망 모의 드라이버 — 15286b6d 스크래치 재현: 원장 stop append 뒤·카드 writeFileSync 앞 exit(70). */
+const FU39400_DEATH_DRIVER = `
+const SRC = process.env.DRIVER_SRC!;
+const STATE = process.env.DRIVER_STATE!;
+const NOW = Number(process.env.DRIVER_NOW);
+const CARD_ID = process.env.DRIVER_CARD_ID!;
+const loop = await import(SRC + '/task-agent/launch-result-loop.ts');
+const runStop = await import(SRC + '/self-implement/run-stop.ts');
+const cards = await import(SRC + '/task-agent/task-card-state.ts');
+const card = cards.readTaskCard(CARD_ID, STATE);
+if (!card) { console.error('DRIVER: CARD-NOT-FOUND'); process.exit(2); }
+try {
+  loop.recycleStalledLaunches([card], {
+    nowMs: NOW,
+    statePath: STATE,
+    recordStop: (input) => {
+      runStop.recordRunStop(input); // 원장 stop append — 실물 런 원장(ELANOUS_STATE_DIR=시험 격리 뿌리).
+      console.error('DRIVER: process death AFTER ledger stop append, BEFORE card writeFileSync');
+      process.exit(70); // 카드 writeFileSync «앞» 사망 — exit 은 finally 를 건너뛰므로 .lock 이 쥔 채 남는다.
+    },
+  });
+  console.error('DRIVER: UNEXPECTED-SURVIVAL');
+  process.exit(3);
+} catch (error) {
+  console.error('DRIVER: THROWN ' + String(error));
+  process.exit(4);
+}
+`;
+
+test('FU-39400 빨강 B — 카드 원장 쓰기 EACCES: throw 전파 대신 관측 가능한 cardWriteFailed outcome·부분 실패 격리', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fu39400-eacces-'));
+  dirs.push(root);
+  setElanousConfigDir(root);
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root; // 런 원장도 같은 격리 뿌리(기록기 = 정본 recordRunStop — 15286b6d 빨강 B 재현)
+  try {
+    // EACCES 주입이 이 호스트에서 실제로 발동하는가(root 는 mode 비트를 우회한다) — 미발동 환경은 정직하게 실패.
+    const probePath = join(root, 'eacces-probe.json');
+    writeFileSync(probePath, '{}');
+    chmodSync(probePath, 0o444);
+    let probeCode: string | null = null;
+    try { writeFileSync(probePath, '{"x":1}'); } catch (error) { probeCode = (error as NodeJS.ErrnoException).code ?? null; }
+    if (probeCode !== 'EACCES') throw new Error(`FU-39400: EACCES 주입 미발동 환경(root 등) — probe code=${probeCode ?? 'none'}`);
+
+    mkdirSync(join(root, 'run-ledger'), { recursive: true });
+    const statePath = join(root, 'task-agent-actions.json');
+    const runA = 'run-fu39400-ea01';
+    const runB = 'run-fu39400-eb02';
+    // 출처: 15286b6d 시드 30분 — NO_PROGRESS_MS(15분) 상한 위 회수 자격(기존 시험 «stale» 패턴).
+    const staleAt = new Date(NOW - 30 * 60_000).toISOString();
+    const a = card({ id: 'fu39400-eacces-a', runId: runA, checklistId: 'FU-39400-CARD-WRITE-FAIL', createdAt: staleAt, history: hist([{ at: staleAt, event: 'live-move', detail: 'x' }]) });
+    const b = card({ id: 'fu39400-eacces-b', runId: runB, checklistId: 'FU-39400-CARD-WRITE-FAIL', createdAt: staleAt, history: hist([{ at: staleAt, event: 'live-move', detail: 'x' }]) });
+    writeTaskCards(statePath, [a, b]);
+    chmodSync(statePath, 0o444); // 출처: 15286b6d 빨강 B 재현 원문 — chmod 444 → 카드 writeFileSync EACCES
+    let thrown: unknown = null;
+    let outcomes: TaRecycleOutcome[] = [];
+    try { outcomes = recycleStalledLaunches([a, b], { nowMs: NOW, statePath }); } catch (error) { thrown = error; }
+    // 수리 전 빨강: EACCES 가 recycleStalledLaunches 밖으로 전파(launch-result-loop.ts:225 무방어).
+    expect(thrown).toBe(null);
+    // 부분 실패 격리 — 첫 카드 쓰기 실패가 같은 호출의 둘째 카드 회수를 태우지 않는다(2카드 주입).
+    expect(outcomes).toHaveLength(2);
+    expect(outcomes.map((o) => o.cardId)).toEqual(['fu39400-eacces-a', 'fu39400-eacces-b']);
+    expect(outcomes.every((o) => o.stopRecorded)).toBe(true); // 원장 stop 은 콜백 안에서 «이미» 기록됐다 — 관측 가능한 실패 상태
+    expect(outcomes.every((o) => cardWriteFailedOf(o))).toBe(true); // 카드 skip-note 만 빠진 재조정 대상 표지(FU-39400)
+    // 출처: 완료선 «원장 stop 1줄»(#124063) — 장애 주입에도 runId 별 stop 원장은 남는다.
+    expect(readLedgerStopLines(join(root, 'run-ledger', `${runA}.jsonl`))).toHaveLength(1);
+    expect(readLedgerStopLines(join(root, 'run-ledger', `${runB}.jsonl`))).toHaveLength(1);
+    // 카드: skip-note 미부착 — hasSkipNote 미발동으로 재시도 대상 유지(다음 스윕이 원장→카드 정합).
+    for (const id of ['fu39400-eacces-a', 'fu39400-eacces-b']) {
+      const onDisk = readTaskCard(id, statePath);
+      const notes = (onDisk?.history ?? []) as Array<{ event?: string }>;
+      expect(notes.some((e) => e.event === TA_SKIP_NOTE_EVENT)).toBe(false);
+    }
+  } finally {
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+  }
+});
+
+test('FU-39400 빨강 A — 프로세스 사망(원장 stop 뒤·카드 쓰기 앞) → 재시작 1회 원장 stop 1줄·카드 skip-note 정합', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fu39400-death-'));
+  dirs.push(root);
+  setElanousConfigDir(root);
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  try {
+    mkdirSync(join(root, 'run-ledger'), { recursive: true });
+    const runId = 'run-fu39400-dd01';
+    const cardId = 'fu39400-death';
+    const statePath = join(root, 'task-agent-actions.json');
+    const lockPath = `${statePath}.lock`;
+    const ledgerPath = join(root, 'run-ledger', `${runId}.jsonl`);
+    // 출처: 15286b6d 시드 30분 — 회수 자격.
+    const staleAt = new Date(NOW - 30 * 60_000).toISOString();
+    writeTaskCards(statePath, [card({ id: cardId, runId, checklistId: 'FU-39400-CARD-WRITE-FAIL', createdAt: staleAt, history: hist([{ at: staleAt, event: 'live-move', detail: 'x' }]) })]);
+    // ① 사망 주입 — 드라이버 서브프로세스: recordStop 이 실물 원장에 stop 을 적립한 뒤 exit(70)(출처: 15286b6d 빨강 A — exit code 70).
+    const driverPath = join(root, 'fu39400-death-driver.ts');
+    writeFileSync(driverPath, FU39400_DEATH_DRIVER);
+    const death = spawnSync(process.execPath, [driverPath], {
+      encoding: 'utf8',
+      cwd: root,
+      env: { ...process.env, DRIVER_SRC: resolve(import.meta.dir, '..'), DRIVER_STATE: statePath, DRIVER_NOW: String(NOW), DRIVER_CARD_ID: cardId, ELANOUS_STATE_DIR: root },
+    });
+    expect(death.status).toBe(70); // 사망 시점 계약: 원장 stop append 뒤·카드 writeFileSync 앞
+    expect(String(death.stderr)).toContain('process death AFTER ledger stop append');
+    // 출처: 완료선 «원장 stop 1줄»(#124063) — 사망 직후 관측: 원장에만 stop 이 남는다.
+    expect(readLedgerStopLines(ledgerPath)).toHaveLength(1);
+    const afterDeathNotes = (readTaskCard(cardId, statePath)?.history ?? []) as Array<{ event?: string }>;
+    expect(afterDeathNotes.some((e) => e.event === TA_SKIP_NOTE_EVENT)).toBe(false); // 카드 skip-note 0 — «원장만 stop» 상태
+    expect(existsSync(lockPath)).toBe(true); // 사망 보유자의 .lock 잔존(exit 은 finally 를 건너뛴다)
+    // ② 재시작 직후(잠금 미경과 창) 디스크 관측 — 회수 호출 없이: 원장만 stop·카드 skip-note 0·.lock 잔존.
+    // (출처: 15286b6d 부수 — 사망 보유자의 .lock 이 stale 창(file-lock.ts STALE_MS=30_000)까지 다음 회수를 지연시킨다.
+    //  현재 main 의 재시도 루프(240×25ms)는 타이밍에 따라 stale 창을 넘기며 자가정합하거나 6초 타임아웃 throw —
+    //  어느 쪽이든 «정합은 다음 스윕이 완료» 가 계약이므로, 여기서는 디스크 상태만 관측하고 정합은 ③이 증명한다.)
+    const immediateNotes = (readTaskCard(cardId, statePath)?.history ?? []) as Array<{ event?: string }>;
+    expect(immediateNotes.some((e) => e.event === TA_SKIP_NOTE_EVENT)).toBe(false); // 아직 카드 회수 표시 없음
+    expect(existsSync(lockPath)).toBe(true); // 사망 보유자의 .lock 잔존(exit 은 finally 를 건너뛴다)
+    // ③ stale 창 경과 뒤 재시작 1회 — 원장→카드 정합(완료선 #124063 «재시작 1회 카드 정합» 증명 · 조사 §40 «시험 0개» 몫).
+    // 출처: src/storage/file-lock.ts STALE_MS=30_000 — mtime 기준 stale 판정 경과 모의.
+    const staleAgo = new Date(Date.now() - 31_000);
+    utimesSync(lockPath, staleAgo, staleAgo);
+    const reconciled = recycleStalledLaunches([readTaskCard(cardId, statePath)!], { nowMs: NOW, statePath });
+    expect(reconciled).toHaveLength(1); // 출처: 완료선 «재시작 1회 카드 정합»(#124063).
+    expect(reconciled[0]!.stopRecorded).toBe(true); // 기각 아님 — appendRunStopEntryOnce 기존 줄 반환(#39400)
+    expect(cardWriteFailedOf(reconciled[0]!)).toBe(false); // 정상 회수 — cardWriteFailed 아님
+    let thrownRestart: unknown = null;
+    try { recycleStalledLaunches([readTaskCard(cardId, statePath)!], { nowMs: NOW, statePath }); } catch (error) { thrownRestart = error; }
+    expect(thrownRestart).toBe(null); // 정합 뒤 재스윕은 멱등 — throw 없이 조용히 건너뛴다
+    // 핵심 정합: 원장 stop 여전히 1줄(중복 없음 — #39400 appendRunStopEntryOnce).
+    expect(readLedgerStopLines(ledgerPath)).toHaveLength(1);
+    const notes = (readTaskCard(cardId, statePath)?.history ?? []) as Array<{ event?: string; detail?: string; runId?: string }>;
+    const skip = notes.find((e) => e.event === TA_SKIP_NOTE_EVENT);
+    expect(skip?.runId).toBe(runId); // 카드 recycled skip-note 1줄 — 원장 stop 과 runId 일치(정합)
+    expect(String(skip?.detail)).toContain('failed/recycled/');
+    expect(existsSync(lockPath)).toBe(false); // 정합 완료 — 잠금 해제
+  } finally {
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+  }
+  // 출처: 드라이버 서브프로세스 구동 — 5초 기본 상향.
+}, 20000);
+
+// ── FU-39400 r2 — terra mustFix 3건(RED 우선): ①catch 재독 runId 귀속 ②재독 실패 미확인 ③권한 복구 후 회수 재실행 ──
+
+/** terra mustFix 1·3 공용 — EACCES 주입이 이 호스트에서 실제로 발동하는가(root 는 mode 비트를 우회한다). 미발동 환경은 정직하게 실패. */
+function requireEaccesProbe(root: string): void {
+  const probePath = join(root, 'eacces-probe.json');
+  writeFileSync(probePath, '{}');
+  chmodSync(probePath, 0o444);
+  let probeCode: string | null = null;
+  try { writeFileSync(probePath, '{"x":1}'); } catch (error) { probeCode = (error as NodeJS.ErrnoException).code ?? null; }
+  if (probeCode !== 'EACCES') throw new Error(`FU-39400 r2: EACCES 주입 미발동 환경(root 등) — probe code=${probeCode ?? 'none'}`);
+}
+
+test('FU-39400 r2 terra mustFix 1 — 쓰기 실패 catch 재독 카드의 runId 불일치: 다른 런의 skip-note를 이전 런의 정상 회수로 보고하지 않는다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fu39400-mf1-'));
+  dirs.push(root);
+  setElanousConfigDir(root);
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  try {
+    requireEaccesProbe(root);
+    mkdirSync(join(root, 'run-ledger'), { recursive: true });
+    const statePath = join(root, 'task-agent-actions.json');
+    const runA = 'run-mf1-a';
+    const staleAt = new Date(NOW - 30 * 60_000).toISOString(); // 출처: 기존 «stale» 패턴 — NO_PROGRESS_MS 상한 위 회수 자격
+    const staleView = card({ id: 'ta-mf1', runId: runA, checklistId: 'FU-39400-R2', createdAt: staleAt, history: hist([{ at: staleAt, event: 'live-move', detail: 'x' }]) });
+    writeTaskCards(statePath, [staleView]);
+    // catch 재독이 보게 될 카드 — 관측 사이 재발사(run-B) + 다른 회수자의 run-B skip-note까지 끼어든 원장 모습.
+    const relaunchedNoted = card({
+      id: 'ta-mf1', runId: 'run-mf1-b', checklistId: 'FU-39400-R2', createdAt: staleAt,
+      history: hist([
+        { at: staleAt, event: 'live-move', detail: 'x' },
+        { at: AT(2 * 60_000), event: TA_SKIP_NOTE_EVENT, detail: 'failed/recycled/environment: 15분 무진척 — 정확 runId run-mf1-b stop · 재발사는 사람/판단부 몫', runId: 'run-mf1-b' },
+      ]),
+    });
+    chmodSync(statePath, 0o444); // 카드 쓰기 EACCES — catch 경로 진입(빨강 B와 동일 주입)
+    let readCalls = 0;
+    const outcomes = recycleStalledLaunches([staleView], {
+      nowMs: NOW,
+      statePath,
+      recordStop: () => { /* 원장 stop 성공 — stopRecorded=true */ },
+      reasonCodeFor: () => 'provider-credential-failure',
+      readCard: () => {
+        readCalls += 1;
+        return readCalls === 1 ? staleView : relaunchedNoted; // 사전 재검증=옛 모습(run-A) · catch 재독=재발사+회수 노트 카드(run-B)
+      },
+    });
+    expect(readCalls).toBe(2); // 출처: terra mustFix 1 — 사전 재검증 1 + catch 재독 1
+    expect(outcomes).toHaveLength(1); // 출처: terra mustFix 1 — 유일한 outcome은 이전 런(run-A)의 cardWriteFailed(정상 회수 아님)
+    expect(outcomes[0]!.runId).toBe(runA);
+    expect(cardWriteFailedOf(outcomes[0]!)).toBe(true); // 다른 런(run-B)의 skip-note는 run-A 회수의 증거가 아니다
+    expect(cardWriteUnknownOf(outcomes[0]!)).toBe(false); // 재독 자체는 성공(카드를 봤다) — 미확인 아님
+  } finally {
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+  }
+});
+
+test('FU-39400 r2 terra mustFix 2 — 쓰기 실패 뒤 카드 재독이 실패하면: 미부착 단정 금지, cardWriteUnknown 미확인 보존', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fu39400-mf2-'));
+  dirs.push(root);
+  setElanousConfigDir(root);
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  try {
+    requireEaccesProbe(root);
+    mkdirSync(join(root, 'run-ledger'), { recursive: true });
+    const statePath = join(root, 'task-agent-actions.json');
+    const runId = 'run-mf2-a';
+    const staleAt = new Date(NOW - 30 * 60_000).toISOString(); // 출처: 기존 «stale» 패턴 — 회수 자격
+    const staleView = card({ id: 'ta-mf2', runId, checklistId: 'FU-39400-R2', createdAt: staleAt, history: hist([{ at: staleAt, event: 'live-move', detail: 'x' }]) });
+    writeTaskCards(statePath, [staleView]);
+    chmodSync(statePath, 0o444); // 카드 쓰기 EACCES
+    let readCalls = 0;
+    const outcomes = recycleStalledLaunches([staleView], {
+      nowMs: NOW,
+      statePath,
+      recordStop: () => { /* 원장 stop 성공 */ },
+      reasonCodeFor: () => 'provider-credential-failure',
+      readCard: () => {
+        readCalls += 1;
+        if (readCalls === 1) return staleView; // 사전 재검증 통과
+        throw new Error('Unexpected end of JSON input — 재독 실패(파서·파일 오류 재현)'); // catch 재독 실패 — 부착 여부 불명
+      },
+    });
+    expect(readCalls).toBe(2); // 출처: terra mustFix 2 — 사전 재검증 1 + 실패한 catch 재독 1
+    expect(outcomes).toHaveLength(1); // 출처: terra mustFix 2 — 재독 실패 outcome 은 폐기되지 않고 미확인 상태로 보존
+    expect(outcomes[0]!.stopRecorded).toBe(true); // 원장 stop은 잠금 안에서 이미 기록됐다
+    expect(cardWriteUnknownOf(outcomes[0]!)).toBe(true); // 재독 실패 = 부착 여부 «미확인» 상태 보존
+    expect(cardWriteFailedOf(outcomes[0]!)).toBe(false); // cardWriteFailed(미부착 «관측»)과 구별 — 단정 금지
+  } finally {
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+  }
+});
+
+test('FU-39400 r2 terra mustFix 3 — 권한 복구(chmod 644) 후 회수 재실행: runId별 stop 1줄 유지 + 해당 runId skip-note 부착', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fu39400-mf3-'));
+  dirs.push(root);
+  setElanousConfigDir(root);
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root; // 정본 recordRunStop — 실제 회수 경로(원장 실기록)
+  try {
+    requireEaccesProbe(root);
+    mkdirSync(join(root, 'run-ledger'), { recursive: true });
+    const statePath = join(root, 'task-agent-actions.json');
+    const runA = 'run-mf3-a';
+    const runB = 'run-mf3-b';
+    const staleAt = new Date(NOW - 30 * 60_000).toISOString(); // 출처: 기존 «stale» 패턴 — 회수 자격
+    const a = card({ id: 'fu39400-mf3-a', runId: runA, checklistId: 'FU-39400-R2', createdAt: staleAt, history: hist([{ at: staleAt, event: 'live-move', detail: 'x' }]) });
+    const b = card({ id: 'fu39400-mf3-b', runId: runB, checklistId: 'FU-39400-R2', createdAt: staleAt, history: hist([{ at: staleAt, event: 'live-move', detail: 'x' }]) });
+    writeTaskCards(statePath, [a, b]);
+    // ① EACCES 구간 — 기존 시험(빨강 B)이 확인하는 건 쓰기 실패 직후까니다(terra mustFix 3 지적).
+    chmodSync(statePath, 0o444);
+    const first = recycleStalledLaunches([a, b], { nowMs: NOW, statePath });
+    expect(first).toHaveLength(2); // 출처: terra mustFix 3 전제(빨강 B 증명 상태) — EACCES 구간 2건 cardWriteFailed
+    expect(first.every((o) => cardWriteFailedOf(o))).toBe(true);
+    expect(readLedgerStopLines(join(root, 'run-ledger', `${runA}.jsonl`))).toHaveLength(1); // 출처: 잠금 안 기록 — 쓰기 실패 전 원장 stop
+    expect(readLedgerStopLines(join(root, 'run-ledger', `${runB}.jsonl`))).toHaveLength(1);
+    // ② 권한 복구 — 실제 회수 경로를 한 번 더 실행한다(기존 시험이 안 본 구간).
+    chmodSync(statePath, 0o644);
+    const second = recycleStalledLaunches([readTaskCard('fu39400-mf3-a', statePath)!, readTaskCard('fu39400-mf3-b', statePath)!], { nowMs: NOW, statePath });
+    expect(second).toHaveLength(2); // 출처: terra mustFix 3 — 복구 후 두 카드 모두 정상 회수 관측
+    expect(second.every((o) => !cardWriteFailedOf(o) && !cardWriteUnknownOf(o))).toBe(true); // 정상 회수(재조정·미확인 아님)
+    expect(second.map((o) => o.runId)).toEqual([runA, runB]);
+    // 각 runId의 stop이 한 줄로 유지된다 — 재실행이 둘째 줄을 적립하지 않는다(appendRunStopEntryOnce 멱급).
+    expect(readLedgerStopLines(join(root, 'run-ledger', `${runA}.jsonl`))).toHaveLength(1); // 출처: terra mustFix 3 — 재실행 후에도 stop 1줄
+    expect(readLedgerStopLines(join(root, 'run-ledger', `${runB}.jsonl`))).toHaveLength(1); // 출처: terra mustFix 3 — 재실행 후에도 stop 1줄
+    // 카드에 해당 runId의 skip-note가 붙는다(runId 결속 · 1개씩).
+    for (const [id, runId] of [['fu39400-mf3-a', runA], ['fu39400-mf3-b', runB]] as const) {
+      const notes = (readTaskCard(id, statePath)?.history ?? []) as Array<{ event?: string; runId?: string }>;
+      const skips = notes.filter((entry) => entry.event === TA_SKIP_NOTE_EVENT);
+      expect(skips).toHaveLength(1); // 출처: terra mustFix 3 — 해당 runId skip-note 부착 1개
+      expect(skips[0]!.runId).toBe(runId); // 노트는 회수된 runId에 결속
+    }
+  } finally {
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+  }
+});
+
+// ── FU-39400 r3 — terra r2 mustFix 1: 카드 쓰기·재독 모두 실패한 분기에서 cardWriteFailedOutcome 이
+// 실제 stopRecorded 값을 보존한다(원장 stop 기록까지 실패한 경우 «성공»으로 허위 보고 금지) ──
+
+test('FU-39400 r3 terra r2 mustFix 1 — 원장 stop 기록까지 실패한 뒤 카드 쓰기·재독도 실패: 실제 stopRecorded(=false)를 보존한다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fu39400-r3-mf1-'));
+  dirs.push(root);
+  setElanousConfigDir(root);
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  try {
+    requireEaccesProbe(root);
+    mkdirSync(join(root, 'run-ledger'), { recursive: true });
+    const statePath = join(root, 'task-agent-actions.json');
+    const runId = 'run-r3-a';
+    const staleAt = new Date(NOW - 30 * 60_000).toISOString(); // 출처: 기존 «stale» 패턴 — 회수 자격
+    const staleView = card({ id: 'ta-r3', runId, checklistId: 'FU-39400-R3', createdAt: staleAt, history: hist([{ at: staleAt, event: 'live-move', detail: 'x' }]) });
+    writeTaskCards(statePath, [staleView]);
+    chmodSync(statePath, 0o444); // 카드 쓰기 EACCES — catch 경로 진입(빨강 B와 동일 주입)
+    let readCalls = 0;
+    const outcomes = recycleStalledLaunches([staleView], {
+      nowMs: NOW,
+      statePath,
+      recordStop: () => false, // 출처: terra r2 mustFix 1 «실제 stop 기록도 실패한 경우» — 원장 stop 기록 실패(stopRecorded=false)
+      reasonCodeFor: () => 'provider-credential-failure',
+      readCard: () => {
+        readCalls += 1;
+        if (readCalls === 1) return staleView; // 사전 재검증 통과
+        throw new Error('Unexpected end of JSON input — 재독 실패(파서·파일 오류 재현)'); // catch 재독 실패
+      },
+    });
+    expect(readCalls).toBe(2); // 출처: 기존 mustFix 2 패턴 — 사전 재검증 1 + 실패한 catch 재독 1
+    expect(outcomes).toHaveLength(1); // 재독 실패 outcome 은 폐기되지 않고 보존
+    expect(outcomes[0]!.stopRecorded).toBe(false); // 출처: terra r2 mustFix 1 — 실제 원장 stop 실패를 «성공»으로 허위 보고하지 않는다
+    expect(cardWriteUnknownOf(outcomes[0]!)).toBe(true); // 재독 실패 = 부착 여부 «미확인» 상태 보존
+    expect(cardWriteFailedOf(outcomes[0]!)).toBe(false); // cardWriteFailed(미부착 관측)과 구별 — 단정 금지
+    expect(String(outcomes[0]!.skipNote)).toContain('stop-record-failed'); // 출처: 정상 회수와 동일 규약 — stop 실패 노트로 보고(허위 skipNote 금지)
+  } finally {
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+  }
+});
+
+// ── FU-39400 r5 — JUD-C #129833 mustFix ①②(RED 우선): 카드 쓰기 실패/재독 불명 오표시(두 호출점) ⊕
+//    stop 기록 false + 쓰기 실패 + 재독 성공에서 outcome 소멸(잠금 전 오류와 구별) ──
+// 출처: JUD-C #129833(head 758150648e9b) — launch-result-loop.ts:235-244,255-278 · ta-sweep-tick.ts:129-136 ·
+// tasks-card-show.ts:196-199. 기존 false 시험(r3)은 재독 throw 만 검사 — 재독 «성공» 갈래가 비어 있다.
+
+/** FU-39400 r5(JUD-C #129833) — outcome 의 stopAttempted 관측치(잠금 안 stop 시도 여부 · 관측 접근). */
+const stopAttemptedOf = (outcome: TaRecycleOutcome): boolean | undefined =>
+  (outcome as unknown as Record<string, unknown>)['stopAttempted'] as boolean | undefined;
+
+test('FU-39400 r5b terra mustFix 4·1 — tasks show: 잠금 획득 실패(결정적 EISDIR·root 무관) 회수는 skip-note=칸 history 로 오표시하지 않고 stop «시도 안 함»을 구분한다', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fu39400-r5-show-'));
+  dirs.push(root);
+  setElanousConfigDir(root);
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  try {
+    mkdirSync(join(root, 'run-ledger'), { recursive: true });
+    const statePath = join(root, 'task-agent-actions.json');
+    const staleAt = new Date(NOW - 30 * 60_000).toISOString(); // 출처: 기존 «stale» 패턴 — NO_PROGRESS_MS 상한 위 회수 자격
+    writeTaskCards(statePath, [card({
+      id: 'ta-r5-show', runId: 'run-r5-show', checklistId: 'FU-39400-R5', createdAt: staleAt,
+      history: hist([{ at: staleAt, event: 'live-move', detail: 'x' }]),
+    })]);
+    // 출처: terra r5 mustFix 4 — #39574 · chmod 444 EACCES 주입은 root 처럼 mode 비트를 우회하는 환경에서 의도적으로
+    // 실패한다. `${statePath}.lock` 경로에 디렉터리를 놓으면 .lock 생성(openSync 'wx') 은 항상 EEXIST 이고
+    // stale 회수 unlink(디렉터리) 도 항상 실패해 잠금 획득 실패(타임아웃 throw)가 root 에서도 결정적이다
+    // (src/storage/file-lock.ts acquireLockSync · 시뮬 S4 — 15286b6d chmod 555 대체).
+    mkdirSync(`${statePath}.lock`);
+    const lockStaleAgo = new Date(Date.now() - 31_000); // 출처: src/storage/file-lock.ts STALE_MS=30_000 — stale 판정 경과 모의(빨강 A 시험 부수 패턴)
+    utimesSync(`${statePath}.lock`, lockStaleAgo, lockStaleAgo);
+    const lines: string[] = [];
+    await showTaskCard('ta-r5-show', {}, showDeps(statePath, NOW), (line) => lines.push(line));
+    const recycleLines = lines.filter((line) => line.startsWith('TA 회수'));
+    expect(recycleLines).toHaveLength(1); // 출처: JUD-C #129833 mustFix 1 — 쓰기 실패 회수 시도는 관측(TA 회수 줄)에서 사라지지 않는다
+    const onDisk = readTaskCard('ta-r5-show', statePath);
+    // 디스크 정본 — skip-note 는 «붙지 않았다». 표시가 이와 모순되면 오표시다.
+    expect((onDisk?.history ?? []).some((entry) => (entry as { event?: string }).event === TA_SKIP_NOTE_EVENT)).toBe(false);
+    expect(recycleLines[0]!).not.toContain('skip-note=칸 history'); // 미부착 오표시 금지(JUD-C #129833 mustFix 1)
+    expect(recycleLines[0]!).toContain('미부착'); // 카드 쓰기 실패 — skip-note 미부착(재조정 대상) 표지
+    // 출처: terra r5 mustFix 1 — #39574 · stopAttempted=false(잠금 전 오류)는 «실패» 가 아니라 «시도 안 함» 이다(CLI 회귀).
+    expect(recycleLines[0]!).toContain('정확 runId stop=시도 안 함');
+    expect(recycleLines[0]!).not.toContain('정확 runId stop=실패');
+  } finally {
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+  }
+}, 20_000); // 잠금 획득 실패 재시도 상한(240회) 여유 — 출처: 빨강 A 드라이버 시험 5초 기본 상향 관례
+
+test('FU-39400 r5b terra mustFix 4 — stop 기록 false + 카드 쓰기 실패(콜백 안 결정적 EISDIR) + 재독 성공: outcome 이 사라지지 않는다(잠금 안 시도 보존)', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fu39400-r5-mf2-'));
+  dirs.push(root);
+  setElanousConfigDir(root);
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  try {
+    mkdirSync(join(root, 'run-ledger'), { recursive: true });
+    const statePath = join(root, 'task-agent-actions.json');
+    const runId = 'run-r5-mf2';
+    const staleAt = new Date(NOW - 30 * 60_000).toISOString(); // 출처: 기존 «stale» 패턴 — 회수 자격
+    const staleView = card({ id: 'ta-r5-mf2', runId, checklistId: 'FU-39400-R5', createdAt: staleAt, history: hist([{ at: staleAt, event: 'live-move', detail: 'x' }]) });
+    writeTaskCards(statePath, [staleView]);
+    const stopCalls: string[] = [];
+    const outcomes = recycleStalledLaunches([staleView], {
+      nowMs: NOW,
+      statePath,
+      // 출처: terra r5 mustFix 4 — #39574 · chmod 444 는 root 처럼 mode 비트를 우회하는 환경에서 발동하지 않는다.
+      // 잠금 안 콜백(updateTaskCard 콜백 = readState 뒤·writeFileSync 앞의 유일한 훅)에서 카드 스토어 «파일 경로»를
+      // 디렉터리로 교체하면 다음 writeFileSync 는 EISDIR 로 항상 실패한다 — 실제 진입점(recycleStalledLaunches)을 그대로 호출.
+      recordStop: (input) => {
+        stopCalls.push(input.runId);
+        rmSync(statePath);
+        mkdirSync(statePath); // 카드 스토어 파일→디렉터리 — 결정적 쓰기 실패 주입(EISDIR)
+        return false; // 출처: JUD-C #129833 mustFix 2 — 원장 stop 기록 실패(false)
+      },
+      reasonCodeFor: () => 'provider-credential-failure',
+      // 재독 «성공» 갈래 보존(빨강 B 관측 계약) — EISDIR 스토어의 실디스크 재독은 반드시 실패하므로, 관측 사이
+      // 변화 없는 카드 뷰를 돌려주는 주입 판독기를 쓴다(기존 r2 mustFix 1·2 시험의 readCard 주입 패턴).
+      readCard: () => staleView,
+    });
+    expect(outcomes).toHaveLength(1); // 수리 전 빨강: [] — 회수 시도가 관측에서 소멸(JUD-C #129833 mustFix 2 · 시뮬 S3)
+    expect(stopCalls).toHaveLength(1); // 출처: JUD-C #129833 mustFix 2 — 잠금 «안»에서 stop 시도는 실제로 있었다(잠금 전 오류와 구별)
+    expect(outcomes[0]!.stopRecorded).toBe(false); // 관측값 보존 — 허위 성공 금지(r3 계약 유지)
+    expect(cardWriteFailedOf(outcomes[0]!)).toBe(true); // 카드 skip-note·stop 실패 마커 모두 못 붙였다
+    expect(cardWriteUnknownOf(outcomes[0]!)).toBe(false); // 재독은 성공 — 불명 아님
+    expect(stopAttemptedOf(outcomes[0]!)).toBe(true); // 잠금 안 stop 시도 관측 — 잠금 전 오류(false)와 구별
+    expect(String(outcomes[0]!.skipNote)).toContain('stop-record-failed'); // stop 실패 노트로 보고(허위 skipNote 금지 · r3 계약)
+    expect(statSync(statePath).isDirectory()).toBe(true); // 쓰기 실패 주입 원문 — 스토어는 파일이 아니라 디렉터리(writeFileSync EISDIR)
+    // 뷰에는 skip-note 도 stop 실패 마커도 없다 — 쓰기 실패로 둘 다 못 붙였다.
+    expect((staleView.history ?? []).some((entry) => (entry as { event?: string }).event === TA_SKIP_NOTE_EVENT)).toBe(false);
+    expect((staleView.history ?? []).some((entry) => (entry as { event?: string }).event === TA_STOP_FAILED_EVENT)).toBe(false);
+    expect(findStalledLaunches([staleView], NOW + 60 * 60_000).map((c) => c.id)).toEqual(['ta-r5-mf2']); // 재시도 대상 유지 — 마커가 없어 다음 스윕이 다시 잡는다
+  } finally {
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+  }
+});
+
+test('FU-39400 r5b terra mustFix 4·1 — 잠금 «전» 오류(잠금 획득 실패 · 결정적 EISDIR): stop 시도 없음(stopAttempted=false)·«시도 안 함» 노트를 보존해 구별한다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fu39400-r5-prelock-'));
+  dirs.push(root);
+  setElanousConfigDir(root);
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  try {
+    mkdirSync(join(root, 'run-ledger'), { recursive: true });
+    const statePath = join(root, 'task-agent-actions.json');
+    const runId = 'run-r5-prelock';
+    const staleAt = new Date(NOW - 30 * 60_000).toISOString(); // 출처: 기존 «stale» 패턴 — 회수 자격
+    const staleView = card({ id: 'ta-r5-prelock', runId, checklistId: 'FU-39400-R5', createdAt: staleAt, history: hist([{ at: staleAt, event: 'live-move', detail: 'x' }]) });
+    writeTaskCards(statePath, [staleView]);
+    // 출처: terra r5 mustFix 4 — #39574 · chmod 555 는 root 에서 우회된다. `${statePath}.lock` 경로에 디렉터리를 놓으면
+    // .lock 생성(openSync 'wx') 이 항상 EEXIST 로 실패하고 stale 회수 unlink(디렉터리) 도 항상 실패해
+    // 잠금 획득 실패(타임아웃 throw)가 root 에서도 결정적이다 — 콜백 진입 «전» throw(시뮬 S4).
+    mkdirSync(`${statePath}.lock`);
+    const lockStaleAgo = new Date(Date.now() - 31_000); // 출처: src/storage/file-lock.ts STALE_MS=30_000 — stale 판정 경과 모의(빨강 A 시험 부수 패턴)
+    utimesSync(`${statePath}.lock`, lockStaleAgo, lockStaleAgo);
+    const stopCalls: string[] = [];
+    const outcomes = recycleStalledLaunches([staleView], {
+      nowMs: NOW,
+      statePath,
+      recordStop: (input) => { stopCalls.push(input.runId); }, // 잠금 전 오류라면 불리지 않는다
+      reasonCodeFor: () => 'provider-credential-failure',
+    });
+    expect(stopCalls).toHaveLength(0); // 출처: JUD-C #129833 mustFix 2 — 잠금 전 오류: stop 시도 자체가 없다
+    expect(outcomes).toHaveLength(1); // 수리 전 빨강: [] — 이쪽 분기도 소멸(회수 시도 관측 누락)
+    expect(outcomes[0]!.stopRecorded).toBe(false); // stop 시도가 없었으니 기록도 없다 — 관측값 그대로
+    expect(cardWriteFailedOf(outcomes[0]!)).toBe(true); // 카드 쓰기(잠금 포함) 실패 상태 보존
+    expect(stopAttemptedOf(outcomes[0]!)).toBe(false); // 잠금 안 시도 없음 — mustFix ②(stopAttempted=true)와 구별되는 관측치
+    // 출처: terra r5 mustFix 1 — #39574 · 시도가 없었으면 «stop 기록 실패» 노트가 아니라 «시도 안 함» 노트로 구별해 남긴다.
+    expect(String(outcomes[0]!.skipNote)).toContain('stop-not-attempted');
+    expect(String(outcomes[0]!.skipNote)).not.toContain('stop-record-failed');
+    const onDisk = readTaskCard('ta-r5-prelock', statePath);
+    expect((onDisk?.history ?? []).some((entry) => (entry as { event?: string }).event === TA_SKIP_NOTE_EVENT)).toBe(false); // 카드는 그대로 — 다음 스윕 재시도
+  } finally {
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+  }
+}, 20_000); // 잠금 획득 실패 재시도 상한(240회) 여유 — 출처: 빨강 A 드라이버 시험 5초 기본 상향 관례
+
+test('FU-39400 r5 — taRecycleOutcomeLine: 네 갈래 표시(정상 skip-note·마커·쓰기 실패 미부착·재독 불명) (JUD-C #129833 mustFix ①)', () => {
+  const base = { cardId: 'ta-r5-line', runId: 'run-r5-line', cause: 'grounding' as const, minutesStalled: 30, skipNote: 'failed/recycled/grounding: …' };
+  expect(taRecycleOutcomeLine({ ...base, stopRecorded: true }))
+    .toBe('TA 회수: runId=run-r5-line · 원인=grounding · 무진척 30분 · 정확 runId stop=기록됨 · skip-note=칸 history');
+  expect(taRecycleOutcomeLine({ ...base, stopRecorded: false, skipNote: 'stop-record-failed/grounding: …' }))
+    .toBe('TA 회수: runId=run-r5-line · 원인=grounding · 무진척 30분 · 정확 runId stop=실패 — 재시도 대상 유지(stop-record-failed/grounding: …) · 마커=칸 history(회수 아님)');
+  const writeFailed = taRecycleOutcomeLine({ ...base, stopRecorded: true, cardWriteFailed: true });
+  expect(writeFailed).toContain('skip-note 미부착 — 카드 쓰기 실패'); // 출처: JUD-C #129833 mustFix 1 — stopRecorded=true 여도 미부착 표시
+  expect(writeFailed).not.toContain('skip-note=칸 history'); // 오표시 금지 · 출처: JUD-C #129833 mustFix 1
+  const unknown = taRecycleOutcomeLine({ ...base, stopRecorded: true, cardWriteFailed: false, cardWriteUnknown: true });
+  expect(unknown).toContain('skip-note 부착 불명'); // 출처: JUD-C #129833 mustFix 1 — 재독 불명 표시
+  expect(unknown).not.toContain('skip-note=칸 history'); // 오표시 금지 · 출처: JUD-C #129833 mustFix 1
+  // 출처: terra r5 mustFix 1 — #39574 · stop 시도가 없었다(stopAttempted=false · 잠금 획득·진입 전 오류)면
+  // «실패» 가 아니라 «시도 안 함» 으로 구분한다. undefined(관측 없음 · spy 경로)는 기존 «실패» 표시를 유지한다.
+  const notAttempted = taRecycleOutcomeLine({ ...base, stopRecorded: false, stopAttempted: false, skipNote: 'stop-not-attempted/grounding: …' });
+  expect(notAttempted).toContain('정확 runId stop=시도 안 함'); // 수리 전 빨강: «실패» — 시도하지 않은 것을 실패라 오표시
+  expect(notAttempted).not.toContain('정확 runId stop=실패');
+  const attempted = taRecycleOutcomeLine({ ...base, stopRecorded: false, stopAttempted: true, skipNote: 'stop-record-failed/grounding: …' });
+  expect(attempted).toContain('정확 runId stop=실패 — 재시도 대상 유지'); // 시도했으나 실패 — 기존 표시 유지
+  const unobserved = taRecycleOutcomeLine({ ...base, stopRecorded: false, skipNote: 'stop-record-failed/grounding: …' });
+  expect(unobserved).toContain('정확 runId stop=실패 — 재시도 대상 유지'); // 관측 없음(undefined) — 기존 표시 유지
+});
+
+// ── FU-39400 r5b — terra r5 mustFix 3: cardWriteFailedOutcome 은 새 export 로 달았지만 외부 소비처가 없다 ──
+// (전수 grep — 정의·모듈 내부 사용 2곳·시험 주석만). 불필요한 export 를 제거한다(모듈 내부 사용은 유지).
+test('FU-39400 r5b terra mustFix 3 — cardWriteFailedOutcome 불필요 export 제거: 모듈 밖으로 노출되지 않는다(내부 사용 유지)', () => {
+  expect((launchResultLoopModule as unknown as Record<string, unknown>)['cardWriteFailedOutcome']).toBeUndefined(); // 수리 전 빨강: export 노출 — 불필요 공개면
 });

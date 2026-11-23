@@ -22,8 +22,12 @@ describe('graph node catalog', () => {
   test('카탈로그 existing ⊕ proposed 는 그래프 파서 어휘와 같다', () => {
     expect([...kinds].sort()).toEqual([...HARNESS_CORE_KINDS].sort());
     expect(catalog.kinds.proposed).toEqual({});
+    // A memory node carries its own declaration (recipe none + memory block); every other kind parses with a plain recipe.
+    const nodeBody: Record<string, string> = { memory: '    recipe: none\n    memory: { action: read, read: [instance] }\n' };
     for (const kind of kinds) {
-      const parsed = parseGraphTemplateYaml(`graph_id: catalog-kind\nversion: 1\nentry_node: node\nterminal_nodes: [node]\nnodes:\n  - node_id: node\n    kind: ${kind}\n    recipe: test\n    max_visits: 1\nedges: []\n`);
+      const body = nodeBody[kind] ?? '    recipe: test\n';
+      // 출처: #36722 — one-visit probe node, the same shape the catalog parser accepted before memory joined.
+      const parsed = parseGraphTemplateYaml(`graph_id: catalog-kind\nversion: 1\nentry_node: node\nterminal_nodes: [node]\nnodes:\n  - node_id: node\n    kind: ${kind}\n${body}    max_visits: 1\nedges: []\n`);
       expect(parsed.errors).toEqual([]);
       expect(parsed.template?.nodes[0]?.kind).toBe(kind);
     }

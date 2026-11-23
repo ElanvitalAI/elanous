@@ -27,7 +27,10 @@ import { ptyAvailable } from './availability.js';
 export { ptyAvailable } from './availability.js';
 import { resolvePtyRef, canTransitionAccessMode, ptyIdSeparatorIndex, type PtyAccessMode, type PtyTransitionPolicy } from './pty-ref.js';
 import { resolveWriteDecision, resolveTakeover, type PtyWriteActor } from './pty-write-arbiter.js';
-import { addPtyManifestOutputBytes, upsertPtyManifest, updatePtyManifestSnapshot, updatePtyManifestNickname, markPtyManifestClosed, removePtyManifest, touchLivePtyManifest } from './pty-manifest.js';
+import { addPtyManifestOutputBytes, upsertPtyManifest, updatePtyManifestSnapshot, updatePtyManifestNickname, markPtyManifestClosed, removePtyManifest, touchLivePtyManifest, reapDeadPtyManifest, listPtyManifestRows } from './pty-manifest.js';
+import { appendPtyEvent } from './pty-event-log.js';
+import { resolveInstanceName } from '../instance-identity.js';
+import { decidePtyBudgetGuard, parsePtyHostBudgetEnv, PTY_BUDGET_DENY_AT_PCT } from './pty-budget-guard.js';
 import { processPtyControlRequests } from './pty-control-ipc.js';
 import { tapPtyOutput, autoStopPtyRecording } from './pty-recording.js';
 import { forgetExternalWriteProvenance, noteExternalWrite, notePtyAccessMode } from './pty-write-provenance.js';
@@ -273,6 +276,11 @@ export interface PtyHandle extends PtyControlTarget {
    *  oldest lines and keeps only the newest `maxLines`. '' when the emulator
    *  is unavailable or the buffer has no history. */
   renderScrollback?(maxLines: number): Promise<string>;
+  /** ELS-WHEEL-SCROLLBACK (OP #136704): true while the screen emulator is on the ALTERNATE buffer and the
+   *  pane program tracks its own mouse (DECSET 1000/1002/1003 — `modes.mouseTrackingMode` ≠ none). A wheel
+   *  there belongs to the pane program as bytes: the els scrollback lane is empty on an alternate screen.
+   *  Absent on a handle without a screen emulator. */
+  wheelPassthrough?(): boolean;
   /** Render the current screen as a PNG (xterm grid → SVG → PNG). Returns
    *  null when the emulator or the SVG→PNG renderer is unavailable. For
    *  VISUAL delivery — e.g. a Telegram photo attachment when the user asks
@@ -428,6 +436,39 @@ export const DEFAULT_TERM_NAME = 'xterm-256color';
 export function startPty(opts: StartOpts): PtyHandle {
   if (!ptyAvailable()) {
     throw new Error('node-pty not installed — run `bun add node-pty`');
+  }
+  // ⭐ HQ-PTY-BUDGET-GUARD(#130253/#130442 계기) — 호스트 단위 PTY 예산 가드.
+  //   아래 MAX_CONCURRENT 는 «이 프로세스» 의 Map 크기만 본다 — 홀더·하니스 프로세스가 늘면 호스트
+  //   openpty 풀은 무제한 소진된다(2026-11-22 사고: ttys 527·고아 484 — 출처: #130253/#130442). 공유 매니페스트 원장으로
+  //   ① 죽은 소유자 행 회수(고아 보유자) → ② 라이브 점유 계수 → ③ 다음 발급이 임계를 넘으면 거부(fail-closed).
+  //   ELANOUS_PTY_HOST_BUDGET 미설정 = 수동(원장 무접촉·종전 동작 그대로).
+  const hostPtyBudget = parsePtyHostBudgetEnv(process.env.ELANOUS_PTY_HOST_BUDGET);
+  if (hostPtyBudget > 0) { // 출처: #130442 — 0=미무장(가드 무동작)
+    const reclaimedOrphans = reapDeadPtyManifest();
+    const occupied = listPtyManifestRows().filter((row) => row.alive).length;
+    const budgetDecision = decidePtyBudgetGuard({ occupied, capacity: hostPtyBudget, denyAtPct: PTY_BUDGET_DENY_AT_PCT });
+    if (budgetDecision.verdict === 'deny') {
+      const deniedId = opts.id ?? mintPtyId(opts.kind);
+      // 거부 감사 1줄(칸②) — pty_events lifecycle 채널: 발급되지 않은 id 에 거부 이유를 남긴다.
+      appendPtyEvent({
+        instance: resolveInstanceName(),
+        surfaceId: deniedId,
+        kind: 'lifecycle',
+        now: Date.now(),
+        payload: {
+          event: 'budget-denied',
+          occupied: budgetDecision.occupied,
+          capacity: budgetDecision.capacity,
+          projectedOccupied: budgetDecision.projectedOccupied,
+          projectedPct: budgetDecision.projectedPct,
+          denyAtPct: budgetDecision.denyAtPct,
+          reclaimedOrphans,
+          purpose: opts.purpose ?? null,
+          seat: opts.seat ?? null,
+        },
+      });
+      throw new Error(budgetDecision.denyReason ?? 'pty host budget guard: denied');
+    }
   }
   if (processes.size >= MAX_CONCURRENT) {
     // Lifecycle policy (2026-07-12) — NO time-based idle kill (so an idle
@@ -716,6 +757,15 @@ export function startPty(opts: StartOpts): PtyHandle {
         lines.push(line ? line.translateToString(true) : '');
       }
       return lines.join('\n');
+    },
+    // ELS-WHEEL-SCROLLBACK (OP #136704): the pane's own wheel lane — alternate buffer + its own mouse
+    // tracking (any DECSET mode ≠ none) means a wheel belongs to the pane program as bytes (the els
+    // scrollback lane is empty there: an alternate screen has no history to spin). The els server asks
+    // this per frame and stamps it on the attach frames; the view routes the wheel accordingly.
+    wheelPassthrough(): boolean {
+      if (!term) return false;
+      const t = term;
+      return t.buffer.active.type === 'alternate' && t.modes.mouseTrackingMode !== 'none';
     },
     async renderScreenPng(): Promise<Buffer | null> {
       if (!term) return null;

@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "entries": {
+    "toolbatch/RUNSHELL-PR2-UNAPPROVED-INGRESS": {
+      "expect": "green",
+      "greenSince": "PR-2 target, not yet observed",
+      "reason": "Target: actual product ingress denies unapproved marker command; this does not measure signed approval issuance or consumption."
+    },
+    "toolbatch/RUNSHELL-PR1-READ-PRESERVATION": {
+      "expect": "green",
+      "greenSince": "PR-1 preparation",
+      "reason": "Product script dispatch runs read-local through a policy callback with no human approval, preserves output hash and exactly one fixture invocation; absent callback remains denied."
+    },
+    "toolbatch/RUNSHELL-GRAPH-READ": {
+      "expect": "green",
+      "greenSince": "2026-11-22",
+      "reason": "Real graph lifecycle calls RunShell with isolated fixture binaries, including approval denial and unsafe argv preflight."
+    },
+    "toolbatch/RUNSHELL-ELN-KUBE-HOST-READ": {
+      "expect": "green",
+      "greenSince": "0.3.33 RUNSHELL-ALLOWLIST-EXPAND second read bundle",
+      "reason": "Fake local CLI and cluster binaries through product RunShell dispatch: local results consumed, cluster denial executes zero calls, prior human approval permits one call, unsafe argv refuses before any step."
+    },
+    "toolbatch/RUNSHELL-GIT-GH-READ": {
+      "expect": "green",
+      "greenSince": "0.3.33 RUNSHELL-ALLOWLIST-EXPAND first git/gh bundle",
+      "reason": "A fake git/gh product dispatch proves local git read needs no human prompt, gh GET needs approval, denial has no gh effect, and gh POST is refused before execution."
+    },
+    "toolbatch/RUNSHELL-DEFAULT-OP-30M": {
+      "expect": "green",
+      "greenSince": "0.3.33 RUNSHELL-SCRIPT-DEFAULT-CHECKS",
+      "reason": "The OP 30-minute check verifies required steps, incomplete observations for real-format mixed queue rows and an empty landing log, and explicit preview truncation in an isolated universe."
+    },
+    "toolbatch/RUNSHELL-SCRIPT-7TASK": {
+      "expect": "green",
+      "greenSince": "2026-11-22 (ELN-TOOLBATCH-EXPERIMENT simulation)",
+      "reason": "Seven isolated product CLI tasks compare ordinary RunShell with script mode; the scripted turn proxy falls at least 30 percent with identical answers and no extra failed CLI calls. Provider usage remains unmeasured."
+    },
+    "toolbatch/RUNSHELL-RECIPE-INPUT-LIMITS": {
+      "expect": "green",
+      "greenSince": "0.3.33 RUNSHELL-RECIPE-INPUT-LIMITS",
+      "reason": "Synthetic input boundaries cover inclusive raw bytes, nodes, depth, text, and expanded shared graph rejection."
+    },
+    "toolbatch/RUNSHELL-RECIPE-SIGNED": {
+      "expect": "green",
+      "greenSince": "0.3.33 RUNSHELL-RECIPE-SIGNED",
+      "reason": "Fake JUD Ed25519 key proves valid grant and denies missing trust, forged signature, changed recipe hash, and signed revoke as a grant; no effects are wired."
+    }
+  }
+}

@@ -5906,6 +5906,8 @@ describe('TUI-H9-ACTIVE-SESSION-ID — 재기동은 이 TUI 가 보여 주던 �
       scriptPath: '/opt/elanous/bin/elanous.mjs',
       args: [],
       spawnChild: async (_command, argv) => { spawned.push(argv); return 7; },
+      // The child ran for a minute before exiting 7 — a normal end, not a fast-fail fallback.
+      now: (() => { let t = 1_000_000; return () => (t += 60_000); })(),
       exit: (code: number): never => { exitCall.code = code; throw new Error('exit'); },
     }).catch(() => {});
 

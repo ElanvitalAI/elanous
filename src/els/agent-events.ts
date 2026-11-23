@@ -19,6 +19,7 @@ export function decodeEventLine(line: string): ParsedFrame {
   if (!parsed.ok) return parsed;
   const e = parsed.frame.event;
   const free = e.kind === 'state' ? e.message : e.kind === 'notice' ? e.text : e.kind === 'meta' ? e.title : undefined;
-  if (free !== undefined && looksSecret(free)) return { ok: false, ignore: false, reason: 'secret-shaped text' };
+  const detail = e.kind === 'state' ? e.detail : undefined;
+  if ((free !== undefined && looksSecret(free)) || (detail !== undefined && looksSecret(detail))) return { ok: false, ignore: false, reason: 'secret-shaped text' };
   return parsed;
 }

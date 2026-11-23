@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "entries": {
+    "member-journey/HANDLE-WEBCHAT-FIRST-TURN": {
+      "expect": "green",
+      "greenSince": "0.3.33 HANDLE-JOOSUNG-PERSONAL-SPACE-1121 simulation closeout",
+      "reason": "A fake Google signup and reserved fake handle pass the production member home serving gate, HMAC bare-origin handoff and first prompt, with restart, concurrent same-token exchange, independent bearer separation, and absent serving injected"
+    }
+  }
+}

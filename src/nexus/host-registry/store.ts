@@ -117,7 +117,7 @@ export function reclaimStaleLock(lock: string, observedToken: string | undefined
 }
 
 /** Serialises read-modify-write across processes with an owner-tokened mkdir lock. */
-function withLedgerLock<T>(path: string, fn: () => T): T {
+export function withLedgerLock<T>(path: string, fn: () => T): T {
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const lock = `${path}.lock`;

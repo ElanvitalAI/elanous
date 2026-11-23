@@ -3,7 +3,7 @@ import { rmSync } from 'node:fs';
 import { streamLLMWithTools, type LLMMessage, type LLMProvider } from './llm.js';
 import { truncateOutput } from './output-truncation.js';
 
-async function getFollowupToolResult(providerName: string, model: string, inlineLimitBytes: number, repeatCount = 12_000) {
+async function getFollowupToolResult(providerName: string, model: string, inlineLimitBytes: number, repeatCount = 12_000, coordinator = false) {
   const fullOutput = `HEAD-${'🙂'.repeat(repeatCount)}-TAIL`;
   let calls = 0;
   let followupMessages: LLMMessage[] = [];
@@ -25,7 +25,7 @@ async function getFollowupToolResult(providerName: string, model: string, inline
   };
 
   await streamLLMWithTools(
-    [{ role: 'user', content: 'read the large result' }],
+    [...(coordinator ? [{ role: 'system' as const, content: '## 조율자 프로필 (이 자리 = 조율 자리)' }] : []), { role: 'user', content: 'read the large result' }],
     {
       onText() {},
       onToolResult: (call) => { callbackOutput = call.result; },
@@ -151,4 +151,14 @@ test('image-bearing tool results keep the image block and cap only oversized met
 
 test('truncateOutput rejects a spill limit too small to include the recovery path', () => {
   expect(() => truncateOutput('x'.repeat(1000), { toolName: 'tiny-limit', inlineLimit: 32 })).toThrow(RangeError);
+});
+
+test('coordinator tool result is limited to 8 KiB while preserving the full spill', async () => {
+  const { content, fullOutput } = await getFollowupToolResult('coord-test', 'test-model', 50 * 1024, 12_000, true);
+  const savedPath = /saved to ([^\s]+) \(/.exec(content)?.[1];
+  try {
+    expect(Buffer.byteLength(content, 'utf8')).toBeLessThanOrEqual(8 * 1024);
+    expect(savedPath).toBeDefined();
+    expect(await Bun.file(savedPath!).text()).toBe(fullOutput);
+  } finally { if (savedPath) rmSync(savedPath, { force: true }); }
 });

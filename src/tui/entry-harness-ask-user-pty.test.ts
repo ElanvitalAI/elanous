@@ -21,19 +21,19 @@ test('the actual Next TUI tool call shows questions and assumptions in composer 
           args: { questions: ['어떤 좌석을 판매하나요?', '환불 마감은 언제인가요?'],
             assumptions: ['좌석 중복 판매는 허용하지 않음'] } }),
         ELANOUS_TEST_FAKE_LLM_RESPONSE: '인터뷰 반영 완료.' },
-      ready: { label: 'boot', until: screen => screen.includes('Ctrl+Q 종료'), timeoutMs: INTERVIEW_PTY_TIMEOUT_MS },
+      ready: { label: 'boot', until: screen => screen.includes('Ctrl+Q quit'), timeoutMs: INTERVIEW_PTY_TIMEOUT_MS },
       steps: [
         { label: 'ask-in-composer', text: 'interview fixture', until: screen => screen.includes('어떤 좌석을 판매하나요?')
           && screen.includes('환불 마감은 언제인가요?') && screen.includes('가정 1. 좌석 중복 판매는 허용하지 않음')
           && screen.includes('❯ '), timeoutMs: INTERVIEW_PTY_TIMEOUT_MS },
-        { label: 'answered', text: '지정석, 공연 하루 전까지', until: screen => screen.includes('인터뷰 반영 완료.') && screen.includes('턴 완료'),
+        { label: 'answered', text: '지정석, 공연 하루 전까지', until: screen => screen.includes('인터뷰 반영 완료.') && screen.includes('● Turn done'),
           timeoutMs: INTERVIEW_PTY_TIMEOUT_MS },
         { label: 'next-request-ask-in-composer', text: 'interview fixture again',
           until: screen => screen.includes('질문 · 한 번 답변하면 이 라운드를 마칩니다')
             && screen.includes('환불 마감은 언제인가요?') && screen.includes('❯ '),
           timeoutMs: INTERVIEW_PTY_TIMEOUT_MS },
         { label: 'next-request-answered', text: '다음 요청의 사람 답변',
-          until: screen => screen.includes('턴 완료') && screen.includes('인터뷰 반영 완료.'),
+          until: screen => screen.includes('● Turn done') && screen.includes('인터뷰 반영 완료.'),
           timeoutMs: INTERVIEW_PTY_TIMEOUT_MS },
       ],
     });

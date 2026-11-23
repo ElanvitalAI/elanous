@@ -1,4 +1,4 @@
-import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -39,6 +39,9 @@ function fixture(stdin = '', overrides: (context: { path: string }) => Partial<M
     // Real wake reads the pty manifest and seat folders; focused tests opt in through overrides.
     registerLogSink: async () => undefined,
     wake: async (address, msgId) => ({ wake: 'none', source: 'unresolved', address, msgId, result: 'skipped-test-universe' }),
+    // MSG-FILTERS-RELAX: the caller seat is explicit in tests (the host ELANOUS_TRACK never leaks into origin).
+    callerSeat: () => null,
+    saveAckDigest: async () => {},
     ...overrides({ path }),
   });
   return {
@@ -512,6 +515,28 @@ test('post --to ALL reaches other seats and a loop address through the existing 
   expect(f.stderr).toEqual([]);
 });
 
+test('MSG-ACK-MULTI-ID: positional and selected IDs never acknowledge siblings or advance the cursor', async () => {
+  const f = fixture();
+  const store = f.store();
+  try { for (const body of ['one', 'two', 'three', 'four']) store.post({ from: 'OP', to: 'MK', body }); }
+  finally { store.close(); }
+  await f.run('ack', '2', '--to', 'MK', '--json');
+  expect(JSON.parse(f.stdout.pop()!)).toEqual({ recipient: 'MK', id: 2, status: 'acked' });
+  await f.run('ack', '--ids', '1,3', '--to', 'MK', '--json');
+  expect(JSON.parse(f.stdout.pop()!)).toMatchObject({ recipient: 'MK', ids: [1, 3], status: 'acked' });
+  const check = f.store();
+  try {
+    expect(check.getCursor('MK')).toBe(0);
+    expect(check.listByRecipient('MK').map(row => row.id)).toEqual([4]);
+    for (const id of [1, 2, 3]) expect(check.listReceipts({ messageId: id }).map(row => row.state)).toEqual(['posted', 'seen']);
+  } finally { check.close(); }
+  await f.run('ack', '--ids', '4,999', '--to', 'MK');
+  const after = f.store();
+  try { expect(after.listByRecipient('MK').map(row => row.id)).toEqual([4]); }
+  finally { after.close(); }
+  expect(f.stderr.at(-1)).toContain('message not found');
+});
+
 test('list pages by recipient and cursor; unread and watch are read-only until explicit ack', async () => {
   const f = fixture();
   const store = f.store();
@@ -535,11 +560,11 @@ test('list pages by recipient and cursor; unread and watch are read-only until e
   expect(f.sleeps).toBe(1);
   const before = f.store();
   try { expect(before.getCursor('MK')).toBe(0); } finally { before.close(); }
-  await f.run('ack', '1', '--to', 't', '--json');
-  expect(JSON.parse(f.stdout.pop()!)).toEqual({ recipient: 'MK', cursor: 1 });
+  await f.run('ack', '--through', '1', '--to', 't', '--json');
+  expect(JSON.parse(f.stdout.pop()!)).toEqual({ recipient: 'MK', through: 1 });
   await f.run('list', '--to', 'MK', '--json');
   expect(JSON.parse(f.stdout.pop()!).map((row: { id: number }) => row.id)).toEqual([3]);
-  await f.run('ack', '3', '--to', 'MK');
+  await f.run('ack', '--through', '3', '--to', 'MK');
   expect(f.stdout.pop()).toBe('MK acknowledged through #3');
   const storeForPerMessageAck = f.store();
   let individualId: number;
@@ -670,7 +695,7 @@ test('list --thread shows the durable request and reply across seats without cha
   await f.run('list', '--thread', String(reply.id), '--json');
   expect(JSON.parse(f.stdout.at(-1)!)).toEqual([request, reply]);
   const store = f.store();
-  try { expect(store.getCursor('TC')).toBe(request.id); expect(store.getCursor('OP')).toBe(0); }
+  try { expect(store.getCursor('TC')).toBe(0); expect(store.getCursor('OP')).toBe(0); expect(store.listByRecipient('TC').map(row => row.id)).toEqual([notice.id]); }
   finally { store.close(); }
   expect(f.stderr).toEqual([]);
   expect(f.exits).toEqual([]);
@@ -856,7 +881,8 @@ test('CLI list, thread and post --reply-to leave a pre-threading ledger undamage
   const oldQuestion: Message = { id: 1, from: 'OP', to: 'TC', body: 'old question', kind: 'memo', intent: 'info', needsAck: false, origin: { kind: 'agent', seat: 'OP' }, schemaVersion: 1, createdAt: '2026-10-01T00:00:00.000Z' };
   const oldAnswer: Message = { id: 2, from: 'TC', to: 'OP', body: 'old answer', intent: 'info', needsAck: false, origin: { kind: 'agent', seat: 'TC' }, schemaVersion: 1, createdAt: '2026-10-01T00:01:00.000Z' };
   await f.run('list', '--to', 'TC', '--after', '0', '--json');
-  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([oldQuestion]);
+  // MSG-FILTERS-RELAX: an explicit --after is a history read — each row carries its ack state.
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([{ ...oldQuestion, ackState: 'unread' }]);
   await f.run('thread', '1', '--json');
   expect(JSON.parse(f.stdout.at(-1)!)).toEqual({ question: oldQuestion, replies: [] });
   await f.run('post', 'new reply', '--from', 'TC', '--to', 'OP', '--reply-to', '1', '--json');
@@ -1034,7 +1060,7 @@ test('bad seats, body, kind, cursor, limit and future ack exit 2 with one-line e
     ['watch', '--once'],
     ['unread', '--to', '../MK'],
     ['post', 'body', '--from', '../bad', '--to', 'MK'],
-    ['post', 'body', '--from', 'OP', '--to', 'MK', '--kind', 'BAD!'],
+    // MSG-FILTERS-RELAX: any --kind is stored now (see the MSG-FILTERS-RELAX tests); no row here.
     ['post', 'body', '--body', 'duplicate', '--from', 'OP', '--to', 'MK'],
     ['list', '--to', 'MK', '--after', '-1'],
     ['list', '--to', 'MK', '--limit', '1.5'],
@@ -1602,7 +1628,7 @@ test('msg serve --sse publishes its port for the restart path and clears it when
   expect(readPostOffice(dir)).toBeNull();
 });
 
-test('MSG-RECEIPTS-FOLLOWUP ① — positional and --through hand acks leave «seen» like --id, for the messages they move past', async () => {
+test('MSG-RECEIPTS-FOLLOWUP ① — positional and --through hand acks leave «seen» for acknowledged messages', async () => {
   const f = fixture();
   const writer = f.store();
   const a = writer.post({ from: 'OP', to: 'TC', body: 'a' });
@@ -1610,7 +1636,7 @@ test('MSG-RECEIPTS-FOLLOWUP ① — positional and --through hand acks leave «s
   const c = writer.post({ from: 'OP', to: 'TC', body: 'c' });
   const d = writer.post({ from: 'OP', to: 'TC', body: 'd' });
   writer.close();
-  await f.run('ack', String(b.id), '--to', 'TC'); // positional = through
+  await f.run('ack', String(b.id), '--to', 'TC'); // positional = exactly one
   await f.run('ack', '--through', String(c.id), '--to', 'TC');
   const store = f.store();
   try {
@@ -1863,4 +1889,85 @@ test('real hook child exits 0 within HOOK_STDIN_READ_LIMIT_MS+margin with an unc
     expect(Date.now() - started).toBeLessThan(HOOK_STDIN_READ_LIMIT_MS + 8_000); // 상한(5s)+여유 안에 종료
     expect(Date.now() - started).toBeGreaterThanOrEqual(HOOK_STDIN_READ_LIMIT_MS); // 상한을 실제로 기다린 뒤 폴백
   } finally { try { child.stdin.end(); } catch { /* 자식 종료 뒤 정리 */ } }
+});
+
+describe('MSG-FILTERS-RELAX — msg post accepts and stores instead of refusing', () => {
+  test('an unknown kind is stored lowercased; an unknown intent is stored as info with an intent: ref', async () => {
+    const f = fixture();
+    await f.run('post', 'hello', '--from', 'OP', '--to', 'TC', '--kind', 'Coord.Reply', '--intent', 'Heads-Up', '--json');
+    expect(f.exits).toEqual([]);
+    const posted = JSON.parse(f.stdout.at(-1)!);
+    expect([posted.kind, posted.intent, posted.refs]).toEqual(['coord.reply', 'info', ['intent:heads-up']]);
+    const store = f.store();
+    try { expect(store.getMessage(posted.id)!.kind).toBe('coord.reply'); } finally { store.close(); }
+  });
+
+  test('a --from that differs from the caller seat is stored with the caller in origin.seat', async () => {
+    const f = fixture('', () => ({ callerSeat: () => 'OP' }));
+    await f.run('post', 'on behalf', '--from', 'TC', '--to', 'UX', '--json');
+    expect(f.exits).toEqual([]);
+    const posted = JSON.parse(f.stdout.at(-1)!);
+    expect([posted.from, posted.origin]).toEqual(['TC', { kind: 'agent', seat: 'OP' }]);
+    const store = f.store();
+    try { expect(store.getMessage(posted.id)!.origin).toEqual({ kind: 'agent', seat: 'OP' }); } finally { store.close(); }
+  });
+
+  test('--from defaults to the caller seat, then to the seat folder of the cwd', async () => {
+    const f = fixture('', () => ({ callerSeat: () => 'ux' }));
+    await f.run('post', 'no from', '--to', 'OP', '--json');
+    expect(JSON.parse(f.stdout.at(-1)!).from).toBe('UX');
+    const g = fixture('', () => ({ cwd: () => '/Users/someone/elanous-hq/seats/MK/sub' }));
+    await g.run('post', 'from cwd', '--to', 'OP', '--json');
+    expect(JSON.parse(g.stdout.at(-1)!).from).toBe('MK');
+  });
+
+  test('a sub-seat sender is accepted', async () => {
+    const f = fixture();
+    await f.run('post', 'sub seat', '--from', 'mk/graphics', '--to', 'OP', '--json');
+    expect(f.exits).toEqual([]);
+    expect(JSON.parse(f.stdout.at(-1)!).from).toBe('MK/graphics');
+  });
+
+  test('an unknown --priority and an unparsable --deadline are warnings; the message is stored', async () => {
+    const f = fixture();
+    await f.run('post', 'still goes', '--from', 'OP', '--to', 'TC', '--priority', 'asap', '--deadline', 'soon', '--json');
+    expect(f.exits).toEqual([]);
+    const posted = JSON.parse(f.stdout.at(-1)!);
+    expect(posted.body).toBe('still goes');
+    expect(posted.priority).toBeUndefined();
+    expect(posted.deadlineAt).toBeUndefined();
+    expect(f.stderr).toContain('msg post 경고: --priority asap 를 모른다 (urgent · p0 · normal · 정수) — 우선순위 없이 저장한다');
+    expect(f.stderr).toContain('msg post 경고: --deadline must be a date/time Date.parse accepts, HH:MM or +<n>m|h (soon) — 기한 없이 저장한다');
+    await f.run('post', 'numeric', '--from', 'OP', '--to', 'TC', '--priority', '5', '--json');
+    expect(JSON.parse(f.stdout.at(-1)!).priority).toBe(5);
+  });
+});
+
+describe('MSG-FILTERS-RELAX — msg list re-reads acknowledged mail', () => {
+  test('ack a mail → plain list hides it, --all shows it with its acked state, --after returns it too', async () => {
+    const f = fixture();
+    const store = f.store();
+    try {
+      store.post({ from: 'OP', to: 'MK', body: 'first' });
+      store.post({ from: 'OP', to: 'MK', body: 'second' });
+    } finally { store.close(); }
+    await f.run('ack', '--id', '1', '--to', 'MK', '--json');
+    await f.run('list', '--to', 'MK', '--json');
+    expect(JSON.parse(f.stdout.at(-1)!).map((row: { id: number }) => row.id)).toEqual([2]);
+    await f.run('list', '--to', 'MK', '--all', '--json');
+    expect(JSON.parse(f.stdout.at(-1)!).map((row: { id: number; ackState: string }) => [row.id, row.ackState])).toEqual([[1, 'acked'], [2, 'unread']]);
+    await f.run('list', '--to', 'MK', '--after', '0', '--json');
+    expect(JSON.parse(f.stdout.at(-1)!).map((row: { id: number }) => row.id)).toEqual([1, 2]);
+    f.stdout.length = 0;
+    await f.run('list', '--to', 'MK', '--all');
+    expect(f.stdout[0]).toMatch(/^#1 \S+ OP → MK \[\S+\] \(acked\): first$/);
+    expect(f.stdout[1]).toMatch(/^#2 \S+ OP → MK \[\S+\] \(unread\): second$/);
+    // cursor ack (through) is shown as acked too.
+    await f.run('ack', '2', '--to', 'MK');
+    f.stdout.length = 0;
+    await f.run('list', '--to', 'MK', '--all', '--json');
+    expect(JSON.parse(f.stdout[0]!).map((row: { ackState: string }) => row.ackState)).toEqual(['acked', 'acked']);
+    await f.run('list', '--thread', '1', '--json');
+    expect(JSON.parse(f.stdout.at(-1)!).map((row: { id: number }) => row.id)).toEqual([1]);
+  });
 });

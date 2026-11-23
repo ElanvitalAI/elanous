@@ -1,21 +1,38 @@
 import { describe, expect, test } from 'bun:test';
 import { PaneRegistry, authorizeRequest, isMutating, resolveTabCloseScope, spawnParentOf, type ServerRole } from './server-auth.js'; import type { AllowRule } from './control.js';
 
+test('acting seat gets OP decisions but not owner registration or confirmation bypass', () => {
+  const roles: ServerRole[] = [
+    { kind: 'hand', seat: 'TC-H-CX-2', pane: 'p', workspaces: ['own'] },
+    { kind: 'peer', seat: 'TC-H-CX-2', pane: 'p', pid: 1, uid: 501 },
+  ];
+  for (const role of roles) {
+    const denied = authorizeRequest(role, { op: 'do' }, 'foreign', []);
+    expect(denied.allow).toBe(false);
+    expect(denied.allow === false && denied.reason).toContain('an OP pane is authorized for this request at this gate');
+    expect(authorizeRequest(role, { op: 'do' }, 'foreign', [], undefined, true).allow).toBe(true);
+    expect(authorizeRequest(role, { op: 'coordinator' }, undefined, [], undefined, true).allow).toBe(true);
+    expect(authorizeRequest(role, { op: 'seat-set', seat: 'OP', runtime: {} }, undefined, [], undefined, true).allow).toBe(false);
+    expect(authorizeRequest(role, { op: 'close' }, 'foreign', [], undefined, true).allow).toBe(false);
+    expect(authorizeRequest(role, { op: 'close', confirmed: true }, 'foreign', [], undefined, true).allow).toBe(true);
+  }
+});
+
 const OWNER_ENV = 'ELANOUS_ELS_OWNER_TOKEN';
 const PANE_ENV = 'ELANOUS_ELS_PANE_TOKEN';
 const HAND_PARENT = { kind: 'hand', seat: 'HAND-MCP', workspaces: ['w-hand'] } as const;
 const OP_PARENT = { kind: 'op' } as const;
 
 describe('PaneRegistry.registerOwner + classify — owner 등록 절차', () => {
-  test('owner 토큰: 등록 전 owner(new 스폰·seat-set 만 허용, 그 밖 변형 거부) · `els seat set OP` 후 op', () => {
+  test('owner 토큰: 등록 전 owner(11-23 완화 — 모든 연산 허용) · `els seat set OP` 후 op', () => {
     const registry = new PaneRegistry();
     const owner = registry.registerOwner();
     const before = registry.classify({ token: owner.token });
     expect(before.kind).toBe('owner');
     const spawn = authorizeRequest(before, { op: 'new', ws: 'w' }, undefined, undefined);
     expect(spawn.allow).toBe(true);
-    const denied = authorizeRequest(before, { op: 'close', pane: 'w:p' }, undefined, undefined);
-    expect(denied.allow).toBe(false);
+    const close = authorizeRequest(before, { op: 'close', pane: 'w:p' }, undefined, undefined);
+    expect(close).toEqual({ allow: true });
     const seatSet = authorizeRequest(before, { op: 'seat-set', seat: 'OP' }, undefined, undefined);
     expect(seatSet.allow).toBe(true);
     expect(registry.registerSeat('OP')).toBe(true);
@@ -123,12 +140,10 @@ describe('authorizeRequest — JUD #39053 ⓒ1 리터럴', () => {
     expect(verdict.allow === false && verdict.reason).toContain('denied');
   });
 
-  test('② 소켓 직통 위장(무토큰·가짜 토큰) = outsider: 변형 연산 전면 거부', () => {
+  test('② 소켓 직통(무토큰) = outsider: 같은 uid 운영자 — 11-23 완화로 변형 연산 허용', () => {
     const outsider = registry.classify(undefined);
     expect(outsider.kind).toBe('outsider');
-    const verdict = authorizeRequest(outsider, { op: 'do', pane: 'p-op' }, 'w-op', undefined);
-    expect(verdict.allow).toBe(false);
-    expect(verdict.allow === false && verdict.reason).toContain('no pane credential');
+    expect(authorizeRequest(outsider, { op: 'do', pane: 'p-op' }, 'w-op', undefined)).toEqual({ allow: true });
   });
 
   test('③ 진짜 OP pane: 모든 pane 허용', () => {
@@ -136,15 +151,38 @@ describe('authorizeRequest — JUD #39053 ⓒ1 리터럴', () => {
     expect(authorizeRequest(opRole, { op: 'new', ws: 'w-x' }, undefined, undefined).allow).toBe(true);
   });
 
-  test('④ 손은 자기 workspace 만', () => {
+  test('④ 손은 자기 workspace 만 — foreign-workspace denial identifies an allowed OP pane', () => {
     expect(authorizeRequest(handRole, { op: 'do', pane: 'p-hand' }, 'w-hand', undefined)).toEqual({ allow: true });
-    expect(authorizeRequest(handRole, { op: 'send', pane: 'p-op' }, 'w-op', undefined).allow).toBe(false);
+    expect(authorizeRequest(handRole, { op: 'send', pane: 'p-op' }, 'w-op', undefined)).toEqual({
+      allow: false,
+      reason: 'els: send denied — default rules: seat HAND-MCP may control only its own workspaces (target w-op not bound); an OP pane is authorized for this request at this gate (other checks may still apply)',
+    });
+    expect(authorizeRequest(opRole, { op: 'send', pane: 'p-op' }, 'w-op', undefined)).toEqual({ allow: true });
   });
 
-  test('close 는 confirm 필요 — 역할 무관', () => {
-    const verdict = authorizeRequest(opRole, { op: 'close', pane: 'p-x' }, 'w-x', undefined);
+  test('guidance is true for default and no-rule refusals, but not asserted for earlier target failures', () => {
+    const peer: ServerRole = { kind: 'peer', pid: 42, uid: 501, seat: 'OTHER', pane: 'peer' };
+    for (const [role, request, workspace] of [
+      [handRole, { op: 'do', pane: 'p-other' }, 'foreign'],
+      [handRole, { op: 'snapshot', pane: 'p-other' }, 'foreign'],
+      [handRole, { op: 'close', pane: 'p-hand' }, 'w-hand'],
+      [peer, { op: 'send', pane: 'p-other' }, 'foreign'],
+    ] as const) {
+      const denied = authorizeRequest(role, request, workspace, undefined);
+      expect(denied.allow).toBe(false);
+      expect(denied.allow === false && denied.reason).toContain('an OP pane is authorized for this request at this gate (other checks may still apply)');
+      expect(authorizeRequest(opRole, request, workspace, undefined)).toEqual({ allow: true });
+    }
+    const unresolved = authorizeRequest(handRole, { op: 'rename', kind: 'workspace' }, undefined, undefined);
+    expect(unresolved).toEqual({ allow: false, reason: 'els: rename denied — workspace target not resolved' });
+    expect(authorizeRequest(opRole, { op: 'rename', kind: 'workspace' }, undefined, undefined).allow).toBe(false);
+  });
+
+  test('close: 손은 confirm 필요 · OP 는 confirm 없이 허용(11-23 완화)', () => {
+    const verdict = authorizeRequest(handRole, { op: 'close', pane: 'p-hand' }, 'w-hand', undefined);
     expect(verdict.allow).toBe(false);
     expect(verdict.allow === false && verdict.reason).toContain('confirm');
+    expect(authorizeRequest(opRole, { op: 'close', pane: 'p-x' }, 'w-x', undefined)).toEqual({ allow: true });
   });
 
   test('tab close: a confirmed own-workspace tab is allowed, a foreign tab and unconfirmed close are refused', () => {
@@ -152,9 +190,12 @@ describe('authorizeRequest — JUD #39053 ⓒ1 리터럴', () => {
       { tabId: 't-own', workspace: 'w-hand', ownerSeats: ['HAND-MCP'] })).toEqual({ allow: true });
     expect(authorizeRequest(handRole, { op: 'close-tab', tab: 't-other', confirmed: true }, 'w-op', undefined,
       { tabId: 't-other', workspace: 'w-op', ownerSeats: ['HAND-OTHER'] }).allow).toBe(false);
-    const unconfirmed = authorizeRequest(opRole, { op: 'close-tab', tab: 't-own' }, 'w-hand', undefined);
+    const unconfirmed = authorizeRequest(handRole, { op: 'close-tab', tab: 't-own' }, 'w-hand', undefined,
+      { tabId: 't-own', workspace: 'w-hand', ownerSeats: ['HAND-MCP'] });
     expect(unconfirmed.allow).toBe(false);
     expect(unconfirmed.allow === false && unconfirmed.reason).toContain('confirm');
+    expect(authorizeRequest(opRole, { op: 'close-tab', tab: 't-own' }, 'w-hand', undefined,
+      { tabId: 't-own', workspace: 'w-hand', ownerSeats: ['HAND-MCP'] })).toEqual({ allow: true });
   });
 
   test('tab close refuses another seat in the same workspace, mixed owners, and a checked tab ID unlike execution', () => {
@@ -219,12 +260,11 @@ describe('JUD must ⓒ2-① (OP #104711) — reads are an allowlist: input-line 
     expect(isMutating({ op: 'status', pane: 'p' })).toBe(false);
     expect(isMutating({ op: 'ping' })).toBe(false);
   });
-  test('② outsider → OP pane input-line 원천 거부', () => {
+  test('② outsider(같은 uid 운영자) → OP pane input-line 허용(11-23 완화)', () => {
     const registry = new PaneRegistry();
     const outsider = registry.classify(undefined);
     const verdict = authorizeRequest(outsider, { op: 'input-line', pane: 'p-op', text: 'x', from: 'y' }, 'w-op', undefined);
-    expect(verdict.allow).toBe(false);
-    expect(verdict.allow === false && verdict.reason).toContain('mutating ops need a pane of this els server');
+    expect(verdict).toEqual({ allow: true });
   });
   test('③ hand → 다른 workspace(OP) pane input-line 거부 — 문을 경유해 default 규칙이 거부', () => {
     const registry = new PaneRegistry();
@@ -252,12 +292,12 @@ describe('build self-report — a pane reports its own build, nobody else\'s', (
     const env = registry.registerSpawn({ ELANOUS_ELS_PANE: 'p-self', ELANOUS_ELS_WS: 'w-self' }, '/tmp');
     return registry.classify({ token: env[PANE_ENV] });
   };
-  test('a pane spawned without a credentialed parent may report its own pane; another pane or no token may not', () => {
+  test('a pane spawned without a credentialed parent may report its own pane; another pane may not; no token (operator) may', () => {
     const own = handRole();
     expect(own).toMatchObject({ kind: 'hand', seat: 'unknown', pane: 'p-self' });
     expect(authorizeRequest(own, { op: 'build', pane: 'p-self' }, undefined, undefined).allow).toBe(true);
     expect(authorizeRequest(own, { op: 'build', pane: 'p-other' }, undefined, undefined).allow).toBe(false);
-    expect(authorizeRequest({ kind: 'outsider', note: 'no pane credential' }, { op: 'build', pane: 'p-self' }, undefined, undefined).allow).toBe(false);
+    expect(authorizeRequest({ kind: 'outsider', note: 'no pane credential' }, { op: 'build', pane: 'p-self' }, undefined, undefined).allow).toBe(true);
   });
 });
 
@@ -276,44 +316,61 @@ test('JUD #39096 ⓑ — ledger-verified peer seat is a role-door principal; sea
   expect(authorizeRequest(peer, { op: 'seat-set' }, undefined, undefined).allow).toBe(false);
 });
 
-test('coordinator mutations require OP pane or verified OP peer, never an allow-listed non-OP', () => {
+test('coordinator mutations require OP pane, verified OP peer, or the same-uid operator (outsider/owner), never an allow-listed non-OP pane', () => {
   const opPeer: ServerRole = { kind: 'peer', pid: PEER_PID, pane: PEER_PANE, seat: 'OP', uid: PEER_UID };
   const roles: ServerRole[] = [opPeer, { kind: 'op', pane: 'op' },
     { ...opPeer, seat: 'HAND' }, { kind: 'hand', pane: 'p', seat: 'OP', workspaces: ['w'] },
     { kind: 'outsider', note: 'no credential' }, { kind: 'owner', note: 'unregistered' }];
+  const expected = [true, true, false, false, true, true];
   for (const op of ['coordinator', 'coordinator-unset']) {
     for (const [index, role] of roles.entries()) {
-      expect(authorizeRequest(role, { op }, 'w', PEER_INPUT_RULES).allow).toBe(index < 2);
+      expect(authorizeRequest(role, { op }, 'w', PEER_INPUT_RULES).allow).toBe(expected[index]);
     }
   }
 });
 
-test('JUD #39096 ⓑ — no-token outsider keeps spawn (main behavior) but cannot type into panes', () => {
+test('JUD #39096 ⓑ — no-token outsider keeps spawn and (11-23 relaxation) may type into panes', () => {
   const OUTSIDER: ServerRole = { kind: 'outsider', note: 'no pane credential' };
   expect(authorizeRequest(OUTSIDER, { op: 'new' }, undefined, undefined).allow).toBe(true);
-  expect(authorizeRequest(OUTSIDER, INPUT_LINE_REQ, 'w1', PEER_INPUT_RULES).allow).toBe(false);
+  expect(authorizeRequest(OUTSIDER, INPUT_LINE_REQ, 'w1', PEER_INPUT_RULES).allow).toBe(true);
 });
 
-// JUD #39096 must ⓒ + CC-1 (OP #105970·#106123 턴3): raw paths (do/input-line/attach) are mapped
-// door actions; an unmapped mutating op (rename — door-struct ops land in #102111) is fail-closed.
-test('JUD #39096 ⓒ CC-1 — unmapped mutating op (rename) is fail-closed at the door for every role', () => {
+// Non-workspace rename remains unmapped and fail-closed for pane roles; the same-uid operator is allowed (11-23).
+test('JUD #39096 ⓒ CC-1 — unmapped rename kinds remain fail-closed for pane roles', () => {
   const peer: ServerRole = { kind: 'peer', pid: PEER_PID, pane: PEER_PANE, seat: 'OP', uid: PEER_UID };
   const verdict = authorizeRequest(peer, { op: 'rename', pane: 'p1' }, 'w1', PEER_INPUT_RULES);
   expect(verdict.allow).toBe(false);
   const outsider = { kind: 'outsider', note: 'raw socket' } as ServerRole;
-  expect(authorizeRequest(outsider, { op: 'rename' }, undefined, undefined).allow).toBe(false);
+  expect(authorizeRequest(outsider, { op: 'rename' }, undefined, undefined).allow).toBe(true);
   // mapped raw paths stay door actions at authorizeRequest: do/attach/input-line reach the
   // pane-role door below (asserted by the ⓒ attach·input-line tests above) — rename does not.
 });
 
+test('workspace rename uses resolved workspace do policy and refuses unresolved targets', () => {
+  const request = { op: 'rename', kind: 'workspace', id: 'w-id' };
+  const hand: ServerRole = { kind: 'hand', seat: 'HAND-MCP', pane: 'p', workspaces: ['own'] };
+  const op: ServerRole = { kind: 'op', pane: 'op' };
+  const outsider: ServerRole = { kind: 'outsider', note: 'no credential' };
+  expect(isMutating(request)).toBe(true);
+  expect(authorizeRequest(op, request, 'own', undefined).allow).toBe(true);
+  expect(authorizeRequest(op, request, undefined, undefined).allow).toBe(false);
+  expect(authorizeRequest(hand, request, 'own', undefined).allow).toBe(true);
+  expect(authorizeRequest(hand, request, 'foreign', undefined).allow).toBe(false);
+  expect(authorizeRequest(outsider, request, 'own', undefined).allow).toBe(true);
+  expect(authorizeRequest(op, { ...request, kind: 'tab' }, 'own', undefined).allow).toBe(false);
+  expect(authorizeRequest(hand, { ...request, kind: 'tab' }, 'own', PEER_INPUT_RULES).allow).toBe(false);
+  expect(authorizeRequest(hand, { ...request, kind: 'tab' }, 'foreign', undefined).allow).toBe(false);
+  expect(authorizeRequest(op, { ...request, kind: 'tab' }, undefined, undefined).allow).toBe(false);
+});
+
 describe('ELS-PTY-RECORD door: snapshot writes a file so it is mutating, judged as `read`; record is judged as `do`', () => {
-  test('분류: snapshot·record 모두 mutating (outsider 불가)', () => {
+  test('분류: snapshot·record 모두 mutating', () => {
     expect(isMutating({ op: 'snapshot', pane: 'p' })).toBe(true);
     expect(isMutating({ op: 'record', pane: 'p' })).toBe(true);
   });
-  test('snapshot: outsider 거부 · own-workspace hand 허용 · other workspace hand 거부 · OP 허용 · 미등록 owner 허용', () => {
+  test('snapshot: outsider 허용(11-23) · own-workspace hand 허용 · other workspace hand 거부 · OP 허용 · 미등록 owner 허용', () => {
     const registry = new PaneRegistry();
-    expect(authorizeRequest(registry.classify(undefined), { op: 'snapshot', pane: 'p' }, 'w-hand', undefined).allow).toBe(false);
+    expect(authorizeRequest(registry.classify(undefined), { op: 'snapshot', pane: 'p' }, 'w-hand', undefined).allow).toBe(true);
     const handEnv = registry.registerSpawn({ ELANOUS_ELS_PANE: 'p-hand', ELANOUS_ELS_WS: 'w-hand' }, '/Users/x/elanous-hq/seats/HAND-MCP', HAND_PARENT);
     const hand = registry.classify({ token: handEnv[PANE_ENV] });
     expect(authorizeRequest(hand, { op: 'snapshot', pane: 'p-hand' }, 'w-hand', undefined).allow).toBe(true);
@@ -323,9 +380,9 @@ describe('ELS-PTY-RECORD door: snapshot writes a file so it is mutating, judged 
     const owner = registry.registerOwner();
     expect(authorizeRequest(registry.classify({ token: owner.token }), { op: 'snapshot', pane: 'p' }, 'w', undefined).allow).toBe(true);
   });
-  test('record: outsider 거부 · own-workspace hand 허용 · other workspace hand 거부', () => {
+  test('record: outsider 허용(11-23) · own-workspace hand 허용 · other workspace hand 거부', () => {
     const registry = new PaneRegistry();
-    expect(authorizeRequest(registry.classify(undefined), { op: 'record', pane: 'p' }, 'w-hand', undefined).allow).toBe(false);
+    expect(authorizeRequest(registry.classify(undefined), { op: 'record', pane: 'p' }, 'w-hand', undefined).allow).toBe(true);
     const handEnv = registry.registerSpawn({ ELANOUS_ELS_PANE: 'p-hand', ELANOUS_ELS_WS: 'w-hand' }, '/Users/x/elanous-hq/seats/HAND-MCP', HAND_PARENT);
     const hand = registry.classify({ token: handEnv[PANE_ENV] });
     expect(authorizeRequest(hand, { op: 'record', pane: 'p-hand' }, 'w-hand', undefined).allow).toBe(true);
