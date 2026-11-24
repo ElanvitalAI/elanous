@@ -18,7 +18,7 @@ import { parseEventFrame } from '../agent-events/protocol.js';
 
 const recordingBridge = (): { bridge: AgentEventBridge; seen: { level: string; text: string }[] } => {
   const seen: { level: string; text: string }[] = [];
-  return { seen, bridge: { busy: () => {}, attention: () => {}, blocked: () => {}, approval: () => {}, notice: (level: 'info' | 'warn' | 'alert', text: string) => { seen.push({ level, text }); } } };
+  return { seen, bridge: { busy: () => {}, attention: () => {}, blocked: () => {}, resume: () => {}, approval: () => {}, notice: (level: 'info' | 'warn' | 'alert', text: string) => { seen.push({ level, text }); } } };
 };
 
 test('every notice the queue accepts is emitted once, and the queue item is untouched', () => {
@@ -45,7 +45,7 @@ test('urgent seat mail emits alert; the capsule summary row emits through the sa
 
 test('a throwing bridge never changes the queue answer', () => {
   const queue = createNextTuiQueue();
-  wireNoticeEvents(queue, { busy: () => {}, attention: () => {}, blocked: () => {}, approval: () => {}, notice: () => { throw new Error('sink down'); } });
+  wireNoticeEvents(queue, { busy: () => {}, attention: () => {}, blocked: () => {}, resume: () => {}, approval: () => {}, notice: () => { throw new Error('sink down'); } });
   const item = queue.enqueueNotice('still queued', 'event-watch');
   expect(item.status).toBe('queued');
   expect(queue.count).toBe(1);

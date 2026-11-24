@@ -83,19 +83,32 @@ export function readShardArtifacts(dir: string, parts: readonly (readonly string
     if (clean !== undefined && ((rc === 0 || rc === 1) || timedOutComplete) && summary) {
       const junit = read(`part-${index}.junit.xml`);
       const retryFiles = retryManifest;
+      // A retry manifest may contain many files from the same part. Parse the
+      // original JUnit and timeout log once, rather than once per retry.
+      let failuresByFile: Map<string, string[]> | undefined;
+      let timedOutIds: Set<string> | undefined;
       const retryPass = retryFiles.flatMap((file, retryIndex): RetryPassEvidence[] => {
         if (!files.includes(file)) return [];
         const retryRc = rcOf(read(`part-${index}.retry-${retryIndex}.rc`));
         const retryLog = read(`part-${index}.retry-${retryIndex}.log`);
         const retryJunit = read(`part-${index}.retry-${retryIndex}.junit.xml`);
-        const originalFailures = (junitFailedCaseIds(junit ?? '') ?? []).filter((id) => testFileOfId(id) === file);
+        if (!failuresByFile) {
+          failuresByFile = new Map();
+          for (const id of junitFailedCaseIds(junit ?? '') ?? []) {
+            const testFile = testFileOfId(id);
+            const ids = failuresByFile.get(testFile) ?? [];
+            ids.push(id);
+            failuresByFile.set(testFile, ids);
+          }
+        }
+        const originalFailures = failuresByFile.get(file) ?? [];
         const verdict = cleanRetryVerdict(retryRc, retryLog, retryJunit, file, originalFailures);
         if (!verdict.clean) return [];
         // A multi-file part that passes alone points to isolation/order contamination. A single-file
         // part that passes under the same retry limit points to load. A timed-out original is timeout.
-        const timedOutIds = new Set(parseTimedOutFailures(clean));
+        const timeoutSet = timedOutIds ??= new Set(parseTimedOutFailures(clean));
         return originalFailures.map((id) => ({ id,
-          cause: timedOutIds.has(id) ? 'timeout' : files.length > 1 ? 'isolation' : 'load' }));
+          cause: timeoutSet.has(id) ? 'timeout' : files.length > 1 ? 'isolation' : 'load' }));
       });
       good.push({ log: clean, rc: rc === 0 ? 0 : 1, files, ...(junit !== undefined ? { junit } : {}),
         ...(retryPass.length ? { loadFlaky: retryPass.map((row) => row.id), retryPass } : {}) });

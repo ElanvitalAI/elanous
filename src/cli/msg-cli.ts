@@ -4,6 +4,7 @@ import { Database } from 'bun:sqlite';
 import { formatMessage, registerMsgListCommand } from './msg-list-cli.js';
 import { readUnreadCount } from '../msg/msg-store.js';
 import { registerMsgWaitForCommands } from './msg-wait-for-cli.js';
+import { registerMsgRequirementCommands } from './msg-requirement-cli.js';
 import { registerMsgReceiptsCommands } from './msg-receipts-cli.js';
 import { existsSync, mkdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -16,6 +17,7 @@ import { buildMsgHookOutput, seatFromCwd, type MsgHookEvent, type MsgHookFormat 
 import { SEAT_AGENT_RUNTIMES, type SeatAgentRuntime } from '../loops/seat-registry.js';
 import { MAIL_FALLBACK_MS, runMailFallback, spawnMailFallback } from '../msg/msg-mail-fallback.js';
 import { clearPostOffice, discoverPostOfficeUrl, ensurePostOffice, writePostOffice } from '../msg/msg-post-office.js';
+import { triageMailbox, type TriageRow } from '../msg/inbox-triage.js';
 import { acquireLockSync } from '../storage/file-lock.js';
 import { GitHubMsgMirrorTransport } from '../msg/msg-mirror-github.js';
 import { configuredMirrorTarget, runMsgMirrorTick, type MirrorTarget, type MsgMirrorStateStore, type MsgMirrorTransport } from '../msg/msg-mirror-runner.js';
@@ -787,6 +789,7 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
   registerMsgListCommand(msg, { openStore: open, cacheReads: deps.openStore === undefined, out, setExitCode });
   // ELN-SELF-TIMER-WATCH(I3) — 원장 항목에 묶인 셀프 깨우개: wait-for · wait-tick · wait-list.
   registerMsgWaitForCommands(msg, { out, setExitCode });
+  registerMsgRequirementCommands(msg, { out, setExitCode });
   // SEAT-INBOX B1-C — 영수증 읽기·구독(receipts --follow = 우체국 SSE) ⊕ 명시 영수증(receipt).
   registerMsgReceiptsCommands(msg, { openStore: open, out, setExitCode, ...(deps.now === undefined ? {} : { now: deps.now }),
     ...(deps.signal === undefined ? {} : { signal: deps.signal, handleSignals: false }),
@@ -917,6 +920,21 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       const outcome = withStore(store => archiveDeliveredRows(store, archive, { days }));
       emit({ ...outcome, archive, days }, opts.json,
         () => out.log(`archived ${outcome.archived} row(s) to ${archive} (cutoff ${outcome.cutoffIso}; cursors ${JSON.stringify(outcome.cursors)})`));
+    })());
+
+  // MAILBOX-HYGIENE-AUTO — 미읽음 우편함 분류(고아·대체·만료·비지도·종류별).
+  msg.command('triage').description('Classify unread mailboxes: orphan mailboxes, superseded, expired, unsupervised')
+    .option('--to <seat>').option('--json')
+    .action((opts: CommonOptions & { to?: string }) => run(() => {
+      const rows = withStore(store => triageMailbox(store, { now: new Date(), withTotals: true }) as { rows: TriageRow[]; totals: { recipients: number; unread: number } });
+      const filtered = opts.to ? rows.rows.filter(r => r.recipient === seat(opts.to, '--to')) : rows.rows;
+      emit(filtered, opts.json, () => {
+        if (!filtered.length) { out.log('No unread mailboxes.'); return; }
+        out.log(`recipients: ${rows.totals.recipients} unread: ${rows.totals.unread}`);
+        for (const row of filtered) {
+          out.log(`${row.recipient}: unread=${row.unread}${row.orphan ? ' [orphan]' : ''} unsupervised=${row.counts.unsupervised} superseded=${row.counts.superseded} expired=${row.counts.expired} request=${row.counts.request} decision=${row.counts.decision} alert=${row.counts.alert} report=${row.counts.report} digest=${row.counts.digest}`);
+        }
+      });
     })());
 
   msg.command('watch').description('Watch durable messages; SSE accelerates delivery and polling covers outages')

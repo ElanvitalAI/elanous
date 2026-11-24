@@ -29,14 +29,22 @@ const TEST_TIMEOUT_MS = 120_000;
 /** 출처: #37153 live PTY p95 시험 감싸개 — 20샘플 지연 측정 전체 상한. */
 const P95_TEST_TIMEOUT_MS = 300_000;
 
-/** The one-line English hint the status line must show verbatim (UX-fixed wording — OP order ②). */
-export const FIRST_RUN_HINT = 'ctrl+b c new shell · a chat · s list · j/k move · x close · q quit · ? help';
+/** The one-line English hint the status line must show verbatim (UX-fixed wording — OP order ②). The status line is CUT
+ *  TO THE WIDTH (attach-app.ts statusText · ELS-FIRST-RUN-FU3 ①): the build label (`0.3.34-dev.0 · dev · 261124_1154 · ` —
+ *  version · channel · stamp, measured 11-24) rides left of the hint, so at 120 cols the `q quit · ? help` tail is the part
+ *  that falls off — the FIRST_RUN_HINT literal itself (attach-view.ts) keeps it for the widths that fit. */
+export const FIRST_RUN_HINT = 'ctrl+b c new shell · a chat · s list · j/k move · x close · q';
+/** The build label the status line puts left of the hint: `0.3.xx(-dev.y)? · dev · <스탬프> · ` (version · channel · stamp). */
+const BUILD_LABEL_PREFIX = /^\s*(?:\d+(?:\.\d+)+(?:-dev\.\d+)? · )?(?:dev · )?(?:\d{6}(?:_\d{4})? · )?/;
 
-/** The bottom row at 120 cols: FIRST_RUN_HINT verbatim, blank padding, then the exit/background buttons (attach-buttons.ts layout). */
+/** The bottom row at 120 cols: build label (optional) · FIRST_RUN_HINT, blank padding, then the exit/background buttons (attach-buttons.ts layout). */
 const isHintRow = (line: string): boolean => {
   const row = line.trimEnd();
   const buttons = buttonsLayout(120).text.trimEnd();
-  return row.startsWith(FIRST_RUN_HINT) && row.endsWith(buttons) && row.slice(FIRST_RUN_HINT.length, row.length - buttons.length).trim() === '';
+  if (!row.endsWith(buttons)) return false;
+  const body = row.slice(0, row.length - buttons.length);
+  const label = BUILD_LABEL_PREFIX.exec(body)?.[0] ?? '';
+  return body.slice(label.length).startsWith(FIRST_RUN_HINT) && body.slice(label.length + FIRST_RUN_HINT.length).trim() === '';
 };
 
 /** The production ledger this test must never touch (~/.elanous/els/journal.json → ELANOUS_STATE_DIR). */

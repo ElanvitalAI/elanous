@@ -19,4 +19,4 @@ test('seed 7: real Next TUI serves urgent mail during a background Agent and lat
   } finally {
     rmSync(universeRoot, { recursive: true, force: true });
   }
-}, 180_000);
+}, 300_000); // 완료 깨움 대기 AGENT_HOLD_MS + 25s + idle ripen 120s(#39609) — #39881 C1 줄포리.

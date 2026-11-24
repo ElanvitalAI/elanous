@@ -67,7 +67,7 @@ import { inspectActiveProvider } from '../provider-summary.js';
 import { parse as parseYaml } from 'yaml';
 import type { PendingTaskNotification } from '../agent/task-notification.js';
 import { dispatchReplMessageTool, isReplMessageTool } from './ops-msg-bridge.js';
-import { buildSeatBootSystemMessages, buildSeatMemoryIndexSystemMessages, detectSeatTui, resolveSeatMemoryContext, type SeatBootDeps } from '../seat/seat-boot-preamble.js';
+import { buildActiveDirectivesSystemMessages, buildSeatBootSystemMessages, buildSeatMemoryIndexSystemMessages, detectSeatTui, resolveSeatMemoryContext, resolveSessionMemoryStore, type SeatBootDeps } from '../seat/seat-boot-preamble.js';
 import { seatRole, type SeatRole } from '../seat/seat-role.js';
 import { coordinatorReasoningConfig } from '../seat/coordinator-reasoning.js';
 import { lookupSeatOwners, type SeatOwnerReaders } from '../core-turn/seat-owner-lookup.js';
@@ -493,7 +493,9 @@ export function buildReplTools(options: {
   // 🧠 OP-MEMORY-PARITY (O6) — 자리 세션이면 memory_save 를 자리 저장소 판으로 바꾸고 memory_delete·memory_search 를 붙인다.
   //    자리가 아니면(사람 대화 TUI) 손대지 않는다 — 전역 memory_save 그대로.
   try {
-    const seatMemory = options.seatMemoryContext ?? resolveSeatMemoryContext(getSessionCwd());
+    // MEMORY-STORE-SPLIT — CLI 와 같은 해석기(자리 → 저장소 프로젝트 → 전역). 전역이면 null(전역 memory_save 그대로).
+    const sessionStore = options.seatMemoryContext ? null : resolveSessionMemoryStore(getSessionCwd());
+    const seatMemory = options.seatMemoryContext ?? (sessionStore ? { seat: sessionStore.seat, dir: sessionStore.dir, ...(sessionStore.commonDir ? { commonDir: sessionStore.commonDir } : {}) } : null);
     if (seatMemory) {
       (require('../seat-memory/seat-memory-tools.js') as typeof import('../seat-memory/seat-memory-tools.js'))
         .applySeatMemoryTools(specs, dispatchByName, {
@@ -524,6 +526,15 @@ export function buildReplTools(options: {
   const ledger = require('../skills/tools/ops-ledger.js') as typeof import('../skills/tools/ops-ledger.js');
   const ask = require('../skills/tools/msg-ask.js') as typeof import('../skills/tools/msg-ask.js');
   specs.push(ledger.buildMsgListTool(), ledger.buildMsgPostTool(), ask.buildMsgAskTool(), ledger.buildMsgAckTool());
+  // SESSION-AUTOPILOT — the structured switch (autopilot_set) and the person's goal stack, in every session.
+  {
+    const autopilot = require('../session-autopilot/autopilot-tool.js') as typeof import('../session-autopilot/autopilot-tool.js');
+    for (const spec of autopilot.buildAutopilotTools()) {
+      specs.push(spec);
+      dispatchByName.set(spec.name, args => autopilot.dispatchAutopilotTool(spec.name, args, {
+        cwd: getSessionCwd(), ...(options.sessionId ? { sessionId: options.sessionId } : {}) }));
+    }
+  }
   const bashMod = require('../skills/tools/index.js') as typeof import('../skills/tools/index.js');
   // CAPSULE-A2 — the chat child's Bash runs under the capsule policy.
   const dispatchBash = options.dispatchBash ?? ((args: Record<string, unknown>, opts: { cwd: string; signal?: AbortSignal }) => {
@@ -898,8 +909,21 @@ function buildReplStableSystemPrompt(ctx: ReplSystemPromptContext): string | und
       { cwd: ctx.cwd, ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}) }, ctx.seatBootDeps ?? {},
     ).map((message) => (typeof message.content === 'string' ? message.content : '')).join('\n\n');
   } catch { /* 색인만 빠진다 */ }
+  // ACTIVE-DIRECTIVES-BLOCK — 세션 시작 «살아 있는 지시»(같은 대화 스냅샷 · 안정 구역 · ≤1.5KB).
+  let activeDirectives = '';
+  try {
+    activeDirectives = buildActiveDirectivesSystemMessages(
+      { cwd: ctx.cwd, ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}) }, ctx.seatBootDeps ?? {},
+    ).map((message) => (typeof message.content === 'string' ? message.content : '')).join('\n\n');
+  } catch { /* 블록만 빠진다 */ }
   const appCapabilityHint = ctx.enabledToolNames === undefined || role === 'coordinator' ? '' : '사용자가 시스템 설계·만들기·배포를 요청하면 엘라누스의 등록 도구로 요구사항, 아키텍처 문서·구성도·설계 PDF/도식, 프론트엔드·백엔드 API·DB 스키마/시드 코드와 로컬 실행·시험을 진행하라. 실제 배포는 제공된 app.publish@1/app-publish.action@1 capability와 소유자 검증·게시 승인을 사용하라. 회원 연결이 없거나 app.publish를 쓸 수 없으면 생성 서버를 127.0.0.1의 빈 31500~31599 포트에서 백그라운드 실행하고 tailscale serve status --json으로 해당 포트의 기존 매핑이 없는지 확인한 뒤 tailscale serve --bg --tls-terminated-tcp <선택포트> tcp://127.0.0.1:<선택포트>로 그 포트만 tailnet에 공유하라(443의 루트 경로와 기존 Serve 설정 변경 금지, 공개 인터넷 노출 금지). 실제 URL의 HTTP 200과 앱 화면을 확인한 뒤 URL·프로세스·serve 설정과 되돌리기 명령을 보고하고, 제공되지 않은 실행 기능은 가정하지 마라. 단계별 실제 파일·시험 결과·영수증과 반환된 tailnet URL을 보여 주고, URL의 실제 동작 확인 전 배포 완료를 주장하지 말라. app.publish 되돌리기는 해당 배포 ID·영수증 범위로, 로컬 운영자 배포 되돌리기는 tailscale serve --tls-terminated-tcp <선택포트> off와 보고한 프로세스 종료만 수행하라(serve reset 금지). app_build 실행 확인을 사용자가 거절했거나 응답이 없으면(APP_BUILD_DECLINED) 그 턴에서는 Bash 빌드·tailscale serve/funnel·공개 리스너·배포 CLI 등 다른 경로로 빌드·배포하지 말고 사용자에게 다음 행동을 물어라.';
-  const parts = [skillCatalogText, base ?? '', appCapabilityHint, card, seatMemoryIndex].filter(part => part.length > 0);
+  // SESSION-AUTOPILOT — one line: when the person's words are about the autopilot mode, call autopilot_set.
+  let autopilotLine = '';
+  try {
+    const autopilot = require('../session-autopilot/autopilot-tool.js') as typeof import('../session-autopilot/autopilot-tool.js');
+    if (ctx.enabledToolNames?.includes(autopilot.AUTOPILOT_TOOL_NAME)) autopilotLine = autopilot.AUTOPILOT_PROMPT_LINE;
+  } catch { /* the line only drops out */ }
+  const parts = [skillCatalogText, base ?? '', appCapabilityHint, card, seatMemoryIndex, activeDirectives, autopilotLine].filter(part => part.length > 0);
   return parts.length > 0 ? parts.join('\n\n') : undefined;
 }
 
@@ -926,6 +950,14 @@ function buildReplVolatileContext(ctx: ReplSystemPromptContext): string[] {
     }
   } catch { /* seat detection unavailable: do not invent an identity */ }
   if (ownerCheck) out.push(ownerCheck);
+  // SESSION-AUTOPILOT — while ON, the decision-autonomy paragraph + the person's goals ride the turn's volatile tail.
+  try {
+    const ap = require('../session-autopilot/autopilot.js') as typeof import('../session-autopilot/autopilot.js');
+    const goalsMod = require('../session-autopilot/goals.js') as typeof import('../session-autopilot/goals.js');
+    const file = ap.autopilotStateFile(ctx.cwd);
+    const paragraph = ap.autopilotPolicyParagraph(ap.readAutopilotState(file), goalsMod.readGoals(goalsMod.autopilotGoalsFile(file)) ?? []);
+    if (paragraph) out.push(paragraph);
+  } catch { /* the paragraph only drops out */ }
   return out;
 }
 

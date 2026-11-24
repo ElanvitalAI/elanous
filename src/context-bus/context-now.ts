@@ -286,8 +286,10 @@ function releaseContextFact(version: string, run: ReleaseRunView | undefined,
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') ledgerErrors.push({ signal: 'gate-shards', source: gateShardsSource, reason: unreadableReason(error) });
   }
-  const gate = gateFile?.version === version ? summarizeShards(gateFile, Date.now()) : null;
-  const terminalShards = gateFile?.shards.filter(shard => ['done', 'failed', 'timeout'].includes(shard.state)).length ?? 0;
+  // A version can have multiple runs; only the selected run's shard ledger is its progress.
+  const scopedGateFile = run && gateFile?.version === version && gateFile.runId === run.runId ? gateFile : null;
+  const gate = scopedGateFile ? summarizeShards(scopedGateFile, Date.now()) : null;
+  const terminalShards = scopedGateFile?.shards.filter(shard => ['done', 'failed', 'timeout'].includes(shard.state)).length ?? 0;
   let regressions: Extract<ContextFact, { kind: 'release' }>['regressions'] = gate?.verdict
     ? { introduced: gate.verdict.introduced, preexisting: gate.verdict.preexisting } : null;
   let receiptStatus: Extract<ContextFact, { kind: 'release' }>['receiptStatus'] = 'absent';
@@ -330,7 +332,7 @@ function releaseContextFact(version: string, run: ReleaseRunView | undefined,
   if (!run && !runUnavailable) nextAction = schedule ? '예약 시각 대기' : landingFreeze?.state === 'on' ? '착지 동결 해제 대기' : '런 관측 대기';
   const runPublishAt = typeof raw.input?.publishAt === 'string' && Number.isFinite(Date.parse(raw.input.publishAt))
     ? new Date(raw.input.publishAt).toISOString() : null;
-  const expectedPublishAt = schedule?.publishAt ?? runPublishAt;
+  const expectedPublishAt = runPublishAt ?? schedule?.publishAt ?? null;
   const parsedOutputs = (raw.nodes ?? []).flatMap(node => {
     const value = node.output;
     if (value && typeof value === 'object' && !Array.isArray(value)) return [{ nodeId: node.nodeId, output: value as Record<string, unknown> }];
@@ -390,8 +392,8 @@ function releaseContextFact(version: string, run: ReleaseRunView | undefined,
     preexisting: regressions?.preexisting ?? nodePreexisting,
     undetermined: nodeUndetermined,
   } : null;
-  const progress = gateFile?.version === version ? { completed: terminalShards, total: gateFile.shards.length,
-    failed: gateFile.shards.filter(shard => shard.state === 'failed' || shard.state === 'timeout' || (shard.state === 'done' && shard.rc !== undefined && shard.rc !== 0)).length } : null;
+  const progress = scopedGateFile ? { completed: terminalShards, total: scopedGateFile.shards.length,
+    failed: scopedGateFile.shards.filter(shard => shard.state === 'failed' || shard.state === 'timeout' || (shard.state === 'done' && shard.rc !== undefined && shard.rc !== 0)).length } : null;
   if (ledgerErrors.some(error => error.signal === 'schedule-index')) sourceRefs.push({ signal: 'schedule-index', source: scheduleSource });
   if (ledgerErrors.some(error => error.signal === 'release-index')) sourceRefs.push({ signal: 'release-index', source: 'elanous://release' });
   if (progress) sourceRefs.push({ signal: 'gate-progress', source: gateShardsSource });
@@ -400,7 +402,7 @@ function releaseContextFact(version: string, run: ReleaseRunView | undefined,
   sourceRefs.push({ signal: 'receipt-status', source: gateVerdictSource },
     { signal: 'landing-freeze', source: 'elanous://landing-freeze' });
   if (waiverEvents.length) sourceRefs.push({ signal: 'waivers', source: runSourceRef });
-  if (expectedPublishAt) sourceRefs.push({ signal: 'expected-publish-at', source: schedule?.publishAt ? scheduleFactSource : runSourceRef });
+  if (expectedPublishAt) sourceRefs.push({ signal: 'expected-publish-at', source: runPublishAt ? runSourceRef : scheduleFactSource });
   if (auditMeasurement) sourceRefs.push({ signal: 'receipt-audit', source: runSourceRef });
   if (sweepCertificateAgeMinutes !== null) sourceRefs.push({ signal: 'sweep-certificate', source: sweepCertificateSource });
   if (!run && !schedule && landingFreeze?.state !== 'on' && !gateFile && !regressions && receiptStatus === 'absent' && !ledgerErrors.length) return null;

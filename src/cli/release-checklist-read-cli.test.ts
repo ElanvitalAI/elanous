@@ -18,6 +18,14 @@ function cli(sweep: StaleChecklistSweep) {
   return program;
 }
 
+test('checklist load is registered as a read-only command with version and JSON options', () => {
+  const checklist = cli(() => { throw new Error('unexpected sweep'); }).commands[0]!.commands[0]!;
+  const load = checklist.commands.find(command => command.name() === 'load');
+  expect(load).toBeDefined();
+  expect(load!.options.map(option => option.long)).toContain('--version');
+  expect(load!.options.map(option => option.long)).toContain('--json');
+  expect(load!.options.map(option => option.long)).not.toContain('--apply');
+});
 const scan: StaleMergedChecklistScan = {
   scannedMergedMainPrs: 1,
   scannedOpenPrs: 1,

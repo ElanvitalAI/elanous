@@ -177,6 +177,10 @@ test('judgment (0.2.30): a stalled sweep lands on the ledger as an executed fail
   const runBash = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
     const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string };
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: `${JSON.stringify({ outcome: 'ok', version: '9.9.97', commit: CUT, branch: 'release/9.9.97' })}\n`, stderr: '' };
+    // The gate reads its cut commit off the graph context (releaseCutRecord: `cut-branch` first, legacy
+    // `version-release` as the fallback) and refuses «invalid commit or version» before any sweep — so the
+    // fake cut node must land a real-shaped 40-char sha like the real cmd:cut-branch output does.
+    if (ctx.nodeId === 'cut-branch') return { exitCode: 0, stdout: `${JSON.stringify({ outcome: 'ok', commit: CUT, version: '9.9.97', branch: 'release/9.9.97' })}\n`, stderr: '' };
     if (ctx.nodeId !== 'gate') return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
     gate.body = body;
     const out = spyOn(console, 'log').mockImplementation((line: unknown) => { gate.printed.push(String(line)); });

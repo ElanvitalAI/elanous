@@ -74,6 +74,8 @@ test('L3 reference fetching is caller supplied and raw detail is never stored on
     id: 'tool-1', ts: 1, source: 'tool', body: { kind: 'tool-call', toolCallId: 'call-1', title: 'Read' },
     detail: { level: 3, summary: '파일을 읽음', steps: ['요청', '결과 수신'], rawRef: { runId: 'run-1', blockId: 'tool-1' } },
   };
+  expect(nextMessageBlockDetailLevel(tool, 0)).toBe(3);
+  expect(nextMessageBlockDetailLevel(tool, 3)).toBe(0);
   const lines = messageBlockDetailLines(tool, 3, 80, 'line one\nline two');
   expect(lines.join('\n')).toContain('line one');
   expect(lines.join('\n')).toContain('line two');

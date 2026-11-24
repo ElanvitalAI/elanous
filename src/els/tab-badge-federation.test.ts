@@ -66,10 +66,10 @@ test('stall boundary: 0ms and exactly 900000ms are working, 900001ms is stalled;
 
 test('federation: badge, badgeLabel, stalled and lastEventAtMs survive core -> /els/ls -> fetchJson -> federated list -> CLI line and sidetab row', async () => {
   const { clock, core, federated } = origin();
-  for (const [ms, badge, label, stalled, agent, mark] of [
-    [0, 'working', '[▶ working]', false, 'working', ' ●'],
-    [WINDOW_MS, 'working', '[▶ working]', false, 'working', ' ●'],
-    [WINDOW_MS + 1, 'stalled', '[⏸ stalled]', true, 'stalled', ' ⏸'],
+  for (const [ms, badge, label, stalled, agent] of [
+    [0, 'working', '[▶ working]', false, 'working'],
+    [WINDOW_MS, 'working', '[▶ working]', false, 'working'],
+    [WINDOW_MS + 1, 'stalled', '[⏸ stalled]', true, 'stalled'],
   ] as const) {
     clock.at = T0 + ms;
     const originRow = pick(rowsOf(core.list().message)[0]!);
@@ -86,8 +86,8 @@ test('federation: badge, badgeLabel, stalled and lastEventAtMs survive core -> /
     expect(paneListLines(list, T0)[0]).toContain(label);
     // The remote subtree is host → workspace → tab → pane: the pane and every header above it read the carried state.
     expect(elsRowsFromList(list, 'mshq').map((row) => [row.badge, row.agentState])).toEqual(Array(4).fill(['busy', agent]));
-    // (a remote row carries no workspace name, so only the mark is compared; line 0 is the «spaces» head)
-    expect(buildSpaceList(withCommands(parsePaneRows(list), list), undefined, 40, 4)[1]!.replace(/\u001b\[[0-9;]*m/g, '').startsWith(mark)).toBe(true);
+    // (the space list itself is no longer a badge surface: OP #134199/#134203 leaves its lines name-only — the
+    // «space mark» test below pins that — so there is nothing more to assert on buildSpaceList here.)
   }
 });
 
@@ -137,20 +137,22 @@ test('restart: a reattached pane keeps the PTY\'s real last output time; first s
   expect(pick(rowsOf(third.list().message)[0]!)).toEqual({ badge: 'working', badgeLabel: '[▶ working]', stalled: false, lastEventAtMs: T0 + WINDOW_MS + 1 });
 });
 
-test('space mark: failed and blocked (approval) outrank stalled; stalled outranks working; stalled alone is ⏸', () => {
+test('space mark: no pane state paints the space line — only the coordinator ⭐ and the remote-dead ✕ (OP #134199/#134203)', () => {
   const list = (panes: { pane: string; state: string; stalled?: boolean }[]): string => JSON.stringify({ panes: panes.map((p) => ({ address: `w1/t1/${p.pane}`,
     workspace: 'OP', title: p.pane, command: ['sh'], ...p })) });
   const mark = (panes: { pane: string; state: string; stalled?: boolean }[]): string => {
     const json = list(panes);
     return buildSpaceList(withCommands(parsePaneRows(json), json), undefined, 40, 3)[1]!.replace(/\u001b\[[0-9;]*m/g, '').trimEnd();
   };
-  // `blocked` is the approval wait; `failed` is the contract's failure word. Both outrank stalled, in either pane order.
-  expect(mark([{ pane: 'a', state: 'failed' }, { pane: 'b', state: 'working', stalled: true }])).toBe(' ✕ OP');
-  expect(mark([{ pane: 'b', state: 'working', stalled: true }, { pane: 'a', state: 'failed' }])).toBe(' ✕ OP');
-  expect(mark([{ pane: 'a', state: 'failed' }, { pane: 'c', state: 'blocked' }, { pane: 'b', state: 'working', stalled: true }])).toBe(' ✕ OP');
-  expect(mark([{ pane: 'a', state: 'blocked' }, { pane: 'b', state: 'working', stalled: true }])).toBe(' ◐ OP');
-  expect(mark([{ pane: 'b', state: 'working', stalled: true }, { pane: 'a', state: 'blocked' }])).toBe(' ◐ OP');
-  expect(mark([{ pane: 'a', state: 'working' }, { pane: 'b', state: 'working', stalled: true }])).toBe(' ⏸ OP');
-  expect(mark([{ pane: 'b', state: 'working', stalled: true }])).toBe(' ⏸ OP');
-  expect(mark([{ pane: 'a', state: 'working' }, { pane: 'b', state: 'idle' }])).toBe(' ● OP');
+  // The state precedence (failed/blocked outrank stalled; stalled outranks working) lives in the per-pane agents
+  // rows; OP #134199/#134203 took every state mark off the space line itself, so whatever mix of failed, blocked,
+  // stalled and working panes a space folds, its list line reads just the name.
+  expect(mark([{ pane: 'a', state: 'failed' }, { pane: 'b', state: 'working', stalled: true }])).toBe(' OP');
+  expect(mark([{ pane: 'b', state: 'working', stalled: true }, { pane: 'a', state: 'failed' }])).toBe(' OP');
+  expect(mark([{ pane: 'a', state: 'failed' }, { pane: 'c', state: 'blocked' }, { pane: 'b', state: 'working', stalled: true }])).toBe(' OP');
+  expect(mark([{ pane: 'a', state: 'blocked' }, { pane: 'b', state: 'working', stalled: true }])).toBe(' OP');
+  expect(mark([{ pane: 'b', state: 'working', stalled: true }, { pane: 'a', state: 'blocked' }])).toBe(' OP');
+  expect(mark([{ pane: 'a', state: 'working' }, { pane: 'b', state: 'working', stalled: true }])).toBe(' OP');
+  expect(mark([{ pane: 'b', state: 'working', stalled: true }])).toBe(' OP');
+  expect(mark([{ pane: 'a', state: 'working' }, { pane: 'b', state: 'idle' }])).toBe(' OP');
 });

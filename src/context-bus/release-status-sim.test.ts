@@ -48,7 +48,7 @@ test('RLA-CONTEXT-BUS-RELEASE-STATUS: Telegram, TUI and release_status share one
     const shards = join(root, 'release', version, 'gate-logs', 'cut');
     const shardsFile = join(shards, 'shards.json');
     mkdirSync(shards, { recursive: true });
-    writeFileSync(shardsFile, JSON.stringify({ v: 1, version, updatedAt: at,
+    writeFileSync(shardsFile, JSON.stringify({ v: 1, version, runId, updatedAt: at,
       verdict: { introduced: 2, preexisting: 1 }, shards: [
         { id: 'pod-0', state: 'done', rc: 0, plannedMin: 1 },
         { id: 'pod-1', state: 'running', startedAt: at, plannedMin: 10 },
@@ -100,7 +100,7 @@ test('RLA-CONTEXT-BUS-RELEASE-STATUS: Telegram, TUI and release_status share one
         'receipt-status=elanous://release/9.8.7/gate-verdict',
         'waivers=elanous://graph-runs/release-loop/release-sim-1',
         'landing-freeze=elanous://landing-freeze',
-        'expected-publish-at=elanous://release/9.8.7/schedule',
+        'expected-publish-at=elanous://graph-runs/release-loop/release-sim-1',
         'ETA 120m', '미덮임 1/3', 'residual 실행 1', 'sweep 증명서 나이 0m',
         '실패 introduced 2 / preexisting 1 / 미판정 ?']) {
         expect(output).toContain(token);
@@ -131,10 +131,17 @@ test('RLA-CONTEXT-BUS-RELEASE-STATUS: Telegram, TUI and release_status share one
 
     writeSchedule(version, { cutAt: at, publishAt: '2026-11-06T09:00:00.000Z' }, 'sim-update', root);
     const rescheduled = contextNow({ topic: '발행 상황' }, deps).facts.find(fact => fact.kind === 'release');
-    expect(rescheduled).toMatchObject({ expectedPublishAt: '2026-11-06T09:00:00.000Z' });
-    expect(dispatchReleaseStatus({ topic: 'ops' }, { contextNow: options => contextNow(options, deps) }).text).toContain('09:00');
-    expect(await telegramReleaseReply(deps)).toContain('09:00');
-    expect((await tuiReleaseReply(deps)).join('\n')).toContain('09:00');
+    expect(rescheduled).toMatchObject({ expectedPublishAt: '2026-11-06T08:00:00.000Z' });
+    expect(dispatchReleaseStatus({ topic: 'ops' }, { contextNow: options => contextNow(options, deps) }).text).toContain('08:00');
+    expect(await telegramReleaseReply(deps)).toContain('08:00');
+    expect((await tuiReleaseReply(deps)).join('\n')).toContain('08:00');
+
+    const staleShards = JSON.parse(readFileSync(shardsFile, 'utf8'));
+    staleShards.runId = 'previous-run';
+    writeFileSync(shardsFile, JSON.stringify(staleShards));
+    const scoped = contextNow({ topic: '발행 상황' }, deps).facts.find(fact => fact.kind === 'release');
+    expect(scoped).toMatchObject({ gateProgress: null });
+    expect(scoped?.sourceRefs?.some(ref => ref.signal === 'gate-progress')).toBe(false);
 
     const runLedgerPath = join(runs, `${runId}.json`);
     const runLedger = JSON.parse(readFileSync(runLedgerPath, 'utf8'));

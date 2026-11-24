@@ -222,7 +222,7 @@ export interface NextTuiWakeupDeps {
   /** TURN-CAPSULE-EVENTS R1(C4) — 버스 원천 어댑터(schedule-wakeup.ts:219) 포워드. 없으면 옛길(스케줄러 자체 큐) 그대로. 생산 배선은 entry.ts 몫. */
   publishEvent?: WakeupSchedulerDeps['publishEvent'];
   /** Built-in self-retro (SEAT-ROLE-CARD device 2): opens an origin-'retro' turn on this same door every `intervalMin` minutes. 0 = off. */
-  retro?: { readonly seat: string; readonly intervalMin: number; readonly store: SeatRetroStateStore };
+  retro?: { readonly seat: string; readonly intervalMin: number; readonly store: SeatRetroStateStore; readonly metrics?: () => readonly string[] };
 }
 
 export interface NextTuiWakeup {
@@ -311,6 +311,7 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
       clearTimer: deps.clearTimer ?? (handle => clearTimeout(handle as ReturnType<typeof setTimeout>)),
       startTurnIfIdle: (text, opts) => gate.startTurnIfIdle(text, opts),
       confirmStarted: confirmTurnStarted,
+      ...(deps.retro.metrics ? { metrics: deps.retro.metrics } : {}),
       notify: deps.notify,
       ...(deps.log ? { log: (event: string, data: Record<string, unknown>) => deps.log!('tui.retro', event, data) } : {}),
     }) : null;

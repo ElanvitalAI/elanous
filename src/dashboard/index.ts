@@ -960,7 +960,7 @@ import { createDashboardSidetabRuntime, mergeLocalAgentSessions, runDashboardAge
 import { visibleMissionFailureLogData } from './visible-mission-diagnostics.js';
 import { CLASSIC_SIDETAB_MISSION_TOOL_NAME, createClassicSidetabMissionIntegration, createClassicSidetabMissionPairSessionRegistry, type ClassicSidetabHandReplyInput, type ClassicSidetabMissionAgent, type ClassicSidetabMissionDispatchContext, type ClassicSidetabMissionIntegration, type ClassicSidetabMissionPairResult, type ClassicSidetabMissionResult, type ClassicSidetabMissionTrioResult } from './classic-sidetab-mission.js';
 import { cancelClassicMissionCli, startClassicMissionCli } from './mission-cli-consumer.js';
-import { enqueueClassicSidetabMissionCompletion, runPreparedClassicSidetabVisibleMission } from './classic-sidetab-mission-job.js';
+import { enqueueClassicSidetabMissionCompletion, runPreparedClassicSidetabVisibleMission } from '../sidetab-core/classic-sidetab-mission-job.js';
 import { startClassicSidetabMissionPair } from './classic-sidetab-mission-pair.js';
 import { captureClassicMissionExitObservation, createClassicSidetabMissionTrioVisibleRunner, startClassicSidetabMissionTrio } from './classic-sidetab-mission-trio.js';
 import { probeGrokLogin } from '../agent-mission/grok-auth-status.js';

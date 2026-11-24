@@ -3,10 +3,11 @@
 
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-type KnowledgeDocsRootSource = 'config' | 'tool-checkout' | 'workdir' | 'none';
+type KnowledgeDocsRootSource = 'config' | 'tool-checkout' | 'workdir' | 'current-sections' | 'none';
 
 interface KnowledgeDocsRoot {
   path: string;
@@ -35,6 +36,11 @@ interface ResolveKnowledgeDocsRootsOpts {
   toolDocsSegments?: readonly string[];
   /** 현재 작업 디렉터리. 기본은 process.cwd(). */
   cwd?: string;
+  /**
+   * 환경 변수 — 좌석 상태 뿌리(`ELANOUS_STATE_DIR`) 해석용. 기본 `process.env`.
+   * 시험은 격리 값을 주입한다(src/memory.ts `seatHandoffStateRoot` 와 같은 규약).
+   */
+  env?: NodeJS.ProcessEnv;
   exists?: (path: string) => boolean;
   readPackageName?: (packageJsonPath: string) => string | undefined;
   gitRoot?: (cwd: string) => string | undefined;
@@ -75,6 +81,15 @@ function dedupe(roots: KnowledgeDocsRoot[]): KnowledgeDocsRoot[] {
   return out;
 }
 
+/**
+ * 좌석 상태 뿌리 — `ELANOUS_STATE_DIR` 이면 `<isol>/seat-state`, 아니면 `~/elanous-hq/seat-state`.
+ * src/memory.ts `seatHandoffStateRoot` 와 같은 규약(격리 우선).
+ */
+export function defaultSeatStateRoot(env: NodeJS.ProcessEnv = process.env): string {
+  const isolated = env.ELANOUS_STATE_DIR?.trim();
+  return isolated ? join(isolated, 'seat-state') : join(homedir(), 'elanous-hq', 'seat-state');
+}
+
 /** 수집 뿌리 목록과 각 뿌리의 출처. 없으면 빈 목록 ⊕ source `none`. */
 export function resolveKnowledgeDocsRoots(opts: ResolveKnowledgeDocsRootsOpts = {}): KnowledgeDocsRootsResult {
   // 배열이 있으면(빈 배열·공백만) 설정이 있는 것이다. 자동 감지로 넘어가지 않는다.
@@ -105,6 +120,17 @@ export function resolveKnowledgeDocsRoots(opts: ResolveKnowledgeDocsRootsOpts = 
     const workDocs = join(gitRoot, 'docs');
     if (exists(workDocs)) candidates.push({ path: workDocs, source: 'workdir' });
   }
+
+  // DOCS-SEARCH-INDEX-EMPTY — 현행 절(current sections) 후보 3종: 좌석 OPS 규칙(파일 뿌리)·
+  // conductor 증류 사실(파일 뿌리)·plans(디렉터리 뿌리). fail-soft exists — 없는 절은
+  // 조용히 건너뛴다. FACTS 는 KNOWN_PREFIXES 밖이라 도구 docs 순회 선정에서 영원히 탈락한다
+  // — 파일 뿌리로 직접 회수한다.
+  const seatOpsRules = join(defaultSeatStateRoot(opts.env), 'OPS', 'OPS-RULES.md');
+  if (exists(seatOpsRules)) candidates.push({ path: seatOpsRules, source: 'current-sections' });
+  const factsDistilled = join(toolDocs, 'conductor', 'FACTS-DISTILLED.md');
+  if (exists(factsDistilled)) candidates.push({ path: factsDistilled, source: 'current-sections' });
+  const toolPlans = join(toolDocs, 'plans');
+  if (exists(toolPlans)) candidates.push({ path: toolPlans, source: 'current-sections' });
 
   const roots = dedupe(candidates);
   if (roots.length === 0) return { roots: [], source: 'none' };

@@ -1,0 +1,2 @@
+# Every node of invest-orch.yaml is handler:<name> (scripts/demo-invest-orch/handlers.ts) — no shell recipes.
+{}

@@ -83,7 +83,7 @@ export async function routeElsHttp(core: ElsCore, hostName: string, method: stri
   if (method !== 'GET') return json(405, { error: 'read-only: GET only' });
   if (url.pathname === '/els/ls') {
     const listed = JSON.parse(core.list().message) as { workspaces?: { id: string; role?: string }[]; panes: { tab: string; pane: string; title: string; cwd: string; state: string; address: string; build?: unknown;
-      seat?: string | null; spaceCoordinator?: boolean; activityState?: string; kind?: string; badge?: string; badgeLabel?: string; stalled?: boolean; lastEventAtMs?: number; status?: unknown }[] };
+      seat?: string | null; spaceCoordinator?: boolean; activityState?: string; kind?: string; badge?: string; badgeLabel?: string; stalled?: boolean; lastEventAtMs?: number; status?: unknown; git?: { branch: string; ahead: number; behind: number; dirty: boolean; root: string | null } }[] };
     const coordinators = new Set((listed.workspaces ?? []).filter((ws) => ws.role === 'coordinator').map((ws) => ws.id));
     // ELS-TAB-STATE-BADGE: stalled is decided HERE, once, by the origin server's clock; a federated reader only carries it.
     return json(200, { host: hostName, workspaces: (listed.workspaces ?? []).filter((ws) => ws.role === 'coordinator'), panes: listed.panes.map((row) => ({ ws: row.address.split('/')[0], tab: row.tab, pane: row.pane,
@@ -95,7 +95,9 @@ export async function routeElsHttp(core: ElsCore, hostName: string, method: stri
       ...(row.seat === null || (typeof row.seat === 'string' && /^[A-Z][A-Z0-9_-]{0,63}$/.test(row.seat)) ? { seat: row.seat } : {}),
       badge: row.badge, badgeLabel: row.badgeLabel, stalled: row.stalled, lastEventAtMs: row.lastEventAtMs,
       // SEAT-STATE-ENUM: the status codes, decided here like the stall (origin clock).
-      ...(row.status !== undefined ? { status: row.status } : {}) })) });
+      ...(row.status !== undefined ? { status: row.status } : {}),
+      // ELS-GIT-AWARENESS-HERDR (OP #139752): the pane's git labels ride along from the origin's cache; the read-only window runs no git of its own.
+      ...(row.git !== undefined ? { git: row.git } : {}) })) });
   }
   if (url.pathname === '/els/read') {
     const address = parseAddress(url.searchParams.get('address') ?? '');

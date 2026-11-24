@@ -150,7 +150,7 @@ export class MouseResidueGuard {
 // NEXT-TUI-PASTE-ATOMIC (대표 11-17 · ASK-USER-TURN-COLOR-AND-HISTORY-1117 item 3): a folded paste token
 // («[Paste #n · k lines · full text]», src/tui/core/input.ts) stands for the whole paste, so it edits as one unit:
 // Backspace after it or Delete before it removes all of it; ←/→ step over it; the cursor never lands inside.
-const PASTE_TOKEN = /\[Paste #\d+ · \d+ lines · full text\]/gu;
+const PASTE_TOKEN = /\[Paste #\d+ · \+?\d+ lines · full text\]/gu;
 
 /** [start, end) of every folded paste token in `text`. */
 export function pasteTokenRanges(text: string): [number, number][] {

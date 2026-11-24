@@ -6,7 +6,8 @@ import { runSimWorlds } from '../kernel.js';
 
 // CAPSULE-B4-HARNESS-DONE-FRAME (B5 queue-bridge wiring, repl/index.ts watchQueueCapsuleDone): the harness child
 // (RunShell mode:'bg') ends while the seat is idle, its `shell:<handle>:<n>` completion crosses as one capsule-done
-// frame, and the idle door opens exactly one next turn — within 20s, duplicates 0 — judged on the green table row.
+// frame, and the idle door opens exactly one next turn — after the 120s passive ripen (#39609, measured — #39666),
+// duplicates 0 — judged on the green table row.
 test('C1 harness child end axis passes against the green table row', async () => {
   const root = mkdtempSync(join(tmpdir(), 'c1-harness-'));
   try {
@@ -17,4 +18,4 @@ test('C1 harness child end axis passes against the green table row', async () =>
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-}, 150_000); // 출처: 부팅 ⊕ 자식 15s ⊕ 깨어남 ≤20s ⊕ 중복 창 5s ⊕ 정리 — RED-A 실측 wallMs 21725 (seed-7)
+}, 300_000); // 출처: 부팅 ⊕ 자식 15s ⊕ passive ripen 120s(#39609, 실측·압축 금지 #39666) ⊕ 중복 창 5s ⊕ 정리

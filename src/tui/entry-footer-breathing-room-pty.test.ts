@@ -75,7 +75,7 @@ test('a roomy screen breathes at 80 · 120 · 200 columns and folds to today\'s 
     const lines = rowsOf(screen);
     const prompt = promptRowIndex(screen);
     expect(lines).toHaveLength(40);
-    expect(prompt).toBe(40 - 3); // input · separator · status line
+    expect(prompt).toBe(40 - 4); // input · separator · two status rows (TUI-STATUS-3ROW: seat · work)
     expect(chatPart(lines[prompt - 1]!)).toBe('─'.repeat(cols)); // the old rule over the input (대표 r2)
     expect(lines[prompt - 2]!.trim()).toBe(''); // ②
     expect(lines[prompt - 3]!.trim()).toBe(''); // ③
@@ -86,7 +86,7 @@ test('a roomy screen breathes at 80 · 120 · 200 columns and folds to today\'s 
   const lines = rowsOf(narrow);
   const prompt = promptRowIndex(narrow);
   expect(lines).toHaveLength(24);
-  expect(prompt).toBe(24 - 2); // today's tight layout: the separator sits above the input
+  expect(prompt).toBe(24 - 3); // today's tight layout: the separator sits above the input
   expect(chatPart(lines[prompt - 1]!)).toBe('─'.repeat(80));
   expect(chatPart(lines[23]!).trim()).not.toBe('');
 }, 45_000);
@@ -108,7 +108,7 @@ test('the fold boundary is exactly the compact height: breathing at 25 rows, fol
     const lines = rowsOf(at25);
     const prompt = promptRowIndex(at25);
     expect(lines).toHaveLength(25);
-    expect(prompt).toBe(25 - 3); // input · ① separator · status line
+    expect(prompt).toBe(25 - 4); // input · ① separator · two status rows
     expect(chatPart(lines[prompt + 1]!)).toBe('─'.repeat(80)); // the separator under the input
     expect(lines[prompt - 2]!.trim()).toBe(''); // ② the blank row
     expect(lines[prompt - 3]!.trim()).toBe(''); // ③ the conversation-end margin
@@ -119,7 +119,7 @@ test('the fold boundary is exactly the compact height: breathing at 25 rows, fol
     const lines = rowsOf(at24);
     const prompt = promptRowIndex(at24);
     expect(lines).toHaveLength(24);
-    expect(prompt).toBe(24 - 2); // today's tight layout: the separator sits directly above the input
+    expect(prompt).toBe(24 - 3); // today's tight layout: the separator sits directly above the input
     expect(chatPart(lines[prompt - 1]!)).toBe('─'.repeat(80)); // the separator over the input
     expect(chatPart(lines[prompt - 2]!).trim()).not.toBe(''); // the transcript's end lands right on the separator — the spare rows folded away
   }
@@ -142,7 +142,7 @@ test('the breathing rows and the separator are plain structure, not color: a NO_
   const lines = rowsOf(screen);
   const prompt = promptRowIndex(screen);
   expect(lines).toHaveLength(40);
-  expect(prompt).toBe(40 - 3);
+  expect(prompt).toBe(40 - 4);
   expect(lines[prompt - 1]!).toBe('─'.repeat(80)); // the old rule over the input, literal in NO_COLOR
   expect(lines[prompt - 2]!.trim()).toBe('');
   expect(lines[prompt - 3]!.trim()).toBe('');
@@ -162,7 +162,7 @@ test('a conversation that fills the screen keeps the breathing rows between its 
   const lines = rowsOf(screen);
   const prompt = promptRowIndex(screen);
   expect(lines).toHaveLength(40);
-  expect(prompt).toBe(40 - 3); // input · ① separator · status line — the block kept its rows
+  expect(prompt).toBe(40 - 4); // input · ① separator · two status rows (TUI-STATUS-3ROW) — the block kept its rows
   expect(chatPart(lines[prompt - 1]!)).toBe('─'.repeat(80)); // the old rule right over the input (대표 r2)
   expect(lines[prompt - 2]!.trim()).toBe(''); // ② the blank row
   expect(lines[prompt - 3]!.trim()).toBe(''); // ③ the conversation-end margin

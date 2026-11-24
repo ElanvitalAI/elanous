@@ -45,7 +45,7 @@ import type { ChannelBus } from '../terminal-matrix/channel-bus.js';
 import { startChildLivenessHeartbeat } from './child-liveness-heartbeat.js';
 import {
   OWNER_APPROVAL_TOOL_NAMES, SEAT_CAP_APPROVAL_DEFER_MAX_MS, SEAT_CAP_DEFERRED_WRAPUP_MS,
-  SEAT_IDLE_NO_WORK_NOTICE, SEAT_TURN_CAP_CONTINUE_PROMPT, SEAT_TURN_CAP_TOOL_NOTICE, SeatTurnCapAbort,
+  SEAT_IDLE_NO_WORK_NOTICE, SEAT_TOOL_BATCHING_GUIDELINE, SEAT_TURN_CAP_CONTINUE_PROMPT, SEAT_TURN_CAP_TOOL_NOTICE, SeatTurnCapAbort,
   isEmptyMailListResult, isIdleAgentOutputNotReady, isIdleWaitCall, type SeatTurnCapConfig,
 } from './seat-turn-cap.js';
 import type { TuiChatContext } from './short-question.js';
@@ -652,6 +652,10 @@ export async function runGoalLoop(
   // TUI-GOAL-INTERIM-QUIET r2 — 반복이 한 번뿐이면 재주입이 없으니 «마지막 반복» 줄을 첫 turn 앞에 둔다.
   if (maxIterations <= 1) {
     messages.splice(opts.injectPreamble !== false ? 1 : 0, 0, { role: 'system', content: finalIterationNote });
+  }
+  // ELN-GLM-TOOL-EFFICIENCY — 자리 모드에만 도구 묶음 지침을 목표 계약 바로 뒤에 싣는다(안내문 · 동작 분기 0).
+  if (opts.seatTurnCap != null) {
+    messages.splice(opts.injectPreamble !== false ? 1 : 0, 0, { role: 'system', content: SEAT_TOOL_BATCHING_GUIDELINE });
   }
 
   // 종결 선언 도구를 모델 catalog 에 주입. dispatch 는 루프가 가로채 benign ack 를 준다.

@@ -11,6 +11,7 @@ import { devVersion, checklistDevVersion, listChecklist, summarizeChecklist, typ
 import { add, move, validateVersion } from '../release-loop/feature-store.js';
 import { formatKst, formatSchedule, getSchedule, listSchedules, setSchedule, type ReleaseSchedule } from '../release-loop/release-schedule.js';
 import { mergedPrsLast24h as countMergedPrsLast24h } from '../release-loop/placement.js';
+import { readGreenTriageSources, renderGreenTriage, triageGreen, type GreenTriageSources } from '../release-loop/green-triage.js';
 import { latestGraphRun, type GraphRunState } from '../graph-runner/runner.js';
 import { formatElanousCard, type ElanousCard } from './elanous-card.js';
 
@@ -28,7 +29,7 @@ export const RELEASE_STATUS_SPEC: LLMToolSpec = {
   parameters: { type: 'object', properties: {
     version: { type: 'string', description: '조회할 판. 생략하면 개발 판과 다음 판.' },
     topic: { type: 'string', enum: ['status', 'features', 'cell', 'schedule', 'ops'], description: '읽을 대상(기본 status).' },
-    action: { type: 'string', enum: ['schedule', 'blocked', 'landed'], description: '짧은 읽기 요약: 다음 컷 일정·막힌 칸·최근 24시간 병합 PR.' },
+    action: { type: 'string', enum: ['schedule', 'blocked', 'landed', 'green-triage'], description: '짧은 읽기 요약: 다음 컷 일정·막힌 칸·최근 24시간 병합 PR·green-triage(🟡 칸 세 갈래: 병합+영수증=지금 판정 · 병합만=증거 생산 · 병합 PR 없음=공급).' },
     owner: { type: 'string', description: 'topic=features 때 담당 읽기 필터.' },
     status: { type: 'string', description: 'topic=features 때 상태 읽기 필터.' },
     id: { type: 'string', description: 'topic=cell 때 찾을 칸 id(필수).' },
@@ -65,6 +66,7 @@ export interface ReleaseToolDeps {
   move?: typeof move;
   setSchedule?: typeof setSchedule;
   mergedPrsLast24h?: (now?: Date) => number;
+  greenTriageSources?: () => GreenTriageSources;
 }
 
 function nextVersion(version: string): string {
@@ -171,8 +173,15 @@ export function dispatchReleaseStatus(rawArgs: Record<string, unknown>, deps: Re
   const dev = checklistDevVersion(deps.devVersion?.() ?? devVersion());
   if (args.action !== undefined) {
     const action = args.action;
-    if (typeof action !== 'string' || !['schedule', 'blocked', 'landed'].includes(action)) {
-      throw new Error('action 은 schedule, blocked, landed 중 하나여야 합니다');
+    if (typeof action !== 'string' || !['schedule', 'blocked', 'landed', 'green-triage'].includes(action)) {
+      throw new Error('action 은 schedule, blocked, landed, green-triage 중 하나여야 합니다');
+    }
+    if (action === 'green-triage') {
+      const version = (requested as string | undefined) ?? dev;
+      validateVersion(version);
+      const result = triageGreen(version, checklist(version).items, (deps.greenTriageSources ?? readGreenTriageSources)());
+      debug.log('release.tool', 'status', { action, version, ...result.counts });
+      return { text: renderGreenTriage(result), structured: { greenTriage: result } };
     }
     if (action === 'schedule') {
       const released = checklist(dev).released;

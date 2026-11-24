@@ -219,18 +219,18 @@ function invokeFakeGitBytes(stdout: Buffer, stderr: Buffer, status: number) {
 }
 
 describe('elanous git', () => {
-  test('incident simulation: warns and records a push into another seat\'s open PR, then passes it through', () => {
+  test('incident simulation: refuses and records a push into another seat\'s open PR branch', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } });
     try {
       const result = invokeGitInProcess(['push'], fixture.binDir, {
         ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir,
       });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('seat:TC');
-      expect(result.stderr).toContain('warning');
-      expect(readFileSync(fixture.pushLog, 'utf8')).toContain('push');
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
+      expect(result.stderr).toContain('another seat');
+      expect(existsSync(fixture.pushLog)).toBe(false);
       expect(JSON.parse(readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim())).toMatchObject({
-        seat: 'OPC', verdict: 'foreign-owner-warning', PR: [{ repository: 'ElanvitalAI/elanous', number: 35704 }],
+        seat: 'OPC', verdict: 'foreign-owner-refused', PR: [{ repository: 'ElanvitalAI/elanous', number: 35704 }],
         targets: [{ repository: 'ElanvitalAI/elanous', branch: 'feat/foreign-cell' }],
       });
       expect(readFileSync(fixture.ghLog, 'utf8')).toContain('api --method GET repos/ElanvitalAI/elanous/pulls -f state=open -f head=ElanvitalAI:feat/foreign-cell');
@@ -250,66 +250,67 @@ describe('elanous git', () => {
       expect(readFileSync(fixture.pushLog, 'utf8')).not.toContain('--force-owner');
       const audit = readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim().split('\n');
       expect(audit).toHaveLength(1);
-      expect(JSON.parse(audit[0]!)).toMatchObject({ seat: 'OPC', verdict: 'foreign-owner-warning', forceOwnerRequested: true, PR: [{ repository: 'ElanvitalAI/elanous', number: 35704, seat: 'TC' }], targets: [{ repository: 'ElanvitalAI/elanous', branch: 'feat/foreign-cell' }], reason: 'push to another seat open PR branch' });
+      expect(JSON.parse(audit[0]!)).toMatchObject({ seat: 'OPC', verdict: 'foreign-owner-forced', forceOwnerRequested: true, PR: [{ repository: 'ElanvitalAI/elanous', number: 35704, seat: 'TC' }], targets: [{ repository: 'ElanvitalAI/elanous', branch: 'feat/foreign-cell' }] });
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
   }, 90_000);
 
-  test('foreign PR push proceeds with a warning even when audit storage fails', () => {
+  test('foreign PR push is refused even when audit storage fails', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } });
     try {
       writeFileSync(fixture.auditDir, 'not a directory');
       const result = invokeGitInProcess(['push'], fixture.binDir, { ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('push owner guard warning');
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
       expect(result.stderr).toContain('audit write failed');
-      expect(readFileSync(fixture.pushLog, 'utf8').trim()).toBe('push');
+      expect(existsSync(fixture.pushLog)).toBe(false);
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
   }, 90_000);
 
-  test('--force-owner used as a push-option operand is preserved and observed', () => {
+  test('a --force-owner push-option operand does not override the foreign PR push refusal', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } });
     try {
       const result = invokeGitInProcess(['push', '-o', '--force-owner', 'origin', 'HEAD'], fixture.binDir, {
         ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir,
       });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('push owner guard warning');
-      expect(readFileSync(fixture.pushLog, 'utf8').trim()).toBe('push -o --force-owner origin HEAD');
-      expect(JSON.parse(readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim())).toMatchObject({ verdict: 'foreign-owner-warning' });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
+      expect(existsSync(fixture.pushLog)).toBe(false);
+      expect(JSON.parse(readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim())).toMatchObject({ verdict: 'foreign-owner-refused' });
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
   }, 90_000);
 
-  test('foreign push with --force-owner still proceeds when its audit ledger cannot be written', () => {
+  test('foreign push with --force-owner is refused when its audit ledger cannot be written', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } });
     try {
       writeFileSync(fixture.auditDir, 'not a directory');
       const result = invokeGitInProcess(['push', '--force-owner'], fixture.binDir, {
         ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir,
       });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('audit write failed');
-      expect(existsSync(fixture.pushLog)).toBe(true);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard audit failed');
+      expect(existsSync(fixture.pushLog)).toBe(false);
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
   }, 90_000);
 
-  test('unknown or same-seat PR ownership remains pass-through with an observable warning when unknown', () => {
+  test('an unlabelled PR on a foreign branch prefix is refused by the seat ownership guard', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [], headRepositoryOwner: { login: 'ElanvitalAI' } });
     try {
       const result = invokeGitInProcess(['push'], fixture.binDir, {
         ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir,
       });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('ownership is unknown');
-      expect(readFileSync(fixture.pushLog, 'utf8')).toContain('push');
-      expect(JSON.parse(readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim())).toMatchObject({ verdict: 'pass-uncertain', reason: 'open PR or caller seat ownership is unknown' });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
+      expect(result.stderr).toContain("prefix 'feat'");
+      expect(existsSync(fixture.pushLog)).toBe(false);
+      expect(JSON.parse(readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim())).toMatchObject({ verdict: 'foreign-owner-refused' });
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
@@ -329,13 +330,56 @@ describe('elanous git', () => {
     }
   }, 90_000);
 
-  test('default push settings warn on the actual foreign destination branch', () => {
+  test('own seat branch prefix is allowed by the seat ownership guard', () => {
+    const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } }, { targetBranches: ['opc/own-cell'] });
+    try {
+      const result = invokeGitInProcess(['push'], fixture.binDir, {
+        ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir,
+      });
+      expect(result.status).toBe(0);
+      expect(result.stderr).not.toContain('push owner guard refused');
+      expect(readFileSync(fixture.pushLog, 'utf8')).toContain('push');
+    } finally {
+      rmSync(fixture.binDir, { recursive: true, force: true });
+    }
+  }, 90_000); // 출처: #39756 신규 seat 소유 가드 시험 상한(기존 90_000 관례와 동일 결합항)
+
+  test('a delegates:<caller> label on a foreign PR authorizes the push', () => {
+    const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }, { name: 'delegates:OPC' }], headRepositoryOwner: { login: 'ElanvitalAI' } });
+    try {
+      const result = invokeGitInProcess(['push'], fixture.binDir, {
+        ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir,
+      });
+      expect(result.status).toBe(0);
+      expect(result.stderr).not.toContain('push owner guard refused');
+      expect(readFileSync(fixture.pushLog, 'utf8')).toContain('push');
+    } finally {
+      rmSync(fixture.binDir, { recursive: true, force: true });
+    }
+  }, 90_000); // 출처: #39756 신규 seat 소유 가드 시험 상한(기존 90_000 관례와 동일 결합항)
+
+  test('a foreign seat branch prefix is refused even without an open PR', () => {
+    const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } }, { targetBranches: ['tc/foreign-cell'] });
+    try {
+      const result = invokeGitInProcess(['push'], fixture.binDir, {
+        ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir,
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
+      expect(result.stderr).toContain("prefix 'tc'");
+      expect(existsSync(fixture.pushLog)).toBe(false);
+    } finally {
+      rmSync(fixture.binDir, { recursive: true, force: true });
+    }
+  }, 90_000); // 출처: #39756 신규 seat 소유 가드 시험 상한(기존 90_000 관례와 동일 결합항)
+
+  test('default push settings refuse the actual foreign destination branch', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } });
     try {
       const result = invokeGitInProcess(['push'], fixture.binDir, { ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('push owner guard warning');
-      expect(existsSync(fixture.pushLog)).toBe(true);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
+      expect(existsSync(fixture.pushLog)).toBe(false);
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
@@ -345,29 +389,29 @@ describe('elanous git', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } }, { defaultRemote: 'upstream' });
     try {
       const result = invokeGitInProcess(['push', 'upstream'], fixture.binDir, { ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('push owner guard warning');
-      expect(readFileSync(fixture.pushLog, 'utf8').trim()).toBe('push upstream');
-      expect(JSON.parse(readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim())).toMatchObject({ verdict: 'foreign-owner-warning' });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
+      expect(existsSync(fixture.pushLog)).toBe(false);
+      expect(JSON.parse(readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim())).toMatchObject({ verdict: 'foreign-owner-refused' });
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
   }, 90_000);
 
-  test('explicit refspec is warned, recorded, and passed through', () => {
+  test('explicit refspec is refused and recorded', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } });
     try {
       const result = invokeGitInProcess(['push', 'origin', 'HEAD'], fixture.binDir, { ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('push owner guard warning');
-      expect(readFileSync(fixture.pushLog, 'utf8')).toContain('push origin HEAD');
-      expect(JSON.parse(readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim())).toMatchObject({ verdict: 'foreign-owner-warning' });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
+      expect(existsSync(fixture.pushLog)).toBe(false);
+      expect(JSON.parse(readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim())).toMatchObject({ verdict: 'foreign-owner-refused' });
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
   }, 90_000);
 
-  test('git -C records a warning for the target seat path when environment identity is absent', () => {
+  test('git -C refusal names the calling seat resolved from the target seat path when environment identity is absent', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } });
     const seatPath = join(fixture.binDir, 'seats', 'OPC');
     mkdirSync(seatPath, { recursive: true });
@@ -375,15 +419,16 @@ describe('elanous git', () => {
       const result = invokeGitInProcess(['-C', seatPath, 'push', 'origin'], fixture.binDir, {
         ELANOUS_TRACK: undefined, ELANOUS_HARNESS_SEAT: undefined, ELANOUS_STATE_DIR: fixture.auditDir,
       });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('current seat:OPC');
-      expect(existsSync(fixture.pushLog)).toBe(true);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
+      expect(result.stderr).toContain('calling seat OPC');
+      expect(existsSync(fixture.pushLog)).toBe(false);
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
   }, 90_000);
 
-  test('real Git relative -C bare push to another seat is warned and passed through', () => {
+  test('real Git relative -C bare push to another seat is refused', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/rejected', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } });
     const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
     const remote = join(fixture.binDir, 'remote.git');
@@ -445,15 +490,16 @@ exec '${realGit}' "$@"
           ELANOUS_TRACK: undefined, ELANOUS_HARNESS_SEAT: undefined, ELANOUS_STATE_DIR: fixture.auditDir,
         });
       });
-      expect(result.stderr.toString()).toContain('current seat:OPC');
-      expect(result.status).toBe(0);
-      expect(existsSync(join(fixture.binDir, 'real-push.log'))).toBe(true);
+      expect(result.stderr.toString()).toContain('push owner guard refused');
+      expect(result.stderr.toString()).toContain('calling seat OPC');
+      expect(result.status).toBe(1);
+      expect(existsSync(join(fixture.binDir, 'real-push.log'))).toBe(false);
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
   }, 90_000);
 
-  test('multi-refspec partial failure warns, records one row, and passes through', () => {
+  test('multi-refspec refusal records every destination in one audit row', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/updatable', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } }, {
       targetBranches: ['feat/rejected', 'feat/updatable'],
     });
@@ -461,18 +507,18 @@ exec '${realGit}' "$@"
       const result = invokeGitInProcess(['push', 'origin', 'HEAD:refs/heads/feat/rejected', 'HEAD:refs/heads/feat/updatable'], fixture.binDir, {
         ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir,
       });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('push owner guard warning');
-      expect(readFileSync(fixture.pushLog, 'utf8')).toContain('push origin HEAD:refs/heads/feat/rejected HEAD:refs/heads/feat/updatable');
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
+      expect(existsSync(fixture.pushLog)).toBe(false);
       const rows = readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim().split('\n');
       expect(rows).toHaveLength(1);
-      expect(JSON.parse(rows[0]!)).toMatchObject({ verdict: 'foreign-owner-warning', targets: [{ branch: 'feat/rejected' }, { branch: 'feat/updatable' }], PR: [{ number: 35704, branch: 'feat/updatable', seat: 'TC' }] });
+      expect(JSON.parse(rows[0]!)).toMatchObject({ verdict: 'foreign-owner-refused', targets: [{ branch: 'feat/rejected' }, { branch: 'feat/updatable' }], PR: [{ number: 35704, branch: 'feat/updatable', seat: 'TC' }] });
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
   }, 90_000);
 
-  test('push-option operand and --no-dry-run mode are warned, recorded, and passed through', () => {
+  test('push-option operand and --no-dry-run mode are refused and recorded', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } });
     try {
       const variants = [
@@ -485,22 +531,19 @@ exec '${realGit}' "$@"
         const result = invokeGitInProcess(args, fixture.binDir, {
           ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir,
         });
-        expect(result.status).toBe(0);
-        expect(result.stderr).toContain('push owner guard warning');
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain('push owner guard refused');
       }
-      expect(readFileSync(fixture.pushLog, 'utf8')).toContain('push -o incident-note --no-dry-run origin HEAD:refs/heads/feat/foreign-cell');
-      expect(readFileSync(fixture.pushLog, 'utf8')).toContain('push -qo incident-note --no-dry-run origin HEAD:refs/heads/feat/foreign-cell');
-      expect(readFileSync(fixture.pushLog, 'utf8')).toContain('push --force-with-lease origin HEAD:refs/heads/feat/foreign-cell');
-      expect(readFileSync(fixture.pushLog, 'utf8')).toContain('push --future-option origin HEAD:refs/heads/feat/foreign-cell');
+      expect(existsSync(fixture.pushLog)).toBe(false);
       const rows = readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim().split('\n');
       expect(rows).toHaveLength(4);
-      expect(JSON.parse(rows[3]!)).toMatchObject({ verdict: 'foreign-owner-warning', unsupportedOption: '--future-option' });
+      expect(JSON.parse(rows[3]!)).toMatchObject({ verdict: 'foreign-owner-refused', unsupportedOption: '--future-option' });
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
   }, 90_000);
 
-  test('test-universe CLI entry warns and passes through the simulated push into a foreign-seat PR', () => {
+  test('test-universe CLI entry refuses the simulated push into a foreign-seat PR', () => {
     const currentBranch = 'feat/test-universe-guard';
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: currentBranch, body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' } });
     const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
@@ -528,9 +571,9 @@ exec '${realGit}' "$@"
           ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir,
         }),
       });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('push owner guard warning');
-      expect(existsSync(fixture.pushLog)).toBe(true);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
+      expect(existsSync(fixture.pushLog)).toBe(false);
     } finally {
       rmSync(home, { recursive: true, force: true });
       rmSync(fixture.binDir, { recursive: true, force: true });
@@ -548,7 +591,7 @@ exec '${realGit}' "$@"
       expect(result.status).toBe(0);
       const audit = readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim().split('\n');
       expect(audit).toHaveLength(1);
-      expect(JSON.parse(audit[0]!)).toMatchObject({ verdict: 'foreign-owner-warning', targets: [{ branch: 'feat/foreign-cell' }, { branch: 'feat/second-destination' }], forceOwnerRequested: true });
+      expect(JSON.parse(audit[0]!)).toMatchObject({ verdict: 'foreign-owner-forced', targets: [{ branch: 'feat/foreign-cell' }, { branch: 'feat/second-destination' }], forceOwnerRequested: true });
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
@@ -577,7 +620,7 @@ exec '${realGit}' "$@"
     }
   }, 90_000);
 
-  test('fork remote lookup warns for the matching foreign PR', () => {
+  test('fork remote lookup refuses the matching foreign PR', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'forker' } }, {
       remoteUrl: 'git@github.com:forker/elanous-agent.git', parentRepository: 'ElanvitalAI/elanous',
     });
@@ -585,37 +628,41 @@ exec '${realGit}' "$@"
       const result = invokeGitInProcess(['push', 'origin'], fixture.binDir, {
         ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir,
       });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('push owner guard warning');
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
       expect(readFileSync(fixture.ghLog, 'utf8')).toContain('api --method GET repos/ElanvitalAI/elanous/pulls -f state=open -f head=forker:feat/foreign-cell');
+      expect(existsSync(fixture.pushLog)).toBe(false);
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
   }, 90_000);
 
-  test('same head owner and branch in a different fork does not match the push target repository', () => {
+  test('same head owner and branch in a different fork does not match the push target and its foreign prefix is refused', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'ElanvitalAI' }, headRepositoryFullName: 'ElanvitalAI/other-fork' });
     try {
       const result = invokeGitInProcess(['push'], fixture.binDir, {
         ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir,
       });
-      expect(result.status).toBe(0);
-      expect(readFileSync(fixture.pushLog, 'utf8').trim()).toBe('push');
-      expect(result.stderr).not.toContain('push refused');
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
+      expect(result.stderr).toContain("prefix 'feat'");
+      expect(result.stderr).not.toContain('belongs to PR owner seat');
+      expect(existsSync(fixture.pushLog)).toBe(false);
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }
   }, 90_000);
 
-  test('GitHub head owner comparison is case-insensitive for warning and audit', () => {
+  test('GitHub head owner comparison is case-insensitive for refusal and audit', () => {
     const fixture = makePushOwnershipFixture({ number: 35704, headRefName: 'feat/foreign-cell', body: '칸: TSC-SCC-SWEEP-6', labels: [{ name: 'seat:TC' }], headRepositoryOwner: { login: 'Joosung80' } });
     try {
       const result = invokeGitInProcess(['push', 'origin'], fixture.binDir, {
         ELANOUS_TRACK: 'OPC', ELANOUS_STATE_DIR: fixture.auditDir,
       });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('push owner guard warning');
-      expect(existsSync(fixture.pushLog)).toBe(true);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('push owner guard refused');
+      expect(existsSync(fixture.pushLog)).toBe(false);
+      expect(JSON.parse(readFileSync(join(fixture.auditDir, 'git', 'push-owner-guard.jsonl'), 'utf8').trim())).toMatchObject({ verdict: 'foreign-owner-refused' });
     } finally {
       rmSync(fixture.binDir, { recursive: true, force: true });
     }

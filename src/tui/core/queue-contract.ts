@@ -32,7 +32,7 @@ export type NextTuiQueueBoundary = 'tool-result' | 'idle';
  * ELN-CHILD-NOTICE-INTO-QUEUE; this file only owns their place in the order.
  */
 export type NextTuiQueueItemKind = 'user' | 'notice';
-export type NextTuiQueueNoticeSource = 'sidetab' | 'harness-child' | 'seat-mail' | 'seat-mail-guide' | 'graph-node' | 'event-watch' | 'capsule-done' | 'ceo-ingress';
+export type NextTuiQueueNoticeSource = 'sidetab' | 'harness-child' | 'seat-mail' | 'seat-mail-guide' | 'graph-node' | 'event-watch' | 'capsule-done' | 'ceo-ingress' | 'work-pull';
 
 /** Input mode decides batching: a slash command or `!` shell line never travels with ordinary chat. */
 export type NextTuiQueueMode = 'chat' | 'command' | 'shell';
@@ -66,10 +66,19 @@ export interface NextTuiQueueItem {
   /** Why a `cancelled` item was cancelled (the `cancel` reason) — a watcher tells «carried into the running turn» from a drop. */
   readonly cancelReason?: string;
   readonly urgent?: boolean;
+  /** QUEUE-FINISH-FIRST: the mail's class from its structured ledger fields (intent · origin · crown) — set at enqueue. */
+  readonly mailClass?: 'P0' | 'P1' | 'P2';
+  /** QUEUE-P1-3MIN: the mail's structured intent (request · decision · info · alert) — a decision joins at once. */
+  readonly mailIntent?: string;
+  /** QUEUE-FINISH-FIRST: the ledger `replyTo` of a seat mail — a reply to a mail the current work waits on joins it. */
+  readonly replyTo?: number;
   /** SEAT-MAIL-COALESCE-NOTICE: an info seat mail — waits like a passive result, listed in the next digest. */
   readonly passive?: boolean;
   /** SEAT-MAIL-COALESCE-NOTICE: this mail's one digest line (`#id · from · kind · body…`). */
   readonly digest?: string;
+  /** NOTICE-FOLD-1LINE: a `seat-mail` notice's sender and where the mail's own body sits — in `text` (`bodyAt`) and
+   *  in its `digest` line (`digestBodyAt`) — so the chat folds each mail of a digest to its own line. */
+  readonly mail?: NextTuiQueueMailSpan;
   /**
    * When a notice existed, if the producer knows. Absent means unknown.
    * The zero-miss receipt must not treat unknown as a zero wait.
@@ -145,4 +154,15 @@ export interface NextTuiQueueNoticeEntry {
   readonly msgId?: number;
   readonly passive?: boolean;
   readonly digest?: string;
+  readonly mailClass?: 'P0' | 'P1' | 'P2';
+  readonly mailIntent?: string;
+  readonly replyTo?: number;
+}
+
+/** NOTICE-FOLD-1LINE — a seat mail's sender and body offsets (set by the producer that built the text; never parsed). */
+export interface NextTuiQueueMailSpan {
+  readonly sender: string;
+  readonly bodyAt: number;
+  readonly bodyLength: number;
+  readonly digestBodyAt: number;
 }

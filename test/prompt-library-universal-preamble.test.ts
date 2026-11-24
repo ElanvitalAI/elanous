@@ -377,7 +377,6 @@ describe('buildDashboardTurnPreamble — universal layer integration', () => {
         conciseness: {
           enabled: true,
           finalMessageMaxLines: 6,
-          preambleMaxWords: 12,
         },
       },
     } as unknown as Parameters<typeof buildDashboardTurnPreamble>[0]['userConfig'];

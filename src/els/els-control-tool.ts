@@ -84,7 +84,7 @@ function tryParse(message: string): unknown {
 
 
 interface JournalRow { readonly id: string; readonly name?: string; readonly workspaceId?: string }
-interface ListedPane { readonly pane: string; readonly tab: string; readonly kind?: string; readonly cwd?: string }
+interface ListedPane { readonly pane: string; readonly tab: string; readonly kind?: string; readonly cwd?: string; readonly seat?: string | null }
 interface Listing { readonly workspaces: readonly JournalRow[]; readonly tabs: readonly JournalRow[]; readonly panes: readonly ListedPane[] }
 
 /** Pane kinds that take typed prose, not shell lines. Every other kind (pty, shell, other, remote, unknown) is
@@ -229,8 +229,15 @@ export async function runElsControl(args: unknown, deps: ElsControlDeps): Promis
     }
     struct = { kind, id: doorAction === 'close' ? own : id, ...(str(a.name) ? { name: str(a.name) } : {}), ...(before ? { before } : {}) };
   }
+  // ELS-OP-CLOSE-TAB (대표 11-24 «보안 기본 완화»): the OP coordinator closing a seat's tab is routine — no person is asked
+  // and the whole tab closes (server `close-tab`: one `els.close` audit line with caller · label · pane count). The OP's
+  // own tab is the exception: refused here, and again at the server, unless a person confirms it there.
+  const coordinatorClose = action === 'close' && deps.seat?.name === 'OP' && !!resolved;
+  if (coordinatorClose && resolved!.listing.panes.some((pane) => pane.tab === resolved!.tabId && pane.seat === 'OP')) {
+    return refusal(action, 'op-tab', `tab ${resolved!.tabId} is the OP tab itself — closing it needs a person's confirmation`, deps.stateDir, paneId);
+  }
   let confirm: boolean | undefined;
-  if ((action === 'close' || action === 'move') && deps.ask) confirm = await deps.ask(`ElsControl ${action} ${target.pane} (workspace ${target.workspace}) — confirm closing?`);
+  if ((action === 'close' || action === 'move') && deps.ask && !coordinatorClose) confirm = await deps.ask(`ElsControl ${action} ${target.pane} (workspace ${target.workspace}) — confirm closing?`);
   let sent: ElsRequest | undefined;
   const control = createControl({
     stateDir: deps.stateDir,
@@ -238,6 +245,7 @@ export async function runElsControl(args: unknown, deps: ElsControlDeps): Promis
     execute: async (input) => {
       sent = action === 'stop' ? { op: 'interrupt', pane: input.target.pane }
         : action === 'send' ? { op: 'input-line', pane: input.target.pane, text: input.text ?? '', from: 'ElsControl' }
+        : coordinatorClose && struct?.kind !== 'pane' ? { op: 'close-tab', tab: resolved!.tabId }
         : wireRequest(input, title, resolved?.listing.panes.find((pane) => pane.pane === paneId)?.cwd);
       return requestEls(join(dirname(deps.socketPath), 'ctl.sock'), sent);
     },

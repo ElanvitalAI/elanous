@@ -84,3 +84,47 @@ export function interpretMouse(report: MouseReport, layout: MouseLayout): MouseA
 export function mouseEvent(report: MouseReport): KeyEvent {
   return { kind: 'mouse', report };
 }
+
+/** ELS-WHEEL-HISTORY (herdr encode_mouse_wheel · encode_alternate_scroll): the bytes a wheel notch becomes for a pane that
+ *  takes it itself. `x`/`y` are 1-based PANE coordinates (the els chrome to the left and above already taken off).
+ *  `mouse-sgr` → SGR 1006 report · `mouse-x10` → legacy `ESC [ M` report · `arrows` → three ↑/↓ (alternate scroll).
+ *  null for `host` (the els scrollback takes it) or a button that is not a wheel notch. */
+export function wheelBytes(route: 'mouse-sgr' | 'mouse-x10' | 'arrows' | 'host', button: number, x: number, y: number): string | null {
+  if (button !== WHEEL_UP && button !== WHEEL_DOWN) return null;
+  const px = Math.max(1, x), py = Math.max(1, y);
+  if (route === 'mouse-sgr') return `\u001b[<${button};${px};${py}M`;
+  if (route === 'mouse-x10') return px > 223 || py > 223 ? null : `\u001b[M${String.fromCharCode(32 + button, 32 + px, 32 + py)}`;
+  if (route === 'arrows') return (button === WHEEL_UP ? '\u001b[A' : '\u001b[B').repeat(3);
+  return null;
+}
+
+/** ELS-WHEEL-HISTORY (single-pane view · `els side attach <pane>`): the view now asks the terminal for SGR mouse reports, so
+ *  every report is decided here and never reaches the pane raw. The pane sits at the top-left (same coordinates), the
+ *  status line is the last row. A wheel follows the frame's route (the pane's own mouse report · ↑/↓ · els scrollback);
+ *  other reports go to the pane only while it tracks its own mouse (a shell would print them as junk). A report split
+ *  across two reads is held until its tail arrives. */
+export function createPaneViewMouse(): { feed: (text: string, route: 'mouse-sgr' | 'mouse-x10' | 'arrows' | 'host', rows: number) => { send: string; scroll: number } } {
+  let pending = '';
+  return {
+    feed(text, route, rows) {
+      const split = splitMouse(pending + text);
+      pending = split.pending;
+      let send = '';
+      let scroll = 0;
+      for (const segment of split.segments) {
+        if (segment.kind === 'text') { send += segment.text; continue; }
+        const report = segment.report;
+        if (report.y >= rows) continue;                                  // the status line takes no pointer
+        if ((report.button & 0x40) !== 0) {
+          if (report.release) continue;
+          const bytes = wheelBytes(route, report.button, report.x, report.y);
+          if (bytes !== null) send += bytes;
+          else if (route === 'host') scroll += report.button === WHEEL_UP ? 3 : report.button === WHEEL_DOWN ? -3 : 0;
+          continue;
+        }
+        if (route === 'mouse-sgr') send += report.bytes;
+      }
+      return { send, scroll };
+    },
+  };
+}

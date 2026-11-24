@@ -204,8 +204,9 @@ function selfProactiveScenario(lang: keyof typeof SELF_PROACTIVE_COPY): UxPackSc
       { id: 'more-work-continues', expect: '① a declared next step opens an automatic next turn («↻ Continuing (next step)») that runs it',
         check: (_screen, { frames }) => CONTINUED_FLAT.test(afterSeen(frames[SELF_PROACTIVE_FRAME.afterPlan] ?? '', copy.pledge))
           && seen(frames[SELF_PROACTIVE_FRAME.afterPlan] ?? '', copy.continued) },
-      { id: 'waiting-waker-resumes', expect: '② the waker the model set fires and the work resumes («↻ Resuming (scheduled check)»)',
-        check: (_screen, { frames }) => SCHEDULED_RESUME_FLAT.test(squeeze(frames[SELF_PROACTIVE_FRAME.afterWait] ?? ''))
+      // TUI-NOTICE-QUIET (대표 11-24): the resume banner is bookkeeping (logged, not drawn) — the resumed answer is the surface.
+      { id: 'waiting-waker-resumes', expect: '② the waker the model set fires and the work resumes (its answer shows; no «↻ Resuming» row)',
+        check: (_screen, { frames }) => !SCHEDULED_RESUME_FLAT.test(squeeze(frames[SELF_PROACTIVE_FRAME.afterWait] ?? ''))
           && seen(frames[SELF_PROACTIVE_FRAME.afterWait] ?? '', copy.resumed) },
       { id: 'waiting-not-taken-as-more-work', expect: '② waiting is not mistaken for more-work: no goal-continue turn between the wait and its waker',
         check: (_screen, { frames }) => {

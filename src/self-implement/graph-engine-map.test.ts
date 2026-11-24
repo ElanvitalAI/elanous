@@ -5,8 +5,8 @@ import { parse } from 'yaml';
 
 const repoRoot = resolve(import.meta.dir, '../..');
 const mapText = readFileSync(join(repoRoot, 'seat-state/OPC/MAP-orchestrator-to-graph-1027.md'), 'utf8');
-const sourceLines = readFileSync(join(repoRoot, 'src/self-implement/orchestrator.ts'), 'utf8').split('\n');
-const graphLines = readFileSync(join(repoRoot, 'graphs/implement-loop.yaml'), 'utf8').split('\n');
+const orchestrator = readFileSync(join(repoRoot, 'src/self-implement/orchestrator.ts'), 'utf8');
+const judge = readFileSync(join(repoRoot, 'src/task-agent/judge.ts'), 'utf8');
 const graph = parse(readFileSync(join(repoRoot, 'graphs/implement-loop.yaml'), 'utf8')) as {
   nodes: Array<{ node_id: string }>;
   edges: Array<{ from: string; to?: string; map?: Record<string, string> }>;
@@ -41,39 +41,60 @@ const mapRows = new Map(
     .map((cells) => [cells[0]!, cells] as const),
 );
 
-function sourceLine(pattern: RegExp, label: string): number {
-  const index = sourceLines.findIndex((line) => pattern.test(line));
-  expect(index, `${label} must exist in orchestrator.ts`).toBeGreaterThanOrEqual(0);
-  return index + 1;
-}
+const orchestratorAnchors: Readonly<Record<string, RegExp>> = {
+  runSelfImplementInner: /^async function runSelfImplementInner\(/m,
+  goalDocumentBody: /^function goalDocumentBody\(/m,
+  goalContentHash: /^function goalContentHash\(/m,
+  goalSource: /const goalSource = opts\.naturalLanguageDispatch/,
+  goalClarification: /if \(opts\.goalFile && resolvedGoalFile\)/,
+  implementing: /progress\('implementing', round ===/,
+  implemented: /progress\('implemented', impl\.ok/,
+  gateEntry: /onNodeEntry\(node\('gate'\)/,
+  gated: /observe\('gated',/,
+  gateFailed: /progress\('gate-failed',/,
+  reviewEntry: /onNodeEntry\(node\('review'\)/,
+  reviewing: /progress\('reviewing',/,
+  reworkEntry: /onNodeEntry\(node\('rework'\)/,
+  mainSync: /progress\('gating', `최신/,
+  regate: /const regate = deferGateToLand/,
+  prOpening: /progress\('pr-opening', 'PR 생성…'\)/,
+  landingAdmission: /const landing = admitLandingMerge\(/,
+  landingHeld: /const detail = landing\.kind === 'held'/,
+  merged: /progress\('merged', formatAutoMergeSuccessMessage/,
+  cleanup: /withJourneyNode\('cleanup'/,
+  runPostMergeCleanup: /^async function runPostMergeCleanup\(/m,
+  preserveBlockedArtifacts: /const preserveBlockedArtifacts = async/,
+  salvageHardCap: /const salvageHardCap = async/,
+  autohealRecordedStop: /^async function autohealRecordedStop\(/m,
+  observeNodeEntry: /const observeNodeEntry\s*=/,
+  makeRunObserver: /^export function makeRunObserver\(/m,
+  gateSkippedByGraph: /observe\('gate-skipped-by-graph',/,
+};
 
-function rangeContains(text: string, line: number): boolean {
-  return [...text.matchAll(/orchestrator\.ts:(\d+)–(\d+)/g)].some((match) => {
-    const start = Number(match[1]);
-    const end = Number(match[2]);
-    return start <= line && line <= end && end <= sourceLines.length;
-  });
+function resolveAnchor(file: string, anchor: string): boolean {
+  if (file === 'orchestrator.ts') {
+    return orchestratorAnchors[anchor]?.test(orchestrator) ?? false;
+  }
+  if (file === 'graphs/implement-loop.yaml') {
+    return graph.nodes.some((node) => node.node_id === anchor);
+  }
+  return file === 'src/task-agent/judge.ts' && anchor === 'judgeNextMove'
+    && /^export function judgeNextMove\(/m.test(judge);
 }
 
 describe('GRAPH-ENGINE-MAP', () => {
-  test('YAML의 모든 노드가 대응표에 있고 실제 orchestrator 줄 범위를 가리킨다', () => {
+  test('YAML 노드 대응표가 완전하고 모든 소스 앵커가 현재 구현에 연결된다', () => {
     expect(mapText).toContain(`(${graph.nodes.length}개 노드 전부)`);
     expect([...mapRows.keys()].sort()).toEqual(graph.nodes.map((node) => node.node_id).sort());
     for (const [nodeId, cells] of mapRows) {
       expect(cells, `${nodeId} row has eight cells`).toHaveLength(8);
       expect(cells.every((cell) => cell.length > 0), `${nodeId} row has no blank cells`).toBe(true);
-      for (const match of cells[2]!.matchAll(/orchestrator\.ts:(\d+)–(\d+)/g)) {
-        expect(Number(match[1]), `${nodeId} range starts within source`).toBeGreaterThan(0);
-        expect(Number(match[2]), `${nodeId} range ends within source`).toBeLessThanOrEqual(sourceLines.length);
-      }
     }
-
-    const runInner = sourceLine(/^async function runSelfImplementInner\(/, 'runSelfImplementInner');
-    const observeEntry = sourceLine(/^\s*const observeNodeEntry\s*=/, 'observeNodeEntry');
-    const runObserver = sourceLine(/^export function makeRunObserver\(/, 'makeRunObserver');
-    expect(rangeContains(mapRows.get('author')![2]!, runInner)).toBe(true);
-    expect(rangeContains(mapText.match(/orchestrator\.ts:\d+–\d+[^\n]*observeNodeEntry/)?.[0] ?? '', observeEntry)).toBe(true);
-    expect(rangeContains(mapText.match(/orchestrator\.ts:\d+–\d+[^\n]*makeRunObserver/)?.[0] ?? '', runObserver)).toBe(true);
+    expect(mapText).not.toMatch(/\.(?:ts|yaml):\d+/);
+    const citations = mapText.matchAll(/`([\w/.\-]+\.(?:ts|yaml))#([\w-]+)`/g);
+    for (const [citation, file, anchor] of citations) {
+      expect(resolveAnchor(file!, anchor!), citation).toBe(true);
+    }
   });
 
   test('대표 노드의 출구 enum이 YAML on/map 선언과 일치하고 escaped table pipes를 보존한다', () => {
@@ -91,63 +112,52 @@ describe('GRAPH-ENGINE-MAP', () => {
   });
 
   test('FRONT/BACK seam과 graphs/units 등록 계약 초안이 포함된다', () => {
-    expect(mapText).toContain('## FRONT(MK) seam — orchestrator.ts 줄 범위');
-    expect(mapText).toContain('## BACK(TC) seam — orchestrator.ts 줄 범위');
+    expect(mapText).toContain('## FRONT(MK) seam — orchestrator.ts 앵커');
+    expect(mapText).toContain('## BACK(TC) seam — orchestrator.ts 앵커');
     expect(mapText).toContain('## 레고 부품 후보 — graphs/units 등록 계약 초안');
     const unitRows = mapText.split('\n').filter((line) => line.startsWith('| unit:') || line.startsWith('| unit-'));
     expect(unitRows.length).toBeGreaterThanOrEqual(8);
   });
 
-  test('방문 예산 보조 인용이 현재 observeNodeEntry 구현을 덮는다', () => {
-    const observerLine = sourceLine(/^\s*const observeNodeEntry\s*=/, 'observeNodeEntry');
-    const budgetCitation = mapText.split('\n').find((line) => line.startsWith('- 예산 보조:')) ?? '';
-    expect(budgetCitation).toContain('observeNodeEntry');
-    expect(budgetCitation).not.toContain('recordNodeVisit');
-    expect(rangeContains(budgetCitation, observerLine)).toBe(true);
+  test('방문 예산과 실행 관측이 현재 구현을 인용한다', () => {
+    const budgetCitation = mapText.split('\n').find((line) => line.startsWith('- 예산 보조:'));
+    expect(budgetCitation).toContain('`orchestrator.ts#observeNodeEntry`');
+    expect(mapText).toContain('`orchestrator.ts#makeRunObserver`');
+    expect(mapText).toContain('`orchestrator.ts#gateSkippedByGraph`');
   });
 
-  test('gate 인용 범위가 gating entry부터 gated 및 gate-failed 판정까지 덮는다', () => {
-    const gateCitation = mapRows.get('gate')![2]!;
-    const gateEntry = sourceLine(/onNodeEntry\(node\('gate'\)/, 'gate entry');
-    const gated = sourceLine(/observe\('gated',/, 'gated observation');
-    const gateFailed = sourceLine(/progress\('gate-failed',/, 'gate-failed disposition');
-    expect(rangeContains(gateCitation, gateEntry)).toBe(true);
-    expect(rangeContains(gateCitation, gated)).toBe(true);
-    expect(rangeContains(gateCitation, gateFailed)).toBe(true);
-  });
-
-  test('주요 실행 단계 인용이 현재 orchestrator 경계들을 덮는다', () => {
-    // MAP ranges were re-anchored after #34231 (0418bf763) moved these orchestration branches.
-    const currentMarkers: Array<[string, RegExp, string]> = [
-      ['dispatch', /^async function runSelfImplementInner\(/, 'runSelfImplementInner entry'],
-      ['plan', /^\s*const goalSource = opts\.naturalLanguageDispatch/, 'plan preparation boundary'],
-      ['decompose', /^\s*if \(opts\.goalFile && resolvedGoalFile\)/, 'goal clarification boundary'],
-      ['implement', /progress\('implementing',/, 'implement progress'],
-      ['gate', /onNodeEntry\(node\('gate'\)/, 'gate node entry'],
-      ['review', /onNodeEntry\(node\('review'\)/, 'review node entry'],
-      ['result-parse', /^\s*const preserveBlockedArtifacts = async/, 'failure preservation'],
-      ['salvage', /^\s*const salvageHardCap = async/, 'hard-cap salvage'],
-      ['re-ground', /^function goalContentHash\(/, 'goal content hash'],
-      ['main-sync', /progress\('gating', `최신/, 'main-sync progress'],
-      ['regate', /const regate = deferGateToLand/, 'post-sync gate (deferred to pinned train by #34231)'],
-      ['open-pr', /^\s*progress\('pr-opening', 'PR 생성…'\);/, 'PR opening'],
-      ['freeze-check', /const landing = admitLandingMerge\(/, 'landing freeze admission'],
-      ['hold', /const detail = landing\.kind === 'held'/, 'held landing result'],
-      ['merge', /progress\('merged', formatAutoMergeSuccessMessage/, 'merged result'],
-      ['cleanup', /withJourneyNode\('cleanup'/, 'post-merge cleanup'],
-    ];
-    for (const [nodeId, pattern, label] of currentMarkers) {
-      const line = sourceLine(pattern, label);
-      expect(rangeContains(mapRows.get(nodeId)![2]!, line), `${nodeId} range covers ${label} at ${line}`).toBe(true);
+  test('실행 단계마다 해당 경계 앵커가 있다', () => {
+    const expectedAnchors = {
+      dispatch: ['runSelfImplementInner'],
+      author: ['runSelfImplementInner', 'goalDocumentBody', 'goalContentHash'],
+      plan: ['goalSource'],
+      decompose: ['goalClarification'],
+      implement: ['implementing', 'implemented'],
+      gate: ['gateEntry', 'gated', 'gateFailed'],
+      review: ['reviewEntry', 'reviewing'],
+      rework: ['reworkEntry'],
+      'result-parse': ['preserveBlockedArtifacts'],
+      salvage: ['salvageHardCap'],
+      're-ground': ['goalContentHash'],
+      'main-sync': ['mainSync'],
+      regate: ['regate'],
+      'open-pr': ['prOpening'],
+      'freeze-check': ['landingAdmission'],
+      hold: ['landingHeld'],
+      merge: ['merged'],
+      cleanup: ['cleanup', 'runPostMergeCleanup'],
+    };
+    for (const [nodeId, anchors] of Object.entries(expectedAnchors)) {
+      for (const anchor of anchors) {
+        expect(mapRows.get(nodeId)?.[2], nodeId).toContain(`\`orchestrator.ts#${anchor}\``);
+      }
     }
   });
 
-  test('non-executable candidate nodes cite their YAML declarations, not stale orchestrator lines', () => {
+  test('실행 모듈 없는 후보 노드는 YAML 선언을 인용한다', () => {
     for (const nodeId of ['ready', 'pr-head-checkout']) {
-      const line = graphLines.findIndex((source) => new RegExp(`^\\s*- node_id: ${nodeId}$`).test(source)) + 1;
-      expect(line, `${nodeId} declaration exists`).toBeGreaterThan(0);
-      expect(mapRows.get(nodeId)![2]).toContain(`graphs/implement-loop.yaml:${line}`);
-      expect(mapRows.get(nodeId)![2]).not.toContain('orchestrator.ts:');
+      expect(mapRows.get(nodeId)?.[2]).toContain(`\`graphs/implement-loop.yaml#${nodeId}\``);
+      expect(mapRows.get(nodeId)?.[2]).not.toContain('orchestrator.ts#');
     }
   });
 });

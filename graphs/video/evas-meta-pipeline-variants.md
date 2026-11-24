@@ -1,6 +1,6 @@
 # 메타 광고 파이프라인 — 세 판본의 «오버레이» (대표 2026-09-10)
 
-> 설계·판정은 [`RFC-krea-higgsfield-periodic-pipeline`](../../내부 문서 `RFC-krea-higgsfield-periodic-pipeline-2026-09-10`) **§2ⓔ** 가 canonical.
+> 설계·판정은 [`RFC-krea-higgsfield-periodic-pipeline`](../../내부 문서 `IDEAS`) **§2ⓔ** 가 canonical.
 > 이 문서는 그 셋을 «그래프 오버레이»로 어떻게 쓰나만 답한다.
 
 ## 왜 오버레이인가 — 그래프를 «셋» 만들지 않는다

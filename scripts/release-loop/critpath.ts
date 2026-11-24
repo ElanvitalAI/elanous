@@ -5,6 +5,7 @@
 // Every step lands in an append-only ledger
 // (<instance>/release/<v>/critpath.json) so a rerun skips what is already done and the run is its own evidence.
 import { createHash } from 'node:crypto';
+import { verifyHumanApprovalProof, type DecisionTrustRoot, type HumanProof } from '../../src/decisions/decision-ledger.js';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { publicWaiverReason } from './known-issues-node.js';
@@ -18,7 +19,7 @@ export interface CritpathLedger { version: string; binding?: ApprovalBinding; wa
 export interface ApprovalBinding { version: string; cutSha: string; notesSha256: string }
 export type ApprovalState = { state: 'approved'; id: string } | { state: 'pending'; id: string } | { state: 'unverified'; id: string } | { state: 'declined'; id: string } | { state: 'none' };
 /** The slice of a decision-ledger entry the approval check reads (src/decisions/decision-ledger.ts DecisionEntry). */
-export interface ApprovalRecord { id: string; refs?: string[]; status: string; choice?: string; decidedBy?: { kind: string } }
+export interface ApprovalRecord { id: string; refs?: string[]; status: string; choice?: string; decidedBy?: { kind: string }; proof?: HumanProof }
 
 export const APPROVE_OPTION = 'a';
 /** Distinct from failure (1): the run is healthy and waits for a human publish decision. 75 = EX_TEMPFAIL (sysexits.h). */
@@ -28,16 +29,16 @@ export function approvalRef(b: ApprovalBinding): string {
   return `release-critpath/${b.version}/${b.cutSha}/${b.notesSha256}`;
 }
 
-/** A ledger human marker has no out-of-band proof and cannot authorize an irreversible step. */
-export function approvalState(records: readonly ApprovalRecord[], b: ApprovalBinding): ApprovalState {
+/** A ledger human marker alone authorizes nothing: only a trust-root signature over this exact binding, verified out of band, approves. */
+export function approvalState(records: readonly ApprovalRecord[], b: ApprovalBinding, trustRoots?: readonly DecisionTrustRoot[]): ApprovalState {
   const ref = approvalRef(b);
   const entry = records.filter((r) => r.refs?.includes(ref)).at(-1);
   if (!entry) return { state: 'none' };
   if (entry.status === 'open') return { state: 'pending', id: entry.id };
-  // The ledger is writable by the same account as a seat. Until an out-of-band
-  // trust root exists, even a human marker is a claim, never release authority.
+  // The ledger is writable by the same account as a seat. A human marker stays a claim
+  // until a trust-root signature over this exact binding proves it out of band.
   if (entry.status === 'decided' && entry.choice === APPROVE_OPTION && entry.decidedBy?.kind === 'human')
-    return { state: 'unverified', id: entry.id };
+    return verifyHumanApprovalProof(ref, entry.proof, trustRoots) ? { state: 'approved', id: entry.id } : { state: 'unverified', id: entry.id };
   return { state: 'declined', id: entry.id };
 }
 
@@ -57,6 +58,8 @@ export interface CritpathDeps {
   npmPublish(input: { version: string; tgz: string }): Promise<{ ok: boolean; npm?: string; summary: string }>;
   verify(version: string, repo: string): Promise<{ ok: boolean; summary: string }>;
   approvalRecords(): ApprovalRecord[];
+  /** Trust-root public keys for out-of-band human approval proofs; absent = every human marker stays unverified. */
+  trustRoots?: () => readonly DecisionTrustRoot[];
   requestApproval(b: ApprovalBinding, waiveReason?: string): { id: string };
   now?: () => Date;
   log?: (line: string) => void;
@@ -197,7 +200,7 @@ export async function runCritpath(o: CritpathOptions, deps: CritpathDeps): Promi
       if (!dry.ok) return fail('npm', `${npmCmd} --dry-run`, dry.detail);
       record('npm', `${npmCmd} --dry-run`, 'dry-run', prepared.tgzSha1);
     }
-    const approval = approvalState(deps.approvalRecords(), binding);
+    const approval = approvalState(deps.approvalRecords(), binding, deps.trustRoots?.());
     const remaining = [rerun, verifyCmd, 'bun website/scripts/deploy-pages.ts --remote <host> --yes   # after the docs PR merges'];
     log(`· approval ${approval.state} for v${o.version} cut ${binding.cutSha} notes sha256 ${binding.notesSha256}`);
     log(`dry run — nothing was published. Remaining:\n${remaining.map((c) => `   ${c}`).join('\n')}`);
@@ -207,7 +210,7 @@ export async function runCritpath(o: CritpathOptions, deps: CritpathDeps): Promi
   // ② approval — only while an irreversible step is still ahead.
   if (!releaseExists || (!npmDone && !npmStaged)) {
     const approvalCmd = `approval record ${approvalRef(binding)}`;
-    const approval = approvalState(deps.approvalRecords(), binding);
+    const approval = approvalState(deps.approvalRecords(), binding, deps.trustRoots?.());
     if (approval.state === 'declined') return fail('approval', approvalCmd, `publish card ${approval.id} was not approved — a changed cut or notes raises a new card`);
     if (approval.state !== 'approved') {
       const card = approval.state === 'pending' || approval.state === 'unverified' ? { id: approval.id } : deps.requestApproval(binding, waiveReason);

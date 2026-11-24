@@ -9,7 +9,6 @@ import { clampNum, positiveIntOr, str } from './coercion.js';
 export interface ChatConcisenessConfig {
   enabled: boolean;
   finalMessageMaxLines: number;
-  preambleMaxWords: number;
 }
 
 export interface ChatToolOutputConfig {
@@ -121,7 +120,6 @@ export interface ChatConfig {
 const CHAT_CONCISENESS_DEFAULTS: ChatConcisenessConfig = {
   enabled: true,
   finalMessageMaxLines: 10,
-  preambleMaxWords: 12,
 };
 
 export const CHAT_DEFAULTS: ChatConfig = {
@@ -204,12 +202,6 @@ export function parseChatConfig(raw: unknown): ChatConfig {
           CHAT_CONCISENESS_DEFAULTS.finalMessageMaxLines,
           1,
           100,
-        ),
-        preambleMaxWords: clampNum(
-          chatConciseness.preambleMaxWords,
-          CHAT_CONCISENESS_DEFAULTS.preambleMaxWords,
-          1,
-          50,
         ),
       },
       toolOutput: {

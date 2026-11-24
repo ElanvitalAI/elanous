@@ -74,7 +74,16 @@ export interface CompactSessionResult {
  *  ORIGINAL stored rows (role `tool`, ts, from, turn_id) byte-for-byte — never converted to `user`,
  *  which would replay audit content as if the person had said it. */
 function isAuditRow(m: SerializedMessage): boolean {
-  return m.role === 'tool' || m.goalInterim === true;
+  return m.role === 'tool' || m.goalInterim === true || m.compactedReply === true;
+}
+
+/** TUI-ANSWER-VANISH-ON-TOOLCALL — an answer the person already saw (a final or failure reply). Summarizing it
+ *  away used to delete the row from the store, so the next transcript reload (the Next TUI reloads on the first
+ *  tool event of the following turn) wiped the answer from the screen. It is summarized once, then kept as a
+ *  display-only row (`compactedReply`): never replayed (chat.ts toLLM), never summarized again. */
+function isShownReplyRow(m: SerializedMessage): boolean {
+  return m.role === 'assistant' && m.goalInterim !== true
+    && (m.compactedReply === true || m.replyFinal === true || m.replyFailure === true);
 }
 
 /** ★ ELN-COMPACT-REAL(OP #135458 §4-4②) — agent/system 전송원(`from`)을 가진 user 행(자리
@@ -171,7 +180,7 @@ function writeKeepingAppends(
     && snapshot.every((row, i) => JSON.stringify(row) === JSON.stringify(current[i]));
   if (!prefixIntact) return { outcome: 'prefix-changed', written: [] };
   const written = [...rewritten, ...current.slice(snapshot.length)];
-  rewriteSessionMessages(sessionId, written, root);
+  rewriteSessionMessages(sessionId, written, root, 'compaction');
   return { outcome: 'written', written };
 }
 
@@ -310,16 +319,25 @@ function rewriteKeepingAuditRows(
     const tailLen = messages.length - summaryAt - 1 - preserved.length;
     const tailStart = tailLen > 0 ? workingRows[workingRows.length - tailLen]! : rows.length;
     const anchors = workingRows.slice(0, summaryAt);
-    const keptHead = rows.slice(0, tailStart).filter((row, i) => isAuditRow(row) || anchors.includes(i));
-    const preservedRows = preserved
+    const preservedAt = new Set(preserved
       .map(pos => workingRows[pos])
-      .filter((row): row is number => row !== undefined)
-      .map(row => rows[row]!)
-      .filter((row): row is SerializedMessage => row !== undefined);
+      .filter((row): row is number => row !== undefined));
+    // Shown replies sit after the summary beside the preserved user rows, in their stored order, so the
+    // transcript still reads question → answer; tool/interim audit rows keep their place before the summary.
+    const keptHead: SerializedMessage[] = [];
+    const afterSummary: SerializedMessage[] = [];
+    rows.slice(0, tailStart).forEach((row, i) => {
+      if (anchors.includes(i)) keptHead.push(row);
+      else if (isShownReplyRow(row)) afterSummary.push(row.compactedReply === true ? row : { ...row, compactedReply: true });
+      else if (preservedAt.has(i)) afterSummary.push(row);
+      else if (isAuditRow(row)) keptHead.push(row);
+    });
+    const keptReplies = afterSummary.filter(row => row.role === 'assistant').length;
+    if (keptReplies > 0) debug.log('compact.session', 'replies-kept', { keptReplies });
     return [
       ...keptHead,
       toSerialized(messages[summaryAt]!, ts),
-      ...preservedRows,
+      ...afterSummary,
       ...rows.slice(tailStart),
     ];
   }

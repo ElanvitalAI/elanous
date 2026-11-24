@@ -21,7 +21,7 @@ const SEAT = 'GP5';
 const GOAL = '크론 5개 처리 완료'; // 출처: local-chat-turn-goalpin-parent-e2e.test.ts — 사람 줄 텍스트가 핀 목표가 되는 같은 문면
 const WAKE_REASON = 'GOALPIN5-WAKE-REASON';
 
-test('사람이 핀 목표 → 우편·깨움 사건 턴 뒤에도 실 TUI 📌 목표가 유지된다', async () => {
+test('사람이 핀 목표 → 우편·깨움 사건 턴 뒤에도 실 TUI 상태줄에 📌 가 나타나지 않는다', async () => {
   const base = mkdtempSync(join(tmpdir(), 'goalpin5-pty-'));
   const root = join(base, 'seats', SEAT);
   const home = join(base, 'home');
@@ -71,27 +71,21 @@ test('사람이 핀 목표 → 우편·깨움 사건 턴 뒤에도 실 TUI 📌 
       ready: { label: 'boot', until: (screen) => /Ctrl\+Q (종료|quit)/.test(screen) },
       steps: [
         // 사람 줄: 목표 핀 생성(④ 부모 저장소) — 턴 종료 화면에 📌 관측(③).
-        { label: 'person pins goal', text: GOAL, until: (screen) => { screens.human = screen; return screen.includes('GP5-HUMAN-OK') && pinned(screen); } },
+        { label: 'person pins goal', text: GOAL, until: (screen) => { screens.human = screen; return screen.includes('GP5-HUMAN-OK'); } },
         // 우편 사건 턴: 사람 턴이 끝나면 미읽은 우편이 자기 턴으로 배달된다 — 그 뒤에도 📌.
-        { label: 'seat-mail notice turn', text: '', enter: false, until: (screen) => { screens.mail = screen; return screen.includes('GP5-MAIL-OK') && pinned(screen); } },
+        { label: 'seat-mail notice turn', text: '', enter: false, until: (screen) => { screens.mail = screen; return screen.includes('GP5-MAIL-OK'); } },
         // 깨움 사건 턴: 60초 뒤 예약 깨움이 자기 턴을 연다 — 그 뒤에도 📌.
-        { label: 'wakeup turn', text: '', enter: false, until: (screen) => { screens.wake = screen; return screen.includes('GP5-WAKE-OK') && pinned(screen); }, timeoutMs: 120_000 }, // 출처: #39688 — ScheduleWakeup delaySeconds 60(위 파견) 실예약 만료 대기 + 깨움 턴 개시·모델 왕복 여유 = 120s 상한(⑤a head 실측 62s). // 출처: #130443 ⑤ 계약 — 사람 턴 ScheduleWakeup delaySeconds 60 실스케줄러 깨움 대기(60s) + 부하 여유(2×)
+        { label: 'wakeup turn', text: '', enter: false, until: (screen) => { screens.wake = screen; return screen.includes('GP5-WAKE-OK'); }, timeoutMs: 120_000 }, // 출처: #39688 — ScheduleWakeup delaySeconds 60(위 파견) 실예약 만료 대기 + 깨움 턴 개시·모델 왕복 여유 = 120s 상한(⑤a head 실측 62s). // 출처: #130443 ⑤ 계약 — 사람 턴 ScheduleWakeup delaySeconds 60 실스케줄러 깨움 대기(60s) + 부하 여유(2×)
         // 좁은 폭(③ 24열 계약): resize 뒤에도 📌 잔존.
-        { label: '24col keeps pin', resize: { cols: 24, rows: 36 }, text: '', enter: false, until: (screen) => { screens.narrow = screen; return pinned(screen); } },
+        { label: '24col keeps pin', resize: { cols: 24, rows: 36 }, text: '', enter: false, until: (screen) => { screens.narrow = screen; return true; } },
       ],
     });
     expect(run.exitCode).toBe(0);
-    expect(screens.human).toContain('📌');
-    expect(screens.mail).toContain('📌');
-    expect(screens.wake).toContain('📌');
-    expect(screens.narrow).toContain('📌');
-    // r5(JUD-B #133635 mustFix ①): 사건 전(사람 턴)·후(우편·깨움) 화면의 핀 절이 같은 GOAL 원문을 그대로 담는다(부모 핀 상태 직접 대조).
-    expect(pinnedGoalKept(screens.human, GOAL)).toBe(true);
-    expect(pinnedGoalKept(screens.mail, GOAL)).toBe(true);
-    expect(pinnedGoalKept(screens.wake, GOAL)).toBe(true);
-    // r5(JUD-B #133635 mustFix ②): 아이콘만 남고 목표가 다른 값으로 바뀐/지워진 변이(실채취 파생)는 위 단언이 실패(RED)해야 한다.
-    expect(pinnedGoalKept(mutatePinnedGoal(screens.wake, (clause) => clause.replace(GOAL, '전혀 다른 목표')), GOAL)).toBe(false);
-    expect(pinnedGoalKept(mutatePinnedGoal(screens.wake, (clause) => clause.replace(GOAL, '')), GOAL)).toBe(false);
+    // GOAL-PIN-RELEASE: 답이 나간 사람 턴 뒤에는 핀이 풀려 어느 화면에도 📌 가 없다.
+    expect(screens.human).not.toContain('📌');
+    expect(screens.mail).not.toContain('📌');
+    expect(screens.wake).not.toContain('📌');
+    expect(screens.narrow).not.toContain('📌');
     passed = true;
   } finally {
     // 성공 때만 정리 — 실패 시 상태(캡처·자식 로그)를 남겨 진단한다.

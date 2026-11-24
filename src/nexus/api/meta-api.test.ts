@@ -18,7 +18,7 @@ import { createHitlPendingCallbacks } from './hitl-runtime.js';
 import * as hudWriter from './daemon-hud-writer.js';
 import type { DaemonToolDispatchCtx, DaemonToolSurface } from '../../boot/daemon-tools/types.js';
 import type { FeedbackEnvelope } from '../../feedback/envelope.js';
-import { handlePromptPost, handlePromptStreamPost } from './meta-api.js';
+import { handlePromptPost, handlePromptStreamPost, registerRelayHostChannelRequest } from './meta-api.js';
 
 afterEach(() => {
   mock.restore();
@@ -558,4 +558,52 @@ describe('POST /v1/prompt/stream turn-end provider tagging', () => {
       model: 'grok-4.6',
     });
   });
+});
+
+test('ReportPdf is exposed only to an allowlisted relay webchat member requesting a PDF', async () => {
+  const env = {
+    ELANOUS_REPORT_PDF_GCS_BUCKET: 'demo-pdf-test',
+    ELANOUS_REPORT_PDF_TEST_MEMBER_IDS: 'test-member',
+    GOOGLE_APPLICATION_CREDENTIALS: '/unused-demo-key',
+  };
+  const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, env);
+  try {
+    const observed: boolean[] = [];
+    spyOn(coreTurnModule, 'runCoreTurn').mockImplementation(async (ctx) => {
+      observed.push(ctx.tools.some((tool) => tool.name === 'ReportPdf'));
+      return { stopReason: 'end_turn', finalText: 'OK' };
+    });
+    const opts = { history: new DaemonSessionHistory(), bearerToken: 'test-owner-token', toolCwd: process.cwd() };
+    for (const [memberId, pinOwner, userText] of [
+      ['test-member', 'test-member', 'PDF로 만들어 줘'],
+      ['other', 'other', 'PDF로 만들어 줘'],
+      ['test-member', 'other', 'PDF로 만들어 줘'],
+      [undefined, undefined, 'PDF로 만들어 줘'],
+      ['test-member', 'test-member', '안녕하세요'],
+      ['test-member', 'test-member', 'PDF가 무엇인가요?'],
+      ['test-member', 'test-member', 'PDF로 만들어 줘. 공개하지 마.'],
+      ['test-member', 'test-member', 'Please create a PDF, but do not publish it.'],
+      ['test-member', 'test-member', 'Please create a PDF report.'],
+    ] as const) {
+      const request = new Request('https://demo.elanous.app/v1/prompt/stream', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...((!memberId || memberId !== pinOwner) ? { authorization: 'Bearer test-owner-token' } : {}),
+        },
+        body: JSON.stringify({ userText, sessionId: crypto.randomUUID() }),
+      });
+      if (pinOwner) registerRelayHostChannelRequest(request, pinOwner, memberId);
+      const response = await handlePromptStreamPost(request, opts);
+      expect(response.status).toBe(200);
+      await response.text();
+    }
+    expect(observed).toEqual([true, false, false, false, false, false, false, false, true]);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });

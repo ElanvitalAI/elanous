@@ -24,6 +24,7 @@ import { buildLedgerCitationRule, RESEARCH_SYNTHESIS_EVIDENCE_BUDGET_CHARS } fro
 import { isAuthRejectionError, streamLLMWithTools } from '../llm.js';
 import { drainPendingInterjections } from '../session/pending-input.js';
 import { drainMidTurnEvents } from '../session/mid-turn-events.js';
+import { queueNoticeHead } from '../chat/interjection.js';
 import type { LLMMessage, StreamWithToolsHandlers } from '../llm.js';
 import { debug, redactSecretText, withAmbientSessionScope } from '../debug/log.js';
 import { emitTurnLife } from '../debug/turn-life.js';
@@ -40,6 +41,7 @@ import {
 } from './research-route.js';
 import { CitationLedger, countVerifiedCitations, createCitationStreamFilter, sanitizeCitations } from './citation-guard.js';
 import { coreStopReasonFromProvider } from './provider-stop-reason.js';
+import { createToolBatchObserver } from './tool-batch-observation.js';
 import type { TurnNoProgressFire } from '../llm/turn-progress.js';
 import { TURN_STALL_DEFAULT_RECIPIENTS, createTurnStallReporter, defaultTurnStallMailer, type TurnStallMailer } from './turn-stall-report.js';
 import {
@@ -124,6 +126,18 @@ export function extractRecentUserText(
 /** Surface selection only accepts the dispatch-forwarded human prompt.
  * Unlike deferred preload, it must not reinterpret later machine-authored
  * user messages appended by the goal loop. */
+// RESEARCH-TURN-ON-SEAT-MAIL (11-24/25): a seat's turn is internal operations (mail, rails, PRs) — the web research
+// ladder only answered it with unrelated sources. The opt-in is the person's own explicit ask for research.
+const EXPLICIT_RESEARCH_REQUEST = /조사|검색|리서치|\bresearch\b|search the web|web search|look (?:it |this |that )?up online/iu;
+
+/** Why this turn skips the research ladder, or null: a queue notice (seat mail · capsule result) always skips;
+ *  a seat session skips unless the person's text explicitly asks for research. A missing seat identity = old route. */
+export function seatResearchSkipReason(userText: string | undefined, seat: string | null): 'queue-notice' | 'seat-session' | null {
+  if (userText && queueNoticeHead(userText) !== null) return 'queue-notice';
+  if (seat && !EXPLICIT_RESEARCH_REQUEST.test(userText ?? '')) return 'seat-session';
+  return null;
+}
+
 function selectSurfaceUserText(ctx: CoreTurnContext): string | undefined {
   return ctx.userText;
 }
@@ -482,6 +496,9 @@ export async function runCoreTurn(
 
     let accumulatedText = '';
     let dispatchCount = 0;
+    // ELN-GLM-TOOL-EFFICIENCY — 도구 수·실제 겹쳐 돈 수·같은 경로 재읽기를 구조 카운트로 모아 dispatch-summary 에 싣는다.
+    const toolBatch = createToolBatchObserver();
+    let resolvedModel: string | undefined;
     let finalPhaseAnswer = false;
     let enforceResearchToolAllowlist = false;
     let enforceResearchDocumentWrite = false;
@@ -582,6 +599,12 @@ export async function runCoreTurn(
       } catch {
         // Observability must not prevent the selected tool from dispatching.
       }
+      let endToolBatchObservation: (() => void) | undefined;
+      try {
+        endToolBatchObservation = toolBatch.start(name, args, c?.turnIndex);
+      } catch {
+        // Observability must not prevent the selected tool from dispatching.
+      }
       // OBSERVE-TURN-EVENT-LIFECYCLE — 캡슐 진입(Agent/Task=agent · mcp__=mcp · Bash/Shell/Terminal=bash · 나머지=other).
       try {
         emitTurnLife('turn-life:capsule-enter', {
@@ -634,6 +657,7 @@ export async function runCoreTurn(
         success = true;
         return result;
       } finally {
+        endToolBatchObservation?.();
         if (orderedLinearResearchWorkflow && name === 'elanous_linear_issue') releaseOrderedLinearResearch?.();
         if (name === 'Agent' && enforceResearchToolAllowlist) {
           debug.log('research.turn', 'subagent-completed', {
@@ -732,6 +756,8 @@ export async function runCoreTurn(
   // skipped, so the web chat (and any surface with web tools) answered «만들어 배포해줘» as research. Same verdict on
   // every surface: the pin decides first, like an obvious local command.
   const forcedRoutePin = resolveTurnRoutePin(surfaceUserText, ctx.tools)?.mode === 'force';
+  const seatSkip = options.researchRouteOverride === undefined ? seatResearchSkipReason(surfaceUserText, stallSeat) : null;
+  if (seatSkip) debug.log('research.turn', 'skipped-seat', { sessionId: ctx.sessionId, seat: stallSeat, reason: seatSkip });
   const routePrefilter = structuredRouteEligible
     ? obviousLocalCommand(surfaceUserText) ?? (forcedRoutePin ? 'route-pin-forced' as const : undefined)
     : undefined;
@@ -739,10 +765,10 @@ export async function runCoreTurn(
   const legacyResearchTurn = (legacyGroundingFirst || isResearchAgentIntent(surfaceUserText))
     && (!orderedNonResearchWorkflow || orderedLinearResearchWorkflow);
   // A legacy «agent research» turn keeps its provisional-first-pass mode; every other eligible turn is grounding-first.
-  const groundingFirstRouted = options.researchRouteOverride !== undefined ? false
+  const groundingFirstRouted = options.researchRouteOverride !== undefined || seatSkip ? false
     : structuredRouteEligible ? !routePrefilter && (legacyGroundingFirst || !legacyResearchTurn)
     : legacyGroundingFirst && !forcedRoutePin;
-  const researchTurnRouted = options.researchRouteOverride !== undefined ? false
+  const researchTurnRouted = options.researchRouteOverride !== undefined || seatSkip ? false
     : structuredRouteEligible ? !routePrefilter
     : legacyResearchTurn && !forcedRoutePin;
   if (routePrefilter) {
@@ -789,8 +815,8 @@ export async function runCoreTurn(
   // routing: it keeps its pre-1121 path instead of the structured research route.
   const skillRouted = structuredRouteEligible && (namedExecutableSkill || orderedLinearIssueStep);
   // The forced app pin decides on the skill-routed path too (#38215 REVIEW-2 ②): one verdict on every path.
-  const groundingFirst = skillRouted ? legacyGroundingFirst && !forcedRoutePin : groundingFirstRouted;
-  const researchTurn = skillRouted ? legacyResearchTurn && !forcedRoutePin : researchTurnRouted;
+  const groundingFirst = skillRouted ? legacyGroundingFirst && !forcedRoutePin && !seatSkip : groundingFirstRouted;
+  const researchTurn = skillRouted ? legacyResearchTurn && !forcedRoutePin && !seatSkip : researchTurnRouted;
   const explicitSkillToolRequest = namedExecutableSkill;
   // Privacy gate (review #38087 r1·r2 must-fix): a default entry is not a CONFIRMED entry. Until the plan's structured
   // route says entered, no external search carries this turn's text — no q0, no axis searches, no search/fetch tool in
@@ -1192,6 +1218,7 @@ export async function runCoreTurn(
         : ctx.modelOverride !== undefined ? { model: ctx.modelOverride } : {}),
       onResolvedProvider: (provider: string, model: string) => {
         lastResolvedProvider = provider;
+        resolvedModel = model;
         ctx.callbacks?.onResolvedProvider?.(provider, model);
       },
       onNoProgress: (fire: TurnNoProgressFire) => { stallReport.note(fire); },
@@ -1855,14 +1882,6 @@ export async function runCoreTurn(
           if (result?.ok) researchRunOutcome = 'completed';
         }
       }
-      try {
-        debug.log('core.turn', 'dispatch-summary', {
-          sessionId: ctx.sessionId,
-          dispatchCount,
-        });
-      } catch {
-        // Observability must not prevent a completed turn from returning.
-      }
       return {
         stopReason: coreStopReasonFromProvider(ctx.signal.aborted, providerFinishReason),
         finalText,
@@ -1884,6 +1903,20 @@ export async function runCoreTurn(
       }
       throw err;
     } finally {
+      // ELN-GLM-TOOL-EFFICIENCY — 턴 요약은 정상 마감·중단·오류 «모든» 출구에서 한 번 낸다(종전엔 정상 마감만).
+      //   값은 카운트뿐이다(도구 인자·경로·본문 0). 조회: elanous logs --category core.turn --event dispatch-summary --json
+      try {
+        debug.log('core.turn', 'dispatch-summary', {
+          sessionId: ctx.sessionId,
+          dispatchCount,
+          ...toolBatch.summary(),
+          ...(lastResolvedProvider !== null ? { provider: lastResolvedProvider } : {}),
+          ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
+          aborted: ctx.signal.aborted,
+        });
+      } catch {
+        // Observability must not prevent a completed turn from returning.
+      }
       if (ctx.signal.aborted) researchRunOutcome = 'failed';
       if (researchRunObserver) {
         if (researchSynthesisStarted) researchRunObserver.event({ type: 'exit', node: 'synthesis', outcome: researchSynthesisOutcome });

@@ -33,7 +33,7 @@ test('Next PTY shows measured tokens at normal and narrow widths and clears them
         ready: { label: 'boot', until: (screen) => screen.includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q quit') },
         steps: [
           // While the turn runs only the estimate shows (est.Nt); the measured 14/6 arrives with the completed turn.
-          { label: 'running', text: 'B3 measured prompt', until: (screen) => screen.includes('> B3 measured prompt')
+          { label: 'running', text: 'B3 measured prompt', until: (screen) => screen.includes('❯ B3 measured prompt')
             && screen.includes('est.') && !screen.includes('14/6') },
           { label: 'completed', until: (screen) => screen.includes('B3 measured reply') && screen.includes('● Turn done')
             && screen.includes('14/6t') },
@@ -75,7 +75,7 @@ test('Next PTY clears prior measured tokens on failed and cancelled turns in the
       steps: [
         { label: 'first-completed', text: 'B3 first', until: (screen) => screen.includes('B3 first reply') && screen.includes('14/6t') },
         { label: 'failed', text: 'B3 fail now', until: (screen) => screen.includes('● reply failed') && screen.includes('?/?t') },
-        { label: 'cancel-running', text: 'B3 cancel now', until: (screen) => screen.includes('> B3 cancel now') && screen.includes('Thinking') && !screen.includes('14/6') },
+        { label: 'cancel-running', text: 'B3 cancel now', until: (screen) => screen.includes('❯ B3 cancel now') && screen.includes('Thinking') && !screen.includes('14/6') },
         { label: 'cancelled', keys: '\x1b', until: (screen) => screen.includes('● Response cancelled') && !screen.includes('14/6') },
       ],
     });

@@ -9,7 +9,8 @@ import type { Command } from 'commander';
 import { registerRfcStatusCommand } from './rfc-status.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { relative, resolve } from 'node:path';
-import { knowledgeDbPath, openKnowledgeDb, hybridQueryKnowledge } from '../domains/knowledge.js';
+import { docsIndexCount, hybridQueryKnowledge, ingestDocsCorpus, knowledgeDbPath, openKnowledgeDb } from '../domains/knowledge.js';
+import { getUserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import { assessDeclaredRevision, assessDocsStaleness, assessOneDocStaleness, emptyBranchCounts, enrichDocStalenessHistory, formatDocStaleness, formatRemovedIdentifierHistory, STALE_SCORE_THRESHOLD, type DeclaredRevisionAssessment, type DocStaleness } from '../autopilot/discovery/doc-staleness.js';
@@ -90,12 +91,30 @@ export async function runDocsSearch(
   opts: { limit?: string; domain?: string; kind?: string; json?: boolean },
 ): Promise<number> {
   if (!query?.trim()) { console.error('elanous docs search: 질의가 필요합니다'); return 1; }
-  if (!existsSync(knowledgeDbPath())) {
-    console.error(`elanous docs search: knowledge.db 없음 (${knowledgeDbPath()}) — knowledge-ingest 가 한 번은 돌아야 합니다.`);
-    return 1;
-  }
+  // DOCS-SEARCH-INDEX-EMPTY — 색인 자가부트: db 없든 docs 색인 0이든 이 실행 안에서
+  // 1회 채운다. 뿌리 해석은 크론 knowledge-ingest 와 같은 ingestDocsCorpus(config
+  // knowledge.docsRoots 존중·현행 절 후보 포함). 그래도 0이면 기존 문구·rc 1 유지.
+  const dbMissing = !existsSync(knowledgeDbPath());
   const db = openKnowledgeDb();
   try {
+    if (docsIndexCount(db) === 0) {
+      const knowledgeCfg = (getUserConfig().raw.knowledge ?? {}) as { docsRoots?: unknown };
+      // 배열이면 빈 배열도 설정이다. undefined 로 바꾸면 자동 감지로 넘어간다.
+      const configuredRoots = Array.isArray(knowledgeCfg.docsRoots)
+        ? knowledgeCfg.docsRoots.filter((p): p is string => typeof p === 'string')
+        : undefined;
+      try {
+        await ingestDocsCorpus(db, {
+          ...(configuredRoots !== undefined ? { docsRoots: configuredRoots } : {}),
+          toolModuleUrl: import.meta.url,
+          toolDocsSegments: ['..', '..', 'docs'],
+        });
+      } catch { /* fail-soft — 임베딩 다운이면 색인 0으로 아래 판정이 기존 문구로 안내 */ }
+    }
+    if (dbMissing && docsIndexCount(db) === 0) {
+      console.error(`elanous docs search: knowledge.db 없음 (${knowledgeDbPath()}) — knowledge-ingest 가 한 번은 돌아야 합니다.`);
+      return 1;
+    }
     const k = Math.min(Math.max(Number(opts.limit ?? 8) || 8, 1), 20);
     const matches = await hybridQueryKnowledge(db, query.trim(), {
       k,

@@ -87,7 +87,9 @@ test('graph run: nodes inside the run tab, blocked node, harness under a node on
   r.tabs.end('grounding', true, '');
   r.tabs.progress('verify-repair', 'r6');
   r.tabs.status('materialize', 'blocked');
-  expect(r.stored().panes[0]!.scrollback).toBe('  ✅ grounding\n  🟢 verify-repair · r6\n  🟡 materialize · 승인 대기');
+  const text = r.stored().panes[0]!.scrollback;
+  expect(text.endsWith('\n\n  ✅ grounding\n  🟢 verify-repair · r6\n  🟡 materialize · 승인 대기')).toBe(true);
+  expect(text.split('\n')[1]).toBe('✓ grounding ═ ◐ verify-repair ─ ◐ materialize'); // graph-view edge line
   expect(r.stored().tabs).toHaveLength(1); // nodes are not tabs
   r.tabs.start({ id: 'h', ws: 'OP', source: 'harness', label: 'repair', parent: 'verify-repair' });
   r.aged();

@@ -143,6 +143,17 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     helpSummary: 'Combined usage and remaining quota',
   },
   {
+    id: 'autopilot',
+    action: 'command',
+    slash: ['/autopilot'],
+    slashPrefixes: ['/autopilot'],
+    phrases: [],
+    roles: ['human'],
+    minimumMaturity: 'stable',
+    requiredFlags: [],
+    helpSummary: 'Self-driving: on [goal] · off · resume · hold · goals',
+  },
+  {
     id: 'harness',
     action: 'command',
     branchModule: './branches/harness.js',

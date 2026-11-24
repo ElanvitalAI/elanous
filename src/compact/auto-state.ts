@@ -86,6 +86,28 @@ export function noOpBackoffHeld(sessionId: string, historyUsedTokens: number): b
   return typeof held === 'number' && historyUsedTokens < held * NO_OP_BACKOFF_GROWTH;
 }
 
+// ── ELN-COMPACT-EVERY-TURN — regrow hold after a compaction that fired ──
+//
+// A long seat's record keeps every person row verbatim (COMPACT P0), so one compaction cannot bring it under the
+// 16k trigger; the turn-start force then fired on EVERY turn (OP 11-24: record 58k→94k tokens, full input >60k)
+// and every summary rewrite broke the provider prompt cache at the head of the history (OP cache hit 54% vs
+// 81–88% on other terra seats). After a compaction fires, the next one waits until the record has regrown by
+// a full trigger's worth past the level the compaction left (hysteresis: the summary is a cache boundary).
+
+/** sessionId → record tokens right after the last compaction that fired. */
+const regrowHold = new Map<string, number>();
+
+/** Record the level a fired compaction left for this session. */
+export function recordCompactRegrowHold(sessionId: string, historyTokensAfter: number): void {
+  regrowHold.set(sessionId, historyTokensAfter);
+}
+
+/** True while the record has not regrown by `regrowTokens` past the last fired compaction's level. */
+export function compactRegrowHeld(sessionId: string, historyUsedTokens: number, regrowTokens: number): boolean {
+  const after = regrowHold.get(sessionId);
+  return typeof after === 'number' && historyUsedTokens < after + regrowTokens;
+}
+
 /** Test-only — also re-exported through `index.ts` for production
  *  callers that need to clear state between runs (multi-session
  *  CLI). */
@@ -95,4 +117,5 @@ export function resetAutoCompactStateForTest(): void {
   breakerReason = '';
   verifyProbeEnabled = false;
   noOpBackoff.clear();
+  regrowHold.clear();
 }

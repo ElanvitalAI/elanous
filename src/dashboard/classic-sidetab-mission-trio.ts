@@ -6,7 +6,7 @@ import { findGitDir } from '../git-fs/locate.js';
 import { runVisibleAgentMission, type VisibleMissionPty, type VisibleMissionResult } from '../sidetab-core/visible-agent-mission.js';
 import type { ClassicSidetabMissionDispatchContext, ClassicSidetabMissionPairSessionRegistry, ClassicSidetabMissionResult } from './classic-sidetab-mission.js';
 import { redactMissionResultPath } from './mission-cli-consumer.js';
-import type { ClassicMissionNotificationEnqueue } from './classic-sidetab-mission-job.js';
+import type { ClassicMissionNotificationEnqueue } from '../sidetab-core/classic-sidetab-mission-job.js';
 
 export type ClassicMissionAgent = 'codex' | 'claude' | 'grok';
 

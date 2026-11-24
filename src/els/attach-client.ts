@@ -8,7 +8,11 @@ import { elsSocketPathProblem } from './server.js';
 import { createLineDecoder } from './wire.js';
 import { AUTH_PANE_TOKEN_ENV, AUTH_OWNER_TOKEN_ENV } from './server-auth.js';
 
-export interface AttachFrame { readonly pane: string; readonly seq: number; readonly cols: number; readonly rows: number; readonly screen: string; /** Lines this frame is scrolled above the live bottom (0 = live). */ readonly back: number; /** ELS-WHEEL-SCROLLBACK (OP #136704): the pane tracks its own mouse on an alternate screen — a wheel there belongs to the pane program as bytes, not to the els scrollback (which is empty there). */ readonly wheelPassthrough?: boolean }
+import type { WheelRoute } from '../pty-shell/registry.js';
+
+const WHEEL_ROUTES: readonly string[] = ['mouse-sgr', 'mouse-x10', 'arrows', 'host'];
+const isWheelRoute = (value: unknown): value is WheelRoute => typeof value === 'string' && WHEEL_ROUTES.includes(value);
+export interface AttachFrame { readonly pane: string; readonly seq: number; readonly cols: number; readonly rows: number; readonly screen: string; /** Lines this frame is scrolled above the live bottom (0 = live). */ readonly back: number; /** ELS-WHEEL-SCROLLBACK (OP #136704): the pane tracks its own mouse on an alternate screen — a wheel there belongs to the pane program as bytes, not to the els scrollback (which is empty there). */ readonly wheelPassthrough?: boolean; /** ELS-WHEEL-HISTORY: where a wheel over the pane goes — absent = the els scrollback (host). */ readonly wheelRoute?: WheelRoute }
 
 export interface AttachHandlers {
   readonly onFrame: (frame: AttachFrame) => void;
@@ -78,7 +82,7 @@ export function attachEls(socketPath: string, pane: string, size: { cols: number
       // The assembler baseline is the same body the server diffs against — renderScreen's scroll header stripped —
       // so a diff row index after a scroll → live return addresses the row the server means (JUD #127758).
       assembled = value.screen.replace(/^\[screen \d+x\d+ scrolled-back=\d+\]\n/, '').split('\n');
-      handlers.onFrame({ pane: String(value.pane), seq: Number(value.seq), cols: Number(value.cols), rows: Number(value.rows), back: Number(value.back ?? 0), screen: value.screen, ...(value.wheelPassthrough === true ? { wheelPassthrough: true } : {}) });
+      handlers.onFrame({ pane: String(value.pane), seq: Number(value.seq), cols: Number(value.cols), rows: Number(value.rows), back: Number(value.back ?? 0), screen: value.screen, ...(value.wheelPassthrough === true ? { wheelPassthrough: true } : {}), ...(isWheelRoute(value.wheelRoute) ? { wheelRoute: value.wheelRoute } : {}) });
     } else if (value.type === 'frame-diff') {
       const count = Number(value.count);
       const rows = Array.isArray(value.lines) ? value.lines : [];
@@ -89,7 +93,7 @@ export function attachEls(socketPath: string, pane: string, size: { cols: number
         const t = (row as { t?: unknown }).t;
         if (Number.isInteger(i) && i >= 1 && i <= count && typeof t === 'string') assembled[i - 1] = t;
       }
-      handlers.onFrame({ pane: String(value.pane), seq: Number(value.seq), cols: Number(value.cols), rows: Number(value.rows), back: Number(value.back ?? 0), screen: assembled.join('\n'), ...(value.wheelPassthrough === true ? { wheelPassthrough: true } : {}) });
+      handlers.onFrame({ pane: String(value.pane), seq: Number(value.seq), cols: Number(value.cols), rows: Number(value.rows), back: Number(value.back ?? 0), screen: assembled.join('\n'), ...(value.wheelPassthrough === true ? { wheelPassthrough: true } : {}), ...(isWheelRoute(value.wheelRoute) ? { wheelRoute: value.wheelRoute } : {}) });
     } else if (value.type === 'focus' && typeof value.pane === 'string' && typeof value.id === 'string') {
       const id = value.id;
       handlers.onFocus?.(value.pane, accepted => write({ op: 'focus-ack', id, accepted }));

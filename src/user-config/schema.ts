@@ -33,6 +33,8 @@ export interface UserConfig {
   nexus?: { demoMode?: boolean; relay?: { enabled?: boolean; url?: string; identityFile?: string; memberNexusUrl?: string; memberKeyFile?: string } };
   /** Execution-phase HITL answer deadline; absent means 30 minutes. */
   hitl?: { executionDeadlineMinutes?: number };
+  /** Host-owned graph settings. vocabularyCatalog = absolute path of the reviewed capability vocabulary catalog; absent means <state>/graph/capability-vocabulary.json. */
+  graph?: { vocabularyCatalog?: string };
   /** Outbound notifications. quietHours is `off` or `HH:MM-HH:MM` KST; absent keeps 00:00-06:30. */
   outbound?: { deferredMaxAttempts?: number; quietHours?: 'off' | string };
   coo?: { linearProject?: string };

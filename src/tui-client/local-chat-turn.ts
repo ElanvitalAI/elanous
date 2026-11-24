@@ -26,7 +26,7 @@ import {
 import { answerHarnessAskUserCall, HARNESS_ASK_USER_IPC_ENV, isHarnessAskUserCall,
   isHarnessAskUserCancel, type HarnessAskUserCall } from './next-harness-ask-user.js';
 import { getSessionTierOverride } from '../model-tier/session-override.js';
-import { serializeTurnPayload, shouldReleasePinForGoalLoop, type GoalCompletionVia } from './local-chat-turn-goalpin-wire.js';
+import { serializeTurnPayload, shouldReleasePinForGoalLoop, shouldReleasePinAfterAnsweredTurn, type GoalCompletionVia } from './local-chat-turn-goalpin-wire.js';
 import { releasePinnedGoal, resolvePinnedObjective, sessionGoalPinStore } from '../core-turn/human-goal-pin.js';
 import { configForSessionProviderTurn, getSessionProvider, sessionProviderChildEnv } from './session-provider.js';
 import { existsSync, statSync } from 'node:fs';
@@ -938,6 +938,9 @@ export async function runLocalChatTurn(
     // SEAT-HUMAN-GOAL-PIN ④: child 의 완료 선언(update_goal complete)만 부모 핀을 해제한다 —
     // structured-final·상태질문 종결은 그 턴의 종결일 뿐 핀은 유지한다(OP #131052 · wire 계약).
     if (shouldReleasePinForGoalLoop({ stopReason: result.goalStopReason ?? '', completionVia: result.goalCompletionVia as GoalCompletionVia | undefined })) {
+      releasePinnedGoal(sessionId, sessionGoalPinStore());
+    } else if (shouldReleasePinAfterAnsweredTurn({ from, answered: firstAssistantTextMs !== null, goalStopReason: typeof result.goalStopReason === 'string' ? result.goalStopReason : undefined })) {
+      // GOAL-PIN-RELEASE: 답이 나간 사람 턴 + 활성 골 루프 없음 → 처리된 줄이 상태줄에 남지 않게 푼다.
       releasePinnedGoal(sessionId, sessionGoalPinStore());
     }
     return {

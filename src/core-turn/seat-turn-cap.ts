@@ -116,3 +116,15 @@ export const SEAT_IDLE_NO_WORK_NOTICE = (limit: number): string =>
 export const SEAT_TURN_CAP_CONTINUE_PROMPT =
   '앞 core 턴이 자리 턴 상한(도구 수 또는 벽시계)에 닿아 마감됐다. 위의 진행 요약을 이어받아 남은 일을 계속하라. '
   + '다 끝났으면 update_goal(status:"complete", evidence) 로 마감하라.';
+
+/** ELN-GLM-TOOL-EFFICIENCY(0.3.28) — 자리 모드(seatTurnCap 이 있는 goal loop)에만 싣는 도구 묶음 지침.
+ *  모델에게 주는 안내문일 뿐이다 — 어떤 동작도 이 문면을 읽거나 키워드로 판정하지 않는다(R-SIG).
+ *  실제 병렬 실행은 카탈로그 구조 필드 `supportsParallel`(src/session-runtime/parallel-dispatch.ts)이 정하고,
+ *  효과는 `core.turn` · `dispatch-summary` 의 parallelDispatchCount · repeatedReadCount 로 잰다. */
+export const SEAT_TOOL_BATCHING_GUIDELINE = [
+  '[seat tool batching]',
+  '- 서로 독립인 읽기(파일 읽기·검색·목록 조회)는 한 응답에 도구 호출 여러 개로 한꺼번에 낸다 — 읽기 전용 도구는 함께 실행된다.',
+  '- 이 턴에서 이미 읽은 파일은 다시 읽지 않는다. 그 뒤에 그 파일을 고쳤을 때만 다시 읽는다.',
+  '- cd 만 하는 셸 호출을 따로 내지 않는다 — 경로는 명령 안에 쓰거나 도구의 경로 인자로 준다.',
+  '- 쓰기(편집·파일 쓰기·셸 실행)는 앞 결과를 본 뒤 하나씩 낸다.',
+].join('\n');

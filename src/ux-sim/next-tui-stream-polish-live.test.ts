@@ -54,7 +54,7 @@ test('next TUI echoes a sent question before the delayed model and paints stream
           raw += chunk;
           // 11-23 next TUI: the submit clears the composer and the question is echoed as the transcript user row
           // «> STREAM-POLISH-ECHO …» (bold «>» between SGR codes), so match on the SGR-stripped stream.
-          if (echoAt === null && raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').includes('> STREAM-POLISH-ECHO')) echoAt = atMs;
+          if (echoAt === null && raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').includes('❯ STREAM-POLISH-ECHO')) echoAt = atMs;
         },
       });
       expect(receipt.exitCode).toBe(0);

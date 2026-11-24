@@ -9,6 +9,7 @@
 // ★ 소비자 — 미션(mission-critique re-export)·하니스(review-adapter)·CLI(elanous self review)·self-implementation.
 // 전부 순수(+ 주입 seam). I/O 없음(gh pr diff·streamLLM 은 호출측).
 
+import { isSecurityClass, type SecurityClass, type ReviewFollowUp } from './security-hold-policy.js';
 import type { ReferencedFileReader } from '../self-implement/goal-file-reader.js';
 import { capIntent, reviewIntentTruncationObservation } from './review-intent.js';
 import { debug } from '../debug/log.js';
@@ -73,6 +74,9 @@ function hasReauthorFuRecommendation(classification: ReauthorClassification): bo
 export interface ReviewResult {
   verdict: ReviewVerdict;
   mustFix: string[];
+  securityClass?: SecurityClass;
+  securityFindings?: Array<{ text: string; kind: 'security-only'; securityClass?: SecurityClass }>;
+  fu?: ReviewFollowUp[];
   shouldFix: string[];
   /** Diff로 검증할 수 없는 finding. MUST-FIX와 접을 때는 출력 상한 전에 전체를 비교한다. */
   unverified?: string[];
@@ -377,7 +381,7 @@ export function planReviewChunks(
  */
 export function foldReviewResults(
   results: readonly ReviewResult[],
-): Pick<ReviewResult, 'verdict' | 'mustFix' | 'shouldFix' | 'unverified' | 'scopeRevertDemoted' | 'requirements' | 'reviewed' | 'failureReason' | 'reviewerFallback' | 'reauthorClassifications'> {
+): Pick<ReviewResult, 'verdict' | 'mustFix' | 'shouldFix' | 'unverified' | 'scopeRevertDemoted' | 'requirements' | 'reviewed' | 'failureReason' | 'reviewerFallback' | 'reauthorClassifications' | 'securityClass' | 'securityFindings' | 'fu'> {
   const dedupe = (values: readonly string[]): string[] => [...new Set(values)];
   const collect = (pick: (r: ReviewResult) => readonly string[] | undefined): string[] =>
     dedupe(results.flatMap((r) => [...(pick(r) ?? [])]));
@@ -408,8 +412,19 @@ export function foldReviewResults(
     && !invalidReauthorFindings.has(candidate.finding)
     && candidateCounts.get(candidate.finding) === 1
     && (candidate.class === 'code-defect' || hasReauthorFuRecommendation(candidate)));
+  const securityComplete = results.filter(r => r.verdict === 'fail').every(r => {
+    const all = allMustFixByResult.get(r) ?? r.mustFix;
+    return all.length > 0 && all.length <= 6 && r.securityFindings?.length === all.length
+      && all.every(text => r.securityFindings?.filter(item => item.text === text).length === 1);
+  });
+  const securityFindings = securityComplete && allMustFix.length <= 6 ? results.flatMap(r => r.securityFindings ?? []) : [];
+  const classes = [...new Set(results.flatMap(r => r.securityClass ? [r.securityClass] : []))];
+  const fu = results.flatMap(r => r.fu ?? []);
   return {
     verdict,
+    ...(classes.length === 1 ? { securityClass: classes[0] } : {}),
+    ...(securityFindings.length ? { securityFindings } : {}),
+    ...(fu.length ? { fu } : {}),
     mustFix: boundedMustFix,
     shouldFix,
     ...(unverified.length ? { unverified } : {}),
@@ -730,6 +745,7 @@ export function buildReviewPrompt(
     '  - FAIL = blocker(s): incorrect, unmet acceptance, unwired code, dead/unused additions, Goodhart. Rework required.',
     '  - WARN = ships but has non-blocking concerns.',
     '  - PASS = correct and sound (a watch item is still fine).',
+    'For a security-only finding, add SECURITY-FINDINGS: and one line - <exact finding> | <securityClass or none>. Classes: destructive, secret-leak, unauth-remote, cross-user-data. Never label functional or mixed findings security-only; retain all functional blockers.',
     'Then optionally a line "MUST-FIX:" followed by blocker findings (one per line, "- " prefix),',
     'If there are no blockers, leave MUST-FIX empty; do not put “없음”, “결함 없음”, “none”, or any explanatory no-finding sentence in that list.',
     'then optionally a line "SHOULD-FIX:" followed by non-blocker findings ("- " prefix). Keep each finding one concise line.',
@@ -890,13 +906,19 @@ export function parseReviewResult(text: string, round?: number): ReviewResult {
   const requirements: string[] = [];
   const reauthorCandidates: ReauthorClassification[] = [];
   const reauthorRawLines: string[] = [];
+  const securityLines: string[] = [];
+  let securityClass: SecurityClass | undefined;
+  let securityClassLines = 0;
   let fallbackFinding: string | undefined;
   let droppedNonePlaceholders = 0;
-  let section: 'must' | 'should' | 'unverified' | 'requirements' | 'reauthor' | 'mockFirst' | null = null;
+  let section: 'must' | 'should' | 'unverified' | 'requirements' | 'reauthor' | 'mockFirst' | 'security' | null = null;
   const mockFirstClassifications: MockFirstFindingClassification[] = [];
   let mockFirstSectionSeen = false;
   let mockFirstMalformedClassificationCount = 0;
   for (const l of lines) {
+    const classMatch = /^securityClass:\s*(\S+)\s*$/i.exec(l);
+    if (classMatch) { securityClassLines++; if (isSecurityClass(classMatch[1])) securityClass = classMatch[1]; section = null; continue; }
+    if (/^SECURITY-FINDINGS:\s*$/i.test(l)) { section = 'security'; continue; }
     if (/^MUST-?FIX/i.test(l)) { section = 'must'; continue; }
     if (/^SHOULD-?FIX/i.test(l)) { section = 'should'; continue; }
     if (/^UNVERIFIED:\s*$/i.test(l)) { section = 'unverified'; continue; }
@@ -911,7 +933,8 @@ export function parseReviewResult(text: string, round?: number): ReviewResult {
     if (l.startsWith('- ')) {
       const f = l.slice(2).trim();
       if (!f) continue;
-      if (section === 'must') {
+      if (section === 'security') { securityLines.push(f); }
+      else if (section === 'must') {
         if (isNoneSentinelFinding(f)) droppedNonePlaceholders++;
         else mustFix.push(f);
       } else if (section === 'should') shouldFix.push(f);
@@ -1016,8 +1039,15 @@ export function parseReviewResult(text: string, round?: number): ReviewResult {
     return hasReauthorFuRecommendation(candidate);
   }) : [];
   const fallback = text.match(/\n\[reviewer fallback: ([^\r\n]+)\]$/);
+  const securityFindings = (mustFix.length > 6 || (securityClassLines > 0 && (securityClassLines !== 1 || !securityClass)) ? [] : securityLines).flatMap(line => {
+    const match = /^(.*?)\s+\|\s+(none|destructive|secret-leak|unauth-remote|cross-user-data)$/.exec(line);
+    if (!match || !mustFix.includes(match[1]!) || securityLines.filter(other => other.startsWith(match[1]! + ' | ')).length !== 1) return [];
+    return [{ text: match[1]!, kind: 'security-only' as const, ...(isSecurityClass(match[2]) ? { securityClass: match[2] } : {}) }];
+  });
   const result: ReviewResult = {
     verdict: finalVerdict,
+    ...(securityClassLines === 1 && securityClass ? { securityClass } : {}),
+    ...(securityFindings.length ? { securityFindings } : {}),
     mustFix: mustFix.slice(0, 6),
     shouldFix: shouldFix.slice(0, 6),
     ...(unverified.length ? { unverified } : {}),

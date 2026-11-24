@@ -13,12 +13,12 @@ test('graph-node liveness uses the last event at the 5 and 25 minute boundaries'
   tabs.start({ id: 'node', ws: 'W', source: 'graph-node', parent: 'run', label: 'verify' });
   tabs.progress('node', 'round 1');
   const line = () => tabs.tree('W').find(row => row.id === 'node')!.text;
-  now = 300_000; expect(line()).toBe('  ● verify · round 1');
-  now = 300_001; expect(line()).toBe('  ◐ verify · round 1');
-  now = 1_500_000; expect(line()).toBe('  ◐ verify · round 1');
-  now = 1_500_001; expect(line()).toBe('  ✕ verify · round 1');
+  now = 300_000; expect(line()).toBe('  🟢 verify · round 1');
+  now = 300_001; expect(line()).toBe('  ⏸ verify · round 1');
+  now = 1_500_000; expect(line()).toBe('  ⏸ verify · round 1');
+  now = 1_500_001; expect(line()).toBe('  🔴 verify · round 1');
   tabs.progress('node', 'round 2');
-  expect(line()).toBe('  ● verify · round 2');
+  expect(line()).toBe('  🟢 verify · round 2');
   tabs.end('node', true, 'done');
-  now += 1_800_000; expect(line()).toBe('  ✓ verify · done');
+  now += 1_800_000; expect(line()).toBe('  ✅ verify · done');
 });

@@ -15,6 +15,8 @@ test('capsule-events registers one default C1 and the other scenes with literal 
   expect(pack.scenarios).toEqual([{ id: 'SEAT-STEER-PREEMPT-137', module: 'src/ux-sim/sim-world/capsule-events/steer-preempt.ts' },
     { id: 'SEAT-CAPSULE-NO-REPEAT-REPORT', module: 'src/ux-sim/sim-world/capsule-events/c8-no-repeat.ts' },
     { id: 'C1', module: 'src/ux-sim/sim-world/capsule-events/scenarios.ts' },
+    { id: 'S3-AGENT', module: 'src/ux-sim/sim-world/capsule-events/s3-agent.ts' },
+    { id: 'S3-TURN', module: 'src/ux-sim/sim-world/capsule-events/s3-parent-turn.ts' },
     { id: 'C7', module: 'src/ux-sim/sim-world/capsule-events/c7-mcp.ts' },
     { id: 'C3', module: 'src/ux-sim/sim-world/capsule-events/c3-shell.ts' },
     { id: 'C3-TRIO', module: 'src/ux-sim/sim-world/capsule-events/c3-trio.ts' },
@@ -27,11 +29,17 @@ test('capsule-events registers one default C1 and the other scenes with literal 
     { id: 'C1-HARNESS', module: 'src/ux-sim/sim-world/capsule-events/c1-harness.ts' },
     { id: 'C9-SESSION-SCOPED', module: 'src/ux-sim/sim-world/capsule-events/c9-session-scoped.ts' }]);
   expect(simWorldScenarios.map(row => row.id)).toEqual(['C1', 'C5', 'C6']);
+  expect(table.entries['capsule-events/S3-AGENT']).toMatchObject({
+    expect: 'red', redReason: 'S3 production Agent boundary unmeasured',
+  });
+  expect(table.entries['capsule-events/S3-TURN']).toMatchObject({
+    expect: 'green', greenSince: '#38901 isolated mbp seed 1',
+  });
   expect(table.entries['capsule-events/C1']).toEqual({ expect: 'green',
-    reason: "C1 done-event wake axes (flag removed — capsule behavior always on, CAPSULE-FLAGS-REMOVE-DEFAULT): the background Agent end delivery passes here (exactly one wake turn within 20s, duplicates 0) and the harness child end frame is green in capsule-events/C1-HARNESS (B4/B5 queue-bridge); the mail axis keeps its own red row capsule-events/C1-MAIL",
+    reason: "C1 done-event wake axes (flag removed — capsule behavior always on, CAPSULE-FLAGS-REMOVE-DEFAULT): the background Agent end delivery passes here (exactly one wake turn after the 120s passive ripen — #39609, measured, not compressed #39666 — duplicates 0) and the harness child end frame is green in capsule-events/C1-HARNESS (B4/B5 queue-bridge); the mail axis keeps its own red row capsule-events/C1-MAIL",
     greenSince: '2026-11-21 pool4-capsule-c1-harness' });
   expect(table.entries['capsule-events/C1-HARNESS']).toEqual({ expect: 'green',
-    reason: "C1 harness child end axis (CAPSULE-B4-HARNESS-DONE-FRAME · B5 queue-bridge): a RunShell mode:'bg' harness child finishes while the seat is idle, its task-notification crosses as one capsule-done frame and opens exactly one next turn within 20s with duplicates 0 — self-implement-stop ('harness' kind) and graph frames remain unmeasured: sim probes at a 20s window (probe-c1-harness-selfimpl-221754) and a 60s window (probe-b-c1-harness-60s-223600) both record stopCount 0, so the axis stays unmeasured (JUD-B #122985)",
+    reason: "C1 harness child end axis (CAPSULE-B4-HARNESS-DONE-FRAME · B5 queue-bridge): a RunShell mode:'bg' harness child finishes while the seat is idle, its task-notification crosses as one capsule-done frame and opens exactly one next turn after the 120s passive ripen (#39609 — measured, not compressed, #39666) with duplicates 0 — self-implement-stop ('harness' kind) and graph frames remain unmeasured: sim probes at a 20s window (probe-c1-harness-selfimpl-221754) and a 60s window (probe-b-c1-harness-60s-223600) both record stopCount 0, so the axis stays unmeasured (JUD-B #122985)",
     greenSince: '2026-11-21 pool4-capsule-c1-harness' });
   expect(table.entries['capsule-events/C7']).toEqual({ expect: 'red',
     reason: 'C7 partial MCP axis; provider, harness, and deadline event remain unmeasured',

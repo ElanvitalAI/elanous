@@ -153,18 +153,21 @@ const m7: SimWorldScenario = {
   },
 };
 
-/** M6 · 10:22 HAND-ELN-ELS-API: the MsgAck tool moved the cursor but left no «seen» receipt (sender saw «unread»). Fixed by #38446. */
+/** M6 — MsgAck moves only the cursor; the answered turn records seen with its queue identity (#122460). */
 const m6: SimWorldScenario = {
   id: 'M6',
-  title: 'the MsgAck tool leaves a seen receipt on every acknowledged mail',
+  title: 'tool ack moves the cursor and the answered turn records seen',
   async run(ctx) {
     const u = seatUniverse(ctx);
     const ids = u.withStore((store) => [store.post({ from: 'OP', to: SEAT, body: 'a' }).id, store.post({ from: 'OP', to: SEAT, body: 'b' }).id]);
     await dispatchMsgAck({ to: SEAT, id: ids.at(-1)! }, { openStore: () => new MsgStore(u.msgPath) });
-    const seen = u.withStore((store) => ids.map((id) => store.listReceipts({ messageId: id }).some((row) => row.state === 'seen')));
-    ctx.recorder.event('m6-ack', { ids, seen });
-    if (seen.every(Boolean)) return { ok: true };
-    return fail('ack left no seen receipt', `seen per mail ${JSON.stringify(seen)} for ${JSON.stringify(ids)}`);
+    const before = u.withStore((store) => ({ cursor: store.getCursor(SEAT), seen: ids.map((id) => store.listReceipts({ messageId: id }).some((row) => row.state === 'seen')) }));
+    const receipts = createLedgerReceiptWriter(u.msgPath);
+    for (const id of ids) receipts.record({ messageId: id, recipient: SEAT, state: 'seen', queueItemId: `sim-m6-${id}` });
+    const seen = u.withStore((store) => ids.map((id) => store.listReceipts({ messageId: id }).some((row) => row.state === 'seen' && row.queueItemId === `sim-m6-${id}`)));
+    ctx.recorder.event('m6-ack', { ids, before, seen });
+    if (before.cursor === ids.at(-1) && before.seen.every(value => !value) && seen.every(Boolean)) return { ok: true };
+    return fail('ack or answered-turn receipt differs', `before ${JSON.stringify(before)} · seen ${JSON.stringify(seen)}`);
   },
 };
 
@@ -270,6 +273,7 @@ const m8: SimWorldScenario = {
     const replyBody = `battery policy summary for #${request.id}`;
     const offered: string[][] = [];
     let replyDispatched = false;
+    let researchRuns = 0;
     const replier: LLMProvider = {
       name: 'sim-seat-researcher', defaultModel: 'sim-seat-researcher-model', available: () => true,
       async *chat() { yield 'unused'; },
@@ -295,11 +299,11 @@ const m8: SimWorldScenario = {
           return dispatchMsgPost(args as Record<string, unknown>, { openStore: () => new MsgStore(u.msgPath) });
         },
         signal: new AbortController().signal, initialProvider: replier,
-      }, { runResearch: async () => ({ ok: true, output: 'research evidence' }), stallSeat: SEAT, stallMailer: async () => {} });
+      }, { runResearch: async () => { researchRuns++; return { ok: true, output: 'research evidence' }; }, stallSeat: SEAT, stallMailer: async () => {} });
     } finally { setUserConfigOverlay(previous); }
-    const rows = u.withStore((store) => store.db.query('SELECT sender, recipient FROM msg_messages WHERE body = ?').all(replyBody) as Array<{ sender: string; recipient: string }>);
-    ctx.recorder.event('m8-reply', { rows: rows.length, offered: offered[0] ?? [] });
-    if (rows.length === 1 && rows[0]!.recipient === 'MK') return { ok: true };
+    const rows = u.withStore((store) => store.list('MK').filter(row => row.body === replyBody));
+    ctx.recorder.event('m8-reply', { rows: rows.length, researchRuns, offered: offered[0] ?? [] });
+    if (researchRuns === 1 && rows.length === 1 && rows[0]!.from === SEAT && rows[0]!.to === 'MK' && rows[0]!.replyTo === request.id) return { ok: true };
     return fail('seat research turn could not reply', `reply rows ${JSON.stringify(rows)} · first tool set ${JSON.stringify(offered[0] ?? [])}`);
   },
 };

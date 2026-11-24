@@ -174,3 +174,47 @@ describe('next TUI × herdr prompt (L3)', () => {
     }
   }, 120_000);
 });
+
+test('real next TUI folds a 2000-character paste, deletes one chip, and submits original text', async () => {
+  expect(ptyAvailable()).toBe(true);
+  const iso = join(dir, 'paste-chip');
+  mkdirSync(iso, { recursive: true });
+  writeFileSync(join(iso, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+  const sessionsRoot = join(iso, 'sessions');
+  process.env.ELANOUS_STATE_DIR = iso;
+  process.env.ELANOUS_STATE_DIR_SOURCE = 'test';
+  process.env.ELANOUS_SESSION_ROOT = sessionsRoot;
+  const raw = Array.from({ length: 40 }, (_, i) => (i === 0 ? 'x'.repeat(50) : 'x'.repeat(49))).join('\n');
+  expect(raw.length).toBe(2000);
+  const pty = startPty({ cmd: process.execPath,
+    args: [join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs'), '--config-dir', iso, '--test-state-dir', iso, '--tui', 'next'],
+    cols: 80, rows: 24, workdir: iso, unsetEnv: PROVIDER_KEYS,
+    env: { ...credentialFreeEnv(), HOME: iso, TMPDIR: dir, ELANOUS_SKIP_LOGIN_ENV: '1', ELANOUS_STATE_DIR: iso,
+      ELANOUS_STATE_DIR_SOURCE: 'test', ELANOUS_SESSION_ROOT: sessionsRoot, ELANOUS_TEST_FAKE_LLM: '1',
+      ELANOUS_TEST_FAKE_LLM_RESPONSE: 'paste received' } });
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const waitFor = async (predicate: (screen: string) => boolean) => {
+    const deadline = Date.now() + 45_000;
+    let screen = '';
+    while (Date.now() < deadline) { screen = await pty.renderScreen(); if (predicate(screen)) return screen; await sleep(100); }
+    throw new Error(`PTY screen timeout: ${screen}`);
+  };
+  try {
+    await waitFor((s) => s.includes(NEXT_TUI_TITLE) && (s.includes('Ctrl+Q 종료') || s.includes('Ctrl+Q quit')));
+    pty.write(`\x1b[200~${raw}\x1b[201~`);
+    const first = await waitFor((s) => s.includes('[Paste #1 · +40 lines · full text]'));
+    expect(first).not.toContain('x'.repeat(50));
+    pty.write('\x7f');
+    await waitFor((s) => !s.includes('[Paste #1 · +40 lines · full text]'));
+    pty.write(`\x1b[200~${raw}\x1b[201~`);
+    await waitFor((s) => s.includes('[Paste #2 · +40 lines · full text]'));
+    pty.write('\r');
+    await waitFor((s) => s.includes('paste received'));
+    const id = getActiveSessionId() ?? '';
+    expect(loadSession(id)?.messages.filter((m) => m.role === 'user').map((m) => m.content)).toEqual([raw]);
+  } finally {
+    pty.write('\x11');
+    await sleep(300);
+    try { pty.kill(); } catch { /* already exited */ }
+  }
+}, 120_000);

@@ -527,6 +527,25 @@ export function registerChecklistReadCommands(
     const { version, codenames, json } = readChecklistContext(cmd);
     await checklistOutput(version, codenames, 'status', json, opts.owner);
   });
+  withContext(checklist.command('green-triage').description('🟡 칸 세 갈래(결정적 · 무 LLM · 무 네트워크): 병합+영수증=지금 판정 · 병합만=증거 생산 · 병합 PR 없음=공급'))
+    .action(async (_opts: unknown, cmd: Command) => {
+      const { version, json } = readChecklistContext(cmd);
+      const { readGreenTriageSources, renderGreenTriage, triageGreen } = await import('../release-loop/green-triage.js');
+      const snapshot = await readRemoteChecklist(version) ?? listChecklist(version);
+      const result = triageGreen(version, snapshot.items, readGreenTriageSources());
+      debug.log('release.checklist', 'green-triage', { version, ...result.counts });
+      if (json) { await writeStdoutJson(`${JSON.stringify(result)}\n`); return; }
+      console.log(renderGreenTriage(result));
+    });
+  withContext(checklist.command('load').description('자리별 작업 부하와 읽기 전용 배분 제안'))
+    .action(async (_opts: unknown, cmd: Command) => {
+      const { version, json } = readChecklistContext(cmd);
+      const { buildChecklistLoad, observeLoadPanes, renderChecklistLoad } = await import('../release-loop/checklist-load.js');
+      const snapshot = await readRemoteChecklist(version) ?? listChecklist(version);
+      const board = buildChecklistLoad(snapshot, await observeLoadPanes());
+      if (json) await writeStdoutJson(`${JSON.stringify(board)}\n`);
+      else console.log(renderChecklistLoad(board));
+    });
   withContext(checklist.command('stale-sweep').description('병합·열린 PR 경로로 노란 칸 상태를 읽기 전용 대조'))
     .action(async (_opts: unknown, cmd: Command) => {
       const { version, json } = readChecklistContext(cmd);

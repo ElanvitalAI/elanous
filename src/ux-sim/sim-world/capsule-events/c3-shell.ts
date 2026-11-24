@@ -5,6 +5,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { mockSeatPtySequence } from '../../mock-seat-pty-sequence.js';
+import { PASSIVE_RESULT_IDLE_WAKE_MS } from '../../../tui/core/queue.js';
 import type { SimWorldScenario } from '../types.js';
 
 /** Bash sleeps far past the 10s cap; the turn must settle before the shell ends. 출처: §3.6 C3 «idle 복귀 ≤ 20s». */
@@ -37,7 +38,7 @@ const c3Shell: SimWorldScenario = {
         ready: { label: 'boot', until: 'Ctrl+Q quit' },
         steps: [
           { label: 'parent settled', text: 'c3-parent', until: screen => /Turn done|○ done/.test(screen), timeoutMs: SETTLE_LIMIT_MS },
-          { label: 'completion triggers next turn', until: () => { settled = true; return delivered().length > 0; }, timeoutMs: (SHELL_SECONDS + 20) * 1000 },
+          { label: 'completion triggers next turn', until: () => { settled = true; return delivered().length > 0; }, timeoutMs: (SHELL_SECONDS + 20) * 1000 + PASSIVE_RESULT_IDLE_WAKE_MS }, // 완료 알림은 idle 120s passive ripen 뒤 깨움(#39609·#39666) — #39881 C1 줄포리, C3는 이전 예산 50s가 ripen 전 만료되어 N03 타임아웃.
           // A duplicate notice would arrive as a second request shortly after the first; watch a bounded window for it.
           { label: 'no duplicate delivery', until: () => { firstDeliveryAt ||= Date.now(); return Date.now() - firstDeliveryAt >= DUPLICATE_WINDOW_MS; },
             timeoutMs: DUPLICATE_WINDOW_MS + 5_000 },

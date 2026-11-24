@@ -51,7 +51,7 @@ test('TUI preamble directs capability discovery through ToolSearch without a rem
 test('research surface carries the current date and allows a full sourced report', () => {
   const baseConfig = configWithoutNativeStructureProviderLookup();
   const config = { ...baseConfig, chat: { ...baseConfig.chat, conciseness: {
-    enabled: true, finalMessageMaxLines: 10, preambleMaxWords: 12,
+    enabled: true, finalMessageMaxLines: 10,
   } } };
   const cwd = mkdtempSync(join(tmpdir(), 'research-preamble-'));
   try {

@@ -52,14 +52,14 @@ test('prefix keys: ctrl+b q detaches, ctrl+b ctrl+b is one literal ctrl+b, anoth
 });
 
 // ELS-MOUSE-REPORT (JUD #111411 ①): the app view must ASK the terminal for mouse reports, or the SGR click handling never fires.
-test('ENTER_VIEW switches to the alt screen and enables mouse reporting (1000 + SGR 1006); LEAVE_VIEW disables it in reverse and leaves the alt screen', () => {
-  expect(ENTER_VIEW).toBe('\u001b[?1049h\u001b[?1000h\u001b[?1006h\u001b[2J\u001b[H');
-  expect(LEAVE_VIEW).toBe('\u001b[?1006l\u001b[?1000l\u001b[?1049l');
+test('ENTER_VIEW switches to the alt screen and enables mouse reporting (1000 + SGR 1006) and bracketed paste (2004); LEAVE_VIEW disables it in reverse and leaves the alt screen', () => {
+  expect(ENTER_VIEW).toBe('\u001b[?1049h\u001b[?1000h\u001b[?1006h\u001b[?2004h\u001b[2J\u001b[H');
+  expect(LEAVE_VIEW).toBe('\u001b[?2004l\u001b[?1006l\u001b[?1000l\u001b[?1049l');
 });
 
-test('the single-pane attach view never enables mouse reporting (its stdin goes raw into the pane)', () => {
-  expect(ENTER_PANE_VIEW).toBe('\u001b[?1049h\u001b[2J\u001b[H');
-  expect(LEAVE_PANE_VIEW).toBe('\u001b[?1049l');
+test('the single-pane attach view enables mouse reporting (1000 + SGR 1006) so a wheel reaches it; the reports are routed, never typed raw', () => {
+  expect(ENTER_PANE_VIEW).toBe('\u001b[?1049h\u001b[?1000h\u001b[?1006h\u001b[2J\u001b[H');
+  expect(LEAVE_PANE_VIEW).toBe('\u001b[?1006l\u001b[?1000l\u001b[?1049l');
 });
 
 test('fitAnsi: colon-form SGR (underline style/colour) is an escape, OSC 8 links and other CSI cost no cells, an open style is closed at the cut', () => {

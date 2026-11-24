@@ -3,6 +3,7 @@ import * as childProcess from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { classifyDestructive } from '../../ask-user-question/guardian.js';
+import { relaxHold } from '../../shell-primitive/relax-hold.js';
 import { setShellApprover } from '../../shell-primitive/runtime.js';
 import { resetShellRunnerDeps, setShellRunnerDeps } from '../../shell-runner/dispatch.js';
 import { createFileCaptureEngine } from '../../shell-runner/file-engine.js';
@@ -19,6 +20,16 @@ const forbidden = [
   { name: 'force push', argv: ['git', 'push', '--force', 'origin', 'simulated'], bash: 'git push --force origin simulated' },
   { name: 'drop table', argv: ['sqlite3', ':memory:', 'DROP TABLE simulated'], bash: 'sqlite3 :memory: "DROP TABLE simulated"' },
 ];
+
+// 스폰 게이트는 argv[0]을 Bun.which로 절대경로 해상한 뒤 승인을 요청한다(#39630/#39782/#39813 스폰 승인 계약).
+// relax-hold 대군(data-store destruction 등)은 서명 그랜트 경로로만 승인되므로 그랜트 키가 없는 시험 호스트에서는
+// 승인 질의 없이 fail-closed 거부된다(node-b 프로브 실측: asked=[] · approvalKey 'runner:denied' · outcome 'denied').
+const spawnArgv = (row: { argv: string[] }): string[] => {
+  const bin = Bun.which(row.argv[0] ?? '');
+  return bin ? [bin, ...row.argv.slice(1)] : row.argv;
+};
+const askableArgv = (rows: typeof forbidden): string[][] =>
+  rows.filter(row => relaxHold(row.argv, '/tmp/guardian-simulated') === null).map(row => row.argv);
 
 function simulatedChild() {
   const child = new EventEmitter() as EventEmitter & {
@@ -45,7 +56,7 @@ test('TUI RunShell runner asks approval and spawns none of four forbidden effect
     const result = await runShellRuntime.run({ command: row.argv, mode: 'inline', approval: 'none' }, ctx);
     expect(result.outcome, row.name).toBe('denied');
   }
-  expect(asked).toEqual(forbidden.map(row => row.argv));
+  expect(asked).toEqual(askableArgv(forbidden));
   expect(actualSpawns).toEqual([]);
 });
 
@@ -85,7 +96,7 @@ test('background RunShell waits before spawn and an explicit approval resumes ex
   approve('allow-once');
   const result = await pending;
   expect(result.outcome).toBe('started');
-  expect(spawns).toEqual([forbidden[0]!.argv]);
+  expect(spawns).toEqual([spawnArgv(forbidden[0]!)]);
 });
 
 test('Bash waits before spawn and preserves ordinary execution', async () => {
@@ -125,7 +136,7 @@ test('Next TUI host approval is honored once at the actual runner boundary', asy
   expect(await invoke(false)).toMatchObject({ error: expect.stringContaining('denied') });
   expect(spawns).toEqual([]);
   expect(await invoke(true)).toMatchObject({ outcome: 'exit', exitCode: 0 });
-  expect(spawns).toEqual([command]);
+  expect(spawns).toEqual([spawnArgv(forbidden[0]!)]);
   expect(approvals).toBe(2);
 });
 

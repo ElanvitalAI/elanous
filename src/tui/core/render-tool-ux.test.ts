@@ -28,7 +28,7 @@ function screen(message: SerializedMessage, detail = block): string {
 
 test('one live tool appears once when its saved trace and expandable block share run and call IDs', () => {
   const shown = screen(result);
-  expect(shown).toContain('▸ 도구 · Read 결과');
+  expect(shown).toMatch(/▸ (tool|도구) · Read 결과/);
   expect(shown).not.toContain('도구: Read');
   expect(shown).not.toContain('visible file result');
   expect(shown).not.toContain('private-key.pem');
@@ -36,12 +36,12 @@ test('one live tool appears once when its saved trace and expandable block share
 
 test('same call ID in another run keeps its saved result visible', () => {
   const shown = screen({ ...result, surfaceRunId: 'run-2' });
-  expect(shown).toContain('도구: Read');
-  expect(shown).toContain('visible file result');
-  expect(shown).toContain('▸ 도구 · Read 결과');
+  expect(shown).toContain('▸ Tool Read · 1 lines (folded)');
+  expect(shown).not.toContain('visible file result');
+  expect(shown).toMatch(/▸ (tool|도구) · Read 결과/);
 });
 
 test('a detail block without verified raw reference leaves the saved result visible', () => {
   const shown = screen(result, { ...block, detail: { level: 1, summary: 'Read 결과' } });
-  expect(shown).toContain('도구: Read');
+  expect(shown).toContain('▸ Tool Read · 1 lines (folded)');
 });

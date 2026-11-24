@@ -22,7 +22,7 @@ test('one goal with two marked interim iterations and a final result uses the ne
   expect([plan.get(2)?.kind, plan.get(3)?.kind, plan.get(4)]).toEqual(['folded', 'folded', undefined]);
   const lines = logViewLines(messages, 100).filter(Boolean);
   // Dark token: grey 235 band, grey 252 text (literal — rule 11).
-  const band = '\u001b[48;5;235;38;5;252m\u001b[1m>\u001b[22m n8n 영상 만들기' + ' '.repeat(83) + '\u001b[0m';
+  const band = '\u001b[48;5;235;38;5;252m\u001b[1m❯\u001b[22m n8n 영상 만들기' + ' '.repeat(83) + '\u001b[0m';
   expect(lines).toEqual([
     band, 'Tool: ScheduleWakeup 예약됨',
     '  · in progress — 1단계 렌더했습니다. (folded)',

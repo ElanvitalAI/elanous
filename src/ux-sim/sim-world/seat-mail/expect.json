@@ -33,7 +33,7 @@
     },
     "seat-mail/M6": {
       "expect": "green",
-      "reason": "ELN-SEAT-LIVE 11-18 10:22 HAND-ELN-ELS-API · fixed by #38446 (MERGED) · regression lock",
+      "reason": "MsgAck only advances cursor; the answered turn writes queue-bound seen (#122460)",
       "greenSince": "2026-11-18"
     },
     "seat-mail/M7": {

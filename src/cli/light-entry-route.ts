@@ -89,7 +89,7 @@ export function selectLightCliRoute(args: readonly string[]): LightCliRoute | un
   if (command[0] === 'release' && command[1] === 'checklist' && command[2] === 'set') return 'release-set';
   if (command[0] === 'release' && command[1] === 'checklist' && command[2] === 'landed-but-yellow') return 'release-landed';
   if (command[0] === 'release' && command[1] === 'checklist'
-    && (command[2] === 'status' || command[2] === 'list')) return 'release';
+    && (command[2] === 'status' || command[2] === 'list' || command[2] === 'load')) return 'release';
   // CLI-ENTRY-LAZY — list·show 는 그 둘만 등록한다(tasks-read-cli.ts · board·shadow·mission 클러스터 0).
   if (command[0] === 'tasks' && command[1] === 'advance') return 'tasks-advance';
   if (command[0] === 'tasks' && (command[1] === 'list' || command[1] === 'show')) return 'tasks-read';

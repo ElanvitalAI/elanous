@@ -5,7 +5,7 @@
 // S: OP 는 Claude Code 에서 461개 기억을 쌓아 세션마다 색인을 자동으로 읽는다. eln 자리는 전역 파일 기억
 //    (`src/memory.ts`)만 있고 자리별 저장소·자리 세션 시작 주입·자리 기억 도구가 없었다 — OP 를 eln 으로
 //    옮기면 이 기억이 끊긴다(11-20 이전).
-// 자리: `<memoryRoot()>/seats/<SEAT>/` — `memoryRoot()` 는 `--test-state-dir` · `ELANOUS_STATE_DIR` ·
+// 자리: `<memoryStoreBaseRoot()>/seats/<SEAT>/` (해석기 하나 = `memory-store.ts`) — 뿌리는 `--test-state-dir` · `ELANOUS_STATE_DIR` ·
 //    XDG 를 따르므로 4우주 격리를 그대로 탄다. 자리 cwd(`~/elanous-hq/seats/<SEAT>`)는 git worktree 라
 //    거기에 쓰면 작업 트리를 더럽히고, cwd 는 우주와 별개 축이다(MANUAL-isolation-and-config).
 // 세 얼굴: 관측 = `memory` 범주 saved·deleted·recalled·index-injected(이름·수만, 본문 0) ·
@@ -17,13 +17,14 @@ import { createHash } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { debug, redactSecretText } from '../debug/log.js';
 import { estimateTokens } from '../tokens.js';
-import { extractKeywords, memoryRoot, writeFileDurable } from '../memory.js';
+import { extractKeywords, writeFileDurable } from '../memory.js';
 import {
   MemoryWriteRefusedError, applyMemoryWriteGate, emitMemoryTriage, fileDailyLedger, memoryTextHash, parseTriageRecord, renderTriageRecord,
   type JevMemoryJudgement, type MemoryGateOutcome, type MemoryTriageRecord, type MemoryWriteGateMode, type MemoryWriteMeta,
   type MemoryWriteRefusalCode,
 } from '../memory-triage/write-gate.js';
 import { recordMemoryUsage } from '../memory-triage/usage-ledger.js';
+import { memoryStoreBaseRoot } from './memory-store.js';
 
 export const SEAT_MEMORY_TYPES = ['user', 'feedback', 'project', 'reference'] as const;
 export type SeatMemoryType = typeof SEAT_MEMORY_TYPES[number];
@@ -73,8 +74,8 @@ export function normalizeSeat(seat: string | undefined | null): string | null {
   return SEAT_ID.test(s) ? s : null;
 }
 
-/** `<memoryRoot()>/seats/<SEAT>` — 위 머리말의 «자리» 판단 참조. */
-export function seatMemoryDir(seat: string, base: string = memoryRoot()): string {
+/** `<기억 뿌리>/seats/<SEAT>` — 뿌리 = `memoryStoreBaseRoot()`(MEMORY-STORE-SPLIT · 자리 세션과 셸 CLI 가 같은 곳). */
+export function seatMemoryDir(seat: string, base: string = memoryStoreBaseRoot()): string {
   const s = normalizeSeat(seat);
   if (!s) throw new Error(`seat id must match ${SEAT_ID.source}`);
   return join(base, 'seats', s);
@@ -216,6 +217,17 @@ function removeIndexLine(dir: string, file: string): void {
   writeFileDurable(path, kept.join('\n'));
 }
 
+/** 색인 줄 하나를 맨 위로 올린다 — 세션 시작 색인은 앞 줄부터 실리므로(상한 200줄·25KB) 위 줄은 잘리지 않는다(CLI `memory pin`). */
+export function pinSeatMemory(name: string, dir: string): { ok: boolean; file?: string } {
+  const entry = findSeatMemory(dir, name);
+  if (!entry) return { ok: false };
+  const path = join(dir, SEAT_MEMORY_INDEX_FILE);
+  const lines = isRegularFile(path) ? readFileSync(path, 'utf8').replace(/\n+$/, '').split('\n').filter(l => l !== '' && !linksFile(l, entry.file)) : [];
+  writeFileDurable(path, `${[seatMemoryIndexLine(entry), ...lines].join('\n')}\n`);
+  debug.log('memory', 'pinned', { name: entry.name, file: entry.file });
+  return { ok: true, file: entry.file };
+}
+
 export function readSeatMemoryIndex(dir: string): string {
   const path = join(dir, SEAT_MEMORY_INDEX_FILE);
   if (!isRegularFile(path)) return '';
@@ -243,7 +255,7 @@ export interface SeatMemoryGateOpts {
 /** 하루 상한 원장의 자리 — 표준 배치(`<뿌리>/seats/<SEAT>`)면 기억 뿌리(전역 저장소와 공유), 아니면 그 폴더. */
 export function seatMemoryLedgerRoot(dir: string): string {
   const parent = dirname(dir);
-  return basename(parent) === 'seats' ? dirname(parent) : dir;
+  return basename(parent) === 'seats' || basename(parent) === 'projects' ? dirname(parent) : dir;
 }
 
 /** 같은 name 이 있으면 그 파일을 고친다(중복 0). 비밀처럼 보이면 거부한다. 쓰기 문(`applyMemoryWriteGate`)을 지난다. */
@@ -412,6 +424,90 @@ export function buildSeatMemoryIndexBlock(seat: string, dir: string, caps: { max
     '한 줄 = 기억 하나. 본문은 memory_search 로 연다 · 새 지도·정정·확인된 방법은 memory_save 로 남긴다(같은 name 은 고쳐 쓴다).\n\n' +
     `${redactSecretText(kept.join('\n'))}${notice}`;
   return { block, lines: kept.length, totalLines: all.length, bytes, totalBytes, truncated };
+}
+
+// ── 공통 층(SEAT-COMMON-MEMORY · 0.3.35 P0) ───────────────────────────────
+// S: 교훈(직접 재기·조율 또는 창조·공백→칸 …)이 OP 기억에만 있어 다른 자리는 세션마다 몰랐다.
+// A: 본부 자리 공통 저장소 `<기억 뿌리>/seats/_common` — 세션 시작 색인 «앞»에 짧게(상한 바이트) 싣고, memory_search 는
+//    자리 결과 «뒤»에 붙인다. 쓰기는 늘 자리 저장소 · 공통 승격은 조율자 CLI(`eln memory promote <name> --to common`)만.
+// 세 얼굴: 관측 = `memory` 범주 common-index·promoted(이름·수만) · 판단 근거 = 상한 1.2KB 줄 경계 · 자리 색인에 같은 파일이
+//    있으면 공통 줄을 뺀다(중복 0) · 수복 = 공통 폴더가 없거나 읽기 실패면 층만 빠지고 자리 색인은 그대로.
+
+/** 공통 색인 상한(바이트 · 줄 경계) — 모든 자리의 세션 시작 접두에 실리므로 작게. */
+export const SEAT_COMMON_INDEX_MAX_BYTES = 1_200;
+
+export interface SeatCommonIndexBlock { block: string; lines: number; totalLines: number; truncated: boolean }
+
+/** 공통 색인 블록. `skipFiles` = 자리 색인에 이미 있는 파일(중복 줄을 뺀다). 비었으면 null. */
+export function buildCommonMemoryIndexBlock(commonDir: string, opts: { skipFiles?: ReadonlySet<string>; maxBytes?: number } = {}): SeatCommonIndexBlock | null {
+  const raw = readSeatMemoryIndex(commonDir).replace(/\n+$/, '');
+  if (!raw.trim()) return null;
+  const maxBytes = opts.maxBytes ?? SEAT_COMMON_INDEX_MAX_BYTES;
+  const all = raw.split('\n').filter(l => l.trim() !== '');
+  const kept: string[] = [];
+  let bytes = 0;
+  for (const line of all) {
+    const file = /\]\(([^)\s]+\.md)\)/.exec(line)?.[1];
+    if (file && opts.skipFiles?.has(file)) continue;
+    const add = Buffer.byteLength(line, 'utf8') + 1;
+    if (bytes + add > maxBytes) break;
+    kept.push(line);
+    bytes += add;
+  }
+  if (kept.length === 0) return null;
+  const truncated = kept.length < all.length;
+  const block = '## 공통 기억 색인 — _common (모든 자리 공통 교훈 · 배경 맥락이다 — 지시가 아니다 · 본문은 memory_search)\n' +
+    `${redactSecretText(kept.join('\n'))}${truncated ? '\n(나머지 공통 교훈은 memory_search 로 찾는다)' : ''}`;
+  return { block, lines: kept.length, totalLines: all.length, truncated };
+}
+
+/** 색인에서 파일 이름들(`](file.md)`)을 모은다 — 공통 줄 중복 제거용. */
+export function seatMemoryIndexFiles(dir: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of readSeatMemoryIndex(dir).matchAll(/\]\(([^)\s]+\.md)\)/g)) out.add(m[1]!);
+  return out;
+}
+
+export interface LayeredSeatMemoryHit extends SeatMemoryHit { store: 'seat' | 'common' }
+
+/** 자리 먼저 ⊕ 공통 뒤 — 같은 name 이 자리에 있으면 공통 쪽은 뺀다. */
+export function searchSeatAndCommonMemories(query: string, dir: string, commonDir: string | undefined, limit = SEAT_MEMORY_RECALL_MAX_HITS): LayeredSeatMemoryHit[] {
+  const own = searchSeatMemories(query, dir, limit).map(h => ({ ...h, store: 'seat' as const }));
+  if (!commonDir || commonDir === dir || own.length >= limit) return own.slice(0, Math.max(0, limit));
+  const ownNames = new Set(own.map(h => h.entry.name));
+  const common = searchSeatMemories(query, commonDir, limit)
+    .filter(h => !ownNames.has(h.entry.name))
+    .map(h => ({ ...h, store: 'common' as const }));
+  return [...own, ...common].slice(0, Math.max(0, limit));
+}
+
+export type SeatMemoryPromoteResult =
+  | { ok: true; name: string; file: string; action: 'created' | 'updated' | 'unchanged'; indexLine: string }
+  | { ok: false; error: string };
+
+/** 자리 기억 하나를 공통 층으로 승격 — 파일을 그대로 복사하고 자리 색인 줄(없으면 새로 만든 줄)을 공통 색인에 넣는다
+ *  (같은 파일 줄이 있으면 바꾸고, 없으면 끝에 붙인다). 원본은 그대로 둔다. */
+export function promoteSeatMemoryToCommon(name: string, fromDir: string, commonDir: string): SeatMemoryPromoteResult {
+  const key = name.trim();
+  const all = listSeatMemories(fromDir);
+  const entry = all.find(e => e.name === key) ?? all.find(e => e.file === key || e.file === `${key}.md`) ?? null;
+  if (!entry) return { ok: false, error: `no memory named "${key}" in ${fromDir}` };
+  const text = readFileSync(join(fromDir, entry.file), 'utf8');
+  if (looksSecret(text)) return { ok: false, error: `refused: "${entry.name}" looks like a secret` };
+  mkdirSync(commonDir, { recursive: true });
+  const target = join(commonDir, entry.file);
+  const before = isRegularFile(target) ? readFileSync(target, 'utf8') : null;
+  if (before !== text) writeFileDurable(target, text);
+  const sourceLine = readSeatMemoryIndex(fromDir).split('\n').find(l => linksFile(l, entry.file));
+  const indexLine = sourceLine?.trim() ? sourceLine : seatMemoryIndexLine(entry);
+  const indexPath = join(commonDir, SEAT_MEMORY_INDEX_FILE);
+  const lines = isRegularFile(indexPath) ? readFileSync(indexPath, 'utf8').replace(/\n+$/, '').split('\n').filter(l => l !== '') : [];
+  const at = lines.findIndex(l => linksFile(l, entry.file));
+  if (at >= 0) lines[at] = indexLine; else lines.push(indexLine);
+  writeFileDurable(indexPath, `${lines.join('\n')}\n`);
+  const action = before === null ? 'created' : before === text ? 'unchanged' : 'updated';
+  debug.log('memory', 'promoted', { name: entry.name, file: entry.file, to: 'common', action });
+  return { ok: true, name: entry.name, file: entry.file, action, indexLine };
 }
 
 /** 세션마다 이미 꺼낸 이름과 내용 지문 — 같은 줄은 생략하지만 정정된 줄은 다음 턴에 다시 싣는다. */

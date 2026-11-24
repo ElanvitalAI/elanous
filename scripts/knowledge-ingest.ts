@@ -7,13 +7,11 @@
 // cron: 45 20 * * * (KST — 주간증류 20:00 · 주간알파 20:30 뒤)
 // 사용: bun scripts/knowledge-ingest.ts [--stats]
 
-import { openKnowledgeDb, ingestKnowledge, ingestDocsDir, pruneKnowledge, knowledgeStats, backfillDocsFts } from '../src/domains/knowledge.js';
+import { openKnowledgeDb, ingestKnowledge, ingestDocsCorpus, pruneKnowledge, knowledgeStats, backfillDocsFts } from '../src/domains/knowledge.js';
 import { openSurfaceEventsDb, applyMemoryDecay, pruneStaleEvents, surfaceEventsDbPath } from '../src/domains/surface-events.js';
 import { archiveColdEvents } from '../src/domains/memory-archive.js';
 import { consolidateEpisodes, promoteSessionRecaps } from '../src/domains/memory-consolidate.js';
 import { existsSync } from 'node:fs';
-import { debug } from '../src/debug/log.js';
-import { resolveKnowledgeDocsRoots } from '../src/knowledge/docs-roots.js';
 import { getUserConfig } from '../src/user-config.js';
 
 // 07-07 관찰 수리: homebrew/bun 주입만으론 부족(node=nvm 전용) — nvm bin 동적 주입.
@@ -40,43 +38,20 @@ try { kpruned = pruneKnowledge(db); } catch { /* fail-soft */ }
 //   벡터화(domain=elanous). elanous 가 "내가 뭘 구현했나"를 self_recall 벡터 층으로 회상.
 //   DocOps P0(2026-07-13): mtime 증분(무변경=stat만·수정=구청크 교체·living doc 갱신
 //   반영) + doc-lint taxonomy와 재귀 inventory를 재사용해 canonical 문서 전체를 합류한다.
-const docs = { files: 0, chunks: 0, skipped: 0, unchanged: 0, refreshed: 0 };
+//   DOCS-SEARCH-INDEX-EMPTY: 뿌리 해석+순회+per-root debug.log 를 ingestDocsCorpus 가
+//   책임진다 — 크론과 docs search 색인 자가부트가 같은 해석을 공유한다(현행 절 후보 포함).
 const knowledgeCfg = (getUserConfig().raw.knowledge ?? {}) as { docsRoots?: unknown };
 // 배열이면 빈 배열도 설정이다. undefined 로 바꾸면 자동 감지로 넘어간다.
 const configuredRoots = Array.isArray(knowledgeCfg.docsRoots)
   ? knowledgeCfg.docsRoots.filter((p): p is string => typeof p === 'string')
   : undefined;
-const resolvedDocs = resolveKnowledgeDocsRoots({
+const docs = await ingestDocsCorpus(db, {
   docsRoots: configuredRoots,
   toolModuleUrl: import.meta.url,
   toolDocsSegments: ['..', 'docs'],
 });
-if (resolvedDocs.roots.length === 0) {
-  debug.log('knowledge.ingest', 'docs-root', { source: resolvedDocs.source, roots: 0 });
-}
-for (const root of resolvedDocs.roots) {
-  try {
-    const r = await ingestDocsDir(db, { domain: 'elanous', dir: root.path });
-    docs.files += r.files; docs.chunks += r.chunks; docs.skipped += r.skipped;
-    docs.unchanged += r.unchanged; docs.refreshed += r.refreshed;
-    debug.log('knowledge.ingest', 'docs-root', {
-      path: root.path,
-      source: root.source,
-      files: r.files,
-      chunks: r.chunks,
-      skipped: r.skipped,
-      unchanged: r.unchanged,
-      refreshed: r.refreshed,
-    });
-  } catch (err) {
-    debug.log('knowledge.ingest', 'docs-root', {
-      path: root.path,
-      source: root.source,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-}
 const st = knowledgeStats(db);
+const docsIndexed = st.byKind.find((k) => k.kind === 'docs')?.n ?? 0;
 db.close();
 
 // ★ M1 graded decay(2026-07-08) — 먼저 stability 기반 tier 강등(삭제 아님·흐려짐만),
@@ -104,5 +79,6 @@ console.log([
   `신규: 신호 ${counts.signals} · 디깅 ${counts.digs} · 알파 ${counts.alpha} · 발송 ${counts.outbound} · 문서 ${docs.chunks}청크(${docs.files}파일·갱신 ${docs.refreshed}·무변경 ${docs.unchanged})` +
     (counts.skipped || docs.skipped ? ` · 실패skip ${counts.skipped + docs.skipped}(다음 주기 재시도)` : ''),
   `누적: 총 ${st.total}건 — ${st.byKind.map(k => `${k.kind} ${k.n}`).join(' · ')}${kpruned ? ` · M5정리 ${kpruned}건` : ''}`,
+  `색인 문서 ${docsIndexed}건 — docs search 하이브리드 검색의 docs 코퍼스(kind=docs)`,
   `기억 계층(M1-M4): hot ${decay.hot} · warm ${decay.warm} · cold ${decay.cold}(강등 ${decay.changed}) · 세션recap ${recap.sessions}(${recap.promoted}턴) · 압축 ${cons.consolidated}→${cons.groups}umbrella · S3이관 ${arch.archived}${arch.skipped ? `(skip ${arch.skipped})` : ''} · 하드망각 ${pruned}건`,
 ].join('\n'));

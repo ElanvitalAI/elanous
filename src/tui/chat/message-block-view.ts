@@ -108,8 +108,11 @@ export function messageBlockDetailLines(
     ...raw.split(/\r?\n/).flatMap((line) => wrapRawLine(safeLogText(line), columns))];
 }
 
-/** Enter advances one available tier; after the last tier, the block folds back to L0. */
+/** Tool calls toggle raw detail; other blocks advance through tiers before folding. */
 export function nextMessageBlockDetailLevel(block: MessageBlock, current: TuiDetailLevel): TuiDetailLevel {
   const max = block.detail?.level ?? 1;
+  // Tool calls are an inspect/fold control: one click or key reveals the actual
+  // arguments and result, rather than making the user traverse intermediate tiers.
+  if (block.body.kind === 'tool-call' && max >= 3 && block.detail?.rawRef) return current === 0 ? 3 : 0;
   return current >= max ? 0 : (current + 1) as TuiDetailLevel;
 }

@@ -57,3 +57,19 @@ test('a failed extension does not cache partial graph or change a prior receipt'
   fail = false;
   expect(gateFileReceiptIdentityFromClosure(tree, 'src/b.test.ts', image)).not.toBeNull();
 });
+
+test('receipt identities reuse hashes for shared immutable inputs and isolate different trees', () => {
+  const reads: string[] = [];
+  const tree: ClosureTree = { files, preload: [], read: path => { reads.push(path); return source.get(path); } };
+  const image = `sha256:${'a'.repeat(64)}`;
+  const first = gateFileReceiptIdentityFromClosure(tree, 'src/a.test.ts', image)!;
+  const count = reads.filter(path => path === 'src/shared.ts').length;
+  const second = gateFileReceiptIdentityFromClosure(tree, 'src/b.test.ts', image)!;
+  expect(reads.filter(path => path === 'src/shared.ts')).toHaveLength(count);
+  expect(second.contentHashes['src/shared.ts']).toBe(first.contentHashes['src/shared.ts']);
+  const changed = new Map(source);
+  changed.set('src/shared.ts', 'export const a = 123;');
+  const other: ClosureTree = { files, preload: [], read: path => changed.get(path) };
+  expect(gateFileReceiptIdentityFromClosure(other, 'src/a.test.ts', image)!.contentHashes['src/shared.ts'])
+    .not.toBe(first.contentHashes['src/shared.ts']);
+});

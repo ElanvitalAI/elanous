@@ -412,6 +412,29 @@ export function registerControlCommands(program: Command): void {
 
   const resources = program.command('resources').description('관제부 자원 조회');
   registerResourceLedgerCommands(resources);
+  const cloud = resources.command('cloud').description('현재 계정의 클라우드 VM 조회 (읽기 전용)');
+  cloud.command('list').option('--json').action(async (options: { json?: boolean }) => {
+      const { cloudHostInventory } = await import('../fleet/cloud-host-inventory.js');
+      const snapshot = await cloudHostInventory();
+      if (options.json) console.log(JSON.stringify(snapshot));
+      else {
+        for (const row of snapshot.hosts) console.log(`${row.provider} ${row.name} ${row.id} ${row.state}${row.protected ? ' PROTECTED' : ''}`);
+        for (const provider of snapshot.providers) console.log(`${provider.provider}: ${provider.status}`);
+      }
+      if (snapshot.providers.some(provider => provider.status !== 'measured')) process.exitCode = 1;
+    });
+
+
+  cloud.command('status <name>').description('정확한 이름 또는 ID로 상태 조회')
+    .option('--json').action(async (name: string, options: { json?: boolean }) => {
+      const { cloudHostInventory, findCloudHost } = await import('../fleet/cloud-host-inventory.js');
+      const result = findCloudHost(await cloudHostInventory(), name);
+      if (options.json) console.log(JSON.stringify(result));
+      else if (result.host) console.log(`${result.host.provider} ${result.host.name} ${result.host.id} ${result.host.state}${result.host.protected ? ' PROTECTED' : ''}`);
+      else console.error(`cloud status: ${result.status}`);
+      if (result.status !== 'measured') process.exitCode = 1;
+    });
+
   const train = program.command('train').description('열차 관측');
   registerTrainThroughputCommands(train);
   resources.command('where <nameOrKind>').description('이름 또는 kind 로 찾기')

@@ -27,7 +27,7 @@ test('a user turn is one band per row across the full width; «>» bold, the bod
     expect(Bun.stringWidth(row)).toBe(columns);
     expect(row.endsWith('\x1b[0m')).toBe(true);
   }
-  expect(userRows[0]).toStartWith(`${BAND}\x1b[1m>\x1b[22m first line`);
+  expect(userRows[0]).toStartWith(`${BAND}\x1b[1m❯\x1b[22m first line`);
   expect(Bun.stripANSI(userRows[1]!).trimEnd()).toBe('  second line that wraps past');
   expect(lines.some((line) => line.includes('answer') && line.includes(BAND))).toBe(false);
 });
@@ -35,7 +35,7 @@ test('a user turn is one band per row across the full width; «>» bold, the bod
 test('NO_COLOR keeps «> » and the two-column indent with no escape codes', () => {
   process.env.NO_COLOR = '1';
   const lines = logViewLines([turn('user', 'hello\nworld')], 30);
-  expect(lines.slice(0, 2)).toEqual(['> hello', '  world']);
+  expect(lines.slice(0, 2)).toEqual(['❯ hello', '  world']);
   expect(lines.join('').includes('\x1b[')).toBe(false);
 });
 
@@ -43,5 +43,5 @@ test('NO_COLOR follows the no-color.org rule: present and non-empty disables col
   expect(userTurnBandEnabled({})).toBe(true);
   expect(userTurnBandEnabled({ NO_COLOR: '' })).toBe(true);
   expect(userTurnBandEnabled({ NO_COLOR: '1' })).toBe(false);
-  expect(userTurnBandRow('> hi', 6)).toBe(`${BAND}\x1b[1m>\x1b[22m hi  \x1b[0m`);
+  expect(userTurnBandRow('❯ hi', 6)).toBe(`${BAND}\x1b[1m❯\x1b[22m hi  \x1b[0m`);
 });

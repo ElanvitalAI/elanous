@@ -41,6 +41,7 @@ export function shouldFoldPaste(text: string): boolean {
 export function createPasteFold(
   log: (category: string, event: string, data: Record<string, unknown>) => void = (c, e, d) => debug.log(c, e, d),
   tokenFor: (id: number, text: string) => string = pasteFoldToken,
+  shouldFold: (text: string) => boolean = shouldFoldPaste,
 ): PasteFold {
   const held = new Map<string, string>();
   let seq = 0;
@@ -49,7 +50,7 @@ export function createPasteFold(
       // 표시(줄 수·글자 수)만 정규화한다 — 끝 줄바꿈 하나는 터미널이 붙이는 것 · CRLF 는 한 줄바꿈.
       //   쥐는 것·제출하는 것은 붙여넣은 원문 그대로다(r1 must-fix).
       const shown = text.replace(/\r\n?/g, '\n').replace(/\n$/, '');
-      if (!shouldFoldPaste(shown)) return text;
+      if (!shouldFold(shown)) return text;
       const token = tokenFor(++seq, shown);
       held.set(token, text);
       log('tui.paste', 'folded', { id: seq, lines: shown.split('\n').length, chars: shown.length });

@@ -4,6 +4,15 @@ import { parse as parseYaml } from 'yaml';
 import { loadPluginManifestFromDir, type PluginManifest } from '../plugins/core/manifest.js';
 import { parseGraphTemplateYaml, type GraphTemplateSpec } from '../self-implement/graph-yaml.js';
 import { lowerGraphV2 } from '../graph-v2/lower.js';
+import { debug } from '../debug/log.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { getUserConfig } from '../user-config.js';
+import {
+  freezeGraphCapabilityVocabularyEntries,
+  graphCapabilityVocabularyDigest,
+  parseGraphCapabilityVocabularyEntries,
+  type GraphCapabilityVocabularyEntry,
+} from './capabilities.js';
 
 export interface GraphManifestDeclaration {
   graphId: string;
@@ -12,6 +21,8 @@ export interface GraphManifestDeclaration {
   policy?: Record<string, unknown>;
   hitl: string[];
   observe?: { categories: string[] };
+  /** Reviewed capability vocabulary pinned to one edition; gates `requires` when declared. */
+  capabilityVocabulary?: { entries: readonly GraphCapabilityVocabularyEntry[]; digest: string };
   [key: string]: unknown;
 }
 
@@ -90,8 +101,15 @@ function validateEdgeVocabulary(rawGraph: unknown, graphId: string): void {
 export function assertGraphManifestRecipeAllowed(manifest: GraphManifestDeclaration, recipe: string,
   recipeIds: ReadonlySet<string> = new Set(), requires?: string,
   node?: Pick<GraphTemplateSpec['nodes'][number], 'nodeId' | 'kind'>): void {
-  if (requires && !manifest.allow.capabilities?.includes(requires.split('.')[0]!))
+  if (requires && manifest.capabilityVocabulary) {
+    // GRAPH-VOCAB-DYNAMIC: a pinned, reviewed vocabulary replaces the plain name list
+    // for contract nodes — the exact contract id must be approved in the pinned edition.
+    const entry = manifest.capabilityVocabulary.entries.find((item) => item.id === requires);
+    if (!entry) throw new Error(`graph.manifest-denied: capability ${requires} is outside the pinned capability vocabulary`);
+    if (entry.status !== 'approved') throw new Error(`graph.manifest-denied: capability ${requires} is ${entry.status}, not approved`);
+  } else if (requires && !manifest.allow.capabilities?.includes(requires.split('.')[0]!)) {
     throw new Error(`graph.manifest-denied: capability ${requires}`);
+  }
   if (recipe.startsWith('hitl:')) {
     if (node?.kind === 'hitl' && manifest.hitl.includes(node.nodeId) && /^hitl:[a-z][a-z0-9-]*$/.test(recipe)) return;
     throw new Error(`graph.manifest-denied: HITL binding needs a declared node: ${recipe}`);
@@ -149,6 +167,48 @@ function graphFile(root: string, asset: string): string {
   return file;
 }
 
+const CAPABILITY_VOCABULARY_FILE = 'capability-vocabulary.json';
+
+/**
+ * The reviewed vocabulary catalog is host-owned: `graph.vocabularyCatalog` in the host config, else
+ * <state>/graph/capability-vocabulary.json. A plugin manifest can only pin a digest; it can never name
+ * or place the catalog, and nothing is discovered by walking up from the plugin root.
+ */
+function graphVocabularyCatalogPath(): string {
+  return getUserConfig().graph?.vocabularyCatalog ?? join(effectiveInstanceRoot(), 'graph', CAPABILITY_VOCABULARY_FILE);
+}
+
+function loadPinnedCapabilityVocabulary(
+  pluginRoot: string,
+  pinnedDigest: string,
+): { entries: readonly GraphCapabilityVocabularyEntry[]; digest: string } {
+  const file = graphVocabularyCatalogPath();
+  const refuse = (reason: string, message: string): never => {
+    debug.log('graph.manifest', 'vocabulary-refused', { reason, plugin: pluginRoot, catalog: file }, { level: 'warn' });
+    throw new Error(message);
+  };
+  let real = '';
+  try { real = realpathSync(file); }
+  catch { refuse('catalog-missing', `graph.manifest-denied: the host capability vocabulary catalog is missing: ${file}`); }
+  const inside = relative(pluginRoot, real);
+  if (!inside.startsWith('..') && !isAbsolute(inside))
+    refuse('catalog-inside-plugin', 'graph.manifest-denied: the host capability vocabulary catalog must not live inside a plugin');
+  let catalog: Record<string, unknown> = {};
+  try { catalog = record(JSON.parse(readFileSync(real, 'utf8')), file); }
+  catch { refuse('catalog-unreadable', `graph.manifest-denied: the host capability vocabulary catalog is unreadable: ${file}`); }
+  for (const key of Object.keys(catalog)) {
+    if (key !== 'entries' && key !== 'digest') refuse('catalog-shape', `${CAPABILITY_VOCABULARY_FILE} uses unsupported key: ${key}`);
+  }
+  const entries = parseGraphCapabilityVocabularyEntries(catalog.entries, `${CAPABILITY_VOCABULARY_FILE} entries`);
+  if (typeof catalog.digest !== 'string' || !/^[0-9a-f]{64}$/.test(catalog.digest))
+    refuse('catalog-shape', `${CAPABILITY_VOCABULARY_FILE} digest must be a sha256 hex digest`);
+  if (graphCapabilityVocabularyDigest(entries) !== catalog.digest)
+    refuse('catalog-tampered', 'graph.manifest-denied: capability vocabulary edition digest does not match its entries');
+  if (catalog.digest !== pinnedDigest)
+    refuse('edition-mismatch', `graph.manifest-denied: plugin pins capability vocabulary edition ${pinnedDigest.slice(0, 12)} but the host catalog edition is ${String(catalog.digest).slice(0, 12)}`);
+  return { entries: freezeGraphCapabilityVocabularyEntries(entries), digest: catalog.digest as string };
+}
+
 /** Load any declared graph plugin; graph IDs come from YAML, not filenames or a release-only registry. */
 export function loadGraphPluginFromDir(pluginDir: string): LoadedGraphPlugin {
   const root = realpathSync(pluginDir);
@@ -159,6 +219,18 @@ export function loadGraphPluginFromDir(pluginDir: string): LoadedGraphPlugin {
   }).manifest;
   const extension = record(record(raw.extensions, 'extensions')['ai.elanous'], 'extensions["ai.elanous"]');
   const capabilities = stringList(extension.capabilities ?? [], 'extensions["ai.elanous"].capabilities');
+  // GRAPH-VOCAB-DYNAMIC: a plugin may only PIN a review-owned edition digest. Vocabulary
+  // entries (approvals, reviewers, contracts) are never plugin-authorable — they resolve
+  // only from the host-configured catalog, so a plugin cannot self-approve a name.
+  const capabilityVocabulary = extension.capabilityVocabulary === undefined ? undefined : (() => {
+    const declaration = record(extension.capabilityVocabulary, 'extensions["ai.elanous"].capabilityVocabulary');
+    for (const key of Object.keys(declaration)) {
+      if (key !== 'digest') throw new Error('extensions["ai.elanous"].capabilityVocabulary must pin an edition digest; entries are review-owned');
+    }
+    if (typeof declaration.digest !== 'string' || !/^[0-9a-f]{64}$/.test(declaration.digest))
+      throw new Error('extensions["ai.elanous"].capabilityVocabulary.digest must be a sha256 hex digest');
+    return loadPinnedCapabilityVocabulary(root, declaration.digest);
+  })();
   const declarations = record(extension.graphManifests, 'extensions["ai.elanous"].graphManifests');
   const assets = plugin.contributes.graphs ?? [];
   if (assets.length === 0) throw new Error(`graph plugin declares no graphs: ${manifestPath}`);
@@ -200,6 +272,7 @@ export function loadGraphPluginFromDir(pluginDir: string): LoadedGraphPlugin {
       policy,
       hitl,
       ...(categories ? { observe: { categories } } : {}),
+      ...(capabilityVocabulary ? { capabilityVocabulary } : {}),
     };
     if (!v2) validateEdgeVocabulary(rawGraph, id);
     const policyRefs = new Set<string>();

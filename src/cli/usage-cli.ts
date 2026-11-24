@@ -443,6 +443,29 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
     });
 
   usage
+    .command('status-cache')
+    .description('TUI 상태줄 3행용 — 같은 수집기로 계정 요약을 <state>/status/llm-usage.json 에 원자적으로 쓴다 (TUI 가 뒤에서 부른다)')
+    .action(async () => {
+      const cache = await import('../statusline/sources/llm-usage.js');
+      const path = cache.llmUsageCachePath();
+      // A collector that hangs must not keep this child (and the TUI's lock) forever.
+      const timeout = new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error('usage collector timeout (60s)')), 60_000);
+        (timer as { unref?: () => void }).unref?.();
+      });
+      try {
+        const report = await Promise.race([collect(), timeout]);
+        cache.writeLlmUsageSnapshot(path, cache.llmUsageSnapshotFromReport(report, Date.now()));
+        out.log(`llm-usage → ${path}`);
+      } catch (error) {
+        const why = error instanceof Error ? error.message : String(error);
+        cache.markLlmUsageRefreshFailed(path, why, Date.now());
+        out.log(`llm-usage refresh failed: ${why}`);
+        exit(1);
+      }
+    });
+
+  usage
     .command('runs')
     .description('저장된 llm-usage 로그를 런·역할·단계·phase·모델·계정별로 집계한다')
     .option('--run <runId>', '런 ID 정확 일치')

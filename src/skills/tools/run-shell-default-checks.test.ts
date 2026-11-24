@@ -52,11 +52,56 @@ const approval = async (command: string[]) => ({ allowed: true,
   priorHumanApproval: (command[1] === 'ops' && command[2] === 'check-30m')
     || (command[1] === 'release' && command[2] === 'checklist' && command[3] !== 'landed-but-yellow') });
 
-test('mail count without a card is limited to the exact OP JSON argv', () => {
-  expect(scriptCommandPolicy(['eln', 'msg', 'count', '--to', 'OP', '--json'])).toBe('read-local');
+test('landing and receipt checks require a cell and expose only bounded evidence scalars', () => {
+  const input = { checkSeat: 'JUD-B', checkVersion: '0.3.35', checkCell: 'EXAMPLE-CELL' };
+  const evidence = { id: 'evidence', command: ['eln', 'release', 'checklist', 'evidence', 'EXAMPLE-CELL', '--version', '0.3.35', '--json'], projection: 'checklist-evidence' as const };
+  const landing = defaultCheckScript({ ...input, check: 'landing' });
+  expect(landing.map(step => step.id)).toEqual(['checklist', 'landed', 'evidence']);
+  expect(landing[2]).toEqual(evidence);
+  expect(defaultCheckScript({ ...input, check: 'verdict-receipt' })[0]).toEqual(evidence);
+  expect(scriptCommandPolicy(evidence.command)).toBe('approval');
+  for (const checkCell of ['', '../unsafe', 'example', 'A'.repeat(129)])
+    expect(() => defaultCheckScript({ ...input, check: 'landing', checkCell })).toThrow();
+  expect(() => defaultCheckScript({ ...input, check: '30-minute' })).toThrow();
+});
+
+test('evidence projection exposes stage states and fails closed for missing stages', async () => {
+  const step = defaultCheckScript({ check: 'verdict-receipt', checkSeat: 'JUD-B', checkVersion: '0.3.35', checkCell: 'EXAMPLE-CELL' })[0];
+  const chain = { id: 'EXAMPLE-CELL', version: '0.3.35', greenEligible: false, stages: ['E1', 'E3', 'E4', 'E5'].map(id => ({ id, state: 'missing', source: 'PRIVATE-CANARY' })) };
+  const dispatch = async () => ({ output: '', exitCode: 0, outcome: 'exit' as const, elapsedMs: 0, stdout: JSON.stringify(chain), stderr: '', truncated: false, approvalKey: '', sandboxed: false, sandboxTool: 'none' as const });
+  const result = await runShellScript([step], undefined, 1000, dispatch);
+  expect(result.outcome).toBe('exit');
+  expect(JSON.parse(result.stdout).steps[0].selected).toEqual({ id: 'EXAMPLE-CELL', version: '0.3.35', greenEligible: false, E1: 'missing', E3: 'missing', E4: 'missing', E5: 'missing' });
+  expect(result.stdout).not.toContain('PRIVATE-CANARY');
+  chain.stages.pop();
+  expect((await runShellScript([step], undefined, 1000, dispatch)).outcome).toBe('spawn-error');
+});
+
+test('mail count without a card is limited to exact supported seat JSON argv', () => {
+  for (const seat of ['OP', 'JUD', 'JUD-B', 'REL', 'RES']) {
+    expect(scriptCommandPolicy(['eln', 'msg', 'count', '--to', seat, '--json'])).toBe('read-local');
+  }
+  expect(scriptCommandPolicy(['eln', 'msg', 'list', '--to', 'JUD', '--json'])).toBe('approval');
   expect(scriptCommandPolicy(['eln', 'msg', 'count', '--to', 'JUD-2', '--json'])).toBe('approval');
   expect(scriptCommandPolicy(['eln', 'msg', 'count', '--to', 'JUD-2'])).toBe('approval');
   expect(scriptCommandPolicy(['eln', 'msg', 'count', '--to', 'OP'])).toBe('approval');
+});
+
+test('non-OP seat checks use an exact count request and never request mail bodies', () => {
+  for (const seat of ['JUD', 'JUD-B', 'REL', 'RES']) {
+    const steps = defaultCheckScript({ check: '30-minute', checkSeat: seat, checkVersion: '0.3.35' });
+    expect(steps[0]).toEqual({ id: 'inbox', command: ['eln', 'msg', 'count', '--to', seat, '--json'], select: ['status', 'count'] });
+    expect(steps.map((step) => step.id)).toEqual(['inbox', 'ops', 'checklist', 'landed', 'cost']);
+    expect(steps[3]).toEqual({ id: 'landed', command: ['eln', 'release', 'checklist', 'landed-but-yellow', '--open', '--json'], headLines: 4 });
+    expect(scriptCommandPolicy(steps[3]!.command)).toBe('approval');
+    expect(steps.some((step) => step.command[1] === 'msg' && step.command[2] === 'list')).toBe(false);
+  }
+  expect(() => defaultCheckScript({ check: '30-minute', checkSeat: 'OTHER', checkVersion: '0.3.35' })).toThrow();
+  const schema = buildRunShellTool().parameters as { properties: { checkSeat: { enum: string[] } } };
+  expect(schema.properties.checkSeat.enum).toEqual(['OP', 'JUD', 'JUD-B', 'REL', 'RES']);
+  const contract = buildRunShellTool().parameters as { oneOf: { required: string[] }[] };
+  expect(contract.oneOf.find((branch) => branch.required.includes('check'))?.required).toEqual(['check', 'checkSeat', 'checkVersion']);
+  expect(() => defaultCheckScript({ check: '30-minute', checkSeat: 'OP', checkVersion: '0.3.35' })).toThrow();
 });
 
 test('default check input contract matches local policy and schema', async () => {
@@ -79,7 +124,7 @@ test('default check input contract matches local policy and schema', async () =>
   await expect(dispatchRunShell({ ...base, checkPreviousGreen: 10000 }, { scriptApproval: async () => { approvals++; return { allowed: true, priorHumanApproval: false }; } })).rejects.toThrow('previous green');
   expect(approvals).toBe(0);
   const schema = buildRunShellTool().parameters as { oneOf: Array<{ required: string[] }>; properties: { checkPreviousGreen: { minimum: number; maximum: number } } };
-  expect(schema.oneOf.find((variant) => variant.required.includes('check'))?.required).toContain('checkPreviousGreen');
+  expect(schema.oneOf.find((variant) => variant.required.includes('check'))?.required).not.toContain('checkPreviousGreen');
   expect(schema.properties.checkPreviousGreen).toMatchObject({ minimum: 0, maximum: 9999 });
 });
 

@@ -28,6 +28,7 @@ import { SIGNALS_DB_PATH } from './breaking-signals.js';
 import { surfaceEventsDbPath } from './surface-events.js';
 import { memoryDbPath, mergeStrayMemoryDbOnce, migrateLegacyMemoryDb } from './memory-db-path.js';
 import { conatusPath } from './conatus-data-dir.js';
+import { resolveKnowledgeDocsRoots } from '../knowledge/docs-roots.js';
 
 // managed memory 네임스페이스(2026-07-19 일반화) — 시맨틱 self-memory. ★scoped(Phase E · 2026-07-24):
 // 종전 global(인스턴스 무관 단일 공유)은 격리 test 가 prod 회상 코퍼스(self-recall docs·taste)를 오염시켰다
@@ -406,6 +407,11 @@ function escapeLike(s: string): string {
   return s.replace(/[\\%_]/g, (m) => `\\${m}`);
 }
 
+/** 파일 뿌리 재지향용 `^basename$` 패턴 — 파일명 특수문자를 글자 그대로만 취급. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /** 파일의 기존 청크(`docs:<절대경로>#i`) 일괄 삭제 — 재인제스트 전 교체용. */
 function deleteDocChunks(db: Database, path: string): number {
   const like = `docs:${escapeLike(docPathKey(path))}#%`;
@@ -425,13 +431,23 @@ export async function ingestDocsDir(
 ): Promise<{ files: number; chunks: number; skipped: number; unchanged: number; refreshed: number }> {
   if (!existsSync(opts.dir)) return { files: 0, chunks: 0, skipped: 0, unchanged: 0, refreshed: 0 };
   ensureDocsIngestState(db);
+  // DOCS-SEARCH-INDEX-EMPTY — 파일 뿌리: 뿌리가 파일이면 dirname 재지향 + `^basename$` 패턴으로
+  // mtime 증분·구청크 교체 기계를 그대로 재활용한다(OPS-RULES.md 한 파일이 곧 한 뿌리).
+  let dir = opts.dir;
+  let pattern: RegExp | undefined = opts.pattern;
+  try {
+    if (statSync(dir).isFile()) {
+      pattern = new RegExp(`^${escapeRegExp(basename(dir))}$`);
+      dir = dirname(dir);
+    }
+  } catch { /* existsSync 은 통과했다 — race 로 사라졌으면 아래 스캔이 빈 목록을 낸다 */ }
   // 명시 pattern 호출은 기존의 단일 디렉터리·파일명 정규식 계약을 유지한다. 기본 호출만
   // DocOps 정본 두 자산(scanDocs 재귀/아카이브 제외 + KNOWN_PREFIXES taxonomy)으로 선정한다.
-  const files = opts.pattern
-    ? readdirSync(opts.dir).filter(name => opts.pattern!.test(name)).map(name => join(opts.dir, name)).sort()
-    : scanDocs(opts.dir)
+  const files = pattern
+    ? readdirSync(dir).filter(name => pattern!.test(name)).map(name => join(dir, name)).sort()
+    : scanDocs(dir)
       .filter(entry => KNOWN_PREFIXES.has(entry.prefix))
-      .map(entry => resolve(dirname(opts.dir), entry.path))
+      .map(entry => resolve(dirname(dir), entry.path))
       .sort();
   debug.log('knowledge.ingest', 'docs-targets', {
     dir: opts.dir,
@@ -476,6 +492,90 @@ export async function ingestDocsDir(
     chunks += r.chunks; skipped += r.skipped;
   }
   return { files: fileCount, chunks, skipped, unchanged, refreshed };
+}
+
+// ── 문서 코퍼스 인제스트 (DOCS-SEARCH-INDEX-EMPTY · 2026-11-24) ────────
+//
+// 뿌리 해석(resolveKnowledgeDocsRoots — 설정·도구 체크아웃·작업 저장소·현행 절)과
+// 순회를 한 기계로 묶는다 — 크론(knowledge-ingest)과 docs search 색인 자가부트가
+// 같은 해석을 공유해야 색인이 0으로 갈라지지 않는다.
+
+export interface DocsCorpusOpts {
+  domain?: string;
+  embed?: EmbedFn;
+  /** 설정 `knowledge.docsRoots`. 배열이면(빈 배열 포함) 그 값만 쓴다. */
+  docsRoots?: readonly string[];
+  /** 도구 체크아웃 판정 기준 모듈. 기본은 이 파일. */
+  toolModuleUrl?: string;
+  /** `toolModuleUrl` 에서 docs 까지의 상대 세그먼트. 기본 `['..','docs']`. */
+  toolDocsSegments?: readonly string[];
+  /** 현재 작업 디렉터리. 기본은 process.cwd(). */
+  cwd?: string;
+  /** 환경 변수(좌석 상태 뿌리 해석). 기본 process.env. */
+  env?: NodeJS.ProcessEnv;
+  exists?: (path: string) => boolean;
+  readPackageName?: (packageJsonPath: string) => string | undefined;
+  gitRoot?: (cwd: string) => string | undefined;
+}
+
+export interface DocsCorpusCounts {
+  files: number; chunks: number; skipped: number; unchanged: number; refreshed: number;
+  /** 해석된 뿌리 수(자가부트 판정·관측용). */
+  roots: number;
+}
+
+/**
+ * 문서 코퍼스 전체 인제스트 — 뿌리 해석 ⊕ 뿌리별 `ingestDocsDir` 순회 ⊕ per-root debug.log.
+ * 각 뿌리는 fail-soft(한 뿌리 실패가 나머지를 멈추지 않는다 — 크론 선례와 같은 계약).
+ */
+export async function ingestDocsCorpus(db: Database, opts: DocsCorpusOpts = {}): Promise<DocsCorpusCounts> {
+  const resolved = resolveKnowledgeDocsRoots({
+    ...(opts.docsRoots !== undefined ? { docsRoots: opts.docsRoots } : {}),
+    ...(opts.toolModuleUrl !== undefined ? { toolModuleUrl: opts.toolModuleUrl } : {}),
+    ...(opts.toolDocsSegments !== undefined ? { toolDocsSegments: opts.toolDocsSegments } : {}),
+    ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+    ...(opts.env !== undefined ? { env: opts.env } : {}),
+    ...(opts.exists ? { exists: opts.exists } : {}),
+    ...(opts.readPackageName ? { readPackageName: opts.readPackageName } : {}),
+    ...(opts.gitRoot ? { gitRoot: opts.gitRoot } : {}),
+  });
+  const totals: DocsCorpusCounts = { files: 0, chunks: 0, skipped: 0, unchanged: 0, refreshed: 0, roots: resolved.roots.length };
+  if (resolved.roots.length === 0) {
+    debug.log('knowledge.ingest', 'docs-root', { source: resolved.source, roots: 0 });
+    return totals;
+  }
+  for (const root of resolved.roots) {
+    try {
+      const r = await ingestDocsDir(db, {
+        dir: root.path,
+        ...(opts.domain !== undefined ? { domain: opts.domain } : {}),
+        ...(opts.embed ? { embed: opts.embed } : {}),
+      });
+      totals.files += r.files; totals.chunks += r.chunks; totals.skipped += r.skipped;
+      totals.unchanged += r.unchanged; totals.refreshed += r.refreshed;
+      debug.log('knowledge.ingest', 'docs-root', {
+        path: root.path,
+        source: root.source,
+        files: r.files,
+        chunks: r.chunks,
+        skipped: r.skipped,
+        unchanged: r.unchanged,
+        refreshed: r.refreshed,
+      });
+    } catch (err) {
+      debug.log('knowledge.ingest', 'docs-root', {
+        path: root.path,
+        source: root.source,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return totals;
+}
+
+/** 문서(docs kind) 색인 행 수 — docs search 자가부트 판정·관측용. */
+export function docsIndexCount(db: Database): number {
+  return Number((db.prepare(`SELECT COUNT(*) AS n FROM docs WHERE kind = 'docs'`).get() as { n: number } | null)?.n ?? 0);
 }
 
 export interface IngestCounts { signals: number; digs: number; alpha: number; outbound: number; skipped: number }

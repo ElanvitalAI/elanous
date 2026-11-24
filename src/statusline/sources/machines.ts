@@ -64,6 +64,28 @@ export function fleetFromResources(map: ResourcesMap | null, now: number): Fleet
   return { level: 'ok', text: '●', hot, warm, idle, unknown };
 }
 
+/** One host's load as the status rows draw it (TUI-STATUS-3ROW row 3): `node-b 25⚠` · `minim5 4` · `mbp ?`. */
+export interface HostLoad {
+  readonly name: string;
+  /** load1 rounded; null = not measured or older than FLEET_STALE_MS. */
+  readonly load: number | null;
+  /** load1 / cpus at or above the warn band (§2c 0.9). */
+  readonly warn: boolean;
+  readonly text: string;
+}
+
+/** Per-host loads from the same Nexus answer the fleet fold uses (no second read, no ssh). */
+export function hostLoads(map: ResourcesMap | null, now: number): HostLoad[] {
+  if (!map) return [];
+  return map.hosts.map((host) => {
+    const verdict = verdictFor(host, now);
+    if (verdict.ratio === null || host.load1.value === null) return { name: host.name, load: null, warn: false, text: `${host.name} ?` };
+    const load = Math.round(host.load1.value);
+    const warn = verdict.ratio >= WARN_FROM;
+    return { name: host.name, load, warn, text: `${host.name} ${load}${warn ? '⚠' : ''}` };
+  });
+}
+
 /** The snapshot fields the definition reads (`machines.level`, `machines.text`, …). */
 export function machinesSnapshot(value: FleetValue): Record<string, string | number> {
   return { level: value.level, text: value.text, hot: value.hot, warm: value.warm, idle: value.idle, unknown: value.unknown };
@@ -174,14 +196,18 @@ export function createFleetSegment(options: {
   readonly read?: () => Promise<FleetRead>;
   readonly intervalMs?: number;
   readonly now?: () => number;
-}): { value(): FleetValue | undefined; start(): void; stop(): void } {
+}): { value(): FleetValue | undefined; hosts(): readonly HostLoad[]; start(): void; stop(): void } {
   let poller: FleetPoller | undefined;
   let seen = false;
+  let lastMap: ResourcesMap | null = null;
+  let hostsKey = '';
+  const now = options.now ?? Date.now;
   let refused = false;
   let stopped = false;
   const read = options.read ?? (() => readNexusResources());
   return {
     value: () => (refused ? REFUSED : seen ? poller?.current() : undefined),
+    hosts: () => (refused || !seen ? [] : hostLoads(lastMap, now())),
     start: () => {
       if (poller) return;
       poller = startFleetPoller({
@@ -191,7 +217,16 @@ export function createFleetSegment(options: {
           const wasRefused = refused;
           refused = answer.kind === 'refused';
           if (answer.kind === 'ok' && answer.map.hosts.length > 0) seen = true;
-          if (refused !== wasRefused) options.onChange();
+          if (answer.kind === 'ok') lastMap = answer.map;
+          // TUI-STATUS-3ROW row 3 draws each host's load: repaint when those numbers move, not only the fleet fold.
+          const nextKey = hostLoads(lastMap, now()).map((host) => host.text).join(' ');
+          const hostsChanged = nextKey !== hostsKey;
+          hostsKey = nextKey;
+          // When the fold changes too, the poller's own onChange repaints — one repaint per answer, not two.
+          const fold = answer.kind === 'ok' ? fleetFromResources(answer.map, now()) : null;
+          const foldChanges = fold !== null && poller !== undefined
+            && (fold.text !== poller.current().text || fold.level !== poller.current().level);
+          if (refused !== wasRefused || (hostsChanged && seen && !refused && !foldChanges)) options.onChange();
           return answer.kind === 'ok' ? answer.map : null;
         },
         onChange: () => { if (seen && !refused) options.onChange(); },

@@ -13,6 +13,9 @@
 //   - `tree()` / `summary()` give the left list (ELS1) the same rows and the «⎇3 ●2 ✕1» suffix: state is kept here once.
 import type { ElsCore, ElsResult } from './core.js';
 import type { PaneState } from './space.js';
+import { projectGraphLoopViews, type GraphViewEvent } from '../graph-view/model.js';
+import { renderGraphDashboard, type DashboardColorMode } from '../graph-view/dashboard.js';
+import { renderGraphView } from '../graph-view/render.js';
 import { agoText, childSummary, KIND_GLYPH, STATUS, type ChildKind, type StatusWord } from './status-vocab.js';
 
 export type ChildSource = ChildKind | 'graph-node';
@@ -37,6 +40,13 @@ export interface ChildTabsDeps {
   readonly now?: () => number;
   readonly setTimer?: (fn: () => void, ms: number) => unknown;
   readonly clearTimer?: (handle: unknown) => void;
+  /** Repaint period of a graph run's widget (spinner). Default 1 s; the timer lives only while a graph tab is running. */
+  readonly tickMs?: number;
+  /** Size of a tab's pane (maximize / resize changes it); a graph tab draws the full dashboard when it is large enough. */
+  readonly paneSize?: (pane: string) => { readonly cols: number; readonly rows: number };
+  readonly colorMode?: DashboardColorMode;
+  readonly setTick?: (fn: () => void, ms: number) => unknown;
+  readonly clearTick?: (handle: unknown) => void;
 }
 
 interface Child extends Omit<ChildStart, 'parent'> {
@@ -51,6 +61,11 @@ interface Child extends Omit<ChildStart, 'parent'> {
   lastAt: number;
   pinned: boolean;
   timer: unknown;
+  tick: number;
+  ticker: unknown;
+  endedAt?: number;
+  drawn?: string;
+  model?: string;
 }
 
 export interface ChildRow {
@@ -77,6 +92,10 @@ export function createChildTabs(deps: ChildTabsDeps) {
   const now = deps.now ?? Date.now;
   const setTimer = deps.setTimer ?? ((fn, ms) => { const handle = setTimeout(fn, ms); handle.unref?.(); return handle; });
   const clearTimer = deps.clearTimer ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
+  const tickMs = deps.tickMs ?? 500; // ≤ 2 fps by default; a repaint whose text did not change is not sent
+  const colorMode: DashboardColorMode = deps.colorMode ?? (/truecolor|24bit/u.test(process.env.COLORTERM ?? '') ? 'truecolor' : /256/u.test(process.env.TERM ?? '') ? '256' : 'none');
+  const setTick = deps.setTick ?? ((fn, ms) => { const handle = setInterval(fn, ms); handle.unref?.(); return handle; });
+  const clearTick = deps.clearTick ?? ((handle) => clearInterval(handle as ReturnType<typeof setInterval>));
   const children = new Map<string, Child>();
   const bundles = new Map<string, string>(); // ws -> bundle pane id
 
@@ -101,10 +120,39 @@ export function createChildTabs(deps: ChildTabsDeps) {
   /** A graph run's tab text: its own lines, then its nodes one level in (siblings in start order). */
   const tabText = (child: Child): string => {
     const nodes = [...children.values()].filter((row) => row.parent === child.id && isNode(row));
-    return [...child.lines, ...nodes.map((node) => nodeLine(node, 1))].join('\n');
+    const lines = [...child.lines, ...nodes.map((node) => nodeLine(node, 1))].join('\n');
+    if (child.source !== 'graph') return lines;
+    const widget = graphWidget(child, nodes);
+    return widget.length > 8 ? widget.join('\n') : `${widget.join('\n')}\n\n${lines}`;
   };
+  /** The graph-view widget (the same one the TUI draws): stage edge of the nodes seen so far, spinner on the running one. */
+  const graphWidget = (child: Child, nodes: Child[]): string[] => {
+    const events: GraphViewEvent[] = [
+      { type: 'loop.started', loopId: 'g', at: child.startedAt, kind: 'graph', lead: 'graph', title: child.label },
+      ...nodes.map((node): GraphViewEvent => ({ type: 'stage.changed', loopId: 'g', at: node.lastAt, stage: node.label,
+        status: node.status === 'done' ? 'done' : node.status === 'failed' ? 'failed' : 'running' })),
+      ...(child.status === 'done' || child.status === 'failed'
+        ? [{ type: 'loop.ended', loopId: 'g', at: child.lastAt, status: child.status === 'done' ? 'done' : 'failed' } as GraphViewEvent] : []),
+    ];
+    const size = child.tab !== undefined ? deps.paneSize?.(child.tab) : undefined;
+    const dash = size ? renderGraphDashboard({ name: child.label, status: child.status === 'done' ? 'done' : child.status === 'failed' ? 'failed' : 'running',
+      startedAt: child.startedAt, ...(child.status === 'done' || child.status === 'failed' ? { endedAt: child.lastAt } : {}), nowMs: now(), tick: child.tick,
+      cols: size.cols, rows: size.rows, color: colorMode,
+      nodes: nodes.map((node) => ({ id: node.id, label: node.label, startedAt: node.startedAt, ...(node.endedAt !== undefined ? { endedAt: node.endedAt } : {}),
+        state: node.status === 'done' ? 'done' as const : node.status === 'failed' ? 'failed' as const : node.status === 'blocked' ? 'blocked' as const : 'running' as const,
+        note: node.model && !/\bmodel[:=]/u.test(node.note) ? `model=${node.model} · ${node.note}` : node.note })) }) : null;
+    if (dash) return dash;
+    const view = projectGraphLoopViews(events).get('g');
+    return view ? renderGraphView(view, 100, 24, { nowMs: now(), tick: child.tick, color: false }) : [];
+  };
+  const stopTick = (child: Child): void => { if (child.ticker !== undefined) { clearTick(child.ticker); child.ticker = undefined; } };
   const draw = (child: Child): void => {
-    if (child.tab !== undefined) deps.core.patchVirtual(child.tab, { text: tabText(child), title: title(child), state: paneState(child.status) });
+    if (child.tab === undefined) return;
+    const text = tabText(child);
+    const key = `${title(child)}\0${child.status}\0${text}`;
+    if (child.drawn === key) return; // dirty-only: an identical frame is not sent
+    child.drawn = key;
+    deps.core.patchVirtual(child.tab, { text, title: title(child), state: paneState(child.status) });
   };
   const graphOf = (node: Child): Child | undefined => node.parent ? children.get(node.parent) : undefined;
 
@@ -132,6 +180,7 @@ export function createChildTabs(deps: ChildTabsDeps) {
   const remove = (child: Child): void => {
     if (child.timer) clearTimer(child.timer);
     if (child.promo) clearTimer(child.promo);
+    stopTick(child);
     children.delete(child.id);
     // Its nodes go with it; anything still running below it moves up to the removed child's own parent.
     const gone = new Set([child.id, ...[...children.values()].filter((row) => row.parent === child.id && isNode(row)).map((row) => row.id)]);
@@ -165,6 +214,8 @@ export function createChildTabs(deps: ChildTabsDeps) {
       }
       child.tab = (JSON.parse(opened.message) as { pane: string }).pane;
       child.view = 'tab';
+      if (child.source === 'graph' && child.status !== 'done' && child.status !== 'failed' && tickMs > 0)
+        child.ticker = setTick(() => { child.tick++; if (children.get(child.id) !== child || child.status === 'done' || child.status === 'failed') { stopTick(child); return; } draw(child); }, tickMs);
       draw(child);
       return opened;
     }
@@ -187,7 +238,7 @@ export function createChildTabs(deps: ChildTabsDeps) {
       if (input.parent && !parent) return refuse(`unknown parent ${input.parent}`);
       if (input.source === 'graph-node' && parent?.source !== 'graph') return refuse('a graph-node needs its graph run as parent');
       const t = now();
-      const child: Child = { ...input, tab: undefined, view: 'none', promo: undefined, status: 'working', note: '', lines: [], startedAt: t, lastAt: t, pinned: false, timer: undefined };
+      const child: Child = { ...input, tab: undefined, view: 'none', promo: undefined, status: 'working', note: '', lines: [], startedAt: t, lastAt: t, pinned: false, timer: undefined, tick: 0, ticker: undefined };
       children.set(child.id, child);
       if (isNode(child)) { draw(parent!); return out('ok'); }
       if (child.source === 'shell') return out('ok'); // no tab unless pinned
@@ -203,7 +254,7 @@ export function createChildTabs(deps: ChildTabsDeps) {
       child.lines.push(line);
       if (child.lines.length > MAX_LINES) child.lines.splice(0, child.lines.length - MAX_LINES);
       touch(child);
-      if (isNode(child)) child.note = line;
+      if (isNode(child)) { child.note = line; const m = /\bmodel[:=]\s*([\w./-]+)/u.exec(line)?.[1]; if (m) child.model = m; }
       const owner = isNode(child) ? graphOf(child) : child;
       if (owner?.view === 'bundle') refreshBundle(child.ws); else if (owner) draw(owner);
       return out('ok');
@@ -228,11 +279,13 @@ export function createChildTabs(deps: ChildTabsDeps) {
       if (!child) return refuse(`unknown child ${id}`);
       if (child.status === 'done' || child.status === 'failed') return refuse(`${id} already ended`);
       child.status = ok ? 'done' : 'failed';
+      child.endedAt = now();
       child.note = isNode(child) ? summary : '';
       child.lines.push(`${STATUS[child.status].mark} ${summary}`);
       touch(child);
       if (isNode(child)) { const run = graphOf(child); if (run) draw(run); return out('ok'); }
       if (child.promo) { clearTimer(child.promo); child.promo = undefined; }
+      stopTick(child);
       draw(child);
       if (child.view === 'bundle') refreshBundle(child.ws);
       const line = `${KIND_GLYPH[child.source as ChildKind]} ${child.label} [${child.source}] ${ok ? 'done' : 'FAILED'}: ${summary}`;

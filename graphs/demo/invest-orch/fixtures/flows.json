@@ -1,0 +1,43 @@
+{
+ "kospi": {
+  "foreign5dMillion": -1319999,
+  "foreign20dMillion": -14197220,
+  "inst5dMillion": 318154,
+  "days": [
+   {
+    "date": "2026-11-24",
+    "foreign": 704975,
+    "inst": 646431,
+    "retail": -1727485
+   },
+   {
+    "date": "2026-11-23",
+    "foreign": -256461,
+    "inst": 176284,
+    "retail": -353235
+   },
+   {
+    "date": "2026-11-20",
+    "foreign": -1095596,
+    "inst": -933020,
+    "retail": 1521439
+   },
+   {
+    "date": "2026-11-19",
+    "foreign": -408561,
+    "inst": 11985,
+    "retail": -56046
+   },
+   {
+    "date": "2026-11-18",
+    "foreign": -264356,
+    "inst": 416474,
+    "retail": -616878
+   }
+  ]
+ },
+ "samsungForeign5dShares": -6260282,
+ "recordedFrom": "live:kr-flow",
+ "source": "fixture",
+ "recordedAt": "2026-11-24T04:59:06.823Z"
+}

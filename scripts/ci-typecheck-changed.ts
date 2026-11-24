@@ -48,7 +48,11 @@ export function tscExecEnv(callerEnv: NodeJS.ProcessEnv | undefined): NodeJS.Pro
 
 /** git 조회용 — 명령 실패는 호출자가 빈 출력과 구분할 수 있게 전파한다. */
 function sh(cmd: string, cwd = process.cwd()): string {
-  return execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd, env: gitEnv() });
+  // maxBuffer 64MB 명시 — 기본 1MB는 게이트 병합 상태(merge-main 뒤)의 3점 --name-only diff를 못 담는다.
+  // 출처: #39891 r9 PREGATE-RED/39891-d90aa144e8b1-node-b-181719 — «git diff --name-only <base>...HEAD»가
+  // spawnSync /bin/sh ENOBUFS로 죽어 «변경 파일 수집 실패» fail-closed(병합 상태 diff 실측 1,090,027바이트 계열).
+  // 선례: runGitDiffQuery 64MB(#39985)·아래 tsc 실행부 64MB(2026-08-28).
+  return execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd, env: gitEnv(), maxBuffer: 64 * 1024 * 1024 });
 }
 
 export type TscRun = { out: string; ran: boolean; why?: string; exitCode?: number };
@@ -719,6 +723,40 @@ function applyChangedPathStatus(out: string, paths: Map<string, string>): string
   }
 }
 
+/**
+ * 🩸 2026-11-24 출처: #39891 r4~r7(#140964·#141389) — changedPathPairs의 git diff 스폰이
+ *    호스트 부하 시 신호 사망(«종료코드 null»)·«종료코드 0» 파이프/스폰 예외로 일회 실패해
+ *    재시도 없이 fail-closed로 죽어 4회 연속 게이트 RED가 됐다. 한 조회를 같은 인자로 재시도한다.
+ */
+const GIT_DIFF_ATTEMPTS = 3;
+const GIT_DIFF_RETRY_BACKOFF_MS = 200;
+
+/** 동기 재시도 사이의 짧은 대기 — Atomics.wait 불가 환경이면 즉시 재시도한다. */
+function sleepSync(ms: number): void {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    /* 대기 실패 시 즉시 재시도 */
+  }
+}
+
+type GitDiffQuery = { out?: string; failure?: string };
+
+/** git diff 한 번 — throw를 즉시 실패로 올리지 않고 {out | failure}로 돌려준다. */
+function runGitDiffQuery(run: GitRunner, args: string[]): GitDiffQuery {
+  try {
+    // maxBuffer 64MB 명시 — 기본 1MB는 게이트 병합 상태(merge-main 뒤)의 대형 3점 diff를 못 담는다.
+    // 출처: #39891 r4~r8 5연속 «종료코드 null»(r8 PREGATE-RED/…-172118 재시도 3회 전부 동일 사망) —
+    // 병합 상태 diff 실측 1,090,027바이트 > 기본 1,048,576 → 스폰 kill. 선례: 아래 tsc 실행부 64MB.
+    return { out: String(run('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }) ?? '') };
+  } catch (error: unknown) {
+    const e = error as { status?: number | null; stdout?: string; stderr?: string };
+    // exit 0으로 throw한 실행(파이프·스폰 예외)은 실제로는 성공했다 — stdout을 성공 출력으로 파싱한다.
+    if (e.status === 0 && typeof e.stdout === 'string') return { out: e.stdout };
+    return { failure: (e.stderr ?? '').trim() || `종료코드 ${String(e.status)}` };
+  }
+}
+
 /** base→HEAD·staged·worktree 세 diff의 rename 사슬을 합쳐 현재 경로를 기준 revision 경로까지 보존한다. */
 export function changedPathPairs(base: string, run: GitRunner = execFileSync): ChangedPathResult {
   try {
@@ -729,7 +767,20 @@ export function changedPathPairs(base: string, run: GitRunner = execFileSync): C
       ['diff', '--name-status', '-z', '--find-renames'],
     ];
     for (const args of commands) {
-      const failure = applyChangedPathStatus(String(run('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) ?? ''), paths);
+      let out: string | undefined;
+      let lastFailure: string | undefined;
+      for (let attempt = 1; attempt <= GIT_DIFF_ATTEMPTS; attempt++) {
+        const once = runGitDiffQuery(run, args);
+        if (once.out !== undefined) {
+          out = once.out;
+          break;
+        }
+        lastFailure = once.failure;
+        if (attempt < GIT_DIFF_ATTEMPTS) sleepSync(GIT_DIFF_RETRY_BACKOFF_MS);
+      }
+      // 세 시도 전부 throw했다 — stderr 본문을 그대로 failure에 보존해 fail-closed한다.
+      if (out === undefined) return { fields: [], failure: `git 변경 경로 조회 실패(${GIT_DIFF_ATTEMPTS}회 재시도): ${lastFailure}` };
+      const failure = applyChangedPathStatus(out, paths);
       if (failure) return { fields: [], failure };
     }
     return { fields: [], paths };

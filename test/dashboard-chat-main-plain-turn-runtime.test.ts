@@ -214,7 +214,6 @@ async function implementationDisciplineFromDirectRuntime(
             ...config.chat.conciseness,
             enabled: false,
             finalMessageMaxLines: 6,
-            preambleMaxWords: 12,
           },
         },
         tools: { ...config.tools, nativeStructure: { enabled: nativeStructureEnabled } },

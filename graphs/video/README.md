@@ -1,6 +1,6 @@
 # 외부 프로젝트용 «표준» 그래프 템플릿
 
-> 📄 설계 = [`RFC-graph-engineering-for-external-projects-2026-09-09`](../../내부 문서 `RFC-graph-engineering-for-external-projects-2026-09-09`)
+> 📄 설계 = [`RFC-graph-engineering-for-external-projects-2026-09-09`](../../내부 문서 `IDEAS`)
 > 📦 작동하는 실물 = `~/temp/agentic-consulting` (git · 워커 `scripts/graph-walk.ts`)
 
 ## ⛔ 왜 `graphs/` 가 «아니라» 여기인가
@@ -50,7 +50,7 @@ fi
 > 🎬 **통합 영상 그래프**(2026-09-22)는 여섯 갈래(ad · shorts · script-film · floorplan · vlog · kinetic)를
 > **한 뼈대**로 묶는다 — 노드는 같고 갈리는 것은 «능력·구현·구간» 셋이다.
 > ⛔ **워커는 아직 없다**(선언까지). 📚 = [`MANUAL-unified-video-production`](../../내부 문서 `MANUAL-unified-video-production-2026-09-22`)
-> 📄 설계 = [`RFC-composable-video-pipeline`](../../내부 문서 `RFC-composable-video-pipeline-2026-09-22`)
+> 📄 설계 = [`RFC-composable-video-pipeline`](../../내부 문서 `IDEAS`)
 > ⚠️ 그 과정에서 **`evas-shorts-pipeline.declaration.yaml` 이 «아직도» 파싱되지 않음**을 실측했다 —
 > (📏 수는 적지 않는다 — `check-graph-declaration.ts` 가 그 자리에서 찍는다)
 > 그것은 걸을 그래프가 아니라 읽을 문서다. 통합 선언이 그 자리를 대신한다.

@@ -17,9 +17,9 @@ function scratch(): string {
 }
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-test('#126458 실제 worlds 조각 12개 발견 — 87행·전 접두사 커버(els-remote·member-journey·machine-infra 포함)', () => {
+test('#126458 실제 worlds 조각 12개 발견 — 88행·전 접두사 커버(els-remote·member-journey·machine-infra 포함)', () => {
   const table = readSimWorldExpectTable(join(realWorlds, 'sim-world-expect.json'));
-  expect(Object.keys(table.entries).length).toBe(87); // 출처: #39620 재적층 실측 — main 6997545ad38 단일 표 87행(신규 5행: SEAT-CAPSULE-NO-REPEAT·ROUTER-QUALITY-GUARD-95·RUNSHELL-DEFAULT-OP-30M·RUNSHELL-PR2·E-LIVE-CWD-OSC7)
+  expect(Object.keys(table.entries).length).toBe(88); // 출처: #39620 재적층 실측 — main 6997545ad38 단일 표 87행(신규 5행: SEAT-CAPSULE-NO-REPEAT·ROUTER-QUALITY-GUARD-95·RUNSHELL-DEFAULT-OP-30M·RUNSHELL-PR2·E-LIVE-CWD-OSC7) · 1124 main-red drift: #39796 ELN-CAPSULE-COMPLETION-SCOPED가 capsule-events/C9-SESSION-SCOPED 1행 추가 → 88
   for (const prefix of ['capsule-events', 'els', 'els-remote', 'graph', 'machine-infra', 'member-journey', 'memory', 'op-channel', 'router-cost', 'seat-mail-roundtrip', 'toolbatch', 'worker']) {
     expect(Object.keys(table.entries).some((key) => key.startsWith(`${prefix}/`))).toBe(true);
   }

@@ -1,8 +1,10 @@
 // A side-tab mission can finish while another turn is running. The arrival notice must outlive turns, so it
 // is kept as a transcript marker (same store as the turn-end «Worked for» rows), never in the per-turn
 // `activity` buffer that each turn overwrites and clears.
+import type { TranscriptMarker } from './capsule-transcript.js';
+
 export interface MissionArrivalInfo { readonly agent: string; readonly paired: boolean; readonly ok: boolean; readonly path?: string; readonly error?: string }
-export type TranscriptMarkerStore = Map<string, { afterMessageIndex: number; text: string }[]>;
+export type TranscriptMarkerStore = Map<string, TranscriptMarker[]>;
 
 export function missionArrivalText(info: MissionArrivalInfo): string {
   const who = `${info.agent}${info.paired ? ' + parallel' : ''}`;

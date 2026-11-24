@@ -10,6 +10,9 @@ import { resolveRequestMaxTokens } from './llm/output-budget.js';
 import { STREAM_DISCONNECT_MAX_RETRIES, STREAM_IDLE_TIMEOUT_MAX_RETRIES, StreamIdleTimeoutError, StreamTotalTimeoutError, streamDisconnectRetryDelayMs, isStreamDisconnectRetryable, sleepUnlessAborted } from './llm/stream-fallback.js';
 import { StreamNoProgressError, isTurnProgressEvent, resolveTurnNoProgressMs, type TurnNoProgressFire } from './llm/turn-progress.js';
 import { wellFormedLLMMessages } from './llm-wellformed.js';
+// ELN-DEPTH-BY-DIFFICULTY-AND-RETRO (OP #143390 · 지시서 ⑨) — 턴 끝 관문: 난이도별 산출 형식
+// 검사·supplement 주입(순수 함수 — 시험 src/llm/work-depth.test.ts).
+import { checkDepthRequirement, injectDepthGateIntoSupplement, type WorkDifficulty } from './llm/work-depth.js';
 import { truncateOutput } from './output-truncation.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { isTestUniverseFakeProviderName, testFakeLlmDefaultSelected, testFakeLlmFencesInjectedProvider, testFakeLlmEnabled, testFakeLlmProvider } from './ux-sim/fake-llm.js';
@@ -48,6 +51,7 @@ import { llmUsageCostFields } from './budget/llm-cost.js';
 import { accumulateByokUsage } from './llm/openrouter-byok-cost.js';
 import { ACTION_PHASE_OPS_TOOLS, isSteeredShellRejection, REPAIR_PHASE_READ_ONLY_OPS_TOOLS } from './llm/tool-loop-steered-rejection.js';
 import { ToolCallTiming } from './chat/tool-call-timing.js';
+import { spendPolicyStream, SpendPolicyStopError } from './llm/spend-policy-stream.js';
 import { recordChildFirstLlmResponse, recordChildFirstLlmStart, recordChildFirstToolCall } from './llm/child-first-llm-observation.js';
 import {
   dispatchWithParallelSafety,
@@ -5048,7 +5052,7 @@ type StreamLLMOpts = LLMOpts & {
 };
 
 /** 시험 전용 이음매 — 시험이 «자동 공급자 + 정책 우주» 를 흉내낼 때만 쓴다(운영 스위치 아님 · 기본 undefined). */
-let liveSpendTestSeam: { readonly eligible?: boolean; readonly deps?: Partial<import('./oauth/llm-call-gate.js').LlmCallGateDeps> & { policyDir?: string } } | undefined;
+let liveSpendTestSeam: { readonly eligible?: boolean; readonly deps?: Partial<import('./oauth/llm-call-gate.js').LlmCallGateDeps> & { policyDir?: string }; readonly providerFor?: (name: string) => LLMProvider | undefined } | undefined;
 export function __setLiveSpendTestSeam(seam: typeof liveSpendTestSeam): void { liveSpendTestSeam = seam; }
 
 /** 지출 관문 대상인가 — 명시 provider(opts.provider/initialProvider · auto 아닌 설정)·가짜 기본은 건드리지 않는다. */
@@ -7253,9 +7257,17 @@ function maybeEnrichFinalAnswerWithFinalizationSnapshot(
   editedFiles: readonly string[],
   verificationState: VerificationLoopState,
   snapshot: FinalizationPolicySnapshot,
+  workDepth?: { difficulty: WorkDifficulty } | null,
 ): string {
   const trimmed = finalText.trim();
   const supplement = snapshot.finalVerificationSummary;
+  // ELN-DEPTH-BY-DIFFICULTY-AND-RETRO — 턴 끝 관문(CX-6 과 같은 관문 코드): 최종 답이
+  // 난이도별 산출 형식(D2 «원인·근거·가설» · D3 «선택지 3 표·채택·되돌리기·판정식»)에
+  // 못 미치면 supplement 유무·needsHelp 와 무관하게 관문 줄을 붙여 되돌린다.
+  if (workDepth && !checkDepthRequirement(workDepth.difficulty, trimmed).ok) {
+    const gated = injectDepthGateIntoSupplement(workDepth.difficulty, trimmed, supplement);
+    if (gated) return `${trimmed}\n\n${gated}`;
+  }
   if (!supplement) return finalText;
   const mentionsEditedFile = editedFiles.some((file) => trimmed.includes(file));
   const mentionsVerifyCommand = verificationState.lastCommand ? trimmed.includes(verificationState.lastCommand) : false;
@@ -8731,6 +8743,9 @@ export async function streamLLMWithTools(
     initialProvider?: LLMProvider;
     /** 이 턴 폴백 후보에서 뺄 공급자(이미 같은 턴에서 실패한 쪽 — 되돌아가지 않게). */
     skipProviders?: readonly string[];
+    /** ELN-DEPTH-BY-DIFFICULTY-AND-RETRO — 이번 일감의 난이도(D1/D2/D3 · 결정적 1차 판정 +
+     *  모델 확인은 호출자 몫). 주어지면 턴 끝 관문이 산출 형식을 검사해 깊이 부족을 되돌린다. */
+    workDepth?: { difficulty: import('./llm/work-depth.js').WorkDifficulty };
   } = {},
 ): Promise<string> {
   const coordinatorSeat = messages.some(message => message.role === 'system' && typeof message.content === 'string' && message.content.includes('## 조율자 프로필 (이 자리 = 조율 자리)'));
@@ -9177,6 +9192,8 @@ export async function streamLLMWithTools(
   // for the rest of the turn (live p50 19 · max 159 rounds); once history has grown past COMPACT_REARM_GROWTH × that,
   // the breaker gets one more try (half-open).
   let compactOpenedAtTokens: number | undefined;
+  // ELN-COMPACT-EVERY-TURN ② — deterministic old-tool-result pruning (hysteresis state for this loop).
+  const toolResultPruneState: import('./agent-substrate/tool-result-prune.js').ToolResultPruneState = {};
   // ★ agent-loop-substrate 조각2 — pluggable context 전략(기본=2-tier compaction). 주입(opts.contextStrategy)으로
   //   read-time projection 등 교체. 문맥관리를 substrate 프리미티브로 통일(streamLLMWithTools 인라인 산재 해소).
   const { createDefaultContextStrategy: _makeContextStrategy, shouldRearmCompaction } = require('./agent-substrate/context-strategy.js') as typeof import('./agent-substrate/context-strategy.js');
@@ -9258,6 +9275,24 @@ export async function streamLLMWithTools(
     debug.log('llm.router', 'tool-loop.turn.start', {
       turn, historyLen: history.length,
     }, { level: 'info' });
+
+    // ELN-COMPACT-EVERY-TURN ② — before any compaction: at half the window, results older than the last 3 rounds
+    // become frozen one-line placeholders (same bytes every later request · committed only when it reclaims enough).
+    if (turn > 0) {
+      try {
+        const { pruneOldToolResults } = require('./agent-substrate/tool-result-prune.js') as typeof import('./agent-substrate/tool-result-prune.js');
+        const { resolveAutoCompactWindow } = require('./compact/auto.js') as typeof import('./compact/auto.js');
+        // The budget is the smaller of the model window and the provider request cap (codex 400K chars ≈ 100K tokens).
+        const requestCapTokens = opts.requestSizeGuard ? Math.floor(opts.requestSizeGuard.maxChars / 4) : Number.POSITIVE_INFINITY; // 출처: tokens.ts 4 chars/token
+        const contextTokens = Math.min(resolveAutoCompactWindow(effectiveModel), requestCapTokens);
+        const pruned = pruneOldToolResults(history, { contextTokens }, toolResultPruneState);
+        if (pruned.fired || pruned.reason === 'below-min-reclaim') {
+          debug.log('llm.router', 'tool-loop.tool-result-prune', { turn, ...pruned });
+        }
+      } catch (error) {
+        debug.log('llm.router', 'tool-loop.tool-result-prune-error', { turn, error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+      }
+    }
 
     // Turn context backstop — with the codex/unlimited tool-loop cap
     // removed, a long tool-heavy turn (esp. mission build) grows `history`
@@ -9471,6 +9506,12 @@ export async function streamLLMWithTools(
       streamAttemptAbortCleanup = undefined;
       streamAttemptAbort = undefined;
     };
+    // Six default fallback rows; eight retries bound stale observations without an infinite loop.
+    const MAX_POLICY_QUOTA_RETRIES = 8;
+    let policyQuotaRetries = 0;
+    const gateToolRequests = liveSpendEligible(opts);
+    let gatedProviderSelected = false;
+    let policyEnforcedThisAttempt = false;
     let providerToolSchemaDiagnostics: Record<string, {
       originalName: string;
       providerName: string;
@@ -9540,11 +9581,26 @@ export async function streamLLMWithTools(
           };
           const providerMessages = mapProviderToolNamesInMessages(history, nameMap.toProviderName);
           previousRequestEstimatedTokens = estimateMessagesTokens(providerMessages);
-          logLlmProviderSelection(activeProvider);
-          streamIter = restoreProviderToolCallNames(
-            activeProvider.streamChat!(providerMessages, providerOpts),
-            nameMap.toOriginalName,
-          )[Symbol.asyncIterator]();
+          const requestedProvider = activeProvider;
+          gatedProviderSelected = false;
+          policyEnforcedThisAttempt = false;
+          const providerStream = gateToolRequests ? spendPolicyStream({
+            messages: providerMessages, opts: providerOpts, original: requestedProvider,
+            select: async () => {
+              const live = await import('./oauth/llm-call-live.js');
+              return live.runLiveGate({ role: live.spendRoleFor(opts.usageRole), location: 'host',
+                ...(opts.model ? { models: [opts.model] } : {}), estimateUsd: 0.05, actor: opts.usageSite ?? 'stream-llm-with-tools' },
+              liveSpendTestSeam?.deps ?? {}).catch(error => live.gateErrorOutcome(error, {
+                ...(liveSpendTestSeam?.deps?.policyDir !== undefined ? { policyDir: liveSpendTestSeam.deps.policyDir } : {}), actor: opts.usageSite ?? 'stream-llm-with-tools' }));
+            },
+            settle: async (handle, outcome) => (await import('./oauth/llm-call-gate.js')).settleLlmCall(handle, outcome),
+            signalFromError: error => (require('./oauth/llm-call-gate.js') as typeof import('./oauth/llm-call-gate.js')).llmSignalFromError(error),
+            accountForRow: row => (require('./oauth/llm-call-live.js') as typeof import('./oauth/llm-call-live.js')).codexAccountNameForRow(row),
+            providerForName: name => liveSpendTestSeam?.providerFor ? liveSpendTestSeam.providerFor(name) : providerByName(name),
+            onDecision: outcome => { policyEnforcedThisAttempt = outcome !== 'pass-through'; },
+            onSelected: (selected, model) => { gatedProviderSelected = true; activeProvider = selected; activeModel = model; opts.onResolvedProvider?.(selected.name, model); logLlmProviderSelection(selected); },
+          }) : (logLlmProviderSelection(activeProvider), activeProvider.streamChat!(providerMessages, providerOpts));
+          streamIter = restoreProviderToolCallNames(providerStream, nameMap.toOriginalName)[Symbol.asyncIterator]();
           streamAttemptStartedAt = Date.now();
           progressAt = streamAttemptStartedAt;
         }
@@ -9605,7 +9661,7 @@ export async function streamLLMWithTools(
         await recordChildFirstLlmResponse({ status: 'error', ...(status === undefined ? {} : { httpStatus: status }), error: err });
         if (idleTimer) clearTimeout(idleTimer);
         releaseStreamAttempt(true, err);
-        if (streamIter && !turnUsageSeen && !(err instanceof RequestSizeLimitError)) {
+        if (streamIter && (!gateToolRequests || gatedProviderSelected) && !turnUsageSeen && !(err instanceof RequestSizeLimitError)) {
           logAgentTurnUsage(activeModel, 'unmeasured', {
             providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm-with-tools',
             role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind,
@@ -9613,6 +9669,15 @@ export async function streamLLMWithTools(
             ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
           });
           turnUsageSeen = true;
+        }
+        if (err instanceof SpendPolicyStopError) throw err;
+        // The failed attempt has already settled its quota signal. Re-select without replaying dispatched tools.
+        if (gateToolRequests && policyEnforcedThisAttempt && !opts.signal?.aborted && pendingCalls.length === 0 && !streamEmittedImage
+          && (await import('./oauth/llm-call-gate.js')).llmSignalFromError(err)) {
+          if (++policyQuotaRetries > MAX_POLICY_QUOTA_RETRIES) throw new SpendPolicyStopError('LLM spend guard: quota observations did not converge');
+          rewindDisconnectedStream();
+          streamIter = undefined;
+          continue;
         }
         if (err instanceof RequestSizeLimitError) throw err;
         if (err instanceof StreamTotalTimeoutError) {
@@ -10182,6 +10247,7 @@ export async function streamLLMWithTools(
         editedFilePaths,
         verificationLoopState,
         finalization,
+        opts.workDepth,
       );
       // 검증 보충 — final-answer supplement attachment point: let the caller
       // append verification-recency / loop-closure wording after the final
@@ -12266,6 +12332,11 @@ export async function streamLLMWithTools(
         && (modelFamily === 'gemini'
           || applyCodexBehaviorGuard('force-synthesis', effectiveModel, codexGuardCandidate, true));
       let synthesizedText: string | null = null;
+      if (opts.researchTurn && !isUserInterventionRequired) {
+        const { deliverFinalResearchMail } = await import('./llm/research-seat-final.js');
+        await deliverFinalResearchMail({ provider, model: effectiveModel, history, tools: activeTools, handlers, turn,
+          ...(opts.sessionId ? { sessionId: opts.sessionId } : {}), ...(opts.signal ? { signal: opts.signal } : {}) });
+      }
       if (shouldForceSynthesis) {
         forceSynthesisAttempted = true;
         synthesizedText = await tryForceSynthesisPass({
@@ -12436,6 +12507,11 @@ export async function streamLLMWithTools(
     && !forceSynthesisAttempted
     && (modelFamily === 'gemini'
       || applyCodexBehaviorGuard('force-synthesis', effectiveModel, codexGuardCandidate, true));
+  if (opts.researchTurn && loopTermination === 'budget-exhausted' && !codexContinuationNeeded && !forceSynthesisAttempted) {
+    const { deliverFinalResearchMail } = await import('./llm/research-seat-final.js');
+    await deliverFinalResearchMail({ provider, model: effectiveModel, history, tools: activeTools, handlers, turn: maxTurns,
+      ...(opts.sessionId ? { sessionId: opts.sessionId } : {}), ...(opts.signal ? { signal: opts.signal } : {}) });
+  }
   if (shouldForceSynthesisOnBudget) {
     forceSynthesisAttempted = true;
     synthesizedText = await tryForceSynthesisPass({

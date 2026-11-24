@@ -206,13 +206,26 @@ export function registerSimCommands(program: Command, simAppRuntime: SimAppRunti
         }
       }
     });
-  sim.command('run <scenario-file>')
-    .description('등록된 UX simulation 시나리오를 test 우주에서 실행한다')
-    .action(async (scenarioFile: string) => {
+  sim.command('run [scenario-file]')
+    .description('등록된 UX simulation 시나리오를 test 우주에서 실행한다 · --pack <id> = 회귀 묶음(시나리오별 PASS/FAIL 한 줄 · 영수증 · FAIL 이면 exit 1)')
+    .option('--pack <id>', '회귀 묶음 실행 (daily-regression)')
+    .option('--only <scenario>', '--pack 안의 시나리오 하나만')
+    .action(async (scenarioFile: string | undefined, opts: { pack?: string; only?: string }) => {
       try {
         // Enforce isolation before either runner inspects the supplied path. Otherwise
         // release-graph dispatch can leak a path-validation error outside test mode.
         if (!getTestStateRoot()) throw new Error('scenario runner requires --test isolated mode');
+        if (opts.pack !== undefined) {
+          if (scenarioFile !== undefined) throw new Error('--pack takes no scenario file');
+          const { formatSimRegressionLine, runSimRegressionPack } = await import('../ux-sim/sim-world/daily-regression/pack.js');
+          const receipt = await runSimRegressionPack({ pack: opts.pack, stateRoot: resolve(getTestStateRoot()!), ...(opts.only ? { only: opts.only } : {}),
+            onRow: (row) => console.log(formatSimRegressionLine(row)) });
+          console.log(`${receipt.ok ? 'OK' : 'FAIL'} ${receipt.pack} · pass ${receipt.counts.pass} · fail ${receipt.counts.fail} · skip ${receipt.counts.skip} · receipt ${receipt.receiptPath}`);
+          if (!receipt.ok) process.exitCode = 1;
+          return;
+        }
+        if (opts.only !== undefined) throw new Error('--only needs --pack');
+        if (scenarioFile === undefined) throw new Error('scenario file or --pack <id> is required');
         // The release graph rig is only needed when a scenario is run, not to register sim commands.
         const { runReleaseSimRigIfFile } = await import('../ux-sim/release-sim-rig.js');
         const releaseResult = await runReleaseSimRigIfFile(scenarioFile);

@@ -38,6 +38,7 @@ import { recordSessionObservation } from './session-observation.js';
 import { telegramEndpointKey, discordEndpointKey, telegramOldPathTarget } from './session-endpoint-key.js';
 import { truncateBeforeNthUser } from '../acp/session-fork.js';
 import { mintTurnUri } from '../mss/uri/builder.js';
+import { recordRemovedMessages } from './message-tombstones.js';
 import type { TurnUri } from '../mss/uri/brand.js';
 import type { ContentBlock } from '../llm.js';
 
@@ -347,6 +348,11 @@ export interface SerializedMessage {
   tokenEstimate?: number;
   /** Goal-loop iteration reply, not the final assistant answer. */
   goalInterim?: boolean;
+  /** An answer already shown to the person that a compaction summarized: kept for the transcript only,
+   *  never replayed to the model (TUI-ANSWER-VANISH-ON-TOOLCALL). */
+  compactedReply?: boolean;
+  /** A line the person typed mid-turn that joined the running turn at a tool boundary (a steer). */
+  steerJoined?: boolean;
   /** Persisted only for a completed assistant turn; partial/draft text stays private in basic history. */
   replyFinal?: boolean;
   /** A fixed public failure marker persisted after a failed turn; partial reply text stays private. */
@@ -820,10 +826,17 @@ export function rewriteSessionMessages(
   id: string,
   messages: SerializedMessage[],
   root: string = sessionRoot(),
+  /** Caller tag for the tombstones of chat rows this rewrite drops (TUI-ANSWER-VANISH ⑤). */
+  cause = 'rewrite',
 ): SessionMeta {
   ensureRoots(root);
   const file = sessionFile(id, root);
   if (!existsSync(file)) throw new Error(`session not found: ${id}`);
+  // TUI-ANSWER-VANISH ⑤ — a dropped chat row leaves a tombstone + `tui.transcript message-removed` (fail-open).
+  try {
+    const before = loadSession(id, root)?.messages ?? [];
+    recordRemovedMessages(id, before, messages, cause, root);
+  } catch { /* observability is fail-open */ }
   const body = messages
     .map(m => JSON.stringify(m.turn_id !== undefined ? m : { ...m, turn_id: mintTurnUri() }))
     .join('\n');
@@ -851,7 +864,7 @@ export function replaceSessionHistory(
   root: string = sessionRoot(),
 ): SessionMeta {
   adoptSession(id, { source: 'tui', transport: 'acp' }, root);
-  return rewriteSessionMessages(id, messages, root);
+  return rewriteSessionMessages(id, messages, root, 'request-size-compact');
 }
 
 /** TUI history writer used by ACP compaction. Keep the active user turn out of

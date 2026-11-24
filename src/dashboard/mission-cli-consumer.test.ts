@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { createMissionOutStore } from '../agent-mission/mission-out.js';
 import { cancelClassicMissionCli, startClassicMissionCli } from './mission-cli-consumer.js';
 import { TaskNotificationQueue } from '../agent/task-notification.js';
-import { enqueueClassicSidetabMissionCompletion } from './classic-sidetab-mission-job.js';
+import { enqueueClassicSidetabMissionCompletion } from '../sidetab-core/classic-sidetab-mission-job.js';
 import { createAgentWake, formatAgentWakePrompt } from './input/agent-wake.js';
 
 const MISSION_ID = '123e4567-e89b-42d3-a456-426614174000';

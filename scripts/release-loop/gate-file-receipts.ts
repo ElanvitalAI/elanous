@@ -4,7 +4,7 @@ import { debug } from '../../src/debug/log.js';
 
 // A cut tree is immutable. Extend its graph only from requested test roots, retaining
 // previously scanned edges without building an entire repository graph for one receipt.
-const graphByTree = new WeakMap<ClosureTree, { graph?: ClosureGraph; extend: (root: string) => ClosureGraph }>();
+const graphByTree = new WeakMap<ClosureTree, { graph?: ClosureGraph; extend: (root: string) => ClosureGraph; hashes: Map<string, string> }>();
 
 export interface GateFileReceiptIdentity {
   file: string;
@@ -41,10 +41,12 @@ export interface GateFileReceiptEnvelope extends GateFileReceipt {
 
 /** Hash every tracked input reachable from one test, including literal non-code assets; opaque/missing inputs fail closed. */
 export function gateFileReceiptIdentityFromClosure(tree: ClosureTree, file: string, imageDigest: string): GateFileReceiptIdentity | null {
-  if (!tree.files.includes(file) || !/^sha256:[a-f0-9]{64}$/i.test(imageDigest)) return null;
+  if (!/^sha256:[a-f0-9]{64}$/i.test(imageDigest)) return null;
   let cached = graphByTree.get(tree);
+  // Reuse the immutable graph's tracked index after its first successful build.
+  if (cached?.graph ? !cached.graph.tracked.has(file) : !tree.files.includes(file)) return null;
   if (!cached) {
-    cached = { extend: createRootedClosureGraph(tree) };
+    cached = { extend: createRootedClosureGraph(tree), hashes: new Map() };
     graphByTree.set(tree, cached);
   }
   let graph = cached.graph;
@@ -80,12 +82,20 @@ export function gateFileReceiptIdentityFromClosure(tree: ClosureTree, file: stri
   }
   const contentHashes: Record<string, string> = {};
   for (const path of [...closure].sort()) {
+    const hash = cached.hashes.get(path);
+    if (hash !== undefined) {
+      contentHashes[path] = hash;
+      continue;
+    }
     const content = tree.read(path);
     if (content === undefined) {
       const reason = `${path}: unreadable closure input`;
       opaqueReasons.add(reason);
       contentHashes[path] = createHash('sha256').update(`opaque:${reason}`).digest('hex');
-    } else contentHashes[path] = createHash('sha256').update(content).digest('hex');
+    } else {
+      contentHashes[path] = createHash('sha256').update(content).digest('hex');
+      cached.hashes.set(path, contentHashes[path]!);
+    }
   }
   return { file, closureFiles: [...closure].sort(), contentHashes, imageDigest,
     ...(opaqueReasons.size ? { opaqueReasons: [...opaqueReasons].sort() } : {}) };

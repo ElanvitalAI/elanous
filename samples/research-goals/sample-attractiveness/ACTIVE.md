@@ -51,4 +51,4 @@ termination:
   --max_turns 15
 ```
 
-자세한 사용법 + 도구 레퍼런스: [`내부 문서 `PFC-RESEARCH-TOOLS``](../../../내부 문서 `PFC-RESEARCH-TOOLS`)
+자세한 사용법 + 도구 레퍼런스: `내부 문서 `PFC-RESEARCH-TOOLS``

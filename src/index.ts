@@ -3807,9 +3807,13 @@ selfCmd.command('repair-commit-export <pr> <base-head> <child-output> <repo> <ou
     }
   });
 { const { registerSelfUtterancesCommand } = await import('./cli/self-utterances-cli.js'); registerSelfUtterancesCommand(selfCmd); }
+{ const { registerSelfDocsFindCommand } = await import('./cli/self-docs-find.js'); registerSelfDocsFindCommand(selfCmd); }
 
 // M12 Claude Code 의존도 계기판 — `elanous self dependence [--since] [--until] [--json]`(읽기만).
 { const { registerDependenceCommand } = await import('./cli/dependence-gauge.js'); registerDependenceCommand(selfCmd); }
+
+// ELN-OP-SELF-HEAL-LOOP — 자기 관측 집계 `elanous self observe [--since] [--seat] [--json]`(읽기만 · 칸 초안은 출력만).
+{ const { registerSelfObserveCommand } = await import('./cli/self-observe.js'); registerSelfObserveCommand(selfCmd); }
 
 function printExtendedOrchestrateHelp(command: Command, positional = '[goals...]'): void {
   const optionLines = command.options
@@ -6518,7 +6522,10 @@ selfCmd
   .option('--since-review <saved review name|head>', '저장된 리뷰의 mustFix와 해당 head 이후 변경만 다시 판정')
   .option('--full', '저장 리뷰가 있어도 PR 전체를 다시 리뷰')
   .option('--over-cap-reason <reason>', '저장 리뷰 r5 상한 이후 이번 호출 1회 예외 사유(doctor.review cap-override 기록)')
-  .action(async (prParts: string[], opts: { intent?: string; model?: string; acp?: boolean; acpModel?: string; acpBackend?: string; acpTimeout?: string; context?: string[]; contextText?: string[]; contextPack?: boolean; json?: boolean; save?: string; sinceReview?: string; full?: boolean; overCapReason?: string }) => {
+  .option('--classification-from <seat>', '미분류 보안 지적 요청 발신 자리(수신 자리도 명시 필요)')
+  .option('--classification-to <seat>', '미분류 보안 지적 재분류 요청을 받을 판정자 자리')
+  .action(async (prParts: string[], opts: { intent?: string; model?: string; acp?: boolean; acpModel?: string; acpBackend?: string; acpTimeout?: string; context?: string[]; contextText?: string[]; contextPack?: boolean; json?: boolean; save?: string; sinceReview?: string; full?: boolean; overCapReason?: string; classificationFrom?: string; classificationTo?: string }) => {
+    if (!!opts.classificationFrom !== !!opts.classificationTo) { ui.error('분류 요청에는 --classification-from 과 --classification-to 둘 다 필요합니다.'); process.exit(2); }
     const prArgs = prParts.flatMap((p) => String(p).split(/[,\s]+/).filter(Boolean)); // 번호/#번호/URL·콤마목록.
     if (!prArgs.length) { ui.error('PR 필요: elanous self review <번호|URL> [..]'); process.exit(2); }
     // ⭐ 본문은 seam(`runSelfReviewCliCommand`)에 있다 — 이 액션은 **의존 배선만** 한다.
@@ -9599,8 +9606,11 @@ sessionCmd
   .command('show [prefix]')
   .description('Print the messages of a session (default: active)')
   .option('--include-tools', 'Include tool-call telemetry (role:tool · 실제 호출 도구·args·result 추적)')
-  .action(async (prefix: string | undefined, opts: { includeTools?: boolean }) => {
+  .option('--vanished', 'Only the chat rows removed from this session (tombstones: when · cause · preview)')
+  .action(async (prefix: string | undefined, opts: { includeTools?: boolean; vanished?: boolean }) => {
     const { sessionBudget } = await import('./session/chat.js');
+    const { formatTombstoneLine, interleaveTombstones, loadTombstones } = await import('./session/message-tombstones.js');
+    const { sessionRoot } = await import('./session/index.js');
     const id = prefix ? resolveSessionId(prefix) : getActiveSessionId();
     if (!id) { ui.error('no session'); process.exit(1); }
     const loaded = loadSession(id);
@@ -9609,7 +9619,16 @@ sessionCmd
     console.log(`${sessionBudget(id)}  ${loaded.meta.messageCount} messages`);
     console.log('');
     const asStr = (v: unknown): string => typeof v === 'string' ? v : JSON.stringify(v);
-    for (const m of loaded.messages) {
+    // TUI-ANSWER-VANISH ⑤ — a removed chat row shows «[removed HH:MM · cause]» where it was.
+    const stones = loadTombstones(id, sessionRoot());
+    if (opts.vanished) {
+      if (stones.length === 0) console.log('(no removed chat rows)');
+      for (const stone of stones) console.log(`${stone.createdAt}  ${formatTombstoneLine(stone)}  (${stone.msgId})`);
+      return;
+    }
+    for (const entry of interleaveTombstones(loaded.messages, stones)) {
+      if (entry.kind === 'removed') { console.log(formatTombstoneLine(entry.stone)); console.log(''); continue; }
+      const m = entry.message;
       // tool = 도구 텔레메트리(추적성) — 기본 제외(노이즈)·--include-tools 로 표시.
       if (m.role === 'tool' && !opts.includeTools) continue;
       console.log(`── ${m.role} @ ${m.ts} ──`);

@@ -1,6 +1,6 @@
 import { debug } from '../debug/log.js';
 import { emitTurnLife } from '../debug/turn-life.js';
-import { readSeatMailSnapshot, type SeatMailSnapshot, type SeatMailWatchStatus } from './seat-mail-boot.js';
+import { readSeatMailSnapshot, resolveSeatId, type SeatMailSnapshot, type SeatMailWatchStatus } from './seat-mail-boot.js';
 import { createChildNoticeProducers, type ChildNoticeQueue } from './core/notice-producers.js';
 import { headerFieldsOf } from '../msg/msg-context-header.js';
 import type { NextTuiQueueTransitionListener } from './core/queue.js';
@@ -11,6 +11,11 @@ import type { MessageOrigin } from '../msg/msg-store.js';
 import { isDecisionMail } from './seat-mail-priority.js';
 import { createSeatMailAdapter, type SeatMailAdapter } from './turn-events/mail-adapter.js';
 import { isInfoSeatMail } from './seat-mail-digest.js';
+import { mkdirSync, realpathSync, statSync, unwatchFile, watch as fsWatch, watchFile } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { ALL_SEAT_BELL, readSeatBell, seatBellDir, seatBellFile } from '../msg/seat-bell.js';
 
 /**
  * ELN-CHILD-NOTICE-INTO-QUEUE — «자리 우편 도착» 생산 배선(3곳 중 1).
@@ -23,6 +28,83 @@ import { isInfoSeatMail } from './seat-mail-digest.js';
  * 판정 상한은 이 주기를 import 하는 external-event-receipt 가 여유를 더해 정한다.
  */
 export const DEFAULT_SEAT_MAIL_POLL_MS = 15_000;
+
+/**
+ * SEAT-MESSAGE-BUS stage 1 — with the seat doorbell armed, polling is only the safety net (watch failure · a missed
+ * ring → `tui.seat-mail bell-missed`). Without a bell (no seat · watch failed) the watcher keeps the 15s poll above.
+ */
+export const SEAT_MAIL_SAFETY_POLL_MS = 120_000;
+
+/** Rings inside this window share one ledger read (3 posts within 100 ms → one read with all three). */
+export const SEAT_MAIL_BELL_DEBOUNCE_MS = 250;
+
+/** The OS file watch the bell uses. Injectable for failure tests. `files` = the bell names this listener cares about. */
+export type SeatBellWatchFn = (dir: string, onEvent: (filename: string | null) => void, onError: (error: unknown) => void, files: readonly string[]) => { close(): void };
+
+/** Stat-watch period for the bell files (a stat of two tiny files — never a ledger read). */
+export const SEAT_MAIL_BELL_STAT_MS = 200;
+
+/**
+ * Two OS watches on the bell, either one is enough:
+ * - fs.watch on the bell folder (inotify on linux — instant). Probed on node-b (bun 1.4.2 · macOS 11-24): silent for a
+ *   path under a symlink (/var → /private/var), and FSEvents batches 0.4–0.8 s behind on the real path — so it is
+ *   the fast path only, opened on the realpath.
+ * - fs.watchFile on each bell file (stat, {@link SEAT_MAIL_BELL_STAT_MS}) — fires on creation and every ring on every
+ *   host; the same adapter the els mail event hub chose for the same bun behaviour (src/els/mail-event-hub.ts).
+ * A ring seen by both is one read: the watcher debounces.
+ */
+const defaultBellWatch: SeatBellWatchFn = (dir, onEvent, _onError, files) => {
+  let real = dir;
+  try { real = realpathSync(dir); } catch { /* keep the given path */ }
+  let watcher: ReturnType<typeof fsWatch> | null = null;
+  try {
+    watcher = fsWatch(real, { persistent: false }, (_event, filename) => {
+      onEvent(filename === null || filename === undefined ? null : String(filename));
+    });
+    // A dead folder watch leaves the stat watch running — the bell is still heard (only the fast path is gone).
+    watcher.on('error', () => { try { watcher?.close(); } catch { /* fail-soft */ } watcher = null; });
+    (watcher as { unref?: () => void }).unref?.();
+  } catch { watcher = null; /* the stat watch below still hears the bell */ }
+  const paths = files.map((file) => join(real, file));
+  for (const [index, path] of paths.entries()) {
+    const file = files[index]!;
+    watchFile(path, { interval: SEAT_MAIL_BELL_STAT_MS, persistent: false }, (curr, prev) => {
+      if (curr.mtimeMs !== prev.mtimeMs || curr.ino !== prev.ino) onEvent(file);
+    });
+  }
+  return {
+    close: () => {
+      try { watcher?.close(); } catch { /* fail-soft */ }
+      // bun's two-argument unwatchFile throws — the one-argument form drops this process's listeners for the path.
+      for (const path of paths) { try { unwatchFile(path); } catch { /* fail-soft */ } }
+    },
+  };
+};
+
+export interface SeatBellOptions {
+  /** The bell folder (`seatBellDir(<ledger path>)`). */
+  dir: string;
+  /** The seat this process holds — it listens to `<seat>.bell` and `ALL.bell`. */
+  seat: string;
+  watch?: SeatBellWatchFn;
+  debounceMs?: number;
+  /** One-shot timer for the debounce (default setTimeout, unref'd). */
+  schedule?: { set: (fn: () => void, ms: number) => unknown; clear: (handle: unknown) => void };
+  now?: () => number;
+  log?: (event: string, data: Record<string, unknown>, level: 'debug' | 'info' | 'warn') => void;
+}
+
+/**
+ * The seat whose bell this process listens to = the seat this cwd holds (the same resolution the ledger reader uses,
+ * gated on its seat-state folder). Baton acting is not observable here: the lease lives in the els server process and
+ * its display snapshot is not a credential, and the reader only reads this cwd's seat — so own seat only.
+ */
+export function resolveDefaultSeatBell(cwd: string, env: NodeJS.ProcessEnv = process.env, home: string = homedir()): SeatBellOptions | null {
+  const seat = resolveSeatId(cwd, { env });
+  if (seat === null) return null;
+  try { if (!statSync(join(home, 'elanous-hq', 'seat-state', seat)).isDirectory()) return null; } catch { return null; }
+  return { dir: seatBellDir(join(elanousStateRoot(), 'msg', 'messages.db')), seat };
+}
 
 /**
  * ELN-SEAT-MAIL-REPLAY — at most this many per-message seat-mail notices wait in the queue; the rest collapse into ONE
@@ -117,6 +199,8 @@ export interface SeatMailArrivalInfo {
   readonly origin?: MessageOrigin;
   readonly intent?: string | null;
   readonly crownDirective?: string | null;
+  /** The ledger `replyTo` (structured reply correlation — never parsed from the body). */
+  readonly replyTo?: number;
   readonly createdAt?: string;
   /** SEAT-MAIL-COALESCE-NOTICE — an info mail: it waits for the next digest (no mid-turn carry, no wake of its own). */
   readonly passive?: boolean;
@@ -153,13 +237,20 @@ export function createSeatMailArrivalWatcher(
     mailAdapter?: SeatMailAdapter;
     /** One-shot timer for the read retry (default setTimeout, unref'd). */
     retryTimer?: { set: (fn: () => void, ms: number) => unknown; clear: (handle: unknown) => void };
+    /**
+     * SEAT-MESSAGE-BUS stage 1 — the seat doorbell. Default (no `bell` and no injected `timer`): resolved from cwd
+     * ({@link resolveDefaultSeatBell}). An injected `timer` means the caller drives time, so the bell stays off unless
+     * passed. `false` = off.
+     */
+    bell?: SeatBellOptions | false;
     heartbeat?: { getSessionId: () => string | null; seatStateRoot?: string; host?: string;
       schedule?: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
       cancel?: (timer: ReturnType<typeof setInterval>) => void };
   } = {},
 ): SeatMailArrivalWatcher {
   const read = deps.readSnapshot ?? readSeatMailSnapshot;
-  const intervalMs = deps.intervalMs ?? DEFAULT_SEAT_MAIL_POLL_MS;
+  const bellOptions: SeatBellOptions | null = deps.bell === false ? null
+    : deps.bell ?? (deps.timer === undefined ? (() => { try { return resolveDefaultSeatBell(cwd); } catch { return null; } })() : null);
   const timer = deps.timer ?? {
     set: (fn: () => void, ms: number) => setInterval(fn, ms),
     clear: (handle: unknown) => clearInterval(handle as Parameters<typeof clearInterval>[0]),
@@ -273,7 +364,7 @@ export function createSeatMailArrivalWatcher(
         (deps.onReadError ?? ((err: unknown) => debug.log('tui.next', 'seat-mail-read-error', { error: String(err) })))(error);
       }
     }
-    if (inTurn.size === 0 || !source) return;
+    if (inTurn.size === 0 || !source) { bellRecheck(); return; }
     const finished = [...inTurn];
     inTurn.clear();
     // `responded` only says some output or tool activity appeared. «seen» (the ack) needs a completed turn: an outcome of
@@ -305,6 +396,7 @@ export function createSeatMailArrivalWatcher(
     // Cancelled / stopped: due now (no back-off) — back in the queue for the next turn. Failed: the next poll after retryAt.
     const waiting = queue.items.filter((item) => item.source === 'seat-mail' && typeof item.msgId === 'number').length;
     if (reofferParked(Math.max(0, Math.min(queueCap - waiting, queueNoticeRoom()))) > 0) deps.onArrived?.();
+    bellRecheck();
   };
 
   const pollMessages = (src: SeatMessageSource): SeatMailPollOutcome => {
@@ -388,6 +480,7 @@ export function createSeatMailArrivalWatcher(
           parked.set(message.id, { msgId: message.id, seat: read.seat, attempt: 1, message: { id: message.id, sender: message.from,
             body: message.body, kind: message.kind ?? null, ...headerFieldsOf(message),
             ...(message.origin ? { origin: message.origin } : {}),
+            ...(typeof message.replyTo === 'number' ? { replyTo: message.replyTo } : {}),
             ...noticeTotalField(read),
             ...(message.createdAt === undefined ? {} : { createdAt: message.createdAt }) } });
         } else log('seat-mail-dedupe-hit', { seat: read.seat, msgId: message.id, owner: adapter.owner(message.id) });
@@ -411,6 +504,7 @@ export function createSeatMailArrivalWatcher(
         kind: message.kind ?? null,
         ...headerFieldsOf(message),
         ...(message.origin ? { origin: message.origin } : {}),
+        ...(typeof message.replyTo === 'number' ? { replyTo: message.replyTo } : {}),
         ...noticeTotalField(read),
         ...(message.createdAt === undefined ? {} : { createdAt: message.createdAt }),
       };
@@ -424,6 +518,7 @@ export function createSeatMailArrivalWatcher(
         ...(message.origin ? { origin: message.origin } : {}),
         ...(message.intent ? { intent: message.intent } : {}),
         ...(message.crownDirective ? { crownDirective: message.crownDirective } : {}),
+        ...(typeof message.replyTo === 'number' ? { replyTo: message.replyTo } : {}),
         ...(message.createdAt ? { createdAt: message.createdAt } : {}) });
       noticeMessages.set(item.id, { msgId: message.id, seat: read.seat, message: input, attempt: 1 });
       src.receipts?.record({ messageId: message.id, recipient: read.seat, state: 'delivered', queueItemId: item.id });
@@ -485,6 +580,96 @@ export function createSeatMailArrivalWatcher(
     return { kind: 'quiet', unread: snapshot.unread };
   };
 
+  // SEAT-MESSAGE-BUS stage 1 — the doorbell. A ring (msg post · relay · ack · terminal receipt) wakes one ledger read
+  // after a short debounce; the interval timer above becomes the safety net only.
+  const bellSchedule = bellOptions?.schedule ?? {
+    set: (fn: () => void, ms: number) => { const t = setTimeout(fn, ms); t.unref?.(); return t; },
+    clear: (h: unknown) => clearTimeout(h as Parameters<typeof clearTimeout>[0]),
+  };
+  const bellNow = bellOptions?.now ?? Date.now;
+  const bellLog = bellOptions?.log ?? ((event: string, data: Record<string, unknown>, level: 'debug' | 'info' | 'warn') => {
+    try { debug.log('tui.seat-mail', event, data, { level }); } catch { /* observability is fail-open */ }
+  });
+  const bellFiles = bellOptions ? new Set([seatBellFile(bellOptions.seat), seatBellFile(ALL_SEAT_BELL)]) : new Set<string>();
+  let bellWatch: { close(): void } | null = null;
+  let bellDebounce: unknown = null;
+  let bellRangAt: number | null = null;
+  /** Highest lastMsgId across this seat's bells at the last read — the final re-check compares against it. */
+  let bellSeenThrough = 0;
+  const bellStamps = (): { through: number; at: number | null } => {
+    if (!bellOptions) return { through: 0, at: null };
+    let through = 0;
+    let at: number | null = null;
+    for (const file of bellFiles) {
+      const stamp = readSeatBell(join(bellOptions.dir, file));
+      if (stamp === null) continue;
+      through = Math.max(through, stamp.lastMsgId);
+      const rungAt = Date.parse(stamp.at);
+      if (Number.isFinite(rungAt)) at = Math.max(at ?? 0, rungAt);
+    }
+    return { through, at };
+  };
+  const bellStampNow = (): number => bellStamps().through;
+  const bellRead = (reason: 'ring' | 'start' | 'settle'): void => {
+    if (bellDebounce !== null) { bellSchedule.clear(bellDebounce); bellDebounce = null; }
+    const rangAt = bellRangAt;
+    bellRangAt = null;
+    const stamps = bellStamps();
+    bellSeenThrough = Math.max(bellSeenThrough, stamps.through);
+    // latency = ring written → read starts (the newest stamp's own clock; the first observed event when unreadable).
+    if (reason === 'ring' && rangAt !== null) bellLog('bell-wake', { latencyMs: Math.max(0, bellNow() - (stamps.at ?? rangAt)) }, 'debug');
+    if (handle === null) return;
+    try { poll(); } catch (error) { bellLog('bell-read-failed', { error: String(error) }, 'warn'); }
+  };
+  const ring = (filename: string | null, reason: 'ring' | 'start' = 'ring'): void => {
+    if (filename !== null && !bellFiles.has(filename)) return; // tmp files of the atomic write · other seats' bells
+    if (handle === null) return;
+    bellRangAt ??= bellNow();
+    if (bellDebounce !== null) return; // one read for every ring inside the window
+    bellDebounce = bellSchedule.set(() => { bellDebounce = null; bellRead(reason); }, bellOptions?.debounceMs ?? SEAT_MAIL_BELL_DEBOUNCE_MS);
+  };
+  const disarmBell = (): void => {
+    if (bellDebounce !== null) { bellSchedule.clear(bellDebounce); bellDebounce = null; }
+    bellRangAt = null;
+    try { bellWatch?.close(); } catch { /* fail-soft */ }
+    bellWatch = null;
+  };
+  const bellLost = (error: unknown): void => {
+    // The watch died: go back to the plain 15s poll (the safety net would otherwise be the only path for 2 minutes).
+    bellLog('bell-watch-failed', { seat: bellOptions?.seat, error: String(error) }, 'warn');
+    disarmBell();
+    if (handle === null || deps.intervalMs !== undefined) return;
+    try { timer.clear(handle); handle = timer.set(safetyTick, DEFAULT_SEAT_MAIL_POLL_MS); } catch { /* keep the old timer */ }
+  };
+  const armBell = (): boolean => {
+    if (!bellOptions) return false;
+    try {
+      mkdirSync(bellOptions.dir, { recursive: true });
+      bellWatch = (bellOptions.watch ?? defaultBellWatch)(bellOptions.dir, (filename) => ring(filename), bellLost, [...bellFiles]);
+      bellSeenThrough = bellStampNow();
+      return true;
+    } catch (error) {
+      bellLog('bell-watch-failed', { seat: bellOptions.seat, error: String(error) }, 'warn');
+      bellWatch = null;
+      return false;
+    }
+  };
+  /** The safety net: a read that finds mail the bell never announced is a miss — one info line, then it delivers. */
+  const safetyTick = (): void => {
+    const outcome = poll();
+    if (!bellOptions || bellDebounce !== null) return; // a ring is already on its way — not a miss
+    const count = outcome.kind === 'messages' ? outcome.msgIds.length : outcome.kind === 'arrived' ? 1 : 0;
+    if (count > 0) bellLog('bell-missed', { count, seat: bellOptions.seat, watching: bellWatch !== null }, 'info');
+  };
+  /**
+   * Final re-check right before the queue goes idle (opencode run-coordinator pattern): a ring that landed while the
+   * turn settled is read now instead of waiting for the next ring or the safety net.
+   */
+  const bellRecheck = (): void => {
+    if (!bellOptions || bellWatch === null || handle === null) return;
+    if (bellDebounce !== null || bellStampNow() > bellSeenThrough) bellRead('settle');
+  };
+
   return {
     getStatus: () => status,
     poll,
@@ -493,8 +678,11 @@ export function createSeatMailArrivalWatcher(
       if (handle !== null) return;
       attachTransition();
       status = 'starting';
-      try { handle = timer.set(poll, intervalMs); }
-      catch (error) { status = 'start-error'; throw error; }
+      const bellOn = armBell();
+      try { handle = timer.set(safetyTick, deps.intervalMs ?? (bellOn ? SEAT_MAIL_SAFETY_POLL_MS : DEFAULT_SEAT_MAIL_POLL_MS)); }
+      catch (error) { disarmBell(); status = 'start-error'; throw error; }
+      // Mail that landed before this process listened: one read right after boot, not a safety period later.
+      if (bellOn) ring(null, 'start');
       try {
         if (deps.heartbeat) {
           const { resolveSeatId } = require('./seat-mail-boot.js') as typeof import('./seat-mail-boot.js');
@@ -521,6 +709,7 @@ export function createSeatMailArrivalWatcher(
       status = 'stopped';
       detachTransition?.();
       detachTransition = null;
+      disarmBell();
       if (readRetry !== null) { retryTimer.clear(readRetry); readRetry = null; }
       if (handle === null) return;
       timer.clear(handle);

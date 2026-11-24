@@ -48,3 +48,15 @@ export function shouldReleasePinForGoalLoop(result: {
 }): boolean {
   return result.stopReason === 'goal_complete' && result.completionVia === 'update_goal';
 }
+
+/**
+ * ③ 답이 나간 사람 턴의 핀 해제(GOAL-PIN-RELEASE): 사람 줄이 연 턴이 답을 내고 끝났고 활성 골 루프(goalStopReason)가
+ *    없으면 그 줄은 이미 처리됐다 — 상태줄에 지시처럼 남기지 않는다. 알림 턴(사람 아님)은 해제하지 않는다.
+ */
+export function shouldReleasePinAfterAnsweredTurn(turn: {
+  readonly from?: MessageSource;
+  readonly answered: boolean;
+  readonly goalStopReason?: string;
+}): boolean {
+  return turn.from?.kind === 'human' && turn.answered && (turn.goalStopReason === undefined || turn.goalStopReason === '');
+}

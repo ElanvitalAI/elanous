@@ -3,7 +3,7 @@ import { debug } from '../debug/log.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 import { mayWriteReleaseChecklist } from './release-checklist-write.js';
 import {
-  setItem,
+  setItems,
   parityGap,
   type ChecklistStatus,
   type ChecklistDisposition,
@@ -83,8 +83,8 @@ export function registerReleaseChecklistSetCommand(program: Command): void {
     .option('--json', '결과 JSON')
     .option('--hq-override', '본부 임대 거부를 관측하며 수동 우회');
   checklist
-    .command('set <id>')
-    .description('칸 상태·근거·담당·처분 갱신')
+    .command('set <ids...>')
+    .description('칸 상태·근거·담당·처분 갱신 (여럿 가능 · 하나라도 틀리면 전부 취소)')
     .option('--version <v>', '판 또는 별칭')
     .option('--json', '결과 JSON')
     .option('--hq-override', '본부 임대 거부를 관측하며 수동 우회')
@@ -107,7 +107,7 @@ export function registerReleaseChecklistSetCommand(program: Command): void {
     .option('--ref <path...>', '근거 문서 더하기 — 저장소 상대 경로[#절] (반복 가능 · 중복 제거)')
     .action(
       async (
-        id: string,
+        ids: string[],
         opts: {
           ref?: string[];
           status?: string;
@@ -153,7 +153,7 @@ export function registerReleaseChecklistSetCommand(program: Command): void {
         const signerSeat = opts.status === 'green' ? ((await resolveServerConfirmedSeat()) ?? process.env.ELANOUS_TRACK) : process.env.ELANOUS_TRACK;
         const greenSigner = authorizeChecklistGreenSigner({ status: opts.status, seat: signerSeat });
         if (!greenSigner.allowed) {
-          debug.log('release.checklist', 'green-signer-refusal', { version, id, seat: greenSigner.seat });
+          debug.log('release.checklist', 'green-signer-refusal', { version, ids, seat: greenSigner.seat });
           throw new CliUserError(
             greenSigner.refuse ?? 'checklist green flip is judge-only',
             'JUD-* · REVIEW-* · OP — 판정자만 green 전환 가능',
@@ -161,9 +161,9 @@ export function registerReleaseChecklistSetCommand(program: Command): void {
         }
         if (!mayWriteReleaseChecklist(cmd)) return;
         const dispatchKind = opts.kind && !['screen', 'postpub'].includes(opts.kind) ? (opts.kind as ChecklistDispatchKind) : undefined;
-        const data = setItem(
+        const data = setItems(
           version,
-          id,
+          ids,
           {
             ...(opts.ref !== undefined ? { refs: opts.ref } : {}),
             ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}),
@@ -185,18 +185,20 @@ export function registerReleaseChecklistSetCommand(program: Command): void {
           },
           opts.status === 'green' ? (greenSigner.seat ?? 'cli') : process.env.ELANOUS_TRACK || 'cli',
         );
-        const item = data.items.find((entry) => entry.id === id);
-        const why = item?.kind === 'screen' && item.status === 'green' ? parityGap(item.evidence) : null;
-        if (why) {
-          console.error(`⚠ 짝: ${why} — 근거에 «짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 …» 한 줄`);
-          debug.log('release.checklist', 'parity-warning', {
-            version,
-            id,
-            why,
-          });
+        for (const id of ids) {
+          const item = data.items.find((entry) => entry.id === id);
+          const why = item?.kind === 'screen' && item.status === 'green' ? parityGap(item.evidence) : null;
+          if (why) {
+            console.error(`⚠ 짝: ${why} — 근거에 «짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 …» 한 줄`);
+            debug.log('release.checklist', 'parity-warning', {
+              version,
+              id,
+              why,
+            });
+          }
         }
         if (json) console.log(JSON.stringify(data));
-        else console.log(`✅ ${id} 갱신`);
+        else for (const id of ids) console.log(`✅ ${id} 갱신`);
       },
     );
 }

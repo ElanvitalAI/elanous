@@ -75,15 +75,15 @@ test('real els server: a running graph shows its node chain and progress note wi
   await live.progressed;
   expect(await tree()).toEqual([
     ['working', '↳ ⎔ graph · live-graph · liverun1'],
-    ['working', '  ● verify · r2 · repair · fail 1 · pass 3 · backend/booking.test.ts'],
+    ['working', '  🟢 verify · r2 · repair · fail 1 · pass 3 · backend/booking.test.ts'],
   ]);
   live.release();
   expect((await live.run).status).toBe('done');
   expect(await tree()).toEqual([
     ['done', '↳ ⎔ graph · live-graph · liverun1'],
-    ['done', '  ✓ verify · ok'],
-    ['done', '  ✓ build · ok'],
-    ['done', '  ✓ done · ok'],
+    ['done', '  ✅ verify · ok'],
+    ['done', '  ✅ build · ok'],
+    ['done', '  ✅ done · ok'],
   ]);
 });
 
@@ -104,16 +104,18 @@ test('liveness of a running node follows the clock: ● within 5 min, ◐ to 25 
 
   const live = startRun(graphFixture(), 'clockrun-0002');
   await live.progressed;
-  now = 300_000; expect(await node()).toBe('  ● verify · r2 · repair · fail 1 · pass 3 · backend/booking.test.ts');
-  now = 300_001; expect(await node()).toBe('  ◐ verify · r2 · repair · fail 1 · pass 3 · backend/booking.test.ts');
-  now = 1_500_001; expect(await node()).toBe('  ✕ verify · r2 · repair · fail 1 · pass 3 · backend/booking.test.ts');
+  now = 300_000; expect(await node()).toBe('  🟢 verify · r2 · repair · fail 1 · pass 3 · backend/booking.test.ts');
+  now = 300_001; expect(await node()).toBe('  ⏸ verify · r2 · repair · fail 1 · pass 3 · backend/booking.test.ts');
+  now = 1_500_001; expect(await node()).toBe('  🔴 verify · r2 · repair · fail 1 · pass 3 · backend/booking.test.ts');
   for (const fire of timers.splice(0)) fire(); // the run outlived tabAfterMs: it gets its own tab
-  expect(tabText.at(-1)).toBe('  ✕ verify · r2 · repair · fail 1 · pass 3 · backend/booking.test.ts');
+  expect(tabText.at(-1)!.endsWith('\n\n  🔴 verify · r2 · repair · fail 1 · pass 3 · backend/booking.test.ts')).toBe(true);
+  expect(tabText.at(-1)!.startsWith('⠋ Running graph(verify)')).toBe(true);
   live.release();
   expect((await live.run).status).toBe('done');
   await producer.idle();
   // The run's own end line first, then its chain one level in.
-  expect(tabText.at(-1)).toBe('✓ done\n  ✓ verify · ok\n  ✓ build · ok\n  ✓ done · ok');
+  expect(tabText.at(-1)!.endsWith('✅ done\n  ✅ verify · ok\n  ✅ build · ok\n  ✅ done · ok')).toBe(true);
+  expect(tabText.at(-1)!.startsWith('✓ Finished graph(done)')).toBe(true); // the graph-view widget heads the tab
 });
 
 test('no els server: requests fail and the graph run still finishes', async () => {

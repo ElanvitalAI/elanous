@@ -5,9 +5,19 @@ import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
 import { validateProvenance, type Provenance } from '../provenance/provenance.js';
-import { hasReceiptTable, latestReceiptIdOn, TERMINAL_RECEIPT_STATES, legacyIntent, listReceiptsOn, MSG_RECEIPTS_SCHEMA, recordReceiptOn, type Receipt, type ReceiptInput, type ReceiptQuery, type ReceiptRecordOutcome, type ReceiptSource, type ReceiptState } from './msg-receipts.js';
+import { currentReceiptState, hasReceiptTable, latestReceiptIdOn, receiptsCheckNeedsStart, TERMINAL_RECEIPT_STATES, legacyIntent, listReceiptsOn, MSG_RECEIPTS_SCHEMA, recordReceiptOn, type Receipt, type ReceiptInput, type ReceiptQuery, type ReceiptRecordOutcome, type ReceiptSource, type ReceiptState } from './msg-receipts.js';
 import { recordReceiptClock } from '../hq/msg-receipt-clock-sink.js';
 import { appendLedgerEvent } from './ledger-events.js';
+import { ALL_SEAT_BELL, ringSeatBell } from './seat-bell.js';
+
+/** ELS-ORCH-TASK-ENVELOPE §1 — one result artifact reference (WU §4-3 `attachments[{path, sha}]` shape). */
+export interface TaskResultArtifact { path: string; sha: string; }
+/** ELS-ORCH-TASK-ENVELOPE §1 — the finishing result a reply carries: done/failed, artifacts, summary. */
+export interface TaskResultEnvelope {
+  state: 'done' | 'failed';
+  artifacts?: TaskResultArtifact[];
+  summary?: string;
+}
 
 export interface MessageEnvelope {
   from: string;
@@ -28,6 +38,10 @@ export interface MessageEnvelope {
   crownDirective?: string;
   /** SEAT-INBOX-PROTOCOL §1b: explicit structural origin; derived from the sender when absent. */
   origin?: MessageOrigin;
+  /** ELS-ORCH-TASK-ENVELOPE §1: request↔reply correlation — ties the replies of one chain (independent of `replyTo`). */
+  correlationId?: string;
+  /** ELS-ORCH-TASK-ENVELOPE §1: the finishing result this reply carries (done/failed · artifacts · summary). */
+  result?: TaskResultEnvelope;
 }
 
 /**
@@ -62,6 +76,19 @@ export interface Message extends MessageEnvelope {
    *  addressed to the replying seat (ALL · group · another seat) and on every opted-out entrance (`--no-dedupe`,
    *  programmatic producers). */
   autoAcked?: number;
+}
+
+/** ELS-ORCH-TASK-ENVELOPE §2 — a `collect` result: the chain's replies, per-sender receipt states, and the counts. */
+export interface CollectResult {
+  /** Reply rows carrying the correlationId (the `reply_to` thread is `listThread`'s, not this). */
+  replies: Message[];
+  /** The sender's furthest receipt on the replied-to message, per reply sender. */
+  receipts: Record<string, ReceiptState>;
+  done: number;
+  failed: number;
+  pending: number;
+  /** A `timeoutMs` expiry returns the partial result instead of throwing. */
+  timedOut: boolean;
 }
 
 /** ELN-MSG-POST-IDEMPOTENT — default dedupe window. Justification: the 11-18 JUD retry loop re-sent one report 13 times
@@ -170,6 +197,29 @@ function canonicalGroupAddress(value: string): string {
 }
 
 /** Check untrusted input before opening the DB or executing a write. */
+/** ELS-ORCH-TASK-ENVELOPE §1 — validate the result envelope (absent reads as absent; any other off-spec shape throws). */
+function validateTaskResult(input: unknown): TaskResultEnvelope | undefined {
+  if (input === undefined || input === null) return undefined;
+  if (typeof input !== 'object' || Array.isArray(input)) throw new Error('result must be an object');
+  const record = input as Record<string, unknown>;
+  if (record.state !== 'done' && record.state !== 'failed') throw new Error('result.state must be done or failed');
+  if (record.artifacts !== undefined && record.artifacts !== null) {
+    if (!Array.isArray(record.artifacts)) throw new Error('result.artifacts must be an array');
+    for (const item of record.artifacts) {
+      if (typeof item !== 'object' || item === null || Array.isArray(item)) throw new Error('result.artifacts entries must be objects');
+      const artifact = item as Record<string, unknown>;
+      if (typeof artifact.path !== 'string' || !artifact.path.trim()) throw new Error('result.artifacts entries need a nonempty path');
+      if (typeof artifact.sha !== 'string' || !artifact.sha.trim()) throw new Error('result.artifacts entries need a nonempty sha');
+    }
+  }
+  if (record.summary !== undefined && record.summary !== null && typeof record.summary !== 'string') throw new Error('result.summary must be a string');
+  return {
+    state: record.state,
+    ...(Array.isArray(record.artifacts) ? { artifacts: record.artifacts as TaskResultArtifact[] } : {}),
+    ...(typeof record.summary === 'string' ? { summary: record.summary } : {}),
+  };
+}
+
 export function validateMessageEnvelope(input: unknown): MessageEnvelope {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('message must be an object');
   const record = input as Record<string, unknown>;
@@ -209,8 +259,12 @@ export function validateMessageEnvelope(input: unknown): MessageEnvelope {
   const crownDirective = record.crownDirective === undefined || record.crownDirective === null ? undefined : String(record.crownDirective).trim() || undefined;
   if (record.origin !== undefined && (typeof record.origin !== 'object' || record.origin === null || Array.isArray(record.origin)
       || !['human', 'agent', 'system', 'tool'].includes((record.origin as { kind?: unknown }).kind as string))) throw new Error('origin.kind must be human, agent, system, or tool');
+  // ELS-ORCH-TASK-ENVELOPE §1 — correlation id: one nonempty whitespace-free token; blank is the same as absent.
+  const correlationId = record.correlationId === undefined || record.correlationId === null ? undefined : String(record.correlationId).trim() || undefined;
+  if (correlationId !== undefined && /\s/.test(correlationId)) throw new Error('correlationId must not contain whitespace');
+  const result = validateTaskResult(record.result);
   // MSG-FILTERS-RELAX: an unknown field is ignored (and logged), never a refused message.
-  const unknownFields = Object.keys(record).filter(key => !['from', 'to', 'body', 'kind', 'replyTo', 'expiresAt', 'priority', 'supersedes', 'provenance', 'intent', 'refs', 'deadlineAt', 'doneWhen', 'needsAck', 'crownDirective', 'origin'].includes(key));
+  const unknownFields = Object.keys(record).filter(key => !['from', 'to', 'body', 'kind', 'replyTo', 'expiresAt', 'priority', 'supersedes', 'provenance', 'intent', 'refs', 'deadlineAt', 'doneWhen', 'needsAck', 'crownDirective', 'correlationId', 'result', 'origin'].includes(key));
   if (unknownFields.length > 0) {
     try { debug.log('msg', 'msg.envelope.unknown-fields-ignored', { fields: unknownFields }, { level: 'warn' }); } catch { /* observability is fail-open */ }
   }
@@ -228,6 +282,8 @@ export function validateMessageEnvelope(input: unknown): MessageEnvelope {
     ...(doneWhen === undefined ? {} : { doneWhen }),
     ...(record.needsAck === undefined ? {} : { needsAck: record.needsAck as boolean }),
     ...(crownDirective === undefined ? {} : { crownDirective }),
+    ...(correlationId === undefined ? {} : { correlationId }),
+    ...(result === undefined ? {} : { result: Object.freeze({ ...result }) }),
     ...(record.origin === undefined ? {} : { origin: normalizeMessageOrigin(record.origin as Record<string, unknown>, from) }),
   };
 }
@@ -396,6 +452,8 @@ interface MessageRow {
   body_ref_json?: string | null;
   origin_seat?: string | null;
   origin_delegated?: number | null;
+  correlation_id?: string | null;
+  result_json?: string | null;
 }
 
 function fromRow(row: MessageRow): Message {
@@ -415,6 +473,8 @@ function fromRow(row: MessageRow): Message {
     ...(row.deadline_at == null ? {} : { deadlineAt: row.deadline_at }),
     ...(row.done_when == null ? {} : { doneWhen: row.done_when }),
     needsAck: row.needs_ack === 1,
+    ...(row.correlation_id == null ? {} : { correlationId: row.correlation_id }),
+    ...(parseStoredResult(row.result_json) ? { result: parseStoredResult(row.result_json)! } : {}),
     ...(row.crown_directive == null ? {} : { crownDirective: row.crown_directive }),
     ...(parseStoredProvenance(row.provenance_json) ? { provenance: parseStoredProvenance(row.provenance_json)! } : {}),
     ...(origin ? { origin } : {}),
@@ -455,6 +515,13 @@ function parseStoredRefs(json: string | null | undefined): string[] | undefined 
   return undefined;
 }
 
+/** ELS-ORCH-TASK-ENVELOPE §1 — a stored result envelope (result_json); corrupt or off-spec shapes read as absent. */
+function parseStoredResult(json: string | null | undefined): TaskResultEnvelope | undefined {
+  if (!json) return undefined;
+  try { return validateTaskResult(JSON.parse(json)); } catch { /* corrupt result metadata is unknown */ }
+  return undefined;
+}
+
 function parseStoredProvenance(json: string | null | undefined): Provenance | undefined {
   if (json) {
     try { const value: unknown = JSON.parse(json); if (validateProvenance(value)) return value; } catch { /* corrupt or legacy metadata is unknown */ }
@@ -477,8 +544,35 @@ export class MsgStore {
 
   /** ELS-SERVER-EVENT-HUB-NO-DB-POLL — one best-effort sidecar line beside a COMMITTED ledger write; ':memory:' is exempt. */
   private emitLedgerEvent(kind: 'post' | 'ack' | 'receipt' | 'group'): void {
-    if (this.dbPath === ':memory:') return;
+    if (this.dbPath === ':memory:') { this.pendingBells.clear(); return; }
     appendLedgerEvent(this.dbPath, kind);   // never throws — the ledger write is the fact, this line is a courtesy
+    this.flushBells();
+  }
+
+  /**
+   * SEAT-MESSAGE-BUS stage 1 — seats whose unread set this process changed, rung at the next committed-write point
+   * (the same points that emit the sidecar line). A rolled-back write may leave a spare ring behind: harmless, a ring
+   * only makes the listener re-read the ledger.
+   */
+  private readonly pendingBells = new Map<string, number>();
+
+  private queueBell(address: string, msgId: number): void {
+    try {
+      if (address === 'ALL') this.pendingBells.set(ALL_SEAT_BELL, Math.max(this.pendingBells.get(ALL_SEAT_BELL) ?? 0, msgId));
+      else if (address.startsWith('group:')) {
+        if (!this.hasGroupMemberships) return;
+        const members = this.db.query('SELECT DISTINCT seat FROM msg_group_memberships WHERE address = ? AND left_after_id IS NULL')
+          .all(address) as Array<{ seat: string }>;
+        for (const { seat } of members) this.pendingBells.set(seat, Math.max(this.pendingBells.get(seat) ?? 0, msgId));
+      } else this.pendingBells.set(address, Math.max(this.pendingBells.get(address) ?? 0, msgId));
+    } catch { /* the bell is a courtesy — never break the ledger write */ }
+  }
+
+  private flushBells(): void {
+    if (this.pendingBells.size === 0) return;
+    const bells = [...this.pendingBells];
+    this.pendingBells.clear();
+    for (const [seat, msgId] of bells) ringSeatBell(this.dbPath, seat, msgId);   // never throws
   }
 
   /**
@@ -597,6 +691,20 @@ export class MsgStore {
     CREATE INDEX IF NOT EXISTS idx_msg_group_memberships_seat_interval ON msg_group_memberships(seat, joined_after_id, left_after_id);`);
     // SEAT-INBOX B1-C — 영수증 표(덧붙이기만). 옛 바이너리는 이 표를 모르므로 읽기에 영향 0.
     if (!options.readOnly) this.db.exec(MSG_RECEIPTS_SCHEMA);
+    // ELS-ORCH-TASK-ENVELOPE ④-1 — SQLite cannot ALTER a CHECK: an existing receipts table keeps its old
+    // 8-state CHECK forever (CREATE TABLE IF NOT EXISTS never rewrites it), so a `started` receipt would
+    // fail the constraint. Rebuild the table in one IMMEDIATE transaction to the 9-state schema instead.
+    if (!options.readOnly && receiptsCheckNeedsStart(this.db)) this.db.transaction(() => {
+      // RENAME keeps the old index attached to the renamed table → the new CREATE INDEX IF NOT EXISTS
+      // would then skip. Drop it first so the fresh schema recreates it (idempotent on a rerun).
+      this.db.exec('DROP INDEX IF EXISTS idx_msg_receipts_message');
+      this.db.exec('ALTER TABLE msg_receipts RENAME TO msg_receipts_old');
+      this.db.exec(MSG_RECEIPTS_SCHEMA);
+      // Copy ids by hand: append order and every receipt row survive the rebuild exactly as they were.
+      this.db.exec(`INSERT INTO msg_receipts(id, message_id, recipient, state, plan_item_id, queue_item_id, reason, evidence, at, source)
+        SELECT id, message_id, recipient, state, plan_item_id, queue_item_id, reason, evidence, at, source FROM msg_receipts_old`);
+      this.db.exec('DROP TABLE msg_receipts_old');
+    }).immediate();
     if (!options.readOnly) this.db.exec(`CREATE TABLE IF NOT EXISTS msg_group_all_budget (
       sender TEXT NOT NULL,
       hour_start TEXT NOT NULL,
@@ -641,6 +749,9 @@ export class MsgStore {
       // SEAT-MAIL #16 — repeat counter on the first row (NULL = sent once) and when the last suppressed repeat arrived.
       if (!columns.has('repeat_count')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN repeat_count INTEGER');
       if (!columns.has('last_repeat_at')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN last_repeat_at TEXT');
+      // ELS-ORCH-TASK-ENVELOPE §1 — correlation + result columns (additive; old binaries ignore them).
+      if (!columns.has('correlation_id')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN correlation_id TEXT');
+      if (!columns.has('result_json')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN result_json TEXT');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_reply_to ON msg_messages(reply_to, id)');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_dedupe ON msg_messages(sender, recipient, created_at)');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_post_attempt ON msg_messages(post_attempt)');
@@ -659,7 +770,7 @@ export class MsgStore {
     const columns = new Set((this.db.query('PRAGMA table_info(msg_messages)').all() as { name: string }[]).map(row => row.name));
     const wanted = ['reply_to', 'expires_at', 'priority', 'supersedes', 'provenance_json', 'from_kind', 'crown_directive', 'intent',
       'refs_json', 'body_ref_json', 'deadline_at', 'needs_ack', 'schema_version', 'origin_seat', 'origin_delegated', 'done_when', 'body_sha256',
-      'post_attempt', 'repeat_count', 'last_repeat_at'];
+      'post_attempt', 'repeat_count', 'last_repeat_at', 'correlation_id', 'result_json'];
     if (wanted.some(name => !columns.has(name))) return true;
     const indexes = new Set((this.db.query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'msg_messages'").all() as { name: string }[])
       .map(row => row.name));
@@ -747,6 +858,11 @@ export class MsgStore {
       && this.archivedMessagesWhere('id = ?', [msg.replyTo], 1).length === 0) {
       throw new Error(`reply target not found: #${msg.replyTo}`);
     }
+    // ELS-ORCH-TASK-ENVELOPE §1 — a reply inherits the parent's correlationId when it carries none
+    // (an explicit correlationId on the reply always wins; a parent without one leaves it absent).
+    const correlationId = msg.correlationId ?? (msg.replyTo !== undefined && columnPresent(this.db, 'correlation_id')
+      ? ((this.db.query('SELECT correlation_id FROM msg_messages WHERE id = ?').get(msg.replyTo) as { correlation_id: string | null } | null)?.correlation_id ?? undefined)
+      : undefined);
     const createdAt = new Date().toISOString();
     if (msg.supersedes !== undefined && !this.db.query('SELECT 1 FROM msg_messages WHERE id = ?').get(msg.supersedes)) throw new Error(`superseded message not found: #${msg.supersedes}`);
     // §5 canonical intent (v2 rows never store NULL): absent intent maps through the §1b legacy-kind table —
@@ -760,16 +876,19 @@ export class MsgStore {
       ? { ...baseOrigin, delegatedByCrown: true as const }
       : baseOrigin;
     const fromKind = origin?.kind ?? null;
-    const result = this.db.query(`INSERT INTO msg_messages(sender, recipient, body, kind, reply_to, created_at, expires_at, priority, supersedes, provenance_json, from_kind, intent, refs_json, deadline_at, needs_ack, crown_directive, schema_version, body_ref_json, origin_seat, origin_delegated, done_when, body_sha256, post_attempt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(msg.from, msg.to, msg.body, msg.kind ?? null, msg.replyTo ?? null, createdAt, msg.expiresAt ?? null, msg.priority ?? null, msg.supersedes ?? null, msg.provenance ? JSON.stringify(msg.provenance) : null, fromKind, intent, msg.refs ? JSON.stringify(msg.refs) : null, msg.deadlineAt ?? null, needsAck ? 1 : 0, msg.crownDirective ?? null, 2, null, origin?.seat ?? null, origin?.delegatedByCrown === undefined ? null : (origin.delegatedByCrown ? 1 : 0), msg.doneWhen ?? null, messageBodySha256(msg.body), attemptToken ?? null);
+    const result = this.db.query(`INSERT INTO msg_messages(sender, recipient, body, kind, reply_to, created_at, expires_at, priority, supersedes, provenance_json, from_kind, intent, refs_json, deadline_at, needs_ack, crown_directive, schema_version, body_ref_json, origin_seat, origin_delegated, done_when, body_sha256, post_attempt, correlation_id, result_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(msg.from, msg.to, msg.body, msg.kind ?? null, msg.replyTo ?? null, createdAt, msg.expiresAt ?? null, msg.priority ?? null, msg.supersedes ?? null, msg.provenance ? JSON.stringify(msg.provenance) : null, fromKind, intent, msg.refs ? JSON.stringify(msg.refs) : null, msg.deadlineAt ?? null, needsAck ? 1 : 0, msg.crownDirective ?? null, 2, null, origin?.seat ?? null, origin?.delegatedByCrown === undefined ? null : (origin.delegatedByCrown ? 1 : 0), msg.doneWhen ?? null, messageBodySha256(msg.body), attemptToken ?? null, correlationId ?? null, msg.result ? JSON.stringify(msg.result) : null);
     const id = Number(result.lastInsertRowid);
+    this.queueBell(msg.to, id);
     // SEAT-INBOX B1-C §4a — posted = 원장 커밋. 수신자 칸은 주소 그대로(ALL · group 포함).
     recordReceiptOn(this.db, { messageId: id, recipient: msg.to, state: 'posted', source: 'ledger' }, () => new Date(createdAt),
       { deferEvent: emit => { this.pendingPostedEvents.push(emit); } });
     // ELS-SERVER-EVENT-HUB-NO-DB-POLL — the sidecar line waits with the posted receipts: emitted only past the
     // outermost commit, dropped with a rollback (withPostedEvents drains this queue after the commit).
     this.pendingPostedEvents.push(() => this.emitLedgerEvent('post'));
-    return { id, ...msg, intent, needsAck, ...(origin ? { origin } : {}), schemaVersion: 2, createdAt };
+    // ELS-ORCH-TASK-ENVELOPE §1 — the returned message reflects the stored row: a reply's
+    // inherited correlationId (an explicit one already lives in msg) and the result envelope.
+    return { id, ...msg, ...(correlationId !== undefined ? { correlationId } : {}), intent, needsAck, ...(origin ? { origin } : {}), schemaVersion: 2, createdAt };
   }
 
   /**
@@ -786,6 +905,9 @@ export class MsgStore {
     // [JUD must=1 수리] recordReceiptOn 이 throw(done needs evidence 등)하면 clock 에 doneAt 이 남으면 안 된다 —
     // 검증·기록이 성공한 뒤에만 clock 을 남긴다(순서: receipt 먼저, clock 나중).
     const receipt = recordReceiptOn(this.db, { ...input, recipient }, this.clock);
+    // A terminal receipt leaves the seat's actionable set; posted rings with the INSERT, delivered/seen are the
+    // listener's own bookkeeping (ringing them would only wake it to re-read what it just took).
+    if ((TERMINAL_RECEIPT_STATES as readonly string[]).includes(input.state)) this.queueBell(recipient, input.messageId);
     if (input.state === 'seen' || input.state === 'done')
       recordReceiptClock(this.db, { messageId: input.messageId, recipient, event: input.state });
     // ELS-SERVER-EVENT-HUB-NO-DB-POLL — emitted only past a committed write (inside a caller's transaction the
@@ -899,7 +1021,7 @@ export class MsgStore {
         const original = liveOriginal ?? this.archivedMessagesWhere('id = ?', [message.replyTo], 1)[0] ?? null;
         if (original !== null && original.to === message.from) {
           if (liveOriginal !== null) this.ackMessage(message.from, message.replyTo, 'acked');
-          else this.ackArchivedOriginal(message.from, message.replyTo, 'acked');
+          else { this.ackArchivedOriginal(message.from, message.replyTo, 'acked'); this.flushBells(); }
           posted = { ...posted, autoAcked: message.replyTo };
         }
       } catch (error) {
@@ -1223,6 +1345,86 @@ export class MsgStore {
     });
   }
 
+  /**
+   * ELS-ORCH-TASK-ENVELOPE §2 — collect one correlation chain: the replies carrying the
+   * `correlationId` and, per reply sender, that sender's furthest receipt on the message they
+   * replied to. `join` picks the return point: `all` — every fan-out addressee's own reply is
+   * resolved (a `result` envelope, or an `expired` receipt on the replied-to message: an expired
+   * follow never resolves, so its absence from the done count is the partial result; an addressee
+   * still owed a reply stays pending to the wall clock — and an `expired` receipt on that
+   * addressee's own original is their termination, not a wait); `quorum` — `quorum`
+   * replies carry `result.state === 'done'`; `first` — one does. `timeoutMs` is wall-clock
+   * (`Date.now`, not the injected ledger clock): an expiry returns the partial result with
+   * `timedOut: true` instead of throwing. This is the store's first awaiting method — a poll
+   * between snapshots, never a blocking sleep, so the host process keeps serving between checks.
+   */
+  async collect(correlationId: string, opts: { join?: 'all' | 'quorum' | 'first'; quorum?: number; timeoutMs?: number } = {}): Promise<CollectResult> {
+    if (typeof correlationId !== 'string' || correlationId.trim() === '') throw new Error('correlationId must be a non-empty string');
+    const join = opts.join ?? 'all';
+    if (join !== 'all' && join !== 'quorum' && join !== 'first') throw new Error(`invalid collect join: ${String(join)}`);
+    if (opts.quorum !== undefined && (!Number.isSafeInteger(opts.quorum) || opts.quorum < 1)) throw new Error('collect quorum must be a positive integer');
+    if (join === 'quorum' && opts.quorum === undefined) throw new Error('collect quorum join needs a quorum');
+    if (opts.timeoutMs !== undefined && (!Number.isSafeInteger(opts.timeoutMs) || opts.timeoutMs < 0)) throw new Error('collect timeoutMs must be a nonnegative integer');
+    const deadline = opts.timeoutMs === undefined ? undefined : Date.now() + opts.timeoutMs;
+    const pollMs = opts.timeoutMs === undefined ? 50 : Math.max(5, Math.min(100, Math.ceil(opts.timeoutMs / 20)));
+    for (;;) {
+      const snapshot = this.collectSnapshot(correlationId);
+      const resolved = join === 'all' ? snapshot.pending === 0
+        : join === 'quorum' ? snapshot.done >= (opts.quorum as number)
+        : snapshot.done >= 1;
+      if (resolved) return { ...snapshot, timedOut: false };
+      if (deadline !== undefined && Date.now() >= deadline) return { ...snapshot, timedOut: true };
+      await new Promise<void>(resolve => setTimeout(resolve, pollMs));
+    }
+  }
+
+  /** One collect snapshot: the chain's reply rows, each sender's furthest receipt on the replied-to
+   * message, and the resolution counts. `pending` counts only unresolved replies and unanswered
+   * originals — an `expired` receipt (the reply sender's on the replied-to message, or an
+   * unanswered addressee's own on their original) terminates that target instead of pending forever. */
+  private collectSnapshot(correlationId: string): CollectResult {
+    if (!columnPresent(this.db, 'correlation_id')) return { replies: [], receipts: {}, done: 0, failed: 0, pending: 0, timedOut: false };
+    const { replies, unanswered } = this.readWithSchema((hasReplyTo, _groups, hasProvenance, hasFromKind) => {
+      if (!hasReplyTo) return { replies: [] as Message[], unanswered: [] as Array<{ id: number; recipient: string }> };
+      const replies = (this.db.query(`SELECT id, sender, recipient, body, kind, reply_to, created_at, ${envelopeMetaSql(this.db, false)}, ${hasProvenance ? 'provenance_json' : 'NULL AS provenance_json'}, ${hasFromKind ? 'from_kind' : 'NULL AS from_kind'}, ${v2Select(this.db, false)} FROM msg_messages
+        WHERE correlation_id = ? AND reply_to IS NOT NULL ORDER BY id ASC`).all(correlationId) as MessageRow[]).map(fromRow);
+      // ELS-ORCH-TASK-ENVELOPE §2 (JUD-B #140802) — each original's addressee owes their own reply
+      // (`from` = the addressee, `reply_to` = the original): a silent addressee is an unanswered
+      // wait target, so a fan-out is never an early empty return while an addressee still owes one.
+      const unanswered = (this.db.query('SELECT id, recipient FROM msg_messages WHERE correlation_id = ? AND reply_to IS NULL ORDER BY id ASC').all(correlationId) as Array<{ id: number; recipient: string }>)
+        .filter(original => !replies.some(reply => reply.replyTo === original.id && reply.from === original.recipient));
+      return { replies, unanswered };
+    });
+    const receipts: Record<string, ReceiptState> = {};
+    let done = 0;
+    let failed = 0;
+    let pending = 0;
+    for (const reply of replies) {
+      if (reply.result?.state === 'done') done += 1;
+      else if (reply.result?.state === 'failed') failed += 1;
+      const repliedTo = reply.replyTo;
+      const furthest = repliedTo === undefined || !hasReceiptTable(this.db) ? null
+        : currentReceiptState((this.db.query('SELECT state FROM msg_receipts WHERE message_id = ? AND recipient = ?')
+          .all(repliedTo, reply.from) as Array<{ state: ReceiptState }>).map(row => row.state));
+      if (furthest !== null) receipts[reply.from] = furthest;
+      // ELS-ORCH-TASK-ENVELOPE §2 — an expired follow will never resolve: close the reply instead of counting it pending forever.
+      if (reply.result === undefined && furthest !== 'expired') pending += 1;
+    }
+    // ELS-ORCH-TASK-ENVELOPE §2 (JUD-B #140802 · judb-39920-471e820a4007) — `all` waits for the
+    // fan-out's every addressee until they terminate, expiry included: an unanswered original whose
+    // addressee's receipt on it already went `expired` is a terminated target (the partial result
+    // names it in `receipts`), not a pending one; a silent addressee with no or a still-live
+    // receipt stays pending to the wall clock, so the join never returns early on silence.
+    for (const original of unanswered) {
+      const furthest = !hasReceiptTable(this.db) ? null
+        : currentReceiptState((this.db.query('SELECT state FROM msg_receipts WHERE message_id = ? AND recipient = ?')
+          .all(original.id, original.recipient) as Array<{ state: ReceiptState }>).map(row => row.state));
+      if (furthest !== null) receipts[original.recipient] = furthest;
+      if (furthest !== 'expired') pending += 1;
+    }
+    return { replies, receipts, done, failed, pending, timedOut: false };
+  }
+
   list(recipient: string, after: number = 0, limit: number = 100, opts: { includeAcked?: boolean } = {}): Message[] {
     return this.listByRecipient(recipient, after, limit, opts);
   }
@@ -1265,6 +1467,7 @@ export class MsgStore {
       ON CONFLICT(recipient) DO UPDATE SET last_id = MAX(msg_cursors.last_id, excluded.last_id)`)
       .run(to, cursor, cursor);
     if (result.changes === 0) throw new Error('cursor exceeds the latest message ID');
+    this.queueBell(to, cursor);
     // ELS-SERVER-EVENT-HUB-NO-DB-POLL — emitted only past a committed write (inside a caller's transaction the
     // caller's own completion point emits; any one complete line wakes the full recompute).
     if (!this.db.inTransaction) this.emitLedgerEvent('ack');
@@ -1315,6 +1518,7 @@ export class MsgStore {
     if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
     this.db.query(`INSERT INTO msg_message_acks(message_id, recipient, status) VALUES (?, ?, ?)
       ON CONFLICT(message_id,recipient) DO UPDATE SET status=excluded.status`).run(messageId, to, status);
+    this.queueBell(to, messageId);
   }
 
   /** Acknowledge exactly one delivered message for its recipient without moving past siblings. */
@@ -1329,6 +1533,7 @@ export class MsgStore {
       ON CONFLICT(message_id,recipient) DO UPDATE SET status=excluded.status`)
       .run(to, status, messageId, to, to, to);
     if (!result.changes) throw new Error(`message not found for ${to}: #${messageId}`);
+    this.queueBell(to, messageId);
     if (!this.db.inTransaction) this.emitLedgerEvent('ack');
     return true;
   }
@@ -1388,6 +1593,7 @@ export class MsgStore {
       const insert = this.db.query(`INSERT INTO msg_message_acks(message_id, recipient, status) VALUES (?, ?, ?)
         ON CONFLICT(message_id, recipient) DO NOTHING`);
       for (const row of rows) insert.run(row.id, to, row.done ? 'done' : 'acked');
+      if (rows.length > 0) this.queueBell(to, rows.at(-1)!.id);
       return rows.map(row => row.id);
     }).immediate();
     if (ids.length > 0) this.emitLedgerEvent('ack');
@@ -1431,6 +1637,24 @@ export class MsgStore {
   }
 
   unread(): UnreadRecipient[] { return this.unreadRecipients(); }
+
+  /** MAILBOX-HYGIENE: does a cursor row exist for this recipient? (없으면 고아 우편함) */
+  hasCursor(recipient: string): boolean {
+    const to = canonicalSeatId(recipient);
+    return !!this.db.query('SELECT 1 FROM msg_cursors WHERE recipient = ?').get(to);
+  }
+
+  /** MAILBOX-HYGIENE: 미읽음 원시 행(만료 포함, per-message ack 제외, 직접 수신자만) — 분류 도구용. */
+  listUnreadRows(): Array<{ id: number; recipient: string; sender: string; kind: string | null; expires_at: string | null; supersedes: number | null }> {
+    return this.db.query(`SELECT m.id, m.recipient, m.sender, m.kind, m.expires_at, m.supersedes
+      FROM msg_messages m
+      LEFT JOIN msg_cursors c ON c.recipient = m.recipient
+      LEFT JOIN msg_message_acks a ON a.message_id = m.id AND a.recipient = m.recipient
+      WHERE m.id > COALESCE(c.last_id, 0)
+        AND a.message_id IS NULL
+        AND m.recipient <> 'ALL' AND m.recipient NOT LIKE 'group:%'
+      ORDER BY m.id`).all() as never;
+  }
 
   close(): void {
     this.archiveDb?.close();
@@ -1557,7 +1781,7 @@ export function readUnreadSource(recipient: string, path: string = defaultMsgSto
   finally { db.close(); }
 }
 
-const V2_CORE_COLUMNS = ['intent', 'refs_json', 'deadline_at', 'needs_ack', 'crown_directive', 'schema_version', 'body_ref_json'] as const;
+const V2_CORE_COLUMNS = ['intent', 'refs_json', 'deadline_at', 'needs_ack', 'crown_directive', 'schema_version', 'body_ref_json', 'correlation_id', 'result_json'] as const;
 const V2_ORIGIN_COLUMNS = ['origin_seat', 'origin_delegated', 'done_when'] as const;
 
 function columnPresent(db: Database, name: string): boolean {

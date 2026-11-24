@@ -21,6 +21,9 @@ export const SEAT_MAIL_INFO_KINDS: readonly string[] = ['info', 'ack', 'receipt'
 /** Body characters one digest line keeps. */
 export const SEAT_MAIL_DIGEST_BODY_CHARS = 120;
 
+/** The first line of a digest turn — the count header (NOTICE-FOLD-1LINE skips it for the folded preview). */
+export const SEAT_MAIL_DIGEST_HEAD = '[seat-mail digest]';
+
 /** Idle-door debounce: mail notices arriving within this window of each other open one turn, not several. */
 export const SEAT_MAIL_COALESCE_MS = 3_000;
 
@@ -48,8 +51,13 @@ export function isInfoSeatMail(message: SeatMailDigestInput): boolean {
 export function seatMailDigestLine(message: SeatMailDigestInput): string {
   const flat = message.body.replace(/\s+/gu, ' ').trim();
   const body = flat.length <= SEAT_MAIL_DIGEST_BODY_CHARS ? flat : `${flat.slice(0, SEAT_MAIL_DIGEST_BODY_CHARS)}…`;
+  return `${seatMailDigestPrefix(message)}${body}`;
+}
+
+/** The digest line's head before the body (`#id · from · kind · `) — NOTICE-FOLD-1LINE finds the body by its length. */
+export function seatMailDigestPrefix(message: SeatMailDigestInput): string {
   const kind = typeof message.kind === 'string' && message.kind.trim() !== '' ? message.kind.trim() : '-';
-  return `#${message.id} · ${message.sender} · ${kind} · ${body}`;
+  return `#${message.id} · ${message.sender} · ${kind} · `;
 }
 
 /** A notice as it leaves the queue in one bundle (the fields this module reads). */
@@ -72,7 +80,7 @@ export function seatMailBundleText(notices: readonly SeatMailBundleNotice[]): st
   if (mail.length === 0 || (mail.length === 1 && mail[0]!.passive !== true)) return notices.map((notice) => notice.text).join('\n\n');
   const info = mail.filter((notice) => notice.passive === true);
   const action = mail.filter((notice) => notice.passive !== true);
-  const header = `[seat-mail digest] ${mail.length} mails — ${action.length} need action · ${info.length} info (every mail listed here is acked automatically after this turn)`;
+  const header = `${SEAT_MAIL_DIGEST_HEAD} ${mail.length} mails — ${action.length} need action · ${info.length} info (every mail listed here is acked automatically after this turn)`;
   const lines = mail.map((notice) => `- ${notice.digest}`);
   const blocks = action.map((notice) => notice.text);
   return [[header, ...lines].join('\n'), ...blocks, ...rest.map((notice) => notice.text)].join('\n\n');

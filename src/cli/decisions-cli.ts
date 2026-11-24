@@ -13,6 +13,9 @@ import { DecisionLedger, importDecisionMarkdown, validateDecisionRaise, type Dec
 import { formatProactMeter, readProactMeter } from '../decisions/proact-meter.js';
 import { CROWN_MARK, CROWN_THRESHOLD_CATEGORIES, CONSENSUS_CATEGORIES, ConsensusEngine, MAX_REVIEW_ROUND_TRIPS, categoryLabel, representativeLabel, type ConsensusCategory, type ConsensusRepresentative, type CrownCard, type ProposalCard } from '../loops/consensus.js';
 import { writeStdoutFully } from './stdout-flush.js';
+import { readFileSync } from 'node:fs';
+import { createPrivateKey, sign as cryptoSign } from 'node:crypto';
+import { readDecisionTrustRoots, verifyHumanApprovalProof } from '../decisions/decision-ledger.js';
 import { readQueryCache } from '../storage/short-lived-read-cache.js';
 import { formatDecisionRow } from './decision-list-format.js';
 import { decisionListSince, filterDecisionListSince } from './decision-list-since.js';
@@ -289,6 +292,28 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
     }));
   root.command('withdraw <id>').description('결정 철회도 원장에 남긴다').requiredOption('--reason <reason>').option('--json').option('--hq-override')
     .action((id: string, o: { reason: string; json?: boolean; hqOverride?: boolean }) => fail(() => { if (!mayWrite('withdraw', o.hqOverride)) return; const entry = new DecisionLedger(config).withdraw(id, o.reason); return emit(entry, o.json, `철회: ${formatDecisionDetail(entry)}`); }));
+  root.command('verify').description('결정 원장 사슬 검증 · 대역 밖 사람 증명 재확인 (사슬 파손·미확인 증명 시 exit 1)')
+    .option('--json')
+    .action((o: { json?: boolean }) => fail(() => {
+      const led = new DecisionLedger(config);
+      const chain = led.verifyChain();
+      const roots = readDecisionTrustRoots(config.stateDir ?? elanousStateRoot());
+      const humans = led.list({ status: 'all' }).filter(e => e.decidedBy?.kind === 'human');
+      const proofs = humans.map(e => ({ id: e.id, proof: e.proof ? { keyId: e.proof.keyId, verified: e.refs?.some(ref => verifyHumanApprovalProof(ref, e.proof, roots)) ?? false } : null }));
+      const unverified = proofs.filter(p => !p.proof?.verified);
+      if (!chain.ok || unverified.length) process.exitCode = 1;
+      return emit({ chain, trustRoots: roots.length, proofs }, o.json,
+        `사슬 ${chain.ok ? '양호' : '파손'}${chain.problems.length ? ` · ${chain.problems.join(' · ')}` : ''} · 과거(무사슬) 행 ${chain.legacy} · 신뢰 뿌리 ${roots.length}개\n` +
+        (proofs.length ? proofs.map(p => `human 결정 ${p.id}: ${p.proof ? (p.proof.verified ? `증명 확인(${p.proof.keyId})` : `증명 미확인(${p.proof.keyId})`) : '증명 없음 — unverified'}`).join('\n') : 'human 결정 0건'));
+    }));
+  root.command('sign-approval').description('대역 밖 승인 서명 — 사람 키 장치에서만 실행 (개인 키는 우편·보고에 올리지 않는다)')
+    .requiredOption('--ref <approvalRef>', '서명할 승인 묶음 참조 (release-critpath/<v>/<cut>/<notesSha>)')
+    .requiredOption('--key <private-pem>', '사람 개인 키 PEM 경로')
+    .option('--json')
+    .action((o: { ref: string; key: string; json?: boolean }) => fail(() => {
+      const sig = cryptoSign(null, Buffer.from(o.ref, 'utf8'), createPrivateKey(readFileSync(o.key, 'utf8'))).toString('hex');
+      return emit({ ref: o.ref, sig }, o.json, `ref: ${o.ref}\nsig: ${sig}`);
+    }));
   root.command('import-markdown <file>').description('기존 대표 결정 문서 씨앗을 가져온다 (재실행 안전)').option('--json').option('--hq-override')
     .action((file: string, o: { json?: boolean; hqOverride?: boolean }) => fail(() => {
       if (!mayWrite('import-markdown', o.hqOverride)) return;

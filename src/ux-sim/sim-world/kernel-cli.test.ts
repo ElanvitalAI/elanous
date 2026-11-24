@@ -191,7 +191,7 @@ describe('sim world run all — full run (slow: capsule-events ~92s on node-b)',
     test('`sim world run all --seed 1` (full) covers every registered world and exits 0 iff summary.ok, else 1', async () => {
     const root = stateRoot();
     const result = await simCli(['sim', 'world', 'run', 'all', '--seed', '1', '--run-id', 'full'], {
-      mode: 'spawn', stateRoot: root, allowPaths: RUN, timeoutMs: 280_000 });
+      mode: 'spawn', stateRoot: root, allowPaths: RUN, timeoutMs: 900_000 }); // 1124 main-red ENOENT: 280s에 스폰 래퍼가 CLI를 살해해 summary.json 기록 직전 사망 — all 런 지속 증가(#39881 ripen 포함) 대응
     const summary = JSON.parse(readFileSync(join(root, 'sim-world', 'full', 'summary.json'), 'utf8'));
     expect(summary.worlds).toEqual(['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel', 'router-cost', 'toolbatch', 'els', 'els-remote', 'member-journey', 'machine-infra']);
     expect(Object.keys(summary.worldWallMs).sort()).toEqual(['capsule-events', 'els', 'els-remote', 'graph', 'machine-infra', 'member-journey', 'memory', 'op-channel', 'router-cost', 'seat-mail', 'seat-mail-roundtrip', 'supervisors', 'ta', 'toolbatch', 'worker']);
@@ -200,5 +200,6 @@ describe('sim world run all — full run (slow: capsule-events ~92s on node-b)',
     expect(JSON.parse(result.stdout.trim().split('\n').at(-1)!).ok).toBe(summary.ok);
     expect(result.exitCode).toBe(summary.ok ? 0 : 1);
   // Source: R-LIVE10 — capsule-events alone measured ~92s on node-b; allowance covers a loaded gate host.
-  }, 300_000);
+  // 1124 main-red ENOENT: bun 자체 시험 타임아웃 300s가 all 런(~324s+)을 살해 — 래퍼(900s)와 동일 상한으로.
+  }, 900_000);
 });

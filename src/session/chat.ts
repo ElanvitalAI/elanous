@@ -35,11 +35,11 @@ import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
 import { isSimpleQuestionFastRoute } from '../model-tier/simple-question-fast-route.js';
 import { recordTurn } from '../status/metrics.js';
 import { createMeasuredTurnUsage, type MeasuredTurnUsage } from './turn-usage.js';
-import { shouldFireTurnStartCompact, trimKeepingAnchorAndLatestTurn } from './long-session-compact.js';
+import { shouldFireTurnStartCompact, trimKeepingAnchorAndLatestTurn, TURN_COMPACT_HISTORY_TOKENS } from './long-session-compact.js';
 import { compactSessionHistory } from './compact-session.js';
 import { CHAT_DEFAULTS } from '../user-config/chat.js';
 import type { CompactProvider } from '../compact/provider.js';
-import { clearNoOpBackoff, noOpBackoffHeld, recordNoOpBackoff } from '../compact/auto-state.js';
+import { clearNoOpBackoff, compactRegrowHeld, noOpBackoffHeld, recordCompactRegrowHold, recordNoOpBackoff } from '../compact/auto-state.js';
 import {
   buildTerminalCapableTurn,
   isTerminalCapableTurn,
@@ -244,13 +244,14 @@ export function toLLM(messages: SerializedMessage[], systemPrompt?: string): LLM
   // stands in for it when it IS that prompt (identical text, no duplicate). The old
   // `messages.some(role === 'system')` dropped the prompt as soon as the session compactor wrote its
   // summary row (a system row), i.e. right after the first compaction.
-  const head = messages.find(m => m.role !== 'tool' && m.goalInterim !== true);
+  const head = messages.find(m => m.role !== 'tool' && m.goalInterim !== true && m.compactedReply !== true);
   const storedPrompt = head?.role === 'system' && head.content === systemPrompt;
   if (systemPrompt && !storedPrompt) out.push({ role: 'system', content: systemPrompt });
   for (const m of messages) {
     // 'tool' = durable tool-telemetry (추적성·audit-only). Excluded from replay
     // so persisted tool rounds don't pollute the next turn's conversation context.
-    if (m.role === 'tool' || m.goalInterim === true) continue;
+    // compactedReply = an answer already summarized by a compaction; the summary carries it for the model.
+    if (m.role === 'tool' || m.goalInterim === true || m.compactedReply === true) continue;
     const role: LLMMessage['role'] =
       m.role === 'user' ? 'user'
       : m.role === 'assistant' ? 'assistant'
@@ -587,6 +588,12 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
           sessionId: opts.sessionId, historyUsedTokens, fullInputTokens,
           fired: false, reason: 'no-op-backoff', // 출처: #135458 §4-4③
         }, { level: 'info' });
+      } else if (compactRegrowHeld(opts.sessionId, historyUsedTokens, TURN_COMPACT_HISTORY_TOKENS)) {
+        // ELN-COMPACT-EVERY-TURN — the last compaction's summary is the cache boundary; keep it until the record
+        // has regrown by a full trigger's worth (hysteresis), instead of rewriting the prefix every turn.
+        debug.log('compact.session', 'turn-start', {
+          sessionId: opts.sessionId, historyUsedTokens, fullInputTokens, fired: false, reason: 'regrow-hold',
+        }, { level: 'info' });
       } else {
         try {
           const result = await compactSessionHistory(opts.sessionId, {
@@ -610,6 +617,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
               if (stored[i]!.role === 'user' && stored[i]!.content === userMsg.content) own = i;
             }
             messages = own >= 0 ? [...stored.slice(0, own), ...stored.slice(own + 1)] : stored;
+            recordCompactRegrowHold(opts.sessionId, estimateMessagesTokens(toLLM([...messages, userMsg])));
           } else if (result.reason === 'no-op') {
             recordNoOpBackoff(opts.sessionId, historyUsedTokens); // 출처: #135458 §4-4③
           }

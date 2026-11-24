@@ -74,7 +74,7 @@ export function statuslineUserPath(stateRoot: string = elanousStateRoot()): stri
  * The definition to draw with: the user's statusline.yaml over the default, or the default with a one-line warning
  * when that file cannot be read, does not parse, or does not merge.
  */
-export function loadNextTuiStatusline(path: string = statuslineUserPath(), readText: (path: string) => string = (file) => readFileSync(file, 'utf8')): { readonly definition: StatuslineDefinition; readonly warning?: string } {
+export function loadNextTuiStatusline(path: string = statuslineUserPath(), readText: (path: string) => string = (file) => readFileSync(file, 'utf8')): { readonly definition: StatuslineDefinition; readonly warning?: string; readonly custom?: true } {
   const base = defaultStatuslineDefinition();
   const fallback = (why: string) => ({ definition: base, warning: `Status line: ${path} ${why} — using the default` });
   let text: string;
@@ -84,7 +84,8 @@ export function loadNextTuiStatusline(path: string = statuslineUserPath(), readT
     return fallback(`cannot be read (${error instanceof Error ? error.message : String(error)})`);
   }
   const verdict = judgeNextTuiStatusline(text);
-  return verdict.ok ? { definition: verdict.definition } : fallback(verdict.why);
+  // `custom`: the person's own statusline.yaml is drawn — the Next TUI keeps its declarative line (TUI-STATUS-3ROW).
+  return verdict.ok ? { definition: verdict.definition, custom: true } : fallback(verdict.why);
 }
 
 /**
@@ -248,6 +249,10 @@ export function createNextTuiStatusline(options: {
   let rendered = false;
   return {
     warning: loaded.warning,
+    /** A user statusline.yaml is in use: draw the declarative line, not the default status rows (TUI-STATUS-3ROW). */
+    custom: loaded.custom === true,
+    /** The running build's short label (`261124_1811·dev`) for the status rows' seat row. */
+    buildShort: (): string => versionLabel(build, build.commitTime).short,
     /** Where the line sits (DESIGN §2b · STATUSLINE-CONTRACT-V1 `position:`); bottom unless the definition says otherwise. */
     position: loaded.definition.position ?? STATUSLINE_DEFAULT_POSITION,
     /** Legacy commit time is looked up after the first paint. */

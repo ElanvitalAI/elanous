@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { Command } from 'commander';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { APPROVE_OPTION, approvalRef, type ApprovalBinding, type CritpathDeps, type PreparedRelease } from '../../scripts/release-loop/critpath.js';
 import type { RaiseInput } from '../decisions/decision-ledger.js';
 
@@ -36,7 +37,7 @@ export async function defaultCritpathDeps(log: (line: string) => void): Promise<
   const cli = await import('./release-cli.js');
   const { fetchNpmRegistry, runNpmPublish } = await import('../../scripts/release-loop/npm-publish-node.js');
   const { prereleaseKind } = await import('../../scripts/release-loop/release-version.js');
-  const { DecisionLedger } = await import('../decisions/decision-ledger.js');
+  const { DecisionLedger, readDecisionTrustRoots } = await import('../decisions/decision-ledger.js');
   const readPrepared = (dir: string): PreparedRelease | null => {
     if (!existsSync(join(dir, 'release.json'))) return null;
     const m = cli.readManifest(dir);
@@ -93,6 +94,11 @@ export async function defaultCritpathDeps(log: (line: string) => void): Promise<
       return { ok: r.ok, summary: `verify ${r.ok ? 'ok' : 'fail'} · ${r.versionLine || '-'} · notesPage ${r.notesPage ?? '-'}${r.error ? ` · ${r.error}` : ''}` };
     },
     approvalRecords: () => new DecisionLedger().list({ status: 'all' }),
+    // JUD-B #139625 (PR #39854 HOLD): the default path supplied no trust roots, so critpath.ts
+    // approvalState received undefined and even a valid out-of-band ed25519 proof stayed 'unverified'
+    // — automatic publication could never resume. Same single source as the ledger above:
+    // <stateDir>/release/trust-root.json (public keys only, never secrets; no file = no roots = fail-closed).
+    trustRoots: () => readDecisionTrustRoots(elanousStateRoot()),
     requestApproval: (b: ApprovalBinding, waiveReason?: string) => {
       const ref = approvalRef(b);
       const entry = new DecisionLedger().raiseOnce(critpathApprovalCard(b, waiveReason), ref);

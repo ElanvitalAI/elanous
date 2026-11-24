@@ -258,7 +258,8 @@ export function releaseResumeWaiver(
     if (index >= 0 && rejectedHealRequiresNewRun(state, index)) {
       throw new Error('owner waiver unavailable after rejected gate heal; start a new release run from the same cut');
     }
-    if (index < 0 || state.path.lastIndexOf(opts.ownerWaive) !== index || record?.nodeId !== opts.ownerWaive || record.ok !== false || record.executed !== true || !failedAfterGate(state, index)) throw new Error('owner waiver requires the failed executable gate on the saved path');
+    const stopped = index >= 0 && record?.executed === false && gateUnmeasuredDetail(state, index)?.startsWith('stopped: ') === true;
+    if (index < 0 || state.path.lastIndexOf(opts.ownerWaive) !== index || record?.nodeId !== opts.ownerWaive || record.ok !== false || (!stopped && (record.executed !== true || !failedAfterGate(state, index)))) throw new Error('owner waiver requires the failed executable gate on the saved path');
     const reason = opts.reason.trim();
     const gateResult = lastJsonObject(record.output);
     if (hasRecordedMeasuredGateRegressions(gateResult)) throw new Error('measured gate regressions cannot be waived');

@@ -36,7 +36,7 @@ import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { envLiteral } from '../platform/env-literal.js';
 import { firstRunEnvironment, isNexusFirstRunPass, type NexusFirstRunReceipt } from '../../scripts/release-loop/nexus-first-run.js';
 import { getUserConfig } from '../user-config/reader.js';
-import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind, type ChecklistDispatchKind } from '../release-loop/checklist.js';
+import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItems, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind, type ChecklistDispatchKind } from '../release-loop/checklist.js';
 import * as features from '../release-loop/feature-store.js';
 import { evidencePlan, fetchMergedChecklistPrs, landedButYellow, type MergedPrRunner } from '../release-loop/landed-but-yellow.js';
 import { formatSchedule, getSchedule, listSchedules, planIncrementalSweepTick, setSchedule } from '../release-loop/release-schedule.js';
@@ -1111,14 +1111,14 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     const data = addItem(version, { id, title, ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.kind !== undefined && !dispatchKind ? { kind: opts.kind as ChecklistKind } : {}), ...(dispatchKind ? { dispatchKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator ? { accelerator: true } : {}) }, { allowDuplicateId: opts.allowDuplicateId });
     if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 추가`);
   });
-  withContext(checklist.command('set <id>').description('칸 상태·근거·담당·처분 갱신'))
+  withContext(checklist.command('set <ids...>').description('칸 상태·근거·담당·처분 갱신 (여럿 가능 · 하나라도 틀리면 전부 취소)'))
     .option('--status <status>', 'green|yellow|red|done').option('--evidence <evidence>', '근거').option('--owner <owner>', '담당')
     .option('--disposition <disposition>', 'move|known-issue|block').option('--kind <kind>', 'screen = 다섯 화면 짝 칸 · 근거에 짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 … 한 줄 · postpub = 발행 뒤 실측 칸 — 판 관문이 발행 전 판정에서 빼고 따로 센다 · code|ops|measure|decision|umbrella = 발사 분류')
     .option('--priority <priority>', 'P0|P1|P2').option('--deadline-version <v>', '마감 판').option('--predecessor <id...>', '선행 칸 id').option('--no-predecessor', '선행 칸 비우기(진짜 의존이 아니면 · CHECKLIST-PRED-CLEAR)')
     .option('--ceo-minutes <minutes>', '대표 손 분량(분)').option('--ceo-date <date>', '대표 손 날짜 YYYY-MM-DD')
     .option('--accelerator', '가속 등급 부여').option('--no-accelerator', '가속 등급 해제(기본은 없음)')
     .option('--ref <path...>', '근거 문서 더하기 — 저장소 상대 경로[#절] (반복 가능 · 중복 제거)')
-    .action((id: string, opts: { ref?: string[]; status?: string; evidence?: string; owner?: string; disposition?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[] | false; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean }, cmd: Command) => {
+    .action((ids: string[], opts: { ref?: string[]; status?: string; evidence?: string; owner?: string; disposition?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[] | false; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean }, cmd: Command) => {
       const { version, json } = context(cmd);
       if (opts.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(opts.status)) throw new CliUserError(`잘못된 상태: ${opts.status}`, 'green|yellow|red|done');
       if (opts.disposition !== undefined && !['move', 'known-issue', 'block'].includes(opts.disposition)) throw new CliUserError(`잘못된 처분: ${opts.disposition}`, 'move|known-issue|block');
@@ -1127,14 +1127,16 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         throw new CliUserError('초록 판정은 OP 또는 OPC만 기록할 수 있다 — 판정국에 [GREEN-REQ]를 보내 판정을 요청하라', 'release checklist set <id> --evidence "[GREEN-REQ] …"');
       if (!mayWrite(cmd)) return;
       const dispatchKind = opts.kind && !['screen', 'postpub'].includes(opts.kind) ? opts.kind as ChecklistDispatchKind : undefined;
-      const data = setItem(version, id, { ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined && !dispatchKind ? { kind: opts.kind as ChecklistKind } : {}), ...(dispatchKind ? { dispatchKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor === false ? [] : opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}) }, process.env.ELANOUS_TRACK || 'cli');
-      const item = data.items.find((entry) => entry.id === id);
-      const why = item?.kind === 'screen' && item.status === 'green' ? parityGap(item.evidence) : null;
-      if (why) {
-        console.error(`⚠ 짝: ${why} — 근거에 «짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 …» 한 줄`);
-        debug.log('release.checklist', 'parity-warning', { version, id, why });
+      const data = setItems(version, ids, { ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined && !dispatchKind ? { kind: opts.kind as ChecklistKind } : {}), ...(dispatchKind ? { dispatchKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor === false ? [] : opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}) }, process.env.ELANOUS_TRACK || 'cli');
+      for (const id of ids) {
+        const item = data.items.find((entry) => entry.id === id);
+        const why = item?.kind === 'screen' && item.status === 'green' ? parityGap(item.evidence) : null;
+        if (why) {
+          console.error(`⚠ 짝: ${why} — 근거에 «짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 …» 한 줄`);
+          debug.log('release.checklist', 'parity-warning', { version, id, why });
+        }
       }
-      if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 갱신`);
+      if (json) console.log(JSON.stringify(data)); else for (const id of ids) console.log(`✅ ${id} 갱신`);
     });
   withContext(checklist.command('claim <id>').description('칸의 단일 주인을 잡는다'))
     .requiredOption('--by <owner>', '잡을 자리 또는 하위 자리').option('--force', 'OP 승인으로 기존 주인을 바꾼다').option('--reason <reason>', 'OP 강제 재배정 사유')

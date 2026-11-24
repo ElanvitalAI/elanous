@@ -1,4 +1,5 @@
 import { closeSync, existsSync, fstatSync, ftruncateSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { createHash, createPublicKey, verify as cryptoVerify } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
@@ -23,6 +24,8 @@ export type DecisionActor =
   | { kind: 'auto'; agent: string; track?: DecisionTrack; delegation: string; origin?: 'automation' }
   /** Recorded from a document, not decided here: never passes a human gate. */
   | { kind: 'imported'; source: string };
+/** DECISION-LEDGER-HUMAN-AUTH 0.3.34 — out-of-band proof: a trust-root signature over the exact approval binding. */
+export interface HumanProof { keyId: string; sig: string }
 export interface DecisionEntry {
   id: string; title: string; category: DecisionCategory; scqa: { s: string; c: string; q?: string; a?: string };
   options: DecisionOption[]; recommendation: Recommendation; raisedAt?: string; importedAt?: string;
@@ -37,7 +40,7 @@ export interface DecisionEntry {
   crossCheckSkipped?: string;
   alternative?: string;
   dissent?: string;
-  decidedAt?: string; decidedBy?: DecisionActor; choice?: string; note?: string; versionAtDecision?: Versions;
+  decidedAt?: string; decidedBy?: DecisionActor; choice?: string; note?: string; versionAtDecision?: Versions; proof?: HumanProof;
   withdrawnAt?: string; withdrawReason?: string;
   history: Array<{ type: 'raised' | 'options-added' | 'decided' | 'withdrawn'; at?: string; by: string; version?: Versions; choice?: string; reason?: string }>;
 }
@@ -50,7 +53,7 @@ export interface SeatDecisionRecord {
   decidedAt?: string; versionAtDecision?: Versions; refs?: string[];
 }
 export type SeatDecisionInput = Pick<SeatDecisionRecord, 'title' | 'decision' | 'seat' | 'delegation' | 'refs'> & { decidedAt?: string };
-type Event = { type: 'raised'; entry: DecisionEntry } | { type: 'seat-recorded'; entry: SeatDecisionRecord } | { type: 'options-added'; id: string; at: string; options: DecisionOption[]; by: string } | { type: 'decided'; id: string; at?: string; by: DecisionActor; choice?: string; version?: Versions; note?: string } | { type: 'withdrawn'; id: string; at: string; reason: string; version: Versions };
+type Event = { type: 'raised'; entry: DecisionEntry } | { type: 'seat-recorded'; entry: SeatDecisionRecord } | { type: 'options-added'; id: string; at: string; options: DecisionOption[]; by: string } | { type: 'decided'; id: string; at?: string; by: DecisionActor; choice?: string; version?: Versions; note?: string; proof?: HumanProof } | { type: 'withdrawn'; id: string; at: string; reason: string; version: Versions };
 export interface DecisionLedgerOptions extends VersionOptions { stateDir?: string; now?: () => Date; resolveVersion?: (at: string) => Versions; writeAnswer?: typeof writePendingQuestionAnswer; postDecisionNotice?: (entry: DecisionEntry, stateDir: string, seat: string) => number }
 
 /** null = the decision resumes no run; otherwise whether the answer file was written (or already matched). */
@@ -165,6 +168,29 @@ export function validateDecisionRaise(input: RaiseInput): RaiseInput {
   return validate(input);
 }
 
+/** Trust roots live outside the ledger (<stateDir>/release/trust-root.json): public keys only, never secrets. */
+export interface DecisionTrustRoot { keyId: string; publicKey: string }
+export function readDecisionTrustRoots(stateDir: string): DecisionTrustRoot[] {
+  try {
+    const path = join(stateDir, 'release', 'trust-root.json');
+    if (!existsSync(path)) return [];
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { keys?: unknown };
+    if (!Array.isArray(parsed.keys)) return [];
+    return parsed.keys.filter((k): k is DecisionTrustRoot => {
+      if (!k || typeof k !== 'object') return false;
+      const key = k as Partial<DecisionTrustRoot>;
+      return typeof key.keyId === 'string' && key.keyId.trim() !== '' && typeof key.publicKey === 'string' && /BEGIN PUBLIC KEY/.test(key.publicKey);
+    });
+  } catch { return []; }
+}
+/** Out-of-band human proof: a trust-root signature over this exact binding. No roots, no proof, no approval. */
+export function verifyHumanApprovalProof(ref: string, proof: HumanProof | undefined, trustRoots: readonly DecisionTrustRoot[] | undefined): boolean {
+  if (!proof || !trustRoots?.length) return false;
+  const root = trustRoots.find(k => k.keyId === proof.keyId);
+  if (!root) return false;
+  try { return cryptoVerify(null, Buffer.from(ref, 'utf8'), createPublicKey(root.publicKey), Buffer.from(proof.sig, 'hex')); }
+  catch { return false; }
+}
 export class DecisionLedger {
   readonly path: string;
   private readonly lockPath: string;
@@ -265,10 +291,29 @@ export class DecisionLedger {
     });
   }
   private append(event: Event): void { this.appendBatch([event]); }
+  /** Chain state: the last chained row's sha, or GENESIS when chaining (re)starts after pre-chain rows. */
+  private lastChainSha(): string {
+    if (!existsSync(this.path)) return 'GENESIS';
+    const lines = readFileSync(this.path, 'utf8').split('\n').filter(Boolean);
+    if (!lines.length) return 'GENESIS';
+    try {
+      const last = JSON.parse(lines.at(-1)!) as { chainSha?: unknown };
+      return typeof last.chainSha === 'string' && /^[0-9a-f]{64}$/.test(last.chainSha) ? last.chainSha : 'GENESIS';
+    } catch { return 'GENESIS'; }
+  }
   private appendBatch(events: Event[]): void {
     const fd = openSync(this.path, 'a', 0o600);
     try {
-      const bytes = Buffer.from(events.map(event => JSON.stringify(event)).join('\n') + '\n', 'utf8');
+      // DECISION-LEDGER-HUMAN-AUTH 0.3.34 — every row hashes the previous row:
+      // rewriting, removing or reordering any row breaks the chain verifyChain() walks.
+      let prev = this.lastChainSha();
+      const rows = events.map(event => {
+        const sha = createHash('sha256').update(`${prev}\n${JSON.stringify(event)}`).digest('hex');
+        const row = JSON.stringify({ ...event, chainPrev: prev, chainSha: sha });
+        prev = sha;
+        return row;
+      });
+      const bytes = Buffer.from(rows.join('\n') + '\n', 'utf8');
       const size = fstatSync(fd).size;
       try {
         if (writeSync(fd, bytes) !== bytes.length) throw new Error('short decision ledger write');
@@ -277,6 +322,33 @@ export class DecisionLedger {
         throw error;
       }
     } finally { closeSync(fd); }
+  }
+  /** Verification path: recompute every row sha and the prev linkage; pre-chain legacy rows are counted, not failures. */
+  verifyChain(): { ok: boolean; problems: string[]; legacy: number } {
+    const problems: string[] = [];
+    let legacy = 0;
+    let chained = false;
+    let prev: string | null = null;
+    const lines = existsSync(this.path) ? readFileSync(this.path, 'utf8').split('\n').filter(Boolean) : [];
+    lines.forEach((line, i) => {
+      let parsed: Record<string, unknown>;
+      try { parsed = JSON.parse(line) as Record<string, unknown>; }
+      catch { problems.push(`row ${i + 1}: invalid JSON`); return; }
+      const { chainSha, chainPrev, ...event } = parsed;
+      // 'GENESIS' marks the first chained row (appendBatch chains from it) — every later row must chain from the sha before it.
+      const chainedRow = typeof chainSha === 'string' && /^[0-9a-f]{64}$/.test(chainSha)
+        && (chainPrev === 'GENESIS' || (typeof chainPrev === 'string' && /^[0-9a-f]{64}$/.test(chainPrev)));
+      if (!chainedRow) {
+        if (chained) problems.push(`row ${i + 1}: chain fields missing after chained rows`);
+        else legacy += 1;
+        return;
+      }
+      if (chainPrev !== (chained ? prev : 'GENESIS')) problems.push(`row ${i + 1}: chainPrev breaks continuity (expected ${(chained ? prev : 'GENESIS') ?? ''})`);
+      if (createHash('sha256').update(`${chainPrev}\n${JSON.stringify(event)}`).digest('hex') !== chainSha) problems.push(`row ${i + 1}: chainSha mismatch — payload rewritten after append`);
+      chained = true;
+      prev = chainSha;
+    });
+    return { ok: problems.length === 0, problems, legacy };
   }
   list(filters: { status?: 'open' | 'decided' | 'all'; since?: string; version?: string; decidedBy?: 'human' | 'auto'; category?: DecisionCategory } = {}): DecisionEntry[] {
     if (filters.since && !Number.isFinite(Date.parse(filters.since))) throw new Error('invalid since date');
@@ -299,7 +371,7 @@ export class DecisionLedger {
         }
         if (event.type === 'decided' && (event.choice ? !old.options.some(option => option.key === event.choice) : old.options.length !== 0 || !old.refs?.length)) throw new Error(`invalid decision option: ${event.id}`);
         if (event.type === 'decided') map.set(event.id, { ...old, status: 'decided', ...(event.at ? { decidedAt: event.at } : {}), decidedBy: event.by, choice: event.choice,
-          ...(event.version ? { versionAtDecision: event.version } : {}), ...(event.note ? { note: event.note } : {}),
+          ...(event.version ? { versionAtDecision: event.version } : {}), ...(event.note ? { note: event.note } : {}), ...(event.proof ? { proof: event.proof } : {}),
           history: [...old.history, { type: 'decided', ...(event.at ? { at: event.at } : {}), by: event.by.kind, choice: event.choice, ...(event.version ? { version: event.version } : {}) }] });
         else map.set(event.id, { ...old, status: 'withdrawn', withdrawnAt: event.at, withdrawReason: event.reason,
           history: [...old.history, { type: 'withdrawn', at: event.at, by: 'agent', reason: event.reason, version: event.version }] });
@@ -401,14 +473,15 @@ export class DecisionLedger {
     return entry;
   }
   /** Record the decision and say whether its answer reached the waiting run (null = the decision resumes nothing). */
-  decideWithDelivery(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string): { entry: DecisionEntry; delivery: AnswerDelivery; notice: DecisionNotice } {
-    return this.decideLocked(id, choice, by, note, decidedAt);
+  decideWithDelivery(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string, proof?: HumanProof): { entry: DecisionEntry; delivery: AnswerDelivery; notice: DecisionNotice } {
+    return this.decideLocked(id, choice, by, note, decidedAt, proof);
   }
-  decide(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string): DecisionEntry {
-    return this.decideLocked(id, choice, by, note, decidedAt).entry;
+  decide(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string, proof?: HumanProof): DecisionEntry {
+    return this.decideLocked(id, choice, by, note, decidedAt, proof).entry;
   }
-  private decideLocked(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string): { entry: DecisionEntry; delivery: AnswerDelivery; notice: DecisionNotice } {
+  private decideLocked(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string, proof?: HumanProof): { entry: DecisionEntry; delivery: AnswerDelivery; notice: DecisionNotice } {
     if (!by || (by.kind !== 'human' && by.kind !== 'auto')) throw new Error('decidedBy is required');
+    if (proof && (!/^[0-9A-Za-z_-]{1,64}$/.test(proof.keyId) || !/^[0-9a-f]{16,512}$/.test(proof.sig))) throw new Error('invalid human proof shape');
     if (by.kind === 'human') by = cleanHuman(by);
     if (by.kind === 'auto') {
       single(by.delegation, 'delegation'); single(by.agent, 'agent');
@@ -421,7 +494,7 @@ export class DecisionLedger {
       if (!old.options.some(o => o.key === choice)) throw new Error(`option not found: ${choice}`);
       const at = utc(decidedAt ?? this.now().toISOString());
       if (old.raisedAt && at < old.raisedAt) throw new Error('decision before raise');
-      this.append({ type: 'decided', id, at, by, choice, version: this.version(at), ...(note ? { note: safe(single(note, 'note')) } : {}) });
+      this.append({ type: 'decided', id, at, by, choice, version: this.version(at), ...(note ? { note: safe(single(note, 'note')) } : {}), ...(proof ? { proof } : {}) });
       debug.log('decisions', 'decided', { id, category: old.category, by: by.kind });
       const decided = this.show(id);
       return { entry: decided, delivery: this.deliverAnswer(decided), notice: this.notifyDecided(decided) };

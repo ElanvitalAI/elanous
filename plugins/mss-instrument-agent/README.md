@@ -3,7 +3,7 @@
 Read-only subagent that audits code for missing `debug.log` sites per MSS PLAN §11.5.
 
 - Body: [`./agents/mss-instrument-reviewer.md`](./agents/mss-instrument-reviewer.md)
-- Plan reference: [`내부 문서 `PLAN-memory-and-signal-substrate`` §11.5](../../내부 문서 `PLAN-memory-and-signal-substrate`)
+- Plan reference: [`내부 문서 `PLAN-memory-and-signal-substrate`` §11.5](../../내부 문서 `IDEAS`)
 - Phase: M0 scaffolding (manual invocation only; PR-hook wire lands in M2.2+)
 
 ## Usage

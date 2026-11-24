@@ -31,6 +31,7 @@ import { queryFederatedUnfinishedRunLedgers, type FederatedUnfinishedRunLedgerEn
 import { queryRunningRuns, type RunningRunsResult } from '../self-implement/running-runs.js';
 import { debug } from '../debug/log.js';
 import { runGitCommand } from '../git-fs/runner.js';
+import { callingSeatFromEnv, decidePushSeatOwnership, delegatedSeatsOf, seatLabelOf } from '../git-fs/push-ownership.js';
 import {
   defaultCensusParallelRunner,
   defaultCmdRunner,
@@ -238,8 +239,8 @@ function pushLiveConflictMerge(input: {
   }
   if (integration.unmeasured || !integration.commitSha || integration.conflicts.length) return { pushed: false, reason: 'integration-unmeasured-or-conflicted' };
 
-  const view = run('gh', ['pr', 'view', url, '--json', 'headRefOid,headRefName,headRepositoryOwner,headRepository'], { cwd });
-  let identity: { headRefOid?: string; headRefName?: string; headRepositoryOwner?: { login?: string }; headRepository?: { name?: string } } = {};
+  const view = run('gh', ['pr', 'view', url, '--json', 'headRefOid,headRefName,headRepositoryOwner,headRepository,labels'], { cwd });
+  let identity: { headRefOid?: string; headRefName?: string; headRepositoryOwner?: { login?: string }; headRepository?: { name?: string }; labels?: { name?: string }[] } = {};
   try { if (view.ok) identity = JSON.parse(view.out) as typeof identity; } catch { /* unavailable means refuse */ }
   const branch = identity.headRefName;
   const ownerRepo = identity.headRepositoryOwner?.login && identity.headRepository?.name
@@ -248,6 +249,11 @@ function pushLiveConflictMerge(input: {
     || identity.headRefOid?.toLowerCase() !== head.toLowerCase()) return { pushed: false, reason: 'pinned-pr-identity-unavailable-or-changed' };
   const validBranch = run('git', ['check-ref-format', '--branch', branch], { cwd });
   if (!validBranch.ok) return { pushed: false, reason: 'invalid-pr-head-branch' };
+  // SEAT-FOREIGN-PR-PUSH-GUARD (OP #134088): 남의 PR 가지 push 거부 — 가지 접두어·PR 작성
+  // 자리(`seat:` 라벨) ↔ 호출 자리(ELANOUS_TRACK) 대조. 주인 위임(`delegates:<호출자리>`)만 허용.
+  const ownership = decidePushSeatOwnership({ callingSeat: callingSeatFromEnv(cwd), branch,
+    ownerSeat: seatLabelOf(identity.labels), delegatedTo: delegatedSeatsOf(identity.labels) });
+  if (ownership.kind === 'refuse') return { pushed: false, reason: `push-owner-guard:${ownership.reason}` };
   const pushRemote = run('git', ['remote', 'get-url', '--push', 'origin'], { cwd });
   const pushUrls = pushRemote.ok ? pushRemote.out.trim().split(/\r?\n/).filter(Boolean) : [];
   if (pushUrls.length !== 1 || !ownerRepo || githubOwnerRepo(pushUrls[0]!) !== ownerRepo) {

@@ -593,85 +593,99 @@ export function setItemIfSnapshot(v: string, id: string, patch: Parameters<typeo
 }
 
 function setItemGuarded(v: string, id: string, patch: Parameters<typeof setItem>[2], by: string, expected?: Pick<ChecklistItem, 'title' | 'status' | 'evidence'>): Checklist {
-  assertNoOuterWhitespaceCellId(id);
+  return setItemsGuarded(v, [id], patch, by, expected);
+}
+
+export function setItems(v: string, ids: string[], patch: Parameters<typeof setItem>[2], by: string): Checklist {
+  return setItemsGuarded(v, ids, patch, by);
+}
+
+function setItemsGuarded(v: string, ids: string[], originalPatch: Parameters<typeof setItem>[2], by: string, expected?: Pick<ChecklistItem, 'title' | 'status' | 'evidence'>): Checklist {
+  if (!ids.length || new Set(ids).size !== ids.length) throw new CliUserError('칸 id 는 하나 이상, 중복 없이 지정한다');
+  ids.forEach(assertNoOuterWhitespaceCellId);
   return mutate(v, (data, otherItems) => {
-    const item = data.items.find((i) => i.id === id);
-    if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
-    if (expected && (item.title !== expected.title || item.status !== expected.status || item.evidence !== expected.evidence))
-      throw new CliUserError(`판정 중 칸 변경: ${id}`, '현재 칸으로 다시 측정한다');
-    if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new CliUserError(`잘못된 상태: ${patch.status}`);
-    if (patch.disposition !== undefined && !['move', 'known-issue', 'block'].includes(patch.disposition)) throw new CliUserError(`잘못된 처분: ${patch.disposition}`);
-    // #134310 ②(JUD-2 보안 HOLD) — green 전환의 가드는 CLI 가 아니라 원장 공통 전환 문에 둔다: 다른 명령 경로
-    // (ops-ledger ChecklistSet 등)·직접 호출도 같은 검사를 받는다. 허용 집합은 종전 정책의 합집합 — 판정자
-    // JUD*·REVIEW*(CLI 가드 #133987) ⊕ OP·OPC(release-cli 판정국 [GREEN-REQ]) ⊕ 코드 고정 자동화 신원
-    // 'harness'(merged-pr-checklist 병합 자동 green)·'tasks-green-sweep'(green-sweep 판정 스윕) — 이 둘은
-    // 호출부 코드가 정하는 값이지 호출자 입력(ELANOUS_TRACK·'cli' 등)이 아니며, 자동화 행위자의 인증 신원
-    // 통합은 CX-3 ELS-ORCH-PEER-IDENTITY 가 다룬다(FU). 서명자 출처 인증(#134310 ①)은 CLI 경로의 몫이고,
-    // 직접 파일 쓰기는 이번 범위 밖 FU(파일 권한 · OP #134310).
-    if (patch.status === 'green') {
-      const seat = (by ?? '').trim();
-      const codeFixedAutomation = seat === 'harness' || seat === 'tasks-green-sweep';
-      if (!(seat === 'OP' || seat === 'OPC' || seat.startsWith('JUD') || seat.startsWith('REVIEW') || codeFixedAutomation))
-        throw new CliUserError(
-          `checklist green flip is judge-only — store write by "${seat || 'cli'}" refused (judges: JUD-* / REVIEW-*; owner: OP/OPC)`,
-          'JUD-* · REVIEW-* · OP/OPC — 판정자만 green 전환 가능',
-        );
-    }
-    if (patch.kind !== undefined && !CHECKLIST_KINDS.includes(patch.kind)) throw new CliUserError(`잘못된 종류: ${patch.kind}`, 'screen|postpub');
-    if (patch.dispatchKind !== undefined && !CHECKLIST_DISPATCH_KINDS.includes(patch.dispatchKind)) throw new CliUserError(`잘못된 발사 종류: ${patch.dispatchKind}`, 'code|ops|measure|decision|umbrella');
-    if (patch.priority !== undefined && !['P0', 'P1', 'P2'].includes(patch.priority)) throw new CliUserError(`잘못된 우선순위: ${patch.priority}`);
-    if (patch.predecessors !== undefined && (!Array.isArray(patch.predecessors) || patch.predecessors.some((p) => typeof p !== 'string' || !p.trim() || p === id))) throw new CliUserError('잘못된 선행 칸');
-    assertPredecessorsExist(patch.predecessors, data, otherItems);
-    if (patch.deadlineVersion !== undefined) store.validateVersion(patch.deadlineVersion);
-    if (patch.accelerator !== undefined && patch.accelerator !== true && patch.accelerator !== null) throw new CliUserError('가속 등급은 true(부여) 또는 null(해제)이다');
-    if (patch.provenance !== undefined && !validateProvenance(patch.provenance)) throw new CliUserError('잘못된 근거 출처 꼬리표');
-    const evidenceWasProvided = patch.evidence !== undefined;
-    if (patch.provenance !== undefined && patch.evidence === undefined) patch = { ...patch, evidence: item.evidence ?? '' };
-    if (patch.evidence !== undefined) {
-      const provenanceLines = (evidence: string | undefined) => evidence?.split(/\r?\n/).filter(line => line.startsWith('provenance: ')) ?? [];
-      const currentLines = provenanceLines(item.evidence);
-      const incomingLines = evidenceWasProvided ? provenanceLines(patch.evidence) : [];
-      if (incomingLines.length > 1) throw new CliUserError('근거에 출처 꼬리표가 중복됐다');
-      const currentLine = currentLines.length === 1 ? currentLines[0] : undefined;
-      const incomingLine = incomingLines[0];
-      const currentProvenance = currentLine ? parseProvenanceEvidenceLine(currentLine) : null;
-      if (incomingLine && !parseProvenanceEvidenceLine(incomingLine))
-        throw new CliUserError('잘못된 근거 출처 꼬리표');
-      if (incomingLine && !patch.provenance && (!currentProvenance || incomingLine !== currentLine))
-        throw new CliUserError('잘못된 근거 출처 꼬리표');
-      if (currentProvenance && incomingLine && incomingLine !== currentLine) throw new CliUserError('기존 근거 출처 꼬리표와 새 꼬리표가 충돌한다');
-      if (patch.provenance) {
-        const provenanceLine = provenanceEvidenceLine(patch.provenance);
-        if (currentProvenance && currentLine !== provenanceLine) throw new CliUserError('기존 근거 출처 꼬리표와 새 꼬리표가 충돌한다');
-        if (incomingLine && incomingLine !== provenanceLine) throw new CliUserError('근거 출처 꼬리표와 새 꼬리표가 충돌한다');
-        const humanEvidence = (patch.evidence ?? '').split(/\r?\n/).filter(line => !line.startsWith('provenance: ')).join('\n');
-        patch = { ...patch, evidence: humanEvidence ? `${humanEvidence}\n${provenanceLine}` : provenanceLine };
-      } else if (currentProvenance && !incomingLine) {
-        patch = { ...patch, evidence: patch.evidence ? `${patch.evidence}\n${currentLine}` : currentLine };
+    let changed = false;
+    for (const id of ids) {
+      let patch = originalPatch;
+      const item = data.items.find((i) => i.id === id);
+      if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
+      if (expected && (item.title !== expected.title || item.status !== expected.status || item.evidence !== expected.evidence))
+        throw new CliUserError(`판정 중 칸 변경: ${id}`, '현재 칸으로 다시 측정한다');
+      if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new CliUserError(`잘못된 상태: ${patch.status}`);
+      if (patch.disposition !== undefined && !['move', 'known-issue', 'block'].includes(patch.disposition)) throw new CliUserError(`잘못된 처분: ${patch.disposition}`);
+      // #134310 ②(JUD-2 보안 HOLD) — green 전환의 가드는 CLI 가 아니라 원장 공통 전환 문에 둔다: 다른 명령 경로
+      // (ops-ledger ChecklistSet 등)·직접 호출도 같은 검사를 받는다. 허용 집합은 종전 정책의 합집합 — 판정자
+      // JUD*·REVIEW*(CLI 가드 #133987) ⊕ OP·OPC(release-cli 판정국 [GREEN-REQ]) ⊕ 코드 고정 자동화 신원
+      // 'harness'(merged-pr-checklist 병합 자동 green)·'tasks-green-sweep'(green-sweep 판정 스윕) — 이 둘은
+      // 호출부 코드가 정하는 값이지 호출자 입력(ELANOUS_TRACK·'cli' 등)이 아니며, 자동화 행위자의 인증 신원
+      // 통합은 CX-3 ELS-ORCH-PEER-IDENTITY 가 다룬다(FU). 서명자 출처 인증(#134310 ①)은 CLI 경로의 몫이고,
+      // 직접 파일 쓰기는 이번 범위 밖 FU(파일 권한 · OP #134310).
+      if (patch.status === 'green') {
+        const seat = (by ?? '').trim();
+        const codeFixedAutomation = seat === 'harness' || seat === 'tasks-green-sweep';
+        if (!(seat === 'OP' || seat === 'OPC' || seat.startsWith('JUD') || seat.startsWith('REVIEW') || codeFixedAutomation))
+          throw new CliUserError(
+            `checklist green flip is judge-only — store write by "${seat || 'cli'}" refused (judges: JUD-* / REVIEW-*; owner: OP/OPC)`,
+            'JUD-* · REVIEW-* · OP/OPC — 판정자만 green 전환 가능',
+          );
+      }
+      if (patch.kind !== undefined && !CHECKLIST_KINDS.includes(patch.kind)) throw new CliUserError(`잘못된 종류: ${patch.kind}`, 'screen|postpub');
+      if (patch.dispatchKind !== undefined && !CHECKLIST_DISPATCH_KINDS.includes(patch.dispatchKind)) throw new CliUserError(`잘못된 발사 종류: ${patch.dispatchKind}`, 'code|ops|measure|decision|umbrella');
+      if (patch.priority !== undefined && !['P0', 'P1', 'P2'].includes(patch.priority)) throw new CliUserError(`잘못된 우선순위: ${patch.priority}`);
+      if (patch.predecessors !== undefined && (!Array.isArray(patch.predecessors) || patch.predecessors.some((p) => typeof p !== 'string' || !p.trim() || p === id))) throw new CliUserError('잘못된 선행 칸');
+      assertPredecessorsExist(patch.predecessors, data, otherItems);
+      if (patch.deadlineVersion !== undefined) store.validateVersion(patch.deadlineVersion);
+      if (patch.accelerator !== undefined && patch.accelerator !== true && patch.accelerator !== null) throw new CliUserError('가속 등급은 true(부여) 또는 null(해제)이다');
+      if (patch.provenance !== undefined && !validateProvenance(patch.provenance)) throw new CliUserError('잘못된 근거 출처 꼬리표');
+      const evidenceWasProvided = patch.evidence !== undefined;
+      if (patch.provenance !== undefined && patch.evidence === undefined) patch = { ...patch, evidence: item.evidence ?? '' };
+      if (patch.evidence !== undefined) {
+        const provenanceLines = (evidence: string | undefined) => evidence?.split(/\r?\n/).filter(line => line.startsWith('provenance: ')) ?? [];
+        const currentLines = provenanceLines(item.evidence);
+        const incomingLines = evidenceWasProvided ? provenanceLines(patch.evidence) : [];
+        if (incomingLines.length > 1) throw new CliUserError('근거에 출처 꼬리표가 중복됐다');
+        const currentLine = currentLines.length === 1 ? currentLines[0] : undefined;
+        const incomingLine = incomingLines[0];
+        const currentProvenance = currentLine ? parseProvenanceEvidenceLine(currentLine) : null;
+        if (incomingLine && !parseProvenanceEvidenceLine(incomingLine))
+          throw new CliUserError('잘못된 근거 출처 꼬리표');
+        if (incomingLine && !patch.provenance && (!currentProvenance || incomingLine !== currentLine))
+          throw new CliUserError('잘못된 근거 출처 꼬리표');
+        if (currentProvenance && incomingLine && incomingLine !== currentLine) throw new CliUserError('기존 근거 출처 꼬리표와 새 꼬리표가 충돌한다');
+        if (patch.provenance) {
+          const provenanceLine = provenanceEvidenceLine(patch.provenance);
+          if (currentProvenance && currentLine !== provenanceLine) throw new CliUserError('기존 근거 출처 꼬리표와 새 꼬리표가 충돌한다');
+          if (incomingLine && incomingLine !== provenanceLine) throw new CliUserError('근거 출처 꼬리표와 새 꼬리표가 충돌한다');
+          const humanEvidence = (patch.evidence ?? '').split(/\r?\n/).filter(line => !line.startsWith('provenance: ')).join('\n');
+          patch = { ...patch, evidence: humanEvidence ? `${humanEvidence}\n${provenanceLine}` : provenanceLine };
+        } else if (currentProvenance && !incomingLine) {
+          patch = { ...patch, evidence: patch.evidence ? `${patch.evidence}\n${currentLine}` : currentLine };
+        }
+      }
+      validateCeoLoad(patch);
+      // --ref 는 «더하기»다 — 기존 참조 뒤에 붙이고 중복을 지운다.
+      if (patch.refs !== undefined) patch = { ...patch, refs: normalizeRefs([...(item.refs ?? []), ...patch.refs]) };
+      if (patch.owner !== undefined) {
+        parseOwner(patch.owner);
+        if (item.owner && patch.owner !== item.owner) {
+          throw new CliUserError(`지금 주인: ${item.owner} — --force 로만 바꾼다`, 'release checklist claim <id> --by <자리> --force');
+        }
+      }
+      const fields = (['evidence', 'knownIssue', 'owner', 'status', 'disposition', 'kind', 'dispatchKind', 'priority', 'predecessors', 'deadlineVersion', 'ceoMinutes', 'ceoDate', 'accelerator', 'refs'] as const).filter((field) => patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(item[field] ?? null));
+      if (fields.length === 0) continue;
+      changed = true;
+      const at = new Date().toISOString();
+      for (const field of fields) {
+        const from = item[field];
+        const to = patch[field]!;
+        if ((field === 'accelerator' || field === 'knownIssue') && to === null) delete (item as unknown as Record<string, unknown>)[field];
+        else (item as unknown as Record<string, unknown>)[field] = to;
+        item.updatedAt = at;
+        item.updatedBy = by;
+        change(data, id, field, from, to, by, at);
       }
     }
-    validateCeoLoad(patch);
-    // --ref 는 «더하기»다 — 기존 참조 뒤에 붙이고 중복을 지운다.
-    if (patch.refs !== undefined) patch = { ...patch, refs: normalizeRefs([...(item.refs ?? []), ...patch.refs]) };
-    if (patch.owner !== undefined) {
-      parseOwner(patch.owner);
-      if (item.owner && patch.owner !== item.owner) {
-        throw new CliUserError(`지금 주인: ${item.owner} — --force 로만 바꾼다`, 'release checklist claim <id> --by <자리> --force');
-      }
-    }
-    const fields = (['evidence', 'knownIssue', 'owner', 'status', 'disposition', 'kind', 'dispatchKind', 'priority', 'predecessors', 'deadlineVersion', 'ceoMinutes', 'ceoDate', 'accelerator', 'refs'] as const).filter((field) => patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(item[field] ?? null));
-    if (fields.length === 0) return false;
-    const at = new Date().toISOString();
-    for (const field of fields) {
-      const from = item[field];
-      const to = patch[field]!;
-      if ((field === 'accelerator' || field === 'knownIssue') && to === null) delete (item as unknown as Record<string, unknown>)[field];
-      else (item as unknown as Record<string, unknown>)[field] = to;
-      item.updatedAt = at;
-      item.updatedBy = by;
-      change(data, id, field, from, to, by, at);
-    }
-    return true;
+    return changed;
   });
 }
 

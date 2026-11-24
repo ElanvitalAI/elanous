@@ -75,7 +75,7 @@ test('ⓐ 리터럴 ①②③④ — 바쁜 턴 우편 1: 본문 원문·msgId·
   expect(drained[0]!.text).toBe(item!.text); // 큐 항목 문면과 일치(seatMessageNotice 재사용)
   expect(drained[0]!.text).toContain('TC-H-CX-1'); // 보낸 자리 — 머리줄
   expect(drained[0]!.text).toContain('msg:4127 · 리터럴 본문 원문 4127'); // 본문 원문(전문)
-  // ② drain → onDrained 로 큐 항목(q1) 제거 1회.
+  // ② 큐 항목(q1) 제거 1회 — N03-SEED7 수리 뒤로는 이벤트함 «접수 시점»에 즉시(배수 대기창 폐쇄).
   expect(f.removals).toEqual([{ source: 'seat-mail', msgId: 4127 }]);
   expect(f.queue.items.filter((q) => q.source === 'seat-mail')).toHaveLength(0);
   // ③ 같은 msgId 재도착 → 세션 동안 0건(한 번만).
@@ -143,4 +143,23 @@ test('JUD security HOLD: no sender preempts a busy turn — OP decision mail rid
     { msgId: 803, seat: 'TC-H-CX-13', sender: 'TC', origin: { kind: 'agent', seat: 'TC' }, intent: 'request', text: 'msg:803 · later' },
   ]);
   expect(midturn).toEqual(['801:msg:801 · earlier', '802:msg:802 · go', '803:msg:803 · later']);
+});
+
+test('N03-SEED7 — 이벤트함 접수 즉시 큐 노티스 제거: 배수 전 이중 배달 창을 닫는다(OP #140613)', () => {
+  const session = 'midturn-mail-seed7-immediate';
+  clearMidTurnEvents(session);
+  const f = midturnFixture(session);
+  const input = { id: 1411, sender: 'OP', body: 'C4 urgent request', kind: null };
+  const item = f.producers.seatMessageArrived(input);
+  expect(item).not.toBeNull();
+  // 바쁜 턴 도착 → 이벤트함 접수와 «동시에» 원본 큐 노티스가 지워진다(배수 대기 창 없음).
+  f.onArrived([{ msgId: input.id, seat: 'TC-H-POOL-3', sender: 'OP', text: item!.text }]);
+  expect(midTurnEventCount(session)).toBe(1);
+  expect(f.removals).toEqual([{ source: 'seat-mail', msgId: 1411 }]); // ← 즉시 제거(현행은 배수 때 — RED)
+  expect(f.queue.items.filter((q) => q.source === 'seat-mail')).toHaveLength(0);
+  // 배수는 그대로 · 배수 시점의 중복 제거 호출은 없다(세션 1회 계약 유지).
+  const drained = drainMidTurnEvents(session);
+  expect(drained).toHaveLength(1);
+  expect(f.removals).toHaveLength(1);
+  clearMidTurnEvents(session);
 });

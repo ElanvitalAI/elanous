@@ -92,6 +92,11 @@ export function requestEls(socketPath: string, request: ElsRequest, timeoutMs = 
       try { value = JSON.parse(line); } catch { malformed(); return; }
       if (!isResult(value)) { malformed(); return; }
       if (awaitingAck) {
+        // Older servers reject an invalid credential without the auth prefix.
+        // Recognize only that exact rejection; never accept an unframed success.
+        if (value.exitCode !== 0 && value.message === 'els: invalid credential') {
+          done({ ...value, transport: { outcome: 'answered' } }); return;
+        }
         if (!value.message.startsWith('auth: ')) { malformed(); return; }
         if (value.exitCode !== 0) { done({ ...value, transport: { outcome: 'answered' } }); return; }
         awaitingAck = false;

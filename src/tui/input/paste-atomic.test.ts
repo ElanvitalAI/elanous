@@ -8,7 +8,7 @@ const key = (name: string, extra: Partial<Key> = {}): Key => ({ name, ctrl: fals
 const paste = (text: string): Key => ({ name: 'paste', ctrl: false, shift: false, paste: text } as Key);
 // A paste folds from PASTE_FOLD_MIN_LINES lines; the token names its line count.
 const PASTED = Array.from({ length: PASTE_FOLD_MIN_LINES }, (_, index) => `line ${index + 1}`).join('\n');
-const TOKEN = `[Paste #1 · ${PASTE_FOLD_MIN_LINES} lines · full text]`;
+const TOKEN = `[Paste #1 · +${PASTE_FOLD_MIN_LINES} lines · full text]`;
 
 function composerWithPaste(before: string, after: string) {
   const input = createNextTuiCoreInput();

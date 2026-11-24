@@ -626,7 +626,7 @@ test('0.2.14 published graph executes the real story recipe into the isolated re
     mkdirSync(checklistDir, { recursive: true });
     setElanousConfigDir(root);
     addItem(version, { id: 'STORY_214', title: 'New reading mode — details' });
-    setItem(version, 'STORY_214', { status: 'green' }, 'MK');
+    setItem(version, 'STORY_214', { status: 'green' }, 'JUD-1');
     const ledger = new ClaimsLedger({ stateDir: root });
     ledger.add({ id: 'EXPORT_214', claim: 'New export mode is available.', audience: 'personal', owner: 'MK' });
     ledger.verify('EXPORT_214', { value: 'yes', command: 'bun measure-export.ts', measuredAt: new Date().toISOString(),

@@ -92,7 +92,8 @@ describe('resolveKnowledgeDocsRoots', () => {
       toolModuleUrl: fx.scriptUrl,
       toolDocsSegments: ['..', 'docs'],
       cwd: join(fx.root, 'work'),
-      exists: () => true,
+      // 현실적 스텁 — 참 스텁이면 현행 절 후보(실제 홈·도구 docs 아래 경로)까지 끌어들인다.
+      exists: (p) => p === fx.toolDocs,
       readPackageName: () => 'elanous',
       gitRoot: () => join(fx.root, 'tool'),
     });

@@ -39,7 +39,7 @@ docs/design/craft/
 
 ### 📌 1차가 «둘»이었던 이유 ⊕ 2차가 나머지를 마저 들인 이유
 
-1차는 플랜([`PLAN-design-source-acquisition-and-use`](../../plans/PLAN-design-source-acquisition-and-use-2026-08-22.md) §5 3️⃣)의
+1차는 플랜(`PLAN-design-source-acquisition-and-use` §5 3️⃣)의
 *"한 번에 11개를 다 들이지 않는다"* 를 따랐다 — 그때는 **읽는 자가 없었다**.
 - `anti-ai-slop` = 「자동 강제 ↔ 사람 판단」을 **가르는 문법**의 원본
 - `accessibility-baseline` = 그중 **기계가 실제로 잴 수 있는** 축(WCAG)
@@ -90,7 +90,7 @@ shasum -a 256 내부 문서 `*` docs/design/craft/LICENSE
 ⓐ 라이선스 전문을 같이 둔다              ✅ LICENSE
 ⓑ 「고쳤다」를 표시한다                   ⚠️ 지금은 «안 고쳤다». 고치는 순간 이 절에 적는다
 ⓒ 원저작 귀속을 보존한다                 ✅ anti-ai-slop.md:11 의
-                                            `> Adapted from [refero_skill](…)` 줄이 살아 있다
+                                            `> Adapted from refero_skill` 줄이 살아 있다
 ```
 
 > ### ⚠️⭐ **ⓒ 는 «Apache-2.0 밖»의 의무다**
@@ -145,6 +145,6 @@ shasum -a 256 내부 문서 `*` docs/design/craft/LICENSE
 
 ## 5. 🧭 관련
 
-- 확보 전략 = [`PLAN-design-source-acquisition-and-use`](../../plans/PLAN-design-source-acquisition-and-use-2026-08-22.md)
-- 소스 전수 조사 = [`RESEARCH-free-design-sources-inventory`](../../archive/2026-08/RESEARCH-free-design-sources-inventory-2026-08-22.md)
-- 로드맵 축 **B1** = [`ROADMAP-f-track-acp-conformance-and-design-projects`](../../ROADMAP-f-track-acp-conformance-and-design-projects-2026-08-22.md)
+- 확보 전략 = `PLAN-design-source-acquisition-and-use`
+- 소스 전수 조사 = `RESEARCH-free-design-sources-inventory`
+- 로드맵 축 **B1** = `ROADMAP-f-track-acp-conformance-and-design-projects`

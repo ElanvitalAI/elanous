@@ -9,25 +9,22 @@ describe('getConcisenessSystemPrompt', () => {
     const prompt = getConcisenessSystemPrompt({
       enabled: true,
       finalMessageMaxLines: 7,
-      preambleMaxWords: 12,
     });
     expect(prompt).toContain('at most 7 lines');
   });
 
-  test('mentions the configured preamble word cap', () => {
+  test('mentions the fixed preamble word cap', () => {
     const prompt = getConcisenessSystemPrompt({
       enabled: true,
       finalMessageMaxLines: 10,
-      preambleMaxWords: 9,
     });
-    expect(prompt).toContain('9 words or fewer');
+    expect(prompt).toContain('12 words or fewer');
   });
 
   test('includes anti-narration and terminal formatting rules', () => {
     const prompt = getConcisenessSystemPrompt({
       enabled: true,
       finalMessageMaxLines: 10,
-      preambleMaxWords: 12,
     });
     expect(prompt).toContain('Do not narrate each step');
     // TUI-INITIATIVE 0단(대표 10-15 «시키는 일만 하고 끝나는 상태부터 막자»): every brevity rule has an act-first path.
@@ -47,7 +44,6 @@ describe('buildConcisenessSystemMessages', () => {
     const msgs = buildConcisenessSystemMessages({
       enabled: true,
       finalMessageMaxLines: 10,
-      preambleMaxWords: 12,
     });
     expect(msgs).toHaveLength(1);
     expect(msgs[0]!.role).toBe('system');
@@ -58,7 +54,6 @@ describe('buildConcisenessSystemMessages', () => {
     expect(buildConcisenessSystemMessages({
       enabled: false,
       finalMessageMaxLines: 10,
-      preambleMaxWords: 12,
     })).toEqual([]);
   });
 });

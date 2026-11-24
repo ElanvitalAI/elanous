@@ -12,6 +12,7 @@ import type { LLMMessage, LLMProvider, LLMStreamEvent } from '../llm.js';
 import * as surfaceModule from '../session-runtime/index.js';
 import * as deferredModule from '../session-runtime/tier-flip.js';
 import { runGoalLoop } from './run-goal-loop.js';
+import { runCoreTurn, type RunCoreTurnOptions } from './run-core-turn.js';
 import { CORE_TOOL_SPECS } from '../domains/core-tools.js';
 import type { CoreTurnContext } from './types.js';
 import { debug } from '../debug/log.js';
@@ -62,7 +63,12 @@ function expectResearchToolsHidden(toolNames: string[]): void {
   for (const name of researchToolNames) expect(toolNames).not.toContain(name);
 }
 
-async function driveKnownAnswer(turns: ScriptedTurns, userText: string, messages: LLMMessage[] = [{ role: 'user', content: userText }]) {
+async function driveKnownAnswer(
+  turns: ScriptedTurns,
+  userText: string,
+  options: { messages?: LLMMessage[]; runResearch?: RunCoreTurnOptions['runResearch'] } = {},
+) {
+  const messages = options.messages ?? [{ role: 'user' as const, content: userText }];
   const { provider, callsSeen } = scriptedProvider(turns, 'known-answer-fixture');
   const seenToolNames: string[][] = [];
   const seenMessages: LLMMessage[][] = [];
@@ -83,8 +89,10 @@ async function driveKnownAnswer(turns: ScriptedTurns, userText: string, messages
     dispatchTool: async (name) => { dispatchedTools.push(name); return 'fixture evidence'; },
     signal: new AbortController().signal,
   };
+  const { runResearch } = options;
   const result = await runGoalLoop(ctx, {
     controlSpaceId: null, intentStallProvider: null, changedFiles: () => [],
+    ...(runResearch ? { runTurn: (turn) => runCoreTurn(turn, { runResearch }) } : {}),
     attachLifecycleBridge: () => () => {}, startLivenessHeartbeat: () => () => {},
   });
   return { result, calls: callsSeen(), seenMessages, seenToolNames, dispatchedTools, routeReasons };
@@ -305,7 +313,7 @@ describe('CHAT-KNOWN-ANSWER-NO-RESEARCH', () => {
       { role: 'assistant', content: '단군왕검은 고조선을 세운 인물로 전해집니다.' },
       { role: 'user', content: '가장 오래 산 왕' },
     ];
-    const followup = await driveKnownAnswer([[{ type: 'text', delta: '전승 자료로는 장수왕이 알려져 있습니다.' }]], '가장 오래 산 왕', history);
+    const followup = await driveKnownAnswer([[{ type: 'text', delta: '전승 자료로는 장수왕이 알려져 있습니다.' }]], '가장 오래 산 왕', { messages: history });
     expect(followup.result.finalText).toContain('장수왕');
     expect(followup.calls).toBe(1);
     expect(followup.dispatchedTools).toEqual([]);
@@ -318,10 +326,26 @@ describe('CHAT-KNOWN-ANSWER-NO-RESEARCH', () => {
     ['최신 한국 인구를 알려줘', 'freshness'],
     ['현재 대통령은 누구야?', 'freshness'],
     ['광합성이 뭔가요? 출처 링크를 붙여줘', 'citations'],
-  ])('keeps research available for %s', async (question, reason) => {
-    const result = await driveKnownAnswer([[{ type: 'text', delta: '확인한 내용입니다.' }]], question);
-    expect(result.seenToolNames.flat()).toContain('WebSearch');
-    expect(result.routeReasons).toContainEqual(expect.objectContaining({ reason }));
+  ])('grounds %s before the answer model is called', async (question, reason) => {
+    const sourceUrl = 'https://example.org/fixture-evidence';
+    const evidence = '격리 검색에서 확보한 근거';
+    const researchRequests: string[] = [];
+    const result = await driveKnownAnswer((messages) => {
+      expect(researchRequests).toEqual([question]);
+      expect(messages.some((message) => typeof message.content === 'string'
+        && message.content.includes(evidence))).toBe(true);
+      return [{ type: 'text', delta: `확인한 내용입니다. ${sourceUrl}` }];
+    }, question, {
+      runResearch: async (request, _signal, _admit, _routing, hooks) => {
+        researchRequests.push(request);
+        hooks?.onRoute?.({ localOnly: false, needsFreshFacts: reason === 'freshness', needsCitations: reason === 'citations' });
+        return { ok: true, output: evidence, sourceUrls: [sourceUrl] };
+      },
+    });
+    expect(researchRequests).toEqual([question]);
+    expect(result.calls).toBe(1);
+    expect(result.result.finalText).toContain(sourceUrl);
+    expect(result.routeReasons).toContainEqual(expect.objectContaining({ event: 'research-available', reason }));
   });
 
   test.each(['S5 상태 값이 3 맞아?', 'S5 값이 3 맞아?', 'S5의 값이 3 맞아?'])(

@@ -101,7 +101,7 @@ S: 골 저작기와 Pod 자식은 HQ의 private `seat-state` 파일을 읽지 �
 
 ## UX simulation device index
 
-The UX simulation device catalog is [`src/ux-sim/mock-scenario-catalog.json`](../../src/ux-sim/mock-scenario-catalog.json). Its IDs use the `UX-MS-` prefix so they do not collide with the reusable verification scenes MS-01–05 defined above.
+The UX simulation device catalog is `src/ux-sim/mock-scenario-catalog.json`. Its IDs use the `UX-MS-` prefix so they do not collide with the reusable verification scenes MS-01–05 defined above.
 
 ```bash
 bun scripts/ux-sim.ts list

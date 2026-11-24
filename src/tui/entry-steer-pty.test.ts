@@ -50,20 +50,22 @@ test('A200: input typed during a tool turn is steered into the next model reques
     { label: 'steer-queued', chunks: [`${SLOW}-READ`, '\r', 'turn left please', '\r'], gapMs: 350,
       until: (s) => s.includes('steer pending') },
     // after: the child drained it right before the next model request.
-    { label: 'steer-applied', until: (s) => s.includes('Steer applied') },
+    // TUI-NOTICE-QUIET (대표 11-24): «Steer applied» is no longer drawn — the pending mark clearing is the surface.
+    { label: 'steer-applied', until: (s) => !s.includes('steer pending') },
     { label: 'settled', until: (s) => s.includes('STEER-DONE') && !s.includes('steer pending') },
   ], 'steer-notes.txt');
   expect(run.exitCode).toBe(0);
   const settled = run.frames.find((frame) => frame.label === 'settled')?.screen ?? '';
   // Applied steer does not come back as a separate queued turn.
-  expect(settled).not.toContain('> turn left please');
+  expect(settled).not.toContain('❯ turn left please');
   expect(settled).not.toMatch(QUEUE_ONE);
+  expect(settled).not.toContain('Steer applied');
 }, 90_000);
 
 test('A200: Esc with queued input auto-submits it as the next turn (draft stays empty)', async () => {
   const run = await runSteer([
     { label: 'queued', chunks: [`${SLOW} first`, '\r', 'after cancel', '\r'], gapMs: 350, until: (s) => QUEUE_ONE.test(s) },
-    { label: 'esc', keys: '\x1b', until: (s) => s.includes('> after cancel') && s.includes('STEER-DONE') },
+    { label: 'esc', keys: '\x1b', until: (s) => s.includes('❯ after cancel') && s.includes('STEER-DONE') },
   ]);
   expect(run.exitCode).toBe(0);
   const screen = run.frames.find((frame) => frame.label === 'esc')?.screen ?? '';

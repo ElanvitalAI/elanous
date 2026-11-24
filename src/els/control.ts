@@ -471,8 +471,11 @@ export function createControl(deps: ControlDeps) {
       // The server-selected interrupt is a raw Escape, whereas normal input is a sanitized line.
       const auditedText = input.fixedKey === 'escape' ? '\x1b' : input.action === 'input' ? clean(text) : text;
       const from = input.from ?? input.principal.id;
-      // ELS-DOOR-STRUCT-OPS: close destroys work. It must carry a human confirmation marker; nothing else closes.
-      if (input.action === 'close' && input.confirm !== true) {
+      // ELS-DOOR-STRUCT-OPS: close destroys work. It must carry a human confirmation marker — except for the OP
+      // coordinator (its seat or the baton's acting OP): closing a seat tab is routine coordinator work (ELS-OP-CLOSE-TAB ·
+      // 대표 11-24 «보안 기본 완화»). Its own tab is refused by the callers that know the tab's owner (tool · server).
+      const coordinatorClose = input.principal.seat === 'OP' || deps.isActingOperator?.(input.principal) === true;
+      if (input.action === 'close' && input.confirm !== true && !coordinatorClose) {
         const reason = 'close needs confirm:true (human confirmation)';
         audit({ ...socketAuditFields(input.socketAudit), principal: input.principal.id, kind: input.principal.kind, workspace: input.target.workspace, tab: input.target.tab, pane: input.target.pane, action: input.action, result: 'denied', danger: 'n/a', reason, chars: 0, sha256: sha256(''), at: now() });
         return { ok: false, code: 'denied', reason, message: `els close: denied for ${input.principal.id} (${reason})` };
@@ -492,7 +495,7 @@ export function createControl(deps: ControlDeps) {
         if (auditFailure) return { ok: false, code: 'audit-failed', reason: auditFailure, message: `els ${input.action}: denied; audit not written` };
         return { ok: false, code: 'denied', reason, message: `els ${input.action}: denied (${reason})` };
       }
-      if (CONFIRM_REQUIRED_ACTIONS.has(input.action) && input.confirm !== true && input.principal.seat !== 'OP') {
+      if (CONFIRM_REQUIRED_ACTIONS.has(input.action) && input.confirm !== true && !coordinatorClose) {
         const reason = `${input.action} needs confirm:true (human confirmation)`;
         audit({ ...base, result: 'denied', danger: 'n/a', reason });
         return { ok: false, code: 'denied', reason, message: `els ${input.action}: denied for ${input.principal.id} (${reason})` };

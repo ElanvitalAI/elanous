@@ -5,6 +5,8 @@
 import { StringDecoder } from 'node:string_decoder';
 import { childSummary, STATUS, wordOfSeatState, type StatusColor, type StatusWord } from './status-vocab.js';
 import { parsePaneSeatStatus } from './seat-status.js';
+import { isWaiting, needsPerson } from './seat-marks.js';
+import type { BlockReason, SeatState } from '../agent-events/protocol.js';
 
 const ESC = '\u001b';
 const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
@@ -165,11 +167,18 @@ export function createPrefixFilter(): { feed: (bytes: string) => { send: string;
 
 // Bare `els` (the app view) is mouse-driven: tab/button clicks arrive as SGR (1006) press reports, so the terminal must be asked
 // to send them (1000 = button reports). Disabled again in reverse order on leave.
-export const ENTER_VIEW = `${ESC}[?1049h${ESC}[?1000h${ESC}[?1006h${ESC}[2J${ESC}[H`;
-export const LEAVE_VIEW = `${ESC}[?1006l${ESC}[?1000l${ESC}[?1049l`;
-// `els attach <pane>` forwards raw stdin to the pane, so it must NOT turn mouse reporting on (the reports would land in the shell).
-export const ENTER_PANE_VIEW = `${ESC}[?1049h${ESC}[2J${ESC}[H`;
-export const LEAVE_PANE_VIEW = `${ESC}[?1049l`;
+// ELS-TYPING-LATENCY: ?2004h — the person's terminal wraps a paste in ESC[200~ … ESC[201~, so the pane program gets the
+// paste as ONE paste (not a stream of typed keys, each redrawn and a newline submitting early). The server drops the
+// markers for a pane that did not ask for bracketed paste itself.
+export const ENTER_VIEW = `${ESC}[?1049h${ESC}[?1000h${ESC}[?1006h${ESC}[?2004h${ESC}[2J${ESC}[H`;
+export const LEAVE_VIEW = `${ESC}[?2004l${ESC}[?1006l${ESC}[?1000l${ESC}[?1049l`;
+// `els attach <pane>`: ELS-WHEEL-HISTORY — mouse reporting ON (1000 + 1006 SGR) so a wheel over the pane is seen at all.
+// Before this the terminal sent no wheel (or turned it into ↑/↓ itself) and eln's history never moved. Every report is
+// routed by createPaneViewMouse (attach-mouse.ts) — none reaches a pane that does not track its own mouse.
+// ELS-WHEEL-HISTORY: the pane view's mouse router lives with the mouse parser; re-exported so the CLI keeps one view import.
+export { createPaneViewMouse } from './attach-mouse.js';
+export const ENTER_PANE_VIEW = `${ESC}[?1049h${ESC}[?1000h${ESC}[?1006h${ESC}[2J${ESC}[H`;
+export const LEAVE_PANE_VIEW = `${ESC}[?1006l${ESC}[?1000l${ESC}[?1049l`;
 
 // ---- Stage 3: the herdr-shaped screen — spaces on the left, the live pane in the middle, one status line --------------
 
@@ -190,6 +199,10 @@ export interface PaneRow {
   readonly seat?: string;
   /** ELS-SIDEBAR-HERDR-CLEAN: the pane's working folder (the selected space's path line). */
   readonly cwd?: string;
+  /** SIDETAB-TWO-MARKS: the seat state code the pane published, its reason, and the seat's unread mail — the attention mark's inputs. */
+  readonly seatState?: SeatState;
+  readonly seatReason?: BlockReason;
+  readonly unread?: number;
 }
 
 /** Mark of a host the federated list reports down (design DESIGN-ELS-SIDETAB-SERVER §원격 «⇄aws1 ✕»; same «✕ ⇄host · 연결 끊김» as the sidetab rows). */
@@ -263,7 +276,7 @@ export function parsePaneRows(listJson: string): PaneRow[] {
     const row = raw as Record<string, unknown>;
     if (typeof row.pane !== 'string' || typeof row.address !== 'string') continue;
     const wsId = row.address.split('/')[0] ?? '';
-    rows.push({ pane: row.pane, ...(typeof row.tab === 'string' ? { tabId: row.tab } : {}), wsId, ...(coordinators.has(wsId) ? { role: 'coordinator' as const } : {}), ...(row.spaceCoordinator === true ? { spaceCoordinator: true } : {}), ...(typeof row.seat === 'string' && row.seat ? { seat: row.seat } : {}), workspace: String(row.workspace ?? ''), title: `${String(tabs.find(tab => tab.id === row.tab)?.label ?? row.title ?? row.pane)} ${buildBadge(row.build)}`, state: rowState(row), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
+    rows.push({ pane: row.pane, ...(typeof row.tab === 'string' ? { tabId: row.tab } : {}), wsId, ...(coordinators.has(wsId) ? { role: 'coordinator' as const } : {}), ...(row.spaceCoordinator === true ? { spaceCoordinator: true } : {}), ...(typeof row.seat === 'string' && row.seat ? { seat: row.seat } : {}), workspace: String(row.workspace ?? ''), title: `${String(tabs.find(tab => tab.id === row.tab)?.label ?? row.title ?? row.pane)} ${buildBadge(row.build)}`, state: rowState(row), ...markFields(row), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
   }
   return coordinatorFirst(rows);
 }
@@ -289,7 +302,7 @@ export function parseRemoteRows(listJson: string): PaneRow[] {
     const space = Array.isArray(spaces) ? spaces.find((ws) => ws && typeof ws === 'object' && ws.host === row.host && ws.id === row.ws && typeof ws.name === 'string') : undefined;
     const label = split > 0 ? title.slice(0, split) : space?.name ?? row.ws;
     rows.push({ pane: row.address, wsId: `${row.host}:${row.ws}`, workspace: `⇄${row.host} ${label}`, title: `${split > 0 ? title.slice(split + 3) : title || String(row.pane ?? row.address)} ${buildBadge(row.build)}`,
-      state: rowState(row), remote: row.host, ...(row.role === 'coordinator' ? { role: 'coordinator' as const } : {}), ...(row.spaceCoordinator === true ? { spaceCoordinator: true } : {}), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
+      state: rowState(row), ...markFields(row), remote: row.host, ...(row.role === 'coordinator' ? { role: 'coordinator' as const } : {}), ...(row.spaceCoordinator === true ? { spaceCoordinator: true } : {}), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
   }
   return coordinatorFirst(rows);
 }
@@ -298,7 +311,17 @@ export function parseRemoteRows(listJson: string): PaneRow[] {
  *  else the activity state as before. The code decides; the pane's screen is never read for it. */
 function rowState(row: Record<string, unknown>): string {
   const status = parsePaneSeatStatus(row.status);
+  // SIDETAB-TWO-MARKS: a seat that needs a person (or waits on a reply/timer) is IDLE in slot 1; the attention mark says why.
+  if (status && (needsPerson(status.state, status.reason) || isWaiting(status.state, status.reason))) return 'idle';
   return status ? wordOfSeatState(status.state) : String(row.activityState ?? row.state ?? '');
+}
+
+/** SIDETAB-TWO-MARKS: the attention inputs of a list row (codes and the mail badge only). */
+function markFields(row: Record<string, unknown>): Pick<PaneRow, 'seatState' | 'seatReason' | 'unread'> {
+  const status = parsePaneSeatStatus(row.status);
+  const mail = (row.unreadMail as { count?: unknown } | null | undefined)?.count;
+  return { ...(status ? { seatState: status.state, ...(status.reason ? { seatReason: status.reason } : {}) } : {}),
+    ...(typeof mail === 'number' && mail > 0 ? { unread: mail } : {}) };
 }
 
 /** Pane state → the shared status word (`exited` reads as done: the screen it left is still there). */

@@ -27,7 +27,8 @@ export function createNextTuiCoreInput(): NextTuiCoreInput {
   let historyIndex = 0;
   let draft = '';
   // The sequence ID keeps multiple pastes distinct; say that the full text remains for submission.
-  const pasteFold = createPasteFold(undefined, (id, text) => `[Paste #${id} · ${text.split('\n').length} lines · full text]`);
+  const pasteFold = createPasteFold(undefined, (id, text) => `[Paste #${id} · +${text.split('\n').length} lines · full text]`,
+    (text) => text.split('\n').length >= 3 || text.length >= 300);
 
   return {
     get editor() { return editor; },

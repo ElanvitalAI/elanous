@@ -28,7 +28,7 @@ test('Next PTY groups background Agents without raw dispatch rows and settles th
       steps: [
         { label: 'log focus', text: 'noise-parent', until: TURN_DONE, timeoutMs: 30_000 }, // Source: #36642. Basic chat hides the roster until the parent turn settles.
         { label: 'running', keys: '\x1b[5~', until: (screen) => screen.includes('◐ sub-agents · running 5'), timeoutMs: 30_000 }, // Source: #36642 five-child dispatch fixture. PageUp leaves basic chat so the roster is visible.
-        { label: 'settled', until: (screen) => screen.includes('✓ Results ready 5'), timeoutMs: 30_000 }, // Source: #36642 five-child dispatch fixture and BackgroundJobStatus pending-result state.
+        { label: 'settled', until: (screen) => screen.includes('✓ sub-agents · done 5'), timeoutMs: 30_000 }, // Source: #36642 five-child dispatch fixture. TUI-NOTICE-QUIET: «Results ready N» is no longer drawn, the roster's done row is the settled surface.
       ],
     });
     if (process.env.ELANOUS_TUI_EVIDENCE_PATH) {
@@ -85,7 +85,7 @@ test('five background Agents stay listed while typing, and one can be stopped by
         // each pending result at once, so the footer never sits on «Results ready 5» anymore.
         // The roster rows are the terminal surface: nothing running, the four non-stopped done.
         { label: 'all terminal', until: (screen) => [...screen.matchAll(/flood worker · running/g)].length === 0 && [...screen.matchAll(/flood worker · done/g)].length >= 4, timeoutMs: 30_000 }, // Source: #36642 five-child fixture, surface per #38650
-        { label: 'next turn receives results', text: 'collect-results', until: (screen) => screen.includes('> collect-results') && TURN_DONE(screen), timeoutMs: 30_000 }, // Source: #36642. The next turn must finish before result delivery is asserted.
+        { label: 'next turn receives results', text: 'collect-results', until: (screen) => screen.includes('❯ collect-results') && TURN_DONE(screen), timeoutMs: 30_000 }, // Source: #36642. The next turn must finish before result delivery is asserted.
       ],
     });
     const requests = readFileSync(capture, 'utf8').trim().split('\n').map((line) => JSON.parse(line));

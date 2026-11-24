@@ -1,0 +1,75 @@
+# DEMO-1126-INVEST-ORCH — «엘라누스 지휘 × 코나투스 투자 엔진 × codex/claude/eln 패널» (리서치 시연 · 투자 권유 아님).
+# One run: plan → [Conatus research ∥ crawl ∥ X ∥ 이벤트 충격 ∥ 시세 ∥ 수급 ∥ 매력도 ∥ Conatus ops] → factsheet
+#   → [12 panel personas ∥ 3 mentor frames — each a separate CLI run: eln · codex · claude] → consensus
+#   → Conatus 판단·검증(dry · mandate disarmed · no executor) → 결정 분류 → report + dashboard JSON.
+# Every node is `handler:<name>` — the registry is scripts/demo-invest-orch/handlers.ts and the door is
+#   bun scripts/demo-invest-orch/run.ts [--dry-run] [--els]   (--dry-run = recorded fixtures, no network, no model).
+# Panel bindings (runtime · provider · model) live in each node's `input` so the graph file is the one place to read them.
+graph_id: invest-orch-demo
+version: 1
+loop:
+  title: 투자 리서치 오케스트레이션 시연
+  description: 종목·지수 질문 하나를 코나투스 리서치·스킬 데이터·멀티 런타임 패널·가중 합의·결정 분류로 한 번에 돌린다 (리서치 시연 · 투자 권유 아님 · 주문 없음).
+  inputs: [question, ticker, fixtures, els]
+  trigger:
+    events: [manual]
+max_parallel_nodes: 16
+entry_node: plan
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: plan, kind: agent, recipe: 'handler:plan', max_visits: 1 }
+  - { node_id: conatus-research, kind: agent, recipe: 'handler:conatus-research', max_visits: 1 }
+  - { node_id: conatus-ops, kind: agent, recipe: 'handler:conatus-ops', max_visits: 1 }
+  - { node_id: news, kind: agent, recipe: 'handler:news', max_visits: 1 }
+  - { node_id: x-pulse, kind: agent, recipe: 'handler:x-pulse', max_visits: 1 }
+  - { node_id: event-shock, kind: agent, recipe: 'handler:event-shock', max_visits: 1 }
+  - { node_id: market, kind: agent, recipe: 'handler:market', max_visits: 1 }
+  - { node_id: flows, kind: agent, recipe: 'handler:flows', max_visits: 1 }
+  - { node_id: score, kind: agent, recipe: 'handler:score', max_visits: 1 }
+  - { node_id: gather, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: factsheet, kind: agent, recipe: 'handler:factsheet', max_visits: 1 }
+  - { node_id: panel-global-macro, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: panel, persona: global-macro, runtime: eln, provider: openrouter, model: z-ai/glm-4.6 } }
+  - { node_id: panel-us-china-tech-geopol, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: panel, persona: us-china-tech-geopol, runtime: eln, provider: openrouter, model: deepseek/deepseek-chat-v3.1 } }
+  - { node_id: panel-fx-sensitivity, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: panel, persona: fx-sensitivity, runtime: eln, provider: openrouter, model: qwen/qwen3-235b-a22b-2507 } }
+  - { node_id: panel-korean-flow, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: panel, persona: korean-flow, runtime: eln, provider: openrouter, model: moonshotai/kimi-k2 } }
+  - { node_id: panel-ai-ethics-sentiment, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: panel, persona: ai-ethics-sentiment, runtime: eln } }
+  - { node_id: panel-climate-power, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: panel, persona: climate-power, runtime: eln, provider: openrouter, model: z-ai/glm-4.6 } }
+  - { node_id: panel-memory-cycle, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: panel, persona: memory-cycle, runtime: codex } }
+  - { node_id: panel-hbm-ai, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: panel, persona: hbm-ai, runtime: codex } }
+  - { node_id: panel-cross-asset-rotator, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: panel, persona: cross-asset-rotator, runtime: codex } }
+  - { node_id: panel-dart-fundamentals, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: panel, persona: dart-fundamentals, runtime: claude, model: haiku } }
+  - { node_id: panel-soxx-flow, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: panel, persona: soxx-flow, runtime: claude, model: haiku } }
+  - { node_id: panel-tsmc-comparative, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: panel, persona: tsmc-comparative, runtime: claude, model: haiku } }
+  - { node_id: mentor-1, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: mentor, slot: 1, runtime: claude, model: haiku } }
+  - { node_id: mentor-2, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: mentor, slot: 2, runtime: codex } }
+  - { node_id: mentor-3, kind: agent, recipe: 'handler:panelist', max_visits: 1, input: { role: mentor, slot: 3, runtime: eln } }
+  - { node_id: panel-join, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: consensus, kind: agent, recipe: 'handler:consensus', max_visits: 1 }
+  - { node_id: conatus-judge, kind: judge, recipe: 'handler:conatus-judge', max_visits: 1 }
+  - { node_id: decision-triage, kind: agent, recipe: 'handler:decision-triage', max_visits: 1 }
+  - { node_id: report, kind: agent, recipe: 'handler:report', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - from: plan
+    on: outcome
+    branches:
+      ok: [conatus-research, conatus-ops, news, x-pulse, event-shock, market, flows, score]
+    map: { fail: failed, error: failed }
+    join: gather
+    # Every data source falls back to its recorded fixture; a branch that still fails is shown, not fatal.
+    warning_branches: [conatus-research, conatus-ops, news, x-pulse, event-shock, market, flows, score]
+  - { from: gather, on: outcome, map: { ok: factsheet, fail: factsheet, error: failed } }
+  - from: factsheet
+    on: outcome
+    branches:
+      ok: [panel-global-macro, panel-us-china-tech-geopol, panel-fx-sensitivity, panel-korean-flow, panel-ai-ethics-sentiment, panel-climate-power, panel-memory-cycle, panel-hbm-ai, panel-cross-asset-rotator, panel-dart-fundamentals, panel-soxx-flow, panel-tsmc-comparative, mentor-1, mentor-2, mentor-3]
+    map: { fail: failed, error: failed }
+    join: panel-join
+    # A panelist that fails is marked [failed] and the weights renormalise (attractiveness-panel SKILL Step 5).
+    warning_branches: [panel-global-macro, panel-us-china-tech-geopol, panel-fx-sensitivity, panel-korean-flow, panel-ai-ethics-sentiment, panel-climate-power, panel-memory-cycle, panel-hbm-ai, panel-cross-asset-rotator, panel-dart-fundamentals, panel-soxx-flow, panel-tsmc-comparative, mentor-1, mentor-2, mentor-3]
+  - { from: panel-join, on: outcome, map: { ok: consensus, fail: consensus, error: failed } }
+  - { from: consensus, on: outcome, map: { ok: conatus-judge, fail: failed, error: failed } }
+  - { from: conatus-judge, on: outcome, map: { ok: decision-triage, fail: failed, error: failed } }
+  - { from: decision-triage, on: outcome, map: { ok: report, fail: failed, error: failed } }
+  - { from: report, on: outcome, map: { ok: done, fail: failed, error: failed } }

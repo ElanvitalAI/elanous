@@ -18,7 +18,9 @@ import { debug, redactSecretText } from '../debug/log.js';
 import { buildSeatRoleCardBlock } from './seat-role-card.js';
 import { collectSeatBootSections, renderSeatBootCard } from '../cli/seat-cli.js';
 import { defaultMsgStorePath } from '../msg/msg-store.js';
-import { buildSeatMemoryIndexBlock, seatMemoryDir } from '../seat-memory/seat-memory.js';
+import { buildCommonMemoryIndexBlock, buildSeatMemoryIndexBlock, seatMemoryDir, seatMemoryIndexFiles } from '../seat-memory/seat-memory.js';
+import { gitWorktreeRoots, resolveMemoryStore, type MemoryStore } from '../seat-memory/memory-store.js';
+import { buildActiveDirectivesBlock } from '../directives/active-directives-block.js';
 import { readOpRolePackBootPrompt, readSeatHandoffBootPrompt } from '../tui/seat-mail-boot.js';
 
 export interface SeatDetection {
@@ -61,8 +63,10 @@ export interface SeatBootDeps {
   msgPath?: string;
   env?: NodeJS.ProcessEnv;
   now?: () => Date;
-  /** 자리 기억 저장소의 뿌리(시험) — 기본 `memoryRoot()`. 실제 폴더 = `<뿌리>/seats/<자리>`. */
+  /** 자리 기억 저장소의 뿌리(시험) — 기본 `memoryStoreBaseRoot()`. 실제 폴더 = `<뿌리>/seats/<자리>` · `<뿌리>/projects/<저장소>`. */
   seatMemoryRoot?: string;
+  /** 지시 색인 경로(시험) — 기본 `directiveDbPath()`. */
+  directivesDbPath?: string;
 }
 
 /** 자리 세션의 자리 기억 저장소(OP-MEMORY-PARITY O6). 자리(무인) TUI 판정이 서야 한다 — 아니면 null. */
@@ -72,10 +76,48 @@ export function resolveSeatMemoryContext(cwd: string, deps: SeatBootDeps = {}): 
   return { seat: detection.seat, dir: seatMemoryDir(detection.seat, deps.seatMemoryRoot) };
 }
 
+/** 🧠 MEMORY-STORE-SPLIT — 이 세션이 쓰는 기억 저장소(자리 ⊕ 프로젝트). 전역 사용자 저장소면 null(전역 memory_save 그대로).
+ *  세션 시작 색인·턴 회상·memory_save 도구가 CLI 와 «같은» 해석기(`resolveMemoryStore`)를 쓴다. */
+export function resolveSessionMemoryStore(cwd: string, deps: SeatBootDeps = {}): { seat: string; dir: string; store: MemoryStore; commonDir?: string } | null {
+  const store = resolveMemoryStore(cwd, {
+    ...(deps.env !== undefined ? { env: deps.env } : {}),
+    ...(deps.seatMemoryRoot !== undefined ? { baseRoot: deps.seatMemoryRoot } : {}),
+  });
+  if (store.kind === 'user') return null;
+  // SEAT-COMMON-MEMORY — 본부 자리만 공통 층(`seats/_common`)을 읽는다. 일반 사용자는 프로젝트 저장소가 공통 역할.
+  return { seat: store.label, dir: store.dir, store, ...(store.kind === 'seat' ? { commonDir: store.commonDir } : {}) };
+}
+
+/** 세션 시작 «살아 있는 지시» 블록 — OP 자리(원장 ⊕ 색인)와 일반 사용자 프로젝트(색인만). 그 밖 자리는 싣지 않는다. */
+function activeDirectivesMessages(store: MemoryStore, deps: SeatBootDeps): LLMMessage[] {
+  try {
+    let block: string | null = null;
+    if (store.kind === 'seat' && store.seat === 'OP') {
+      const stateRoot = join(deps.home ?? homedir(), 'elanous-hq', 'seat-state'); // 부트 카드와 같은 자리 상태 뿌리 · 없으면 색인만
+      block = buildActiveDirectivesBlock({ label: store.seat, seat: store.seat, ledgerDir: join(stateRoot, store.seat, 'directives') },
+        deps.directivesDbPath !== undefined ? { dbPath: deps.directivesDbPath } : {});
+    } else if (store.kind === 'project') {
+      block = buildActiveDirectivesBlock({ label: store.repo.name, roots: gitWorktreeRoots(store.repo), ledgerDir: null },
+        deps.directivesDbPath !== undefined ? { dbPath: deps.directivesDbPath } : {});
+    }
+    return block ? [{ role: 'system', content: block }] : [];
+  } catch (error) {
+    debug.log('memory', 'directives-block', { lines: 0, reason: 'error', error: error instanceof Error ? error.message : String(error) });
+    return [];
+  }
+}
+
+/** 세션 시작 안정 구역 — 기억 색인(자리·프로젝트) · 살아 있는 지시. 대화마다 한 번 · 바이트 고정. */
+function sessionStartStable(cwd: string, deps: SeatBootDeps): Pick<CardEntry, 'memoryIndex' | 'directives'> {
+  const target = resolveSessionMemoryStore(cwd, deps);
+  if (!target) return { memoryIndex: [], directives: [] };
+  return { memoryIndex: seatMemoryIndexMessages(target.seat, target.dir, target.commonDir), directives: activeDirectivesMessages(target.store, deps) };
+}
+
 // 대화마다 한 장(작업 디렉터리별). 대시보드는 한 번에 한 대화이고 ACP sessionId 가 수명 내내 같으므로
 // 세션 id 가 아니라 «대화 ⊕ cwd» 가 키다. 비우는 자리는 `startSeatBootConversation`(새 대화) 뿐 — 축출 없음.
 // 첫 화면 한 줄(`describeSeatBoot`)과 턴 카드가 «같은 스냅샷»을 본다.
-interface CardEntry { messages: LLMMessage[]; observed: Record<string, unknown>; memoryIndex?: LLMMessage[] }
+interface CardEntry { messages: LLMMessage[]; observed: Record<string, unknown>; memoryIndex?: LLMMessage[]; directives?: LLMMessage[] }
 const cardCache = new Map<string, CardEntry>();
 
 export function resetSeatBootCacheForTest(): void {
@@ -398,25 +440,36 @@ function buildCardMessages(cwd: string, deps: SeatBootDeps): CardEntry {
   return {
     messages: [{ role: 'system', content }],
     observed: { seat: detection.seat, source: detection.source, unread, chars: content.length },
-    memoryIndex: seatMemoryIndexMessages(detection.seat, deps),
   };
 }
 
 /** 🧠 세션 시작 자리 기억 색인(OP-MEMORY-PARITY O6) — Claude Code 가 MEMORY.md 를 세션 시작에 싣는 것과 같은 자리.
  *  대화마다 한 번 만들어 카드 캐시에 같이 둔다 ⇒ 같은 대화 동안 바이트가 같다(캐시 접두 안정 · O4).
  *  세션 중 새로 저장한 기억은 다음 대화부터 색인에 실린다(그 사이엔 memory_search·턴 회상이 맡는다). */
-function seatMemoryIndexMessages(seat: string, deps: SeatBootDeps): LLMMessage[] {
+function seatMemoryIndexMessages(seat: string, dir: string, commonDir?: string): LLMMessage[] {
+  // SEAT-COMMON-MEMORY — 공통 색인(상한 1.2KB)이 자리 색인 «앞»에 같은 system 메시지로 실린다. 공통 층 실패는 층만 빠진다.
+  let common: string | null = null;
+  if (commonDir && commonDir !== dir) {
+    try {
+      const c = buildCommonMemoryIndexBlock(commonDir, { skipFiles: seatMemoryIndexFiles(dir) });
+      debug.log('memory', 'common-index', c ? { seat, lines: c.lines, totalLines: c.totalLines, truncated: c.truncated } : { seat, lines: 0, reason: 'empty-or-missing' });
+      common = c?.block ?? null;
+    } catch (error) {
+      debug.log('memory', 'common-index', { seat, lines: 0, reason: 'error', error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  let own: string | null = null;
   try {
-    const dir = seatMemoryDir(seat, deps.seatMemoryRoot);
     const built = buildSeatMemoryIndexBlock(seat, dir);
     debug.log('memory', 'index-injected', built
       ? { seat, lines: built.lines, totalLines: built.totalLines, bytes: built.bytes, totalBytes: built.totalBytes, truncated: built.truncated }
       : { seat, lines: 0, reason: 'empty-or-missing' });
-    return built ? [{ role: 'system', content: built.block }] : [];
+    own = built?.block ?? null;
   } catch (error) {
     debug.log('memory', 'index-injected', { seat, lines: 0, reason: 'error', error: error instanceof Error ? error.message : String(error) });
-    return [];
   }
+  const parts = [common, own].filter((p): p is string => !!p);
+  return parts.length ? [{ role: 'system', content: parts.join('\n\n') }] : [];
 }
 
 function conversationCard(cwd: string, deps: SeatBootDeps, sessionId?: string): CardEntry {
@@ -443,6 +496,7 @@ function conversationCard(cwd: string, deps: SeatBootDeps, sessionId?: string): 
     // 부트 카드가 턴을 막지 않는다 — 실패는 관측만.
     debug.log('dashboard.seat-boot', 'card-skipped', { cwd, reason: 'error', error: err instanceof Error ? err.message : String(err) });
   }
+  try { Object.assign(entry, sessionStartStable(cwd, deps)); } catch { entry.memoryIndex = []; entry.directives = []; }
   cardCache.set(cwd, entry);
   return entry;
 }
@@ -455,6 +509,11 @@ export function buildSeatBootSystemMessages(ctx: { cwd: string; sessionId?: stri
 /** 이 대화의 자리 기억 색인(system 메시지 0~1개) — 카드와 같은 스냅샷. 호출부는 «캐시 접두» 쪽(안정 구역)에 싣는다. */
 export function buildSeatMemoryIndexSystemMessages(ctx: { cwd: string; sessionId?: string }, deps: SeatBootDeps = {}): LLMMessage[] {
   return conversationCard(ctx.cwd, deps, ctx.sessionId).memoryIndex ?? [];
+}
+
+/** 이 대화의 «살아 있는 지시» 블록(system 메시지 0~1개) — 카드와 같은 스냅샷 · 안정 구역(캐시 접두)에 싣는다. */
+export function buildActiveDirectivesSystemMessages(ctx: { cwd: string; sessionId?: string }, deps: SeatBootDeps = {}): LLMMessage[] {
+  return conversationCard(ctx.cwd, deps, ctx.sessionId).directives ?? [];
 }
 
 /** 첫 화면 한 줄용 — 자리면 {자리, 안 읽은 우편 수}. 턴 카드와 같은 스냅샷이다. */

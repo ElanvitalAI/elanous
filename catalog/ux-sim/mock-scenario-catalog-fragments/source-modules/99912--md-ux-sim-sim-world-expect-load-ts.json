@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SIM-WORLD-EXPECT-LOAD-TS",
+  "path": "src/ux-sim/sim-world/expect-load.ts",
+  "boundary": "Loads the sim-world expectation table: the legacy single worlds/sim-world-expect.json wins when present, else per-world expect/<world>.json fragments are discovered (SIM-WORLD-REGISTRY-NO-SHARED-EDIT #126458); a tree with neither is a loud load failure and malformed rows throw, never a silently empty table",
+  "deviceIds": [
+    "sim-world-kernel"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

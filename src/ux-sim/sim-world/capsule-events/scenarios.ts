@@ -1,5 +1,5 @@
 // C1 background-agent axis: actual TUI and child REPL; the LLM is the external fake device.
-// The C1 wake axes: this scene measures the background Agent end (exactly one wake turn within 20s, duplicates 0);
+// The C1 wake axes: this scene measures the background Agent end (exactly one wake turn after the 120s passive ripen — #39609, duplicates 0);
 // the harness child end frame is measured by capsule-events/C1-HARNESS (B4/B5 queue-bridge) and the mail axis keeps
 // its own red row capsule-events/C1-MAIL. Capsule behavior is always enabled; measure one default configuration.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -32,7 +32,8 @@ const c1Scene: SimWorldScenario = {
         ready: { label: 'boot', until: 'Ctrl+Q quit' },
         steps: [
           { label: 'parent settled', text: 'c1-parent', until: screen => /Turn done|○ done/.test(screen), timeoutMs: 30_000 },
-          { label: 'completion triggers next turn', until: () => delivered().length > 0, timeoutMs: 20_000 },
+          // #39609: capsule-done is a passive notice — it ripens for PASSIVE_RESULT_IDLE_WAKE_MS (120s, measured — not compressed, #39666) before exactly one wake turn opens. 180s = 120s ripen + boot/join headroom.
+          { label: 'completion triggers next turn', until: () => delivered().length > 0, timeoutMs: 180_000 },
         ],
       });
       const count = delivered().length;

@@ -4,7 +4,7 @@
 
 import type { LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
-import { buildSeatMemoryIndexSystemMessages, resolveSeatMemoryContext, type SeatBootDeps } from '../seat/seat-boot-preamble.js';
+import { buildSeatMemoryIndexSystemMessages, resolveSessionMemoryStore, type SeatBootDeps } from '../seat/seat-boot-preamble.js';
 import { recallSeatMemoriesForTurn } from './seat-memory.js';
 
 export interface SeatMemoryLayers { index: LLMMessage[]; recall: LLMMessage[] }
@@ -12,7 +12,7 @@ export interface SeatMemoryLayers { index: LLMMessage[]; recall: LLMMessage[] }
 /** 턴 회상 블록 문면(없으면 null) — REPL 은 이것을 사용자 역할 텍스트 블록으로 싣는다. */
 export function seatMemoryRecallText(ctx: { cwd: string; userText: string; sessionId?: string }, deps: SeatBootDeps = {}): string | null {
   try {
-    const target = resolveSeatMemoryContext(ctx.cwd, deps);
+    const target = resolveSessionMemoryStore(ctx.cwd, deps); // MEMORY-STORE-SPLIT — CLI 와 같은 해석기
     if (!target) return null;
     return recallSeatMemoriesForTurn({
       seat: target.seat, dir: target.dir, text: ctx.userText,

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ClassicSidetabMissionPairResult, ClassicSidetabMissionPairSessionRegistry, ClassicSidetabMissionResult, ClassicSidetabMissionDispatchContext } from './classic-sidetab-mission.js';
-import { enqueueClassicSidetabMissionPairCompletion, type ClassicMissionNotificationEnqueue, type ClassicSidetabMissionPairCompletionResult } from './classic-sidetab-mission-job.js';
-import { readClassicSidetabPairBaseSha, sidetabCandidateProtocolPrompt } from './classic-sidetab-mission-reconcile.js';
+import { enqueueClassicSidetabMissionPairCompletion, type ClassicMissionNotificationEnqueue, type ClassicSidetabMissionPairCompletionResult } from '../sidetab-core/classic-sidetab-mission-job.js';
+import { readClassicSidetabPairBaseSha, sidetabCandidateProtocolPrompt } from '../sidetab-core/classic-sidetab-mission-reconcile.js';
 
 interface ClassicSidetabPairSession {
   id: string;

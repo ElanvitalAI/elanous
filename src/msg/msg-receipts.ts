@@ -5,6 +5,7 @@
 //   delivered = 받는 자리 입력 큐에 notice{msgId} 항목이 생김(Next TUI) · 클래식 대시보드는 주입 턴이 열림
 //   seen      = 그 큐 항목이 status delivered 로 전이(모델 맥락에 들어감) · 클래식은 그 턴 다음 경계
 //   accepted · rejected · done = B2(계획 원장 구독). 여기는 API 와 명시 CLI(`eln msg receipt`)만.
+//   started = ELS-ORCH-TASK-ENVELOPE §1 — 받아 작업 시작(seen 다음·accepted 앞 승급).
 // 답의 문장을 읽어 상태를 세우는 길은 없다.
 //
 // 호환 쓰기(§4c): seen · accepted · rejected → msg_message_acks(acked) · done → msg_message_acks(done). 그래서 `eln msg list`
@@ -14,7 +15,7 @@
 import type { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
 
-export const RECEIPT_STATES = ['posted', 'delivered', 'seen', 'accepted', 'rejected', 'done', 'expired', 'overdue'] as const;
+export const RECEIPT_STATES = ['posted', 'delivered', 'seen', 'started', 'accepted', 'rejected', 'done', 'expired', 'overdue'] as const;
 export type ReceiptState = typeof RECEIPT_STATES[number];
 
 /** Who wrote the row — a structural actor name, never derived from message text. */
@@ -56,7 +57,7 @@ export const MSG_RECEIPTS_SCHEMA = `CREATE TABLE IF NOT EXISTS msg_receipts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       message_id INTEGER NOT NULL REFERENCES msg_messages(id),
       recipient TEXT NOT NULL,
-      state TEXT NOT NULL CHECK(state IN ('posted','delivered','seen','accepted','rejected','done','expired','overdue')),
+      state TEXT NOT NULL CHECK(state IN ('posted','delivered','seen','started','accepted','rejected','done','expired','overdue')),
       plan_item_id TEXT,
       queue_item_id TEXT,
       reason TEXT,
@@ -69,7 +70,7 @@ export const MSG_RECEIPTS_SCHEMA = `CREATE TABLE IF NOT EXISTS msg_receipts (
 
 /** Progress rank. `overdue` is an annotation (§4a «상태 아님») and never moves the current state. */
 const RANK: Readonly<Record<Exclude<ReceiptState, 'overdue'>, number>> = {
-  posted: 0, delivered: 1, seen: 2, accepted: 3, rejected: 4, done: 4, expired: 4,
+  posted: 0, delivered: 1, seen: 2, started: 2.5, accepted: 3, rejected: 4, done: 4, expired: 4,
 };
 const TERMINAL: ReadonlySet<ReceiptState> = new Set(['rejected', 'done', 'expired']);
 
@@ -81,6 +82,9 @@ const TERMINAL: ReadonlySet<ReceiptState> = new Set(['rejected', 'done', 'expire
 export function receiptReaches(state: ReceiptState, until: ReceiptState): boolean {
   if (state === until) return true;
   if (state === 'overdue' || until === 'overdue') return false;
+  // ELS-ORCH-TASK-ENVELOPE — `started` is «work began», not «read»: it satisfies only itself, so a
+  // `--until seen` follow still ends on seen (started ranks above seen but is not it).
+  if (state === 'started') return false;
   return TERMINAL.has(state) || RANK[state] >= RANK[until];
 }
 
@@ -127,6 +131,18 @@ export function isReceiptState(value: string): value is ReceiptState {
 
 export function hasReceiptTable(db: Database): boolean {
   return (db.query("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'msg_receipts'").get() as { count: number }).count > 0;
+}
+
+/**
+ * ELS-ORCH-TASK-ENVELOPE ④-1 — an existing receipts table keeps its old 8-state CHECK forever:
+ * `CREATE TABLE IF NOT EXISTS` never rewrites it and SQLite cannot ALTER a CHECK, so a `started`
+ * receipt would fail the constraint. True only while the stored schema still lacks 'started'
+ * (the 9-state upgrade rebuilds the table and this turns false for good).
+ */
+export function receiptsCheckNeedsStart(db: Database): boolean {
+  if (!hasReceiptTable(db)) return false;
+  const row = db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'msg_receipts'").get() as { sql: string } | null;
+  return row != null && !row.sql.includes("'started'");
 }
 
 interface ReceiptRow {

@@ -16,4 +16,4 @@ test('C3 shell axis passes against the green table row (no env switch)', async (
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-}, 240_000); // 출처: 부팅 ≤60s ⊕ 정착 20s ⊕ 완료 50s ⊕ 중복 창 5s ⊕ 정리 — 부하 호스트(node-b 120s 초과 실측)
+}, 300_000); // 출처: 부팅 ≤60s ⊕ 정착 20s ⊕ 완료 170s(50s + idle ripen 120s #39609) ⊕ 중복 창 5s ⊕ 정리 — 부하 호스트(node-b 120s 초과 실측)

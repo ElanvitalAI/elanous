@@ -4,12 +4,21 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGraph } from './runner.js';
 import {
+  approvedGraphCapabilityIds,
   dispatchGraphContract,
   emptyGraphCapabilityRegistry,
+  emptyGraphCapabilityVocabulary,
+  graphCapabilityRegistryFromVocabulary,
+  graphCapabilityVocabularyDigest,
+  parseGraphCapabilityVocabularyEntries,
+  pinGraphCapabilityVocabulary,
+  proposeGraphCapability,
   registerGraphCapabilityContract,
   registerGraphCapabilityProviderDeclaration,
+  reviewGraphCapability,
   STORE_EVENTS_CONTRACT,
   type GraphCapabilityContract,
+  type GraphCapabilityVocabularyEntry,
 } from './capabilities.js';
 
 const contract: GraphCapabilityContract = {
@@ -260,4 +269,163 @@ test('runner rejects invalid capability kind, recipe, and requires combinations 
     await expect(runGraph(graphPath, { quiet: true, deps: { root: join(root, 'wrong-recipe') } }))
       .rejects.toThrow('contract capability node must not name a provider recipe');
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+const webContract: GraphCapabilityContract = {
+  id: 'search.web@1',
+  input: { type: 'object', required: ['query'], properties: { query: { type: 'string' } } },
+  output: { type: 'object', required: ['results'], properties: { results: { type: 'array' } } },
+};
+const composeContract: GraphCapabilityContract = {
+  id: 'answer.compose@1',
+  input: { type: 'object' },
+  output: { type: 'object' },
+};
+const contractNameOf = (entry: { readonly id: string }): string => entry.id.slice(0, entry.id.lastIndexOf('@'));
+
+test('GRAPH-VOCAB-DYNAMIC: register → review → pin is the real registration path — only approved contracts dispatch', async () => {
+  let vocabulary = emptyGraphCapabilityVocabulary();
+  vocabulary = proposeGraphCapability(vocabulary, webContract);
+  // 미심사 계약은 실제 등록 경로에 없다: 공급자 선언도 디스패치도 실패 폐쇄.
+  let registry = graphCapabilityRegistryFromVocabulary(vocabulary);
+  expect(registry.contracts).toEqual({});
+  expect(() => registerGraphCapabilityProviderDeclaration(registry, {
+    id: 'web-provider', provides: ['search.web@1'], tier: 'free',
+    invoke: () => ({ ok: true, outcome: 'ok', result: {} }),
+  })).toThrow('declares unknown contract: search.web@1');
+  const context = { graphId: 'vocab-sim', runId: 'run', nodeId: 'search', input: { query: 'graph' }, outputs: {} };
+  expect(await dispatchGraphContract('search.web@1', context, registry)).toMatchObject({ ok: false, error: 'unprovided' });
+
+  vocabulary = reviewGraphCapability(vocabulary, 'search.web@1', { verdict: 'approved', reviewer: 'jud-b' });
+  registry = graphCapabilityRegistryFromVocabulary(vocabulary);
+  expect(approvedGraphCapabilityIds(vocabulary)).toEqual(['search.web@1']);
+  registry = registerGraphCapabilityProviderDeclaration(registry, {
+    id: 'web-provider', provides: ['search.web@1'], tier: 'free',
+    invoke: () => ({ ok: true, outcome: 'ok', result: { results: [] } }),
+  });
+  expect(await dispatchGraphContract('search.web@1', context, registry))
+    .toMatchObject({ ok: true, result: { results: [] } });
+
+  // 기각된 계약도 등록 경로에 들어오지 않는다.
+  vocabulary = reviewGraphCapability(proposeGraphCapability(vocabulary, composeContract),
+    'answer.compose@1', { verdict: 'rejected', reviewer: 'jud-b' });
+  const rejectedRegistry = graphCapabilityRegistryFromVocabulary(vocabulary);
+  expect(rejectedRegistry.contracts).toEqual({ 'search.web@1': webContract });
+  expect(() => registerGraphCapabilityProviderDeclaration(rejectedRegistry, {
+    id: 'compose-provider', provides: ['answer.compose@1'], tier: 'free',
+    invoke: () => ({ ok: true, outcome: 'ok', result: {} }),
+  })).toThrow('declares unknown contract: answer.compose@1');
+
+  const pin = pinGraphCapabilityVocabulary(vocabulary);
+  expect(Object.isFrozen(pin)).toBe(true);
+  expect(Object.isFrozen(pin.entries)).toBe(true);
+  expect(pin.entries.map((entry) => entry.id)).toEqual(['answer.compose@1', 'search.web@1']);
+  expect(pin.digest).toBe(graphCapabilityVocabularyDigest(vocabulary.entries));
+});
+
+test('GRAPH-VOCAB-DYNAMIC: review fails closed and proposals may not skip versions', () => {
+  const approved = reviewGraphCapability(
+    proposeGraphCapability(emptyGraphCapabilityVocabulary(), webContract),
+    'search.web@1', { verdict: 'approved', reviewer: 'jud-b' });
+  expect(() => reviewGraphCapability(approved, 'search.web@1', { verdict: 'rejected', reviewer: 'jud-b' }))
+    .toThrow('only proposed capability vocabulary can be reviewed: search.web@1 is approved');
+  expect(() => reviewGraphCapability(emptyGraphCapabilityVocabulary(), 'search.web@1', { verdict: 'approved', reviewer: 'jud-b' }))
+    .toThrow('unknown graph capability proposal: search.web@1');
+  const proposed = proposeGraphCapability(emptyGraphCapabilityVocabulary(), webContract);
+  expect(() => reviewGraphCapability(proposed, 'search.web@1', { verdict: 'approved', reviewer: '  ' }))
+    .toThrow('capability review for search.web@1 requires a reviewer');
+  expect(() => proposeGraphCapability(proposed, webContract)).toThrow('duplicate graph capability proposal: search.web@1');
+  expect(() => proposeGraphCapability(approved, webContract)).toThrow('pinned in the approved vocabulary; propose the next version');
+
+  // 새 이름은 @1 에서 시작해야 한다 — v1 생략 거부.
+  expect(() => proposeGraphCapability(emptyGraphCapabilityVocabulary(), { ...webContract, id: 'search.web@3' }))
+    .toThrow('graph capability proposal search.web@3 skips versions: the next version for search.web is 1');
+  // 기각 뒤에는 정확히 다음 판 버전만 제안할 수 있다 — v3 건너뛰기 거부.
+  const rejected = reviewGraphCapability(proposed, 'search.web@1', { verdict: 'rejected', reviewer: 'jud-b' });
+  expect(() => proposeGraphCapability(rejected, { ...webContract, id: 'search.web@3' }))
+    .toThrow('graph capability proposal search.web@3 skips versions: the next version for search.web is 2');
+  expect(() => proposeGraphCapability(rejected, webContract)).toThrow('was rejected; propose the next version');
+  const nextVersion = proposeGraphCapability(rejected, { ...webContract, id: 'search.web@2' });
+  expect(nextVersion.entries.filter((entry) => contractNameOf(entry) === 'search.web').map((entry) => entry.id))
+    .toEqual(['search.web@1', 'search.web@2']);
+  // 연속 제안에서도 다음 버전만 — @4 거부.
+  expect(() => proposeGraphCapability(nextVersion, { ...webContract, id: 'search.web@4' }))
+    .toThrow('graph capability proposal search.web@4 skips versions: the next version for search.web is 3');
+  // 승인된 판 이후에도 다음 버전만.
+  expect(() => proposeGraphCapability(approved, { ...webContract, id: 'search.web@3' }))
+    .toThrow('graph capability proposal search.web@3 skips versions: the next version for search.web is 2');
+  expect(() => proposeGraphCapability(approved, { ...webContract, id: 'search.web@2' })).toBeTruthy();
+  for (const invalid of ['Search.Web@1', 'search.web@0', 'search@1', 'search.web@', 'search.web']) {
+    expect(() => proposeGraphCapability(emptyGraphCapabilityVocabulary(), { ...webContract, id: invalid as `search.${string}@${number}` }))
+      .toThrow('invalid graph capability contract id');
+  }
+});
+
+test('GRAPH-VOCAB-DYNAMIC: the edition digest is canonical and pins contract schemas too', () => {
+  // 같은 최종 판을 등록 순서와 계약 스키마 키 순서를 바꿔 두 경로로 도달한다.
+  const reorderedInput = { properties: { query: { type: 'string' } }, required: ['query'], type: 'object' };
+  let one = emptyGraphCapabilityVocabulary();
+  one = reviewGraphCapability(proposeGraphCapability(one, webContract), 'search.web@1', { verdict: 'approved', reviewer: 'jud-b' });
+  one = reviewGraphCapability(proposeGraphCapability(one, composeContract), 'answer.compose@1', { verdict: 'approved', reviewer: 'jud-c' });
+  let two = emptyGraphCapabilityVocabulary();
+  two = reviewGraphCapability(proposeGraphCapability(two, composeContract), 'answer.compose@1', { verdict: 'approved', reviewer: 'jud-c' });
+  two = reviewGraphCapability(proposeGraphCapability(two, { ...webContract, input: reorderedInput }), 'search.web@1', { verdict: 'approved', reviewer: 'jud-b' });
+  const pinOne = pinGraphCapabilityVocabulary(one);
+  const pinTwo = pinGraphCapabilityVocabulary(two);
+  expect(pinTwo.digest).toBe(pinOne.digest);
+  expect(pinTwo.entries).toEqual(pinOne.entries);
+  // 판 내용이 하나라도 다르면 다른 판이다: 판결 주석, 그리고 계약 스키마 자체.
+  expect(graphCapabilityVocabularyDigest([{ id: 'search.web@1', status: 'approved', reviewer: 'jud-b', contract: webContract }]))
+    .not.toBe(graphCapabilityVocabularyDigest([{ id: 'search.web@1', status: 'approved', reviewer: 'jud-b', note: 'annotated', contract: webContract }]));
+  const tamperedSchema = { ...webContract, input: { type: 'object', required: ['query', 'locale'] } };
+  expect(graphCapabilityVocabularyDigest([{ id: 'search.web@1', status: 'approved', reviewer: 'jud-b', contract: webContract }]))
+    .not.toBe(graphCapabilityVocabularyDigest([{ id: 'search.web@1', status: 'approved', reviewer: 'jud-b', contract: tamperedSchema }]));
+});
+
+test('GRAPH-VOCAB-DYNAMIC: catalog parsing requires the real contract and rejects forged shapes', () => {
+  const label = 'capabilityVocabulary entries';
+  const entry = (id: string, status: string, extra: Record<string, unknown> = {}) =>
+    ({ id, status, contract: { id, input: { type: 'object' }, output: { type: 'object' } }, ...extra });
+  const entries = parseGraphCapabilityVocabularyEntries([
+    entry('search.web@1', 'approved', { reviewer: 'jud-b' }),
+    entry('answer.compose@2', 'proposed'),
+    entry('answer.compose@1', 'rejected', { reviewer: 'jud-c', note: 'citation check unproven' }),
+  ], label);
+  expect(approvedGraphCapabilityIds({ entries })).toEqual(['search.web@1']);
+  const invalid: Array<[unknown, string]> = [
+    [[entry('search.web@1', 'approved')], 'without a reviewer'],
+    [[entry('search.web@1', 'proposed', { reviewer: 'jud-b' })], 'with a reviewer'],
+    [[entry('search.web@1', 'draft')], 'status must be proposed'],
+    [[entry('search.web@1', 'approved', { reviewer: 'jud-b' }), entry('search.web@1', 'proposed')], 'duplicate contract ids'],
+    [[{ ...entry('search.web@1', 'approved', { reviewer: 'jud-b' }), contract: { id: 'other.web@1', input: {}, output: {} } }], 'under entry id'],
+    [[{ ...entry('search.web@1', 'approved', { reviewer: 'jud-b' }), contract: undefined }], 'real contract'],
+    [[{ ...entry('search.web@1', 'approved', { reviewer: 'jud-b' }), contract: { id: 'search.web@1', input: {}, output: {}, guarantees: { maxLatencyMs: -1 } } }], 'invalid contract'],
+    [[entry('search@1', 'approved', { reviewer: 'jud-b' })], 'positive version'],
+    [[{ ...entry('search.web@1', 'approved', { reviewer: 'jud-b' }), reviewerSeat: 'jud-b' }], 'unsupported key'],
+    [{ entries: [] }, 'must be an array'],
+  ];
+  for (const [value, message] of invalid) {
+    expect(() => parseGraphCapabilityVocabularyEntries(value, label)).toThrow(message);
+  }
+});
+
+test('GRAPH-VOCAB-DYNAMIC (#37609 MF2): a pinned edition deep-copies and deep-freezes contracts, so source mutation changes nothing', () => {
+  const schema = { type: 'object', properties: { query: { type: 'string', enum: ['a', 'b'] } } };
+  const vocabulary = { entries: [{ id: 'search.web@1' as const, status: 'approved' as const, reviewer: 'jud-b',
+    contract: { id: 'search.web@1' as const, input: schema, output: { type: 'object' } } }] };
+  const pin = pinGraphCapabilityVocabulary(vocabulary);
+  const digestBefore = pin.digest;
+  const pinnedBefore = JSON.stringify(pin.entries);
+  schema.properties.query.enum.push('injected');
+  (schema.properties.query as Record<string, unknown>).type = 'number';
+  vocabulary.entries[0]!.contract.output = { type: 'array' };
+  expect(JSON.stringify(pin.entries)).toBe(pinnedBefore);
+  expect(pin.digest).toBe(digestBefore);
+  const pinnedInput = pin.entries[0]!.contract.input as { properties: { query: { type: string; enum: string[] } } };
+  expect(pinnedInput.properties.query.enum).toEqual(['a', 'b']);
+  expect(pinnedInput.properties.query.type).toBe('string');
+  expect(Object.isFrozen(pin.entries[0]!.contract)).toBe(true);
+  expect(Object.isFrozen(pinnedInput.properties.query)).toBe(true);
+  expect(Object.isFrozen(pinnedInput.properties.query.enum)).toBe(true);
+  expect(() => { pinnedInput.properties.query.enum.push('late'); }).toThrow();
 });

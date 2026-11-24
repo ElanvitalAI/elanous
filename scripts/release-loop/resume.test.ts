@@ -209,6 +209,18 @@ test('a waived tui whose recorded failure has exit null (killed or timed out) st
 
 // stopped, sweep-incomplete, and killed gate waiver graph paths run in the release simulation rig.
 
+test('owner can waive only the exact saved stopped gate record', () => {
+  const state = { graphId: 'release-loop', runId: 'stopped-owner-waiver', status: 'stopped',
+    path: ['gate'], nodes: [{ nodeId: 'gate', ok: false, executed: false, exit: null, error: STOPPED_NODE_ERROR }],
+    input: { version: '0.3.34', acceptedRegressions: [] } } as unknown as GraphRunState;
+  const request = { from: 'gate', ownerWaive: 'gate', reason: 'Owner accepts the unmeasured gate.', approvedBy: 'OP' };
+  expect(releaseResumeWaiver(state, request)).toMatchObject({ nodeId: 'gate', ownerWaived: true, approvedBy: 'OP',
+    unmeasured: `stopped: ${STOPPED_NODE_ERROR}` });
+  const forged = structuredClone(state);
+  forged.nodes[0]!.error = 'other failure';
+  expect(() => releaseResumeWaiver(forged, request)).toThrow();
+});
+
 // Appended-tip re-gate and measured waiver now run in the release simulation rig.
 
 // The old graph measured waiver contract runs through the release simulation rig.

@@ -143,6 +143,11 @@ export interface GoalContinueController {
   noteGoalCompleted(): void;
   /** 판정된 턴 끝이 무장돼 있으면 H2 로 연다. 사람 입력이 먼저면 미뤘다가 다시 잰다. */
   check(): { opened: boolean; reason: string };
+  /**
+   * QUEUE-FINISH-FIRST: a continuation would fire at the next idle boundary (the last turn end armed one and no
+   * cap/limit/completion has dropped it). Read only — the entry queue holds ordinary mail while this is true.
+   */
+  isArmed(): boolean;
   /** 사람이 턴을 열었다 — 연속 카운터·지문을 비운다. */
   noteHumanTurn(): void;
   /** classic: H2 yield port 를 감싸 «입력칸 마운트 = 판정 시점»으로 잇는다(입력칸 무접촉). */
@@ -330,6 +335,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
   };
 
   return {
+    isArmed() { return armed !== null && !completedGoal; },
     noteTurnEnded(end) {
       armed = null;
       turnRunningStreak = 0;

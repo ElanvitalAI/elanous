@@ -110,7 +110,7 @@ export function isCallSafeForParallel(call: { name: string; args?: unknown }): b
 
 /** Dispatch all `calls` honouring parallel safety — ALL-OR-NOTHING per batch
  *  (JUD #39447 HOLD #122147):
- *    - every call per-call safe → the whole batch runs concurrently (Promise.all)
+ *    - every call per-call safe → the whole batch runs concurrently
  *    - any unsafe call → the whole batch runs strictly sequential, in
  *      original call order
  *
@@ -152,14 +152,14 @@ export async function dispatchWithParallelSafety<T extends { name: string }>(
     }
     return { safeCount, unsafeCount, parallelActivated, skippedIndices };
   }
-  // Parallel kickoff for the fully-safe batch. Promise.all is safe here
-  // because `dispatchOne` is expected to catch its own errors and write an
-  // error result into the caller's storage — one failing Read must never
-  // cancel two sibling Reads.
+  // Wait for all result slots before propagating an unexpected callback failure.
+  // Ordinary tool failures are already represented by dispatchOne as results.
   if (signal?.aborted) {
     for (let i = 0; i < calls.length; i += 1) skippedIndices.push(i);
   } else {
-    await Promise.all(calls.map((call, index) => dispatchOne(call, index)));
+    const settled = await Promise.allSettled(calls.map(async (call, index) => dispatchOne(call, index)));
+    const firstFailure = settled.find((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
+    if (firstFailure) throw firstFailure.reason;
   }
   return { safeCount, unsafeCount, parallelActivated, skippedIndices };
 }

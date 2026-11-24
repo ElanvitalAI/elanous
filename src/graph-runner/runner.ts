@@ -5,7 +5,7 @@ import { execFile, spawnSync } from 'node:child_process';
 import { closeSync, cpSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { getElanousConfigDir, getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { debug, redactSecretText } from '../debug/log.js';
@@ -503,6 +503,154 @@ function safeSegment(value: string): string {
     throw new Error(`invalid graph run identifier: ${value}`);
   }
   return value;
+}
+
+/** K5 launch key (RFC-verbs-as-subgraph-units K5): parent run id ⊕ node id ⊕ attempt ⊕ input digest. */
+function graphLaunchKey(parts: { runId: string; nodeId: string; attempt: string | number; inputSha256: string }): string {
+  return `k5:${createHash('sha256').update(JSON.stringify([parts.runId, parts.nodeId, parts.attempt, parts.inputSha256])).digest('hex')}`;
+}
+
+/** Same launch key → same run id; nothing else needs to be stored for the key to dedupe. */
+function graphLaunchKeyRunId(key: string): string {
+  return `launch-${createHash('sha256').update(key).digest('hex').slice(0, 32)}`;
+}
+
+type LaunchClaimOwner = { pid: number; pidStartedAt: string; host: string; claimedAt: string; token?: string };
+type LaunchClaim = { kind: 'claimed'; dir: string } | { kind: 'deduped'; state: GraphRunState }
+  | { kind: 'in-flight'; owner?: LaunchClaimOwner };
+type LaunchClaimHooks = { beforeReclaim?: () => Promise<void> | void };
+
+function readClaimOwner(dir: string): LaunchClaimOwner | undefined {
+  try { return JSON.parse(readFileSync(join(dir, 'owner.json'), 'utf8')) as LaunchClaimOwner; } catch { return undefined; }
+}
+
+/** Stage a directory holding owner.json and rename it onto `target`; false when `target` already exists. */
+function renameStagedOwnerDir(parent: string, label: string, target: string, owner: LaunchClaimOwner): boolean {
+  const staging = join(parent, `.${label}.${randomUUID()}.staging`);
+  mkdirSync(staging);
+  writeFileSync(join(staging, 'owner.json'), JSON.stringify(owner) + '\n');
+  try {
+    renameSync(staging, target);
+    return true;
+  } catch (error) {
+    rmSync(staging, { recursive: true, force: true });
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'EEXIST' && code !== 'ENOTEMPTY') throw error;
+    return false;
+  }
+}
+
+/**
+ * Atomic launch claim (lock directories, never flock).
+ * - Claim: a staged directory with owner.json {pid, pidStartedAt, host, claimedAt, token} is renamed onto
+ *   graph-runs/<graph>/.launch-claims/<runId>.claim; the rename fails while another claim exists, so one caller wins.
+ * - Stale rule: a claim whose owner is on this host and no longer alive (pid + start time), or whose owner.json is
+ *   unreadable, may be reclaimed. A live or foreign-host owner without a ledger yet is in-flight: the loser fails.
+ * - Reclaim is serialized by `<runId>.claim.reclaim` (same staged-rename lock). Under it the reclaimer re-reads the
+ *   claim and moves it aside only if its token is still the one it judged stale; otherwise it backs off and
+ *   re-evaluates (deduped once a ledger exists, else in-flight).
+ * - The reclaim lock follows the same stale rule. Breaking a dead reclaimer's lock moves it to a unique name and
+ *   checks the moved token; if it turns out to be a live lock it is put back and this caller refuses (in-flight).
+ */
+function acquireLaunchClaim(root: string, graphId: string, runId: string, owner: LaunchClaimOwner,
+  processStartMs: (pid: number) => number | null, hooks: LaunchClaimHooks = {}): LaunchClaim | Promise<LaunchClaim> {
+  const claims = join(root, 'graph-runs', safeSegment(graphId), '.launch-claims');
+  mkdirSync(claims, { recursive: true });
+  const dir = join(claims, `${safeSegment(runId)}.claim`);
+  const lock = `${dir}.reclaim`;
+  const token = randomUUID();
+  const stale = (holder: LaunchClaimOwner | undefined): boolean => !holder || (holder.host === hostname()
+    && graphRunAlive({ pid: holder.pid, pidStartedAt: holder.pidStartedAt } as GraphRunState, processStartMs) === false);
+  const takeReclaimLock = (): boolean => {
+    const lockOwner = { ...owner, token };
+    if (renameStagedOwnerDir(claims, `${runId}.reclaim`, lock, lockOwner)) return true;
+    const holder = readClaimOwner(lock);
+    if (!stale(holder)) return false;
+    const broken = `${lock}.broken-${randomUUID()}`;
+    try { renameSync(lock, broken); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return renameStagedOwnerDir(claims, `${runId}.reclaim`, lock, lockOwner);
+      throw error;
+    }
+    if (readClaimOwner(broken)?.token !== holder?.token) {
+      // We moved a lock that became live after we judged it stale: put it back and do not reclaim.
+      try { renameSync(broken, lock); } catch { /* the restore lost to a newer lock; refuse either way */ }
+      debug.log('graph.launch', 'reclaim-lock-backed-off', { graphId, runId }, { level: 'warn' });
+      return false;
+    }
+    rmSync(broken, { recursive: true, force: true });
+    debug.log('graph.launch', 'reclaim-lock-reclaimed', { graphId, runId, ...(holder ? { stalePid: holder.pid } : { reason: 'owner-unreadable' }) });
+    return renameStagedOwnerDir(claims, `${runId}.reclaim`, lock, lockOwner);
+  };
+  const reclaim = (inspected: LaunchClaimOwner | undefined): LaunchClaim | undefined => {
+    if (!takeReclaimLock()) {
+      const recorded = readGraphRunIfPresent(graphId, runId, root);
+      if (recorded) return { kind: 'deduped', state: recorded };
+      debug.log('graph.launch', 'reclaim-backed-off', { graphId, runId, reason: 'reclaim-lock-held' });
+      return { kind: 'in-flight', owner: readClaimOwner(lock) };
+    }
+    try {
+      // Compare-then-rename under the reclaim lock: only the claim we judged stale may be moved.
+      const onDisk = readClaimOwner(dir);
+      if (!existsSync(dir)) return undefined;
+      if (onDisk?.token !== inspected?.token || onDisk?.pid !== inspected?.pid || onDisk?.claimedAt !== inspected?.claimedAt) {
+        debug.log('graph.launch', 'reclaim-backed-off', { graphId, runId, reason: 'claim-changed' });
+        return undefined;
+      }
+      const moved = `${dir}.stale-${randomUUID()}`;
+      try { renameSync(dir, moved); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        return undefined;
+      }
+      rmSync(moved, { recursive: true, force: true });
+      debug.log('graph.launch', 'claim-reclaimed', { graphId, runId, reason: inspected ? 'owner-dead' : 'owner-unreadable',
+        ...(inspected ? { stalePid: inspected.pid, staleHost: inspected.host, claimedAt: inspected.claimedAt } : {}) });
+    } finally {
+      if (readClaimOwner(lock)?.token === token) rmSync(lock, { recursive: true, force: true });
+    }
+  };
+
+  const claimFrom = (startAttempt: number): LaunchClaim | Promise<LaunchClaim> => {
+    for (let attempt = startAttempt; attempt < 3; attempt++) {
+      if (renameStagedOwnerDir(claims, runId, dir, { ...owner, token })) {
+        // The winner writes its ledger before releasing the claim, so a free claim with a ledger means we lost the race.
+        let recorded: GraphRunState | undefined;
+        try { recorded = readGraphRunIfPresent(graphId, runId, root); }
+        catch (error) { rmSync(dir, { recursive: true, force: true }); throw error; }
+        if (recorded) {
+          rmSync(dir, { recursive: true, force: true });
+          return { kind: 'deduped', state: recorded };
+        }
+        return { kind: 'claimed', dir };
+      }
+      const existing = readGraphRunIfPresent(graphId, runId, root);
+      if (existing) return { kind: 'deduped', state: existing };
+      const inspected = readClaimOwner(dir);
+      if (!stale(inspected)) return { kind: 'in-flight', owner: inspected };
+      const beforeReclaim = hooks.beforeReclaim?.();
+      if (beforeReclaim) {
+        return beforeReclaim.then(() => reclaim(inspected) ?? claimFrom(attempt + 1));
+      }
+      const result = reclaim(inspected);
+      if (result) return result;
+    }
+    return { kind: 'in-flight', owner: readClaimOwner(dir) };
+  };
+  return claimFrom(0);
+}
+
+function readGraphRunIfPresent(graphId: string, runId: string, root: string): GraphRunState | undefined {
+  try { return readGraphRun(graphId, runId, root); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+/** A finite, non-negative `costUsd` in a node's JSON output; anything else is unmeasured. */
+function reportedCostUsd(output: unknown): { costUsd: number } | { invalid: boolean } {
+  const value = lastJsonObject(output)?.costUsd;
+  if (value === undefined) return { invalid: false };
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? { costUsd: value } : { invalid: true };
 }
 
 /** N-way HITL: options pinned into `pending` only for 3+ declared choices, so 2-option records stay byte-identical. */
@@ -1275,6 +1423,19 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   // harness handoff is trusted from env; task-agent remains an in-process scope.
   const growthScope = scopedContext ?? (envGrowthScope === 'harness' ? 'harness' : undefined);
   const rejectedGrowthScopeEnv = scopedContext === undefined && envGrowthScope !== undefined && envGrowthScope !== 'harness';
+  // Launch-key and budget options are refused before any ledger is read (rule: every refusal has an event).
+  const refuseRunOption = (category: string, reason: string, message: string): never => {
+    debug.log(category, 'refused', { path: resolve(path), reason }, { level: 'warn' });
+    throw new Error(message);
+  };
+  if (options.launchKey !== undefined) {
+    if (!options.launchKey.trim()) refuseRunOption('graph.launch', 'empty-key', 'launch key must not be empty');
+    if (options.resumeRunId) refuseRunOption('graph.launch', 'with-resume', 'launch key cannot be combined with --resume');
+    if (options.dryRun) refuseRunOption('graph.launch', 'with-dry-run', 'launch key cannot be combined with --dry-run');
+    if (options.runId) refuseRunOption('graph.launch', 'with-run-id', 'launch key cannot be combined with an explicit run id');
+  }
+  if (options.budgetUsd !== undefined && (!Number.isFinite(options.budgetUsd) || options.budgetUsd <= 0))
+    refuseRunOption('graph.budget', 'invalid-budget', 'budgetUsd must be a positive finite number');
   if (options.resumeRunId && options.runId) throw new Error('runId and resumeRunId cannot be combined');
   if (options.resumeInputPatch && !options.resumeRunId) throw new Error('resumeInputPatch requires --resume');
   if (options.fromNodeId && !options.resumeRunId) throw new Error('--from requires --resume');
@@ -1546,7 +1707,18 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     if (options.fromNodeId && graphMode === 'current') throw new Error('graph or recipes changed since failed run');
     throw new Error(`run identity mismatch: ${saved.graphId}/${saved.runId}`);
   }
-  const runId = safeSegment(options.resumeRunId ?? options.runId ?? randomUUID());
+  const launchRunId = options.launchKey === undefined ? undefined : graphLaunchKeyRunId(options.launchKey);
+  if (launchRunId !== undefined) {
+    const existing = readGraphRunIfPresent(graphId, launchRunId, root);
+    if (existing) {
+      // Same key → same run: nothing executes again; an unfinished run is resumed explicitly by the caller.
+      debug.log('graph.launch', 'deduped', { graphId, runId: existing.runId, status: existing.status });
+      options.deps?.log?.('launch-deduped', { graphId, runId: existing.runId, status: existing.status });
+      return existing;
+    }
+  }
+  let launchClaimDir: string | undefined;
+  const runId = safeSegment(options.resumeRunId ?? launchRunId ?? options.runId ?? randomUUID());
   const suppliedS2Budget = options.s2CorrectionBudget;
   const savedS2Budget = saved?.s2CorrectionBudget;
   // S2-RESUME-CORRECTION-BUDGET-POLICY (#37896 r3 MF): start may omit the budget (zero corrections; the
@@ -1934,8 +2106,18 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       ...(graph.nodes.some(node => node.memory) ? { memoryIdentity: options.deps!.memoryIdentity } : {}),
       ...(options.input === undefined ? {} : { input: options.input }),
       ...(options.unitContext?.entryNodeId === undefined ? {} : { entryNodeId: options.unitContext.entryNodeId }),
+      ...(options.budgetUsd === undefined ? {} : { usdBudget: { budgetUsd: options.budgetUsd, measuredUsd: 0, measuredNodes: 0, unmeasuredNodes: [] } }),
+      ...(options.launchKey === undefined ? {} : { launchKeySha256: createHash('sha256').update(options.launchKey).digest('hex') }),
       executed: 0, dryRun: options.dryRun === true, graphRevision: 1, statePath };
   if (options.resumeRunId && s2CorrectionBudget) state.s2CorrectionBudget = s2CorrectionBudget;
+  if (options.resumeRunId && options.budgetUsd !== undefined) {
+    // Prior nodes of an unbudgeted run were never metered, so a budget cannot start mid-run.
+    if (!state.usdBudget) refuseRunOption('graph.budget', 'added-on-resume', 'budgetUsd cannot be added on resume to a run started without one');
+    if (state.usdBudget!.budgetUsd !== options.budgetUsd) {
+      debug.log('graph.budget', 'usd-budget-changed', { graphId, runId, from: state.usdBudget!.budgetUsd, to: options.budgetUsd });
+      state.usdBudget = { ...state.usdBudget!, budgetUsd: options.budgetUsd };
+    }
+  }
   if (state.pending?.outcome === 'waived-known-issue') {
     // This run's original graph snapshot predates the named edge. Keep every
     // other node and recipe pinned; graft only the route declared by the
@@ -2236,8 +2418,17 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       });
     }
     const priorExecuted = state.executed;
+    // K5: restarting an interrupted (stopped) unit visit re-attaches its child; a genuinely failed visit gets a fresh key.
+    const interrupted = state.nodes[from];
+    const interruptedLaunchKey = interrupted?.nodeId === options.fromNodeId && interrupted.error === STOPPED_NODE_ERROR
+      ? interrupted.launchKey : undefined;
     state.path = state.path.slice(0, from);
     state.nodes = state.nodes.slice(0, from);
+    if (interruptedLaunchKey && interrupted?.executionId) {
+      state.currentNode = { nodeId: interrupted.nodeId, executionId: interrupted.executionId, startedAt: interrupted.startedAt ?? new Date().toISOString(),
+        launchKey: interruptedLaunchKey };
+      debug.log('graph.launch', 'reattach-interrupted', { graphId, runId, nodeId: interrupted.nodeId });
+    }
     state.executed = state.nodes.filter((node) => node.executed).length;
     state.status = 'running';
     delete state.stoppedAt;
@@ -2891,6 +3082,31 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   let growthScopeSkipLogged = false;
   let growthCapReachedLogged = state.growthRejections?.some((item) =>
     item.reason === 'growth proposal limit 8 reached' || item.reason === 'growth limit 3 reached') ?? false;
+  if (!options.resumeRunId && launchRunId !== undefined) {
+    // The fast ledger check above is not atomic; this exclusive claim is. It is taken before the ledger and any node.
+    await options.deps?.beforeLaunchClaim?.();
+    const pendingClaim = acquireLaunchClaim(root, graphId, launchRunId, { pid: process.pid, pidStartedAt: runnerOwner.pidStartedAt,
+      host: hostname(), claimedAt: new Date().toISOString() }, options.deps?.processStartMs ?? psProcessStartMs,
+      { beforeReclaim: options.deps?.beforeLaunchReclaim });
+    // Production and synchronous test seams publish the ledger before another
+    // launcher in this process can observe our live claim without its ledger.
+    const claim = pendingClaim instanceof Promise ? await pendingClaim : pendingClaim;
+    if (claim.kind === 'deduped') {
+      debug.log('graph.launch', 'deduped', { graphId, runId: claim.state.runId, status: claim.state.status, race: true });
+      options.deps?.log?.('launch-deduped', { graphId, runId: claim.state.runId, status: claim.state.status });
+      return claim.state;
+    }
+    if (claim.kind === 'in-flight') {
+      debug.log('graph.launch', 'refused', { graphId, runId: launchRunId, reason: 'in-flight',
+        ...(claim.owner ? { ownerPid: claim.owner.pid, ownerHost: claim.owner.host } : {}) }, { level: 'warn' });
+      throw new Error(`launch key is being launched by another runner and has no ledger yet: ${graphId}/${launchRunId}`);
+    }
+    launchClaimDir = claim.dir;
+    debug.log('graph.launch', 'claimed', { graphId, runId: launchRunId });
+    // Only a test seam that returns a promise yields here; production keeps claim → ledger in one synchronous step.
+    const afterClaim = options.deps?.afterLaunchClaim?.();
+    if (afterClaim) await afterClaim;
+  }
   if (!options.resumeRunId) {
     mkdirSync(dirname(statePath), { recursive: true });
     if (readdirSync(dirname(statePath)).some((file) => file.startsWith(`${runId}.json.`) && file.endsWith('.decision.json'))) {
@@ -2907,6 +3123,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     mkdirSync(`${statePath}.graph`);
     writeFileSync(join(`${statePath}.graph`, 'graph.yaml'), variantSource, { flag: 'wx' });
     writeFileSync(join(`${statePath}.graph`, 'recipes.yaml'), recipeSource, { flag: 'wx' });
+    // The ledger now dedupes this key; the claim has done its job.
+    if (launchClaimDir) { rmSync(launchClaimDir, { recursive: true, force: true }); launchClaimDir = undefined; }
   }
   if (eventBus && (state.pendingGraphEvents?.length ?? 0) > 0) {
     for (const pendingEvent of [...state.pendingGraphEvents!]) {
@@ -2983,6 +3201,18 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       await emitVisitLifecycle('leave', current, visit, { reason: 'budget-exceeded' });
       state.status = 'budget-exceeded';
       log('budget-exceeded', { graphId, runId, nodeId: current });
+      persist();
+      break;
+    }
+    if (state.usdBudget && !state.dryRun && !resumingPending && !resumingCompleted && !graph.terminalNodes.includes(current)
+        && state.usdBudget.measuredUsd >= state.usdBudget.budgetUsd) {
+      // Stop before launching the next node; the run stays resumable (raise budgetUsd on resume to continue).
+      state.status = 'paused';
+      state.reason = 'usd-budget-exceeded';
+      state.pausedAt = new Date().toISOString();
+      debug.log('graph.budget', 'usd-exceeded', { graphId, runId, nextNodeId: current, budgetUsd: state.usdBudget.budgetUsd,
+        measuredUsd: state.usdBudget.measuredUsd, unmeasuredNodes: state.usdBudget.unmeasuredNodes.length }, { level: 'warn' });
+      log('usd-budget-exceeded', { graphId, runId, nodeId: current, budgetUsd: state.usdBudget.budgetUsd, measuredUsd: state.usdBudget.measuredUsd });
       persist();
       break;
     }
@@ -3079,7 +3309,15 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       .map((record) => Date.parse(record.endedAt ?? ''))
       .find((timestamp) => Number.isFinite(timestamp));
     const nodeStartedAt = new Date(Math.max(Date.now(), (priorNodeEndedAt ?? 0) + 1)).toISOString();
-    if (!resumingCompleted) state.currentNode = { nodeId: current, executionId, startedAt: nodeStartedAt };
+    // K5: a unit child's launch key is written to node state before the child launches. A crash-resume of the same
+    // unrecorded visit reuses the persisted key (re-attach); a new attempt gets a fresh key from its execution id.
+    const unitLaunchKey = units.has(current) && !resumingCompleted && !state.dryRun
+      ? (state.currentNode?.nodeId === current && state.nodes.at(-1)?.executionId !== state.currentNode.executionId
+        ? state.currentNode.launchKey : undefined)
+        ?? graphLaunchKey({ runId, nodeId: current, attempt: executionId, inputSha256: nodeCompletionInputSha256 })
+      : undefined;
+    if (!resumingCompleted) state.currentNode = { nodeId: current, executionId, startedAt: nodeStartedAt,
+      ...(unitLaunchKey === undefined ? {} : { launchKey: unitLaunchKey }) };
     await emitVisitLifecycle('start', current, visit);
     if (!options.quiet) console.error(`[graph] ${current} start (0.00s)`);
     debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: 'start', dryRun: state.dryRun });
@@ -3835,7 +4073,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       );
       const requested = Math.min(node.budget!.innerSteps, node.allowance?.innerSteps ?? node.budget!.innerSteps);
       const allowance = resolveChildAllowance(requested, Math.max(0, remaining));
-      const childRunId = randomUUID();
+      const childRunId = unitLaunchKey === undefined ? randomUUID() : graphLaunchKeyRunId(unitLaunchKey);
       const selectedEntry = node.callEntry ?? unit.template.entryNode;
       const recordEntry = node.callEntry !== undefined || unit.template.unit?.entries !== undefined;
       const info = { graphId, runId, nodeId: current, unit: unit.template.graphId, childRunId, parentRunId: runId,
@@ -3877,7 +4115,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           log('graph.unit', { ...info, phase: 'allowance-clamped', requested: allowance.requested, granted: allowance.granted, remaining });
         }
         entered = true;
-        const child = await runGraph(unit.path, { runId: childRunId, input: inputs, dryRun: false,
+        // Same key → same child run: a recorded child is re-attached, never launched a second time.
+        const existingChild = unitLaunchKey === undefined ? undefined : readGraphRunIfPresent(unit.template.graphId, childRunId, root);
+        if (existingChild) debug.log('graph.launch', 'deduped', { graphId: unit.template.graphId, runId: childRunId, parentRunId: runId,
+          nodeId: current, status: existingChild.status });
+        const child = existingChild ?? await runGraph(unit.path, { runId: childRunId, input: inputs, dryRun: false,
           ...(unit.source === undefined ? {} : { graphSource: unit.source }),
           ...(baseEventBus === undefined ? {} : { eventBus: baseEventBus }),
           ...(options.signal ? { signal: options.signal } : {}),
@@ -4188,7 +4430,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       const completionReceipt = ok && receiptCommit !== undefined && artifactSnapshot.valid
         ? { inputSha256: nodeCompletionInputSha256, commit: receiptCommit, artifactSha256: artifactSnapshot.sha256 }
         : undefined;
-      state.nodes.push({ nodeId: current, executionId, ok, exit, executed: !waiving && (handlerExecuted || (!!joinedFanout && !state.dryRun) || (!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun) || (node.kind === 'classify' && !state.dryRun) || unitExecuted), ...(storedOutput === undefined ? {} : { output: storedOutput }), ...(completionReceipt === undefined ? {} : { completionReceipt }), ...(error ? { error } : {}),
+      state.nodes.push({ nodeId: current, executionId, ...(unitLaunchKey === undefined ? {} : { launchKey: unitLaunchKey }), ok, exit, executed: !waiving && (handlerExecuted || (!!joinedFanout && !state.dryRun) || (!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun) || (node.kind === 'classify' && !state.dryRun) || unitExecuted), ...(storedOutput === undefined ? {} : { output: storedOutput }), ...(completionReceipt === undefined ? {} : { completionReceipt }), ...(error ? { error } : {}),
         ...(failure ? { reason: failure.message, failure } : {}), ...(commandFailureReason && !failure ? { reason: commandFailureReason } : {}),
         ...(waiving ? { waiver: { reason: options.releaseWaiver!.reason, at: nodeEndedAt, ...(options.releaseWaiver!.approvedBy === undefined ? {} : { approvedBy: options.releaseWaiver!.approvedBy }), ...(options.releaseWaiver!.ownerWaived ? { ownerWaived: true } : {}), ...(options.releaseWaiver!.introducedIds === undefined ? {} : { introducedIds: options.releaseWaiver!.introducedIds }), ...(options.releaseWaiver!.unmeasured === undefined ? {} : { unmeasured: options.releaseWaiver!.unmeasured }), ...(options.releaseWaiver!.carriedSweep === undefined ? {} : { carriedSweep: options.releaseWaiver!.carriedSweep }), original: { exit: waivedRecord!.exit, ...(waivedRecord!.output === undefined ? {} : { output: waivedRecord!.output }), ...(waivedRecord!.error === undefined ? {} : { error: waivedRecord!.error }) } } } : {}),
         ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}),
@@ -4238,6 +4480,19 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     if (!resumingCompleted) {
       // Recipe commands expose stdout/exit but no provider usage; never infer zero from success.
       observeModelInputTokens({ scope: 'harness-node', nodeKind: node.kind, runId, nodeId: current });
+      const meteredRecord = state.nodes.at(-1);
+      if (state.usdBudget && !state.dryRun && meteredRecord?.nodeId === current && meteredRecord.executed) {
+        const cost = reportedCostUsd(meteredRecord.output);
+        if ('costUsd' in cost) {
+          state.usdBudget = { ...state.usdBudget, measuredUsd: state.usdBudget.measuredUsd + cost.costUsd, measuredNodes: state.usdBudget.measuredNodes + 1 };
+          debug.log('graph.budget', 'usd-measured', { graphId, runId, nodeId: current, costUsd: cost.costUsd, measuredUsd: state.usdBudget.measuredUsd });
+        } else {
+          // No cost reported: listed as unmeasured, never added as $0.
+          state.usdBudget = { ...state.usdBudget, unmeasuredNodes: [...state.usdBudget.unmeasuredNodes, current] };
+          debug.log('graph.budget', 'usd-unmeasured', { graphId, runId, nodeId: current, reason: cost.invalid ? 'invalid-cost' : 'no-cost-reported' });
+        }
+        persist();
+      }
     }
     let releaseGateFailedEvent: GraphEvent | undefined;
     const triageOutput = lastJsonObject(completedRecord?.output);
@@ -4800,6 +5055,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     disposeReleaseGraphEventAdapters();
     disposeAdaptiveGateHealAdapter();
     if (options.resumeRunId && existsSync(resumeLock)) rmdirSync(resumeLock);
+    // A launcher that failed (not crashed) before its ledger releases its claim; a crash leaves it for the stale rule.
+    if (launchClaimDir) rmSync(launchClaimDir, { recursive: true, force: true });
   }
 }
 
@@ -4889,6 +5146,8 @@ export function manageGraphRun(graphId: string, runId: string, action: 'stop' | 
     const stopMs = running === undefined ? Date.now() : Math.max(Date.now(), Date.parse(running));
     if (state.path.length === state.nodes.length + 1) {
       state.nodes.push({ nodeId: state.path.at(-1)!, ...(current?.executionId ? { executionId: current.executionId } : {}),
+        // K5 field parity: an interrupted unit visit keeps its launch key so `--from` re-attaches the same child.
+        ...(current?.launchKey && current.nodeId === state.path.at(-1) ? { launchKey: current.launchKey } : {}),
         ok: false, exit: null, executed: false, error: STOPPED_NODE_ERROR,
         // The stop instant is always the node end; a start (and so seconds) exists only when the ledger named the running
         // node — a run begun by a runner before GRAPH-NODE-TIMES did not, and a guessed start would be a false time.

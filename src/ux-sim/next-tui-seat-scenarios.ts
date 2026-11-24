@@ -946,11 +946,13 @@ async function runNextWakeupScenario(spec: NextTuiScenarioSpec, root: string, ba
     {
       label: 'scheduled',
       text: '60초 뒤 예약해줘',
-      until: (s) => done(1)(s) && s.includes('⏰ 예약 깨움'),
+      // TUI-NOTICE-QUIET (대표 11-24 12:1x): the «⏰ 예약 깨움 HH:MM» booking echo is logged, not drawn.
+      until: (s) => done(1)(s),
     },
     { label: 'busy over the due time', text: '긴 작업 하나', until: (s) => /(응답 중|턴 스트리밍|running|turn streaming|Thinking)/.test(s), timeoutMs: 30_000 }, // #38392 영어 크롬
     { label: 'long turn done', until: done(2, '긴 작업 하나'), timeoutMs: 30_000 },
-    { label: 'woke after one deferral', until: (s) => banner.test(s) && done(3)(s), timeoutMs: 30_000 },
+    // TUI-NOTICE-QUIET (대표 11-24): the resume banner is no longer drawn — the third answered turn is the surface.
+    { label: 'woke after one deferral', until: (s) => done(3)(s), timeoutMs: 30_000 },
   ];
   const run = await mockSeatPtySequence({
     ...base,
@@ -970,11 +972,11 @@ async function runNextWakeupScenario(spec: NextTuiScenarioSpec, root: string, ba
   const store = activeUserTexts(root);
   const checks = {
     scheduledOnce: wake('scheduled').length === 1,
-    noticeOnScreen: (run.frames.find((f) => f.label === 'scheduled')?.screen ?? '').includes('⏰ 예약 깨움'),
+    noticeHidden: !(run.frames.find((f) => f.label === 'scheduled')?.screen ?? '').includes('⏰ 예약 깨움'),
     deferredWhileBusy: wake('rejected').some((r) => r.id === 'w1' && r.reason === 'NotIdle'),
     firedOnce: wake('fired').length === 1,
     internalTurnOpened: opened.length === 1 && opened[0]?.origin === 'scheduled',
-    bannerOnScreen: banner.test(run.frames.at(-1)?.screen ?? ''),
+    bannerHidden: !banner.test(run.frames.at(-1)?.screen ?? ''),
     wakeTurnStored: store.user.some((t) => t.startsWith('[예약 깨움 w1] 점검')),
     onlyFakeProvider: onlyFake(events),
     exitedClean: run.exitCode === 0,

@@ -72,7 +72,8 @@ test('no server: the CLI says so and writes nothing', async () => {
 
 test('one owner: new/send/read go through the server, a second serve is refused, a dead server is replaced and the pane keeps its cwd', async () => {
   const state = tempDir('els-owner-');
-  const cwd = tempDir('els-cwd-');
+  // The journal records the pane's real cwd (the PTY child's getcwd resolves /tmp → /private/tmp on macOS — cf. folder below).
+  const cwd = realpathSync(tempDir('els-cwd-'));
   const first = await serve(state);
   expect(first.output()).toContain('listening on');
   // Before the refused second serve below: that start rewrites the owner-token file, so the live server's token is read now.
@@ -248,9 +249,11 @@ test('herdr words and defaults: workspace create with no options, pane run/send-
 
   const listed = JSON.parse((await asPerson(['pane', 'list'])).stdout) as { result: { panes: { pane_id: string; cwd: string }[] } };
   expect(listed.result.panes.map((row) => [row.pane_id, row.cwd])).toEqual([[paneId, folder]]);
-  const refused = await asPerson(['pane', 'close', paneId]);   // the CLI carries no human confirmation: the door refuses (#39143)
-  expect([refused.exitCode, refused.stderr]).toEqual([1, expect.stringContaining('close needs confirm:true')]);
-  expect((await closeConfirmed(paneId)).exitCode).toBe(0);
+  // #39763 (ELS-ELN-SECURITY-RELAX, 11-23): the same-uid server socket treats a caller outside any pane
+  // (outsider/owner — server-auth.ts authorizeRequest) as the operator: every op is allowed and still
+  // audited, so the CLI's `pane close` (which carries no confirmation) closes the pane.
+  const closed = await asPerson(['pane', 'close', paneId]);
+  expect(closed.exitCode, closed.stderr).toBe(0);
   expect((JSON.parse((await asPerson(['pane', 'list'])).stdout) as { result: { panes: unknown[] } }).result.panes).toEqual([]);
 }, 120_000);
 
@@ -342,11 +345,14 @@ Options:
 
 Commands:
   seat [seat]                                              Open a seat tab, or register OP with \`els seat set OP\`
+  baton                                                    Delegate or return the OP acting lease
   supervisor                                               The launchd user agent that keeps the els server running: on · off · status
   serve [options]                                          Run the els server: the one owner of the journal and the pane PTYs (run once, by a supervisor)
   mcp                                                      els as an MCP server
   acp                                                      els as an ACP agent
+  up                                                       Review and apply a workspace declaration after terminal confirmation
   ls [options]                                             List workspaces, tabs and panes as JSON: this host and the hosts in els/hosts.json (a host that does not answer is listed as down)
+  status-board [options]                                   One table of seats: seat, state, reason, since, model (a space coordinator sees its own spaces; OP every space)
   update-all [options]                                     Catch up registered ELS hosts to desiredSha, migrate seat tabs at their turn boundary, and print one result row per tab
   new [options] [command...]                               Open a pane: the server spawns a PTY and records ws/tab/pane + cwd in the journal. No command → $SHELL, no --cwd → this folder, no --ws → the folder name. Options go BEFORE --
   read <pane>                                              Read a pane: a local pane id, ws/tab/pane, or host:ws/tab/pane on a registered host
@@ -357,7 +363,8 @@ Commands:
   snapshot <pane>                                          Save a pane's screen as an svg artifact (classic capture engine): prints {path}
   record <pane>                                            Record a pane's PTY output: first call starts (prints {recordingId}), the next call for the pane (even after it was closed) stops and saves the asciicast: prints {path}
   input [options] <pane> <text>                            Submit a direct operator line through the owner control door
-  workspace|ws                                             Workspaces: list · create · close · move · coordinator
+  workspace|ws                                             Workspaces: list · create · rename · close · move · coordinator
+  rename <kind> <id> <name>                                Rename a tab by id or unique name
   tab                                                      Tabs (herdr words): list · close · move
   attach <pane>                                            Show a local pane or registered host:ws/tab/pane live (ctrl+b q detaches)
   attach-stdio <pane> <cols> <rows> [base-url] [ws] [tab]  SSH bridge (ELS-SSH-ATTACH-ANYWHERE): carry the attach wire on stdio, so a pane of this host can be attached from anywhere
@@ -580,7 +587,7 @@ test('els send submits a long bracketed paste through a real owned PTY and obser
   expect(readFileSync(captured, 'utf8')).toBe(`\x1b[200~${text}\x1b[201~\r`);
 }, 30000);
 
-test('workspace rename changes only the named workspace through the owner door', async () => {
+test('workspace rename changes only the named workspace (the relaxed same-uid door needs no owner token)', async () => {
   const state = tempDir('els-ws-rename-');
   const server = await serve(state);
   expect(server.output()).toContain('listening on');
@@ -589,13 +596,13 @@ test('workspace rename changes only the named workspace through the owner door',
     expect(created.exitCode, created.stderr).toBe(0);
   }
   const list = async () => JSON.parse((await side(state, state, ['ws', 'list'])).stdout) as { result: { workspaces: { workspace_id: string; name: string }[] } };
-  const before = await list();
-  const denied = await side(state, state, ['ws', 'rename', 'Alpha', 'Changed']);
-  expect(denied.exitCode).not.toBe(0);
-  expect(await list()).toEqual(before);
-  const owner = await asOwner(state);
-  const renamed = await side(state, state, ['ws', 'rename', 'Alpha', 'Changed'], owner);
+  // #39763 (ELS-ELN-SECURITY-RELAX, 11-23): a token-less same-uid caller (outsider) is the operator, so the
+  // CLI's `ws rename` renames without an owner token; only the named workspace changes.
+  const renamed = await side(state, state, ['ws', 'rename', 'Alpha', 'Changed']);
   expect(renamed.exitCode, renamed.stderr).toBe(0);
+  expect((await list()).result.workspaces.map((row) => row.name)).toEqual(['Changed', 'Beta']);
+  const owner = await asOwner(state);
+  // Value errors stay errors for the owner too: an unknown workspace or a blank name renames nothing.
   expect((await side(state, state, ['workspace', 'rename', 'missing', 'No'], owner)).exitCode).not.toBe(0);
   expect((await side(state, state, ['ws', 'rename', 'Changed', '   '], owner)).exitCode).not.toBe(0);
   const after = await list();

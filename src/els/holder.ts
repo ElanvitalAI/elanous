@@ -9,7 +9,7 @@ import { createConnection, createServer, type Server, type Socket } from 'node:n
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { onPtyEvent, startPty, unregisterPty } from '../pty-shell/registry.js';
+import { onPtyEvent, startPty, unregisterPty, type WheelRoute } from '../pty-shell/registry.js';
 import type { ElsPty } from './core.js';
 import { peerPid, processIdentity, processStartStamp } from './peer-seat.js';
 import { createLineDecoder } from './wire.js';
@@ -227,7 +227,9 @@ export type HolderMessage =
   | { readonly type: 'pong'; readonly paneId: string; readonly ptyId: string; readonly pid: number; readonly processStart?: string; readonly generationNonce?: string }
   | { readonly type: 'snapshot'; readonly paneId: string; readonly ptyId: string; readonly pid: number; readonly processStart?: string; readonly alive: boolean;
       readonly cols: number; readonly rows: number; readonly exitCode: number | null; readonly bracketedPaste: boolean;
-      readonly lastOutputAt: number | null; readonly screen: string }
+      readonly lastOutputAt: number | null; readonly screen: string;
+      /** ELS-WHEEL-HISTORY: where a wheel over this pane goes, from the child's current terminal modes. Absent (an older holder) = host. */
+      readonly wheelRoute?: WheelRoute }
   | { readonly type: 'output'; readonly paneId: string; readonly chunk: string }
   | { readonly type: 'exit'; readonly paneId: string; readonly exitCode: number | null; readonly screen: string }
   | { readonly type: 'wrote'; readonly paneId: string }
@@ -461,7 +463,9 @@ export async function startHolder(start: HolderStart): Promise<Holder> {
         case 'resize': handle.resize(message.cols, message.rows); return;
         case 'snapshot': send({ type: 'snapshot', paneId: meta.paneId, ptyId: handle.id, pid: handle.pid, ...(processStart ? { processStart } : {}), alive: handle.isAlive(),
           cols: handle.cols, rows: handle.rows, exitCode: handle.exitCode, bracketedPaste: handle.bracketedPasteEnabled(),
-          lastOutputAt: handle.lastOutputAt ?? null, screen: await handle.renderScreen(message.ansi === true ? { ansi: true, ...(message.scrollBack ? { scrollBack: message.scrollBack } : {}) } : undefined) }); return;
+          lastOutputAt: handle.lastOutputAt ?? null, screen: await handle.renderScreen(message.ansi === true ? { ansi: true, ...(message.scrollBack ? { scrollBack: message.scrollBack } : {}) } : undefined),
+          // ELS-WHEEL-HISTORY: read AFTER the render so the route matches the screen it rides with.
+          wheelRoute: handle.wheelRoute?.() ?? 'host' }); return;
         case 'kill': handle.kill(); return;
         case 'adopt-renew': {
           // 보안 HOLD 수리(OP #129232) 재결속(reattach) 핸드셰이크 — JUD #128534 신뢰 경로 위의 신뢰 등록:
@@ -629,6 +633,10 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
   let detached = false;
   let exited = false;
   let bracketedPaste = false;
+  // ELS-WHEEL-HISTORY: the child's wheel route as of the last snapshot (every attach frame takes one first).
+  // Before this the holder-backed pane had no route at all, so a wheel over eln (alternate screen + its own mouse)
+  // always fell to the els scrollback — empty on an alternate screen — and the history never moved.
+  let wheelRoute: WheelRoute = 'host';
   let lastOutputAt: number | undefined;
   let pidNow = meta?.pid;
   let holderPtyId = meta?.ptyId;
@@ -748,6 +756,7 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
       case 'snapshot':
         alive = message.alive;
         bracketedPaste = message.bracketedPaste;
+        wheelRoute = message.wheelRoute ?? 'host';
         // The holder's own output time; never move it back behind an output broadcast this client already saw.
         lastOutputAt = Math.max(lastOutputAt ?? 0, message.lastOutputAt ?? 0) || undefined;
         pidNow = message.pid;
@@ -827,6 +836,8 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
       });
     },
     bracketedPasteEnabled: () => bracketedPaste,
+    wheelRoute: () => wheelRoute,
+    wheelPassthrough: () => wheelRoute.startsWith('mouse'),
     lastOutputAt: () => lastOutputAt,
     renderScreen: (options) => new Promise<string>((resolve, reject) => {
       if (exited || detached) {

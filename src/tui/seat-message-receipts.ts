@@ -23,6 +23,8 @@ export interface SeatMailMessage extends StructuredMessageFields {
   kind?: string;
   /** Ledger `created_at`. The notice producer copies this into `occurredAt`. */
   createdAt?: string;
+  /** QUEUE-FINISH-FIRST: ledger `reply_to` — a reply to a mail the current work waits on joins that work. */
+  replyTo?: number;
 }
 
 export interface SeatMailMessageRead {
@@ -84,6 +86,7 @@ export function seatMailMessageOf(m: Message): SeatMailMessage {
     ...(m.createdAt ? { createdAt: m.createdAt } : {}),
     ...(m.origin === undefined ? {} : { origin: m.origin }), ...(m.intent === undefined ? {} : { intent: m.intent }),
     ...(m.crownDirective === undefined ? {} : { crownDirective: m.crownDirective }),
+    ...(m.replyTo === undefined ? {} : { replyTo: m.replyTo }),
   };
 }
 

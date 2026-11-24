@@ -11,14 +11,24 @@
       "greenSince": "0.3.34 ELN-CAPSULE-RESULT-NO-REPEAT-REPORT",
       "reason": "ELN-CAPSULE-RESULT-NO-REPEAT-REPORT (OP 0.3.34 P1-4): a capsule result absorbed into its original work item (mid-turn drain, next-turn passive carry, carried-with-turn summary) is a closed cell — replaying the same capsule-done (re-publish, reconnect) re-reports nothing while a fresh capsule still reports exactly once."
     },
+    "capsule-events/S3-AGENT": {
+      "expect": "red",
+      "reason": "S3 measures admission, owner-only stop, wake, session drain and full result retention. The parent REPL handoff is measured separately in S3-TURN.",
+      "redReason": "S3 production Agent boundary unmeasured"
+    },
+    "capsule-events/S3-TURN": {
+      "expect": "green",
+      "reason": "One Agent completion reaches the next real REPL turn and is absent from the following turn. The model is a deterministic fixture.",
+      "greenSince": "#38901 isolated mbp seed 1"
+    },
     "capsule-events/C1": {
       "expect": "green",
-      "reason": "C1 done-event wake axes (flag removed — capsule behavior always on, CAPSULE-FLAGS-REMOVE-DEFAULT): the background Agent end delivery passes here (exactly one wake turn within 20s, duplicates 0) and the harness child end frame is green in capsule-events/C1-HARNESS (B4/B5 queue-bridge); the mail axis keeps its own red row capsule-events/C1-MAIL",
+      "reason": "C1 done-event wake axes (flag removed — capsule behavior always on, CAPSULE-FLAGS-REMOVE-DEFAULT): the background Agent end delivery passes here (exactly one wake turn after the 120s passive ripen — #39609, measured, not compressed #39666 — duplicates 0) and the harness child end frame is green in capsule-events/C1-HARNESS (B4/B5 queue-bridge); the mail axis keeps its own red row capsule-events/C1-MAIL",
       "greenSince": "2026-11-21 pool4-capsule-c1-harness"
     },
     "capsule-events/C1-HARNESS": {
       "expect": "green",
-      "reason": "C1 harness child end axis (CAPSULE-B4-HARNESS-DONE-FRAME · B5 queue-bridge): a RunShell mode:'bg' harness child finishes while the seat is idle, its task-notification crosses as one capsule-done frame and opens exactly one next turn within 20s with duplicates 0 — self-implement-stop ('harness' kind) and graph frames remain unmeasured: sim probes at a 20s window (probe-c1-harness-selfimpl-221754) and a 60s window (probe-b-c1-harness-60s-223600) both record stopCount 0, so the axis stays unmeasured (JUD-B #122985)",
+      "reason": "C1 harness child end axis (CAPSULE-B4-HARNESS-DONE-FRAME · B5 queue-bridge): a RunShell mode:'bg' harness child finishes while the seat is idle, its task-notification crosses as one capsule-done frame and opens exactly one next turn after the 120s passive ripen (#39609 — measured, not compressed, #39666) with duplicates 0 — self-implement-stop ('harness' kind) and graph frames remain unmeasured: sim probes at a 20s window (probe-c1-harness-selfimpl-221754) and a 60s window (probe-b-c1-harness-60s-223600) both record stopCount 0, so the axis stays unmeasured (JUD-B #122985)",
       "greenSince": "2026-11-21 pool4-capsule-c1-harness"
     },
     "capsule-events/C3": {

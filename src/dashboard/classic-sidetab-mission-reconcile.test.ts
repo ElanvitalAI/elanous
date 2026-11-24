@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { reconcileClassicSidetabCandidatePatches, sidetabCandidateProtocolPrompt } from './classic-sidetab-mission-reconcile.js';
+import { reconcileClassicSidetabCandidatePatches, sidetabCandidateProtocolPrompt } from '../sidetab-core/classic-sidetab-mission-reconcile.js';
 
 const roots: string[] = [];
 function fixture(): { cwd: string; baseSha: string } {

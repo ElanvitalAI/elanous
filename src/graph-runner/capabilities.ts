@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { InProcessHandlerContext, InProcessHandlerResult } from './in-process-registry.js';
 
 /** Closed, domain-neutral vocabulary from SYNTHESIS-two-layer-graph-v2 §3b. */
@@ -105,16 +106,25 @@ export const STORE_EVENTS_CONTRACT: GraphCapabilityContract = Object.freeze({
 
 const CONTRACT_ID = /^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+@[1-9]\d*$/;
 
-export function registerGraphCapabilityContract(
-  registry: GraphCapabilityRegistry,
-  contract: GraphCapabilityContract,
-): GraphCapabilityRegistry {
+/** One validator for both registration paths: code registration and vocabulary review. */
+function validateGraphCapabilityContract(contract: GraphCapabilityContract): void {
   if (!CONTRACT_ID.test(contract.id)) throw new Error(`invalid graph capability contract id: ${contract.id}`);
-  if (Object.hasOwn(registry.contracts, contract.id)) throw new Error(`duplicate graph capability contract: ${contract.id}`);
+  if (!contract.input || typeof contract.input !== 'object' || Array.isArray(contract.input))
+    throw new Error(`invalid input schema for ${contract.id}`);
+  if (!contract.output || typeof contract.output !== 'object' || Array.isArray(contract.output))
+    throw new Error(`invalid output schema for ${contract.id}`);
   if (contract.guarantees?.maxLatencyMs !== undefined && (!Number.isFinite(contract.guarantees.maxLatencyMs) || contract.guarantees.maxLatencyMs < 0))
     throw new Error(`invalid maxLatencyMs guarantee: ${contract.id}`);
   if (contract.guarantees?.maxFreshnessMs !== undefined && (!Number.isFinite(contract.guarantees.maxFreshnessMs) || contract.guarantees.maxFreshnessMs < 0))
     throw new Error(`invalid maxFreshnessMs guarantee: ${contract.id}`);
+}
+
+export function registerGraphCapabilityContract(
+  registry: GraphCapabilityRegistry,
+  contract: GraphCapabilityContract,
+): GraphCapabilityRegistry {
+  validateGraphCapabilityContract(contract);
+  if (Object.hasOwn(registry.contracts, contract.id)) throw new Error(`duplicate graph capability contract: ${contract.id}`);
   return { ...registry, contracts: { ...registry.contracts, [contract.id]: contract } };
 }
 
@@ -172,6 +182,196 @@ export function registerGraphCapabilityProvider(
   provider: GraphCapabilityProvider,
 ): LegacyGraphCapabilityProviders {
   return { ...providers, [name]: provider };
+}
+
+/**
+ * Dynamic capability vocabulary lifecycle (GRAPH-VOCAB-DYNAMIC): a real contract is
+ * registered as a proposal, judged by a named reviewer, and the approved contracts are
+ * materialized into the dispatch registry and pinned as one content-addressed edition.
+ * The pinned edition lives in a review-owned catalog ABOVE the graph plugin root; the
+ * manifest loader rejects nodes naming anything but an approved entry of that edition.
+ */
+export type GraphCapabilityReviewStatus = 'proposed' | 'approved' | 'rejected';
+
+export interface GraphCapabilityVocabularyEntry {
+  readonly id: GraphContractId;
+  readonly status: GraphCapabilityReviewStatus;
+  /** The registered contract; the edition digest pins its schemas too. */
+  readonly contract: GraphCapabilityContract;
+  /** Reviewer seat that produced an approved/rejected verdict; proposals carry none. */
+  readonly reviewer?: string;
+  readonly note?: string;
+}
+
+export interface GraphCapabilityVocabulary {
+  readonly entries: readonly GraphCapabilityVocabularyEntry[];
+}
+
+/** A frozen, content-addressed edition of the vocabulary (`판 고정`). */
+export interface GraphCapabilityVocabularyPin {
+  readonly entries: readonly GraphCapabilityVocabularyEntry[];
+  readonly digest: string;
+}
+
+export const emptyGraphCapabilityVocabulary = (): GraphCapabilityVocabulary => ({ entries: [] });
+
+function contractName(id: string): string {
+  return id.slice(0, id.lastIndexOf('@'));
+}
+
+function contractVersion(id: string): number {
+  return Number(id.slice(id.lastIndexOf('@') + 1));
+}
+
+/** Register a real contract as a proposal; verdicts come only from review. */
+export function proposeGraphCapability(
+  vocabulary: GraphCapabilityVocabulary,
+  contract: GraphCapabilityContract,
+): GraphCapabilityVocabulary {
+  validateGraphCapabilityContract(contract);
+  const id = contract.id;
+  const same = vocabulary.entries.find((entry) => entry.id === id);
+  if (same) {
+    if (same.status === 'approved') throw new Error(`graph capability contract ${id} is pinned in the approved vocabulary; propose the next version`);
+    if (same.status === 'proposed') throw new Error(`duplicate graph capability proposal: ${id}`);
+    throw new Error(`graph capability contract ${id} was rejected; propose the next version`);
+  }
+  const versions = vocabulary.entries
+    .filter((entry) => contractName(entry.id) === contractName(id))
+    .map((entry) => contractVersion(entry.id));
+  const next = (versions.length ? Math.max(...versions) : 0) + 1;
+  if (contractVersion(id) !== next) {
+    throw new Error(`graph capability proposal ${id} skips versions: the next version for ${contractName(id)} is ${next}`);
+  }
+  return { entries: [...vocabulary.entries, { id, status: 'proposed', contract }] };
+}
+
+/** Judge one proposal; approved and rejected verdicts are terminal for that version. */
+export function reviewGraphCapability(
+  vocabulary: GraphCapabilityVocabulary,
+  id: GraphContractId,
+  review: { verdict: 'approved' | 'rejected'; reviewer: string; note?: string },
+): GraphCapabilityVocabulary {
+  if (!review.reviewer.trim()) throw new Error(`capability review for ${id} requires a reviewer`);
+  const entry = vocabulary.entries.find((item) => item.id === id);
+  if (!entry) throw new Error(`unknown graph capability proposal: ${id}`);
+  if (entry.status !== 'proposed') throw new Error(`only proposed capability vocabulary can be reviewed: ${id} is ${entry.status}`);
+  return {
+    entries: vocabulary.entries.map((item) => item.id === id
+      ? { ...item, status: review.verdict, reviewer: review.reviewer, ...(review.note ? { note: review.note } : {}) }
+      : item),
+  };
+}
+
+/** Only approved entries of the reviewed vocabulary may back graph nodes. */
+export function approvedGraphCapabilityIds(vocabulary: GraphCapabilityVocabulary): readonly GraphContractId[] {
+  return vocabulary.entries.filter((entry) => entry.status === 'approved').map((entry) => entry.id).sort();
+}
+
+/**
+ * Materialize the reviewed vocabulary into the real dispatch registry: approved
+ * contracts become dispatchable, proposed and rejected contracts never enter, so
+ * provider declarations for them fail closed as unknown contracts.
+ */
+export function graphCapabilityRegistryFromVocabulary(vocabulary: GraphCapabilityVocabulary): GraphCapabilityRegistry {
+  const contracts: Record<string, GraphCapabilityContract> = {};
+  for (const entry of vocabulary.entries) {
+    if (entry.status === 'approved') contracts[entry.id] = entry.contract;
+  }
+  return { contracts, providers: [] };
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value as Record<string, unknown>).sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/** Deterministic edition identity: canonical content only — no time, no insertion order. */
+export function graphCapabilityVocabularyDigest(entries: readonly GraphCapabilityVocabularyEntry[]): string {
+  const canonical = entries
+    .map((entry) => [entry.id, entry.status, entry.reviewer ?? null, entry.note ?? null, stableJson(entry.contract)])
+    .sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0));
+  return createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex');
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/** Deep copy and deep freeze vocabulary entries, nested contract schemas included, so a pinned edition never aliases its source. */
+export function freezeGraphCapabilityVocabularyEntries(
+  entries: readonly GraphCapabilityVocabularyEntry[],
+): readonly GraphCapabilityVocabularyEntry[] {
+  return deepFreeze(structuredClone([...entries])
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)));
+}
+
+/** Freeze the current vocabulary as one pinned edition for the review-owned catalog. */
+export function pinGraphCapabilityVocabulary(vocabulary: GraphCapabilityVocabulary): GraphCapabilityVocabularyPin {
+  const entries = freezeGraphCapabilityVocabularyEntries(vocabulary.entries);
+  return Object.freeze({ entries, digest: graphCapabilityVocabularyDigest(entries) });
+}
+
+const VOCABULARY_ENTRY_KEYS = new Set(['id', 'status', 'contract', 'reviewer', 'note']);
+
+/** Strict parser for the review-owned vocabulary catalog; unknown shapes fail closed. */
+export function parseGraphCapabilityVocabularyEntries(
+  value: unknown,
+  label: string,
+): readonly GraphCapabilityVocabularyEntry[] {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  const entries = value.map((raw, index): GraphCapabilityVocabularyEntry => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`${label}[${index}] must be an object`);
+    const entry = raw as Record<string, unknown>;
+    for (const key of Object.keys(entry)) {
+      if (!VOCABULARY_ENTRY_KEYS.has(key)) throw new Error(`${label}[${index}] uses unsupported key: ${key}`);
+    }
+    if (typeof entry.id !== 'string' || !CONTRACT_ID.test(entry.id))
+      throw new Error(`${label}[${index}].id must be a <namespace>.<contract>@<positive version> id`);
+    if (entry.status !== 'proposed' && entry.status !== 'approved' && entry.status !== 'rejected')
+      throw new Error(`${label}[${index}].status must be proposed, approved, or rejected`);
+    if (entry.status === 'proposed' && entry.reviewer !== undefined)
+      throw new Error(`${label}[${index}] proposes ${entry.id} with a reviewer; proposals are unjudged`);
+    if (entry.status !== 'proposed' && (typeof entry.reviewer !== 'string' || !entry.reviewer.trim()))
+      throw new Error(`${label}[${index}] records ${entry.status} ${entry.id} without a reviewer`);
+    if (entry.note !== undefined && (typeof entry.note !== 'string' || !entry.note.trim()))
+      throw new Error(`${label}[${index}].note must be a nonempty string`);
+    if (!entry.contract || typeof entry.contract !== 'object' || Array.isArray(entry.contract))
+      throw new Error(`${label}[${index}] must register the real contract for ${entry.id}`);
+    const rawContract = entry.contract as Record<string, unknown>;
+    if (rawContract.id !== entry.id)
+      throw new Error(`${label}[${index}] registers contract ${String(rawContract.id)} under entry id ${entry.id}`);
+    const contract: GraphCapabilityContract = {
+      id: entry.id as GraphContractId,
+      input: rawContract.input as GraphContractSchema,
+      output: rawContract.output as GraphContractSchema,
+      ...(rawContract.guarantees !== undefined ? { guarantees: rawContract.guarantees as GraphCapabilityContract['guarantees'] } : {}),
+    };
+    try {
+      validateGraphCapabilityContract(contract);
+    } catch (error) {
+      throw new Error(`${label}[${index}] registers an invalid contract: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return {
+      id: entry.id as GraphContractId,
+      status: entry.status,
+      contract,
+      ...(typeof entry.reviewer === 'string' ? { reviewer: entry.reviewer } : {}),
+      ...(typeof entry.note === 'string' ? { note: entry.note } : {}),
+    };
+  });
+  const ids = entries.map((entry) => entry.id);
+  if (new Set(ids).size !== ids.length) throw new Error(`${label} must not contain duplicate contract ids`);
+  return entries;
 }
 
 export function capabilityNameFromRecipe(recipe: string): GraphCapabilityName | undefined {

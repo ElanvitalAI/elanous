@@ -2190,7 +2190,7 @@ function defaultConfig(): UserConfig {
     shell: { ...SHELL_DEFAULTS },
     chat: parseChatConfig(undefined),
     voice: { stt: {}, tts: {}, vad: {}, chat: {}, discord: {}, telegram: {}, pwa: {} },
-    intake: { eventMax: 10, telegram: {}, discord: {} },
+    intake: { telegram: {}, discord: {} },
     dashboard: {
       promptBank: { ...DASHBOARD_PROMPT_BANK_DEFAULTS },
       foldMode: 'task-unit',
@@ -3405,7 +3405,6 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       },
     },
     intake: {
-      eventMax: typeof intake.eventMax === 'number' && Number.isSafeInteger(intake.eventMax) && intake.eventMax >= 0 ? intake.eventMax : 10,
       ...(typeof intake.briefingTopic === 'string' && intake.briefingTopic.trim()
         ? { briefingTopic: intake.briefingTopic.trim() } : {}),
       telegram: {
@@ -3503,6 +3502,11 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     ...(rawObj.hitl && typeof rawObj.hitl === 'object' && !Array.isArray(rawObj.hitl)
       && typeof (rawObj.hitl as Record<string, unknown>).executionDeadlineMinutes === 'number'
       ? { hitl: { executionDeadlineMinutes: (rawObj.hitl as { executionDeadlineMinutes: number }).executionDeadlineMinutes } }
+      : {}),
+    ...(rawObj.graph && typeof rawObj.graph === 'object' && !Array.isArray(rawObj.graph)
+      && typeof (rawObj.graph as Record<string, unknown>).vocabularyCatalog === 'string'
+      && isAbsolute((rawObj.graph as { vocabularyCatalog: string }).vocabularyCatalog)
+      ? { graph: { vocabularyCatalog: (rawObj.graph as { vocabularyCatalog: string }).vocabularyCatalog } }
       : {}),
     ...(outboundConfig ? { outbound: outboundConfig } : {}),
     ...(parseHqConfig(rawObj.hq) ? { hq: parseHqConfig(rawObj.hq)! } : {}),

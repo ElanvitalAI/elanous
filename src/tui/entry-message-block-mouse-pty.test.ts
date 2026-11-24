@@ -9,7 +9,7 @@ const TURN_WAIT_MS = 10_000;
 // Source: #37786 — short per-frame waits report the failed mouse transition before the outer budget.
 const DETAIL_WAIT_MS = 5_000;
 
-test('mouse clicks reach tool summary, steps and raw output then fold without another turn', async () => {
+test('one mouse click reveals tool raw output and another folds without another turn', async () => {
   const root = mkdtempSync(join(tmpdir(), 'next-mouse-fold-'));
   let row = 0;
   let before = '';
@@ -42,9 +42,6 @@ test('mouse clicks reach tool summary, steps and raw output then fold without an
           before = transcript(); return true;
         } },
         { label: 'explicit log view', timeoutMs: DETAIL_WAIT_MS, keys: '\x1b[5~\x1b[6~', until: atHeader((s) => s.includes('▸ 도구 · Bash 결과') || s.includes('▸ tool · Bash 결과')) },
-        { label: 'click summary', timeoutMs: DETAIL_WAIT_MS, text: click, enter: false, until: atHeader((s) => s.includes('▾ 도구 · Bash 결과') || s.includes('▾ tool · Bash 결과')) },
-        { label: 'click steps', text: click, enter: false, timeoutMs: DETAIL_WAIT_MS,
-          until: atHeader((s) => s.includes('호출 인자 전달') && s.includes('도구 결과 수신')) },
         { label: 'click raw reference', text: click, enter: false, timeoutMs: DETAIL_WAIT_MS,
           until: (s) => s.includes('mouse-line-07') && s.includes('mouse-stderr-marker') && s.includes('종료 상태') },
         { label: 'scroll expanded header into view', keys: '\x1b[5~\x1b[5~', timeoutMs: DETAIL_WAIT_MS,
@@ -54,7 +51,6 @@ test('mouse clicks reach tool summary, steps and raw output then fold without an
       ],
     });
     const screen = (label: string) => run.frames.find((frame) => frame.label === label)?.screen ?? '';
-    expect(screen('click steps')).toContain('호출 인자 전달');
     expect(screen('click raw reference')).toContain('mouse-line-07');
     expect(screen('click raw reference')).toContain('mouse-stderr-marker');
     expect(screen('click folded again')).not.toContain('mouse-stderr-marker');

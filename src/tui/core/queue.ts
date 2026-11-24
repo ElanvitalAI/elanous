@@ -15,7 +15,7 @@ import {
   type NextTuiQueueNoticeSource,
   type NextTuiQueueMode,
   nextTuiQueueMode,
-  type NextTuiQueueItem,
+  type NextTuiQueueItem, type NextTuiQueueMailSpan,
   type NextTuiPassiveResultSnapshot,
   type NextTuiQueueOp,
   NextTuiQueueConflictError,
@@ -23,6 +23,7 @@ import {
   type NextTuiQueueTransitionListener,
   type NextTuiQueueDrain,
   type NextTuiQueueNoticeDrain,
+  type NextTuiQueueNoticeEntry,
 } from './queue-contract.js';
 // Queue contract types live in queue-contract.ts (size-contract: 600-line module limit); importers keep this path.
 export * from './queue-contract.js';
@@ -54,8 +55,11 @@ interface MutableItem {
   msgId?: number;
   cancelReason?: string;
   urgent?: boolean;
+  mailClass?: 'P0' | 'P1' | 'P2';
+  mailIntent?: string;
+  replyTo?: number;
   passive?: boolean;
-  digest?: string;
+  digest?: string; mail?: NextTuiQueueMailSpan;
   occurredAt?: number;
   capsuleCount?: number;
   capsuleFailed?: number;
@@ -320,7 +324,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
      * A completion notice. It always waits behind user utterances and never steers the running turn:
      * seat mail that lands during a turn stays `queue` until the idle door opens the next turn.
      */
-    enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string } = {}): NextTuiQueueItem {
+    enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string; mailClass?: 'P0' | 'P1' | 'P2'; mailIntent?: string; replyTo?: number; mail?: NextTuiQueueMailSpan } = {}): NextTuiQueueItem {
       return accept({
         kind: 'notice',
         mode: 'chat',
@@ -329,7 +333,10 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
         source,
         ...(meta.msgId === undefined ? {} : { msgId: meta.msgId }),
         ...(meta.urgent ? { urgent: true } : {}),
-        ...(meta.passive ? { passive: true } : {}), ...(meta.digest === undefined ? {} : { digest: meta.digest }),
+        ...(meta.mailClass === undefined ? {} : { mailClass: meta.mailClass }),
+        ...(meta.mailIntent === undefined ? {} : { mailIntent: meta.mailIntent }),
+        ...(meta.replyTo === undefined ? {} : { replyTo: meta.replyTo }),
+        ...(meta.passive ? { passive: true } : {}), ...(meta.digest === undefined ? {} : { digest: meta.digest }), ...(meta.mail ? { mail: meta.mail } : {}),
         ...(meta.occurredAt === undefined ? {} : { occurredAt: meta.occurredAt }),
       });
     },
@@ -554,13 +561,15 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
      * (deliveryOrder head run; a person's line ahead of the run leaves earlier and is never bundled).
      * Order is preserved; every notice keeps its own id/source/msgId chain (#38804).
      */
-    drainNotices(): NextTuiQueueNoticeDrain {
+    drainNotices(keep?: (item: NextTuiQueueItem) => boolean): NextTuiQueueNoticeDrain {
       const order = ordered();
       const batch: MutableItem[] = [];
       for (const item of order) {
         // SEAT-NOTICE-BUNDLE-DRAIN — 사람 줄은 이 묶음에 끼지 않고 자기 턴으로 남는다
         // (deliveryOrder가 사람 줄을 모든 알림 앞에 두므로, 비-notice 항목은 skip).
         if (item.kind !== 'notice' || item.mode !== 'chat') continue;
+        // QUEUE-FINISH-FIRST — a held item (keep → true) stays queued for the release digest.
+        if (keep?.(snapshot(item))) continue;
         batch.push(item);
       }
       if (batch.length === 0) return { kind: 'none' };
@@ -573,9 +582,27 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
           ...(item.occurredAt === undefined ? {} : { occurredAt: item.occurredAt }),
           ...(item.msgId === undefined ? {} : { msgId: item.msgId }),
           ...(item.passive ? { passive: true } : {}), ...(item.digest === undefined ? {} : { digest: item.digest }),
+          ...(item.mailClass === undefined ? {} : { mailClass: item.mailClass }),
+          ...(item.mailIntent === undefined ? {} : { mailIntent: item.mailIntent }),
+          ...(item.replyTo === undefined ? {} : { replyTo: item.replyTo }),
         })),
         remaining: queued().length,
       };
+    },
+    /**
+     * QUEUE-FINISH-FIRST — the named queued notices leave at once (delivered at the idle boundary) because a
+     * continuation turn carries them in full (related mail joins the current work). Unknown / non-queued ids are skipped.
+     */
+    takeNotices(ids: readonly string[]): readonly NextTuiQueueNoticeEntry[] {
+      const out: NextTuiQueueNoticeEntry[] = [];
+      for (const id of ids) {
+        const item = byId.get(id);
+        if (!item || item.status !== 'queued' || item.kind !== 'notice') continue;
+        deliver(item, 'idle');
+        out.push({ id: item.id, text: item.text, ...(item.source === undefined ? {} : { source: item.source }),
+          ...(item.msgId === undefined ? {} : { msgId: item.msgId }) });
+      }
+      return out;
     },
   };
 }

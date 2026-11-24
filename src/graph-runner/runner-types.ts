@@ -46,6 +46,10 @@ export interface GraphRunState {
   activeNode?: { nodeId: string; pid: number; pidStartedAt: string };
   stoppedAt?: string;
   status: 'running' | 'paused' | 'cancelled' | 'done' | 'failed' | 'budget-exceeded' | 'awaiting-approval';
+  /** Run-level USD budget. Only node-reported `costUsd` is measured; nodes without one are listed, never counted as $0. */
+  usdBudget?: { budgetUsd: number; measuredUsd: number; measuredNodes: number; unmeasuredNodes: string[] };
+  /** sha256 of the caller's launch key; the run id itself is derived from the key (graphLaunchKeyRunId). */
+  launchKeySha256?: string;
   forkedFromRunId?: string;
   forkedFromCommit?: string;
   forkedToCommit?: string;
@@ -59,7 +63,7 @@ export interface GraphRunState {
   /** Dry-run path with each fan-out branch's planned writes expanded before its join. */
   plannedPath?: string[];
   /** startedAt/endedAt (ISO) and seconds are written when the node runs; ledgers before GRAPH-NODE-TIMES (0.2.19) have none. */
-  nodes: Array<{ nodeId: string; executionId?: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; reason?: string;
+  nodes: Array<{ nodeId: string; executionId?: string; /** K5 unit child launch key, copied from currentNode. */ launchKey?: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; reason?: string;
     /** Safe destination selected before output redaction; preserves resume routing without storing the outcome value. */
     resumeNextNode?: string;
     /** Legacy destination field written by the previous secret-binding revision. */
@@ -70,7 +74,9 @@ export interface GraphRunState {
     startedAt?: string; endedAt?: string; seconds?: number;
     waiver?: { reason: string; at: string; approvedBy?: string; introducedIds?: string[]; ownerWaived?: boolean; /** RELEASE-WAIVE-UNMEASURED — why the waived gate had no verdict. */ unmeasured?: string; /** RECUT-GATE-WAIVE — the earlier owner-accepted sweep this waiver inherits, with the unmeasured extra diff. */ carriedSweep?: { runId: string; version: string; cut: string; tip: string; commits: string[]; priorWaiverReason: string; priorWaiverAt?: string; source: string }; original: { exit: number | null; output?: unknown; error?: string } } }>;
   /** The node now running and when it started; cleared when its record is written. */
-  currentNode?: { nodeId: string; executionId?: string; startedAt: string };
+  currentNode?: { nodeId: string; executionId?: string; startedAt: string;
+    /** K5 launch key of a unit child, written before the child launches so a crash-resume re-attaches instead of relaunching. */
+    launchKey?: string };
   input?: unknown;
   /** Trusted caller identity pinned on the first memory-enabled run and checked on every resume. */
   memoryIdentity?: GraphMemoryIdentity;
@@ -171,6 +177,10 @@ export interface GraphRunOptions {
   /** Bytes already checked by the tick gate, used for a current-graph start or legacy resume. */
   graphSource?: string;
   dryRun?: boolean;
+  /** Run-level USD budget: stop before the next non-terminal node once measured cost reaches it (resumable as paused). */
+  budgetUsd?: number;
+  /** Idempotent launch: the same key resolves to the same run (start only; never with resume or dry run). */
+  launchKey?: string;
   variant?: { goal: string; plan: GraphVariantPlan };
   runId?: string;
   /** Optional structured event sink for actual node lifecycle events and declared subscriptions. */
@@ -250,6 +260,12 @@ export interface GraphRunOptions {
     /** Run a state write inside a caller-owned persistence fence. */
     withPersistFence?: (state: GraphRunState, persist: () => void) => void;
     beforeNode?: () => void;
+    /** Test seam: awaited between the launch-key ledger check and the atomic claim (concurrency barrier). */
+    beforeLaunchClaim?: () => Promise<void> | void;
+    /** Test seam: awaited after the launch claim is taken and before the ledger is written (crash injection · race barrier). */
+    afterLaunchClaim?: () => Promise<void> | void;
+    /** Test seam: awaited after a claim is judged stale and before the reclaim lock is taken (reclaim race barrier). */
+    beforeLaunchReclaim?: () => Promise<void> | void;
     /** Observe heal-loop terminal failures without making notification delivery affect the saved verdict. */
     postOpAlert?: (body: string) => void;
     processStartMs?: (pid: number) => number | null;

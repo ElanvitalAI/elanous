@@ -173,6 +173,20 @@ export function buildCodingLifecycleAddendum(): LLMMessage[] {
 // 채워져 폴링·3단 보고·직접 구현 쪽으로 기울었다. 조율 자리면 그 블록 대신 이 짧은 프로필을 싣는다.
 const SEAT_OPERATING_CONTRACT = `## Seat operating contract (every elanous seat)
 
+elanous first principle (제1원칙): observe → recognize → self-heal
+- Observe (관측) with first-class CLIs: \`elanous logs\`, \`els status-board\`, \`elanous ops status\`, \`elanous release checklist\`, git/gh. An observation gap is itself a defect to fix.
+- Recognize (인지) top-down: repeated pattern (반복 꼴, L4) → so-what / biggest lever (그래서 뭐·최대 지렛대, L5) → structural hypothesis (구조 가설, L6).
+- Self-heal (셀프 힐링): fix the root cause and verify it in the test/sim universe or with synthetic events. Only if that fails, hand to a human with the information (HITL ⊕ 정보). No symptom patches (regex, wording add-ons).
+- New features and loops state the three faces (세 얼굴): observation · decision basis · repair & handoff.
+- Coordinator seats: every check, retro, and bulletin follows observe → recognize (L4→L5→L6) → heal → verify.
+
+Common lessons (all seats)
+- Measure what you can measure yourself; never end a turn with «unverified».
+- A blocked turn must end in coordinate (hand off + reply waker) or create (open a gap cell + assign) — no excuse endings.
+- Missing command/tool → open a capability-gap cell in the same turn and continue via a workaround.
+- Expected events (your cadence, replies you wait for) late by 10 min → do it yourself or chase once, then reassign.
+- Commitments close automatically; don't hunt for a close command.
+
 Persistence
 - You are an agent. Keep going until the work in front of you is completely resolved before ending your turn. Decompose every request (and every unread mail) into its sub-requests and confirm each one is done. Do not stop after part of it.
 - Never stop or hand back because of uncertainty. Research or deduce the most reasonable approach, act on it, and state the assumption in your report. You can adjust later.
@@ -183,11 +197,11 @@ Before implementing
 
 Investigate before asking an owner
 - Before saying evidence is missing or asking an owner to investigate, execute this ladder: (1) read the full checklist item's evidence; (2) search \`git log origin/main --grep <work-item>\`; (3) search \`gh pr list --search <work-item> --state all\`; (4) inspect \`elanous logs\` and calculate the observed values; (5) read the relevant seat-state ledger. Report the concrete result, including a merged PR number when present; do not ask an owner for evidence already found.
-- Delegate to the responsible seat or tab when appropriate and track the outcome to completion. After asking, continue the next independent task; do not end the turn merely with "I don't know". Use the automatic request/decision follow-up wake to inspect a reply or PR merge; if unanswered at 30 minutes, wake the sender to verify and reassign as needed.
+- Delegate to the responsible seat or tab when appropriate and track the outcome to completion. After asking, continue the next independent task; do not end the turn merely with "I don't know". Use the automatic request/decision follow-up wake to inspect a reply or PR merge.
 
 Explore before you give up
 - Before you write "보류", "미측정", "도구 없음", "can't", or "not available", you must have done all three: (1) read \`--help\` of the command and its subcommand, or \`eln self entrances\`; (2) searched the docs and index you were given (seat-state INDEX.md, repo docs/, skills); (3) actually tried one alternate path (another command, delegate to another seat, or execute the part that works).
-- If it is still blocked, end with an explicit blocker: what you tried (the three attempts), the exact error line, and one targeted question or the owner you handed it to. "Blocked" without attempts is not an acceptable ending.
+- If it is still blocked, list the three attempts and the exact error line, then end per the common lessons (coordinate or create).
 - Default is "it works": execute the part you can now and report only the remainder.
 
 Act, don't ask (within policy)
@@ -206,14 +220,22 @@ Preambles and reports
 - Before each batch of tool calls, write one short sentence in the user's language: what you are checking and why. Do not narrate bookkeeping.
 - Lead reports with the conclusion. Say only what you verified. Replace "might/maybe" with a check you run now.`;
 
+// ELN-OP-OWNERSHIP-IDENTITY (0.3.35 P0) — 프로필이 «구현 손 아님·직접 고치지 않음·지정 경로로만·주인에게 먼저 묻는다» 로
+// 부정형뿐이라 OP 가 제3자 말투(«요청했습니다·확정하지 않겠습니다»)로 자기 결정을 다른 자리에 넘겼다. 주인 정체성으로 연다.
+// 세션 고정 접두부(프롬프트 캐시 핀 #39789)에 실리므로 턴마다 바뀌는 값을 넣지 않는다.
+// OP-CEO-ALLOCATION-LOOP (대표 11-24 09:1x · OP = COO): 마지막 단락 = COO 역할 · 계기판 수치는 접두가 아니라 회고 턴 꼬리로 온다.
 const COORDINATOR_PROFILE = `## 조율자 프로필 (이 자리 = 조율 자리)
 
-- 너는 구현 손이 아니라 조율자다. 코드·문서를 직접 고치거나 시험·빌드를 돌리지 않는다 — 맡을 자리(손 자리·하니스·서브에이전트)에 위임한다.
-- 판정·착지는 지정된 자리와 경로(리뷰·판정·착지 줄)로만 한다. 이미 주인이 있는 일은 주인에게 먼저 묻는다.
-- 보고는 결론 먼저, 짧은 사실로 쓴다. 확인하지 않은 것을 확인했다고 쓰지 않는다.
-- «한 것·남은 것·증거» 3단 틀은 사람이 그 형식을 요청했을 때만 쓴다.
-- Your job is to pull levers, not to wait for replies: at each check pick one bottleneck and act on it directly (assign, dispatch, run the receipt, ping the idle owner).
-- Uncertain routine decisions are yours: pick the reversible default, act, and log it in DECISIONS-OP. Only the contract's ask-list goes to the CEO.`;
+- You own the federation's outcomes: the on-time release, the roster, hourly landings and greens, and the health of every seat. If any of them slips, it is your failure, not another seat's.
+- Delegating work never transfers accountability. You hand off the implementation; you keep the outcome.
+- Decide in this turn. When a call is yours (roster size, priority, reassignment, waiver, release timing), pick the reversible default, execute it, and state it in first person: "I decided X because Y." Do not route your own decision to other seats for a cross-check, and do not write "확정하지 않겠습니다".
+- A report is: decision taken + action executed + result verified. "I asked X" or "검증 중" is not a result — attach a tracking wake (time + what you will check) and own the follow-through until the outcome lands.
+- Verify it yourself before you report (git, gh, \`elanous logs\`, the release checklist). Never claim what you did not verify, and never hedge with what you can check now.
+- Before reversing or overriding a change that a CEO directive asked for, search directives (\`eln directives search\`) and the ledger; if a directive covers it, do not reverse it — raise a decision card instead.
+- Don't hand-implement code, docs, tests, or builds — delegate implementation to a hand seat, the harness, or a subagent.
+- Lead with the conclusion in short facts. Use the «한 것·남은 것·증거» 3-part format only when a person asks for it.
+- At each check pick one bottleneck and pull a lever on it directly (assign, dispatch, run the receipt, wake the idle owner). Log routine decisions in DECISIONS-OP. Only the contract's ask-list goes to the CEO.
+- You are the federation's COO, operating on the CEO's behalf: you own outcomes, continuously reallocate seats, models, hosts and roster to the biggest bottleneck, balance LLM cost against delivery speed with numbers, proactively propose decisions (options + recommendation + deadline) and bring only direction, money and irreversible choices to the CEO; you also keep administration complete (schedules, plans, ledgers, renewals). Every check reads the operating dashboard in the retro turn and runs observe → recognize → heal → verify on it.`;
 
 /** 조율 자리 프로필 한 장(코딩 lifecycle 자리를 대신한다). */
 export function buildCoordinatorProfileAddendum(): LLMMessage[] {
@@ -283,6 +305,64 @@ export interface ProjectAnchorMeta {
   layer?: ProjectAnchorLayer;
   /** 읽은 파일의 절대 경로(관측용). */
   path?: string;
+  /** 예산 때문에 잘려 나간 문자 수(잘렸을 때만). */
+  truncatedChars?: number;
+  /** 이 파일의 must-carry 절 문자 수(있을 때만). */
+  mustCarryChars?: number;
+}
+
+/** ELN-PROMPT-MUST-CARRY — 앵커 파일 안 `<!-- must-carry -->` … `<!-- /must-carry -->` 절은 예산에서 먼저 확보하고
+ *  절대 자르지 않는다. 합계 상한(넘친 절은 보통 본문처럼 잘릴 수 있고 `must-carry-over-cap` 로 남는다). */
+export const PROJECT_ANCHOR_MUST_CARRY_MAX_CHARS = 4 * 1024;
+export const MUST_CARRY_OPEN = '<!-- must-carry -->';
+export const MUST_CARRY_CLOSE = '<!-- /must-carry -->';
+interface MustCarrySection { start: number; end: number }
+/** 표시 짝의 [시작, 끝) — 여는 표시부터 닫는 표시 끝까지. 닫는 표시 없는 여는 표시는 무시. */
+export function extractMustCarrySections(raw: string): MustCarrySection[] {
+  const out: MustCarrySection[] = [];
+  let from = 0;
+  for (;;) {
+    const start = raw.indexOf(MUST_CARRY_OPEN, from);
+    if (start < 0) break;
+    const close = raw.indexOf(MUST_CARRY_CLOSE, start + MUST_CARRY_OPEN.length);
+    if (close < 0) break;
+    const end = close + MUST_CARRY_CLOSE.length;
+    out.push({ start, end });
+    from = end;
+  }
+  return out;
+}
+
+/** ELN-PROMPT-MUST-CARRY — 설계 우산 «있다는 사실 + 절 제목만» 한 줄. 매 세션 파일에서 다시 만든다(손 목록 없음). */
+export const DESIGN_UMBRELLA_RELPATH = 'docs/conductor/CONDUCTOR.md';
+export const DESIGN_UMBRELLA_POINTER_MAX_CHARS = 600;
+export function buildDesignUmbrellaPointerFromText(text: string, relPath: string = DESIGN_UMBRELLA_RELPATH): string | null {
+  const titles: string[] = [];
+  let fenced = false;
+  for (const line of text.split('\n')) {
+    if (/^\s*(```|~~~)/.test(line)) { fenced = !fenced; continue; }
+    if (fenced) continue;
+    const m = /^## (\d+)\.?\s+(.+?)\s*$/.exec(line);
+    if (m) titles.push(`§${m[1]} ${m[2]}`);
+  }
+  if (titles.length === 0) return null;
+  const head = `Design umbrella = ${relPath}`;
+  const tail = ` — before design/structure/priority decisions Read only the relevant section (grep '^## N')`;
+  let body = '';
+  for (const title of titles) {
+    const next = `${body} · ${title}`;
+    if (head.length + next.length + tail.length > DESIGN_UMBRELLA_POINTER_MAX_CHARS) break;
+    body = next;
+  }
+  const line = `${head}${body}${tail}`;
+  return line.length <= DESIGN_UMBRELLA_POINTER_MAX_CHARS ? line : null;
+}
+export function buildDesignUmbrellaPointer(root: string): string | null {
+  try {
+    return buildDesignUmbrellaPointerFromText(readFileSync(join(root, DESIGN_UMBRELLA_RELPATH), 'utf8'));
+  } catch {
+    return null;
+  }
 }
 
 export type ProjectAnchorLayer = 'global' | 'root' | 'dir' | 'local' | 'last-session';
@@ -306,6 +386,10 @@ interface ProjectAnchorResultShape {
   files: ProjectAnchorMeta[];
   skipped: ProjectAnchorSkippedFile[];
   totalChars: number;
+  /** ELN-PROMPT-MUST-CARRY — `<!-- must-carry -->` 절 합계(자르지 않은 몫). */
+  mustCarryChars?: number;
+  /** ELN-PROMPT-MUST-CARRY — 설계 우산 한 줄(저장소 `내부 문서 `CONDUCTOR`` 의 `## ` 제목) · 없으면 null. */
+  umbrellaPointer?: string | null;
 }
 
 export type ProjectAnchorResult = ProjectAnchorResultShape;
@@ -682,6 +766,7 @@ export function loadProjectAnchorWithMeta(cwd: string): ProjectAnchorResult {
   };
 
   const localRaw = new Map<string, string>();
+  let mustCarryUsed = 0;
   // ④ 로컬 — 먼저 읽고 자르지 않는다. 디렉터리마다 하나(AGENTS.local.md 가 이기고 CLAUDE.local.md 는 shadowed).
   const LOCAL_ORDER_BASE = 1_000_000;
   let localUsed = 0;
@@ -699,11 +784,13 @@ export function loadProjectAnchorWithMeta(cwd: string): ProjectAnchorResult {
     }
     localUsed += raw.length;
     localRaw.set(path, raw);
+    const localMustCarry = extractMustCarrySections(raw).reduce((sum, section) => sum + section.end - section.start, 0);
+    mustCarryUsed += localMustCarry;
     const scope = relDir === '' ? '' : ` @ ${relDir}`;
     slots.push({
       order: LOCAL_ORDER_BASE + index * 10,
       text: fence(chosen.label, chosen.filename, scope, raw),
-      meta: { filename: chosen.filename, chars: raw.length, truncated: false, relDir, local: true, layer: 'local', path },
+      meta: { filename: chosen.filename, chars: raw.length, truncated: false, relDir, local: true, layer: 'local', path, ...(localMustCarry > 0 ? { mustCarryChars: localMustCarry } : {}) },
     });
   });
   // ⑤ 지난 세션 — TUI 소유 파일. 로컬 지시 «뒤»(가장 안쪽 · 가장 최근 맥락). «cwd 의 자리 루트»(/seats/<자리>) 하나만 읽는다 —
@@ -767,24 +854,60 @@ export function loadProjectAnchorWithMeta(cwd: string): ProjectAnchorResult {
   if (globalPath && existsSync(globalPath) && !chainAgents.has(safeRealpath(globalPath))) {
     wants.push({ order: 0, path: globalPath, filename: basename(globalPath), label: 'User-global instructions', relDir: relative(cwd, dirname(globalPath)), scope: ' @ instance root', layer: 'global', recordAbsent: false });
   }
+  // ELN-PROMPT-MUST-CARRY — 공용 파일의 `<!-- must-carry -->` 절은 예산에서 «먼저» 떼어 두고 절대 자르지 않는다.
+  //   그래서 공용 파일을 먼저 다 읽어 절 크기를 안다(합계 상한 PROJECT_ANCHOR_MUST_CARRY_MAX_CHARS · 넘친 절은 보통 본문).
+  const sharedRaw = new Map<Want, string | null | undefined>(); // undefined = 없음 · null = 읽기 실패
+  const sharedMustCarry = new Map<Want, MustCarrySection[]>();
+  let mustCarryReserved = 0;
+  let mustCarryOverCap = 0;
+  for (const want of wants) {
+    if (!existsSync(want.path)) { sharedRaw.set(want, undefined); continue; }
+    const raw = readRaw(want.path);
+    sharedRaw.set(want, raw);
+    const honored: MustCarrySection[] = [];
+    for (const section of raw === null ? [] : extractMustCarrySections(raw)) {
+      const size = section.end - section.start;
+      if (mustCarryUsed + mustCarryReserved + size > PROJECT_ANCHOR_MUST_CARRY_MAX_CHARS) { mustCarryOverCap += size; continue; }
+      mustCarryReserved += size;
+      honored.push(section);
+    }
+    sharedMustCarry.set(want, honored);
+  }
+  if (mustCarryOverCap > 0) {
+    debug.log('chat.project-anchor', 'must-carry-over-cap', { cwd, overCapChars: mustCarryOverCap, capChars: PROJECT_ANCHOR_MUST_CARRY_MAX_CHARS });
+  }
   for (const want of wants) {
     const skip = (reason: ProjectAnchorSkipReason): void => {
       slots.push({ order: want.order, skip: { filename: want.filename, relDir: want.relDir, reason } });
     };
+    const raw = sharedRaw.get(want);
+    const mustCarry = sharedMustCarry.get(want) ?? [];
+    const mustCarryChars = mustCarry.reduce((sum, section) => sum + section.end - section.start, 0);
+    mustCarryReserved -= mustCarryChars;
+    // 이 파일이 쓸 수 있는 몫 = 공용 상한 − 쓴 것 − «뒤 파일들의» must-carry 예약.
+    const remaining = sharedCap - sharedUsed - mustCarryReserved;
     // 남은 예산이 절단 마커보다 «작으면» «잘라 싣기»가 상한을 넘긴다 — 그때는 통째로 뺀다(같으면 마커만 싣는다).
-    if (sharedCap - sharedUsed < TRUNCATION_MARKER.length) { if (want.recordAbsent || existsSync(want.path)) skip('budget-exhausted'); continue; }
-    if (!existsSync(want.path)) { if (want.recordAbsent) skip('absent'); continue; }
-    const raw = readRaw(want.path);
+    //   단 must-carry 절이 있으면 빼지 않는다(절만 싣는다).
+    if (remaining < TRUNCATION_MARKER.length && mustCarry.length === 0) { if (want.recordAbsent || raw !== undefined) skip('budget-exhausted'); continue; }
+    if (raw === undefined) { if (want.recordAbsent) skip('absent'); continue; }
     if (raw === null) { skip('read-failed'); continue; }
-    const remaining = sharedCap - sharedUsed;
     const truncated = raw.length > remaining;
-    const sliceLen = truncated ? Math.max(0, remaining - TRUNCATION_MARKER.length) : raw.length;
-    const content = truncated ? `${raw.slice(0, sliceLen)}${TRUNCATION_MARKER}` : raw;
+    let content = raw;
+    if (truncated) {
+      const sliceLen = Math.max(0, remaining - TRUNCATION_MARKER.length - mustCarryChars - mustCarry.length);
+      const kept = mustCarry.filter((section) => section.end > sliceLen).map((section) => raw.slice(section.start, section.end));
+      content = `${raw.slice(0, sliceLen)}${TRUNCATION_MARKER}${kept.map((text) => `\n${text}`).join('')}`;
+    }
     sharedUsed += content.length;
+    mustCarryUsed += mustCarryChars;
     slots.push({
       order: want.order,
       text: fence(want.label, want.filename, want.scope, content),
-      meta: { filename: want.filename, chars: content.length, truncated, relDir: want.relDir, layer: want.layer, path: want.path },
+      meta: {
+        filename: want.filename, chars: content.length, truncated, relDir: want.relDir, layer: want.layer, path: want.path,
+        ...(truncated ? { truncatedChars: Math.max(0, raw.length - content.length) } : {}),
+        ...(mustCarryChars > 0 ? { mustCarryChars } : {}),
+      },
     });
   }
   chain.forEach((dir, index) => {
@@ -806,6 +929,8 @@ export function loadProjectAnchorWithMeta(cwd: string): ProjectAnchorResult {
     files,
     skipped,
     totalChars: sharedUsed + localUsed,
+    mustCarryChars: mustCarryUsed,
+    umbrellaPointer: buildDesignUmbrellaPointer(root),
   };
   // 읽은 로컬 원문 — 자기 편집 비교·백업용(관측 로그에 안 실리게 결과 객체 밖에 둔다).
   localRawByResult.set(result, localRaw);
@@ -863,7 +988,7 @@ function projectAnchorCandidates(cwd: string): string[] {
     ...PROJECT_ANCHOR_CANDIDATES.map(({ filename }) => join(dir, filename)),
     ...PROJECT_ANCHOR_NON_CANDIDATE_FILENAMES.map(filename => join(dir, filename)),
     ...PROJECT_ANCHOR_LOCAL_CANDIDATES.map(({ filename }) => join(dir, filename)),
-  ]), ...(seatLastSessionPath(cwd) ? [seatLastSessionPath(cwd)!] : [])];
+  ]), join(root, DESIGN_UMBRELLA_RELPATH), ...(seatLastSessionPath(cwd) ? [seatLastSessionPath(cwd)!] : [])];
 }
 
 function projectAnchorMtimes(candidates: string[]): ProjectAnchorCandidate[] {
@@ -926,6 +1051,31 @@ function observeProjectAnchorLoss(cwd: string, result: ProjectAnchorResult): voi
   });
 }
 
+/** ELN-PROMPT-MUST-CARRY — «무엇이 실렸나» 목차 한 줄. 새로 읽을 때만(캐시 적중 턴은 같은 결과) = 세션당 한 번
+ *  (파일이 바뀌면 다시). 게이트 없이 항상 남긴다 — 프롬프트에 실린 것을 밖에서 볼 유일한 창이다. */
+export function projectAnchorManifest(result: ProjectAnchorResult): Record<string, unknown> {
+  return {
+    files: result.files.map((file) => ({
+      path: file.path ?? file.filename,
+      layer: file.layer ?? null,
+      chars: file.chars,
+      truncatedChars: file.truncatedChars ?? 0,
+      mustCarryChars: file.mustCarryChars ?? 0,
+    })),
+    skipped: result.skipped,
+    totalChars: result.totalChars,
+    truncatedChars: result.files.reduce((sum, file) => sum + (file.truncatedChars ?? 0), 0),
+    mustCarryChars: result.mustCarryChars ?? 0,
+    mustCarryCapChars: PROJECT_ANCHOR_MUST_CARRY_MAX_CHARS,
+    umbrellaPointerChars: result.umbrellaPointer ? result.umbrellaPointer.length : 0,
+    umbrellaPointerBytes: result.umbrellaPointer ? Buffer.byteLength(result.umbrellaPointer, 'utf8') : 0,
+    capChars: projectAnchorMaxChars(),
+  };
+}
+function observeProjectAnchorManifest(cwd: string, result: ProjectAnchorResult): void {
+  debug.log('chat.project-anchor', 'manifest', { cwd, ...projectAnchorManifest(result) });
+}
+
 /** 🪪 자리 로컬 지시가 «바뀌었다»를 남긴다 — TUI 에이전트가 자기 지시 파일을 고치면(Edit 등) 다음 조회에서
  *  mtime 이 바뀌어 다시 읽히고, 그때 «문면»이 달라졌으면(mtime 만 바뀐 touch 는 아니다) 관측 한 줄 ⊕ 직전 판 백업 한 벌.
  *  ⛔ 이 파일은 git 제외라 모델이 잘못 고치면 되돌릴 이력이 없다 ⇒ 직전 내용을 같은 폴더 `.<파일>.prev` 로 덮어쓴다.
@@ -983,6 +1133,7 @@ export function loadProjectAnchor(cwd: string): ProjectAnchorResult {
       _projectAnchorCache.set(cwd, { result, candidates: after });
       observeLocalInstructionEdits(cwd, cached?.result, result);
       observeProjectAnchorLoss(cwd, result);
+      observeProjectAnchorManifest(cwd, result);
       if (debug.enabled) {
         debug.log('chat.project-anchor', result.content ? 'loaded' : 'empty', {
           cwd,
@@ -998,6 +1149,7 @@ export function loadProjectAnchor(cwd: string): ProjectAnchorResult {
 
   const result = loadProjectAnchorWithMeta(cwd);
   observeProjectAnchorLoss(cwd, result);
+  observeProjectAnchorManifest(cwd, result);
   if (debug.enabled) {
     debug.log('chat.project-anchor', result.content ? 'loaded' : 'empty', {
       cwd,
@@ -1054,7 +1206,9 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
         `\n`
       )
       : '';
-    out.push({ role: 'system', content: `${header}${result.content}` });
+    out.push({ role: 'system', content: `${header}${result.umbrellaPointer ? `${result.umbrellaPointer}\n\n` : ''}${result.content}` });
+  } else if (result.umbrellaPointer) {
+    out.push({ role: 'system', content: result.umbrellaPointer });
   }
   // W4-B (2026-05-03) — Project tree light snapshot. Pre-renders a
   // `tree -L 2`-style overview of the cwd's top-level layout (file

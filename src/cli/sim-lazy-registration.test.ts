@@ -125,7 +125,7 @@ describe('lazy sim command registration', () => {
           `await program.${source}(['--test','sim','--help'],{from:'user'});`,
         ], { cwd, encoding: 'utf8', timeout: 45_000 });
         expect(simHelp.status).toBe(0);
-        expect(simHelp.stdout).toContain('run <scenario-file>');
+        expect(simHelp.stdout).toContain('run [options] [scenario-file]');
         const selected = spawnSync(process.execPath, ['-e',
           `const { program } = await import(${JSON.stringify(index)});` +
           `await program.${source}(['--','sim','run',${JSON.stringify(missing)}],{from:'user'});`,
@@ -141,7 +141,7 @@ describe('lazy sim command registration', () => {
   test('sim help registers without loading the release simulation rig', async () => {
     const result = await runWithReleaseRigBlocked(['sim', '--help']);
     expect({ status: result.exitCode, stderr: result.stderr }).toMatchObject({ status: 0 });
-    expect(result.stdout).toContain('run <scenario-file>');
+    expect(result.stdout).toContain('run [options] [scenario-file]');
     expect(result.stderr).not.toContain('SIM_RIG_LOADED_BEFORE_RUN');
     const releaseRig = resolve(cwd, 'scenarios/ux-sim/release-sim-rig.yaml');
     const run = await runWithReleaseRigBlocked(['--test', 'sim', 'run', releaseRig]);

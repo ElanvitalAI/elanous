@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { elsSocketPath, startElsServer } from './server.js';
 import { processIdentity } from './peer-seat.js';
 
-test.skipIf(process.env.ELS_READ_OWNER_TTY === '1' || !!process.stdin.isTTY)('unverifiable non-tty caller cannot read, status or grep', async () => {
+test.skipIf(process.env.ELS_READ_OWNER_TTY === '1' || !!process.stdin.isTTY)('unverifiable non-tty caller cannot grep (read/status = local operator, CEO 11-24)', async () => {
   const root = mkdtempSync('/tmp/els-unverified-read-');
   const server = await startElsServer({ stateRoot: root, stall: false, spawn: () => ({
     id: 'fixture', isAlive: () => true, write: () => {}, renderScreen: async () => 'private screen', onExit: () => {}, kill: () => {},
@@ -15,12 +15,12 @@ test.skipIf(process.env.ELS_READ_OWNER_TTY === '1' || !!process.stdin.isTTY)('un
   try {
     const pane = JSON.parse(server.core.newPane({ ws: 'test', cwd: root, command: ['eln'], ownerSeat: 'OP' }).message).pane;
     const child = join(root, 'read.ts');
-    writeFileSync(child, `import { requestEls } from ${JSON.stringify(join(import.meta.dir, 'client.ts'))};\nfor (const op of ['read','status','grep']) { const r=await requestEls(${JSON.stringify(elsSocketPath(root))},{op,pane:${JSON.stringify(pane)},pattern:'private'}); console.log(JSON.stringify(r)); }\n`);
+    writeFileSync(child, `import { requestEls } from ${JSON.stringify(join(import.meta.dir, 'client.ts'))};\nfor (const op of ['grep']) { const r=await requestEls(${JSON.stringify(elsSocketPath(root))},{op,pane:${JSON.stringify(pane)},pattern:'private'}); console.log(JSON.stringify(r)); }\n`);
     const p = Bun.spawn([process.execPath, child], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root } });
     const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
     expect({ code, err }).toEqual({ code: 0, err: '' });
     const results = out.trim().split('\n').map(line => JSON.parse(line));
-    expect(results).toHaveLength(3);
+    expect(results).toHaveLength(1);
     for (const result of results) {
       expect(result.exitCode).toBe(1);
       expect(result.message).toContain('신원 확인 불가');

@@ -56,9 +56,23 @@ export interface UpdateAllDeps {
   readonly every?: (callback: () => void, ms: number) => () => void;
   readonly sleep: (ms: number) => Promise<void>;
   readonly now: () => number;
+  /** ELS-BATON-AUTO-ON-RESTART (대표 11-24): OP never goes down with its acting seat. With this port, OP migrates
+   * only after the acting seat is migrated and alive, and only after the OP lease was handed to it. */
+  readonly baton?: UpdateBatonPort;
   readonly timeoutMs?: number;
   /** Remote child only: the SSH parent owns federation; this invocation may see this host alone. */
   readonly localOnly?: boolean;
+}
+
+export interface UpdateBatonPort {
+  /** The seat that holds OP authority while OP restarts (cell: TC). */
+  readonly acting: string;
+  /** Hand OP → acting right before OP is stopped; `exclude` = the old OP TUI pids (they must not count as the new OP). */
+  hand(reason: string, exclude: readonly number[]): Promise<{ ok: boolean; reason?: string }>;
+  /** The new OP is verified: give the lease back (idempotent — the server may already have returned it). */
+  giveBack(memo: string): Promise<boolean>;
+  /** OP is skipped this wave: one log line and one alert. */
+  skip(reason: string): Promise<void>;
 }
 
 const SHA = /^[a-f0-9]{40}$/i;
@@ -185,26 +199,26 @@ export async function updateAllElsTabs(deps: UpdateAllDeps): Promise<{ ok: boole
     }
     return false;
   };
-  for (const pane of listing.panes) {
+  const requestPane = async (pane: UpdatePane): Promise<void> => {
     const seat = pane.seat ?? '';
     const index = rows.length;
-    if (pane.reach !== 'local') continue;
-    if (pane.state === 'exited') { rows.push({ tab: pane.address, seat, result: 'skipped', detail: 'exited' }); continue; }
-    if (['codex', 'claude', 'grok', 'shell'].includes(pane.kind ?? '')) { rows.push({ tab: pane.address, seat, runtime: pane.kind, result: 'skipped', detail: `${pane.kind} tab, uses new install on next command` }); continue; }
-    if (!seat) { rows.push({ tab: pane.address, seat, result: 'skipped', detail: 'not a seat tab' }); continue; }
-    if (!SEAT.test(seat)) { rows.push({ tab: pane.address, seat, result: 'failed', detail: 'invalid seat identity' }); continue; }
-    if (!Number.isSafeInteger(pane.pid) || pane.pid! <= 0) { rows.push({ tab: pane.address, seat, result: 'failed', detail: 'pane process identity unavailable' }); continue; }
-    if (!authorizeSeatControl({ sender, target: seat, sameHost: true })) { rows.push({ tab: pane.address, seat, result: 'failed', detail: 'seat control denied' }); continue; }
+    if (pane.reach !== 'local') return;
+    if (pane.state === 'exited') { rows.push({ tab: pane.address, seat, result: 'skipped', detail: 'exited' }); return; }
+    if (['codex', 'claude', 'grok', 'shell'].includes(pane.kind ?? '')) { rows.push({ tab: pane.address, seat, runtime: pane.kind, result: 'skipped', detail: `${pane.kind} tab, uses new install on next command` }); return; }
+    if (!seat) { rows.push({ tab: pane.address, seat, result: 'skipped', detail: 'not a seat tab' }); return; }
+    if (!SEAT.test(seat)) { rows.push({ tab: pane.address, seat, result: 'failed', detail: 'invalid seat identity' }); return; }
+    if (!Number.isSafeInteger(pane.pid) || pane.pid! <= 0) { rows.push({ tab: pane.address, seat, result: 'failed', detail: 'pane process identity unavailable' }); return; }
+    if (!authorizeSeatControl({ sender, target: seat, sameHost: true })) { rows.push({ tab: pane.address, seat, result: 'failed', detail: 'seat control denied' }); return; }
     const matches = seats.filter(row => row.kind === 'tui' && row.alive && row.seat === seat && row.workdir === pane.cwd && paneCoversOwner(row.ownerPid, pane.pid!));
-    if (matches.length !== 1) { rows.push({ tab: pane.address, seat, result: 'failed', detail: matches.length ? 'ambiguous seat' : 'live TUI missing' }); continue; }
+    if (matches.length !== 1) { rows.push({ tab: pane.address, seat, result: 'failed', detail: matches.length ? 'ambiguous seat' : 'live TUI missing' }); return; }
     verifiedElnRows.add(index);
     const old = matches[0]!;
-    if (!old.sessionId) { rows.push({ tab: pane.address, seat, result: 'failed', detail: 'session identity unavailable' }); continue; }
+    if (!old.sessionId) { rows.push({ tab: pane.address, seat, result: 'failed', detail: 'session identity unavailable' }); return; }
     const expected = { id: old.id, ownerPid: old.ownerPid, sessionId: old.sessionId, workdir: pane.cwd };
     const prior = seen.get(seat);
     if (prior && (prior.expected.id !== expected.id || prior.expected.ownerPid !== expected.ownerPid
       || prior.expected.sessionId !== expected.sessionId || prior.expected.workdir !== expected.workdir)) {
-      rows.push({ tab: pane.address, seat, result: 'failed', detail: 'ambiguous seat target' }); continue;
+      rows.push({ tab: pane.address, seat, result: 'failed', detail: 'ambiguous seat target' }); return;
     }
     deps.progress?.(`Migration requested: ${safe(pane.address)} · ${safe(seat)}`);
     let request = prior?.request;
@@ -213,7 +227,7 @@ export async function updateAllElsTabs(deps: UpdateAllDeps): Promise<{ ok: boole
       const current = deps.target();
       if (current.desired?.toLowerCase() !== desired.toLowerCase() || current.installed?.toLowerCase() !== installed.toLowerCase()) {
         rows.push({ tab: pane.address, seat, result: 'failed', detail: 'desired-build-changed' });
-        continue;
+        return;
       }
       requested++;
       try { request = await deps.migrate(seat, expected); }
@@ -221,16 +235,45 @@ export async function updateAllElsTabs(deps: UpdateAllDeps): Promise<{ ok: boole
       seen.set(seat, { expected, request });
     }
     if (request.status !== 'success' || (request.reason !== 'waiting' && request.reason !== 'accepted')) {
-      rows.push({ tab: pane.address, seat, result: 'failed', detail: request.reason ?? request.status }); continue;
+      rows.push({ tab: pane.address, seat, result: 'failed', detail: request.reason ?? request.status }); return;
     }
     rows.push({ tab: pane.address, seat, result: 'waiting', detail: 'turn boundary or restart pending' });
     const item = pending.get(seat);
     if (item) item.rowIndexes.push(index);
     else pending.set(seat, { oldPid: old.ownerPid, sessionId: old.sessionId, cwd: pane.cwd, rowIndexes: [index] });
+  };
+  // OP and its acting seat are never down together: OP waits until the acting seat's own migration is verified.
+  const deferredOp: UpdatePane[] = [];
+  for (const pane of listing.panes) {
+    if (deps.baton && pane.seat === 'OP' && pane.reach === 'local' && pane.state !== 'exited'
+      && !['codex', 'claude', 'grok', 'shell'].includes(pane.kind ?? '')) { deferredOp.push(pane); continue; }
+    await requestPane(pane);
   }
+  const skipOp = async (why: string): Promise<void> => {
+    for (const pane of deferredOp.splice(0)) rows.push({ tab: pane.address, seat: 'OP', result: 'waiting', detail: `OP not restarted this wave: ${why}` });
+    try { await deps.baton?.skip(why); } catch { /* the skip row is the record */ }
+  };
+  const startOp = async (current: readonly UpdateSeatRow[]): Promise<void> => {
+    const baton = deps.baton!;
+    if (pending.has(baton.acting)) return; // the acting seat is restarting: wait for it
+    const actingRows = rows.filter(row => row.seat === baton.acting && !row.tab.endsWith(':*'));
+    // Healthy = a live eln TUI row for the acting seat, or (a codex/claude acting seat) its live local pane.
+    const actingAlive = current.some(row => row.kind === 'tui' && row.alive && row.seat === baton.acting)
+      || listing.panes.some(pane => pane.seat === baton.acting && pane.reach === 'local' && pane.state !== 'exited'
+        && ['codex', 'claude', 'grok'].includes(pane.kind ?? ''));
+    if (!actingAlive || actingRows.some(row => row.result === 'failed' || row.result === 'waiting')) { await skipOp('acting-unhealthy'); return; }
+    const oldPids = current.filter(row => row.kind === 'tui' && row.seat === 'OP').map(row => row.ownerPid);
+    let handed: { ok: boolean; reason?: string };
+    try { handed = await baton.hand(`update-all migration to ${desired.slice(0, 12)}`, oldPids); }
+    catch (error) { handed = { ok: false, reason: error instanceof Error ? error.message : String(error) }; }
+    if (!handed.ok) { await skipOp(`acting-unhealthy (hand refused: ${safe(handed.reason ?? 'unknown')})`); return; }
+    deps.progress?.(`OP lease handed to ${safe(baton.acting)} · migrating OP`);
+    for (const pane of deferredOp.splice(0)) await requestPane(pane);
+    if (!pending.has('OP')) { try { await baton.giveBack('OP migration was not started'); } catch { /* lease expires on its own */ } }
+  };
   const deadline = deps.now() + (deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   let nextProgress = deps.now() + 30_000;
-  while (pending.size && deps.now() < deadline) {
+  while ((pending.size || deferredOp.length) && deps.now() < deadline) {
     let current: readonly UpdateSeatRow[];
     try { await deps.sleep(1_000); current = deps.seats(); }
     catch (error) {
@@ -246,9 +289,16 @@ export async function updateAllElsTabs(deps: UpdateAllDeps): Promise<{ ok: boole
       const next = candidates[0]!;
       if (next.ownerPid === wait.oldPid || next.sessionId !== wait.sessionId || next.build?.source !== 'installed'
         || next.build.sha.toLowerCase() !== desired.toLowerCase()) continue;
-      for (const index of wait.rowIndexes) rows[index] = { ...rows[index]!, result: 'updated', detail: desired.slice(0, 12) };
+      let detail = desired.slice(0, 12);
+      if (seat === 'OP' && deps.baton) {
+        let back = false;
+        try { back = await deps.baton.giveBack(`update-all: new OP ${next.ownerPid} on ${desired.slice(0, 12)}`); } catch { back = false; }
+        detail += back ? ' · baton returned' : ' · baton return pending';
+      }
+      for (const index of wait.rowIndexes) rows[index] = { ...rows[index]!, result: 'updated', detail };
       pending.delete(seat);
     }
+    if (deferredOp.length) await startOp(current);
     const now = deps.now();
     if (pending.size && now >= nextProgress) {
       deps.progress?.(`Remaining seats: ${pending.size} · ${Math.ceil(Math.max(0, deadline - now) / 1000)}s remaining`);
@@ -257,6 +307,7 @@ export async function updateAllElsTabs(deps: UpdateAllDeps): Promise<{ ok: boole
   }
   for (const wait of pending.values()) for (const index of wait.rowIndexes)
     rows[index] = { ...rows[index]!, result: 'waiting', detail: 'deadline; turn or restart unverified' };
+  if (deferredOp.length) await skipOp('acting-unhealthy (deadline before the acting seat was verified)');
   for (let index = 0; index < rows.length; index++) {
     const pane = listing.panes.find(p => p.address === rows[index]!.tab);
     if (pane && !rows[index]!.runtime) rows[index] = { ...rows[index]!, runtime: verifiedElnRows.has(index) ? 'eln' : pane.kind === 'pty' ? 'unknown' : pane.kind };

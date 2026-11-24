@@ -1,4 +1,9 @@
 import { buildAge, desiredSha, gitAncestor } from './build-badge.js';
+// ELS-GIT-AWARENESS-HERDR (OP #139752): the server's git label store — cached per cwd, debounced, refreshed by
+// async child processes. A listing reads the cache only; the request path never runs or waits for git (#39546).
+import { gitLabelsOf } from './git-label.js';
+
+const gitLabels = gitLabelsOf();
 // els core — the single owner of the journal and of the pane PTYs (one server process; src/els/server.ts hosts it).
 // The journal in memory is the truth; every change is saved by this module and nothing else writes the file.
 // Rules that keep it correct without a lock:
@@ -23,6 +28,7 @@ import { tabBadge } from './tab-badge.js';
 import type { Foreground } from './foreground.js';
 import type { AgentEventFrame } from '../agent-events/protocol.js';
 import type { SpawnParent } from './server-auth.js';
+import type { WheelRoute } from '../pty-shell/registry.js';
 import { grepScreens, type GrepHit } from './pane-grep.js';
 import { readUnreadMailBadges, type UnreadMailBadge } from '../msg/msg-store.js';
 
@@ -68,6 +74,8 @@ export interface ElsPty {
   /** ELS-WHEEL-SCROLLBACK (OP #136704): true while this pane's emulator is on the alternate screen tracking its own mouse —
    *  a wheel there belongs to the pane program as bytes (the els scrollback lane is empty on an alternate screen). Absent = not known. */
   wheelPassthrough?(): boolean;
+  /** ELS-WHEEL-HISTORY: where a wheel over this pane goes (the pane's own mouse report · ↑/↓ · els scrollback). Absent = host. */
+  wheelRoute?(): WheelRoute;
   /** The shell's process id (ELS-PANE-AGENT-DETECT reads its terminal's foreground group); absent = not known. */
   readonly pid?: number;
   /** OS identity captured when the holder's PTY generation was bound. */
@@ -861,6 +869,9 @@ export function createElsCore(deps: ElsCoreDeps) {
       // ELS-SERVER-MAINLOOP-STARVATION: in the server this is the cached answer of the badge worker (no ledger read here).
       const displayCwd = (pane: Pane) => livePty(pane) ? foregroundCwds.get(pane.id) ?? pane.cwd : pane.cwd;
       const badges = (deps.mailBadges ?? mailBadgesOf)(ordered.map(({ pane }) => pane.seatIdentity ?? seatOf(displayCwd(pane))).filter((seat): seat is string => seat !== null));
+      // ELS-GIT-AWARENESS-HERDR (OP #139752): refresh is a debounced, fire-and-forget macrotask — the rows below read
+      // the cache only, so a listing never queues behind git (#39546: typing latency stays zero).
+      gitLabels.refresh([...new Set(ordered.map(({ pane }) => displayCwd(pane)))]);
       const panes = ordered.flatMap(({ pane, tab }) => {
         const ws = journal.workspaces.find((row) => row.id === tab.workspaceId);
         if (!ws) return [];
@@ -872,6 +883,7 @@ export function createElsCore(deps: ElsCoreDeps) {
           ...(sha && report?.version ? { version: report.version } : {}),
           ...(sha && report?.stamp ? { stamp: report.stamp } : {}) };
         const cwd = displayCwd(pane);
+        const git = gitLabels.labelFor(cwd);   // ELS-GIT-AWARENESS-HERDR: cache read only — no git on the request path
         const seat = pane.seatIdentity ?? seatOf(cwd);
         const unreadMail = seat !== null ? badges.get(seat) ?? null : null;
         // ELS-TAB-STATE-BADGE: the badge is the contract state; a working pane with no output, `do` or first sight for the
@@ -903,7 +915,7 @@ export function createElsCore(deps: ElsCoreDeps) {
           ...(elnReport?.seat ? { reported: elnReport.seat } : {}), ...(elnReport?.waitingInput ? { legacyWaitingInput: true } : {}),
           ...(unavailableReason ? { unavailable: true } : {}) }));
         return [{ build, lastEventAtMs, badge: badge.state, badgeLabel: badge.label, stalled: badge.stalled, status, ...(elnReport?.model ? { model: elnReport.model } : {}), address: paneAddress(ws, tab, pane), workspace: ws.name, tab: tab.id, pane: pane.id, title: pane.title, kind: pane.kind,
-          cwd, command: pane.command, state: listedState, activityState, ...(unavailableReason ? { unavailableReason } : {}),
+          cwd, ...(git ? { git } : {}), command: pane.command, state: listedState, activityState, ...(unavailableReason ? { unavailableReason } : {}),
           ptyId: live ? pane.ptyId : '', ...(live?.pid ? { pid: live.pid } : {}), restore: pane.restore, seat, unreadMail,
           ...(ws.coordinatorSeat && seatOf(pane.cwd) === ws.coordinatorSeat && isSpaceCoordinatorTab(tab) ? { spaceCoordinator: true } : {}),
           ...(live && foregrounds.has(pane.id) ? { kind: foregrounds.get(pane.id)!.kind, fgCommand: foregrounds.get(pane.id)!.command } : {}),
@@ -1051,6 +1063,14 @@ export function createElsCore(deps: ElsCoreDeps) {
       catch (error) { return { exitCode: 1, message: `els attach: cannot render ${hit.pane.id}: ${message(error)}` }; }
     },
 
+    /** ELS-TYPING-LATENCY: true while the pane's program has bracketed paste on (DECSET 2004) — the attach keeps a
+     *  pasted ESC[200~ … ESC[201~ only for such a pane. */
+    bracketedPaste(ref: string): boolean {
+      const hit = resolve(ref);
+      const pty = hit ? livePty(hit.pane) : undefined;
+      try { return pty?.bracketedPasteEnabled?.() === true; } catch { return false; }
+    },
+
     /** True while the pane's PTY runs (a virtual or exited pane is shown but not live). */
     paneIsLive(paneId: string): boolean {
       const hit = resolve(paneId);
@@ -1067,6 +1087,13 @@ export function createElsCore(deps: ElsCoreDeps) {
       const hit = resolve(ref);
       const pty = hit ? livePty(hit.pane) : undefined;
       try { return pty?.wheelPassthrough?.() === true; } catch { return false; }
+    },
+
+    /** ELS-WHEEL-HISTORY: the pane's wheel route from its live PTY's current modes ('host' when not known). */
+    wheelRoute(ref: string): WheelRoute {
+      const hit = resolve(ref);
+      const pty = hit ? livePty(hit.pane) : undefined;
+      try { return pty?.wheelRoute?.() ?? (pty?.wheelPassthrough?.() === true ? 'mouse-sgr' : 'host'); } catch { return 'host'; }
     },
 
     /** The live PTY's data stream (attach turns it into immediate frame pushes — UX #38884 ④). */

@@ -10,6 +10,7 @@
 
 import { clipCells, fitCells, UNREACHABLE_MARK, wordOfState, type PaneRow } from './attach-view.js';
 import { STATUS, type StatusWord } from './status-vocab.js';
+import { seatMarks, type SeatMarkInput } from './seat-marks.js';
 
 export interface SpaceTabRow extends PaneRow {
   readonly command?: readonly string[];
@@ -113,6 +114,13 @@ export function paneEmoji(row: SpaceTabRow): string {
   return '⌨️';
 }
 
+const markInput = (row: SpaceTabRow): SeatMarkInput =>
+  ({ word: wordOfState(row.state), ...(row.seatState ? { seatState: row.seatState } : {}), ...(row.seatReason ? { seatReason: row.seatReason } : {}), ...(row.unread ? { unread: row.unread } : {}) });
+/** SIDETAB-TWO-MARKS: slot 1 (activity) glued to slot 2 (attention): «⚪✋», «🟢✉3», «⚪⏳», «🟢». */
+const twoMarks = (row: SpaceTabRow): string => { const marks = seatMarks(markInput(row)); return `${marks.activity}${marks.attention}`; };
+/** The group header count of seats waiting on a person: « ✋2» (empty when none). */
+const personCount = (panes: readonly SpaceTabRow[]): string => { const n = panes.filter((row) => !row.stale && seatMarks(markInput(row)).needsPerson).length; return n > 0 ? ` ✋${n}` : ''; };
+
 const URGENCY: readonly StatusWord[] = ['failed', 'blocked', 'working', 'unknown', 'idle', 'done'];
 /**
  * The stalled badge (ELS-TAB-STATE-BADGE), kept apart from markOf so it composes with the other precedence edits to it. Most urgent
@@ -188,7 +196,7 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
   type Item = { readonly text: string; readonly ws?: string; readonly pane?: string; readonly mode?: 'focus' | 'dim'; readonly bold?: boolean };
   // 출처: OP #134199/#134203 — 스페이스 줄에는 동작 상태를 표시하지 않는다(조율자 ⭐ 표식과 원격 사망 ✕만).
   const isActing = (row: SpaceTabRow): boolean => !!actingSeat && !row.remote && row.seat === actingSeat;
-  const nameOf = (space: Space): string => `${space.panes.some(isActing) ? '[OP 대행] ' : ''}${space.panes.some((row) => row.stale) ? `${UNREACHABLE_MARK} ` : ''}${space.panes.some((row) => row.role === 'coordinator') ? '⭐ ' : ''}${space.name.toLocaleUpperCase()}${actingSeat && space.panes.some(row => !row.remote && row.seat === 'OP') ? ` → ${actingSeat} acting` : ''}`;
+  const nameOf = (space: Space): string => `${space.panes.some(isActing) ? '[OP 대행] ' : ''}${space.panes.some((row) => row.stale) ? `${UNREACHABLE_MARK} ` : ''}${space.panes.some((row) => row.role === 'coordinator') ? '⭐ ' : ''}${space.name.toLocaleUpperCase()}${actingSeat && space.panes.some(row => !row.remote && row.seat === 'OP') ? ` → ${actingSeat} acting` : ''}${personCount(space.panes)}`;
   const items: Item[] = [];
   const pendingEmpty = emptyCoordinators.filter((space) => !rows.some((row) => row.wsId === space.wsId));
   const addEmpty = (space: typeof pendingEmpty[number]): void => {
@@ -229,7 +237,8 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
   // «런타임 · 소속 스페이스»)·머리 단어가 정렬 모드다 — «grouped» = 스페이스별 묶음 안에서 상태순(working →
   // blocked → stalled → idle → failed → offline), «status» = 스페이스를 평탄해 전체 상태순. width < 20 이면 1단으로 줄인다(OP #134220 «좁으면 상태 이모지 + 탭 이름만»).
   const agentSpaces = [...visible, ...(herdrOpen ? herdr : [])];
-  const rankOf = (row: SpaceTabRow): number => row.stale ? 6    // 출처: OP #134223 — 상태순 정렬 계수(working 0 → offline 6, 미지 word 5)
+  const rankOf = (row: SpaceTabRow): number => row.stale ? 6
+    : seatMarks(markInput(row)).needsPerson ? -1   // SIDETAB-TWO-MARKS: a seat waiting on a person is first in its group    // 출처: OP #134223 — 상태순 정렬 계수(working 0 → offline 6, 미지 word 5)
     : { working: 0, blocked: 1, stalled: 2, idle: 3, failed: 4, done: 5, unknown: 5 }[wordOfState(row.state)] ?? 5; // done = 스펙 순서 밖(완료·dim) — 미지 폴백(5)과 동급
   const twoLine = width >= 20;
   if (agentSpaces.length > 0) {
@@ -247,7 +256,7 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
         if (twoLine) items.push({ text: `       shell · ${space.name}`, mode: 'dim' });
         continue;
       }
-      const mark = row.stale ? UNREACHABLE_MARK : STATUS[wordOfState(row.state)].mark;
+      const mark = row.stale ? UNREACHABLE_MARK : twoMarks(row);
       items.push({ text: headCells(` ${mark} ${isActing(row) ? '[OP 대행] ' : ''}${row.remote ? `⇄${row.remote} ` : ''}${labelName(row)}`, width), pane: row.pane, ws: space.wsId, ...(row.spaceCoordinator ? { bold: true } : {}), ...(row.pane === selectedPane ? { mode: 'focus' as const } : {}) });
       if (twoLine) items.push({ text: `       ${row.agent ?? 'shell'} · ${space.name}`, mode: 'dim' });
     }

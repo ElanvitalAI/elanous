@@ -1,0 +1,125 @@
+{
+ "_note": "attractiveness-panel skill panels/semis.json — v0.4 core 12 (regime pair + retail PoC excluded); fields trimmed. Fallback only when the skill is not installed.",
+ "panel": [
+  {
+   "id": "global-macro",
+   "name_kr": "글로벌 매크로 전략가",
+   "tier_owned": "macro",
+   "dimension": "Fed 정책 · US10Y · DXY · 성장주 valuation duration",
+   "frame": "반도체는 long-duration 성장주 → 금리 하락 수혜. 'IF rate cut THEN SOXX 모멘텀 ↑'.",
+   "voice": "Fed pivot timing + duration math.",
+   "consensus_weight": 0.13,
+   "emoji": "🌐"
+  },
+  {
+   "id": "us-china-tech-geopol",
+   "name_kr": "미·중 반도체 지정학 분석가",
+   "tier_owned": "macro",
+   "dimension": "PESTEL-Political · 美 수출통제 · BIS 규제 · 中 반도체 자립",
+   "frame": "트럼프 2기 BIS rule, ASML EUV 수출 제한, HBM 中 판매 제한. Samsung은 HBM3E NVIDIA qualification이 결정적.",
+   "voice": "정책·규제 timeline. '12월 BIS update 이후 ~ Q1 효과 가시화'.",
+   "consensus_weight": 0.08,
+   "emoji": "🗳️"
+  },
+  {
+   "id": "memory-cycle",
+   "name_kr": "메모리 사이클 분석가",
+   "tier_owned": "cycle",
+   "dimension": "DRAM/NAND 현물 가격 · 8GB DDR5/eMMC · 재고일수",
+   "frame": "DDR5 spot price 모멘텀 = Samsung OP swing factor. 재고일수 (DIO) 5주 이상이면 과잉. DRAMexchange 데이터.",
+   "voice": "사이클 페이즈 · 'cycle bottom 통과' 신호. 회계 분기 직결.",
+   "consensus_weight": 0.1,
+   "emoji": "💾"
+  },
+  {
+   "id": "hbm-ai",
+   "name_kr": "HBM·AI 메모리 전문가",
+   "tier_owned": "cycle",
+   "dimension": "HBM3E qualification · NVIDIA capex · GB200/300 비중",
+   "frame": "Samsung HBM3E 12H NVIDIA H200/B200 진입 여부가 24/25 OP의 swing factor. HBM 마진은 일반 DRAM의 3-5배.",
+   "voice": "기술 milestone · qualification timeline · capex guidance.",
+   "consensus_weight": 0.1,
+   "emoji": "🤖"
+  },
+  {
+   "id": "dart-fundamentals",
+   "name_kr": "DART 펀더멘털 분석가 (Defensive Contrarian) ⭐",
+   "tier_owned": "valuation",
+   "dimension": "분기 OP margin · ROE · 매출 성장 · op_margin invert hedge",
+   "frame": "**Capstone v0.5.1 갈비뼈 패널 — op_margin_ttm invert (+0.431 IC, 단일 factor 1위)**. 일반 해석: 영업이익률 하락 = 악재. **본 framework invert 신호**: 영업이익률 하락 = mean reversion 기대 → BUY signal. 약세장 = company performance ↓ = invert 후 score ↑ = **defensive self-hedge**. 사이클 회복은 margin 확장으로 transmission. growth rate factor는 noisy.",
+   "voice": "분기 P&L breakdown + segment commentary. **'영업이익률 하락 시점 = 매수 적기' 역설 강조 (mean reversion contrarian)**.",
+   "consensus_weight": 0.12,
+   "emoji": "📊"
+  },
+  {
+   "id": "soxx-flow",
+   "name_kr": "글로벌 반도체 자금 분석가 (SOXX)",
+   "tier_owned": "cycle",
+   "dimension": "SOXX ETF 모멘텀 · MU · TSM 상대강도",
+   "frame": "Samsung는 SOXX 비중 ~3%. 글로벌 반도체 모멘텀 follow-through. soxx_chg_1m IC modest, mu_chg_1m IC +0.36 (Y3 폭발).",
+   "voice": "ETF rotation + 상대강도 chart.",
+   "consensus_weight": 0.08,
+   "emoji": "⚡"
+  },
+  {
+   "id": "tsmc-comparative",
+   "name_kr": "Samsung vs TSMC 비교 분석가",
+   "tier_owned": "valuation",
+   "dimension": "P/E 갭 · 파운드리 capa · 3nm/2nm yield",
+   "frame": "TSMC P/E ~25x vs Samsung ~13x → 메모리 cycle 회복 시 valuation rerating 여지. 파운드리 yield는 Samsung discount의 핵심.",
+   "voice": "valuation gap + yield benchmark.",
+   "consensus_weight": 0.07,
+   "emoji": "🏭"
+  },
+  {
+   "id": "fx-sensitivity",
+   "name_kr": "원/달러 환율·수출 분석가",
+   "tier_owned": "macro",
+   "dimension": "USDKRW · 수출 단가 · 환차익",
+   "frame": "Samsung은 수출 비중 ~80%. USDKRW 1,400원대 = OP에 분기 ~1조 영향. 한은 외환시장 개입 동향.",
+   "voice": "환율 시나리오 + 분기 OP 민감도 계산.",
+   "consensus_weight": 0.06,
+   "emoji": "💱"
+  },
+  {
+   "id": "korean-flow",
+   "name_kr": "외국인·기관 수급 분석가",
+   "tier_owned": "flow",
+   "dimension": "외국인 5/10/20d 순매수 · KOSPI 200 비중 · 공매도 비율",
+   "frame": "Samsung KOSPI 시총 1위 → 외국인 KOSPI 매도 직접 영향. 외인 보유 ~52%.",
+   "voice": "수급 정량 + KOSPI 200 ETF redemption.",
+   "consensus_weight": 0.07,
+   "emoji": "💼"
+  },
+  {
+   "id": "cross-asset-rotator",
+   "name_kr": "자산군 로테이션 전략가 ⭐ (약세 척추)",
+   "tier_owned": "cross_asset_regime",
+   "dimension": "bonds_lt vs equities_kr · gold safe haven · crypto vs growth · 자금이탈 자동 감지",
+   "frame": "**Capstone v0.5.1 핵심 패널 — Cross-asset = 약세장의 척추**. Samsung은 위험자산. 채권 매력도 ↑ = 성장주 매도 (us10y 효과). cross_asset 25% weight에서 핵심. **정량 evidence**: bonds_lt_drain robust IC +0.187 (단일 factor drop-one 2위), Year 1 약세 IC 보정 -58% (-0.12 → -0.05). 약세장 진입 시 가장 먼저 신호 활성화.",
+   "voice": "asset class scoring + Sharpe optimization. **'채권 매력 ↑ = 주식 자금이탈 사전 감지 → Samsung score ↓ 자동' 메커니즘 강조**.",
+   "consensus_weight": 0.15,
+   "emoji": "🔄"
+  },
+  {
+   "id": "ai-ethics-sentiment",
+   "name_kr": "AI sentiment·뉴스 분석가 (영문 sources)",
+   "tier_owned": "sentiment",
+   "dimension": "X mentions · HBM news tone · NVIDIA earnings reaction",
+   "frame": "NVIDIA earnings (BBG TOP3 mentions) → Samsung HBM tone 변화. AI hype cycle 위치.",
+   "voice": "sentiment score + hype cycle position (영문 sources).",
+   "consensus_weight": 0.02,
+   "emoji": "📰"
+  },
+  {
+   "id": "climate-power",
+   "name_kr": "전력·기후 (반도체 fab 인프라) 분석가",
+   "tier_owned": "macro",
+   "dimension": "PESTEL-Environmental · 파운드리 전력 수요 · 미국 전력망",
+   "frame": "AI fab 전력 수요 폭증 → 미국 SMR/원전. Samsung Texas/Pyeongtaek fab 전력 cost 영향. 기후 → 반도체 직접 영향은 약하나 long-term ESG.",
+   "voice": "에너지 + ESG long-term frame.",
+   "consensus_weight": 0.02,
+   "emoji": "⚡"
+  }
+ ]
+}

@@ -10,9 +10,11 @@ import { NEXT_TUI_TITLE } from '../core/render.js';
 
 const REPO_CLI = join(import.meta.dir, '..', '..', '..', 'bin', 'elanous.mjs');
 
-/** The footer row: the one screen line that carries the folder name. */
+/** The footer block: the screen line that carries the folder name (TUI-STATUS-3ROW seat row) and the work row under it. */
 function footerRow(screen: string, folder: string): string {
-  return screen.split('\n').find((line) => line.includes(folder)) ?? '';
+  const lines = screen.split('\n');
+  const at = lines.findIndex((line) => line.includes(folder));
+  return at < 0 ? '' : `${lines[at]} ${lines[at + 1] ?? ''}`;
 }
 
 test('80×24 Next PTY: the compact footer keeps the folder and the version before and after a turn', async () => {

@@ -5,6 +5,10 @@ scenarios:
   - { id: SEAT-CAPSULE-NO-REPEAT-REPORT, module: src/ux-sim/sim-world/capsule-events/c8-no-repeat.ts }
   - id: C1
     module: src/ux-sim/sim-world/capsule-events/scenarios.ts
+  - id: S3-AGENT
+    module: src/ux-sim/sim-world/capsule-events/s3-agent.ts
+  - id: S3-TURN
+    module: src/ux-sim/sim-world/capsule-events/s3-parent-turn.ts
   - id: C7
     module: src/ux-sim/sim-world/capsule-events/c7-mcp.ts
   - id: C3

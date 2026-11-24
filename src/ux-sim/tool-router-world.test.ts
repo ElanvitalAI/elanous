@@ -21,16 +21,25 @@ import { routeToolSearch } from '../skills/tools/tool-search-route.js';
 import { takeHydratedTools } from '../skills/tools/tool-search-spec.js';
 import { estimateTokens } from '../tokens.js';
 
-const BUILTIN_PLUGIN_IDS = ['absorb', 'elanous-app-deploy', 'elanous-observe', 'elanous-release', 'gcp-architect-expand'];
+function readBuiltinRouteSources() {
+  const pluginRoot = join(import.meta.dir, '../../plugins');
+  return readdirSync(pluginRoot).sort().flatMap((name) => {
+    const manifestPath = join(pluginRoot, name, 'plugin.json');
+    if (!existsSync(manifestPath)) return [];
+    const manifest = parsePluginManifest(JSON.parse(readFileSync(manifestPath, 'utf8')));
+    const tools = (manifest.contributes.aiTools ?? []).filter((tool) => tool.route);
+    return tools.length > 0 ? [{ pluginId: manifest.id, tools }] : [];
+  });
+}
 
 test('tool-router-world: index defaults on, explicit native bypass and failure remain enabled scoped', () => {
+  const expectedPluginIds = readBuiltinRouteSources().map(({ pluginId }) => pluginId).sort();
   const receipt = runToolRouterWorld();
   expect(DEFAULT_TOOL_ROUTING_STRATEGY).toBe('index');
   expect(defaultToolRoutingStrategy('native-all')).toBe('native-all');
   expect(receipt.defaultRoute).toMatchObject({ mode: 'index', miss: false });
   expect(receipt.defaultRoute.matches[0]).toMatchObject({ pluginId: 'elanous-observe', name: 'ObserveLogs' });
-  // Source: plugins/absorb/plugin.json declares the built-in absorb route surface now discovered by the router world.
-  expect(receipt.explicitNativeAll).toMatchObject({ mode: 'native-all', miss: true, enabledPluginIds: BUILTIN_PLUGIN_IDS });
+  expect(receipt.explicitNativeAll).toMatchObject({ mode: 'native-all', miss: true, enabledPluginIds: expectedPluginIds });
   expect(receipt.explicitNativeAll.fallbackReason).toBeUndefined();
   expect(receipt.disabledPlugin).toMatchObject({ mode: 'index', miss: true, matches: [] });
   expect(receipt.failedIndex).toMatchObject({ mode: 'native-all', fallbackReason: 'router-error', enabledPluginIds: ['elanous-release'] });
@@ -46,9 +55,8 @@ test('tool-router-world: index defaults on, explicit native bypass and failure r
   expect(receipt.disabledProviderRouteSchemas).toEqual([]);
   expect(receipt.activeRouteSearchMatches).toContain('ObserveLogs');
   expect(receipt.activeRouteSelectMatches).toContain('ObserveLogs');
-  // Source: plugins/absorb/plugin.json is included in builtin plugin discovery and declares AI tools.
-  expect(receipt.firstPartyPluginIds).toEqual(BUILTIN_PLUGIN_IDS);
-  expect(receipt.ontologyPluginIds).toEqual(receipt.firstPartyPluginIds);
+  expect(receipt.firstPartyPluginIds).toEqual(expectedPluginIds);
+  expect(receipt.ontologyPluginIds).toEqual(expectedPluginIds);
   expect(receipt.appDeployRoute.matches[0]).toMatchObject({ pluginId: 'elanous-app-deploy', name: 'app_deploy', route: { requiresConfirm: true } });
   expect(receipt.appDeployBlocked).toBe(true);
   expect(receipt.appDeployHandlerCalls).toBe(0);
@@ -78,13 +86,7 @@ test('tool-router-world: an app mention alone does not trigger a deploy route', 
 });
 
 test('tool-router-world: multiword ontology does not send budget or dashboard status to observe', () => {
-  const sources = readdirSync(join(process.cwd(), 'plugins')).sort().flatMap((name) => {
-    const manifestPath = join(process.cwd(), 'plugins', name, 'plugin.json');
-    if (!existsSync(manifestPath)) return [];
-    const manifest = parsePluginManifest(JSON.parse(readFileSync(manifestPath, 'utf8')));
-    const tools = (manifest.contributes.aiTools ?? []).filter((tool) => tool.route);
-    return tools.length > 0 ? [{ pluginId: manifest.id, tools }] : [];
-  });
+  const sources = readBuiltinRouteSources();
   const statusRoute = (trigger: string) => ({
     triggers: [trigger], examples: [], sideEffects: 'read-only' as const,
     risk: 'low' as const, cost: 'cheap' as const, requiresConfirm: false,

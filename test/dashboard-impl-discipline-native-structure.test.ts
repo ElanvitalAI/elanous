@@ -19,7 +19,6 @@ function userConfig(nativeStructureEnabled: boolean): Parameters<typeof buildDas
         ...config.chat.conciseness,
         enabled: false,
         finalMessageMaxLines: 6,
-        preambleMaxWords: 12,
       },
     },
     tools: {
@@ -118,7 +117,7 @@ describe('llm 블록이 없는 부분 config — 터지지 않고 «꺼진다»'
     const full = getUserConfig();
     const partial = {
       ...full,
-      chat: { ...full.chat, conciseness: { ...full.chat.conciseness, enabled: false, finalMessageMaxLines: 6, preambleMaxWords: 12 } },
+      chat: { ...full.chat, conciseness: { ...full.chat.conciseness, enabled: false, finalMessageMaxLines: 6 } },
       tools: { ...full.tools, nativeStructure: { enabled: true } },
     };
     // ⛔ 여기서만 계약을 «일부러» 어긴다 — 이 절이 재려는 것이 바로 「계약보다 좁은 config」이기 때문이다.

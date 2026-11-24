@@ -21,8 +21,8 @@ test('the source comes from the structured field: the same wording draws three w
   const agent = logViewLines([user('#38031 리뷰 결과 반영해 줘', { kind: 'agent', seat: 'OP', intent: 'request', msgId: '82543' })], 60);
   // human: the person's band, as before.
   expect(human[0]).toStartWith('\x1b[48;5;235;38;5;252m'); // the person's band, dark token (literal — rule 11)
-  // system: one dim line naming what woke the turn; the internal instruction is not shown.
-  expect(system.slice(0, -1)).toEqual(['\x1b[2m↻ Resuming (scheduled check)\x1b[22m']);
+  // system: a scheduled resume draws nothing (TUI-NOTICE-QUIET 대표 11-24 — bookkeeping); the internal instruction is not shown.
+  expect(system.filter((row) => row.includes('Resuming') || row.includes('SPWAKE'))).toEqual([]);
   // agent: a paler band under «⇢ SEAT · intent · #id», never the person's «>» band.
   expect(plain(agent.slice(0, 2))).toEqual(['⇢ OP · request · #82543', '  #38031 리뷰 결과 반영해 줘']);
   expect(agent.slice(0, 2).every((row) => row.startsWith('\x1b[48;5;60;97m'))).toBe(true);
@@ -31,7 +31,7 @@ test('the source comes from the structured field: the same wording draws three w
 
 test('NO_COLOR keeps the glyphs: «>» for a person, «⇢ SEAT» and an indent for an agent, «↻» for the system', () => {
   process.env.NO_COLOR = '1';
-  expect(logViewLines([user('hi')], 40)[0]).toBe('> hi');
+  expect(logViewLines([user('hi')], 40)[0]).toBe('❯ hi');
   expect(logViewLines([user('hi', { kind: 'agent', seat: 'TC' })], 40).slice(0, 2)).toEqual(['⇢ TC', '  hi']);
   expect(logViewLines([user('x', { kind: 'system', origin: 'goal-continue' })], 40)[0]).toBe('\x1b[2m↻ Continuing\x1b[22m');
 });

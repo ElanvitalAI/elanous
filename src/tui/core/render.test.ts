@@ -154,7 +154,7 @@ test('short transcript starts below the header and grows downward while prompt s
   });
   expect(frame.body[1]).toBe('');
   expect(frame.body[2]).toBe('답변');
-  expect(visibleRow(frame.body[0]!)).toContain('> 질문');
+  expect(visibleRow(frame.body[0]!)).toContain('❯ 질문');
   expect(Bun.stringWidth(visibleRow(frame.body[0]!))).toBe(40);
   expect(frame.lines.at(-2)).toBe('status');
   expect(frame.lines.at(-1)).toBe('❯ ');
@@ -240,7 +240,8 @@ test('Next history hides internal child-agent polling while classic history rema
       ]),
     { role: 'assistant', content: 'completed', ts: '2026-11-10T00:00:03Z' },
   ];
-  const classicScreen = logViewLines(messages, 80).join('\n');
+  // Classic output is folded by default; expand its tool records before checking their content.
+  const classicScreen = logViewLines(messages, 80, new Set(messages.map((_, index) => index))).join('\n');
   const updateGoalBlock: MessageBlock = {
     id: 'goal-update-alias', ts: 5, source: 'tool',
     body: { kind: 'tool-call', toolCallId: 'd', title: 'UpdateGoal' },
@@ -256,8 +257,8 @@ test('Next history hides internal child-agent polling while classic history rema
       { block: { id: 'goal-update', ts: 4, source: 'tool', body: { kind: 'tool-call', toolCallId: 'c', title: 'update_goal' } }, level: 0 },
       { block: updateGoalBlock, level: 0 },
     ],
-    columns: 80, rows: messages.length * 4, header: [], footer: [], promptLine: '❯ ', notices: [], activity: [], scroll: 0,
-    expandedToolIndexes: new Set<number>(),
+    columns: 80, rows: messages.length * 12, header: [], footer: [], promptLine: '❯ ', notices: [], activity: [], scroll: 0,
+    expandedToolIndexes: new Set(messages.map((_, index) => index)),
   });
   const screen = frame.body.join('\n');
   expect(classicScreen).toContain('AgentOutput');
@@ -305,7 +306,7 @@ test('Next history hides internal child-agent polling while classic history rema
   expect(screen).not.toContain('  \n');
   expect(screen).not.toContain('private goal data');
   expect(screen).not.toContain('private alias goal');
-  expect(screen.replace(/\x1b\[[0-9;]*m/g, '')).toContain('> run three children');
+  expect(screen.replace(/\x1b\[[0-9;]*m/g, '')).toContain('❯ run three children');
   expect(screen).toContain('\ncompleted\n');
 });
 
@@ -354,7 +355,7 @@ test('short activity and reply growth keeps the user at the top until the viewpo
     notices: [], scroll: 0, expandedToolIndexes: new Set<number>() };
   for (const activity of [[], ['first activity'], ['first activity', 'second activity'], ['first activity', 'second activity', 'reply']]) {
     const frame = renderNextTuiLogFrame({ ...input, activity });
-    expect(visibleRow(frame.body[0]!)).toContain('> 질문');
+    expect(visibleRow(frame.body[0]!)).toContain('❯ 질문');
     expect(frame.logWindow.leadingBlankRows).toBe(0);
     expect(frame.lines.at(-1)).toBe('❯ ');
     expect(frame.lines).toHaveLength(input.rows);
@@ -363,9 +364,9 @@ test('short activity and reply growth keeps the user at the top until the viewpo
   }
   const activity = Array.from({ length: input.rows }, (_, index) => 'event-' + index);
   const full = renderNextTuiLogFrame({ ...input, activity });
-  expect(visibleRow(full.body.join('\n'))).not.toContain('> 질문');
+  expect(visibleRow(full.body.join('\n'))).not.toContain('❯ 질문');
   const scrolledToTop = renderNextTuiLogFrame({ ...input, activity, scroll: full.maxScroll });
-  expect(visibleRow(scrolledToTop.body[0]!)).toContain('> 질문');
+  expect(visibleRow(scrolledToTop.body[0]!)).toContain('❯ 질문');
   expect(full.body.at(-1)).toBe(activity.at(-1));
   expect(full.lines.at(-1)).toBe('❯ ');
 });
@@ -376,4 +377,30 @@ test('tool activity rows render dim after fitting; other activity rows stay plai
   // Fitting happens first, so the cut matches a plain fit and the escape codes stay intact.
   const long = `${TOOL_DONE_GLYPH} Read(` + 'x'.repeat(200);
   expect(nextTuiActivityRow(long, 40)).toBe(`\x1b[2m${fitLogLine(long, 40)}\x1b[22m`);
+});
+
+test('completed run batches fold together and retain each individual raw detail', () => {
+  const user: SerializedMessage = { role: 'user', content: 'run', ts: '2026-11-15T00:00:00Z' };
+  const entries = Array.from({ length: 12 }, (_, i) => {
+    const id = `run:tool:${i}`;
+    const block: MessageBlock = { id, ts: i, source: 'tool',
+      body: { kind: 'tool-call', toolCallId: `c${i}`, title: 'Read', status: '완료' },
+      detail: { level: 3, summary: `Read ${i}`, rawRef: { runId: 'run', blockId: id } } };
+    const saved: SerializedMessage = { role: 'tool', content: '', ts: '2026-11-15T00:00:00Z',
+      toolName: 'Read', toolCallId: `c${i}`, surfaceRunId: 'run', toolResult: `result ${i}` };
+    return { block, saved, rawText: `raw result ${i}` };
+  });
+  const base = { messages: [user, ...entries.map((entry) => entry.saved)], columns: 100, rows: 80,
+    header: [], footer: [], promptLine: '❯ ', notices: [], activity: [], scroll: 0, expandedToolIndexes: new Set<number>() };
+  const render = (opened: boolean, secondOpened: boolean) => renderNextTuiLogFrame({ ...base,
+    messageBlocks: entries.map((entry, i) => ({ block: entry.block, rawText: entry.rawText,
+      level: (i === 0 && opened || i === 1 && secondOpened ? 3 : 0) as 0 | 3, afterMessageIndex: 0 })) });
+  const folded = render(false, false);
+  expect(folded.lines.join('\n')).toContain('12 tools');
+  expect(folded.logWindow.foldTargets.filter((target) => target.kind === 'message')).toHaveLength(1);
+  const expanded = render(true, true);
+  expect(expanded.logWindow.foldTargets.filter((target) => target.kind === 'message')).toHaveLength(12);
+  expect(expanded.lines.join('\n')).toContain('raw result 0');
+  expect(expanded.lines.join('\n')).toContain('raw result 1');
+  expect(render(false, true).logWindow.foldTargets.filter((target) => target.kind === 'message')).toHaveLength(1);
 });

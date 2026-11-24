@@ -53,3 +53,7 @@ test('ELN-SELF-TIMER-WATCH: self wake observations are allowlisted', () => {
     'self-timer.probe-error',
   ])));
 });
+
+test('TUI-ANSWER-VANISH-ON-TOOLCALL: transcript reload and kept-reply observations are allowlisted', () => {
+  for (const name of ['answer-drop', 'answer-commit', 'replies-kept', 'steer-status-stale', 'steer-echo']) expect(KNOWN_LOG_EVENT_NAMES.has(name)).toBe(true);
+});

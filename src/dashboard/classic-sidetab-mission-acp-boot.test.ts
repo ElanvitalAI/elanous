@@ -5,7 +5,7 @@ import { dispatchSessionRuntimeTool } from '../session-runtime/index.js';
 import * as llmModule from '../llm.js';
 import { streamLLMWithTools, type LLMProvider } from '../llm.js';
 import { bootDashboardAcpSession } from './acp-boot.js';
-import { enqueueClassicSidetabMissionCompletion } from './classic-sidetab-mission-job.js';
+import { enqueueClassicSidetabMissionCompletion } from '../sidetab-core/classic-sidetab-mission-job.js';
 import { createDashboardClassicSidetabMissionCallbacks } from './index.js';
 import { startClassicMissionCli } from './mission-cli-consumer.js';
 

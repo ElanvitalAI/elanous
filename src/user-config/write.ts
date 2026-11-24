@@ -80,6 +80,10 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
     ? { ...rawRest.harness as Record<string, unknown> } : {};
   delete rawHarness.difficultyPlacement;
   delete rawRest.harness;
+  const rawIntake = rawRest.intake && typeof rawRest.intake === 'object' && !Array.isArray(rawRest.intake)
+    ? { ...rawRest.intake as Record<string, unknown> } : {};
+  delete rawIntake.eventMax;
+  delete rawRest.intake;
   const rawAutopilot = rawRest.autopilot && typeof rawRest.autopilot === 'object' && !Array.isArray(rawRest.autopilot)
     ? rawRest.autopilot as Record<string, unknown> : {};
   const rawLoops = rawRest.loops && typeof rawRest.loops === 'object' && !Array.isArray(rawRest.loops)
@@ -318,7 +322,6 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
       conciseness: stripUndef({
         enabled: cfg.chat.conciseness.enabled,
         finalMessageMaxLines: cfg.chat.conciseness.finalMessageMaxLines,
-        preambleMaxWords: cfg.chat.conciseness.preambleMaxWords,
       }),
       toolOutput: stripUndef({
         persistOnOverflow: cfg.chat.toolOutput.persistOnOverflow,
@@ -341,7 +344,7 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
         forceBuiltinVariant: cfg.chat.systemPrompt.forceBuiltinVariant,
       }),
     }),
-    intake: { ...(rawRest.intake && typeof rawRest.intake === 'object' ? rawRest.intake as Record<string, unknown> : {}), ...cfg.intake },
+    intake: { ...rawIntake, ...cfg.intake },
     dashboard: stripUndef({
       promptBank: cfg.dashboard.promptBank,
     }),

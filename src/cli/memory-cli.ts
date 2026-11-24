@@ -13,11 +13,28 @@ import {
 } from '../memory.js';
 import { applyClaudeMemoryImport, claudeMemoryRoot, collectClaudeMemoryFiles } from '../context-bus/claude-memory-import.js';
 import { importClaudeMemories } from '../context-bus/long-term-memory.js';
-import { buildSeatMemoryIndexBlock, normalizeSeat, rebuildSeatMemoryIndex, seatMemoryDir } from '../seat-memory/seat-memory.js';
+import {
+  buildSeatMemoryIndexBlock, deleteSeatMemory, listSeatMemories, normalizeSeat, pinSeatMemory, readSeatMemoryIndex, rebuildSeatMemoryIndex,
+  promoteSeatMemoryToCommon, saveSeatMemory, searchSeatMemories, seatMemoryDir, seatMemoryLedgerRoot, type SeatMemoryEntry,
+} from '../seat-memory/seat-memory.js';
+import { commonMemoryDir, resolveMemoryStore, type MemoryStore } from '../seat-memory/memory-store.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { applySeatMemoryImport, planSeatMemoryImport, summarizeSeatMemoryImport, type SeatMemoryImportPlan } from '../seat-memory/seat-memory-import.js';
 import { OP_SEED_ALLOWED_SOURCE_ROOTS, OP_SEED_DECISIONS_RECENT_DEFAULT, applyOpMemorySeed, planOpMemorySeed, summarizeOpMemorySeed, type OpMemorySeedPlan } from '../seat-memory/op-memory-seed.js';
+
+// 🧠 MEMORY-STORE-SPLIT — CLI 도 세션과 같은 해석기를 쓴다: 자리(ELANOUS_TRACK·cwd seats/<SEAT>) → 저장소 프로젝트 → 전역.
+//    자리·프로젝트 저장소면 아래 명령은 그 저장소(파일 하나 = 기억 하나 · MEMORY.md 색인)를 읽고 쓴다. 전역이면 옛 동작 그대로.
+type FileStore = Exclude<MemoryStore, { kind: 'user' }>;
+function cliFileStore(): FileStore | null {
+  const store = resolveMemoryStore(process.cwd());
+  return store.kind === 'user' ? null : store;
+}
+function findFileMemory(store: FileStore, key: string): SeatMemoryEntry | null {
+  const all = listSeatMemories(store.dir);
+  return all.find(e => e.name === key) ?? all.find(e => e.name.startsWith(key)) ?? null;
+}
+const storeTag = (store: FileStore): string => `${store.kind} ${store.label}`;
 
 export function registerMemoryCommands(program: Command): void {
   const memCmd = program.command('memory').description('Persistent memories injected into every chat turn (user / feedback / project / reference)');
@@ -27,6 +44,16 @@ export function registerMemoryCommands(program: Command): void {
   .description('List memories (optionally filtered by type)')
   .option('-n, --limit <n>', 'Max entries to show', '30')
   .action((type?: string, opts?: { limit: string }) => {
+    const fileStore = cliFileStore();
+    if (fileStore) {
+      const rows = listSeatMemories(fileStore.dir).filter(e => !type || e.type === type).slice(0, parseInt(opts?.limit ?? '30', 10));
+      ui.header(`memories (${rows.length}) — ${storeTag(fileStore)} · ${fileStore.dir}`);
+      for (const e of rows) {
+        console.log(`  [${e.type.padEnd(9)}]  ${e.name}`);
+        if (e.description) console.log(`             ${e.description.slice(0, 100)}`);
+      }
+      return;
+    }
     const t = type as MemoryType | undefined;
     const entries = listMemories({ type: t, limit: parseInt(opts?.limit ?? '30', 10) });
     if (entries.length === 0) {
@@ -53,6 +80,13 @@ export function registerMemoryCommands(program: Command): void {
     let body = description;
     const pipedBody = await readPipedStdin();   // ★ OBS-T3 — 비-TTY 는 파이프를 뜻하지 않는다(소켓이면 EOF 가 안 온다)
     if (pipedBody) body = pipedBody;
+    const fileStore = cliFileStore();
+    if (fileStore) {
+      const r = saveSeatMemory({ name, description: description || name, type, body: body || name }, fileStore.dir, fileStore.label, { origin: 'memory-cli.add' });
+      if (!r.ok) { ui.error(r.error); process.exit(1); }
+      ui.info(`saved [${type}] "${r.name}" (${r.action}) → ${storeTag(fileStore)} ${fileStore.dir}/${r.file}`);
+      return;
+    }
     const e = saveMemory({ type: type as MemoryType, name, description, body }, undefined, { origin: 'memory-cli.add' });
     ui.info(`saved ${e.id.slice(0, 8)} [${e.type}] "${e.name}"`);
   });
@@ -63,6 +97,13 @@ export function registerMemoryCommands(program: Command): void {
   .description('Pin a memory so it is ALWAYS injected (bypass keyword gate). Optionally set priority.')
   .option('-p, --priority <n>', 'priority boost (higher = ranked/kept first)', '5')
   .action((prefix: string, opts: { priority: string }) => {
+    const fileStore = cliFileStore();
+    if (fileStore) {
+      const hit = findFileMemory(fileStore, prefix);
+      if (!hit || !pinSeatMemory(hit.name, fileStore.dir).ok) { ui.error(`no memory matching "${prefix}" in ${storeTag(fileStore)}`); process.exit(1); }
+      ui.info(`📌 pinned "${hit.name}" — top of ${storeTag(fileStore)} index (always in the session-start index)`);
+      return;
+    }
     const e = loadMemory(prefix);
     if (!e) { ui.error(`no memory matching "${prefix}"`); process.exit(1); }
     saveMemory({ type: e.type, name: e.name, description: e.description, body: e.body, id: e.id, pinned: true, priority: parseInt(opts.priority, 10) || 0 });
@@ -73,6 +114,8 @@ export function registerMemoryCommands(program: Command): void {
   .command('unpin <idPrefix>')
   .description('Un-pin a memory (back to keyword-gated recall).')
   .action((prefix: string) => {
+    const fileStore = cliFileStore();
+    if (fileStore) { ui.error(`${storeTag(fileStore)} store has no pin flag — every index line is injected; reorder with \`memory pin\``); process.exit(1); }
     const e = loadMemory(prefix);
     if (!e) { ui.error(`no memory matching "${prefix}"`); process.exit(1); }
     saveMemory({ type: e.type, name: e.name, description: e.description, body: e.body, id: e.id, pinned: false, priority: e.priority });
@@ -129,6 +172,17 @@ export function registerMemoryCommands(program: Command): void {
   .command('show <idPrefix>')
   .description('Print full memory body')
   .action((prefix: string) => {
+    const fileStore = cliFileStore();
+    if (fileStore) {
+      const e = findFileMemory(fileStore, prefix);
+      if (!e) { ui.error(`no memory matching "${prefix}" in ${storeTag(fileStore)}`); process.exit(1); }
+      ui.header(`${e.type}: ${e.name}`);
+      console.log(`  file        ${fileStore.dir}/${e.file}`);
+      console.log(`  description ${e.description}`);
+      console.log('');
+      console.log(e.body);
+      return;
+    }
     const entries = listMemories();
     const hit = entries.find(e => e.id.startsWith(prefix));
     if (!hit) { ui.error(`no memory matching "${prefix}"`); process.exit(1); }
@@ -148,6 +202,19 @@ export function registerMemoryCommands(program: Command): void {
   .option('--type <t>', 'Filter by type')
   .option('-n, --limit <n>', 'Max results', '10')
   .action((parts: string[], opts) => {
+    const fileStore = cliFileStore();
+    if (fileStore) {
+      const found = searchSeatMemories(parts.join(' '), fileStore.dir, Number.MAX_SAFE_INTEGER)
+        .filter(h => !opts.type || h.entry.type === opts.type).slice(0, parseInt(opts.limit, 10));
+      recordMemoryUsage({ store: 'seat', seat: fileStore.label, via: 'search', usedIds: found.map(h => h.entry.file) }, seatMemoryLedgerRoot(fileStore.dir));
+      if (found.length === 0) { ui.info(`No matches in ${storeTag(fileStore)}.`); return; }
+      ui.header(`matches (${found.length}) — ${storeTag(fileStore)}`);
+      for (const h of found) {
+        console.log(`  score ${h.score}  [${h.entry.type}]  ${h.entry.name}`);
+        if (h.entry.description) console.log(`             ${h.entry.description.slice(0, 100)}`);
+      }
+      return;
+    }
     const hits = searchMemories(parts.join(' '), {
       type: opts.type as MemoryType | undefined,
       limit: parseInt(opts.limit, 10),
@@ -166,6 +233,13 @@ export function registerMemoryCommands(program: Command): void {
   .command('delete <idPrefix>')
   .description('Delete a memory')
   .action((prefix: string) => {
+    const fileStore = cliFileStore();
+    if (fileStore) {
+      const e = findFileMemory(fileStore, prefix);
+      if (!e || !deleteSeatMemory(e.name, fileStore.dir, fileStore.label).ok) { ui.error(`no memory matching "${prefix}" in ${storeTag(fileStore)}`); process.exit(1); }
+      ui.info(`deleted "${e.name}" from ${storeTag(fileStore)}`);
+      return;
+    }
     const entries = listMemories();
     const hit = entries.find(e => e.id.startsWith(prefix));
     if (!hit) { ui.error(`no memory matching "${prefix}"`); process.exit(1); }
@@ -177,6 +251,13 @@ export function registerMemoryCommands(program: Command): void {
   .command('index')
   .description('Print MEMORY.md index verbatim')
   .action(() => {
+    const fileStore = cliFileStore();
+    if (fileStore) {
+      const idx = readSeatMemoryIndex(fileStore.dir);
+      if (!idx.trim()) { ui.info(`empty (${storeTag(fileStore)})`); return; }
+      console.log(idx.trimEnd());
+      return;
+    }
     const idx = readIndex();
     if (!idx) { ui.info('empty (no memories yet)'); return; }
     console.log(idx);
@@ -186,6 +267,13 @@ export function registerMemoryCommands(program: Command): void {
   .command('where')
   .description('Show the memory storage path')
   .action(() => {
+    const store = resolveMemoryStore(process.cwd());
+    console.log(`store        ${store.kind}${store.label ? ` ${store.label}` : ''}  (${store.why})`);
+    if (store.kind !== 'user') {
+      console.log(`memory dir   ${store.dir}`);
+      console.log(`index file   ${join(store.dir, 'MEMORY.md')}`);
+      return;
+    }
     console.log(`memory dir   ${memoryRoot()}`);
     console.log(`index file   ${memoryIndexPath()}`);
   });
@@ -249,6 +337,30 @@ export function registerMemoryCommands(program: Command): void {
     for (const [reason, count] of Object.entries(summary.skippedByReason)) console.log(`  skipped ${reason}: ${count}`);
     for (const name of summary.refusedNames) console.log(`  refused (secret-pattern): ${name}`);
     if (!opts.apply) console.log('  re-run with --apply to write');
+  });
+
+  // 🧠 SEAT-COMMON-MEMORY (0.3.35 P0) — 자리 기억 하나를 모든 자리 공통 층(`<기억 뿌리>/seats/_common`)으로 승격한다.
+  //    조율자(OP) 자리에서만 — 자리 세션의 memory_save 는 늘 자기 저장소에 쓰고, 공통 층은 이 문으로만 자란다.
+  memCmd
+  .command('promote <name>')
+  .description('Coordinator (OP) only: copy one seat memory (file + index line) into the common layer every seat reads at session start')
+  .requiredOption('--to <layer>', 'target layer (only "common")')
+  .option('--from <SEAT>', 'source seat store (default: the current seat)')
+  .action((name: string, opts: { to: string; from?: string }) => {
+    if (opts.to !== 'common') { ui.error(`unknown layer "${opts.to}" — only --to common`); process.exit(1); }
+    const store = resolveMemoryStore(process.cwd());
+    if (store.kind !== 'seat' || store.seat !== 'OP') {
+      ui.error(`promote is coordinator-only (OP seat); this store is ${store.kind}${store.label ? ` ${store.label}` : ''} — ask OP to promote`);
+      process.exit(1);
+    }
+    const fromSeat = opts.from ? normalizeSeat(opts.from) : store.seat;
+    if (!fromSeat) { ui.error(`invalid seat "${opts.from}"`); process.exit(1); }
+    const fromDir = fromSeat === store.seat ? store.dir : seatMemoryDir(fromSeat);
+    const commonDir = store.commonDir ?? commonMemoryDir();
+    const r = promoteSeatMemoryToCommon(name, fromDir, commonDir);
+    if (!r.ok) { ui.error(r.error); process.exit(1); }
+    ui.info(`promoted "${r.name}" (${r.action}) seat ${fromSeat} → common · ${join(commonDir, r.file)}`);
+    console.log(`index line   ${r.indexLine}`);
   });
 
   memCmd

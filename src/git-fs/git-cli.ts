@@ -4,11 +4,12 @@ import { dirname, join, resolve } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
 import { hasCliStderrSink, writeCliStderr } from './cli-stderr.js';
+import { callingSeatFromEnv, decidePushSeatOwnership, delegatedSeatsOf, foreignPushRefusal, seatLabelOf } from './push-ownership.js';
 import { runGitWithRetry, type GitRunner } from './retry.js';
 
 const LF = 0x0a;
 const HELP_ARGUMENTS = new Set(['--help', '-h']);
-const HELP_GUIDANCE = "[elanous git] Wraps git and automatically retries transient lock failures. Pushes to another seat's open PR are passed through with an audit warning, even if the audit write fails; uncertain push forms pass through with an observation. --force-owner records an override request. A final result line such as '[git] status ok rc=0' is written to stderr. Git's own help follows.\n";
+const HELP_GUIDANCE = "[elanous git] Wraps git and automatically retries transient lock failures. Pushes to another seat's open PR branch or branch prefix are refused unless the PR carries a 'delegates:<SEAT>' label for the calling seat; --force-owner records an explicit override; uncertain push forms pass through with an observation. A final result line such as '[git] status ok rc=0' is written to stderr. Git's own help follows.\n";
 
 const GLOBAL_OPTIONS_WITH_OPERANDS = new Set([
   '-C',
@@ -367,16 +368,7 @@ function gitCommandCwd(args: string[]): string {
   return cwd;
 }
 
-function callerSeat(cwd = process.cwd()): string | undefined {
-  const fromEnv = [process.env.ELANOUS_TRACK, process.env.ELANOUS_HARNESS_SEAT]
-    .map((value) => value?.trim())
-    .find((value): value is string => Boolean(value && /^[A-Z][A-Z0-9-]{1,11}$/.test(value)));
-  if (fromEnv) return fromEnv;
-  const parts = cwd.split(/[\\/]+/);
-  const seatIndex = parts.lastIndexOf('seats');
-  const fromPath = seatIndex >= 0 ? parts[seatIndex + 1] : undefined;
-  return fromPath && /^[A-Z][A-Z0-9-]{1,11}$/.test(fromPath) ? fromPath : undefined;
-}
+
 
 const PUSH_OPTIONS_WITH_OPERANDS = new Set(['-o', '--push-option', '--receive-pack', '--repo', '--exec', '--recurse-submodules']);
 const PUSH_OPTIONS_WITHOUT_OPERANDS = new Set(['-u', '--set-upstream', '-f', '--force', '--dry-run', '--no-dry-run', '--porcelain', '--delete', '--prune', '--mirror', '--all', '--tags', '--follow-tags', '--atomic', '--no-verify', '--thin', '--no-thin', '--quiet', '-q', '--verbose', '-v', '--progress', '--no-progress', '--signed', '--no-signed', '--ipv4', '--ipv6', '--force-with-lease']);
@@ -465,8 +457,7 @@ function githubRepository(remoteUrl: string): string | undefined {
 }
 
 function prSeat(pr: PushOwnershipPr): string | undefined {
-  const label = pr.labels?.map((item) => item.name ?? '').find((name) => /^seat:[A-Z][A-Z0-9-]{1,11}$/.test(name));
-  return label?.slice('seat:'.length);
+  return seatLabelOf(pr.labels);
 }
 
 type OwnedPushPr = { repository: string; pr: PushOwnershipPr };
@@ -487,7 +478,7 @@ function guardPushOwnership(args: string[]): PushOwnershipDecision {
   const forceOwner = parsedArgs.forceOwner;
   const gitArgs = parsedArgs.args;
   const cwd = gitCommandCwd(args);
-  const seat = callerSeat(cwd);
+  const seat = callingSeatFromEnv(cwd);
   const passUncertain = (reason: string): PushOwnershipDecision => {
     const auditFailure = appendPushOwnerLedger({ seat: seat ?? null, verdict: 'pass-uncertain', reason,
       ...(forceOwner ? { forceOwnerRequested: true } : {}) });
@@ -560,16 +551,32 @@ function guardPushOwnership(args: string[]): PushOwnershipDecision {
     } catch { return passUncertain(`open PR lookup unreadable for ${baseRepository} ${target.branch}`); }
   }
   const uniquePrs = [...new Map(found.map((row) => [`${row.repository}#${row.pr.number}`, row])).values()];
-  const foreign = uniquePrs.find(({ pr }) => {
-    const ownerSeat = prSeat(pr);
-    return seat !== undefined && ownerSeat !== undefined && ownerSeat !== seat;
-  });
-  if (foreign) {
-    const row = { seat: seat ?? null, verdict: 'foreign-owner-warning', PR: uniquePrs.map(({ repository: prRepository, pr }) => ({ repository: prRepository, number: pr.number, branch: pr.headRefName ?? null, seat: prSeat(pr) ?? null })),
-      targets: resolved.targets.map(({ branch }) => ({ repository, branch })), reason: 'push to another seat open PR branch', ...(parsedArgs.unsupportedOption ? { unsupportedOption: parsedArgs.unsupportedOption } : {}), ...(forceOwner ? { forceOwnerRequested: true } : {}) };
+  // SEAT-FOREIGN-PR-PUSH-GUARD (OP #134088): 가지 접두어·PR 작성 자리 ↔ 호출 자리 대조 —
+  // 남의 PR 가지/가지 접두어는 경고가 아니라 **거부**다. 주인 위임(delegates:<호출자리>)
+  // 라벨과 `--force-owner` 만 명시적 우회다(감사 행과 함께).
+  const refusals: { branch: string; ownerSeat: string | undefined; reason: string }[] = [];
+  for (const target of resolved.targets) {
+    const onBranch = uniquePrs.filter(({ pr }) => pr.headRefName === target.branch);
+    const ownerSeats = [...new Set(onBranch.map(({ pr }) => prSeat(pr)).filter((value): value is string => value !== undefined))];
+    const delegatedTo = onBranch.flatMap(({ pr }) => delegatedSeatsOf(pr.labels));
+    const decision = decidePushSeatOwnership({ callingSeat: seat, branch: target.branch,
+      ownerSeat: ownerSeats.length === 1 ? ownerSeats[0] : undefined, delegatedTo });
+    if (decision.kind === 'refuse') refusals.push({ branch: target.branch, ownerSeat: ownerSeats.length === 1 ? ownerSeats[0] : undefined, reason: decision.reason });
+  }
+  if (refusals.length > 0) {
+    const primary = refusals[0]!;
+    const row = { seat: seat ?? null, verdict: forceOwner ? 'foreign-owner-forced' : 'foreign-owner-refused',
+      PR: uniquePrs.map(({ repository: prRepository, pr }) => ({ repository: prRepository, number: pr.number, branch: pr.headRefName ?? null, seat: prSeat(pr) ?? null })),
+      targets: resolved.targets.map(({ branch }) => ({ repository, branch })),
+      reason: refusals.map((refusal) => refusal.reason).join('; '),
+      ...(parsedArgs.unsupportedOption ? { unsupportedOption: parsedArgs.unsupportedOption } : {}),
+      ...(forceOwner ? { forceOwnerRequested: true } : {}) };
     const auditFailure = appendPushOwnerLedger(row);
-    const notice = `push owner guard warning: ${uniquePrs.filter(({ pr }) => prSeat(pr) !== seat).map(({ pr, repository: prRepository }) => `branch ${pr.headRefName ?? '(unknown)'} belongs to PR #${pr.number} in ${prRepository} seat:${prSeat(pr)}`).join('; ')} (current seat:${seat}); proceeding${auditFailure ? ` · audit write failed: ${auditFailure}` : ''}`;
-    return { args: gitArgs, notice };
+    if (forceOwner) {
+      if (auditFailure) return { args: gitArgs, blocked: true, notice: auditFailure };
+      return { args: gitArgs, notice: `push owner guard: --force-owner override recorded (${refusals.map((refusal) => refusal.reason).join('; ')})` };
+    }
+    return { args: gitArgs, blocked: true, notice: `${foreignPushRefusal({ callingSeat: seat, branch: primary.branch, ownerSeat: primary.ownerSeat })} · ${refusals.map((refusal) => refusal.reason).join('; ')}${auditFailure ? ` · audit write failed: ${auditFailure}` : ''}` };
   }
   if (forceOwner) {
     const auditFailure = appendPushOwnerLedger({

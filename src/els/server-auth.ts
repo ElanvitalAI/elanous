@@ -213,25 +213,33 @@ export interface TabCloseScope {
   readonly tabId: string;
   readonly workspace: string;
   readonly ownerSeats: readonly (string | null)[];
+  /** ELS-OP-CLOSE-TAB: the tab holds the OP coordinator's own pane (registered OP pane or a pane seated OP). */
+  readonly opTab?: boolean;
+  /** For the close log: the tab's label and pane count. */
+  readonly label?: string;
+  readonly paneCount?: number;
 }
 
 /** Join the journal's exact tab/pane ids to the server's token ledger. An absent or mixed registration has no owner. */
 export function resolveTabCloseScope(
   listed: { readonly workspaces: readonly { readonly id: string; readonly name: string }[];
-    readonly tabs: readonly { readonly id: string; readonly workspaceId: string }[];
-    readonly panes: readonly { readonly pane: string; readonly tab: string }[] },
+    readonly tabs: readonly { readonly id: string; readonly workspaceId: string; readonly label?: string }[];
+    readonly panes: readonly { readonly pane: string; readonly tab: string; readonly seat?: string | null }[] },
   registrations: readonly PaneRegistration[],
   tabId: string,
 ): TabCloseScope | undefined {
   const tab = listed.tabs.find((row) => row.id === tabId);
   const workspace = tab && listed.workspaces.find((row) => row.id === tab.workspaceId)?.name;
   if (!tab || !workspace) return undefined;
-  const ownerSeats = listed.panes.filter((row) => row.tab === tab.id).map((row) => {
+  const rows = listed.panes.filter((row) => row.tab === tab.id);
+  const ownerSeats = rows.map((row) => {
     const owners = registrations.filter((entry) => entry.pane === row.pane && entry.workspace === workspace);
     const seats = new Set(owners.map((entry) => entry.seat));
     return owners.length && seats.size === 1 ? owners[0]!.seat ?? null : null;
   });
-  return { tabId: tab.id, workspace, ownerSeats };
+  const opTab = rows.some((row) => row.seat === 'OP'
+    || registrations.some((entry) => entry.pane === row.pane && (entry.role === 'op' || entry.seat === 'OP')));
+  return { tabId: tab.id, workspace, ownerSeats, opTab, ...(tab.label ? { label: tab.label } : {}), paneCount: rows.length };
 }
 
 // Payload fields (text/pattern/from) ride along so callers pass real op shapes; the door itself never reads them.
@@ -268,6 +276,17 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
   // CEO 11-23 15:3x «심한 보안 장치 다 완화 · 사람도 똑같이 막힌다»(ELS-ELN-SECURITY-RELAX): the server socket is
   // same-uid only, so a caller outside any pane (the person's own terminal, or an advisor like Claude OP) is the operator —
   // every op is allowed and still audited. Pane roles (op/hand/peer) keep their scopes below.
+  // ELS-OP-CLOSE-TAB (대표 11-24): closing the OP coordinator's own tab is the one close that still needs a person's yes —
+  // for every caller, the owner terminal and same-UID operators included.
+  if (request.op === 'close-tab' && request.confirmed !== true && tabScope?.opTab)
+    return { allow: false, reason: 'els: close-tab denied — the OP tab itself is closed only with a person\'s confirmation' };
+  // ELS-HERDR-CLI-PARITY ② (tab-close bisect 11-24 · 첫 적록 809b57f70c #39938): a tab no seat owns — a
+  // plain scratch tab — is closed unconfirmed by no one, the owner terminal and same-UID operators
+  // included: nobody answered a prompt for it. A person confirms it (confirm:true), a coordinator
+  // closes a seated tab below, and the OP tab above is refused for every caller, confirmed or not.
+  if (request.op === 'close-tab' && request.confirmed !== true && !tabScope?.opTab
+    && !tabScope?.ownerSeats.some((seat) => seat))
+    return { allow: false, reason: 'els: close-tab denied — a tab no seat owns closes only with confirm:true (a person\'s confirmation)' };
   if (role.kind === 'outsider' || role.kind === 'owner') return { allow: true };
   if (request.op === 'move-tab') return role.kind === 'op' || (role.kind === 'peer' && role.seat === 'OP') || actingOp
     ? { allow: true } : { allow: false, reason: 'els: move-tab denied — OP authority required' };
@@ -290,11 +309,14 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
     return { allow: false, reason: 'els: rename denied — workspace target not resolved' };
   const action = request.op === 'rename' && request.kind === 'workspace' ? 'do' : doorAction(request.op);
   if (!action) return { allow: false, reason: `els: ${request.op} is mutating but has no door action mapping` };
+  // ELS-OP-CLOSE-TAB (대표 11-24 «보안 기본 완화»): closing a seat tab is a routine coordinator action — the OP pane, a
+  // ledger-verified OP peer and the baton's acting OP close a non-OP tab without a person (the OP tab is refused above).
+  const coordinator = role.kind === 'op' || (role.kind === 'peer' && role.seat === 'OP') || actingOp;
   if (request.op === 'close-tab') {
-    if (request.confirmed !== true && role.kind !== 'op' && !(role.kind === 'peer' && role.seat === 'OP')) return { allow: false, reason: 'els: close-tab denied — close needs confirm:true (human confirmation)' };
+    if (request.confirmed !== true && !coordinator) return { allow: false, reason: 'els: close-tab denied — close needs confirm:true (human confirmation)' };
     if (!tabScope || tabScope.tabId !== request.tab || tabScope.workspace !== workspace || !tabScope.workspace)
       return { allow: false, reason: 'els: close-tab denied — tab identity or workspace changed before authorization' };
-    if (!actingOp && (role.kind === 'hand' || role.kind === 'peer')
+    if (!coordinator && (role.kind === 'hand' || role.kind === 'peer')
       && (!tabScope.ownerSeats.length || tabScope.ownerSeats.some((seat) => seat !== role.seat)))
       return { allow: false, reason: 'els: close-tab denied — tab contains another or unverified seat owner' };
   }
@@ -310,13 +332,23 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
   // The seat on the real principal remains unchanged for audit/rules. Use OP only for
   // this decision, and never bypass the acting seat's close confirmation requirement.
   const decisionPrincipal = actingOp ? { ...principal, seat: 'OP' } : principal;
-  if (actingOp && action === 'close' && !confirmed)
+  if (actingOp && action === 'close' && !confirmed && request.op !== 'close-tab')
     return { allow: false, reason: 'els: close denied — close needs confirm:true (human confirmation)' };
   const decision = defaultDecision(decisionPrincipal, target, action, confirmed);
   const guidance = '; an OP pane is authorized for this request at this gate (other checks may still apply)';
   if (decision) return decision.allow ? { allow: true } : { allow: false, reason: `els: ${request.op} denied — ${decision.reason}${guidance}` };
   if (rules && authorize(rules, principal, target, action)) return { allow: true };
   return { allow: false, reason: `els: ${request.op} denied — no rule grants ${action} to this pane${guidance}` };
+}
+
+/** ELS-OP-CLOSE-TAB: the `els.close` record for an allowed tab close — caller, tab label, pane count, confirmation. */
+export function closeTabAuditLine(role: ServerRole, scope: TabCloseScope, confirmed: boolean, acting = false): Record<string, unknown> {
+  const caller = role.kind === 'outsider' || role.kind === 'owner' ? `els-socket:${role.kind}`
+    : role.kind === 'peer' ? `local:${role.uid}(${role.seat})`
+      : role.kind === 'op' ? `els-pane:${role.pane}(OP)` : `els-pane:${role.pane}(${role.seat})`;
+  return { ts: new Date().toISOString(), event: 'els.close', principal: caller, ...(acting ? { actingOp: true } : {}),
+    workspace: scope.workspace, tab: scope.tabId, label: scope.label ?? '', panes: scope.paneCount ?? scope.ownerSeats.length,
+    action: 'close-tab', result: 'allowed', confirmed };
 }
 
 /** Audit line for a denial, in the control-audit.jsonl format (same fields as control.ts). */

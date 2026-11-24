@@ -73,3 +73,16 @@ test('a failed cut build is retried and a different cut never inherits the previ
     .toEqual(['started', 'failed', 'started', 'completed', 'started', 'completed']);
   } finally { spy.mockRestore(); }
 });
+
+test('reuses the tracked index for later receipt membership checks', () => {
+  const files = ['src/a.test.ts', 'src/b.test.ts'];
+  const includes = spyOn(files, 'includes');
+  const tree = { files, preload: [], read: (file: string) => files.indexOf(file) >= 0 ? 'export const ok = true;' : undefined };
+  const image = `sha256:${'c'.repeat(64)}`;
+  try {
+    expect(gateFileReceiptIdentityFromClosure(tree, files[0]!, image)).not.toBeNull();
+    expect(gateFileReceiptIdentityFromClosure(tree, files[1]!, image)).not.toBeNull();
+    expect(gateFileReceiptIdentityFromClosure(tree, 'src/missing.test.ts', image)).toBeNull();
+    expect(includes).toHaveBeenCalledTimes(1);
+  } finally { includes.mockRestore(); }
+});

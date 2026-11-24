@@ -509,3 +509,43 @@ test('a broken file under a decision-claim name counts as unreadable even when t
   writeFileSync(claimPath, JSON.stringify({ nodeId: 'approve-publish', decision: 'maybe', decidedAt: 'x' }));
   expect(listGraphRuns(base).unreadable).toBe(1);
 });
+
+test('stopping an active release root is refused before bypassing traffic restore', async () => {
+  const base = root();
+  const file = save(base, 'release-loop', 'release-gate-active', '2026-11-24T00:00:00Z', {
+    status: 'running', path: ['traffic-prep', 'cut-branch', 'gate'], input: { version: '0.3.34' },
+    pid: 4321, pidStartedAt: '2026-11-24T00:00:00Z',
+  });
+  const before = readFileSync(file, 'utf8');
+  const result = await cli(base, ['runs', 'stop', 'release-gate-active'], () => Date.parse('2026-11-24T00:00:00Z'));
+  expect(result.exit).toBe(1);
+  expect(result.err.join(' ')).toContain('traffic-failed-restore');
+  expect(readFileSync(file, 'utf8')).toBe(before);
+  const destroyed = await cli(base, ['runs', 'destroy', 'release-gate-active'], () => Date.parse('2026-11-24T00:00:00Z'));
+  expect(destroyed.exit).toBe(1);
+  expect(destroyed.err.join(' ')).toContain('traffic-failed-restore');
+  expect(readFileSync(file, 'utf8')).toBe(before);
+});
+
+test('traffic guard leaves auxiliary release graph runs stoppable', async () => {
+  const base = root();
+  const file = save(base, 'release-loop', 'release-prefetch-child', '2026-11-24T00:00:00Z', {
+    status: 'running', path: ['prefetch'], nodes: [], executed: 0, input: { version: '0.3.34' },
+    pid: 4321, pidStartedAt: '2026-11-24T00:00:00Z',
+  });
+  const result = await cli(base, ['runs', 'stop', 'release-prefetch-child'], () => null);
+  expect(result.exit).toBe(0);
+  expect(JSON.parse(readFileSync(file, 'utf8')).status).toBe('failed');
+});
+
+test('an auxiliary first node remains stoppable before its path is populated', async () => {
+  const base = root();
+  const file = save(base, 'release-loop', 'release-empty-child', '2026-11-24T00:00:00Z', {
+    status: 'running', path: [], nodes: [], executed: 0, input: { version: '0.3.34' },
+    currentNode: { nodeId: 'prefetch', startedAt: '2026-11-24T00:00:00Z' },
+    pid: 4321, pidStartedAt: '2026-11-24T00:00:00Z',
+  });
+  const result = await cli(base, ['runs', 'stop', 'release-empty-child'], () => null);
+  expect(result.exit).toBe(0);
+  expect(JSON.parse(readFileSync(file, 'utf8')).status).toBe('failed');
+});

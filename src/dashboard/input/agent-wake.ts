@@ -28,7 +28,7 @@ import { homedir } from 'node:os';
 import type { TextInputInternalTurnYieldPort } from '../../chat/index.js';
 import { debug } from '../../debug/log.js';
 import type { PendingTaskNotification } from '../../agent/task-notification.js';
-import { CLASSIC_SIDETAB_MISSION_LABEL } from '../classic-sidetab-mission-job.js';
+import { CLASSIC_SIDETAB_MISSION_LABEL } from '../../sidetab-core/classic-sidetab-mission-job.js';
 import { detectSeatTui, type SeatDetection } from '../seat-boot-preamble.js';
 import type { InternalTurnRejectReason, StartTurnIfIdleOptions, StartTurnIfIdleResult } from './internal-turn.js';
 

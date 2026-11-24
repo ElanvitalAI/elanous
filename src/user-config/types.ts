@@ -1542,8 +1542,6 @@ export interface IntakeSurfaceConfig {
 }
 
 export interface IntakeConfig {
-  /** Maximum immediately scheduled Telegram absorption links per KST day. */
-  eventMax?: number;
   /** Topic title used by the scheduled user absorption briefing and its topic-scoped feeds. */
   briefingTopic?: string;
   telegram: IntakeSurfaceConfig;

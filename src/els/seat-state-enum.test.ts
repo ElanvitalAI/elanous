@@ -52,15 +52,15 @@ test('a BLOCKED report becomes pane.status {state, reason, since} and `els ls --
   expect(w.list().panes.find((p) => p.pane === w.blocked)!.status).toEqual({ state: 'WORKING', since: t0 + 60_000, source: 'derived' });
 });
 
-test('the agents column marks BLOCKED 🟡 from the code, while the screen text is never consulted', () => {
+test('the agents column marks a person-needed BLOCKED as «⚪✋» (SIDETAB-TWO-MARKS) from the code, while the screen text is never consulted', () => {
   const w = world();
   w.send(w.blocked, { kind: 'state', state: 'blocked', code: 'BLOCKED', reason: 'OWNER_UNKNOWN' });
   w.send(w.working, { kind: 'turn', phase: 'start', id: 't1' });
   w.send(w.working, { kind: 'state', state: 'waiting-input', code: 'WAITING_APPROVAL', reason: 'APPROVAL_PENDING' });
   const json = w.core.list().message;
   const shown = layoutSpaceList(withCommands(parsePaneRows(json), json), w.blocked, 28, 20).lines.join('\n');
-  expect(shown).toContain('🟡 TC-SEAT');
-  expect(shown).toContain('🟡 UX-SEAT');
+  expect(shown).toContain('⚪✋ TC-SEAT');
+  expect(shown).toContain('⚪✋ UX-SEAT');
   expect(shown).toContain('⚪ JUD-SEAT');   // its screen says «Blocked» too; with no code it is idle
 });
 

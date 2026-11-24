@@ -2,7 +2,9 @@
 // it and never write the journal. Stage 2: `ls` and `read` also reach the remote hosts in els/hosts.json through their
 // read window (`serve --http`), read-only. attach·wait·close·send to remote hosts come later.
 
-import { filterPanesBySeatState, parseStateFilter, statusBoardLines, viewerSpaces } from '../els/seat-status.js';
+import { filterPanesBySeatState, parsePaneSeatStatus, parseStateFilter, statusBoardLines, viewerSpaces } from '../els/seat-status.js';
+import { seatMarks } from '../els/seat-marks.js';
+import { wordOfSeatState } from '../els/status-vocab.js';
 import { SEAT_STATES } from '../agent-events/protocol.js';
 import { buildCommitTime, cliBuildIdentity, versionLabel } from '../version/build-stamp.js';
 import { readWorkspaceFile, type WorkspaceConfig } from '../els/workspace-config.js';
@@ -19,14 +21,16 @@ import type { Command } from 'commander';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { createAttachApp, type AttachAppDeps } from '../els/attach-app.js';
 import { attachEls, isServerAway, noteAfterFrame, RECONNECT_NOTE, type AttachHandlers } from '../els/attach-client.js';
+import type { WheelRoute } from '../pty-shell/registry.js';
 import { attachElsOverSsh, resolveSshAttach } from '../els/attach-ssh.js';
 import { runSshReadBridge } from '../els/attach-ssh-read-bridge.js';
 import { parseAddress } from '../els/address.js';
 import type { FederatedHost } from '../els/hosts.js';
 import { createLineDecoder } from '../els/wire.js';
 import { guardLeave, realProcess } from '../els/attach-leave.js';
-import { buildBadge, changedRowsPaint, createAppFrameWriter, createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, fitCells, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from '../els/attach-view.js';
+import { buildBadge, changedRowsPaint, createAppFrameWriter, createPaneViewMouse, createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, fitCells, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from '../els/attach-view.js';
 import { requestEls } from '../els/client.js';
+import { AUTO_ACTING_SEAT } from '../els/baton.js';
 import { readPipedStdin } from './piped-stdin.js';
 import { grepScreens, type GrepHit, type GrepScreen } from '../els/pane-grep.js';
 import type { ElsResult } from '../els/core.js';
@@ -194,10 +198,65 @@ export function skillVerbs(side: Command): SkillVerb[] {
 /** `els ls` lines from the federated list JSON — one per pane: address, state, badge, title, build, cwd. The badge is the one the pane's own els server computed
  *  (its clock, so a remote host's stall is judged there); a list without it falls back to the stall rule on `lastEventAtMs` and `nowMs`. */
 export function paneListLines(listJson: string, nowMs: number): string[] {
-  const listed = JSON.parse(listJson) as { panes: { address: string; title: string; state: string; cwd: string; badgeLabel?: string; lastEventAtMs?: number; build?: { sha?: string | null; age?: string } }[] };
+  const listed = JSON.parse(listJson) as { panes: { address: string; title: string; state: string; cwd: string; badgeLabel?: string; lastEventAtMs?: number; build?: { sha?: string | null; age?: string }; git?: GitLabelRow; status?: unknown; unreadMail?: { count?: unknown } | null }[] };
+  // SIDETAB-TWO-MARKS: «⚪✋» (activity + attention) leads the title; a seat waiting on a person is listed first.
+  const markOf = (row: (typeof listed.panes)[number]): { text: string; person: boolean } => {
+    const status = parsePaneSeatStatus(row.status);
+    const mail = row.unreadMail?.count;
+    const marks = seatMarks({ word: status ? wordOfSeatState(status.state) === 'exited' ? 'idle' : wordOfSeatState(status.state) : row.state,
+      ...(status ? { seatState: status.state, ...(status.reason ? { seatReason: status.reason } : {}) } : {}), ...(typeof mail === 'number' ? { unread: mail } : {}) });
+    return { text: `${marks.needsPerson ? '⚪' : marks.activity}${marks.attention}`, person: marks.needsPerson };
+  };
+  const ordered = [...listed.panes].sort((a, b) => Number(markOf(b).person) - Number(markOf(a).person));
   return listed.panes.length === 0
     ? ['els: no panes yet — open one with `els new` (defaults: $SHELL, this folder)']
-    : listed.panes.map((row) => `${row.address}  ${row.state.padEnd(7)} ${row.badgeLabel ?? tabBadge({ state: row.state as PaneState, ...(row.lastEventAtMs === undefined ? {} : { lastEventAtMs: row.lastEventAtMs }) }, nowMs).label} ${row.title} ${buildBadge(row.build, '[자체보고·미인증:unknown unknown]')}  ${row.cwd}`);
+    : ordered.map((row) => `${row.address}  ${row.state.padEnd(7)} ${row.badgeLabel ?? tabBadge({ state: row.state as PaneState, ...(row.lastEventAtMs === undefined ? {} : { lastEventAtMs: row.lastEventAtMs }) }, nowMs).label} ${gitBadge(row.git) ? `${gitBadge(row.git)} ` : ''}${markOf(row).text} ${row.title} ${buildBadge(row.build, '[자체보고·미인증:unknown unknown]')}  ${row.cwd}`);
+}
+
+/** ELS-GIT-AWARENESS-HERDR (OP #139752) — the git label of a pane row as one display token: `[branch]`,
+ *  `↑N` ahead, `↓N` behind, `*` dirty; absent when git could not answer (herdr's sidebar label, els' list line). */
+export interface GitLabelRow { branch: string; ahead: number; behind: number; dirty: boolean; root?: string | null }
+
+export function gitBadge(git: GitLabelRow | undefined): string {
+  if (!git || typeof git.branch !== 'string' || git.branch.length === 0) return '';
+  const counts = `${git.ahead > 0 ? `↑${git.ahead}` : ''}${git.behind > 0 ? `↓${git.behind}` : ''}`;
+  return `[${git.branch}${counts}${git.dirty ? '*' : ''}]`;
+}
+
+/** 판정식 ② — panes grouped by their git worktree root; panes outside any repo keep their order in a trailing group. */
+export interface WorktreeGroup { readonly root: string | null; readonly panes: { address: string; title: string; state: string; cwd: string }[] }
+
+export function worktreeGroups(listJson: string): WorktreeGroup[] {
+  const listed = JSON.parse(listJson) as { panes: { address: string; title: string; state: string; cwd: string; git?: GitLabelRow }[] };
+  const groups = new Map<string | null, WorktreeGroup['panes']>();
+  for (const pane of listed.panes) {
+    const root = pane.git && typeof pane.git.root === 'string' ? pane.git.root : null;
+    const bucket = groups.get(root) ?? [];
+    bucket.push({ address: pane.address, title: pane.title, state: pane.state, cwd: pane.cwd });
+    groups.set(root, bucket);
+  }
+  const ordered = [...groups.entries()].sort((a, b) => (a[0] === null ? 1 : b[0] === null ? -1 : a[0].localeCompare(b[0])));
+  return ordered.map(([root, panes]) => ({ root, panes }));
+}
+
+/** `els worktree list` — one header per worktree, the panes under it; non-repo panes last without a header. */
+export function worktreeListLines(listJson: string): string[] {
+  const groups = worktreeGroups(listJson);
+  const lines: string[] = [];
+  for (const group of groups) {
+    if (group.root !== null) lines.push(group.root);
+    for (const pane of group.panes) lines.push(`${group.root !== null ? '  ' : ''}${pane.address}  ${pane.state.padEnd(7)} ${pane.title}`);
+  }
+  return lines.length === 0 ? ['els: no panes yet'] : lines;
+}
+
+/** 판정식 ③ — `els worktree remove` may not take a worktree that still has a live pane inside (cwd equal or below it). */
+export function worktreeRemoveGuard(cwds: readonly string[], worktree: string): { ok: boolean; reason?: string } {
+  const target = worktree.replace(/\/+$/, '') || worktree;
+  for (const cwd of cwds) {
+    if (cwd === target || cwd.startsWith(`${target}/`)) return { ok: false, reason: `pane cwd still inside: ${cwd}` };
+  }
+  return { ok: true };
 }
 
 type CoordinatorRequest = { readonly op: 'coordinator'; readonly ws: string; readonly seat?: string };
@@ -238,6 +297,39 @@ export function registerElsCommands(program: Command): void {
     const answer = await federation().list();
     if (answer.exitCode !== 0) { emit(answer); return; }
     emit({ exitCode: 0, message: paneListLines(answer.message, Date.now()).join('\n') });
+  });
+  // ELS-GIT-AWARENESS-HERDR (OP #139752): `els worktree …` — list groups panes by their git worktree; open opens a
+  // worktree in a pane (cwd set to the worktree, never the repo's own ws — herdr #4293); remove refuses while a live
+  // pane still sits inside it.
+  const worktreeGroup = side.command('worktree [sub] [path]').description('Git worktrees: list panes per worktree, open one in a pane, or remove an empty one');
+  worktreeGroup.allowExcessArguments(false).action(async (sub?: string, path?: string) => {
+    if (sub === undefined || sub === 'list') {
+      const answer = await federation().list();
+      if (answer.exitCode !== 0) { emit(answer); return; }
+      emit({ exitCode: 0, message: worktreeListLines(answer.message).join('\n') });
+      return;
+    }
+    if (typeof path !== 'string' || path.length === 0) { emit({ exitCode: 2, message: 'els worktree: open/remove needs a worktree path' }); return; }
+    if (sub === 'open') {
+      const resolved = spawnSync('git', ['-C', path, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+      const root = resolved.status === 0 ? resolved.stdout.trim() : '';
+      if (root === '') { emit({ exitCode: 2, message: `els worktree open: not a git worktree: ${path}` }); return; }
+      adoptOwnerCredential();
+      const made = withNewDefaults({ cwd: root, command: [], title: `worktree ${root.split('/').pop() ?? root}` }, process.env, root);
+      emit(await requestEls(elsSocketPath(), { op: 'new', ws: made.ws, cwd: made.cwd, command: made.command, ...(made.title ? { title: made.title } : {}) }));
+      return;
+    }
+    if (sub === 'remove') {
+      const list = await federation().list();
+      if (list.exitCode !== 0) { emit(list); return; }
+      const panes = (JSON.parse(list.message) as { panes: { cwd: string }[] }).panes;
+      const guard = worktreeRemoveGuard(panes.map((pane) => pane.cwd), path);
+      if (!guard.ok) { emit({ exitCode: 2, message: `els worktree remove: ${guard.reason}` }); return; }
+      const removed = spawnSync('git', ['worktree', 'remove', path], { encoding: 'utf8' });
+      emit(removed.status === 0 ? { exitCode: 0, message: `els worktree remove: removed ${path}` } : { exitCode: 1, message: `els worktree remove: ${removed.stderr.trim() || removed.stdout.trim() || 'git could not remove it'}` });
+      return;
+    }
+    emit({ exitCode: 2, message: 'els worktree: subcommand must be list, open or remove' });
   });
   // `els seat set OP`: a `seat` command with a `set` subcommand (a single `seat set <seat>` string would register `seat`
   // taking the two arguments <set> <seat>, so the documented form failed with "only OP is supported").
@@ -500,6 +592,17 @@ export function registerElsCommands(program: Command): void {
           sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
           now: () => Date.now(),
           localOnly: opts.localOnly,
+          // ELS-BATON-AUTO-ON-RESTART: acting seat first, hand OP → TC, then OP; the server returns it when the new OP registers.
+          baton: {
+            acting: AUTO_ACTING_SEAT,
+            hand: async (reason, exclude) => {
+              const reply = await requestEls(elsSocketPath(), { op: 'baton', action: 'auto-hand', reason, exclude });
+              return reply.exitCode === 0 ? { ok: true } : { ok: false, reason: reply.message };
+            },
+            giveBack: async (memo) => (await requestEls(elsSocketPath(), { op: 'baton', action: 'auto-return', handoff: memo })).exitCode === 0
+              && (await requestEls(elsSocketPath(), { op: 'baton', action: 'status' })).message.trim() === 'null',
+            skip: async (reason) => { await requestEls(elsSocketPath(), { op: 'baton', action: 'auto-skip', reason }); },
+          },
           remoteUpdate: opts.localOnly ? undefined : async (host, panes, desired) => {
             if (!listedRegistry) throw new Error('els host listing snapshot absent');
             const registered = registeredHostAtExecution(registryPath, listedRegistry, host.name);
@@ -608,8 +711,21 @@ export function registerElsCommands(program: Command): void {
   tab.command('list').option('--workspace <id>', 'only this workspace').description('Tabs as JSON').action(async (opts: { workspace?: string }) => {
     const { failed, listed } = await listJson(); if (failed) emit(failed); else printJson(herdrTabs(listed!, opts.workspace));
   });
-  tab.command('close <tab>').description('Close a tab and all its panes after terminal confirmation')
+  tab.command('close <tab>').description('Close a tab and all its panes (a person at a terminal confirms; the OP coordinator closes seat tabs without asking)')
     .action(async (id: string) => {
+      // ELS-OP-CLOSE-TAB (대표 11-24): without a terminal (an OP seat's tool, a script) nobody can answer a prompt — send the
+      // close unconfirmed and let the server decide: the OP coordinator / same-UID operator may close a seat tab, a
+      // hand seat still needs a person, and the OP tab itself is always refused without one.
+      // ELS-HERDR-CLI-PARITY ② (tab-close bisect 11-24): the server refuses an unconfirmed close of a
+      // tab no seat owns — report it exactly like the interactive path reports a timed-out prompt —
+      // exit 2, the same words — while the OP seat-tab close above still lands unconfirmed.
+      if (!process.stdin.isTTY || !process.stdout.isTTY) {
+        const result = await requestEls(elsSocketPath(), { op: 'close-tab', tab: id });
+        emit(result.exitCode !== 0 && /close-tab denied/.test(result.message)
+          ? { exitCode: 2, message: `els tab close: confirmation unavailable (${result.message})` }
+          : result);
+        return;
+      }
       const decision = await askHitlOnTerminal(HITL_TIMEOUT_MS)(`Close tab ${id} and all its panes? [y/N] `);
       if (decision !== 'approve') emit({ exitCode: 2, message: `els tab close: ${decision === 'timeout' ? 'confirmation unavailable' : 'cancelled'}` });
       await ask({ op: 'close-tab', tab: id, confirmed: true });
@@ -745,6 +861,8 @@ function runAttachView(ref: string, remote?: FederatedHost): Promise<number> {
     const size = () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 });
     const prefix = createPrefixFilter();
     const decodeKeys = createKeyDecoder();
+    const mouse = createPaneViewMouse();
+    let wheelRoute: WheelRoute = 'host';   // ELS-WHEEL-HISTORY: the route the last frame carried (the pane's current modes)
     let last = '';
     let lastBody: string[] | undefined;
     let lastNote = '';
@@ -798,7 +916,7 @@ function runAttachView(ref: string, remote?: FederatedHost): Promise<number> {
     let retry: ReturnType<typeof setTimeout> | undefined;
     const open = (): void => {
       const handlers: AttachHandlers = {
-        onFrame: (frame) => { everFramed = true; note = noteAfterFrame(note); paint(frame.screen); },   // the first recovered frame ends the «다시 붙는 중» note
+        onFrame: (frame) => { everFramed = true; wheelRoute = frame.wheelRoute ?? (frame.wheelPassthrough ? 'mouse-sgr' : 'host'); note = noteAfterFrame(note); paint(frame.screen); },   // the first recovered frame ends the «다시 붙는 중» note
         // A pane that exits under the view is not a detach: say so and exit 1 (detach is the only 0).
         onEnd: (exitCode, reason) => {
           if (finished) return;
@@ -816,7 +934,9 @@ function runAttachView(ref: string, remote?: FederatedHost): Promise<number> {
     };
     open();
     const onKey = (chunk: Buffer): void => {
-      const keys = prefix.feed(decodeKeys(chunk));
+      const routed = mouse.feed(decodeKeys(chunk), wheelRoute, size().rows);
+      if (routed.scroll !== 0 && attached && 'scroll' in attached) attached.scroll(routed.scroll);   // an ssh-bridged pane has no els scrollback lane
+      const keys = prefix.feed(routed.send);
       if (keys.send) attached?.input(keys.send);
       if (keys.ignored) { note = `ctrl+b ${keys.ignored} 는 아직 없음`; paint(last); }
       if (keys.detach) { attached?.detach(); finish(0, ''); }
@@ -846,6 +966,7 @@ function runAppView(sidebar: boolean | undefined, initialPane?: string): Promise
     size: () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 }),
     cwd: process.cwd(),
     buildLabel: ownBuildLabel(),
+    ownBuild: (() => { const build = cliBuildIdentity(); const builtAt = buildCommitTime(build); return { sha: build.sha, ...(builtAt !== undefined ? { builtAt } : {}) }; })(),
     env: process.env,
     setInterval: (callback, ms) => { const handle = setInterval(callback, ms); handle.unref?.(); return handle; },
     clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),

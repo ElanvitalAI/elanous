@@ -4,19 +4,12 @@ import type { ChatConcisenessConfig } from '../user-config/chat.js';
 export interface BuildConcisenessSystemMessagesOpts {
   enabled: boolean;
   finalMessageMaxLines: number;
-  preambleMaxWords: number;
 }
 
 function lineCapText(maxLines: number): string {
   return maxLines === 1
     ? 'Keep the final response to at most 1 line unless the user explicitly asks for detail.'
     : `Keep the final response to at most ${maxLines} lines unless the user explicitly asks for detail.`;
-}
-
-function preambleText(maxWords: number): string {
-  return maxWords === 1
-    ? 'When a preamble is useful, keep it to 1 word and only before grouped, non-trivial actions.'
-    : `When a preamble is useful, keep it to ${maxWords} words or fewer and only before grouped, non-trivial actions.`;
 }
 
 export function getConcisenessSystemPrompt(
@@ -30,7 +23,7 @@ useful answers instead of narrated progress.
 ## Brevity
 
 - ${lineCapText(opts.finalMessageMaxLines)}
-- ${preambleText(opts.preambleMaxWords)}
+- When a preamble is useful, keep it to 12 words or fewer and only before grouped, non-trivial actions.
 - Skip preambles for trivial reads, single-file inspections, or
   routine confirmations.
 - Do not narrate each step, list every file you read, or explain

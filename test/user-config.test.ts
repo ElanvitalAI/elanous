@@ -236,7 +236,6 @@ describe('user-config defaults', () => {
     expect(c.chat.conciseness).toEqual({
       enabled: true,
       finalMessageMaxLines: 10,
-      preambleMaxWords: 12,
     });
     expect(c.chat.toolOutput).toEqual({
       persistOnOverflow: true,
@@ -460,25 +459,44 @@ describe('user-config lsp section (Phase L4)', () => {
         conciseness: {
           enabled: false,
           finalMessageMaxLines: 999,
-          preambleMaxWords: 0,
         },
       },
     });
     expect(buildUserConfig(cfgPath).chat.conciseness).toEqual({
       enabled: false,
       finalMessageMaxLines: 100,
-      preambleMaxWords: 1,
     });
   });
 
+  test('unused intake eventMax is removed while other intake data survives', () => {
+    write({ intake: { eventMax: 3, briefingTopic: 'brief', futureField: 'keep' } });
+    const cfg = buildUserConfig(cfgPath);
+    expect(cfg.intake).not.toHaveProperty('eventMax');
+    saveUserConfig(cfg, cfgPath);
+    const saved = JSON.parse(require('node:fs').readFileSync(cfgPath, 'utf8'));
+    expect(saved.intake).not.toHaveProperty('eventMax');
+    expect(saved.intake.briefingTopic).toBe('brief');
+    expect(saved.intake.futureField).toBe('keep');
+  });
+
   test('retired flatBullets key is removed on read and save', () => {
-    write({ chat: { conciseness: { flatBullets: false, preambleMaxWords: 9 } } });
+    write({ chat: { conciseness: { flatBullets: false, finalMessageMaxLines: 9 } } });
     const cfg = buildUserConfig(cfgPath);
     expect(cfg.chat.conciseness).not.toHaveProperty('flatBullets');
     saveUserConfig(cfg, cfgPath);
     const saved = JSON.parse(require('node:fs').readFileSync(cfgPath, 'utf8'));
     expect(saved.chat.conciseness).not.toHaveProperty('flatBullets');
-    expect(saved.chat.conciseness.preambleMaxWords).toBe(9);
+    expect(saved.chat.conciseness.finalMessageMaxLines).toBe(9);
+  });
+
+  test('retired preamble cap is removed on read and save', () => {
+    write({ chat: { conciseness: { preambleMaxWords: 3, finalMessageMaxLines: 9 } } });
+    const cfg = buildUserConfig(cfgPath);
+    expect(cfg.chat.conciseness).not.toHaveProperty('preambleMaxWords');
+    saveUserConfig(cfg, cfgPath);
+    const saved = JSON.parse(require('node:fs').readFileSync(cfgPath, 'utf8'));
+    expect(saved.chat.conciseness).not.toHaveProperty('preambleMaxWords');
+    expect(saved.chat.conciseness.finalMessageMaxLines).toBe(9);
   });
 
   test('chat.toolOutput clamps numeric knobs and honors booleans', () => {
@@ -968,7 +986,6 @@ describe('user-config extended schema', () => {
       conciseness: {
         enabled: false,
         finalMessageMaxLines: 6,
-        preambleMaxWords: 8,
       },
       toolOutput: {
         persistOnOverflow: false,
@@ -1037,7 +1054,6 @@ describe('user-config extended schema', () => {
     expect(reloaded.chat.conciseness).toEqual({
       enabled: false,
       finalMessageMaxLines: 6,
-      preambleMaxWords: 8,
     });
     expect(reloaded.chat.toolOutput).toEqual({
       persistOnOverflow: false,

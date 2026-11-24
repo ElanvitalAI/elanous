@@ -2,7 +2,8 @@
 // queue-bridge): a harness child the chat child runs (RunShell mode:'bg') files its completion only in the child's own
 // task-notification queue; the B4 converter (capsuleDoneFromHarnessNotification) turns it into one `capsule-done` frame
 // (repl/index.ts watchQueueCapsuleDone), the TUI queues one notice and knocks the idle door (capsule-done-knock), and
-// exactly one next turn opens — the C1 budget: from idle, ≤20s, duplicates 0.
+// exactly one next turn opens — the C1 budget: from idle, the passive capsule-done notice ripens for 120s
+// (PASSIVE_RESULT_IDLE_WAKE_MS, #39609 — measured, not compressed, #39666) and then opens exactly one turn, duplicates 0.
 // Real Next TUI and child REPL on a PTY; the LLM is the external fake device.
 // Unmeasured here: the self-implement-stop ('harness' kind) terminal stop, graph-run frames, busy-turn (mid-turn box)
 // behavior, and the mail axis (capsule-events/C1-MAIL keeps its own row).
@@ -11,10 +12,10 @@ import { join } from 'node:path';
 import { mockSeatPtySequence } from '../../mock-seat-pty-sequence.js';
 import type { SimWorldScenario } from '../types.js';
 
-/** The harness child must outlive the parent turn, so the seat is idle when it ends (§3.6 C1 «idle 복귀 ≤ 20s»). */
+/** The harness child must outlive the parent turn, so the seat is idle when it ends (§3.6 C1 — passive ripen, #39609). */
 const SHELL_SECONDS = 15;
-/** C1 wake budget: from the idle boundary, the completion turn must open within 20s. */
-const WAKE_LIMIT_MS = 20_000;
+/** C1 wake budget: from the idle boundary, the passive notice ripens 120s (#39609, measured — not compressed, #39666) and the completion turn must open within 180s. */
+const WAKE_LIMIT_MS = 180_000;
 /** After the first delivery, how long a second (duplicate) one is watched for. */
 const DUPLICATE_WINDOW_MS = 5_000;
 

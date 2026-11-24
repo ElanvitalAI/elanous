@@ -24,6 +24,14 @@ export const INTERRUPT_NOTE = '사용자가 이전 턴을 중단했습니다:';
 /** ⭐ 트리아지 한 줄 — 이것이 「기존 작업을 버리지 마라」다. */
 export const UNFINISHED_TASKS_REMINDER = '이전 턴의 미완 작업이 있으면 마저 끝내십시오.';
 
+/**
+ * QUEUE-FINISH-FIRST (대표 11-24 13:0x) — a person's line joins at the step boundary (after the running tool batch's
+ * results are in, never cutting a tool). The model wraps up the step it was on instead of abandoning it.
+ */
+/** QUEUE-P1-3MIN (대표 11-24 13:1x) — the note a request/decision mail joins with (same text as the TUI queue's). */
+export const P1_PAUSE_NOTE = 'Pause the current work: record a one-line checkpoint of where you are (requirement stays open), handle this request/decision now, then resume the paused work.';
+export const STEP_WRAP_UP_NOTE = 'Finish the immediate step you were on (record its result / update the requirement) in one move, then address this input.';
+
 /** 너무 긴 발화는 잘라 넣는다(문맥 예산 보호). 잘렸다는 사실을 «숨기지 않는다». */
 export const LARGE_PROMPT_THRESHOLD = 8_000;
 
@@ -113,7 +121,11 @@ export function buildInterjectionMessage(
   // Arrival order is kept; operator input sits in <user_query>, seat mail only in its untrusted-data frame.
   const body = items.map((t) => (typeof t === 'string' ? wrapUserQuery(capInterjectionText(t)) : wrapSeatMailData(t))).join('\n');
   const head = [human ? note : null, mail ? SEAT_MAIL_DATA_NOTE : null].filter((line): line is string => line !== null).join('\n');
-  return `${head}\n${body}\n${UNFINISHED_TASKS_REMINDER}`;
+  const wrapUp = human && kind === 'mid-turn' ? `${STEP_WRAP_UP_NOTE}\n` : '';
+  // QUEUE-P1-3MIN — a request/decision mail joining at the step boundary pauses the work with a checkpoint (structured intent).
+  const p1 = kind === 'mid-turn' && items.some((t) => typeof t !== 'string' && (t.intent === 'request' || t.intent === 'decision'));
+  const pause = p1 ? `${P1_PAUSE_NOTE}\n` : '';
+  return `${head}\n${body}\n${wrapUp}${pause}${UNFINISHED_TASKS_REMINDER}`;
 }
 
 /**
@@ -220,8 +232,96 @@ function stripPassiveResultContext(text: string): string {
  */
 export const QUEUE_NOTICE_NOTE_PREFIX = '[notice · ';
 
-export function withQueueNoticeContext(text: string, source: string): string {
-  return `${QUEUE_NOTICE_NOTE_PREFIX}${source}]\n\n${text}`;
+/** NOTICE-FOLD-1LINE — the queue item's structured facts the head carries (who sent it, how many, which ids). */
+export interface QueueNoticeMeta {
+  readonly count?: number;
+  readonly senders?: readonly string[];
+  readonly msgIds?: readonly number[];
+  /** Results in this notice that failed (capsule completions) — the folded line takes the warning colour. */
+  readonly failed?: number;
+  /** Per-message spans of a mail notice: the ledger id, the sender and where that message's text sits in the body. */
+  readonly parts?: readonly QueueNoticePart[];
+}
+
+/** One mail inside a notice body — `body.slice(start, start + length)` is that message's own text. */
+export interface QueueNoticePart {
+  readonly msgId: number;
+  readonly sender: string;
+  readonly start: number;
+  readonly length: number;
+}
+
+/** A queue notice turn as the saved row carries it: the head's fields and the notice body. */
+export interface QueueNoticeHead extends QueueNoticeMeta {
+  readonly source: string;
+  readonly body: string;
+}
+
+// `msg post --from` is free text: only a plain seat-like token rides the head (never a separator or a newline).
+const NOTICE_HEAD_TOKEN = /^[\w.:@-]{1,40}$/u;
+
+/** `[notice · seat-mail · 4 msg · from JUD-1,JUD-2 · #140981,#140982]` — the source first, then the known fields. */
+export function withQueueNoticeContext(text: string, source: string, meta: QueueNoticeMeta = {}): string {
+  const senders = [...new Set(meta.senders ?? [])].filter((sender) => NOTICE_HEAD_TOKEN.test(sender));
+  const ids = (meta.msgIds ?? []).filter((id) => Number.isSafeInteger(id) && id >= 0);
+  const span = (n: number) => Number.isSafeInteger(n) && n >= 0;
+  const parts = (meta.parts ?? []).filter((part) => span(part.msgId) && span(part.start) && span(part.length) && part.start + part.length <= text.length)
+    .map((part) => ({ ...part, sender: NOTICE_HEAD_TOKEN.test(part.sender) && !part.sender.includes('/') ? part.sender : 'unknown' }));
+  const fields = [source,
+    ...(meta.count !== undefined && Number.isSafeInteger(meta.count) && meta.count > 0 ? [`${meta.count} msg`] : []),
+    ...(senders.length > 0 ? [`from ${senders.join(',')}`] : []),
+    ...(ids.length > 0 ? [ids.map((id) => `#${id}`).join(',')] : []),
+    ...(meta.failed !== undefined && Number.isSafeInteger(meta.failed) && meta.failed > 0 ? [`${meta.failed} failed`] : []),
+    ...(parts.length > 0 ? [`parts ${parts.map((part) => `${part.msgId}/${part.sender}/${part.start}+${part.length}`).join(',')}`] : [])];
+  return `${QUEUE_NOTICE_NOTE_PREFIX}${fields.join(' · ')}]\n\n${text}`;
+}
+
+/**
+ * NOTICE-FOLD-1LINE — the head {@link withQueueNoticeContext} wrote on a saved user row (under any interrupt/passive/
+ * candidate heads) read back into its fields, plus the notice body; null when the row is not a queue notice turn.
+ * Structural: it reads only our own head grammar, never the body's wording. 순수.
+ */
+export function queueNoticeHead(text: string): QueueNoticeHead | null {
+  let rest = stripPassiveResultContext(stripInterruptedOnPurposeContext(text));
+  if (rest.startsWith(REPLACEMENT_CANDIDATE_NOTE_PREFIX)) {
+    const end = rest.indexOf('\n\n');
+    if (end >= 0 && !rest.slice(0, end).includes('\n')) rest = rest.slice(end + 2);
+  }
+  if (!rest.startsWith(QUEUE_NOTICE_NOTE_PREFIX)) return null;
+  const end = rest.indexOf('\n\n');
+  if (end < 0 || rest.slice(0, end).includes('\n') || !rest.slice(0, end).endsWith(']')) return null;
+  const [source = '', ...fields] = rest.slice(QUEUE_NOTICE_NOTE_PREFIX.length, end - 1).split(' · ');
+  let count: number | undefined;
+  let senders: string[] | undefined;
+  let msgIds: number[] | undefined;
+  let failed: number | undefined;
+  let parts: QueueNoticePart[] | undefined;
+  for (const field of fields) {
+    if (field.endsWith(' msg') && /^\d+$/.test(field.slice(0, -4))) count = Number(field.slice(0, -4));
+    else if (field.endsWith(' failed') && /^\d+$/.test(field.slice(0, -7))) failed = Number(field.slice(0, -7));
+    else if (field.startsWith('parts ')) parts = field.slice(6).split(',').flatMap((entry) => {
+      const [id = '', sender = '', range = ''] = entry.split('/');
+      const [start = '', length = ''] = range.split('+');
+      const part = { msgId: Number(id), sender, start: Number(start), length: Number(length) };
+      return /^\d+$/.test(id) && /^\d+$/.test(start) && /^\d+$/.test(length) && NOTICE_HEAD_TOKEN.test(sender) ? [part] : [];
+    });
+    else if (field.startsWith('from ')) senders = field.slice(5).split(',').filter((sender) => NOTICE_HEAD_TOKEN.test(sender));
+    else if (field.startsWith('#')) msgIds = field.split(',').map((id) => Number(id.slice(1))).filter((id) => Number.isSafeInteger(id));
+  }
+  const body = rest.slice(end + 2);
+  // A span that does not fit the saved body is not trusted (the row falls back to the one-line fold).
+  if (parts && parts.some((part) => part.start + part.length > body.length)) parts = undefined;
+  return { source, body,
+    ...(count === undefined ? {} : { count }),
+    ...(senders?.length ? { senders } : {}),
+    ...(msgIds?.length ? { msgIds } : {}),
+    ...(failed === undefined ? {} : { failed }),
+    ...(parts?.length ? { parts } : {}) };
+}
+
+/** TUI-ANSWER-VANISH ⑤ — the notice body of a queue notice turn's saved user row, else null. 순수. */
+export function queueNoticeBody(text: string): string | null {
+  return queueNoticeHead(text)?.body ?? null;
 }
 
 /** 화면·앵커용 — notice 출처 줄을 떼고 본문만 돌려준다. 순수. */

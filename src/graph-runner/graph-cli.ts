@@ -200,7 +200,9 @@ export function registerGraphCommands(program: Command, runsDeps: {
     .option('--from-visit <execution_id>', 'Restart a failed run at one exact saved node visit')
     .option('--use-current-graph', 'Use the installed graph rather than the run snapshot')
     .option('--input <json>', 'JSON object passed to the graph run')
-    .action(async (file: string, opts: { dryRun?: boolean; json?: boolean; resume?: string; from?: string; fromVisit?: string; input?: string; useCurrentGraph?: boolean }) => {
+    .option('--budget-usd <amount>', 'Run-level USD budget: stop (paused, resumable) before the next node once measured node costUsd reaches it')
+    .option('--launch-key <key>', 'Idempotent launch: the same key returns the same run instead of starting another')
+    .action(async (file: string, opts: { dryRun?: boolean; json?: boolean; resume?: string; from?: string; fromVisit?: string; input?: string; useCurrentGraph?: boolean; budgetUsd?: string; launchKey?: string }) => {
       try {
         await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('graph');
         if (opts.resume && opts.dryRun) throw new Error('--resume cannot be combined with --dry-run');
@@ -262,7 +264,9 @@ export function registerGraphCommands(program: Command, runsDeps: {
                 else done();
               });
             }) }) : capabilityProviders;
-        const state = await runGraph(file, { ...(opts.resume ? { resumeRunId: opts.resume } : { dryRun: opts.dryRun }), ...(opts.from && !pendingResume ? { fromNodeId: opts.from } : {}), ...(pendingResume ? { fromVisitId: pendingResume.executionId } : opts.fromVisit ? { fromVisitId: opts.fromVisit } : {}), useCurrentGraph: opts.useCurrentGraph, ...(input === undefined ? {} : { input }),
+        const budgetUsd = opts.budgetUsd === undefined ? undefined : Number(opts.budgetUsd);
+        const state = await runGraph(file, { ...(opts.resume ? { resumeRunId: opts.resume } : { dryRun: opts.dryRun }),
+          ...(budgetUsd === undefined ? {} : { budgetUsd }), ...(opts.launchKey === undefined ? {} : { launchKey: opts.launchKey }), ...(opts.from && !pendingResume ? { fromNodeId: opts.from } : {}), ...(pendingResume ? { fromVisitId: pendingResume.executionId } : opts.fromVisit ? { fromVisitId: opts.fromVisit } : {}), useCurrentGraph: opts.useCurrentGraph, ...(input === undefined ? {} : { input }),
           ...(verifiedOwnerId ? { verifiedOwnerId } : {}),
           ...(approvalSignal ? { signal: approvalSignal } : {}),
           deps: { ...(runsDeps.root ? { root: runsDeps.root } : {}), capabilityProviders: approvalRegistry,
@@ -648,6 +652,14 @@ export function registerGraphCommands(program: Command, runsDeps: {
           const matches = exact.length ? exact : all.filter(state => state.runId.startsWith(runId));
           if (matches.length !== 1) throw new Error(matches.length ? `ambiguous run id: ${runId}\n${matches.map(state => `${state.graphId}/${state.runId}`).join('\n')}` : `no run: ${runId}`);
           const saved = matches[0]!;
+          // Stopping a live release root skips the graph's traffic-failed-restore node.
+          // Refuse before signalling or changing the ledger; auxiliary fan-out runs are distinct.
+          // A freshly started fan-out child may not have persisted its path yet.
+          const first = saved.path[0] ?? saved.entryNodeId ?? saved.currentNode?.nodeId;
+          const releaseRoot = saved.graphId === 'release-loop' && !saved.parentRunId
+            && (!first || first === 'traffic-prep' || first === 'cut-branch' || first === 'version-release');
+          if (saved.status === 'running' && releaseRoot)
+            throw new Error(`release run ${action} refused: stopping bypasses traffic-failed-restore; use the coordinated release recovery path`);
           const state = manageGraphRun(saved.graphId, saved.runId, action, runsDeps.root, runsDeps.processStartMs);
           if (action === 'stop' && saved.graphId === 'release-loop' && saved.input && typeof saved.input === 'object') {
             const version = (saved.input as Record<string, unknown>).version;

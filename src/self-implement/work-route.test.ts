@@ -39,8 +39,17 @@ function overlay(mode: 'shadow' | 'on' | undefined): void {
   }));
 }
 
-beforeAll(() => overlay(undefined));
-afterAll(() => setUserConfigOverlay(null));
+// COST-OPTIMIZER-WINDOW-AWARE — 창 인지 계정 전환(router.subscription_window_aware)은 Pro+ 멤버십 게이트
+// 뒤의 명시 계약이다(model-orchestration.ts:124-131 · jud-39528 mustFix ② · 멤버십 = envMembershipResolver
+// = env ELANOUS_ROUTER_TIER, 없으면 free — fail-closed). 이 파일의 발사 배선·창 선택기·ADVISOR 시험은
+// 그 계약 아래서 재야 하므로 파일 단위 멤버십 seam: 기존 값 백업 → 'pro' 세팅 → afterAll 원복.
+const priorRouterTier = process.env.ELANOUS_ROUTER_TIER;
+beforeAll(() => { process.env.ELANOUS_ROUTER_TIER = 'pro'; overlay(undefined); });
+afterAll(() => {
+  if (priorRouterTier === undefined) delete process.env.ELANOUS_ROUTER_TIER;
+  else process.env.ELANOUS_ROUTER_TIER = priorRouterTier;
+  setUserConfigOverlay(null);
+});
 
 async function launch(goalDocument: string, childLlm?: { provider: string; model: string; source: 'flag' }, readAccountWindows?: (provider: string) => AccountState | undefined) {
   let env: Record<string, string> | undefined;

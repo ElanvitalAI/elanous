@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { ResourcesMap } from '../../ops/resources';
-import { createFleetSegment, fleetFromResources, FLEET_STALE_MS, readNexusResources, startFleetPoller, type FleetRead } from './machines';
+import { createFleetSegment, fleetFromResources, FLEET_STALE_MS, hostLoads, readNexusResources, startFleetPoller, type FleetRead } from './machines';
 import { localNexusBaseUrl, localNexusTokenPath } from '../../nexus/local-endpoint';
 import { ensureAuthToken } from '../../auth/acp-token';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -150,4 +150,11 @@ test('#38260 REVIEW-2 ②: stop() ends the poller — no read after it, even whe
   await new Promise((resolve) => setTimeout(resolve, 20));
   expect(reads).toBe(1);
   expect(segment.value()).toBeUndefined();
+});
+
+test('TUI-STATUS-3ROW row 3: per-host load from the same answer — rounded, ⚠ from the 0.9 band, «?» when unmeasured or stale', () => {
+  expect(hostLoads(map(host('mshq', 12.4, 24), host('node-b', 25.2, 16), host('minim5', 4, 10), host('mbp', null, 10),
+    host('aws1', 3, 8, new Date(NOW - FLEET_STALE_MS - 1).toISOString())), NOW).map((row) => row.text))
+    .toEqual(['mshq 12', 'node-b 25⚠', 'minim5 4', 'mbp ?', 'aws1 ?']);
+  expect(hostLoads(null, NOW)).toEqual([]);
 });

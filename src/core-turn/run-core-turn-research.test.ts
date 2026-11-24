@@ -2,6 +2,7 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { afterEach, beforeEach, expect, mock, spyOn, test } from 'bun:test';
 
 import * as llmModule from '../llm.js';
+import * as seatBoot from '../seat/seat-boot-preamble.js';
 import { debug } from '../debug/log.js';
 import * as surfaceModule from '../session-runtime/index.js';
 import * as deferredModule from '../session-runtime/tier-flip.js';
@@ -132,6 +133,8 @@ function createManualTimers() {
 }
 
 beforeEach(() => {
+  // RESEARCH-TURN-ON-SEAT-MAIL: a worktree under ~/elanous-hq/seats/<SEAT> is a seat cwd — these turns are not seats.
+  spyOn(seatBoot, 'detectSeat').mockReturnValue(null);
   spyOn(llmModule, 'streamLLMWithTools').mockResolvedValue('done');
   spyOn(surfaceModule, 'resolveSessionSurfaceProfile').mockReturnValue({
     id: 'chat', selectionReason: 'test', baselineContexts: [], defaultFamilies: [], conditionalFamilies: [],

@@ -42,7 +42,7 @@ async function runOnce(): Promise<SampleResult> {
       ready: { label: 'boot', until: (screen: string) => screen.includes('❯ ') && screen.includes('Ctrl+Q') },
       steps: [{ label: 'burst settled', text: '스트리밍 칠 상한 측정용 한 줄', until: (s: string) => s.includes(TAIL) }],
     });
-    const submitIdx = outputs.findIndex((o) => o.text.includes('\x1b[1m>'));
+    const submitIdx = outputs.findIndex((o) => o.text.includes('\x1b[1m❯'));
     const settleIdx = outputs.findIndex((o) => o.text.includes(TAIL));
     if (submitIdx < 0 || settleIdx <= submitIdx) return { settled: false, gaps: [] };
     const repaintAt: number[] = [];

@@ -55,5 +55,5 @@ test('theme follows COLORFGBG (light only when the terminal says so); the row pa
   expect(turnBandTheme({ COLORFGBG: '15;0' })).toBe('dark');
   expect(userTurnBandSgr({ COLORFGBG: '0;15' })).toBe('48;5;255;38;5;235');
   expect(USER_TURN_BAND_SGR).toBe('48;5;235;38;5;252');
-  expect(userTurnBandRow('> hi', 10)).toStartWith('\x1b[48;5;235;38;5;252m'); // dark (COLORFGBG pinned to dark)
+  expect(userTurnBandRow('❯ hi', 10)).toStartWith('\x1b[48;5;235;38;5;252m'); // dark (COLORFGBG pinned to dark)
 });

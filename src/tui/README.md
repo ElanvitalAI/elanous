@@ -1,6 +1,6 @@
 # src/tui/ — elanous 로컬 TUI 서피스 (표현 전용)
 
-> RFC: [`내부 문서 `RFC-elanous-tiered-tool-exposure-2026-07-17``](../../내부 문서 `RFC-elanous-tiered-tool-exposure-2026-07-17`) §6b.
+> RFC: [`내부 문서 `RFC-elanous-tiered-tool-exposure-2026-07-17``](../../내부 문서 `IDEAS`) §6b.
 > 이 디렉토리는 **TUI 서피스의 순수 화면 표현**만 담는다. TUI 는 멀티서피스
 > (telegram·discord·PWA·voice·mission) 중 **하나**일 뿐 — 크로스서피스 core
 > 장치(턴 루프·tool 노출·shell/PTY 실행·HITL·세션)는 여기 두지 않는다.

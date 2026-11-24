@@ -10,6 +10,7 @@ import { cutChecklistGate } from '../../src/release-loop/checklist.js';
 import { getSchedule } from '../../src/release-loop/release-schedule.js';
 import { isLandingFreezeRefusal, readLandingFreeze, LandingFrozenError } from '../../src/release-loop/landing-freeze.js';
 import { debug } from '../../src/debug/log.js';
+import { observeGraphInEls } from './els-graph-observe.js';
 import { lastJsonObject, listGraphRuns, runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { releaseGateCutoverPath } from '../../src/graph-runner/release-gate-cutover-policy.js';
 import { withOpSeatFlock } from '../../src/steward/resync-tick.js';
@@ -414,11 +415,12 @@ async function runUnattendedReleaseLocked(
   const safeCleanup = createMacrophageSafeCleanup({ repoRoot: REPOSITORY_ROOT });
   const macrophage = createMacrophageRuntime({ runId, root, inventory: () => safeCleanup.inventory(), liveCleanup: safeCleanup.cleanup });
   let state: GraphRunState;
+  const elsObserver = observeGraphInEls({ cwd: process.cwd() }); // observation only: a graph tab in els when a server is up
   try { state = await (deps.graph ?? runGraph)(deps.graphPath ?? GRAPH, resumable
     ? { resumeRunId: runId, fromNodeId: resumeFromNodeId, useCurrentGraph: true, input, resumeInputPatch: { ...(input.gateImagePin ? { gateImagePin: input.gateImagePin } : {}), opApprovalMarker: input.opApprovalMarker },
       pinChildUniverse: true, eventBus: macrophage.eventBus, deps: { root, dispatchGraphSubscription: createIncidentPolicyHandler() } }
     : { runId, input, pinChildUniverse: true, eventBus: macrophage.eventBus, deps: { root, dispatchGraphSubscription: createIncidentPolicyHandler() } }); }
-  finally { macrophage.dispose(); }
+  finally { macrophage.dispose(); await elsObserver.stop().catch(() => {}); }
   // A freeze switched on while the graph ran stops gate or publish inside it. Only a failed gate/publish node whose own
   // record is the freeze refusal is reported as the freeze; any other failure keeps its own reason.
   if (state.status === 'failed' && !opts.forceFreeze) {

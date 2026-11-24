@@ -1,8 +1,10 @@
-import type { NextTuiQueueItem, NextTuiQueueNoticeSource } from './queue.js';
+import type { NextTuiQueueItem, NextTuiQueueMailSpan, NextTuiQueueNoticeSource } from './queue.js';
 import { isUrgentSeatMail } from '../seat-mail-priority.js';
-import { isInfoSeatMail, seatMailDigestLine } from '../seat-mail-digest.js';
+import { isInfoSeatMail, seatMailDigestLine, seatMailDigestPrefix } from '../seat-mail-digest.js';
 import { seatMessageContextBlock, type ContextHeaderInput } from '../../msg/msg-context-header.js';
 import type { MessageOrigin } from '../../msg/msg-store.js';
+import { legacyIntent } from '../../msg/msg-receipts.js';
+import { classifySeatMail } from '../queue-finish-first.js';
 
 /**
  * ELN-CHILD-NOTICE-INTO-QUEUE (IMPL-TASK-QUEUE-1117 D칸) — 완료·도착 사건을 입력 큐의
@@ -12,7 +14,7 @@ import type { MessageOrigin } from '../../msg/msg-store.js';
 
 /** 큐에서 생산자가 쓰는 표면만 — 단위시험은 가짜 없이 진짜 큐를 그대로 쓴다. */
 export interface ChildNoticeQueue {
-  enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta?: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string }): NextTuiQueueItem;
+  enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta?: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string; mailClass?: 'P0' | 'P1' | 'P2'; mailIntent?: string; replyTo?: number; mail?: NextTuiQueueMailSpan }): NextTuiQueueItem;
   enqueueCapsuleDoneNotice?(text: string, capsuleId: string, status: string, occurredAt?: number): NextTuiQueueItem | null;
   readonly items: readonly NextTuiQueueItem[];
 }
@@ -87,7 +89,7 @@ export function eventWatchNotice(line: string): string | null {
 
 /** SEAT-INBOX B1-C §3a — 메시지 한 통 = notice 한 항목. 문구 = §5d 머리줄 ⊕ msg:<id> ⊕ 전문(모델 맥락 그대로). */
 export type SeatMessageNoticeInput = ContextHeaderInput & { id: number; body: string; origin?: MessageOrigin;
-  createdAt?: string; unreadTotal?: number };
+  createdAt?: string; unreadTotal?: number; replyTo?: number };
 export function seatMessageNotice(message: SeatMessageNoticeInput): string {
   const body = seatMessageContextBlock(message);
   return message.unreadTotal === undefined ? body : `${body}\n\n[미읽음 총 ${message.unreadTotal}통]`;
@@ -151,6 +153,14 @@ export function createChildNoticeProducers(queue: ChildNoticeQueue) {
         // SEAT-MAIL-COALESCE-NOTICE — info mail waits for the next digest; every mail carries its one digest line.
         ...(isInfoSeatMail(message) ? { passive: true } : {}),
         digest: seatMailDigestLine(message),
+        // QUEUE-FINISH-FIRST — the class rides the item from the structured ledger fields (never the body).
+        mailClass: classifySeatMail({ intent: message.intent ?? legacyIntent(message.kind), fromKind: message.fromKind ?? null,
+          crownDirective: message.crownDirective ?? null, ...(message.origin ? { origin: message.origin } : {}) }),
+        mailIntent: message.intent ?? legacyIntent(message.kind),
+        ...(message.replyTo === undefined ? {} : { replyTo: message.replyTo }),
+        // NOTICE-FOLD-1LINE — the mail's own body inside this text and inside its digest line, by construction.
+        mail: { sender: message.fromSeat ?? message.sender, bodyAt: seatMessageContextBlock(message).length - message.body.length,
+          bodyLength: message.body.length, digestBodyAt: seatMailDigestPrefix(message).length },
         ...(occurredAt === undefined || Number.isNaN(occurredAt) ? {} : { occurredAt }),
       });
     },

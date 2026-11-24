@@ -35,8 +35,8 @@ test('history renders user and assistant text within terminal width without stor
 test('resumed classic dashboard context renders only its question in Next history', () => {
   const classicUser = 'Context:\nDashboard mode: browse\n\nRecent status output:\n  ✓ resumed local session: a1b2c3d4\n  ⚠ plugin warning\n\nQuestion: 이어쓰기 1 classic 질문';
   const lines = logViewLines([{ role: 'user', content: classicUser, ts: '2026-11-12T00:00:00Z' }], 110).join('\n');
-  expect(lines).toContain('> 이어쓰기 1 classic 질문');
-  expect(lines).not.toContain('> Context:');
+  expect(lines).toContain('❯ 이어쓰기 1 classic 질문');
+  expect(lines).not.toContain('❯ Context:');
   expect(lines).not.toContain('Dashboard mode: browse');
   expect(lines).not.toContain('plugin warning');
   expect(classicUser).toContain('Recent status output:'); // stored history stays intact
@@ -48,7 +48,7 @@ test('ordinary user-authored Context prose and similar headings stay visible', (
   const quotedStatus = 'Context:\nDashboard mode: browse\n\nRecent status output:\nmy own notes\n\nQuestion: keep this whole message and mention ✓ resumed local session: abc123';
   for (const content of [ordinary, nearMiss, quotedStatus]) {
     const lines = logViewLines([{ role: 'user', content, ts: '2026-11-12T00:00:00Z' }], 110).join('\n');
-    expect(lines).toContain('> Context:');
+    expect(lines).toContain('❯ Context:');
     expect(lines).toContain('Question: keep this whole message');
   }
 });
@@ -56,7 +56,7 @@ test('ordinary user-authored Context prose and similar headings stay visible', (
 test('resumed classic question keeps later Question headings in the actual user text', () => {
   const classicUser = 'Context:\nDashboard mode: browse\n\nRecent status output:\n  ✓ resumed local session: a1b2c3d4\n\nQuestion: 첫 문단\n\nQuestion: 두 번째 문단';
   const lines = logViewLines([{ role: 'user', content: classicUser, ts: '2026-11-12T00:00:00Z' }], 110).join('\n');
-  expect(lines).toContain('> 첫 문단');
+  expect(lines).toContain('❯ 첫 문단');
   expect(lines).toContain('Question: 두 번째 문단');
   expect(lines).not.toContain('Dashboard mode: browse');
 });
@@ -177,7 +177,7 @@ test('empty history clearly marks the first slice as read only', () => {
 test('tool execution and its result appear in the bounded conversation view', () => {
   const lines = logViewLines([{
     role: 'tool', content: '⚙️ Bash', toolName: 'Bash', toolResult: 'mail list rc=0\n2 messages', ts: '2026-10-20T00:00:00Z',
-  }], 20);
+  }], 20, new Set([0]));
   expect(lines.join('\n')).toContain('Tool: Bash');
   expect(lines.join('\n')).toContain('2 messages');
   expect(lines.every((line) => Bun.stringWidth(line) <= 20)).toBe(true);
@@ -212,7 +212,7 @@ test('live reply preview keeps first text visible, wraps and strips terminal con
 
 test('chat wraps at word boundaries; user rows indent continuations under the prompt mark', () => {
   const user = logViewLines([{ role: 'user', content: 'alpha beta gamma delta', ts: '2026-11-10T00:00:00Z' }], 14);
-  expect(user.slice(0, 2)).toEqual(['> alpha beta ', '  gamma delta']);
+  expect(user.slice(0, 2)).toEqual(['❯ alpha beta ', '  gamma delta']);
   expect(streamReplyLines('foo bar baz quux', 14)).toEqual(['foo bar baz ', 'quux']);
   const longWord = logViewLines([{ role: 'user', content: 'supercalifragilistic', ts: '2026-11-10T00:00:00Z' }], 10);
   expect(longWord.every((line) => Bun.stringWidth(line) <= 10)).toBe(true);
@@ -270,11 +270,12 @@ test('long tool output collapses to one summary line and expands on toggle', () 
   const expanded = logViewLines([toolMessage], 40, new Set([0]));
   expect(expanded.length).toBe(31);
   expect(expanded.join('\n')).toContain('line-12');
-  // Short tool output (≤ limit) stays unfolded with or without a toggle set.
+  // Short results also start folded and can be opened.
   const short: SerializedMessage = {
     role: 'tool', content: '⚙️ ls', toolName: 'ls', toolResult: 'a\nb\nc', ts: '2026-10-20T00:00:01Z',
   };
-  expect(logViewLines([short], 40).join('\n')).toContain('Tool: ls');
+  expect(logViewLines([short], 40)[0]).toBe('▸ Tool ls · 3 lines (folded)');
+  expect(logViewLines([short], 40, new Set([0])).join('\n')).toContain('Tool: ls');
   // A still-running tool block (no result yet) never folds.
   const running: SerializedMessage = {
     role: 'tool', content: '⚙️ Bash', toolName: 'Bash', ts: '2026-10-20T00:00:02Z',
@@ -292,7 +293,7 @@ test('long tool output collapses to one summary line and expands on toggle', () 
   expect(toolFoldSummary('Bash', 30)).toContain('Bash');
   // Toggle targets come from toolFoldBlockStarts, keyed by message index.
   expect(toolFoldBlockStarts([toolMessage], 40)).toEqual([0]);
-  expect(toolFoldBlockStarts([short, running], 40)).toEqual([]);
+  expect(toolFoldBlockStarts([short, running], 40)).toEqual([0]);
 });
 
 test('tool path strips ANSI and OSC control bytes in folded and expanded views', () => {
@@ -320,11 +321,11 @@ test('Enter/Tab (and F) in the log toggle the foldable block nearest the bottom 
   const expanded = new Set<number>();
   const all = { start: 0, rows: 1000 };
   expect(toggleVisibleToolFold(expanded, messages, 40, all)).toBe(true);
-  expect([...expanded]).toEqual([2]);
+  expect([...expanded]).toEqual([3]);
   expect(toggleVisibleToolFold(expanded, messages, 40, all)).toBe(true);
   expect([...expanded]).toEqual([]);
   // No foldable block → no toggle (the key keeps its old meaning in the caller).
-  expect(toggleVisibleToolFold(expanded, [long(3, 'e')], 40, all)).toBe(false);
+  expect(toggleVisibleToolFold(expanded, [], 40, all)).toBe(false);
   expect(expanded.size).toBe(0);
   for (const name of ['return', 'enter', 'tab', 'f']) expect(isToolFoldToggleKey(name)).toBe(true);
   for (const name of ['up', 'down', 'escape', 'a', undefined]) expect(isToolFoldToggleKey(name)).toBe(false);
@@ -376,13 +377,13 @@ test('collapsed summary line stays within the terminal width for a long tool nam
   expect(logViewLines([{ ...toolMessage, toolName: 'Bash' }], 34)[0]).toBe('▸ Tool Bash · 30 lines (folded)');
 });
 
-test('folding is judged by the tool output lines, not by a long tool name wrapping', () => {
+test('short results are foldable and the summary fits despite a long tool name', () => {
   const longName = 'mcp__very_long_server_name__some_extremely_long_tool_name_that_wraps_many_times_over_the_width_x';
   const shortOutput: SerializedMessage = { role: 'tool', content: '⚙️ x', toolName: longName, toolResult: 'ok', ts: 't' };
-  // The label line alone wraps past the limit at width 10, but the output is one line → never folds.
-  expect(logViewLines([shortOutput], 10).length).toBeGreaterThan(TOOL_FOLD_LINE_LIMIT);
-  expect(logViewLines([shortOutput], 10).join('\n')).not.toContain('folded');
-  expect(toolFoldBlockStarts([shortOutput], 10)).toEqual([]);
+  // Even a one-line result is foldable, and a long name remains bounded.
+  expect(logViewLines([shortOutput], 10)).toHaveLength(2);
+  expect(Bun.stringWidth(logViewLines([shortOutput], 10)[0]!)).toBeLessThanOrEqual(10);
+  expect(toolFoldBlockStarts([shortOutput], 10)).toEqual([0]);
   // N in the summary counts output lines.
   const out = Array.from({ length: 12 }, (_, i) => `o-${i}`).join('\n');
   expect(logViewLines([{ ...shortOutput, toolResult: out }], 40)[0]).toMatch(/ · 12 lines \(folded\)$/);
@@ -434,11 +435,11 @@ test('Bash stdout 끝 개행은 빈 출력 줄로 세거나 그리지 않는다'
   expect(open.slice(1, -1)).toEqual(output.trimEnd().split('\n').map((line) => `  ${line}`));
 });
 
-test('짧은 봉투는 접지 않고 펼친 그대로 · 오류 봉투는 error 문면 · 일반 문자열 결과는 옛 모양', () => {
+test('펼친 짧은 봉투와 오류 봉투 및 일반 문자열 결과 표시', () => {
   const short = JSON.stringify({ output: '     1\tonly', linesRead: 1, totalLines: 1, totalBytes: 5, truncated: false, kind: 'text' });
-  expect(logViewLines([toolMsg('Read', short)], 100)).toEqual(['Tool: Read · 1 lines · 5B', '       1 only', '']);
-  expect(logViewLines([toolMsg('Read', JSON.stringify({ error: 'ENOENT: no such file' }))], 100)).toEqual(['Tool: Read · error', '  ENOENT: no such file', '']);
-  expect(logViewLines([toolMsg('Echo', 'plain ok')], 100)).toEqual(['Tool: Echo plain ok', '']);
+  expect(logViewLines([toolMsg('Read', short)], 100, new Set([0]))).toEqual(['Tool: Read · 1 lines · 5B', '       1 only', '']);
+  expect(logViewLines([toolMsg('Read', JSON.stringify({ error: 'ENOENT: no such file' }))], 100, new Set([0]))).toEqual(['Tool: Read · error', '  ENOENT: no such file', '']);
+  expect(logViewLines([toolMsg('Echo', 'plain ok')], 100, new Set([0]))).toEqual(['Tool: Echo plain ok', '']);
 });
 
 test('잘린 봉투(truncateForPersist 2000자 · «… (+N chars)»)도 output 을 줄로 살리고 «잘림» 을 단다', () => {
@@ -460,7 +461,7 @@ test('explicit Next speaker labels preserve literal labels inside user and assis
     { role: 'user', content: '나: 라는 문구를 설명해줘', ts: '2026-11-15T00:00:00Z' },
     { role: 'assistant', content: '엘라누스: 는 본문입니다', ts: '2026-11-15T00:00:01Z' },
   ], 80);
-  expect(lines).toContain('> 나: 라는 문구를 설명해줘');
+  expect(lines).toContain('❯ 나: 라는 문구를 설명해줘');
   expect(lines).toContain('엘라누스: 는 본문입니다');
   expect(streamReplyLines('응답 본문', 80)[0]).toBe('응답 본문');
 });
@@ -476,7 +477,7 @@ test('greeting speaker labels agree between live and saved replies at narrow ter
     const lines = logViewLines(messages, columns);
     const savedReply = logViewLines([messages[1]!], columns).slice(0, -1);
     const liveReply = streamReplyLines(messages[1]!.content, columns);
-    expect(lines[0]).toBe('> 하이');
+    expect(lines[0]).toBe('❯ 하이');
     expect(savedReply[0]).not.toContain('엘라누스');
     // Saved rows reset terminal attributes at wraps; live preview avoids those resets.
     expect(liveReply.map(line => line.replace(/\x1b\[0m/g, ''))).toEqual(savedReply.map(line => line.replace(/\x1b\[0m/g, '')));
@@ -514,7 +515,7 @@ test('READABILITY-PORT assistant lines keep paragraph blank lines and one blank 
       { role: 'user', content: '질문' },
       { role: 'assistant', content: '첫 단락\n\n둘째 https://example.com/a' },
     ] as never, 70).map((l) => l.replace(/\x1b\[[0-9;]*m/g, ''));
-    expect(lines).toEqual(['> 질문', '', '첫 단락', '', '둘째 https://example.com/a', '']);
+    expect(lines).toEqual(['❯ 질문', '', '첫 단락', '', '둘째 https://example.com/a', '']);
   });
 
 test('READABILITY-PORT breatheMarkdown spaces blocks once, never inside a fence, and is idempotent', async () => {

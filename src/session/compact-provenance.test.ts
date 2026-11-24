@@ -31,11 +31,13 @@ for (const marker of [true, false]) {
     expect(result.fired).toBe(true);
     const after = loadSession(session.id, root)!.messages;
     // ★ COMPACT P0(OP #123867) — 구 replay(마지막 user 1개)와 달리 요약 뒤 «슬라이스의
-    //   모든 사람 user»가 원문 순서로 재배치된다: after = [summary, before[0], before[2], …tail].
+    //   모든 사람 user»가 원문 순서로 재배치된다. TUI-ANSWER-VANISH-ON-TOOLCALL — 이미 보인 답(before[1])은
+    //   표시 전용 행(compactedReply)으로 제자리에 남는다: after = [summary, before[0], before[1]+flag, before[2], …tail].
     expect(after[1]).toEqual(before[0]);
-    expect(after[2]).toEqual(before[2]);
-    expect(after.slice(3)).toEqual(before.slice(3));
-    const projected = nextTuiPublicHistory([{role:'user',content:'q',ts:'0'}, {role:'assistant',content:'answer',ts:'1',replyFinal:true}, after[2]!]);
+    expect(after[2]).toEqual({ ...before[1]!, compactedReply: true });
+    expect(after[3]).toEqual(before[2]);
+    expect(after.slice(4)).toEqual(before.slice(3));
+    const projected = nextTuiPublicHistory([{role:'user',content:'q',ts:'0'}, {role:'assistant',content:'answer',ts:'1',replyFinal:true}, after[3]!]);
     expect(projected[1]!.role).toBe(marker ? 'system' : 'assistant');
   });
 }

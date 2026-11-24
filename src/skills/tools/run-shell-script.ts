@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { redactSecretText } from '../../debug/log.js';
 import type { RunShellDispatchResult } from './shell.js';
 
-type Step = { id: string; command: string[]; select: string[]; headLines: number };
+type Step = { id: string; command: string[]; select: string[]; headLines: number; projection?: 'checklist-evidence' };
 type StepReceipt = { id: string; outcome: string; exitCode: number | null; stdoutSha256: string; bytes: number;
   selected?: Record<string, string | number | boolean | null>; preview?: string; truncated: boolean; error?: string };
 
@@ -77,7 +77,7 @@ function parseSteps(value: unknown): Step[] {
   return value.map((raw, index) => {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`RunShell script step ${index} must be an object`);
     const step = raw as Record<string, unknown>;
-    if (Object.keys(step).some((key) => !['id', 'command', 'select', 'headLines'].includes(key))) throw new Error('RunShell script step has unknown field');
+    if (Object.keys(step).some((key) => !['id', 'command', 'select', 'headLines', 'projection'].includes(key))) throw new Error('RunShell script step has unknown field');
     if (typeof step.id !== 'string' || !ID.test(step.id) || seen.has(step.id)) throw new Error('RunShell script step id is invalid or repeated');
     seen.add(step.id);
     if (!Array.isArray(step.command) || step.command.length < 1 || step.command.length > 20
@@ -88,7 +88,8 @@ function parseSteps(value: unknown): Step[] {
     }
     const headLines = step.headLines === undefined ? 2 : step.headLines;
     if (!Number.isInteger(headLines) || (headLines as number) < 0 || (headLines as number) > 4) throw new Error('RunShell script headLines is invalid');
-    return { id: step.id, command: step.command as string[], select: select as string[], headLines: headLines as number };
+    if (step.projection !== undefined && (step.projection !== 'checklist-evidence' || select.length !== 0 || (step.command as string[]).slice(0, 4).join(' ') !== 'eln release checklist evidence')) throw new Error('RunShell script projection is invalid');
+    return { id: step.id, command: step.command as string[], select: select as string[], headLines: headLines as number, ...(step.projection === 'checklist-evidence' ? { projection: 'checklist-evidence' as const } : {}) };
   });
 }
 
@@ -167,8 +168,9 @@ export function scriptCommandPolicy(argv: readonly string[]): ScriptCommandPolic
   const cost = ['eln', 'usage', 'runs', '--since', '30m', '--by', 'role', '--json'];
   if (argv.length === cost.length && argv.every((part, index) => part === cost[index])) return 'read-local';
   if (argv[0] === 'eln' || argv[0] === 'elanous') {
-    // Only the exact OP count form is approval-free; other recipients require a card.
-    if (argv[0] === 'eln' && argv.length === 6 && argv.slice(1).join('\0') === ['msg', 'count', '--to', 'OP', '--json'].join('\0')) return 'read-local';
+    // Only exact body-free count forms for the supported seats are approval-free.
+    if (argv[0] === 'eln' && argv.length === 6 && argv[1] === 'msg' && argv[2] === 'count'
+    && argv[3] === '--to' && ['OP', 'JUD', 'JUD-B', 'REL', 'RES'].includes(argv[4]!) && argv[5] === '--json') return 'read-local';
     if (READ_RULES.some((rule) => matchesReadRule(argv, rule))) return 'read-local';
     if (ELN_NETWORK_READ_RULES.some((rule) => matchesReadRule(argv, rule))) return 'read-network';
     return 'approval';
@@ -226,6 +228,18 @@ function projectFailure(stdout: string): Pick<StepReceipt, 'selected'> {
 }
 
 function project(step: Step, result: RunShellDispatchResult): Pick<StepReceipt, 'selected' | 'preview'> {
+  if (step.projection === 'checklist-evidence') {
+    let chain: any;
+    try { chain = JSON.parse(result.stdout); } catch { throw new Error(`RunShell script ${step.id} expected evidence JSON`); }
+    if (!chain || typeof chain !== 'object' || typeof chain.id !== 'string' || typeof chain.version !== 'string' || typeof chain.greenEligible !== 'boolean' || !Array.isArray(chain.stages)) throw new Error(`RunShell script ${step.id} evidence fields missing`);
+    const selected: NonNullable<StepReceipt['selected']> = { id: chain.id, version: chain.version, greenEligible: chain.greenEligible };
+    for (const id of ['E1', 'E3', 'E4', 'E5']) {
+      const matches = chain.stages.filter((row: any) => row && row.id === id);
+      if (matches.length !== 1 || !['observed', 'missing', 'unmeasurable'].includes(matches[0].state)) throw new Error(`RunShell script ${step.id} evidence ${id} invalid`);
+      selected[id] = matches[0].state;
+    }
+    return { selected };
+  }
   if (step.select.length) {
     let parsed: unknown;
     try { parsed = JSON.parse(result.stdout); }

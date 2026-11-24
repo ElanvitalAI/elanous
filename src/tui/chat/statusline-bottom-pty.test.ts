@@ -52,11 +52,13 @@ for (const cols of [80, 120]) {
     expect(run.exitCode).toBe(0);
     for (const label of ['boot', 'running', 'answered']) {
       const rows = rowsOf(run.frames.find((frame) => frame.label === label)?.screen ?? '');
-      const last = rows.at(-1) ?? '';
-      // The last row is the status line (folder · build), and the input is the row right above it.
-      expect(last).toContain(folder);
-      expect(last).toMatch(/\bdev\b/);
-      expect(promptIndex(rows)).toBe(rows.length - 2);
+      // TUI-STATUS-3ROW: the last two rows are the status — the seat row (folder · build) over the work row — and the
+      // input is the row right above them.
+      const seatRow = rows.at(-2) ?? '';
+      expect(seatRow).toContain(folder);
+      expect(seatRow).toMatch(/\bdev\b/);
+      expect(rows.at(-1)).toMatch(/\bQueue \d+ · Bg \d+\b/);
+      expect(promptIndex(rows)).toBe(rows.length - 3);
     }
     // While the turn runs, the progress row (above the input) says it; the bottom line does not repeat the turn.
     const running = rowsOf(run.frames.find((frame) => frame.label === 'running')!.screen);
@@ -64,6 +66,7 @@ for (const cols of [80, 120]) {
     expect(progress).not.toBe(-1);
     expect(progress).toBeLessThan(promptIndex(running));
     expect(running.at(-1)).not.toMatch(/running|Turn |Thinking|Responding/);
+    expect(running.at(-2)).not.toMatch(/running|Turn |Thinking|Responding/);
   }, 90_000);
 }
 
@@ -93,8 +96,8 @@ test('80×24 with the command picker open: the status line is still the last row
     });
     expect(run.exitCode).toBe(0);
     const rows = rowsOf(run.frames.find((frame) => frame.label === 'picker')!.screen);
-    expect(rows.at(-1)).toContain(folder);
-    expect(promptIndex(rows)).toBe(rows.length - 2);
+    expect(rows.at(-2)).toContain(folder);
+    expect(promptIndex(rows)).toBe(rows.length - 3);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

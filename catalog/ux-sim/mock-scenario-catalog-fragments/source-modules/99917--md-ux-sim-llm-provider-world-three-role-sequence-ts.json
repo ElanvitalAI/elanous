@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-LLM-PROVIDER-WORLD-THREE-ROLE-SEQUENCE-TS",
+  "path": "src/ux-sim/llm-provider-world/three-role-sequence.ts",
+  "boundary": "Runs three synthetic consumer roles (hand-seat, ta-child, review) through the real llm-call gate and settle path across default, team, credit and reset stages over the fake provider world (codex rows, Claude rows, OpenRouter credit, claude-acp); every device, clock, lease and dollar is synthetic and opting a role into credit is explicit; no real key, token, network or host is touched",
+  "deviceIds": [
+    "llm-sim-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

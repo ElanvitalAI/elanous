@@ -266,8 +266,8 @@ describe('next TUI on N03 (this tree · fake LLM)', () => {
     try {
       const r = await runNextTuiScenario({ scenario: 'next-wakeup', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
       expect(r.checks).toEqual({
-        scheduledOnce: true, noticeOnScreen: true, deferredWhileBusy: true, firedOnce: true,
-        internalTurnOpened: true, bannerOnScreen: true, wakeTurnStored: true, onlyFakeProvider: true, exitedClean: true,
+        scheduledOnce: true, noticeHidden: true, deferredWhileBusy: true, firedOnce: true,
+        internalTurnOpened: true, bannerHidden: true, wakeTurnStored: true, onlyFakeProvider: true, exitedClean: true,
       });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 300_000);

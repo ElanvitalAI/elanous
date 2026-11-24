@@ -34,18 +34,11 @@ function runRows(root: string, runId: string): Row[] {
   } finally { store.close(); }
 }
 
-test('감시줄(캡슐 계열 idle-wake-door) 사건 턴 뒤에도 실 TUI 📌 목표가 유지된다', async () => {
+test('감시줄(캡슐 계열 idle-wake-door) 사건 턴 뒤에도 실 TUI 상태줄에 📌 가 나타나지 않는다', async () => {
   const base = mkdtempSync(join(SOCKET_SAFE_TMP, 'goalpin5-door-'));
   const root = join(base, 'seats', SEAT);
   const home = join(base, 'home');
   const screens: Record<string, string> = {};
-  const pinned = (screen: string) => screen.includes('📌');
-  // JUD-B HOLD 필수 1(#133635 — r5 수리): 📌 존재만이 아니라 같은 GOAL 원문을 핀 절(부모 핀 상태 렌더링 —
-  // status-line.ts 431-437 · human-goal-pin.ts ④)에서 직접 대조한다. 변이(아이콘만 남은 목표 교체/삭제)엔 실패해야 한다.
-  const pinnedClause = (screen: string) => screen.split('\n').find((line) => line.includes('📌')) ?? '';
-  const pinnedGoalKept = (screen: string, goal: string) => pinnedClause(screen).includes(goal);
-  const mutatePinnedGoal = (screen: string, mutate: (clause: string) => string) =>
-    screen.split('\n').map((line) => (line.includes('📌') ? mutate(line) : line)).join('\n');
   let passed = false;
   try {
     mkdirSync(join(root, 'sessions'), { recursive: true });
@@ -116,25 +109,18 @@ test('감시줄(캡슐 계열 idle-wake-door) 사건 턴 뒤에도 실 TUI 📌 
       steps: [
         // 사람 줄: 목표 핀 생성(④ 부모 저장소) — 턴 종료 화면에 GP5-DOOR-HUMAN-OK + 📌 관측(③).
         { label: 'person pins goal', text: GOAL, timeoutMs: 240_000,
-          until: (screen) => { screens.human = screen; return screen.includes(HUMAN_REPLY) && pinned(screen); } },
+          until: (screen) => { screens.human = screen; return screen.includes(HUMAN_REPLY); } },
         // 감시줄 사건 턴: 실 PASSIVE_RESULT_IDLE_WAKE_MS(120 s — 압축 금지)가 무르익으면 자동 캡슐 턴이
         // 열리고 그 화면에 GP5-DOOR-WATCH-OK + 여전히 📌.
         { label: 'capsule door automatic turn (real 120 s ripen)', text: '', enter: false, timeoutMs: 300_000,
-          until: (screen) => { screens.watch = screen; return screen.includes(WATCH_REPLY) && pinned(screen); } },
+          until: (screen) => { screens.watch = screen; return screen.includes(WATCH_REPLY); } },
       ],
     });
     expect(run.exitCode).toBe(0);
-    // (a) 첫 턴 settles 뒤 화면에 📌 관측.
-    expect(screens.human).toContain('📌');
-    // (b) 120초 실숙성 뒤 자동 캡슐 턴 — 화면에 GP5-DOOR-WATCH-OK + 여전히 📌 (측정값, 가정 아님).
+    // NO-GOAL-FOOTER: 핀은 내부 턴 상태로만 남고 상태줄에는 📌 가 보이지 않는다(사람·캡슐 턴 화면 모두).
+    expect(screens.human).not.toContain('📌');
     expect(screens.watch).toContain(WATCH_REPLY);
-    expect(screens.watch).toContain('📌');
-    // (b2) r5(JUD-B #133635 mustFix ①): 사건 전(사람 턴)·후(캡슐 자동 턴) 화면의 핀 절이 같은 GOAL 원문을 그대로 담는다(부모 핀 상태 직접 대조).
-    expect(pinnedGoalKept(screens.human, GOAL)).toBe(true);
-    expect(pinnedGoalKept(screens.watch, GOAL)).toBe(true);
-    // (b3) r5(JUD-B #133635 mustFix ②): 아이콘만 남고 목표가 다른 값으로 바뀐/지워진 변이(실채취 파생)는 위 단언이 실패(RED)해야 한다.
-    expect(pinnedGoalKept(mutatePinnedGoal(screens.watch, (clause) => clause.replace(GOAL, '전혀 다른 목표')), GOAL)).toBe(false);
-    expect(pinnedGoalKept(mutatePinnedGoal(screens.watch, (clause) => clause.replace(GOAL, '')), GOAL)).toBe(false);
+    expect(screens.watch).not.toContain('📌');
     // (c) LogStore 영수(#39666 runRows 판본): 프레임 실 수신(listeners ≥ 1)과 실 엔트리 체인 자동 턴 정확히 1개.
     const rows = runRows(root, runId);
     const received = rows.filter((row) => row.event === 'turn-life:capsule-done-received' && row.data.capsuleId === CAPSULE_ID);

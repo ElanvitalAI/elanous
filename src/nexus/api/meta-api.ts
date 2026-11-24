@@ -1,3 +1,4 @@
+import { reportPdfSurface } from './report-pdf.js';
 // NEXUS N-1.5 PR d — voice / push / attachments meta-API native handlers.
 //
 // These endpoints lived in `src/boot/daemon-public-server.ts` (lines
@@ -1390,10 +1391,20 @@ export async function handlePromptStreamPost(
               }
             };
             try {
-              const effectiveSurface = resolvePerRequestToolSurface(
+              const baseSurface = resolvePerRequestToolSurface(
                 parsed.value.tools,
                 opts.toolSurface,
               );
+              const relay = relayHostChannelRequests.get(req);
+              const pdfSurface = relay?.webChatMemberId === relay?.memberId && relay?.webChatMemberId
+                ? reportPdfSurface(
+                  baseSurface,
+                  { id: relay.webChatMemberId, handle: new URL(req.url).hostname.split('.')[0]! },
+                  parsed.value.sessionId,
+                  parsed.value.userText,
+                )
+                : undefined;
+              const effectiveSurface = pdfSurface ?? baseSurface;
               const surfaceResolution = resolveSurfaceKindFromInputSource(parsed.value.source);
               return await runDaemonPromptTurn({
                 history: opts.history!,
@@ -1409,6 +1420,7 @@ export async function handlePromptStreamPost(
                 ...(opts.appDeployPublishHook ? { appDeployPublishHook: opts.appDeployPublishHook } : {}),
                 ...(resolvePromptHitlChannels(typeof body.sessionId === 'string' ? body.sessionId : '', opts) ?? {}),
                 ...(effectiveSurface ? { toolSurface: effectiveSurface } : {}),
+                ...(pdfSurface ? { fastPathEnabled: false } : {}),
                 ...(projectContext?.cwd || opts.toolCwd ? { toolCwd: projectContext?.cwd ?? opts.toolCwd } : {}),
                 ...(projectContext?.instructions ? { projectInstructions: projectContext.instructions } : {}),
                 signal: turnAbortController.signal,

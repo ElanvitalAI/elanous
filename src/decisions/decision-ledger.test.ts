@@ -377,8 +377,12 @@ test('historical Markdown imports recorded D/E decisions with unknown alternativ
   expect(c4.history[1]?.at).toBeUndefined();
   expect(formatDecisionDetail(c4)).toContain('결정: 시각 미상');
   expect(readFileSync(store.path, 'utf8').trim().split('\n')).toHaveLength(33);
-  const c4Events = readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { type: string; id?: string; at?: string; by?: unknown; choice?: string; note?: string });
-  expect(c4Events.filter(event => event.id === c4.id)).toEqual([{ type: 'decided', id: c4.id, by: { kind: 'imported', source: 'markdown C4' }, choice: 'b', note: c4.note }]);
+  const c4Events = readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { type: string; id?: string; at?: string; by?: unknown; choice?: string; note?: string; chainPrev?: string; chainSha?: string });
+  const [c4Row] = c4Events.filter(event => event.id === c4.id);
+  const { chainPrev: c4Prev, chainSha: c4Sha, ...c4Event } = c4Row!; // DECISION-LEDGER-HUMAN-AUTH — appendBatch가 모든 행에 chainPrev/chainSha를 싣는다
+  expect(c4Event).toEqual({ type: 'decided', id: c4.id, by: { kind: 'imported', source: 'markdown C4' }, choice: 'b', note: c4.note });
+  expect(c4Prev).toMatch(/^(?:[0-9a-f]{64}|GENESIS)$/);
+  expect(c4Sha).toMatch(/^[0-9a-f]{64}$/);
   const rerun = importDecisionMarkdown(store, 'docs/DECISIONS-for-ceo-pending-2026-09-30.md');
   expect(rerun.existing).toEqual(result.imported);
   expect(rerun.unread).toEqual(result.unread);
@@ -740,9 +744,16 @@ test('registry lookup validates canonical seat ids while decision tracks retain 
   const recorded = store.recordSeatDecision({ seat: title.id as 'OP', title: '검토', decision: '보류', delegation: '운영 위임' });
   expect(store.seatReport({ seat: title.id as 'OP' })).toEqual([recorded]);
   expect(() => store.seatReport({ seat: title.alias as never })).toThrow('invalid seat');
-  const lines = readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-  expect(lines[0]).toEqual({ type: 'raised', entry: raised });
-  expect(lines[2]).toEqual({ type: 'seat-recorded', entry: recorded });
+  // 출처: PREGATE-RED/39854-ceda7b7dec51-node-b-051042 — changed-tsc TS2769(749,47·753,56): lines 원소 타입에 entry 필드가 없어 raisedRow/recordedRow가 {type} 단신형이 되고 toEqual 오버로드가 불일치 → entry: unknown을 명시해 인자 {type, entry}와 정합.
+  const lines = readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { type: string; entry: unknown; chainPrev?: string; chainSha?: string });
+  const { chainPrev: genesis, chainSha: raisedSha, ...raisedRow } = lines[0]!; // DECISION-LEDGER-HUMAN-AUTH — 사슬 필드는 appendBatch가 더한 것
+  expect(raisedRow).toEqual({ type: 'raised', entry: raised });
+  expect(genesis).toBe('GENESIS');
+  expect(raisedSha).toMatch(/^[0-9a-f]{64}$/);
+  const { chainPrev: recordedPrev, chainSha: recordedSha, ...recordedRow } = lines[2]!;
+  expect(recordedRow).toEqual({ type: 'seat-recorded', entry: recorded });
+  expect(recordedPrev).toBe(lines[1]!.chainSha);
+  expect(recordedSha).toMatch(/^[0-9a-f]{64}$/);
 });
 
 test('raise and auto-decide accept seat names (OP·MK·TC·UX) as track while old letters keep working', () => {

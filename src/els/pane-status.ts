@@ -36,7 +36,8 @@ const WORKING_HINT = /esc to interrupt/i;
 const TURN_RUNNING = /Turn running|응답 중/;
 const TOOL_ROW = /Running ([A-Za-z][\w.-]*)(?:\([^)]*\))?\s*\(([^•)]+?)\s*•\s*esc to interrupt/i;
 // 출처: src/tui/input/composer.ts — eln's prompt row starts with «❯ »; Claude Code's box prompt is «│ > ».
-// A bare «> » is not a prompt: eln's transcript marks a person's past lines with it (log-view USER_PROMPT_MARK).
+// eln's transcript also marks a person's past lines with «❯ » (log-view USER_PROMPT_MARK · 대표 11-24); the composer is the
+// bottom-most «❯» row, and lastPromptText reads from the bottom up, so a past line never stands in for it.
 const PROMPT_ROW = /^(?:❯|│\s*>)\s?(.*?)\s*│?\s*$/;
 
 function lastPromptText(lines: readonly string[]): string | undefined {

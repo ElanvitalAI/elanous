@@ -3,7 +3,7 @@ import { keepBottomStatus } from './core/bottom-status.js';
 import { emitTurnLife } from '../debug/turn-life.js';
 import { CTRL_C_ARM_MS, resolveCtrlCInInput } from '../chat/ctrl-c-in-input.js';
 import { footerBreathingRoom } from './core/footer-breathing-room.js';
-import { workingRowLine } from './chat/working-row.js';
+import { accountsRowLine, progressRowLine, renderStatusRows, STATUS_THREE_ROWS_MIN_HEIGHT, STATUS_TWO_ROWS_MIN_HEIGHT } from './chat/status-rows.js';
 import { nextAssistantPreviewText } from './chat/assistant-preview.js';
 import { C, initTui, initTuiPrimary, closeTui, injectKey, pendingKeyCount as tuiPendingKeyCount, lastHumanKeyAt as tuiLastHumanKeyAt, readKey, setTuiAltScreen, setTuiMouseCapture, type Key } from '../tui.js';
 import { hasDisplayableCompletedToolBlock, nextTuiActivityRow, createNextTuiCompactPainter, createNextTuiHistoryCache, fitLogLine, foldTargetAtScreenRow, isNextTuiContextCountStatus, isToolFoldToggleKey, NEXT_TUI_TITLE, nextTuiCompactHeight, nextTuiStatusAfterWelcome, nextVisibleFoldTarget, renderNextTuiCompactFrame, safeStatusText, streamReplyLines, toolFoldBlockStarts, wheelScroll, wrapLogLines } from './core/render.js';
@@ -11,6 +11,7 @@ import { renderNextTuiEntryFrame, shellApprovalCommandViewport } from './core/en
 import type { MessageBlock } from '../conv-substrate/message-block.js';
 import { nextMessageBlockDetailLevel } from './chat/message-block-view.js';
 import { addTranscriptMarker, missionArrivalText } from './chat/mission-arrival.js';
+import { compactMarkerText, displayRowsAfterReload, mergeDisplayAfterCompact, previousAttemptMarker } from './core/compact-display.js';
 import { createMessageBlockSessionStore, upsertMessageBlock } from './core/message-block-session.js';
 import { formatMessageBlockRawTrace, resolveMessageBlockRawTrace } from './core/message-block-raw-ref.js';
 import { BackgroundJobStatus } from './chat/background-job-status.js';
@@ -33,15 +34,19 @@ import { replacementCandidateContextLine, replacementCandidateScreenLine } from 
 import { isTurnTypeaheadSteerable } from '../chat/turn-typeahead.js';
 import { agentDisplayLine, agentDisplayLines, applyAgentEvent, reconcileAgentOutputStatuses, reconcileNestedAgentSnapshot, type AgentDisplay } from './core/agents.js';
 import { englishFooterText, nextTuiElapsedMs, nextTuiTurnIsPhase } from './chat/status-line.js';
-import { pinnedGoalOf } from '../core-turn/human-goal-pin.js';
 import { decideNextTuiAutoContinue, startNextTuiTurn } from './core/turn.js';
+import { heldPreToolText } from './core/held-answer.js';
 import { createTurnStallWatch, stallMinutes } from './core/turn-stall.js';
 import { debug } from '../debug/log.js';
+import { anchorStickyScroll, stickyScrollHint, stickyScrollResetAllowed, type StickyScrollMemo, type StickyScrollResetCause } from './core/sticky-scroll.js';
 import { setCliStderrSink } from '../git-fs/cli-stderr.js';
 import { createInputLagProbe, noteInputLagPaint, setInputLagProbe } from './input-lag-probe.js';
 import type { NextTuiWakeup } from '../tui-client/next-wakeup.js';
 import { CapsuleActivity } from './chat/capsule-activity.js';
+import { withCapsuleDone } from './chat/capsule-transcript.js';
+import { createNoticeGate, nextNoticeRows } from './chat/notice-gate.js';
 import { detectSeat, detectSeatTui } from '../seat/seat-boot-preamble.js';
+import type { SeatWorkPullMountDeps } from './seat-work-pull.js';
 import { randomUUID } from 'node:crypto';
 import type { CeoAcceptedTurn } from '../agent-events/ceo-ingress.js';
 import { postCeoTurnReply, type CeoTurnRef } from './ceo-turn-reply.js';
@@ -60,9 +65,13 @@ import { formatInlinePanel } from './input/inline-panel.js';
 import { QUEUE_PANEL_HINT, queueFullTextView, queuePanelKey, queuePanelMove, queuePanelOrder, queuePanelSpec, queueWaitRows, type QueuePanelAction, type QueuePanelViewing } from './input/queue-panel.js';
 import { NextTuiQueueConflictError } from './core/queue.js';
 import { createChildNoticeProducers } from './core/notice-producers.js'; // #38031 CHILD-NOTICE
+import { createNeedsHumanPush } from './needs-human-push.js';
+import { createNeedsHumanDeps } from './needs-human-wiring.js';
 import { createSeatMailArrivalWatcher } from './seat-mail-arrival.js'; // #38031 자리 우편 도착 감시
 import { createIdleEventWake, graphNodeEndNotice, graphRunIdleNotice, idleChildLabel } from './idle-event-wake.js';
 import { createIdleWakeDoor } from './idle-wake-door.js';
+import { createQueueFinishFirst, heldChip, midTurnMailAction, orderReleased, P1_PAUSE_NOTE, RESUME_PAUSED_WORK_PROMPT } from './queue-finish-first.js';
+import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from '../chat/internal-turn-contract.js';
 import { QUEUE_IDLE_STALL_MS, QUEUE_IDLE_TICK_MS, createQueueIdleWatchdog } from './core/queue-idle-watchdog.js';
 import { seatMailOnArrived } from './seat-mail-on-arrived.js';
 import { offerSeatMailSteer, type SeatMailMidTurnEvent } from './seat-mail-midturn-steer.js';
@@ -94,7 +103,11 @@ import { formatSidetabSectionFrame, normalizeSidetabSectionOrder, reorderSidetab
 import type { SerializedMessage } from '../session/index.js';
 import { formatTurnEndTime } from '../thinking-line.js';
 import { displayNextPublicReplyText, projectUserReplyStatus, streamReplyProgress, turnReplyFailureMessage } from './core/next-public-reply.js';
-import { nextTuiPublicHistory } from './core/public-history.js';
+import { nextTuiPublicHistory, publicUserText, shownAnswerCount } from './core/public-history.js';
+import { foldExpandedIndexes, queueNoticeMeta, seatMailNoticeParts, toggleNoticePartFold, withNoticeOpenParts } from './chat/notice-fold.js';
+import { chatRowsOnScreen, createTranscriptVanishDetector, vanishPreview } from './core/transcript-vanish.js';
+import { logViewLines } from './chat/log-view.js';
+import { joinedSteerRows, liveSteerStatus } from './core/steer-status.js';
 // The common dispatch verdict lives in its own leaf so the entry chain can
 // use it even when the wire leaf import failed (#38443 r4).
 import { noticeOneDispatch } from './external-event-one-verdict.js';
@@ -292,6 +305,12 @@ export interface NextTuiOptions {
   readonly turnStallLimitMs?: number;
   /** Test seam: idle-with-queue time (ms) after which the queue watchdog wakes the loop (default QUEUE_IDLE_STALL_MS). */
   readonly queueIdleStallMs?: number;
+  /** SEAT-WORK-PULL (OP #139787) — mount override for tests; null disables the pull outright. */
+  readonly workPullForTest?: {
+    readonly seat?: string | null;
+    readonly intervalMs?: number;
+    readonly pullDeps?: NonNullable<SeatWorkPullMountDeps['pullDeps']>;
+  } | null;
   /** Test seam: the seat whose saved plan boots into the queue (production: process.cwd() and the real home). */
   readonly seatPlanBootForTest?: { readonly cwd: string; readonly home: string };
   /**
@@ -314,13 +333,15 @@ const sidetabOpenBySession = new Map<string, boolean>();
 
 /** TUI-IDLE-CPU-SPIN: the public view of the transcript, memoised so an idle render (sidetab 1 s timer) hands the
  *  history cache the SAME array and skips re-wrapping every message. Invalidated exactly like the former inline cache. */
-export function createNextTuiPublicHistoryView(): (visible: readonly SerializedMessage[], busy: boolean) => readonly SerializedMessage[] {
-  let cache: { source: readonly SerializedMessage[]; length: number; busy: boolean;
+export function createNextTuiPublicHistoryView(): (visible: readonly SerializedMessage[], busy: boolean, turnStartedAt?: number) => readonly SerializedMessage[] {
+  let cache: { source: readonly SerializedMessage[]; length: number; busy: boolean; since: number | undefined;
     last: SerializedMessage | undefined; view: readonly SerializedMessage[] } | null = null;
-  return (visible, busy) => {
-    if (!cache || cache.source !== visible || cache.length !== visible.length || cache.last !== visible.at(-1) || cache.busy !== busy) {
-      cache = { source: visible, length: visible.length, busy, last: visible.at(-1),
-        view: nextTuiPublicHistory(visible, busy).map((message) => message.role === 'assistant' && message.content.includes('\t')
+  return (visible, busy, turnStartedAt) => {
+    const since = busy ? turnStartedAt : undefined;
+    if (!cache || cache.source !== visible || cache.length !== visible.length || cache.last !== visible.at(-1) || cache.busy !== busy || cache.since !== since) {
+      cache = { source: visible, length: visible.length, busy, since, last: visible.at(-1),
+        // A running turn hides only ITS OWN saved answer (the live preview shows it); an earlier answer stays.
+        view: nextTuiPublicHistory(visible, busy && since !== undefined ? { since } : busy).map((message) => message.role === 'assistant' && message.content.includes('\t')
           ? { ...message, content: displayNextPublicReplyText(message.content) } : message) };
     }
     return cache.view;
@@ -360,6 +381,21 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   }
   let session = id ? loadSession(id) : null;
   let messages = session?.messages ?? [];
+  /** TUI-ANSWER-VANISH ⑤ — the reload that replaced `messages` since the last frame, and the running turn's door. */
+  let vanishReload: 'compaction' | 'compact-reload' | 'session-reload' | undefined;
+  let vanishTurnDoor: string | undefined;
+  let vanishTurnSource: string | undefined;
+  const vanishRowLines = new WeakMap<SerializedMessage, { columns: number; lines: readonly string[] }>();
+  const observeVanish = createTranscriptVanishDetector((event) => {
+    debug.log('tui.transcript', 'answer-vanished', { ...event }, { level: 'info' });
+  });
+  /** TUI-ANSWER-VANISH-ON-TOOLCALL — first-class record of what a transcript reload did to shown answers. */
+  const observeTranscriptReload = (before: readonly SerializedMessage[], after: readonly SerializedMessage[], at: string, sessionId: string | undefined): void => {
+    const was = shownAnswerCount(before);
+    const now = shownAnswerCount(after);
+    if (now < was) debug.log('tui.transcript', 'answer-drop', { at, sessionId, before: was, after: now }, { level: 'warn' });
+    else if (now > was) debug.log('tui.transcript', 'answer-commit', { at, sessionId, before: was, after: now });
+  };
   // The seat ledger is touched only on next-TUI boot, and only when the
   // optional seat directory exists. The one dashboard module below is the
   // turn-start segments recorder wired over the shared turn delegation.
@@ -410,6 +446,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let busy = false;
   const activeShellCapsules = new Set<string>();
   const agentEvents = createAgentEventBridge(getAgentEventEmitter()); // ELN-AGENT-EVENT-PROTOCOL: no ELANOUS_EVENT_SOCKET → no-op
+  // NEED-HUMAN-PUSH: the needs-person block is also pushed up the ladder (coordinator → OP → CEO card), one mail per block.
+  const needsHuman = createNeedsHumanPush(createNeedsHumanDeps({ cwd: process.cwd(), resumeWith: () => { agentEvents.resume(); goalContinue?.noteHumanTurn(); } }));
   let outerElsArmed = false; // ELS-NESTING-RULE ③: the session already lives in an els pane; this eln closes and els takes the terminal
   let handoffExit = false;
   /** #38510 r1 MF1: every busy flip is a turn boundary the idle watchdog must see (set once it exists). */
@@ -422,9 +460,12 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // O2 (TC #94744): the bus's first consumer — a late one-shot the scheduler gave up on opens its turn through the door.
   let wakeupBusConsumer: WakeupBusConsumer | null = null;
   let wakeupBusTurn: string | null = null;
+  // QUEUE-FINISH-FIRST (대표 11-24 12:4x) — the seat's own work finishes before ordinary mail opens a turn.
+  const finishFirst = createQueueFinishFirst({ log: (category, event, data) => { debug.log(category, event, data); } });
   const setBusy = (next: boolean): void => {
     if (busy === next) return;
     busy = next;
+    if (next) finishFirst.noteTurnStarted();
     agentEvents.busy(next);
     if (!next && wakeupBusTurn !== null) { wakeupBusConsumer?.settle(wakeupBusTurn, doorOutcomeOf(doorTurnKind)); wakeupBusTurn = null; }
     if (!next) { entryDoor?.endTurn(doorTurnKind); doorTurnKind = undefined; }
@@ -444,8 +485,28 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let turnDone: Promise<void> | null = null;
   let humanQuitRequested = false;
   let scroll = 0;
+  /** TUI-STICKY-SCROLLBACK: the last frame's row count, so a scrolled view keeps its top row as rows arrive. */
+  let stickyMemo: StickyScrollMemo | null = null;
+  /** Move the view back to the bottom only for the person's own action; a turn end never steals it. */
+  const resetScroll = (cause: StickyScrollResetCause): void => {
+    if (scroll <= 0) return;
+    if (!stickyScrollResetAllowed(cause)) {
+      debug.log('tui.scroll', 'reset-blocked', { cause, scroll, maxScroll, unseenRows: stickyMemo?.unseenRows ?? 0 }, { level: 'info' });
+      return;
+    }
+    debug.log('tui.scroll', 'reset', { cause, scroll, maxScroll }, { level: 'info' });
+    scroll = 0;
+    if (stickyMemo) stickyMemo = { ...stickyMemo, unseenRows: 0 };
+  };
+  const applyWheel = (direction: 'up' | 'down'): void => {
+    const before = scroll;
+    scroll = wheelScroll(scroll, direction, maxScroll);
+    debug.log('tui.scroll', 'wheel', { delta: direction === 'up' ? 'up' : 'down', from: before, scroll, maxScroll }, { level: 'debug' });
+  };
   const prepareHistory = createNextTuiHistoryCache();
   const publicHistoryView = createNextTuiPublicHistoryView();
+  /** Wall clock of the running turn's start — which saved answer is the running turn's own (public history ④). */
+  let runningTurnStartedAt: number | undefined;
   // The compact path's retained-prefix measure gets its own slot so it never evicts the full history.
   const prepareRetainedHistory = createNextTuiHistoryCache();
   let compactSourcesCache: { messages: readonly SerializedMessage[]; sources: string[] } | null = null;
@@ -579,6 +640,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const toolTextOffsets = new Map<string, number>();
   // Every settled turn keeps its tool rows after its own user message, like classic's transcript.
   const settledTurnTools = new Map<string, { anchor: number; userContent: string; rows: ToolActivityRow[]; graph?: readonly GraphViewEvent[] }[]>();
+  // TUI-ANSWER-VANISH-ON-TOOLCALL — pre-tool streamed lines a tool-round clear frame pulled off the
+  // screen, kept as display-only rows under the turn's question (never persisted, never replayed to the model).
+  const heldAnswerRows = new Map<string, { anchor: number; userContent: string; text: string }>();
   /** Every graph loop this session showed: settled turns first, then the running turn. */
   const sessionGraphViews = (): GraphLoopView[] => [...projectGraphLoopViews([
     ...(settledTurnTools.get(id ?? '') ?? []).flatMap((entry) => entry.graph ?? []), ...graphView.events]).values()];
@@ -619,9 +683,35 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // collapsed and Enter/Tab/F in the log toggles the foldable block on screen nearest the
   // bottom of the last rendered scroll window.
   const expandedToolBlocks = new Set<number>();
+  /** NOTICE-FOLD-1LINE — notice rows opened by a click or the fold key, by row id (kept across renders and reloads). */
+  const expandedNoticeRows = new Set<string>();
+  /** The rows the last frame drew (display indexes) — a fold target's index resolves against these. */
+  let lastFrameMessages: readonly SerializedMessage[] = [];
+  let noticeOpenView: { from: readonly SerializedMessage[]; key: string; view: readonly SerializedMessage[] } | null = null;
   const messageBlockSessions = createMessageBlockSessionStore();
   let messageBlocks: MessageBlock[] = [];
-  const turnEndMarkers = new Map<string, { afterMessageIndex: number; text: string }[]>();
+  const turnEndMarkers = new Map<string, import('./chat/capsule-transcript.js').TranscriptMarker[]>();
+  /** TUI-KEEP-TRANSCRIPT-ON-COMPACT — sessions compacted while shown here: their reloads keep the displayed rows. */
+  const compactedDisplaySessions = new Set<string>();
+  /** The rows to show after reloading `sessionId` from the store. A session compacted while on screen keeps every
+   *  row already displayed (compaction shrinks the model context only); any other reload replaces as before. */
+  const displayAfterReload = (sessionId: string, reloaded: SerializedMessage[] | undefined, at: string): SerializedMessage[] => {
+    const merged = displayRowsAfterReload({ sameSession: id === sessionId, compacted: compactedDisplaySessions.has(sessionId),
+      displayed: messages, reloaded: reloaded ?? [] });
+    if (merged.keptMissing > 0) debug.log('tui.transcript', 'compact-display-kept', { at, sessionId, kept: merged.keptMissing });
+    return merged.rows;
+  };
+  /** A same-session compaction: keep the shown rows, append the new ones and fold one marker at the compaction point. */
+  const displayAfterCompaction = (sessionId: string, reloaded: SerializedMessage[] | undefined, compactStatus: string): SerializedMessage[] => {
+    if (id !== sessionId) return reloaded ?? [];
+    compactedDisplaySessions.add(sessionId);
+    const merged = mergeDisplayAfterCompact(messages, reloaded ?? []);
+    if (merged.compactionPoint >= 0)
+      turnEndMarkers.set(sessionId, [...(turnEndMarkers.get(sessionId) ?? []),
+        { afterMessageIndex: merged.compactionPoint, text: compactMarkerText(compactStatus), tone: 'dim' }]);
+    debug.log('tui.transcript', 'compact-display-kept', { at: 'compact', sessionId, kept: merged.keptMissing, shown: merged.rows.length });
+    return merged.rows;
+  };
   let lastTurnEndStatus: { sessionId: string; text: string } | null = null;
   let messageBlockLevels = new Map<string, 0 | 1 | 2 | 3>();
   let messageBlockRawTexts = new Map<string, string>();
@@ -650,8 +740,18 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     }
     saveMessageBlockSession();
   };
-  let logWindow: { start: number; rows: number; columns: number; bodyTop: number; leadingBlankRows: number; foldTargets: readonly ({ kind: 'message'; id: string; start: number; end: number } | { kind: 'tool'; index: number; start: number; end: number })[] } = { start: 0, rows: 0, columns: 80, bodyTop: 1, leadingBlankRows: 0, foldTargets: [] };
+  let logWindow: { start: number; rows: number; columns: number; bodyTop: number; leadingBlankRows: number; foldTargets: readonly ({ kind: 'message'; id: string; start: number; end: number } | { kind: 'tool'; index: number; part?: number; start: number; end: number })[] } = { start: 0, rows: 0, columns: 80, bodyTop: 1, leadingBlankRows: 0, foldTargets: [] };
   let lastFoldTargetKey: string | null = null;
+  /** NOTICE-FOLD-1LINE — the queue items' structured facts (count · senders · ledger ids) for the notice turn by notice id. */
+  const noticeHeadMeta = new Map<string, import('../chat/interjection.js').QueueNoticeMeta>();
+  const keepNoticeHeadMeta = (noticeId: string, text: string, entries: readonly { id: string; msgId?: number }[]): void => {
+    if (noticeHeadMeta.has(noticeId)) return;
+    const items = entries.map((entry) => queue.get(entry.id));
+    const facts = entries.map((entry, at) => ({ ...(entry.msgId === undefined ? {} : { msgId: entry.msgId }),
+      ...(items[at]?.mail ? { sender: items[at]!.mail!.sender } : {}), ...(items[at]?.capsuleFailed ? { failed: items[at]!.capsuleFailed } : {}) }));
+    noticeHeadMeta.set(noticeId, queueNoticeMeta(facts, seatMailNoticeParts(text, items.flatMap((item) => item ? [item] : []))));
+    if (noticeHeadMeta.size > 64) noticeHeadMeta.delete(noticeHeadMeta.keys().next().value!);
+  };
   let pendingEcho: SerializedMessage | null = null;
   let pendingEchoStart = 0;
   const screenPaintCache = new ScreenPaintCache();
@@ -723,6 +823,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const seatControl = createSeatControl({
       checkpoint: async (mode) => {
         const seat = detectSeat(process.cwd())?.seat;
+        // ELS-BATON-AUTO-ON-RESTART: the OP TUI hands the OP lease to the acting seat right before it stops
+        // (the server takes it back when the next OP TUI in this pane reports its build). Best effort, never blocks the stop.
+        if (seat === 'OP' && process.env.ELANOUS_ELS_PANE && process.env.ELANOUS_ELS_SOCKET) {
+          try {
+            const { requestEls } = await import('../els/client.js');
+            await requestEls(process.env.ELANOUS_ELS_SOCKET, { op: 'baton', action: 'auto-hand', reason: `seat-stop ${mode}`, exclude: [process.pid] }, 3_000);
+          } catch { /* the pane-exit hook and update-all still hand it */ }
+        }
         if (!seat || !id) return;
         await writeSeatControlHandoff(join(effectiveInstanceRoot(), 'seat-control'), driver.liveRequestId(),
           { seat, sessionId: id, mode, createdAt: new Date().toISOString() });
@@ -786,7 +894,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const queueIdleWatchdog = createQueueIdleWatchdog({
     now: () => performance.now(),
     idle: () => !busy && !tuiClosed && queuePanel === null && doorHumanFirst() === null,
-    queued: () => queue.autoDispatchCount + heldNotices.length,
+    // QUEUE-FINISH-FIRST — held mail is not a stall (it waits for the work on purpose; the starvation tick wakes it).
+    queued: () => Math.max(0, queue.autoDispatchCount + heldNotices.length - finishFirst.heldActionableCount()),
     wake: (event) => {
       // SEAT-NOTICE-BOOT-RACE: the person has had no turn yet — refuse the boot-wake so
       // their first words are not steered into a notice turn that opened before them.
@@ -862,25 +971,53 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // SEAT-INBOX B1-C — one notice per message (msgId) · receipts delivered (enqueue) · seen (queue delivered).
   const seatMailWatcher = createSeatMailArrivalWatcher(process.cwd(), queue, {
     heartbeat: { getSessionId: () => id },
-    onArrived: seatMailOnArrived({
+    onArrived: ((inner) => (arrivals?: Parameters<typeof inner>[0]) => { needsHuman.noteArrivals(arrivals); inner(arrivals); })(seatMailOnArrived({
       busy: () => busy, injectKey: () => { idleWakeDoor.knock('seat-mail'); }, queueWake,
       // SEAT-MAIL-COALESCE-NOTICE — arrivals within 3s share one knock (one digest turn).
       schedule: (fn, ms) => { const t = setTimeout(fn, ms); t.unref?.(); return t; },
       enqueueMidTurn: (event, onDrained) => {
-        if (event.kind === 'seat-mail' && steerRequest.current) {
+        const offerSteer = (): boolean => {
+          if (event.kind !== 'seat-mail' || !steerRequest.current) return false;
           // SEAT-STEER-PREEMPT ② (OP #132479 ②): 결정 우편(구조화 intent)은 urgent steer 로 제안돼 실행 중
           // 턴을 선점한다. 보안 계약(b5c5c3b3) 보존 — 보낸 자리 이름은 무시되고 결정은 intent 만으로 인식된다.
           const steerId = offerSeatMailSteer(event, (id, text, urgent, seatMail) => steerRequest.current?.(id, text, urgent, seatMail) === true, () => ++steerSerial);
-          if (steerId !== null) {
-            mailSteers.set(steerId, Number(event.id));
-            debug.log('tui.next', 'seat-mail-steer-offered', { msgId: Number(event.id), steerId });
-            return true;
+          if (steerId === null) return false;
+          mailSteers.set(steerId, Number(event.id));
+          debug.log('tui.next', 'seat-mail-steer-offered', { msgId: Number(event.id), steerId });
+          return true;
+        };
+        // QUEUE-FINISH-FIRST ⊕ QUEUE-P1-3MIN — while the seat's own work is open: P2 is held (the next continuation peeks
+        // it); a P1 joins the running turn at the next step boundary (steer · after the running tool batch, never cutting
+        // a tool) once it has waited 60 s — a decision at once. P0 and related mail keep the steer path unchanged.
+        if (event.kind === 'seat-mail' && finishFirst.holding()) {
+          const msgId = Number(event.id);
+          const item = queue.items.find((one) => one.kind === 'notice' && one.source === 'seat-mail' && one.msgId === msgId);
+          const cls = item ? finishFirst.classify(item) : null;
+          if (item && cls) {
+            const action = midTurnMailAction(item, cls, true, Date.now());
+            if (action.kind === 'held') {
+              debug.log('tui.queue', 'held', { class: cls, waitedMs: 0, reason: 'work-in-progress', msgId, midTurn: true });
+              return false;
+            }
+            if (action.kind === 'steer-at') {
+              debug.log('tui.queue', 'held', { class: cls, waitedMs: 0, reason: 'p1-gate', msgId, midTurn: true, joinInMs: action.inMs });
+              const timer = setTimeout(() => {
+                const still = queue.items.find((one) => one.id === item.id && one.status === 'queued');
+                if (!still) return;
+                if (busy && offerSteer()) { finishFirst.noteP1Steered(still); return; }
+                injectKey(queueWake);
+              }, action.inMs);
+              (timer as { unref?: () => void }).unref?.();
+              return false;
+            }
+            if (cls === 'P1' && offerSteer()) { finishFirst.noteP1Steered(item); return true; }
           }
         }
+        if (offerSteer()) return true;
         const sid = telemetrySessionId; return sid !== null && enqueueMidTurnEvent(sid, event, onDrained);
       },
       removeQueuedNotice,
-    }),
+    })),
     turnLifeLog: emitTurnLife,
     messages: { read: (cwd, afterId) => readSeatMailMessages(cwd, afterId), receipts: createLedgerReceiptWriter() },
     ...(seatMailAdapter ? { mailAdapter: seatMailAdapter } : {}),
@@ -894,6 +1031,29 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     seatMailWatcher,
   );
   try { seatMailWatcher.start(); } catch { /* the header exposes start-error without aborting the TUI */ }
+  // SEAT-WORK-PULL (OP #139787 · part 4 mount) — an idle seat with no in-flight work pulls the
+  // next roster cell on a periodic poll: claimed → one 'work-pull' notice + one queueWake inject
+  // through the same idle door as seat mail; no-work → evidence line only (no notice, no turn).
+  // The person-first gate is the boot-race rule: before the seat's own first turn, even the poll
+  // stays silent. A non-seat TUI mounts nothing (detectSeat null → no polling at all).
+  let workPullStop: (() => void) | null = null;
+  if (options.workPullForTest !== null) {
+    const workPullSeat = options.workPullForTest?.seat !== undefined
+      ? options.workPullForTest.seat
+      : (detectSeat(process.cwd())?.seat ?? null);
+    try {
+      const { mountSeatWorkPull } = await import('./seat-work-pull.js');
+      workPullStop = mountSeatWorkPull({
+        seat: workPullSeat,
+        busy: () => busy,
+        personTurnStarted: () => personTurnStarted,
+        enqueueNotice: (text) => queue.enqueueNotice(text, 'work-pull', {}),
+        injectKey: (key) => { injectKey(key as Key); }, queueWake,
+        ...(options.workPullForTest?.pullDeps ? { pullDeps: options.workPullForTest.pullDeps } : {}),
+        ...(options.workPullForTest?.intervalMs !== undefined ? { intervalMs: options.workPullForTest.intervalMs } : {}),
+      });
+    } catch { /* the pull is optional; the doors and mail still work */ }
+  }
   // ELN-EXTERNAL-EVENTS-BETWEEN-TURNS — a harness child finishing, or a graph
   // node ending, stays a queued notice. The idle door opens only when nothing
   // is running; a running turn is never steered.
@@ -985,26 +1145,40 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let pluginWizardFlow: ReturnType<typeof import('./branches/plugin-wizard.js').createPluginWizardFlow> | null = null;
   // TURN-END-BEFORE-GOAL — 답이 약속만 하고 끝나면 깨움 문으로 한 턴 더(classic 과 같은 모듈 · 동적 로드).
   let goalContinue: ReturnType<(typeof dashboardRuntime)['createGoalContinue']> | null = null;
+  /** SESSION-AUTOPILOT — the session's autopilot controller (state file in the memory store · created with the wake door). */
+  let autopilot: import('../session-autopilot/autopilot.js').SessionAutopilot | null = null;
+  /** The chip on the status line («🚗 AUTO · <goal> · next ⏰hh:mm») — refreshed on boot, turn end, tick and /autopilot. */
+  let autopilotChip = '';
+  /** A seat retro/bulletin rhythm already wakes this session (coordinators add no extra timer). */
+  let autopilotRhythm = false;
   /** SEAT-PULL-ON-IDLE-LIVE — 골이 다음 턴을 안 열었을 때만, opt-in 자리의 빈 계획에서 칸 하나를 집는다. */
   let seatSelfPull: SeatPullAfterGoalDeps['hook'] = null;
   /** 이번 턴이 실패·취소로 끝났나 — 그런 턴은 이어가지 않는다. */
   /** 마지막으로 관측에 남긴 접힌 중간 답 수(next · 바뀔 때만 'folded' 한 줄). */
   let interimFoldedShown = 0;
+  // TUI-NOTICE-QUIET: only act-on-it or failure notices reach the screen; the rest is logged (chat/notice-gate.ts).
+  const noticeGate = createNoticeGate((kind, line) => {
+    debug.log('tui.notice', 'suppressed', { kind, text: line.slice(0, 200) });
+  });
   const pushNotice = (line: string): void => {
-    notices = [...notices, safeStatusText(line)].slice(-3);
+    notices = nextNoticeRows(notices, { kind: 'notice', line: safeStatusText(line) }, noticeGate);
   };
   const pushInternalNotice = (line: string): void => {
     internalNotices = [...internalNotices, safeStatusText(line)].slice(-3);
   };
   // STATUSLINE-WIRE: the footer is the declarative status line (src/statusline/next-tui.ts); a broken user
   // statusline.yaml falls back to the default with one notice.
-  const { createNextTuiStatusline, compactFooterTurn } = await import('../statusline/next-tui.js');
+  const { createNextTuiStatusline, compactFooterTurn, displayCwd } = await import('../statusline/next-tui.js');
   const { runningBuild } = await import('../pty-shell/tui-run-state.js');
   const footerBuild = runningBuild();
   const { createFleetSegment } = await import('../statusline/sources/machines.js');
   // STATUSLINE-SOURCES-RESPONSIVE: the fleet segment (sources/machines.ts) — polled after the first paint.
   // The build stamp needs a git call: it too is looked up after the first footer has been painted, not on the boot path.
   const fleetSegment = createFleetSegment({ onChange: () => render() });
+  // TUI-STATUS-3ROW row 3: the LLM account snapshot — read from its cache file off the render path; a stale file starts
+  // one background `elanous usage status-cache` child (sources/llm-usage.ts). Started after the first paint.
+  const { createLlmUsageSource } = await import('../statusline/sources/llm-usage.js');
+  const llmUsage = createLlmUsageSource({ onChange: () => render() });
   const footerStatusline = createNextTuiStatusline({ build: footerBuild, cwd: () => process.cwd(), fleet: fleetSegment.value,
     afterFirstPaint: () => {
       void import('../version/build-stamp.js').then(({ buildCommitTime }) => {
@@ -1012,6 +1186,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         if (footerStatusline.setCommitTime(buildCommitTime(footerBuild))) render();
       }).catch(() => { /* no stamp */ });
       fleetSegment.start();
+      llmUsage.start();
     } });
   if (footerStatusline.warning) pushNotice(footerStatusline.warning);
   // OP-CHANNEL-INGRESS ②③ — els provisioned THIS tab's ceo ingress (socket + per-tab secret in
@@ -1085,7 +1260,12 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           if (event.type === 'capsule-progress') {
             try { emitTurnLife('turn-life:capsule-progress-received', { capsuleId: event.capsuleId, sessionId, kind: event.kind }); } catch { /* observability is fail-open */ }
           }
-          capsuleActivity.accept(event);
+          // CAPSULE-FOOTER-ONCE (대표 11-24 13:0x): a finished capsule leaves the footer and is written once into the transcript now.
+          const finished = capsuleActivity.accept(event);
+          if (finished && messages.length > 0) {
+            turnEndMarkers.set(sessionId, withCapsuleDone(turnEndMarkers.get(sessionId) ?? [], messages.length - 1, finished));
+            debug.log('tui.capsule', 'done-to-transcript', { kind: finished.kind, status: finished.status, seconds: finished.seconds, afterMessageIndex: messages.length - 1 });
+          } else if (finished) debug.log('tui.capsule', 'done-no-anchor', { kind: finished.kind, status: finished.status, line: finished.line.slice(0, 200) });
           render();
         });
       }).catch(() => { /* the doorbell is optional; the next-turn drain still delivers the result */ });
@@ -1100,7 +1280,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       }
       if (id === sessionId && !busy) {
         session = loadSession(sessionId);
-        messages = session?.messages ?? messages;
+        vanishReload ??= 'session-reload';
+        messages = session ? displayAfterReload(sessionId, session.messages, 'background') : messages;
       }
       render();
     });
@@ -1121,6 +1302,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   slashHandlers.set('status', handleStatus);
   slashHandlers.set('st', handleStatus);
   slashHandlers.set('remaining', async (args, context) => (await import('./branches/remaining.js')).handleNextTuiRemainingSlash(args, context));
+  // SESSION-AUTOPILOT — `/autopilot on [goal] | off | resume | hold | goals | status` calls the same controller as the tool.
+  slashHandlers.set('autopilot', async (args, context) => {
+    const { runAutopilotSlash } = await import('../session-autopilot/autopilot-slash.js');
+    if (!autopilot) { context.chatLines.push('🚗 자율주행: 아직 준비 중 (깨움 문이 뜬 뒤 다시)'); return; }
+    context.chatLines.push(...runAutopilotSlash(autopilot, args));
+    refreshAutopilotChip();
+    if (autopilot.isActive() && !busy) armAutopilotWake('slash');
+  });
   const dispatchSlash = async (name: string, args: string[], context: SignalsSlashContext): Promise<boolean> => {
     const handler = slashHandlers.get(name);
     if (!handler) return false;
@@ -1290,8 +1479,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         }
       }
     }
-    const backgroundLine = backgroundJobs.line();
+    const backgroundLine = noticeGate.backgroundRow(backgroundJobs.line());
     const staleInstallLine = staleInstall.marker();
+    noticeGate.noteSticky(staleInstallLine);
     let modelBadgeResolutionFailed = false;
     const resolveModelBadgeSafely = (): string | undefined => {
       try {
@@ -1322,6 +1512,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         executionModelBadgeLoading = false;
       });
     }
+    // A «n steer pending» status follows the queue; a stale claim is corrected once and observed.
+    const liveStatusForQueue = (): string => {
+      const live = liveSteerStatus(status, queue.steerCount, busy);
+      if (live.stale) {
+        debug.log('tui.next', 'steer-status-stale', { shown: status.split(' · ')[0], steering: queue.steerCount, busy });
+        status = live.text;
+      }
+      return live.text;
+    };
     const title = fitLogLine(NEXT_TUI_TITLE, chatColumns);
     const seatHeadline = seatMailHeader(healthSnapshot, wakeup);
     const header = [title, seatHeadline ? fitLogLine(seatHeadline, chatColumns) : '─'.repeat(Math.max(0, chatColumns))];
@@ -1331,7 +1530,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         ? '도구 실행 · Esc 취소'
         : !busy && focus === 'log'
           ? `로그 탐색 · ↑↓ 스크롤${toolFoldBlockStarts(messages, chatColumns).length > 0 ? ' · Enter 접기/펼치기' : ''} · Esc 입력`
-          : status;
+          : liveStatusForQueue();
     const turnStatusBase = isNextTuiContextCountStatus(rawTurnStatus) ? '' : nextTuiStatusAfterWelcome(rawTurnStatus);
     const background = backgroundJobs.snapshot();
     const backgroundTasks = background ? background.running + background.pending : 0;
@@ -1345,8 +1544,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const attachmentLines = contextAttachmentArea.flatMap((line) => wrapLogLines(safeStatusText(line), chatColumns));
     const attachmentContent = attachmentLines.slice(1);
     // B3: at most a few folded capsule rows, never more than the screen leaves for chat (CX-1 handoff patch).
-    const capsuleLines = capsuleActivity.lines().slice(-Math.max(1, rows - 8));
-    const statusRowCount = 1 + capsuleLines.length + (backgroundLine ? 1 : 0) + (staleInstallLine ? 1 : 0);
+    const capsuleLines = capsuleActivity.runningLines().slice(-Math.max(1, rows - 8));
+    // TUI-STATUS-3ROW: the default bottom status is two rows on a tall screen (seat · work).
+    const statusRowsActive = !footerStatusline.custom && footerStatusline.position === 'bottom';
+    // Row 3 (accounts · host load) from 24 rows: cached numbers only (sources/llm-usage.ts · fleet poller hosts).
+    const accountsRow = statusRowsActive && rows >= STATUS_THREE_ROWS_MIN_HEIGHT
+      ? accountsRowLine({ snapshot: llmUsage.current(), hosts: fleetSegment.hosts(), nowMs: Date.now() }, chatColumns) : null;
+    const statusRowCount = (statusRowsActive && rows >= STATUS_TWO_ROWS_MIN_HEIGHT ? (accountsRow ? 3 : 2) : 1) + capsuleLines.length + (backgroundLine ? 1 : 0) + (staleInstallLine ? 1 : 0);
     const attachmentRowLimit = Math.max(1, Math.min(6, rows - header.length - statusRowCount - 1));
     const attachmentBodyRows = Math.max(1, attachmentRowLimit - 1);
     contextAttachmentScrollStep = attachmentBodyRows;
@@ -1377,8 +1581,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       steering: queue.steerCount,
       backgroundTasks,
       width: statusWidth,
-      // SEAT-HUMAN-GOAL-PIN (OP #128939) — 고정 목표가 살아 있으면 상태줄에 한 줄로 보인다.
-      pinnedGoal: id ? pinnedGoalOf(id) : undefined,
       elapsedMs: id === telemetrySessionId ? turnElapsedMs : undefined,
       measuredUsage: id === telemetrySessionId ? measuredUsage : undefined,
       // 출처: #37786 — classic의 본문 문자/4 추정과 공급자 실측 값을 구분한다.
@@ -1388,12 +1590,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const statusLineDrawn = footerStatusline.render(statusInput);
     // Logic below reads the old footer text (facts); the screen shows the whole declarative line.
     const statusLine = statusLineDrawn.facts;
+    // QUEUE-FINISH-FIRST — one compact chip while ordinary mail waits for the current work.
+    const heldChipText = heldChip(finishFirst.heldCount());
     // The turn-end summary replaces only the idle input status; log navigation keeps its own guide.
     // While the log is at the bottom the same text is already the transcript's turn-end marker, so the
     // footer repeats it only when the marker has scrolled out of view (no duplicate «Worked for» rows).
     const showTurnEnd = !busy && focus !== 'log' && scroll > 0 && lastTurnEndStatus?.sessionId === id;
-    const turnStatus = showTurnEnd
-      ? lastTurnEndStatus!.text : [statusLine, attachmentHint].filter(Boolean).join(' · ');
+    const scrollHint = stickyScrollHint(scroll, stickyMemo?.unseenRows ?? 0);
+    const turnStatus = [scrollHint, showTurnEnd
+      ? lastTurnEndStatus!.text : [statusLine, autopilotChip, heldChipText, attachmentHint].filter(Boolean).join(' · ')].filter(Boolean).join(' · ');
     const attachmentFooter = attachmentLines.length
       ? [attachmentLines[0]!, ...attachmentContent.slice(contextAttachmentScroll, contextAttachmentScroll + attachmentBodyRows)]
       : [];
@@ -1406,16 +1611,17 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const statusAtBottom = footerStatusline.position === 'bottom';
     // Only a plain phase is dropped (the progress row says it); an action answer in the turn slot stays.
     const omitTurn = statusAtBottom && busy && nextTuiTurnIsPhase(statusInput.turnState);
-    const compactTurn = showTurnEnd ? lastTurnEndStatus!.text : compactFooterTurn({
+    const compactTurnBase = showTurnEnd ? lastTurnEndStatus!.text : compactFooterTurn({
       welcomePending,
       // The attachment hint on its own (#38292 REVIEW-1 ①): glued after the footer sentence it was the first thing
       // cut on an 80-column line. (The old nextTuiCompactActionStatus passed the whole English sentence through —
       // «Turn Turn done …» — so the compact branch no longer uses it.)
-      attachmentHint,
+      attachmentHint: [heldChipText, attachmentHint].filter(Boolean).join(' · ') || null,
       // At the bottom during a turn the progress row says the turn; the compact facts (children, hints) stay (#38392 REVIEW-1 ①).
       shortTurn: omitTurn ? '' : nextTuiShortStatus(compactStatusInput).turn,
       activeChildren: agents.filter(({ status: agentStatus }) => agentStatus === 'running' || agentStatus === 'background').length,
     });
+    const compactTurn = scrollHint ? [scrollHint, compactTurnBase].filter(Boolean).join(' · ') : compactTurnBase;
     // NEXT-TUI-FOOTER-24-ROWS: the declarative line on compact screens too (cwd · version stay on an 80×24 terminal);
     // the compact-only facts take the turn's place (statusline/next-tui.ts compactFooterTurn). The compact line keeps
     // its model: the execution badge (the model the next turn will use) when known.
@@ -1444,7 +1650,25 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       ...(rows > compactHeight && welcomePending ? [fitLogLine('Enter send · Esc cancel · Ctrl+Q quit', chatColumns)] : []),
       ...(statusRow !== undefined && !statusAtBottom ? [statusRow] : []),
     ];
-    const bottomStatusRow = statusRow !== undefined && statusAtBottom ? statusRow : undefined;
+    // TUI-STATUS-3ROW v1 (대표 11-24): with the default definition the bottom status is the seat row (autopilot · seat ·
+    // goal · model once · build) over the work row (attention · turn state · counters); the turn's elapsed and tokens
+    // live in the progress row above the input. A user statusline.yaml keeps the declarative line above.
+    const bottomStatusRows: readonly string[] | undefined = statusRowsActive
+      ? renderStatusRows({
+          width: chatColumns, height: rows,
+          attention: [scrollHint, showTurnEnd ? lastTurnEndStatus!.text : null,
+            rows <= compactHeight && welcomePending ? 'Enter send · Esc cancel · Ctrl+Q quit' : null, heldChipText, attachmentHint],
+          // The turn state stays a word in the work row (els reads «Turn running»); a plain phase during a turn is the
+          // progress row's job.
+          state: showTurnEnd || omitTurn ? '' : nextTuiShortStatus(compactStatusInput).turn,
+          autopilot: autopilotChip, seat: displayCwd(process.cwd()).leaf,
+          model: nextTuiShortStatus(compactStatusInput).model, build: footerStatusline.buildShort(),
+          queued: statusInput.queued, steering: statusInput.steering, background: backgroundTasks,
+          children: agents.filter(({ status: agentStatus }) => agentStatus === 'running' || agentStatus === 'background').length,
+          needsHuman: needsHuman.activeBlockId() ? 1 : 0,
+        }).rows
+      : statusRow !== undefined && statusAtBottom ? [statusRow] : undefined;
+    const bottomStatusRow = bottomStatusRows?.[0];
     if (queuePanel && queue.count === 0) { queuePanel = null; queuePanelViewing = null; }
     // ELS-QUEUE-WAIT-DISPLAY r2 (OP #128306 ② · JUD-B #128270): the read-only full-text view over the
     // queue list — v opens it, nothing here cancels or sends; Enter edit stays the list's own path. The
@@ -1510,12 +1734,18 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     // leaves no room for the spare rows, they fold first ④ and today's tight layout stays: the
     // conversation keeps its minimum and the #38392 separator lock keeps its row.
     const breathingRoom = footerBreathingRoom({ rows, headerRows: header.length, footerRows: footer.length,
-      compactHeight, bottomStatus: bottomStatusRow !== undefined });
+      compactHeight, bottomStatus: bottomStatusRows !== undefined });
     // The status line under the input stays with any panel open; only a screen too short for header · footer · input ·
     // status · one conversation row drops it (#38392 r2 ①, core/bottom-status.ts).
-    const belowPrompt = bottomStatusRow !== undefined
-      && keepBottomStatus({ rows, headerRows: header.length, footerRows: footer.length, statusRows: breathingRoom ? 2 : 1 })
-      ? (breathingRoom ? [C.border('─'.repeat(chatColumns)), bottomStatusRow] : [bottomStatusRow])
+    // TUI-STATUS-3ROW: two status rows when they fit; a screen that cannot hold both keeps the work row (attention).
+    const statusBlock = (shown: readonly string[]): string[] | null => shown.length > 0
+      && keepBottomStatus({ rows, headerRows: header.length, footerRows: footer.length, statusRows: shown.length + (breathingRoom ? 1 : 0) })
+      ? (breathingRoom ? [C.border('─'.repeat(chatColumns)), ...shown] : [...shown])
+      : null;
+    // Row 3 goes first when the screen is short of rows; then the seat row; the work row (attention) stays longest.
+    const belowPrompt = bottomStatusRow !== undefined && bottomStatusRows
+      ? (accountsRow ? statusBlock([...bottomStatusRows, accountsRow]) : null)
+        ?? statusBlock(bottomStatusRows) ?? statusBlock(bottomStatusRows.slice(-1)) ?? []
       : [];
     if (breathingRoom) {
       footer.push('', '', C.dim('─'.repeat(chatColumns))); // ③ margin · ② blank · the separator over the input (the old rule stays, 대표 r2)
@@ -1540,7 +1770,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       ? [...messages, pendingEcho] : messages;
     const basicChat = focus === 'input';
     let displayedMessages: readonly SerializedMessage[] = visibleMessages;
-    if (basicChat) displayedMessages = publicHistoryView(visibleMessages, busy);
+    if (basicChat) displayedMessages = publicHistoryView(visibleMessages, busy, runningTurnStartedAt);
+    // NOTICE-FOLD-1LINE — mark the open mails of notice rows (display only); the same array while none is open.
+    const openKey = [...expandedNoticeRows].sort().join('\u0000');
+    if (openKey.includes('#')) {
+      if (noticeOpenView?.from !== displayedMessages || noticeOpenView.key !== openKey)
+        noticeOpenView = { from: displayedMessages, key: openKey, view: withNoticeOpenParts(displayedMessages, expandedNoticeRows) };
+      displayedMessages = noticeOpenView.view;
+    }
     const reconciledAgents = reconcileAgentOutputStatuses(agents, messages, backgroundJobs.snapshot()?.tasks);
     const previewText = streamPreview?.assistantText
       ? nextAssistantPreviewText(streamPreview.text) : streamPreview?.text;
@@ -1573,26 +1810,42 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     // NEXT-TUI-WORKING-ROW: right under the streamed text, above the prompt — the turn is running.
     if (busy && id === telemetrySessionId) {
       const runningTool = runningToolLabel(liveToolRows);
-      displayActivity.push(workingRowLine({
+      // TUI-STATUS-3ROW: the turn's tokens (↑in ↓out) ride on this row now, not on the bottom status.
+      displayActivity.push(progressRowLine({
         phase: runningTool ? { kind: 'tool', ...runningTool } : streamingReply ? { kind: 'responding' }
           : (streamedOutputChars ?? 0) > 0 ? { kind: 'responding' } : { kind: 'thinking' },
-        elapsedMs: turnElapsedMs ?? 0, queued: queue.count, columns: chatColumns,
-      }));
+        elapsedMs: turnElapsedMs ?? 0, queued: queue.count,
+        inputTokens: measuredUsage?.inputTokens, outputTokens: measuredUsage?.outputTokens,
+        estimatedOutputTokens: (streamedOutputChars ?? 0) > 0 ? Math.ceil(streamedOutputChars! / 4) : undefined,
+      }, chatColumns));
     }
     let inlineInsertions: Map<number, string[]> | undefined;
     // nextTuiPublicHistory keeps saved indexes, so a raw user-message index anchors the displayed row.
+    // TUI-ANSWER-VANISH-ON-TOOLCALL — held pre-tool lines render above the tool rows of the same turn.
+    const heldInsert = heldAnswerRows.get(id ?? '');
+    const heldLines = heldInsert && displayedMessages[heldInsert.anchor]?.role === 'user'
+      && displayedMessages[heldInsert.anchor]?.content === heldInsert.userContent
+      ? streamReplyLines(heldInsert.text, chatColumns) : [];
     const settledEntries: [number, string[]][] = [];
+    let heldInserted = false;
     for (const { anchor, userContent, rows, graph } of settledTurnTools.get(id ?? '') ?? []) {
       const toolLines = toolActivityLines(shownToolRows(rows), performance.now());
       // A finished loop stays in the transcript as its folded line (a failed one keeps the failed node open).
       const graphLines = graph && graphViewShowsBlock(graphViewMode)
         ? graphViewTurnLines(graph, chatColumns, Number.POSITIVE_INFINITY, Date.now()) : [];
-      const lines = [...toolLines, ...graphLines];
+      const heldPrefix = anchor === heldInsert?.anchor ? heldLines.map((line) => nextTuiActivityRow(line, chatColumns)) : [];
+      if (heldPrefix.length > 0) heldInserted = true;
+      const lines = [...heldPrefix, ...toolLines, ...graphLines];
       // Compaction reloads and may re-index messages: attach only to the same user turn, never a neighbour.
       const anchored = displayedMessages[anchor];
       if (lines.length === 0 || anchored?.role !== 'user' || anchored.content !== userContent) continue;
       // Blank row before the answer, like after a user message; rows dim as in the live flow.
-      settledEntries.push([anchor, [...toolLines.map((line) => nextTuiActivityRow(line, chatColumns)), ...graphLines, '']]);
+      settledEntries.push([anchor, [...heldPrefix, ...toolLines.map((line) => nextTuiActivityRow(line, chatColumns)), ...graphLines, '']]);
+    }
+    if (heldLines.length > 0 && heldInsert && !heldInserted) {
+      const anchored = displayedMessages[heldInsert.anchor];
+      if (anchored?.role === 'user' && anchored.content === heldInsert.userContent)
+        settledEntries.push([heldInsert.anchor, [...heldLines.map((line) => nextTuiActivityRow(line, chatColumns)), '']]);
     }
     if (settledEntries.length > 0) {
       const key = settledEntries.map(([anchor, lines]) => anchor + '\u0000' + lines.join('\n')).join('\u0001');
@@ -1610,7 +1863,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       busy,
     });
     const frameInput = { messages: displayedMessages,
-      turnEndMarkers: turnEndMarkers.get(id ?? '') ?? [],
+      turnEndMarkers: turnEndMarkers.get(id ?? '') ?? [], expandMarkers: !basicChat,
       messageBlocks: (basicChat ? [] : messageBlocks).map((block) => ({
       block, level: messageBlockLevels.get(block.id) ?? 0, rawText: messageBlockRawTexts.get(block.id),
       afterMessageIndex: messageBlockAfterMessageIndexes.get(block.id),
@@ -1618,13 +1871,42 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       header, footer, belowPrompt,
       promptLine: prompt.line, promptLines, notices: basicChat ? notices : [...notices, ...internalNotices], activity: [...publishApproval.session.lines(), ...firstScreen, ...displayActivity], scroll,
       inlineInsertions,
-      expandedToolIndexes: basicChat ? new Set<number>() : expandedToolBlocks };
+      // NOTICE-FOLD-1LINE — notice rows open by row id in both views; tool blocks only in the log view (as before).
+      expandedToolIndexes: foldExpandedIndexes(displayedMessages, basicChat ? null : expandedToolBlocks, expandedNoticeRows) };
+    lastFrameMessages = displayedMessages;
     const prepared = prepareHistory(frameInput);
-    const frame = compactMode
-      ? renderNextTuiCompactFrame(frameInput, prepared)
-      : renderNextTuiEntryFrame(frameInput, prepared);
+    const paintFrame = (input: typeof frameInput) => compactMode
+      ? renderNextTuiCompactFrame(input, prepared)
+      : renderNextTuiEntryFrame(input, prepared);
+    let frame = paintFrame(frameInput);
+    // TUI-STICKY-SCROLLBACK: rows appended below a scrolled view keep the same top row on screen.
+    const stickyLayout = `${id ?? ''}|${chatColumns}|${basicChat ? 'chat' : 'log'}|${compactMode ? 'compact' : 'full'}`;
+    const historyRows = frame.historyRows ?? 0;
+    const anchored = anchorStickyScroll(scroll, stickyMemo, historyRows, stickyLayout);
+    if (anchored.delta !== 0 && anchored.scroll !== scroll) {
+      scroll = anchored.scroll;
+      frame = paintFrame({ ...frameInput, scroll });
+    }
     ({ scroll, maxScroll, logWindow } = frame);
+    stickyMemo = { historyRows, layout: stickyLayout, unseenRows: scroll > 0 ? anchored.unseenRows : 0 };
     const { lines, promptRow } = frame;
+    // TUI-ANSWER-VANISH ⑤ — a chat row on the last screen that is gone from this one is logged with its cause.
+    try {
+      const reload = vanishReload;
+      vanishReload = undefined;
+      const { onScreen, evaluated } = chatRowsOnScreen({ saved: visibleMessages, displayed: displayedMessages, screenLines: frame.body,
+        tail: 8, renderRow: (row) => {
+          const hit = vanishRowLines.get(row);
+          if (hit && hit.columns === chatColumns) return hit.lines;
+          const rendered = logViewLines([row], chatColumns);
+          vanishRowLines.set(row, { columns: chatColumns, lines: rendered });
+          return rendered;
+        } });
+      observeVanish({ sessionId: id ?? undefined, saved: visibleMessages, displayed: displayedMessages, onScreen, evaluated,
+        scroll, userScrolled: scroll > 0, busy, ...(reload ? { reload } : {}),
+        ...(vanishTurnDoor !== undefined ? { turnDoor: vanishTurnDoor } : {}),
+        ...(vanishTurnSource !== undefined ? { turnSource: vanishTurnSource } : {}) });
+    } catch { /* observability is fail-open */ }
     // ⌨️ TUI-NEXT-KEYSTROKE-COST (OP #132091 PR-1): idle 프레임(팝업 없음·스크롤 0·입력 포커스)이면
     // 다음 idle 키를 위해 프롬프트 주변(앞/뒤 줄)을 저장한다 — 서명 재료는 fast 경로와 동일 튜플.
     if (!busy && !sidetabOpen && graphDetailColumns === 0 && scroll === 0 && focus === 'input'
@@ -1900,6 +2182,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     bindWakeupSession?.(id);
     restoreMessageBlockSession(targetId);
     lastFoldTargetKey = null;
+    expandedNoticeRows.clear();
     session = target;
     messages = target.messages;
     sidetabSectionOrder = normalizeSidetabSectionOrder(target.meta.uiState?.sidetabSectionOrder);
@@ -1911,13 +2194,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     backgroundJobs.setSessionId(targetId);
     const statusSources = await import('../tui-client/local-chat-turn.js');
     observeSession(targetId, statusSources.onLocalChatBackgroundStatus, statusSources.onLocalChatSelfHealthStatus);
-    goalContinue?.noteHumanTurn();
+    goalContinue?.noteHumanTurn(); agentEvents.resume(); needsHuman.resumed();
     lastResumeRows = null;
     expandedToolBlocks.clear();
     activity = [];
     agents = [];
     activeShellCalls.clear();
-    scroll = 0;
+    resetScroll('session-switch');
     maxScroll = 0;
     status = '세션 전환됨 · Enter 전송 · Ctrl+Q 종료';
   };
@@ -2088,6 +2371,158 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     return result === 'opened' || result === 'cancel-refused';
   };
 
+  /**
+   * QUEUE-FINISH-FIRST — run the seat's own continuation at this idle boundary (goal-continue, else the OP requirement
+   * continuation). It opens through {@link startContinuationTurn}; if nothing opens, the door is knocked again and the
+   * leaf releases the held mail (continuation-not-started).
+   */
+  const queuedForFinishFirst = () => queue.items.filter((item) => item.status === 'queued');
+  /**
+   * QUEUE-FINISH-FIRST — every continuation (goal · requirement) opens here: while mail is held the turn carries
+   * (A) the held-mail headline block (peek — every held mail is seen within one turn, bodies deferred) and
+   * (B) related mail (a reply to what the work waits on · the seat's own child result) in full, taken off the queue.
+   */
+  const startContinuationTurn = (text: string, opts: StartTurnIfIdleOptions): StartTurnIfIdleResult => {
+    const extras = finishFirst.continuationExtras(queuedForFinishFirst());
+    const result = wakeup!.gate.startTurnIfIdle(`${text}${extras.suffix}`, opts);
+    if (result.opened) {
+      finishFirst.noteContinuationOpened();
+      if (extras.relatedIds.length > 0) {
+        const joined = queue.takeNotices(extras.relatedIds);
+        debug.log('tui.queue', 'joined', { count: joined.length, msgIds: joined.flatMap((one) => (one.msgId === undefined ? [] : [one.msgId])), turnId: result.turnId });
+      }
+      if (extras.peeked > 0) {
+        finishFirst.notePeeked(extras.heldIds);
+        debug.log('tui.queue', 'peeked', { count: extras.peeked, turnId: result.turnId });
+      }
+    }
+    return result;
+  };
+  /** QUEUE-FINISH-FIRST — `mail-reply:<id>` waits this seat armed (msg wait-for) — a reply to one joins the work. Fail-soft. */
+  const armedMailReplyWaits = async (): Promise<number[]> => {
+    try {
+      const seat = detectSeat(process.cwd())?.seat ?? null;
+      if (!seat) return [];
+      const [{ listWakers }, { mailReplyId }] = await Promise.all([import('../msg/self-timer-watch.js'), import('../op-requirements/turn-end.js')]);
+      return listWakers(seat).filter((w) => w.status === 'armed').flatMap((w) => mailReplyId(w.condition));
+    } catch { return []; }
+  };
+  /**
+   * QUEUE-P1-3MIN — the work a P1 paused resumes with one continuation (front of the line). Busy or refused → a few
+   * short retries; the idle door's «continue» verdict also calls this first.
+   */
+  const resumePausedWork = (attempt = 0): boolean => {
+    if (!finishFirst.resumePending()) return false;
+    const retry = (): void => {
+      if (attempt >= 6) return;
+      const timer = setTimeout(() => { resumePausedWork(attempt + 1); }, 100 * 2 ** attempt);
+      (timer as { unref?: () => void }).unref?.();
+    };
+    if (busy || !wakeup) { retry(); return false; }
+    const result = startContinuationTurn(RESUME_PAUSED_WORK_PROMPT, { origin: 'goal-continue', reason: 'resume paused work' });
+    if (result.opened) { finishFirst.noteResumed(result.turnId); return true; }
+    retry();
+    return false;
+  };
+  const runContinuationFirst = (): void => {
+    if (resumePausedWork()) return;
+    const knockAgain = (): void => { finishFirst.noteContinuationTried(); injectKey(queueWake); };
+    let opened = false;
+    try { opened = goalContinue?.isArmed() === true && goalContinue.check().opened; } catch { opened = false; }
+    if (opened) return;
+    const seat = detectSeat(process.cwd())?.seat ?? null;
+    if (seat !== 'OP' || !wakeup) { knockAgain(); return; }
+    void import('../op-requirements/turn-end.js')
+      .then(({ runRequirementTurnEnd }) => runRequirementTurnEnd({ seat, humanTurn: null, startTurnIfIdle: startContinuationTurn,
+        notify: (line) => { pushNotice(line); render(); } }))
+      .then((req) => { if (!req.opened) knockAgain(); })
+      .catch((error) => { debug.log('op.requirements', 'continue-first-failed', { error: String(error).slice(0, 200) }); knockAgain(); });
+  };
+
+  // ── SESSION-AUTOPILOT (대표 11-24) ─────────────────────────────────────────────────────────────────────────────
+  // 관측 = debug.log('autopilot', on|off|pause|resume|stop|armed|goal-rolled|decided) · 인지 = controller.turnEnded ·
+  // 수복 = arm a wake through the ScheduleWakeup scheduler (the same door as the model's own wakes) · human = pause.
+  let autopilotTick: ReturnType<typeof setInterval> | null = null;
+  let autopilotLastKeyAt = 0;
+  const refreshAutopilotChip = (): void => {
+    const next = autopilot ? autopilot.statusText() : '';
+    if (next !== autopilotChip) { autopilotChip = next; render(); }
+  };
+  const noteAutopilotHuman = (): void => {
+    if (!autopilot) return;
+    try { autopilot.noteHuman(); autopilotLastKeyAt = tuiLastHumanKeyAt(); refreshAutopilotChip(); } catch { /* fail-open */ }
+  };
+  /** Arm one wake when autopilot is active and nothing is scheduled. Returns true when one was armed. */
+  const armAutopilotWake = (why: string, plan?: { delayMs: number; reason: string }): boolean => {
+    const scheduler = wakeup?.scheduler;
+    if (!autopilot || !scheduler || !autopilot.isActive()) return false;
+    if (scheduler.list().length > 0) return false;
+    const delayMs = plan?.delayMs ?? 30 * 60_000;
+    const result = scheduler.schedule({ delaySeconds: Math.round(delayMs / 1000), reason: plan?.reason ?? `🚗 자율주행: 목표를 향해 이어서 진행${autopilot.state().goal ? ` — ${autopilot.state().goal}` : ''}` });
+    if (result.ok) autopilot.noteArmed(result.entry.id, result.entry.dueAt);
+    else debug.log('autopilot', 'arm-failed', { why, error: result.error });
+    refreshAutopilotChip();
+    return result.ok;
+  };
+  const autopilotTurnEnded = (end: { from: import('../session/index.js').MessageSource | undefined; failed: boolean; failureSig?: string; fingerprint: string; openWork: boolean; continuationOpened: boolean }): void => {
+    if (!autopilot) return;
+    try {
+      const scheduled = wakeup?.scheduler.list() ?? [];
+      // Self-initiated = autopilot's own armed wake fired (scheduled origin · its wake id left the scheduler).
+      // Mail · notice · person · retro turns are external events: never counted as autopilot volume.
+      const ownWake = autopilot.ownWakeId();
+      const selfInitiated = end.from?.kind === 'system' && end.from.origin === 'scheduled' && ownWake !== undefined && !scheduled.some((entry) => entry.id === ownWake);
+      const verdict = autopilot.turnEnded({ selfInitiated, fingerprint: end.fingerprint, failed: end.failed,
+        ...(end.failureSig !== undefined ? { failureSig: end.failureSig } : {}), openWork: end.openWork, rhythmActive: autopilotRhythm,
+        ...(scheduled.length > 0 ? { scheduledWakeAt: scheduled[0]!.dueAt } : end.continuationOpened ? { scheduledWakeAt: Date.now() } : {}) });
+      if (verdict.arm) armAutopilotWake('turn-end', verdict.arm);
+      refreshAutopilotChip();
+    } catch (error) { debug.log('autopilot', 'turn-end-failed', { error: String(error).slice(0, 200) }); }
+  };
+  const startAutopilot = async (): Promise<void> => {
+    try {
+      const [ap, { isCoordinatorSeat }, { releaseLedgerRoot }, { join }, { homedir }, { devVersion }] = await Promise.all([
+        import('../session-autopilot/autopilot.js'), import('../seat/seat-role.js'), import('../instance/resolve.js'), import('node:path'), import('node:os'),
+        import('../release-loop/checklist.js')]);
+      const seat = detectSeat(process.cwd())?.seat ?? null;
+      autopilot = ap.createAutopilot({
+        file: ap.autopilotStateFile(process.cwd()),
+        coordinator: isCoordinatorSeat(seat),
+        standingGoal: (() => {
+          // The release cycle source (plan status:current → schedule → package; published → next) · cached 60 s (sqlite read).
+          let cached: { at: number; goal: ReturnType<typeof ap.resolveStandingGoal> } | null = null;
+          return () => {
+            if (cached && Date.now() - cached.at < 60_000) return cached.goal;
+            const goal = ap.resolveStandingGoal({ hqRoot: join(homedir(), 'elanous-hq'), ledgerRoot: releaseLedgerRoot(), installedVersion: devVersion() });
+            cached = { at: Date.now(), goal };
+            return goal;
+          };
+        })(),
+        ...(id ? { sessionId: id } : {}),
+        raiseDecision: ap.raiseAutopilotDecision,
+        postProgress: (goal, due) => { const cardId = ap.raiseGoalProgressCard(goal, due, id ?? undefined); pushNotice(`🚗 목표 임박 · ${goal.title} · ${due} — 진행 카드 ${cardId}`); },
+        notify: (line) => { pushNotice(line); render(); },
+      });
+      autopilot.refresh();
+      autopilotLastKeyAt = tuiLastHumanKeyAt();
+      refreshAutopilotChip();
+      autopilotTick = setInterval(() => {
+        if (!autopilot) return;
+        try {
+          // A human keystroke since the last look = the person took the wheel.
+          const key = tuiLastHumanKeyAt();
+          if (key > autopilotLastKeyAt) { autopilotLastKeyAt = key; autopilot.noteHuman(); }
+          autopilot.refresh();
+          const resumed = autopilot.tick();
+          if (resumed && !busy) armAutopilotWake('auto-resume', { delayMs: 60_000, reason: `🚗 자율주행 재개: 목표를 향해 이어서 진행${autopilot.state().goal ? ` — ${autopilot.state().goal}` : ''}` });
+          refreshAutopilotChip();
+        } catch (error) { debug.log('autopilot', 'tick-failed', { error: String(error).slice(0, 200) }); }
+      }, 30_000);
+      (autopilotTick as { unref?: () => void }).unref?.();
+      if (autopilot.isActive() && !busy) armAutopilotWake('boot');
+    } catch (error) { debug.log('autopilot', 'start-failed', { error: String(error).slice(0, 200) }); }
+  };
+
   /** Sends the head of the queue through the ordinary idle submit path (slash commands included). */
   const dispatchQueued = (): void => {
     // ELN-QUEUE-PANEL-CTRLC-RACE (2026-11-23 r2): the one funnel every auto-drain knock reaches — the idle watchdog's
@@ -2103,6 +2538,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       openLateWakeup();
       return;
     }
+    // QUEUE-FINISH-FIRST — while the seat's own work is open, the continuation goes before ordinary (P1/P2) mail.
+    // The verdict is the leaf's (decideIdleQueue); here it is only followed. A person's line / P0 still starts now.
+    const finishVerdict = heldNotices.length === 0 ? finishFirst.decide(queuedForFinishFirst()) : { kind: 'pass' as const };
+    if (finishVerdict.kind === 'hold') { render(); return; }
+    if (finishVerdict.kind === 'continue') { render(); runContinuationFirst(); return; }
+    // QUEUE-P1-3MIN — deliver-p1: the due P1s leave now (P2 and not-yet-due P1 stay held); open work pauses and resumes.
+    const keepHeldIds = finishVerdict.kind === 'pass-unheld' || finishVerdict.kind === 'deliver-p1' ? new Set(finishVerdict.heldIds) : null;
+    const pauseNote = finishVerdict.kind === 'deliver-p1' && finishVerdict.paused ? `\n\n${P1_PAUSE_NOTE}` : '';
     // CAPSULE-C2: reserve before the dequeue — the busy mark exists before the notice chain's await (D7).
     // CAPSULE-C2-FU: a person's line at the head goes before a held notice and is never refused for human-first.
     const door = entryDoor;
@@ -2112,6 +2555,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     if (!reservation) return;
     const held = opener === 'held-notice' ? heldNotices.shift() : undefined;
     if (held) {
+      keepNoticeHeadMeta(held.id, held.text, [held]);
       turnStartLabel = { door: 'queue-notice', text: held.text, source: held.source ?? undefined, eventId: held.msgId ?? held.id }; // 출처: #38804 — eventId = msgId ?? id(도착·큐·꺼냄 사슬과 같은 id · OP msg:93180)
       dispatchNoticeThroughDoor(held, reservation);
       return;
@@ -2121,11 +2565,16 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     // 사람 줄이 head면(opener 'person') 묶음을 돌리지 않는다: 그 reservation은 사람 dequeue·dispatch가 쓴다.
     // drainNotices는 head가 알림일 때만(opener 'queue-notice') — 사람 예약을 알림이 가로채지 않는다.
     if (opener === 'queue-notice') {
-      const bundle = queue.drainNotices();
+      const drained = queue.drainNotices(keepHeldIds ? (item) => keepHeldIds.has(item.id) : undefined);
+      // QUEUE-FINISH-FIRST — a released digest goes P1 first (arrival order kept inside a class).
+      const bundle = drained.kind === 'notices' ? { ...drained, notices: orderReleased(drained.notices, finishFirst.waits()) } : drained;
+      if (keepHeldIds && bundle.kind !== 'notices') { door.releaseIfUnstarted(reservation); return; }
+      if (bundle.kind === 'notices' && bundle.notices.length > 0 && finishVerdict.kind !== 'deliver-p1') finishFirst.noteMailTurn();
       if (bundle.kind === 'notices' && bundle.notices.length > 0) {
         const head = bundle.notices[0]!;
         // SEAT-MAIL-COALESCE-NOTICE — the bundle's seat mail is ONE digest (count + one line per mail · action bodies).
-        const joined = seatMailBundleText(bundle.notices);
+        const joined = `${seatMailBundleText(bundle.notices)}${pauseNote}`;
+        keepNoticeHeadMeta(head.id, joined, bundle.notices);
         turnStartLabel = { door: 'queue-notice', text: joined, source: head.source ?? undefined, eventId: head.msgId ?? head.id }; // 출처: #38804 — eventId = msgId ?? id
         // OP #129546 ① — 묶음 30통이면 30통 전체가 이 dispatch 한 번에 결속된다(머리만이 아니라):
         // 각 항목은 제 id/msgId 사슬(#38804)을 그대로 가지고 plan link 에 제 본문으로 각각 닿는다.
@@ -2153,6 +2602,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     // one chain: dispatchQueuedExternalEventOne). The composer, the draft and noteHumanTurn are untouched; the model
     // alone sees the one-line source head («[notice · seat-mail]») on the turn it answers.
     if (handoff.itemKind === 'notice') {
+      keepNoticeHeadMeta(handoff.id, handoff.text, [handoff]);
       // OBSERVE-TURN-EVENT-LIFECYCLE — 재생하는 알림의 문 라벨(비동기라 startChatTurn 이 텍스트로 대조).
       turnStartLabel = { door: 'queue-notice', text: handoff.text, source: handoff.source ?? undefined, eventId: handoff.msgId ?? handoff.id }; // 출처: #38804 — eventId = msgId ?? id(도착·큐·꺼냄 사슬과 같은 id · OP msg:93180)
       dispatchNoticeThroughDoor({ id: handoff.id, text: handoff.text, remaining: handoff.remaining,
@@ -2164,7 +2614,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     // A queued person's line replays Enter, which takes the door as a person.
     door.releaseIfUnstarted(reservation);
     // 대기열에서 나가는 것도 사람이 쳐 둔 턴이다 — 골 이어가기의 연속·지문을 비운다(r3 must-fix).
-    goalContinue?.noteHumanTurn();
+    goalContinue?.noteHumanTurn(); agentEvents.resume(); needsHuman.resumed();
+    finishFirst.noteHumanTurn();
+    noteAutopilotHuman();
     personTurnStarted = true;
     const candidate = queue.replacementCandidate(handoff.id);
     const candidateOld = candidate ? queue.get(candidate.candidateFor) : undefined;
@@ -2247,6 +2699,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const turnRunId = randomUUID();
     activeTurnRunId = turnRunId;
     turnFrom = from;
+    // SESSION-AUTOPILOT — the running turn's origin: goal writes in an autonomous turn become proposal cards.
+    try { autopilot?.noteTurnStart(from?.kind === 'human' ? 'human' : 'auto'); } catch { /* fail-open */ }
     // SCHEDULE-WAKEUP-TURN-CAP: every real turn start gets its own gate turn id (notice/mail/queue turns skip the gate's open paths).
     wakeup?.gate.noteTurnStarted();
     // Which plan item (if any) this turn works for: a dispatched plan notice, or an automatic follow-up of one.
@@ -2281,6 +2735,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const ceoTurn = noticeTurn ? ceoNoticeRefs.get(noticeTurn.id) : undefined;
     if (noticeTurn) ceoNoticeRefs.delete(noticeTurn.id);
     const noticeSource = noticeTurn?.source ?? null;
+    const noticeMeta = noticeTurn ? noticeHeadMeta.get(noticeTurn.id) : undefined;
+    if (noticeTurn) noticeHeadMeta.delete(noticeTurn.id);
     pendingNoticeTurn = null;
     const replacementContextLine = replacementContextFor !== null && turnText.trim() === replacementContextFor.text
       ? replacementContextFor.line
@@ -2300,12 +2756,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         ...(matched && label!.eventId !== undefined ? { eventId: label!.eventId } : {}), // 출처: TC #92565 — 라벨 세터의 itemId 규칙 그대로 eventId 일치
         turnSessionId,
       });
+      vanishTurnDoor = matched ? label!.door : 'human';
+      vanishTurnSource = matched ? label!.source : undefined;
       if (matched) turnStartLabel = null;
     } catch { /* observability is fail-open */ }
     lastTurnEndStatus = null;
     telemetrySessionId = turnSessionId;
     const turnStartedAt = performance.now();
     const turnStartedWallAt = Date.now();
+    runningTurnStartedAt = turnStartedWallAt;
     turnElapsedMs = 0;
     measuredUsage = undefined;
     streamedOutputChars = 0;
@@ -2360,7 +2819,19 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           stopSteerApplied?.();
           stopSteerApplied = onLocalChatSteerApplied(sessionId, (steerIds) => {
             if (!busy || id !== turnSessionId) return;
+            // The person's own lines that join now are echoed into the transcript where they joined (below the
+            // tool results, above the next answer) and saved, so the next turn's history carries them too.
+            const joinedLines = joinedSteerRows(queue.items, steerIds, () => new Date().toISOString());
             const applied = queue.markSteered(steerIds);
+            for (const row of joinedLines) {
+              appendMessage(sessionId, row);
+              debug.log('tui.transcript', 'steer-echo', { sessionId, chars: row.content.length });
+            }
+            if (joinedLines.length > 0) {
+              session = loadSession(sessionId);
+              vanishReload ??= 'session-reload';
+              messages = session ? displayAfterReload(sessionId, session.messages, 'steer') : messages;
+            }
             let mailApplied = 0;
             for (const steerId of steerIds) {
               const msgId = mailSteers.get(steerId);
@@ -2383,7 +2854,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         const withCandidate = replacementContextLine ? withReplacementCandidateContext(text, replacementContextLine) : text;
         // mf1(#38102 r4): the notice turn carries the one-line source head for the model only; the person's
         // view is stripped back to the notice text (public-history, like the interrupt/candidate heads).
-        const withNotice = noticeSource !== null ? withQueueNoticeContext(withCandidate, noticeSource) : withCandidate;
+        const withNotice = noticeSource !== null ? withQueueNoticeContext(withCandidate, noticeSource, noticeMeta) : withCandidate;
         const passiveCarry = preparePassiveResultCarry(queue, withNotice);
         const childText = interruptContext !== null ? withInterruptedOnPurposeContext(passiveCarry.text, interruptContext) : passiveCarry.text;
         if (noticeSource !== null) debug.log('tui.next', 'turn-notice-context', { source: noticeSource, chars: text.length });
@@ -2474,9 +2945,30 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       // A207 — the banner is painted in run() after the turn handle returns. This still
       // closes the turn-start timing segment on the first stream byte, not before it.
       onStreamOpen: () => dashboardRuntime.endTurnStartSegments(turnSessionId, 'stream-open'),
+      // TUI-ANSWER-VANISH-ON-TOOLCALL — the cleared pre-tool lines stay on screen above the tool rows.
+      onHeldAnswer: (text) => {
+        let anchor = -1;
+        for (let index = messages.length - 1; index >= 0 && anchor < 0; index -= 1)
+          if (messages[index]!.role === 'user' && stripQueueModelContext(messages[index]!.content) === turnText) anchor = index;
+        // The displayed bubble of that row (a long notice body is folded · public-history ⑤), so the anchor matches.
+        if (anchor >= 0) heldAnswerRows.set(turnSessionId, { anchor, userContent: publicUserText(messages[anchor]!.content), text });
+      },
       onPreview: (preview, replace, source) => {
         // A replaced reply restarts the text; earlier tools now precede all of it.
         if (replace) for (const callId of toolTextOffsets.keys()) toolTextOffsets.set(callId, 0);
+        // TUI-KEEP-TRANSCRIPT-ON-COMPACT ② — a replaced preview stays on screen as one folded «previous attempt» line.
+        if (replace && streamPreview?.sessionId === turnSessionId) {
+          const shown = streamPreview.assistantText ? nextAssistantPreviewText(streamPreview.text) : streamPreview.text;
+          const attempt = previousAttemptMarker(shown, preview);
+          if (attempt) {
+            if (id === turnSessionId && messages.length > 0) {
+              turnEndMarkers.set(turnSessionId, [...(turnEndMarkers.get(turnSessionId) ?? []),
+                { afterMessageIndex: messages.length - 1, text: attempt.text, tone: 'dim', detail: attempt.detail }]);
+              debug.log('tui.transcript', 'preview-replaced', { sessionId: turnSessionId, chars: shown.length, kept: true });
+            } else debug.log('tui.transcript', 'answer-vanished', { sessionId: turnSessionId, cause: 'preview-replace',
+              chars: shown.length, preview: vanishPreview(shown) }, { level: 'info' });
+          }
+        }
         // The REPL tags only session/chat onText; tool, reasoning and diagnostic frames stay separate.
         streamPreview = { sessionId: turnSessionId, text: preview, assistantText: source === 'assistant-text' };
         const progress = preview ? streamReplyProgress(turnSessionId) : null;
@@ -2491,7 +2983,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         if (/^Compacted \d+→\d+ messages$/.test(compactStatus)) lastCompactCount = compactStatus;
         status = projectUserReplyStatus(compactStatus);
         session = loadSession(turnSessionId);
-        messages = session?.messages ?? [];
+        // A status without counts (not fired · failed) is no compaction point — reload as any other reload.
+        const compactedDisplay = /^Compacted\b/.test(compactStatus)
+          ? displayAfterCompaction(turnSessionId, session?.messages, compactStatus)
+          : displayAfterReload(turnSessionId, session?.messages ?? [], 'compact-not-fired');
+        observeTranscriptReload(messages, compactedDisplay, 'compact', turnSessionId);
+        vanishReload = 'compact-reload';
+        messages = compactedDisplay;
         expandedToolBlocks.clear();
         render();
       },
@@ -2515,7 +3013,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         messageBlockSessions.save(turnSessionId, state);
         if (id === turnSessionId) {
           session = loadSession(turnSessionId);
-          messages = session?.messages ?? messages;
+          const reloaded = session ? displayAfterReload(turnSessionId, session.messages, 'message-block') : messages;
+          observeTranscriptReload(messages, reloaded, 'message-block', turnSessionId);
+          vanishReload ??= 'session-reload';
+          messages = reloaded;
           messageBlocks = state.blocks;
           messageBlockLevels = state.levels;
           messageBlockRawTexts = state.rawTexts;
@@ -2572,7 +3073,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           ...(outcome.authFailureKind ? { replyFailureKind: outcome.authFailureKind } : {}),
         });
         session = loadSession(turnSessionId);
-        messages = session?.messages ?? [];
+        vanishReload ??= 'session-reload';
+        messages = displayAfterReload(turnSessionId, session?.messages, 'settled');
         if (ceoTurn && outcome.kind === 'completed' && outcome.goalStopReason !== 'max_turns') {
           const reply = messages.slice(messagesAtTurnStart).filter((row) => row.role === 'assistant' && row.replyFinal === true).at(-1)?.content;
           if (reply) {
@@ -2591,6 +3093,21 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           markers.push({ afterMessageIndex: messages.length - 1, text: turnEndText });
           turnEndMarkers.set(turnSessionId, markers);
         }
+        // TUI-ANSWER-VANISH-ON-TOOLCALL — the real wire never sends a replace frame for a
+        // tool-round clear (llm.ts emits an empty chunk and chat.ts drops the full flag), so
+        // the pre-tool streamed lines live only in the live preview. Hand them to the screen
+        // holder before the live state is discarded, so the settled transcript keeps them
+        // above the tool rows of the same turn (same holder, settle path).
+        if (!heldAnswerRows.has(turnSessionId) && streamPreview !== null && streamPreview.sessionId === turnSessionId
+          && visibleToolActivity.length > 0) {
+          const heldText = heldPreToolText(streamPreview, toolTextOffsets);
+          if (heldText !== null) {
+            let anchor = -1;
+            for (let index = messages.length - 1; index >= 0 && anchor < 0; index -= 1)
+              if (messages[index]!.role === 'user' && stripQueueModelContext(messages[index]!.content) === turnText) anchor = index;
+            if (anchor >= 0) heldAnswerRows.set(turnSessionId, { anchor, userContent: turnText, text: heldText });
+          }
+        }
         activity = [];
         streamPreview = null;
         // Keep the completed tree visible after settlement, now inline after the turn's user
@@ -2601,12 +3118,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           for (let index = messages.length - 1; index >= 0 && anchor < 0; index -= 1)
             if (messages[index]!.role === 'user' && stripQueueModelContext(messages[index]!.content) === turnText) anchor = index;
           if (anchor >= 0) settledTurnTools.set(turnSessionId, [...(settledTurnTools.get(turnSessionId) ?? [])
-            .filter((entry) => entry.anchor !== anchor), { anchor, userContent: turnText, rows: visibleToolActivity,
+            .filter((entry) => entry.anchor !== anchor), { anchor, userContent: publicUserText(messages[anchor]!.content), rows: visibleToolActivity,
               ...(graphView.events.length > 0 ? { graph: [...graphView.events] } : {}) }]);
         }
         visibleToolActivity = [];
         turnAbort = null;
-        scroll = 0;
+        // TUI-STICKY-SCROLLBACK: a turn end (often a notice turn) never moves a scrolled view; the person's submit/End does.
+        resetScroll('turn-end');
         // A mail turn marks its mail seen only once it answered; a turn that failed or was cancelled right away wakes again.
         wakeup?.noteTurnFinished(turnResponded);
         // B1-C seen only after an answered turn (seat-mail notices too) — a failed turn requeues once, never «seen».
@@ -2632,16 +3150,19 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         try {
           if (seatPlanLink?.turnEnded(planChainNotice, outcome.kind === 'completed', outcome.planOutcome) && queue.count > 0) injectKey(queueWake);
         } catch { /* plan bookkeeping never blocks a turn end */ }
-        const auto = decideNextTuiAutoContinue(outcome, queue.autoDispatchCount, input.editor.text);
+        // QUEUE-FINISH-FIRST — ordinary (P1/P2) mail no longer makes the turn end «yield»: the continuation is judged
+        // first, and the mail waits (held · peeked) while the work stays open. A person's line / P0 still yields.
+        const holdableQueued = queuedForFinishFirst().filter((item) => item.kind === 'notice' && item.passive !== true
+          && (finishFirst.classify(item) === 'P1' || finishFirst.classify(item) === 'P2')).length;
+        const auto = decideNextTuiAutoContinue(outcome, Math.max(0, queue.autoDispatchCount - holdableQueued), input.editor.text);
+        let continuationOpenedAtEnd = false;
+        let requirementPending = false;
+        let waitingReplyTo: number[] = [];
         if (goalContinue && auto === 'complete') goalContinue.noteGoalCompleted();
         if (goalContinue && auto === 'yield') {
           debug.log('tui.proactive', 'yield-user-input', { queued: queue.count, bufferedChars: input.editor.text.length });
         }
-        // Stay busy through settle. A sidetab switch requested in that window stays
-        // pending (switchSession sees busy) and runs only after this release.
-        try {
-          await releaseBusyAfterSettle({
-            settle: async () => {
+        const settleTurn = async (): Promise<void> => {
               if (!(auto === 'check' && goalContinue && wakeup)) return;
               // One branch: the goal controller is created with the wakeup door, so it is always here.
               // Self-pull runs in this same branch only when goalContinue.check() opened nothing.
@@ -2651,23 +3172,57 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
                   auto,
                   goal: {
                     check: () => {
-                      try { return goalContinue!.check(); }
+                      try { const r = goalContinue!.check(); if (r.opened) continuationOpenedAtEnd = true; return r; }
                       catch { return { opened: true, reason: 'goal-check-threw' }; }
                     },
                   },
-                  pull: () => pullSeatAfterGoal({
+                  pull: async () => {
+                    // OP-REQUIREMENT-LOOP: open OP requirements get one continuation turn before self-pull.
+                    const pullSeat = detectSeat(process.cwd())?.seat ?? null;
+                    if (pullSeat === 'OP') {
+                      try {
+                        const { runRequirementTurnEnd } = await import('../op-requirements/turn-end.js');
+                        const req = await runRequirementTurnEnd({ seat: pullSeat, humanTurn: from?.kind === 'human' ? { turnId: turnRunId, text: turnText } : null,
+                          startTurnIfIdle: (text, opts) => startContinuationTurn(text, opts), notify: (line) => { pushNotice(line); render(); } });
+                        requirementPending = req.pending === true;
+                        waitingReplyTo = req.waitingReplyTo ?? [];
+                        if (req.opened) continuationOpenedAtEnd = true;
+                        if (req.opened) return { pulled: false, skipped: 'goal-opened' as const, hook: seatSelfPull };
+                      } catch (error) { debug.log('op.requirements', 'turn-end-failed', { error: String(error).slice(0, 200) }); }
+                    }
+                    return pullSeatAfterGoal({
                     goal: null,
                     startTurnIfIdle: (text, opts) => wakeup!.gate.startTurnIfIdle(text, opts),
-                    seat: detectSeat(process.cwd())?.seat ?? null,
+                    seat: pullSeat,
                     queueCount: queue.count,
                     draftLength: input.editor.text.length,
                     readUnread: readUnreadSummary,
                     hook: seatSelfPull,
                     startTurnIfIdleForHook: (text, opts) => wakeup!.gate.startTurnIfIdle(text, opts),
-                  }),
+                  });
+                  },
                 });
                 if (settled) seatSelfPull = settled.hook;
               } catch { /* a goal check or a pull never blocks turn settlement */ }
+        };
+        // Stay busy through settle. A sidetab switch requested in that window stays
+        // pending (switchSession sees busy) and runs only after this release.
+        try {
+          await releaseBusyAfterSettle({
+            settle: async () => {
+              // QUEUE-FINISH-FIRST — work-in-progress for this turn end; recorded before release opens the door.
+              try { await settleTurn(); } finally {
+                const armed = goalContinue?.isArmed() === true;
+                finishFirst.noteTurnEnd({ workInProgress: auto === 'check' && (armed || continuationOpenedAtEnd || requirementPending),
+                  waitingReplyTo: [...waitingReplyTo, ...(await armedMailReplyWaits())] });
+                // SESSION-AUTOPILOT — never just stop: no continuation opened and no wake scheduled → arm one (cadence).
+                autopilotTurnEnded({ from, failed: outcome.kind === 'failed',
+                  ...(outcome.kind === 'failed' ? { failureSig: String(outcome.error ?? outcome.goalStopReason ?? 'failed') } : {}),
+                  fingerprint: (() => { try { return dashboardRuntime.replyLinesOfThisTurn(messages, outcome.compacted ? 'after-last-user' : messagesAtTurnStart).join('\n'); } catch { return ''; } })(),
+                  openWork: armed || requirementPending, continuationOpened: continuationOpenedAtEnd });
+                // QUEUE-P1-3MIN — the P1 turn is over: the paused work resumes right after release (retries while busy).
+                if (finishFirst.resumePending()) { const timer = setTimeout(() => { resumePausedWork(); }, 50); (timer as { unref?: () => void }).unref?.(); }
+              }
             },
             pendingSwitch: () => pendingSidetabSwitch,
             queueCount: () => queue.count,
@@ -2752,7 +3307,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         const seatName = resolveSeatRetroSeat(process.cwd());
         const intervalMin = parseSeatRetroIntervalMin(process.env.ELANOUS_SEAT_RETRO_INTERVAL_MIN);
         if (!seatName || intervalMin <= 0) return {};
-        try { return { retro: { seat: seatName, intervalMin, store: createFileSeatRetroStateStore(seatRetroStateFile(seatName)) } }; }
+        // OP-CEO-ALLOCATION-LOOP: the OP retro carries the runtime-built operating dashboard in its metrics slot (turn tail · cache-safe).
+        const opDashboard = seatName === 'OP' ? await import('../ops-dashboard/retro-wiring.js').then((m) => m.startOpDashboardRefresh()).catch(() => null) : null;
+        try { return { retro: { seat: seatName, intervalMin, store: createFileSeatRetroStateStore(seatRetroStateFile(seatName)), ...(opDashboard ? { metrics: opDashboard.metrics } : {}) } }; }
         catch { return {}; }
       })();
       // TURN-CAPSULE-EVENTS R1(C4) — the scheduler's bus adapter (schedule-wakeup.ts:219) gets its production
@@ -2841,12 +3398,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           render();
         },
       }));
-      const gate = wakeup.gate;
+      autopilotRhythm = 'retro' in retroDep;
+      await startAutopilot();
       goalContinue = dashboardRuntime.createGoalContinue({
-        startTurnIfIdle: (text, opts) => gate.startTurnIfIdle(text, opts),
+        // QUEUE-FINISH-FIRST — the continuation carries the held-mail peek and related mail (startContinuationTurn).
+        startTurnIfIdle: (text, opts) => startContinuationTurn(text, opts),
         notify: (line) => { pushNotice(line); render(); },
         // SEAT-STATE-ENUM: the block goes to els as a code (BLOCKED + one reason), never as the notice sentence.
-        onBlocked: (reason, detail) => agentEvents.blocked(reason, detail),
+        onBlocked: (reason, detail) => { agentEvents.blocked(reason, detail); needsHuman.blocked(reason, detail); },
         planNudge: true,
         // The gate only parks the turn. Watch until this loop takes it; otherwise withdraw and say stop.
         confirmSeatCapTurnStarted: (turnId) => wakeup!.confirmSeatCapTurnStarted(turnId),
@@ -2888,7 +3447,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         }
         if (!appended) return;
         session = loadSession(id!);
-        messages = session?.messages ?? [];
+        vanishReload ??= 'session-reload';
+        messages = displayAfterReload(id!, session?.messages, 'sim-watch');
         render();
       } catch (error) {
         if (simWatchTimer !== null) clearInterval(simWatchTimer);
@@ -2909,7 +3469,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     // the seat plan's restored active item, mail absorbed at boot — are woken here instead of waiting for a person to
     // type. Inside this try, so the finally always clears the interval.
     queueIdleWatchdog.kick('boot');
-    queueIdleTimer = setInterval(() => { queueIdleWatchdog.tick(); }, QUEUE_IDLE_TICK_MS);
+    queueIdleTimer = setInterval(() => {
+      queueIdleWatchdog.tick();
+      // QUEUE-FINISH-FIRST — a held item past its wait limit (P1 10 min · P2 20 min) or a closed coalescing window wakes the door.
+      if (!busy && finishFirst.heldCount() > 0 && finishFirst.releaseDue(queuedForFinishFirst())) injectKey(queueWake);
+    }, QUEUE_IDLE_TICK_MS);
     while (true) {
       const replayed = replay.shift();
       const rawKey = replayed ?? await readKey();
@@ -3040,7 +3604,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             focus = escapeSnapshot.focus;
           }
           escapeSnapshot = null;
-          if (step.wheel) scroll = wheelScroll(scroll, step.wheel, maxScroll);
+          if (step.wheel) applyWheel(step.wheel);
           render();
           continue;
         }
@@ -3258,7 +3822,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         if (!panelClick) sidetabDragSource = null;
         if (!panelClick && (key.mouse.type === 'click' || key.mouse.type === 'double-click') && !sidetabAttachments?.hasModal() && !sidetabAttachments?.hasRemoteView()) {
           const target = foldTargetAtScreenRow(logWindow.foldTargets, logWindow, key.mouse.row);
-          if (target) {
+          // NOTICE-FOLD-1LINE — a click on a notice opens/folds it in place (the view and the focus stay as they are).
+          if (target?.kind === 'tool' && toggleNoticePartFold(expandedNoticeRows, lastFrameMessages, target.index, target.part)) {
+            lastFoldTargetKey = `tool:${target.index}${target.part === undefined ? '' : `#${target.part}`}`;
+          } else if (target) {
             focus = 'log';
             lastFoldTargetKey = target.kind === 'message' ? `message:${target.id}` : `tool:${target.index}`;
             if (target.kind === 'message') {
@@ -3332,7 +3899,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           continue;
         }
         // Wheel over the chat moves the log only; the prompt and focus stay as they were.
-        scroll = wheelScroll(scroll, wheel, maxScroll);
+        applyWheel(wheel);
         render();
         continue;
       }
@@ -3434,6 +4001,12 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         render();
         continue;
       }
+      // TUI-STICKY-SCROLLBACK: End jumps a scrolled view back to the newest rows (the «↓ N new · End to jump» hint).
+      if (key.name === 'end' && scroll > 0 && !key.ctrl && !key.alt && !key.meta) {
+        resetScroll('end-key');
+        render();
+        continue;
+      }
       if (key.name === 'pageup' || key.name === 'pagedown') {
         focus = 'log';
         scroll = Math.max(0, scroll + (key.name === 'pageup' ? 10 : -10));
@@ -3444,7 +4017,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       if (focus === 'log' && (isToolFoldToggleKey(key.name) || key.name === 'space')) {
         const visibleTargets = logWindow.foldTargets.filter((candidate) => candidate.end >= logWindow.start
           && candidate.start < logWindow.start + logWindow.rows);
-        const targetKey = (candidate: typeof visibleTargets[number]): string => candidate.kind === 'message' ? `message:${candidate.id}` : `tool:${candidate.index}`;
+        const targetKey = (candidate: typeof visibleTargets[number]): string => candidate.kind === 'message' ? `message:${candidate.id}`
+          : `tool:${candidate.index}${candidate.part === undefined ? '' : `#${candidate.part}`}`;
         const target = nextVisibleFoldTarget(visibleTargets, messageBlocks, messageBlockLevels, lastFoldTargetKey);
         if (target?.kind === 'message') {
           lastFoldTargetKey = targetKey(target);
@@ -3454,7 +4028,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         }
         if (target?.kind === 'tool') {
           lastFoldTargetKey = targetKey(target);
-          if (expandedToolBlocks.has(target.index)) expandedToolBlocks.delete(target.index);
+          if (toggleNoticePartFold(expandedNoticeRows, lastFrameMessages, target.index, target.part)) { /* NOTICE-FOLD-1LINE — by row id */ }
+          else if (expandedToolBlocks.has(target.index)) expandedToolBlocks.delete(target.index);
           else expandedToolBlocks.add(target.index);
           render();
           continue;
@@ -3679,6 +4254,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         const pending = input.applyKey(key, queue.pendingTexts);
         if (pending.action === 'submit' && pending.submitted) rememberPrompt(pending.submitted);
         if (pending.action === 'submit' && pending.submitted) {
+          resetScroll('submit');
           // OBSERVE-TURN-EVENT-LIFECYCLE — 턴 중 사람 줄 도착(조향/대기 판정은 바로 아래).
           try { emitTurnLife('turn-life:event-arrived', { source: 'human', busy: true, arrivedAt: Date.now() }); } catch { /* observability is fail-open */ }
           const routeRegistry = await loadNextTuiRouteRegistry();
@@ -3825,6 +4401,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         input.retainLivePasteTokens([input.editor.text, ...queue.pendingTexts]);
       }
       if (result.action === 'submit' && result.submitted) {
+        resetScroll('submit');
         const submittedFull = input.expandSubmission(result.submitted, [input.editor.text, ...queue.pendingTexts]);
         // 지운 붙여넣기의 원문은 놓는다 — 입력칸·대기열에 남은 토큰만 쥔다(r3 must-fix).
         input.retainLivePasteTokens([input.editor.text, ...queue.pendingTexts]);
@@ -3872,6 +4449,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           continue;
         }
         if (!route && !submitted.startsWith('/')) {
+          // TUI-WAKE-NOTICE-HIDDEN: a notice never sits below the person's newest message.
+          notices = nextNoticeRows(notices, { kind: 'person' }, noticeGate);
+          internalNotices = [];
           pendingEcho = { role: 'user', content: submittedFull, ts: new Date().toISOString() };
           pendingEchoStart = messages.length;
           render();
@@ -3901,6 +4481,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             bindWakeupSession?.(id);
             restoreMessageBlockSession(id);
             lastFoldTargetKey = null;
+            expandedNoticeRows.clear();
             lastResumeRows = null;
             session = loadSession(id);
             messages = [];
@@ -3908,7 +4489,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             backgroundJobs.setSessionId(id);
             backgroundJobs.clear();
             activity = [];
-            scroll = 0;
+            resetScroll('session-switch');
             focus = 'input';
             input.clearHistory();
           }
@@ -3923,6 +4504,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             continue;
           }
           const compactSessionId = id;
+          let manualCompactStatus: string | null = null;
           setBusy(true);
           // OBSERVE-TURN-EVENT-LIFECYCLE — 채팅 턴 밖의 busy(압축): internal 문 관측.
           try { emitTurnLife('turn-life:turn-start', { door: 'internal', turnSessionId: id, eventId: id }); } catch { /* observability is fail-open */ } // 출처: TC #92565 — eventId = turnSessionId
@@ -3931,16 +4513,22 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           turnDone = Promise.all([import('./slash/compact.js'), import('../tui-client/local-chat-turn.js')])
             .then(([{ compactNextTuiSession }, { localChatModel }]) =>
               compactNextTuiSession(compactSessionId, { force: true, modelId: localChatModel(compactSessionId) }))
-            .then((outcome) => { status = `${outcome.status ?? 'Compacted'} · Enter send`; })
+            .then((outcome) => {
+              if (outcome.fired) manualCompactStatus = outcome.status ?? 'Compacted';
+              status = `${outcome.status ?? 'Compacted'} · Enter send`;
+            })
             .catch((error: unknown) => {
               status = `Compaction failed: ${safeStatusText(error instanceof Error ? error.message : String(error))}`;
             })
             .finally(() => {
               session = loadSession(compactSessionId);
-              messages = session?.messages ?? [];
+              vanishReload ??= 'compact-reload';
+              messages = manualCompactStatus !== null
+                ? displayAfterCompaction(compactSessionId, session?.messages, manualCompactStatus)
+                : displayAfterReload(compactSessionId, session?.messages, 'manual-compact');
               expandedToolBlocks.clear();
               setBusy(false);
-              scroll = 0;
+              resetScroll('compaction');
               settle();
               render();
             });
@@ -3979,14 +4567,16 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             bindWakeupSession?.(id);
             restoreMessageBlockSession(id);
             lastFoldTargetKey = null;
+            expandedNoticeRows.clear();
             lastResumeRows = null;
             session = loadSession(id);
+            vanishReload ??= 'session-reload';
             messages = session?.messages ?? [];
             expandedToolBlocks.clear();
             backgroundJobs.setSessionId(id);
             backgroundJobs.clear();
             activity = [];
-            scroll = 0;
+            resetScroll('resume');
             focus = 'input';
             input.clearHistory();
           }
@@ -4357,7 +4947,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         // A person's turn: an internal turn opened but not yet run gives way, and the door's «last turn» moves.
         wakeup?.gate.port.declined?.('human-turn');
         wakeup?.gate.noteHumanTurn();
-        goalContinue?.noteHumanTurn();
+        goalContinue?.noteHumanTurn(); agentEvents.resume(); needsHuman.resumed();
+        finishFirst.noteHumanTurn();
+        noteAutopilotHuman();
         humanTurnKeyAt = tuiLastHumanKeyAt();
         personTurnStarted = true;
         // OBSERVE-TURN-EVENT-LIFECYCLE — 한가 자리에 사람 턴 도착.
@@ -4378,8 +4970,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     tuiClosed = true;
     if (turnElapsedTimer !== null) clearInterval(turnElapsedTimer);
     if (queueIdleTimer !== null) clearInterval(queueIdleTimer);
+    if (autopilotTick !== null) clearInterval(autopilotTick);
     // MF(r3): TUI 닫힘 → 자리 우편 감시 폴링도 정지(핸들 보존으로 가능). 남으면 messages.db 를 계속 열고 죽은 큐에 notice 를 넣는다.
     seatMailWatcher.stop();
+    workPullStop?.();
     offSeatStop();
     offIdleChildWake();
     offIdleGraphNode();
@@ -4388,6 +4982,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     eventWatchStop.current?.();
     // #38260 REVIEW-2 ②: the fleet poller ends with this TUI (a re-entry creates its own; no second poller keeps asking).
     fleetSegment.stop();
+    llmUsage.stop();
     if (simWatchTimer !== null) clearInterval(simWatchTimer);
     if (sidetabRefreshTimer !== null) clearInterval(sidetabRefreshTimer);
     stopElsFeed();

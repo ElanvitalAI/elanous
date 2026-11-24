@@ -1,0 +1,35 @@
+{
+ "loops": {
+  "count": 0,
+  "armed": false,
+  "live": false,
+  "executionMode": "per-cycle"
+ },
+ "missions": 0,
+ "anomalies": 0,
+ "traces": [
+  {
+   "file": "buzz_cycle.log",
+   "ageMin": 9
+  },
+  {
+   "file": "community_buzz.db",
+   "ageMin": 9
+  },
+  {
+   "file": "price_history.db",
+   "ageMin": 9
+  },
+  {
+   "file": "ops_health.log",
+   "ageMin": 9
+  },
+  {
+   "file": "outbound_deliveries.db",
+   "ageMin": 16
+  }
+ ],
+ "recordedFrom": "live:eln-ops",
+ "source": "fixture",
+ "recordedAt": "2026-11-24T04:59:07.088Z"
+}

@@ -72,6 +72,10 @@ const DEFAULT_KILL_ESCALATION_TIMEOUT_MS = 1_000;
  *  never closed it: the snapshot then follows the live grid again (terminals bound the hold the same way). */
 const SYNC_UPDATE_MAX_HOLD_MS = 1_000;
 
+/** ELS-WHEEL-HISTORY: where a wheel over a pane goes — the pane's own mouse report (SGR 1006 or legacy X10 encoding),
+ *  ↑/↓ keys (alternate screen + DECSET 1007), or the multiplexer's own scrollback. */
+export type WheelRoute = 'mouse-sgr' | 'mouse-x10' | 'arrows' | 'host';
+
 export interface PtyScreenRenderOptions {
   /** Reconstruct each xterm cell's SGR attributes for terminal-native screen inspection. */
   readonly ansi?: boolean;
@@ -281,6 +285,8 @@ export interface PtyHandle extends PtyControlTarget {
    *  there belongs to the pane program as bytes: the els scrollback lane is empty on an alternate screen.
    *  Absent on a handle without a screen emulator. */
   wheelPassthrough?(): boolean;
+  /** ELS-WHEEL-HISTORY: where a wheel over this pane goes, from the pane's current terminal modes (see WheelRoute). */
+  wheelRoute?(): WheelRoute;
   /** Render the current screen as a PNG (xterm grid → SVG → PNG). Returns
    *  null when the emulator or the SVG→PNG renderer is unavailable. For
    *  VISUAL delivery — e.g. a Telegram photo attachment when the user asks
@@ -574,6 +580,13 @@ export function startPty(opts: StartOpts): PtyHandle {
   // the bytes as they arrive, so a snapshot taken in between shows a half-erased, half-drawn frame (lines twice or missing).
   // The grid as it was when the region opened is the last complete frame — renderScreen serves that until the region closes.
   let syncFrame: { at: number; plain: string[]; ansi: string[]; cursor: string } | null = null;
+  // ELS-WHEEL-HISTORY: the two wheel-relevant DECSET modes xterm's `modes` does not expose — 1006 (SGR mouse encoding)
+  // and 1007 (alternate scroll: a wheel on the alternate screen becomes ↑/↓). Read from the pane's own output.
+  let sgrMouse = false;
+  let alternateScroll = false;
+  const trackWheelModes = (params: readonly (number | number[])[], on: boolean): void => {
+    for (const param of params) { if (param === 1006) sgrMouse = on; else if (param === 1007) alternateScroll = on; }
+  };
   const grid = (t: XtermHeadless, ansi: boolean, back = 0): string[] => {
     const active = t.buffer.active;
     const rows: string[] = [];
@@ -587,10 +600,19 @@ export function startPty(opts: StartOpts): PtyHandle {
   if (term) {
     const t = term;
     const handles2026 = (params: readonly (number | number[])[]): boolean => params.some((param) => param === 2026);
-    t.parser.registerCsiHandler({ prefix: '?', final: 'h' }, (params) => { if (handles2026(params) && !syncFrame) syncFrame = { at: Date.now(), plain: grid(t, false), ansi: grid(t, true), cursor: cursorOf(t) }; return false; });
-    t.parser.registerCsiHandler({ prefix: '?', final: 'l' }, (params) => { if (handles2026(params)) syncFrame = null; return false; });
+    t.parser.registerCsiHandler({ prefix: '?', final: 'h' }, (params) => { if (handles2026(params) && !syncFrame) syncFrame = { at: Date.now(), plain: grid(t, false), ansi: grid(t, true), cursor: cursorOf(t) }; trackWheelModes(params, true); return false; });
+    t.parser.registerCsiHandler({ prefix: '?', final: 'l' }, (params) => { if (handles2026(params)) syncFrame = null; trackWheelModes(params, false); return false; });
   }
 
+  // ELS-WHEEL-HISTORY (herdr wheel_routing): the route is read from the pane's CURRENT modes at every frame —
+  // ① any mouse reporting on (1000/1002/1003/9) → the program gets the wheel as its own mouse report;
+  // ② alternate screen + 1007 → ↑/↓ keys; ③ otherwise the els scrollback scrolls.
+  const wheelRoute = (): WheelRoute => {
+    if (!term) return 'host';
+    if (term.modes.mouseTrackingMode !== 'none') return sgrMouse ? 'mouse-sgr' : 'mouse-x10';
+    if (term.buffer.active.type === 'alternate' && alternateScroll) return 'arrows';
+    return 'host';
+  };
   let nickname = opts.nickname;
   let lastWriteActor: PtyWriteActor | null = null;
   let writeAllActive = false;
@@ -762,11 +784,8 @@ export function startPty(opts: StartOpts): PtyHandle {
     // tracking (any DECSET mode ≠ none) means a wheel belongs to the pane program as bytes (the els
     // scrollback lane is empty there: an alternate screen has no history to spin). The els server asks
     // this per frame and stamps it on the attach frames; the view routes the wheel accordingly.
-    wheelPassthrough(): boolean {
-      if (!term) return false;
-      const t = term;
-      return t.buffer.active.type === 'alternate' && t.modes.mouseTrackingMode !== 'none';
-    },
+    wheelPassthrough(): boolean { return wheelRoute().startsWith('mouse'); },
+    wheelRoute: () => wheelRoute(),
     async renderScreenPng(): Promise<Buffer | null> {
       if (!term) return null;
       const t = term;

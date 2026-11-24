@@ -72,7 +72,7 @@ export function buildRunShellTool(): LLMToolSpec {
       'Returns exit code, stdout, stderr, elapsed time, and an outcome tag. ' +
       'Commands outside the local-read policy require a human-approved, single-use execution grant; ' +
       "the approval parameter and previously cached decisions do not bypass that execution gate. " +
-      'Use script for up to eight ordered eln, git, gh, kubectl or host read CLI calls. Exact local read argv needs no prompt; network reads and unlisted eln argv require human approval. Unlisted git, gh, kubectl and host argv are refused. For the OP 30-minute check use check=30-minute with checkSeat, checkVersion and checkPreviousGreen. The model receives a bounded summary. ' +
+      'Use script for up to eight ordered eln, git, gh, kubectl or host read CLI calls. Exact local read argv needs no prompt; network reads and unlisted eln argv require human approval. Unlisted git, gh, kubectl and host argv are refused. For a 30-minute check use check=30-minute with checkSeat and checkVersion; OP also requires checkPreviousGreen. The model receives a bounded summary. ' +
       'Every invocation is written to ~/.monad-agent/audit/shell-YYYY-MM-DD.ndjson.',
     parameters: {
       type: 'object',
@@ -100,8 +100,9 @@ export function buildRunShellTool(): LLMToolSpec {
             },
           },
         },
-        check: { type: 'string', enum: ['30-minute'], description: 'One RunShell script call for the standard seat check.' },
-        checkSeat: { type: 'string', enum: ['OP'] },
+        check: { type: 'string', enum: ['30-minute', 'landing', 'verdict-receipt'], description: 'One RunShell script call for a standard check.' },
+        checkCell: { type: 'string', pattern: '^[A-Z0-9][A-Z0-9_-]{0,127}$', description: 'Checklist cell for landing or verdict-receipt.' },
+        checkSeat: { type: 'string', enum: ['OP', 'JUD', 'JUD-B', 'REL', 'RES'] },
         checkVersion: { type: 'string', description: 'Exact release version, such as 0.3.33.' },
         checkPreviousGreen: { type: 'integer', minimum: 0, maximum: 9999, description: 'OP 30-minute check: green count from the preceding check.' },
         cwd: {
@@ -148,7 +149,7 @@ export function buildRunShellTool(): LLMToolSpec {
             "Requires mode='bg'. Enqueue one <task-notification> once this many complete output lines have been seen.",
         },
       },
-      oneOf: [{ required: ['command'] }, { required: ['script'] }, { required: ['recipeId'] }, { required: ['check', 'checkSeat', 'checkVersion', 'checkPreviousGreen'] }],
+      oneOf: [{ required: ['command'] }, { required: ['script'] }, { required: ['recipeId'] }, { required: ['check', 'checkSeat', 'checkVersion'] }],
       additionalProperties: false,
     },
   };

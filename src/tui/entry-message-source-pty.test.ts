@@ -28,10 +28,11 @@ test('a waker turn is saved as from.kind system and draws as a dim line, not as 
     });
     expect(run.exitCode).toBe(0);
     const transcript = screen.slice(0, screen.lastIndexOf('SRC-WOKE'));
-    expect(transcript).toContain('↻ Resuming (scheduled check)');
-    expect(transcript).not.toMatch(/^> \[예약 깨움/mu);
+    // TUI-NOTICE-QUIET (대표 11-24): the resume banner is bookkeeping — logged (tui.notice suppressed), not drawn.
+    expect(transcript).not.toContain('↻ Resuming (scheduled check)');
+    expect(transcript).not.toMatch(/^❯ \[예약 깨움/mu);
     // The person's own turn still draws as the person.
-    expect(screen).toMatch(/^> SRC-WAIT please/mu);
+    expect(screen).toMatch(/^❯ SRC-WAIT please/mu);
     const sessionFile = readdirSync(join(root, 'sessions')).find((name) => name.endsWith('.jsonl'))!;
     const users = readFileSync(join(root, 'sessions', sessionFile), 'utf8').split('\n').filter(Boolean)
       .map((line) => JSON.parse(line) as { role: string; content: string; from?: unknown }).filter((row) => row.role === 'user');

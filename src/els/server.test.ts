@@ -105,10 +105,11 @@ test('JUD #39053 ⓒ1 E2E: direct-socket and env-spoofed writes are denied at th
   if ('exitCode' in started) throw new Error(started.message);
   cleanups.push(() => started.close());
   const made = JSON.parse((await ask(root, { op: 'new', ws: 'OP', cwd: '/work', command: ['sh'] })).message) as { pane: string };
-  // ① 직통 소켓(무토큰): 변형 연산 거부.
+  // ① 직통 소켓(무토큰): 11-23 완화(server-auth.ts:268-271 «outsider/owner are allowed»)로 문을 통과해
+  // 연산 검증에 닿는다 — 이 요청엔 `from` 이 없다: exitCode 2 malformed 답(원격 probe 실측 원문 리터럴).
   const direct = await askRaw(root, { op: 'do', pane: made.pane, action: 'text', text: 'ls' });
-  expect(direct.exitCode).toBe(1);
-  expect(direct.message).toContain('no pane credential');
+  expect(direct.exitCode).toBe(2);
+  expect(direct.message).toBe('els do: text and from are required');
   // ② ELANOUS_SEAT=OP 위장: env 문자열을 토큰으로 제출해도 원장없는 토큰은 outsider.
   const spoof = await askRaw(root, { op: 'do', pane: made.pane, action: 'text', text: 'ls' }, { op: 'auth', token: 'OP', pid: 1 });
   expect(spoof.exitCode).toBe(1);
@@ -117,10 +118,11 @@ test('JUD #39053 ⓒ1 E2E: direct-socket and env-spoofed writes are denied at th
   const fakeAuth = await askRaw(root, { op: 'do', pane: made.pane, action: 'text', text: 'ls' }, { op: 'auth', token: fakeCredential, pid: 1 });
   expect(fakeAuth.exitCode).toBe(1);
   expect(fakeAuth.message).toBe('auth: invalid credential');
-  // Each refusal must have its own audit record, including authentication rejection.
+  // Each refusal must have its own audit record, including authentication rejection. The tokenless ①
+  // now passes the door (exitCode 2 above) and leaves no denial row — the ledger holds the two auth refusals.
   const auditText = readFileSync(join(root, 'els', 'control-audit.jsonl'), 'utf8');
   const audit = auditText.trim().split('\n').map((l) => JSON.parse(l) as { action: string; result: string; reason: string; peerPid?: number });
-  expect(audit).toHaveLength(3);
+  expect(audit).toHaveLength(2);
   expect(audit.every((row) => row.result === 'denied')).toBe(true);
   expect(audit.filter((row) => row.action === 'auth')).toEqual([
     expect.objectContaining({ result: 'denied', reason: 'invalid credential' }),
@@ -133,7 +135,7 @@ test('JUD #39053 ⓒ1 E2E: direct-socket and env-spoofed writes are denied at th
   expect(legit.exitCode, `legit close answer: ${JSON.stringify(legit)}`).toBe(0);
 });
 
-test('workspace rename socket door resolves the actual target and denies outsiders and unknown targets', async () => {
+test('workspace rename socket door resolves the actual target by id; an outsider rename is allowed (11-23 relax) and unknown targets are denied', async () => {
   const root = state();
   const fake = (): ElsPty => ({ id: `pty_${Math.random().toString(16).slice(2)}`, isAlive: () => true, write: () => {}, renderScreen: async () => '', onExit: () => {}, kill: () => {} });
   const started = await startElsServer({ stateRoot: root, spawn: fake });
@@ -145,14 +147,16 @@ test('workspace rename socket door resolves the actual target and denies outside
   const before = await list();
   const alpha = before.workspaces.find(w => w.name === 'Alpha')!;
   const beta = before.workspaces.find(w => w.name === 'Beta')!;
-  expect((await askRaw(root, { op: 'rename', kind: 'workspace', id: beta.id, name: 'bad', at: { ws: 'Alpha' } })).exitCode).not.toBe(0);
-  expect(await list()).toEqual(before);
+  // 11-23 완화(server-auth.ts:268-271): outsider rename 도 허용 — `at` 는 승인에 쓰이지 않고 문이 id 로
+  // 실제 대상을 확정한다(server.ts:1656-1662). beta 는 'bad' 로 바뀐다.
+  expect((await askRaw(root, { op: 'rename', kind: 'workspace', id: beta.id, name: 'bad', at: { ws: 'Alpha' } })).exitCode).toBe(0);
+  expect((await list()).workspaces).toEqual([{ ...alpha }, { ...beta, name: 'bad' }]);
   expect((await ask(root, { op: 'rename', kind: 'workspace', id: 'missing', name: 'bad' })).exitCode).not.toBe(0);
   expect((await ask(root, { op: 'rename', kind: 'workspace', id: alpha.id, name: 'Changed' })).exitCode).toBe(0);
-  expect((await list()).workspaces).toEqual(expect.arrayContaining([{ ...alpha, name: 'Changed' }, beta]));
+  expect((await list()).workspaces).toEqual(expect.arrayContaining([{ ...alpha, name: 'Changed' }, { ...beta, name: 'bad' }]));
 });
 
-test('tab close over the socket reaps an exited own tab, rejects a foreign tab and requires confirmation even with a file rule', async () => {
+test('tab close over the socket reaps an exited own tab, rejects a foreign tab; the owner closes without confirm (11-23 relax)', async () => {
   const root = state();
   const minted: Record<string, string>[] = [];
   const killed: boolean[] = [];
@@ -185,10 +189,12 @@ test('tab close over the socket reaps an exited own tab, rejects a foreign tab a
   const ownerToken = readFileSync(join(root, 'els', 'owner-token'), 'utf8').trim();
   const ownerAuth = { op: 'auth', token: ownerToken };
   expect((await askRaw(root, { op: 'seat-set', seat: 'OP' }, ownerAuth)).exitCode).toBe(0);
+  // 11-23 완화(server-auth.ts:294): 서버 소유자(op role)는 confirm 없이도 자기 탭을 닫는다 — 실측
+  // 'els close: tab … (N panes)'. 탭이 이미 정리되었으므로 confirmed 재시도는 문에서 거부(1)된다.
   const noConfirm = await askRaw(root, { op: 'close-tab', tab: ownTab }, ownerAuth);
-  expect(noConfirm.exitCode).toBe(1);
-  expect(noConfirm.message).toContain('confirm');
-  expect((await askRaw(root, { op: 'close-tab', tab: ownTab, confirmed: true }, ownerAuth)).exitCode).toBe(0);
+  expect(noConfirm.exitCode).toBe(0);
+  expect(noConfirm.message).toContain('els close: tab');
+  expect((await askRaw(root, { op: 'close-tab', tab: ownTab, confirmed: true }, ownerAuth)).exitCode).toBe(1);
   const after = JSON.parse((await askRaw(root, { op: 'ls' })).message) as { panes: Array<{ pane: string }> };
   expect(after.panes.map(row => row.pane)).toEqual([foreign.pane]);
   expect(killed).toEqual([false, false]); // already exited: nothing left to kill
@@ -257,16 +263,18 @@ test('server automatically archives and reaps only an exited pane after 30 minut
   cleanups.push(() => started.close());
   const dead = JSON.parse((await askRaw(root, { op: 'new', ws: 'W', cwd: '/dead', command: ['sh'] })).message) as { pane: string };
   const live = JSON.parse((await askRaw(root, { op: 'new', ws: 'W', cwd: '/live', command: ['sh'] })).message) as { pane: string };
-  expect((await askRaw(root, { op: 'close', pane: live.pane, confirmed: true })).exitCode).toBe(1);
+  // 11-23 완화(server-auth.ts:268-271): 무토큰 confirmed close 도 허용된다 — live pane 이 종료되고
+  // journal 에서 지워진다. 아래 reap 검증은 exited(dead) pane 에만 남는다.
+  expect((await askRaw(root, { op: 'close', pane: live.pane, confirmed: true })).exitCode).toBe(0);
   alive[0] = false;
   exits[0]!();
   await new Promise((resolve) => setTimeout(resolve, 20));
-  expect((JSON.parse((await askRaw(root, { op: 'ls' })).message) as { panes: unknown[] }).panes).toHaveLength(2);
+  expect((JSON.parse((await askRaw(root, { op: 'ls' })).message) as { panes: unknown[] }).panes).toHaveLength(1); // the confirmed close already removed the live pane
   clock += 30 * 60_000;
   await new Promise((resolve) => setTimeout(resolve, 40));
   const listed = JSON.parse((await askRaw(root, { op: 'ls' })).message) as { panes: Array<{ pane: string }> };
-  expect(listed.panes.map((row) => row.pane)).toEqual([live.pane]);
-  expect(killed).toEqual([false, false]);
+  expect(listed.panes.map((row) => row.pane)).toEqual([]); // the reap archived the dead pane; the live pane was closed above
+  expect(killed).toEqual([false, true]); // the confirmed close killed the live pane; the reaper kills nothing
   const dir = join(root, 'els', 'reaped-panes');
   const files = readdirSync(dir);
   expect(files).toHaveLength(1);
@@ -327,7 +335,8 @@ test('child op over the socket: start, status, end write the parent result line,
   cleanups.push(() => started.close());
   expect((await ask(root, { op: 'child', action: 'start', id: 'h1', ws: 'OP', source: 'harness', label: 'review' })).exitCode).toBe(0);
   expect((await ask(root, { op: 'child', action: 'start', id: 'h1', ws: 'OP', source: 'harness', label: 'review' })).exitCode).toBe(1);
-  expect((await ask(root, { op: 'child', action: 'summary', ws: 'OP' })).message).toBe('⎇1 ●1');
+  // #39760 status-vocab.ts:9 — working mark 🟢: summary glyph 리터럴을 실측 원문으로 갱신.
+  expect((await ask(root, { op: 'child', action: 'summary', ws: 'OP' })).message).toBe('⎇1 🟢1');
   expect((await ask(root, { op: 'child', action: 'status', id: 'h1', state: 'blocked', line: '승인 대기' })).exitCode).toBe(0);
   const rows = JSON.parse((await ask(root, { op: 'child', action: 'tree', ws: 'OP' })).message) as { state: string; text: string }[];
   expect(rows.map((row) => [row.state, row.text])).toEqual([['blocked', '↳ ⎇ harness · review · 승인 대기']]);
@@ -336,7 +345,7 @@ test('child op over the socket: start, status, end write the parent result line,
   expect(ended.message).toContain('FAILED: boom');
   const logged = readFileSync(join(root, 'els', 'child-results.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { ws: string; line: string });
   expect(logged).toEqual([{ at: expect.any(String), ws: 'OP', line: ended.message }] as never);
-  expect((await ask(root, { op: 'child', action: 'summary', ws: 'OP' })).message).toBe('⎇1 ✕1');
+  expect((await ask(root, { op: 'child', action: 'summary', ws: 'OP' })).message).toBe('⎇1 🔴1');
 });
 
 test('a pane started by `els new` carries the workspace and socket in its env, and a sub-agent started there becomes a child tab', async () => {
@@ -352,8 +361,11 @@ test('a pane started by `els new` carries the workspace and socket in its env, a
   const env = seen[0]!;
   expect(env.ELANOUS_ELS_WS).toBe('OP');
   expect(env.ELANOUS_ELS_SOCKET).toBe(elsSocketPath(root));
-  // Exactly the three names the pane carries: the two eln reads + the server-minted pane token (env inheritance = descent proof).
-  expect(Object.keys(env).sort()).toEqual(['ELANOUS_ELS_PANE', 'ELANOUS_ELS_PANE_TOKEN', 'ELANOUS_ELS_SOCKET', 'ELANOUS_ELS_WS']);
+  // The four ELS names the pane carries: the two eln reads + the socket + the server-minted pane token (env inheritance =
+  // descent proof). The pane env also carries the plumbing keys the server plants beside them — ELANOUS_STATE_DIR ·
+  // ELANOUS_STATE_DIR_SOURCE · ELANOUS_EVENT_{SOCKET,WS,PANE} (server.ts registerSpawn call site) and ELANOUS_TRACK on a
+  // seat identity (core.ts newPane) — so the four-name subset keeps this descent proof while those evolve.
+  expect(Object.keys(env).sort()).toEqual(expect.arrayContaining(['ELANOUS_ELS_PANE', 'ELANOUS_ELS_PANE_TOKEN', 'ELANOUS_ELS_SOCKET', 'ELANOUS_ELS_WS']));
   // What the eln in that pane does at boot: wire the producer from the env it was given.
   const registry = new AgentRegistry();
   const wired = wireElsChildProducer({ registry, ws: env.ELANOUS_ELS_WS!, socketPath: env.ELANOUS_ELS_SOCKET!, request: requestEls });

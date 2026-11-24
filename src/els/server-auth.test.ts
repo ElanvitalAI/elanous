@@ -236,8 +236,10 @@ describe('authorizeRequest — JUD #39053 ⓒ1 리터럴', () => {
       { tabId: 't-live', workspace: 'W', ownerSeats: ['RES-INFRA'] }).allow).toBe(true);
     const opPeer: ServerRole = { ...peer, seat: 'OP' };
     const opRules: readonly AllowRule[] = [{ ...rules[0]!, seat: 'OP' }];
+    // ELS-OP-CLOSE-TAB (대표 11-24 «보안 기본 완화»): the verified OP peer is the coordinator — closing another seat's tab is
+    // its routine action (the OP tab itself stays refused: op-close-tab.test.ts).
     expect(authorizeRequest(opPeer, request, 'W', opRules,
-      { tabId: 't-live', workspace: 'W', ownerSeats: ['TC-H-CX-12'] }).allow).toBe(false);
+      { tabId: 't-live', workspace: 'W', ownerSeats: ['TC-H-CX-12'] }).allow).toBe(true);
   });
 
   test('outsider 읽기 연산 허용(③ 읽기 전용)', () => {
@@ -387,5 +389,45 @@ describe('ELS-PTY-RECORD door: snapshot writes a file so it is mutating, judged 
     const hand = registry.classify({ token: handEnv[PANE_ENV] });
     expect(authorizeRequest(hand, { op: 'record', pane: 'p-hand' }, 'w-hand', undefined).allow).toBe(true);
     expect(authorizeRequest(hand, { op: 'record', pane: 'p-other' }, 'w-other', undefined).allow).toBe(false);
+  });
+});
+
+// ELS-HERDR-CLI-PARITY ② (tab-close bisect 11-24 · 첫 적록 809b57f70c #39938): a tab no seat owns —
+// a plain scratch tab — is closed unconfirmed by no one, the owner terminal and the same-UID
+// operator included. A person confirms it (confirm:true), a coordinator still closes a seated tab,
+// and the OP tab above stays refused for everyone without a person's yes.
+describe('authorizeRequest — ELS-HERDR-CLI-PARITY ② : 무소유 탭 닫기 문', () => {
+  const plain = { tabId: 't-plain', workspace: 'w', ownerSeats: [null] };
+  const roles: readonly ServerRole[] = [
+    { kind: 'owner', note: 'owner terminal' },
+    { kind: 'outsider', note: 'same-uid operator' },
+    { kind: 'op', pane: 'p-op' },
+    { kind: 'peer', pid: 4242, pane: 'herdr:p7', seat: 'OP', uid: 501 },
+    { kind: 'hand', seat: 'HAND-MCP', workspaces: ['w'], pane: 'p-hand' },
+  ];
+  test('① 무소유 탭 무확인 닫기 — owner·같은-UID 연산자·OP 패널·OP peer·손 좌석 전부 거부', () => {
+    for (const role of roles) {
+      const verdict = authorizeRequest(role, { op: 'close-tab', tab: 't-plain' }, 'w', undefined, plain);
+      expect(verdict.allow).toBe(false);
+      expect(verdict.allow === false && verdict.reason).toContain('a tab no seat owns');
+    }
+  });
+  test('② 대상 미해결(tabScope 없음)도 같은 무소유 거부 — CLI 가 확인-불가 exit 2 로 통일', () => {
+    const verdict = authorizeRequest(roles[0]!, { op: 'close-tab', tab: 'missing' }, 'w', undefined, undefined);
+    expect(verdict.allow).toBe(false);
+    expect(verdict.allow === false && verdict.reason).toContain('a tab no seat owns');
+  });
+  test('③ confirm:true(사람)이면 owner 통과 · 좌석 탭은 OP 패널·OP peer 가 사람 없이 닫는다', () => {
+    expect(authorizeRequest(roles[0]!, { op: 'close-tab', tab: 't-plain', confirmed: true }, 'w', undefined, plain).allow).toBe(true);
+    const seated = { tabId: 't-seat', workspace: 'w', ownerSeats: ['HAND-MCP'] };
+    expect(authorizeRequest(roles[2]!, { op: 'close-tab', tab: 't-seat' }, 'w', undefined, seated).allow).toBe(true);
+    expect(authorizeRequest(roles[3]!, { op: 'close-tab', tab: 't-seat' }, 'w', undefined, seated).allow).toBe(true);
+  });
+  test('④ OP 탭 자체는 무확인엔 이 문보다 먼저 모두에게 거부 · 사람(confirm:true)이면 통과', () => {
+    const opTab = { tabId: 't-op', workspace: 'w', ownerSeats: [null], opTab: true };
+    for (const role of roles) expect(authorizeRequest(role, { op: 'close-tab', tab: 't-op' }, 'w', undefined, opTab).allow).toBe(false);
+    const refused = authorizeRequest(roles[0]!, { op: 'close-tab', tab: 't-op' }, 'w', undefined, opTab);
+    expect(refused.allow === false && refused.reason).toContain('the OP tab itself');
+    expect(authorizeRequest(roles[0]!, { op: 'close-tab', tab: 't-op', confirmed: true }, 'w', undefined, opTab).allow).toBe(true);
   });
 });

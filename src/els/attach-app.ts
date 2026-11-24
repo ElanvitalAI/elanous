@@ -16,10 +16,22 @@ import { isServerAway, noteAfterFrame, RECONNECT_NOTE, type AttachFrame, type At
 import { createKeyRouter, type KeyAction } from './attach-keys.js';
 import { composeView, emptyCoordinatorSpaces, emptyRemoteCoordinators, FIRST_RUN_HINT, NARROW_BELOW_COLS, parsePaneRows, parseRemoteRows, SIDEBAR_HELP, sidebarWidthFor, UNREACHABLE_MARK, type PaneRow } from './attach-view.js';
 import { buildTabDropdown, layoutSpaceList, buildTabRow, dropdownTargets, withCommands, type DropdownTarget } from './space-tabs-view.js';
-import { interpretMouse, type MouseLayout, type MouseReport } from './attach-mouse.js';
+import { interpretMouse, wheelBytes, type MouseLayout, type MouseReport } from './attach-mouse.js';
+import type { WheelRoute } from '../pty-shell/registry.js';
 import { withNewDefaults } from './cli-args.js';
 import type { ElsResult } from './core.js';
 import type { ElsRequest } from './server.js';
+
+/** ELS-STALE-CLIENT: the one-line hint while this client is older than the server it talks to. */
+export const STALE_CLIENT_HINT = '새 빌드 있음 · q 로 나갔다 다시 els';
+
+/** True when the server's `ls` answer reports a different, NEWER build than this client's own (unknown = not stale). */
+export function clientIsStale(own: { readonly sha: string; readonly builtAt?: number }, lsMessage: string): boolean {
+  let server: { sha?: unknown; builtAt?: unknown } | undefined;
+  try { server = (JSON.parse(lsMessage) as { serverBuild?: { sha?: unknown; builtAt?: unknown } }).serverBuild; } catch { return false; }
+  if (!server || typeof server.sha !== 'string' || !server.sha || !own.sha || server.sha === own.sha) return false;
+  return typeof server.builtAt === 'number' && typeof own.builtAt === 'number' && server.builtAt > own.builtAt;
+}
 
 export interface AttachAppDeps {
   readonly request: (request: ElsRequest) => Promise<ElsResult>;
@@ -28,6 +40,8 @@ export interface AttachAppDeps {
   readonly size: () => { cols: number; rows: number };
   readonly cwd: string;
   readonly buildLabel?: string;
+  /** ELS-STALE-CLIENT: this client's own build (fixed for the life of the process — a running client never updates). */
+  readonly ownBuild?: { readonly sha: string; readonly builtAt?: number };
   /** Override the local active baton lookup for isolated view tests. */
   readonly actingSeat?: () => string | undefined;
   readonly env: Readonly<Record<string, string | undefined>>;
@@ -75,6 +89,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   let selectedEmpty: string | undefined;
   let emptyHits: readonly { readonly y: number; readonly ws: string }[] = [];
   let wrapped = false;                                           // ELS-ONE-SPACE: `w` wrapped this space's tab cycle — the next `w` steps to the next space
+  let staleClient = false;                                       // ELS-STALE-CLIENT: the server runs a newer build than this client
   let lsAnswer = '';                                             // the last `els ls` answer (each pane's command → its tab emoji)
   let ceoPendingRed = 0;                                         // authoritative els owner count; never infer 👀 from queue arrival
   let ceoSideUnavailable = false;
@@ -127,7 +142,8 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   const narrow = (): boolean => deps.size().cols < NARROW_BELOW_COLS;
   let mouseLayout: MouseLayout = { cols: 0, rows: 0, sidebarWidth: 0, sidebar: [], tabs: [] };
   let scroll = 0;                // lines the shown frame is above the live bottom (told by the server's frame)
-  let wheelPassthrough = false;   // ELS-WHEEL-SCROLLBACK (OP #136704): this frame's pane takes the wheel as bytes (alternate screen + its own mouse)
+  let wheelPassthrough = false;
+  let wheelRoute: WheelRoute = 'host';   // ELS-WHEEL-HISTORY: this frame's full wheel route (mouse report · ↑/↓ · els scrollback)   // ELS-WHEEL-SCROLLBACK (OP #136704): this frame's pane takes the wheel as bytes (alternate screen + its own mouse)
   // ELS-MOUSE-RELEASE (JUD-B #111750): a release follows its press. The press the app consumed (tab/list/⏏✕ click, wheel
   // excluded — it has no release) is answered by swallowing its release; a press that went to the pane program is answered by
   // passing its release to the pane too, wherever the pointer is let go — the pane saw the press and waits for the release.
@@ -166,7 +182,15 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     else if (action.kind === 'select') select(action.pane);
     // ELS-WHEEL-SCROLLBACK (OP #136704): a wheel over a pane that tracks its own mouse on an alternate screen belongs to
     // the pane program as bytes — the els scrollback lane is empty there, so scrolling it only eats the wheel.
-    else if (action.kind === 'scroll') { if (wheelPassthrough && attached) attached.input(report.bytes); else scrollPane(action.lines); }
+    // ELS-WHEEL-HISTORY: the frame's wheel route (read from the pane's CURRENT modes) decides — the pane's own mouse
+    // report at PANE coordinates, ↑/↓ for alternate scroll, else the els scrollback.
+    else if (action.kind === 'scroll') {
+      const route = wheelRoute !== 'host' ? wheelRoute : wheelPassthrough ? 'mouse-sgr' : 'host';
+      const left = mouseLayout.sidebarWidth > 0 ? mouseLayout.sidebarWidth + 1 : 0;
+      const top = everyRow().length > 0 ? 1 : 0;   // the tab row over the pane (paneSize)
+      const bytes = attached ? wheelBytes(route, report.button, report.x - left, report.y - top) : null;
+      if (bytes !== null && attached) attached.input(bytes); else scrollPane(action.lines);
+    }
     else if (attached) attached.input(action.bytes);
     else { note = '원격 pane은 마우스 통과 불가'; render(); }
   };
@@ -188,6 +212,9 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
 
   const statusText = (): string => {
     if (voice.isOpen()) return voice.line();
+    // ELS-STALE-CLIENT: a client started before the last update keeps its old code (live 11-24: a 11-23 client missed the
+    // wheel fix) — say so on the one line every screen keeps, until the person restarts it.
+    if (staleClient && !confirm && scroll === 0) return ` ${STALE_CLIENT_HINT}${deps.buildLabel ? ` · ${deps.buildLabel}` : ''} `;
     if (confirm) return ` ${confirm.prompt} · y 확인 · 다른 키 취소 `;
     if (scroll > 0) return ` ↑ 스크롤백 ${scroll}줄 위 · 휠·ctrl+b [ ] 이동 · 입력하면 맨 아래로 `;
     // 출처: seat-state/OP/orders/ELS-FIRST-RUN-UX-1119.md ③ 하단 항상 · UX #38884 — 조용할 때는 FIRST_RUN_HINT 리터럴 한 줄
@@ -200,9 +227,19 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     const where = row ? `${row.workspace} ▸ ${row.title.replace(/(\s*\[[^\]]*\])+\s*$/, '')} · ${row.state}${row.remote ? ' · 읽기 전용' : ''}` : 'pane 없음 — ctrl+b c 로 새 pane';
     return ` ${note ? `${note} · ` : ''}${readError ? `${readError} · ` : ''}${remoteStatus ? `${remoteStatus} · ` : ''}${where} · q 분리 `;
   };
-  const render = (): void => {
+  // ELS-TYPING-LATENCY: a pane frame (every echo of a typed key) changes only the pane area. The sidebar, tab row and
+  // dropdown come from the listing poll and the person's own actions — those renders recompute them; a frame render
+  // reuses the last computed chrome (no listing walk, no baton file read on the typing path).
+  let chrome: { cols: number; height: number; width: number; tabs: { line?: string }; overlay?: readonly string[]; sidebar: readonly string[] | null } | undefined;
+  const render = (frameOnly = false): void => {
     if (finished) return;
     const { cols, rows: height } = deps.size();
+    if (frameOnly && chrome && chrome.cols === cols && chrome.height === height && !newTab.isOpen() && !movePicker) {
+      const kept = chrome;
+      deps.write(composeView({ cols, rows: height, sidebar: kept.sidebar, frame, status: statusText(), buttons: buttonsLayout(cols).text,
+        ...(kept.tabs.line !== undefined ? { tabRow: kept.tabs.line } : {}), ...(kept.overlay ? { overlay: kept.overlay } : {}) }));
+      return;
+    }
     const width = sidebarWidthFor(cols, sidebarOpen);
     // ELS-ONE-SPACE (decision 11-18): left = the spaces folded (no pane lines, no headings); top = the selected space's tabs.
     const shown = withCommands(everyRow(), lsAnswer);
@@ -222,6 +259,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     const list = width ? layoutSpaceList(shown, selected, width, height - 1, deps.env.HOME, ceoSideUnavailable ? -1 : ceoPendingRed, [...emptyCoordinatorSpaces(lsAnswer, rows), ...remoteEmpty], selectedEmpty, agentsGrouped ? 'grouped' : 'status', actingSeat) : undefined;
     emptyHits = list?.emptySpaces ?? [];
     mouseLayout = { cols, rows: height, sidebarWidth: width, sidebar: list?.spaces ?? [], ...(list?.newBox ? { sidebarNew: list.newBox } : {}), tabs: tabs.tabs, ...(tabs.plus ? { plus: tabs.plus } : {}) };
+    chrome = { cols, height, width, tabs, ...(overlay ? { overlay } : {}), sidebar: list ? list.lines : null };
     const screen = composeView({ cols, rows: height, sidebar: list ? list.lines : null, frame, status: statusText(), buttons: buttonsLayout(cols).text,
       ...(tabs.line !== undefined ? { tabRow: tabs.line } : {}), ...(overlay ? { overlay } : {}),
       // ELS-APP-RENDER-SINGLE-FRAME: the dialog is spliced into the same frame — one write, never a second overlay pass.
@@ -255,8 +293,9 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       awaitingServer = false;
       frame = next.screen;
       scroll = next.back;                // the server tells how far this frame is above the live bottom
-      wheelPassthrough = next.wheelPassthrough === true;   // ELS-WHEEL-SCROLLBACK: the frame carries the pane's own wheel lane
-      render();
+      wheelPassthrough = next.wheelPassthrough === true;
+      wheelRoute = next.wheelRoute ?? 'host';   // ELS-WHEEL-SCROLLBACK: the frame carries the pane's own wheel lane
+      render(true);
     },
     onError: (message) => { if (mine === generation) { note = message; render(); } },   // typing refused (view-only attach): said, not swallowed
     onEnd: (code, reason) => {
@@ -305,7 +344,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       flushEmptyFocus();
     }
     generation++; attached?.detach(); attached = undefined; selected = undefined; awaitingServer = false;
-    selectedEmpty = ws; wrapped = false; frame = ''; scroll = 0; wheelPassthrough = false; readError = ''; note = '';
+    selectedEmpty = ws; wrapped = false; frame = ''; scroll = 0; wheelPassthrough = false; wheelRoute = 'host'; readError = ''; note = '';
     render();
   };
 
@@ -322,6 +361,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     frame = '';
     scroll = 0;
     wheelPassthrough = false;
+    wheelRoute = 'host';
     readError = '';
     remember();
     if (pane && remoteRows.some((row) => row.pane === pane)) {
@@ -428,6 +468,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     const before = rows;
     rows = parsePaneRows(answer.message);
     lsAnswer = answer.message;
+    staleClient = deps.ownBuild ? clientIsStale(deps.ownBuild, answer.message) : false;
     try {
       const side = (JSON.parse(answer.message) as { ceoSide?: { pendingRed?: unknown } }).ceoSide;
       ceoSideUnavailable = side !== undefined && (side as { error?: unknown }).error === 'unavailable';
@@ -698,6 +739,9 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       if (finished) return;
       if (wasSavingAtInput && !newTab.isSaving()) router.resetPrefix();
       router.feed(text, () => newTab.isOpen() && !newTab.isSaving(), (event) => {
+        if (finished) return;
+        if (event.kind === 'paste-incomplete') { note = 'Paste incomplete; waiting for end or reconnect ELS'; render(); return; }
+        if (event.kind === 'paste-discarded') { note = 'Paste discarded; please retry'; render(); return; }
         if (movePicker) {
           if (event.kind === 'input') {
             const pending = movePicker;
@@ -737,7 +781,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
         else if (event.key === ':') voice.open();                  // ELS-VOICE-CONTROL-POPUP: say it to els
         else if (event.key === 'Q') quitSpace();                  // ELS-EXIT-BG-BUTTONS: ✕ 종료 by key (ctrl+b q = ⏏ 백그라운드)
         else { note = `ctrl+b ${event.key} 는 아직 없음`; render(); }
-      });
+      }, !newTab.isOpen() && !movePicker && !dropdown && !confirm && !voice.isOpen());
       wasSavingAtInput = newTab.isSaving();
   };
 

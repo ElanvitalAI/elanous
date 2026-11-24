@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'no
 import { join } from 'node:path';
 import { MsgStore } from '../../../msg/msg-store.js';
 import { mockSeatPtySequence } from '../../mock-seat-pty-sequence.js';
+import { PASSIVE_RESULT_IDLE_WAKE_MS } from '../../../tui/core/queue.js';
 import type { SimWorldScenario } from '../types.js';
 
 const SEAT = 'SIMSEAT';
@@ -44,8 +45,12 @@ const c4Agent: SimWorldScenario = {
       const at = screen.lastIndexOf(marker);
       return at >= 0 && screen.slice(at).includes('C4_REPLY') && /Worked for|Turn done/.test(screen.slice(at));
     };
-    const urgentTurns = () => captured().filter(row => newestUser(row).includes('C4 urgent request'));
-    const agentTurns = () => captured().filter(row => newestUser(row).includes('캡슐 완료: agent c4 worker'));
+    // The six-level-evidence preparation call also lands in requests.jsonl with the raw request embedded
+    // after `Request: "…"` (its newest user starts with 'Prepare the result contract'), so a bare substring
+    // count double-counts every turn: urgent 2 = prep + the one serving, agent 2 = prep + the one turn.
+    const turnRows = () => captured().filter(row => !newestUser(row).startsWith('"Prepare the result contract'));
+    const urgentTurns = () => turnRows().filter(row => newestUser(row).includes('C4 urgent request'));
+    const agentTurns = () => turnRows().filter(row => newestUser(row).includes('캡슐 완료: agent c4 worker'));
     let baselineStarted = 0;
     let parentSubmittedAt = 0;
     let parentSettledAt = 0;
@@ -111,7 +116,7 @@ const c4Agent: SimWorldScenario = {
             if (agentTurns().length === 0 || !paintedAnswerAfter(screen, '캡슐 완료: agent c4 worker')) return false;
             agentDeliveredAt = Date.now();
             return true;
-          }, timeoutMs: AGENT_HOLD_MS + 25_000 },
+          }, timeoutMs: AGENT_HOLD_MS + 25_000 + PASSIVE_RESULT_IDLE_WAKE_MS }, // Agent 완료 알림도 idle 120s passive ripen 뒤(#39609·#39666) — #39881 C1 줄포리, C4는 이전 예산이 ripen 전 만료되어 N03 타임아웃.
           { label: 'no duplicate completion', until: () => { duplicateWindowAt ||= Date.now(); return Date.now() - duplicateWindowAt >= 3_000; }, timeoutMs: 8_000 },
         ],
       });

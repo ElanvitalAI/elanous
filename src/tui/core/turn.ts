@@ -35,6 +35,8 @@ export interface NextTuiTurnDeps {
   onStreamOpen?(): void;
   onProgress?(): void;
   onPreview?(text: string, replace: boolean, source?: 'assistant-text'): void;
+  /** TUI-ANSWER-VANISH-ON-TOOLCALL — a tool-round clear frame hands the shown pre-tool lines to the screen holder. */
+  onHeldAnswer?(text: string): void;
   onCompact?(status: string): void;
   onNotice?(line: string): void;
   onAgent?(event: AgentDisplayEvent): void;
@@ -88,6 +90,9 @@ export function startNextTuiTurn(input: Omit<NextTuiTurnInput, 'signal'>, deps: 
     secretPreviewBlocked ||= securityText.toUpperCase().includes(pemOpening);
     pemOpeningTail = securityText.slice(-(pemOpening.length - 1));
     if (replace) {
+      // TUI-ANSWER-VANISH-ON-TOOLCALL — a tool-round clear frame hands the streamed pre-tool
+      // lines to the screen holder before the preview restarts clean; a blocked secret clears silently.
+      if (preview.trim() !== '' && !secretPreviewBlocked) deps.onHeldAnswer?.(preview);
       preview = '';
       previewSource = undefined;
       clearRenderTimer();

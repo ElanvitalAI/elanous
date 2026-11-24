@@ -17,6 +17,8 @@
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { classificationAudit, isUncategorizedSecurityHold } from './security-hold-policy.js';
+import { requestSecurityClassification } from './security-classification-request.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { appendWaiverEvent, appendWaiverEvents, consumeWaiverEvent, evaluateWaiverEvent, expireWaiverEvent, issueOpWaiverEvent, issueReviewCapEvent, readWaiverEvents } from '../release-loop/waiver-events.js';
 import { tierModel } from '../llm/model-defaults.js';
@@ -71,6 +73,9 @@ export function apiReviewModelFromRoleSpec(spec: RoleLlmSpec | undefined): strin
 }
 
 export interface SelfReviewCliOpts {
+  /** Explicit opt-in addresses; never infer a reviewer or sender from a model lane. */
+  classificationFrom?: string;
+  classificationTo?: string;
   intent?: string | undefined;
   model?: string | undefined;
   /** Explicit `roleLlm.review` provider+model, normalized by the CLI entry. */
@@ -117,6 +122,8 @@ export interface SelfReviewCliOpts {
 
 /** 셸/네트워크/로그 경계 — 테스트는 전부 대역으로 채운다. */
 export interface SelfReviewCliDeps {
+  /** Message boundary for isolated review tests. */
+  requestClassification?: typeof requestSecurityClassification;
   /** Explicit repository root for exact-head cited-path checks; absent means unmeasured. */
   reviewRepositoryPath?: string;
   /** `gh` 호출. 실패도 예외 없이 `{status, stdout, stderr}` 로 돌려준다(spawnSync 동형). */
@@ -2092,6 +2099,21 @@ export function selfReviewJsonLine(results: readonly unknown[]): string {
  * scanTurnSignalsAsync 안에서. fail-soft: 발화 실패가 리뷰 저장을 되돌리지 않는다.
  * 저장 블록이 헬퍼로 분리돼 «실제 리뷰 진입점 → 원장 행» 통합 시험이 가능하다.
  */
+/** Post only after the canonical record exists and an independent head read still matches.
+ * Missing addresses never imply an identity; errors must not change the saved verdict. */
+export function requestSavedClassification(input: {
+  path: string; pr: string; head: string; result: Record<string, unknown>;
+  from?: string; to?: string; currentHead: () => string | undefined;
+  request?: typeof requestSecurityClassification;
+}): string {
+  if (!isUncategorizedSecurityHold(input.result)) return 'not-eligible';
+  if (!input.from || !input.to) return 'addresses-required';
+  try {
+    if (input.currentHead() !== input.head) return 'head-unverified-or-moved';
+    return (input.request ?? requestSecurityClassification)(input.path, input.from, input.to).status;
+  } catch { return 'request-failed'; }
+}
+
 export async function persistReviewedResult(input: {
   enriched: Record<string, unknown>; pinnedHead: string; pr: string | number; canonicalResultPath: string;
   normalized: { result: Record<string, unknown>; count: number };
@@ -2107,11 +2129,12 @@ export async function persistReviewedResult(input: {
     || enriched.currentHeadCommit !== pinnedHead) {
     throw new Error('review result is not pinned to the confirmed current PR head');
   }
-  writeFileSync(canonicalResultPath, selfReviewJsonLine([normalized.result]));
+  const output: Record<string, unknown> = { ...normalized.result, classificationAudit: classificationAudit(normalized.result) };
+  writeFileSync(canonicalResultPath, selfReviewJsonLine([output]));
   try {
     // r17 — JUD-C #128647: must-fix 개수만 세지 않고 실제 항목(문자열만)을 요약자 입력에 전달한다.
-    if (lessonSignal && Array.isArray(normalized.result.mustFix) && normalized.result.mustFix.length > 0) {
-      const mustFix = normalized.result.mustFix.filter((finding): finding is string => typeof finding === 'string');
+    if (lessonSignal && Array.isArray(output.mustFix) && output.mustFix.length > 0) {
+      const mustFix = (output.mustFix as unknown[]).filter((finding): finding is string => typeof finding === 'string');
       await emitReviewMustFixSignal(lessonOptions ?? {}, pr, pinnedHead, mustFix);
     }
   } catch { /* lesson emission cannot break review persistence */ }
@@ -2251,6 +2274,10 @@ export async function runSelfReviewCliCommand(
               // 플래그로 canonical 저장을 건너뛰므로 여기가 정확히 1회만 저장·발화한다.
               await persistReviewedResult({ enriched, pinnedHead, pr, canonicalResultPath, normalized,
                 ...(deps.lessonOptions ? { lessonOptions: deps.lessonOptions } : {}) });
+              const classificationStatus = requestSavedClassification({ path: canonicalResultPath, pr, head: pinnedHead,
+                result: normalized.result, from: opts.classificationFrom, to: opts.classificationTo, request: deps.requestClassification,
+                currentHead: () => { const current = prHeadCommit(pr, deps); return current.state === 'known' ? current.value : undefined; } });
+              if (opts.classificationFrom || opts.classificationTo) deps.log('review.classification-request', { pr, head: pinnedHead, status: classificationStatus });
             } catch (error) {
               failed += 1;
               deps.error(`PR ${pr}: 리뷰 결과 저장 실패 (${canonicalResultPath}): ${error instanceof Error ? error.message : String(error)}`);
@@ -3540,6 +3567,8 @@ async function runSelfReviewCliCommandPinned(
       ...(mainMergeCapExempt ? { mainMergeOnlyCapExempt: true } : {}),
       findingPathHeadChecks, pathWarnings, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles,
       ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) };
+    // Audit the same normalized findings that persistence writes, without changing stdout's findings.
+    Object.assign(resultOutput, { classificationAudit: classificationAudit(normalizeSavedReviewMustFix(resultOutput).result) });
     if (opts.json || opts.save !== undefined || shouldPersistCapResult) results.push(resultOutput);
     // REVIEW-NO-SILENT-GLM-FALLBACK — an invalid verdict never becomes the canonical same-head result
     //   (it stays in `--json`/`--save` output, which the land reader refuses).
@@ -3557,6 +3586,10 @@ async function runSelfReviewCliCommandPinned(
         await persistReviewedResult({ enriched: resultOutput, pinnedHead: diffRead.headCommit, pr,
           canonicalResultPath: path, normalized,
           ...(deps.lessonOptions ? { lessonOptions: deps.lessonOptions } : {}) });
+        const classificationStatus = requestSavedClassification({ path, pr, head: diffRead.headCommit,
+          result: normalized.result, from: opts.classificationFrom, to: opts.classificationTo, request: deps.requestClassification,
+          currentHead: () => { const current = prHeadCommit(pr, deps); return current.state === 'known' ? current.value : undefined; } });
+        if (opts.classificationFrom || opts.classificationTo) deps.log('review.classification-request', { pr, head: diffRead.headCommit, status: classificationStatus });
         if (normalized.count > 0 && opts.save === undefined) deps.log('mustfix-normalized', { pr, head: diffRead.headCommit, count: normalized.count });
       } catch (error) {
         deps.error(`PR ${pr}: 리뷰 결과 저장 실패 (${path}): ${error instanceof Error ? error.message : String(error)}`);

@@ -90,7 +90,7 @@ test('actual entry sizes the separator to the chat pane through sidebar and widt
       expect(chatPart(line)).toBe('─'.repeat(width - Bun.stringWidth(left) - Bun.stringWidth('│')));
       expect(chatPart(line)).not.toBe('─'.repeat(width));
     }
-    // DESIGN §2b (#38392): the status line is the last row; the input sits right above it.
-    expect(promptRow(frame.screen)).toBe(24 - 2);
+    // DESIGN §2b (#38392): the status rows are last (TUI-STATUS-3ROW: seat · work from 20 rows); the input sits right above them.
+    expect(promptRow(frame.screen)).toBe(24 - 3);
   }
 }, 30_000);

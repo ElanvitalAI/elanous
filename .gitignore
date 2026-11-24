@@ -190,3 +190,6 @@ CLAUDE.local.md
 
 # ci-typecheck-changed 임시 gate tsconfig(실행 중 생성 — 추적 금지)
 tsconfig.gate-roots.*.json
+
+# Generated internal docs map; regenerated on build/pack.
+docs-index.jsonl

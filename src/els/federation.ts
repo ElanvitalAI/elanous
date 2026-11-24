@@ -21,7 +21,7 @@ export interface FederationDeps {
   readonly postJson?: (host: FederatedHost, path: string, payload: unknown) => Promise<{ status: number; body: unknown }>;
 }
 
-interface RemotePane { ws: string; tab: string; pane: string; title: string; cwd: string; state: string; seat?: string | null; spaceCoordinator?: boolean; activityState?: string; kind?: string; build?: unknown; role?: 'coordinator';
+interface RemotePane { ws: string; tab: string; pane: string; title: string; cwd: string; state: string; model?: string; seat?: string | null; spaceCoordinator?: boolean; activityState?: string; kind?: string; build?: unknown; role?: 'coordinator';
   /** ELS-TAB-STATE-BADGE: decided once at the origin server; absent when that server is older (state then reads as before). */
   badge?: string; badgeLabel?: string; stalled?: boolean; lastEventAtMs?: number;
   /** SEAT-STATE-ENUM: the origin server's status codes, validated. */
@@ -43,6 +43,7 @@ function remotePanes(body: unknown, hostName: string): RemotePane[] | undefined 
     if (!reparsed || reparsed.ws !== parts.ws || reparsed.tab !== parts.tab || reparsed.pane !== parts.pane) return undefined;
     rows.push({ ws: parts.ws, tab: parts.tab, pane: parts.pane,
       title: String(pane.title ?? ''), cwd: String(pane.cwd ?? ''), state: String(pane.state ?? ''), build: pane.build,
+      ...(typeof pane.model === 'string' ? { model: pane.model } : {}),
       ...(pane.seat === null || (typeof pane.seat === 'string' && /^[A-Z][A-Z0-9_-]{0,63}$/.test(pane.seat)) ? { seat: pane.seat } : {}),
       ...(typeof pane.kind === 'string' && ['eln', 'codex', 'claude', 'grok', 'shell', 'other'].includes(pane.kind) ? { kind: pane.kind } : {}),
       ...(pane.role === 'coordinator' ? { role: 'coordinator' } : {}),

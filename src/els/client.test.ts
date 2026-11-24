@@ -71,6 +71,17 @@ test('explicit auth refusal is reported as an answered rejection', async () => {
   });
 });
 
+test('legacy invalid credential rejection is explicit and cannot become a success', async () => {
+  await withServer(s => s.once('data', () => s.end('{"exitCode":1,"message":"els: invalid credential"}\n{"exitCode":0,"message":"ok"}\n')), async path => {
+    expect(await requestEls(path, request, 1000, 'stale-token')).toMatchObject({
+      exitCode: 1, message: 'els: invalid credential', transport: { outcome: 'answered' },
+    });
+  });
+  await withServer(s => s.once('data', () => s.end('{"exitCode":0,"message":"els: invalid credential"}\n')), async path => {
+    expect((await requestEls(path, request, 1000, 'test-token')).transport).toEqual({ outcome: 'unknown', reason: 'malformed' });
+  });
+});
+
 test('auth acknowledgement is validated before accepting a result', async () => {
   await withServer(s => s.once('data', () => s.end('{"exitCode":0,"message":"auth: owner"}\n{"exitCode":0,"message":"ok","queued":2}\n')), async path => {
     const result = await requestEls(path, request, 1000, 'test-token');

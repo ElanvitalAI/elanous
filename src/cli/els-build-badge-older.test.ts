@@ -67,8 +67,10 @@ test('panes built from an ancestor of the desired SHA show the older badge and `
   expect(served).toContain('listening on');
   const socket = join(state, 'els', 'els.sock');
 
-  // A build report is mutating: the pane presents the token its server put in the pane's env. The pane's shell writes it to a
-  // file; the test then reports that pane's build with it.
+  // A build report is mutating. The pane env does carry the server-minted 48-hex pane credential (registerSpawn — the pane
+  // shell writes it out here; measured 11-24), but that credential is bound to its socket peer: a foreign process presenting
+  // it is «auth: outsider» by design (server.ts paneRoleValid). So the report goes in as what the current door accepts from
+  // this side of the socket — the same-uid credential-less caller (client.ts paneAuth → no auth frame, authorizeRequest).
   const open = async (title: string, sha: string | undefined): Promise<string> => {
     const tokenFile = join(cwd, `${title}.token`);
     const created = await side(['new', '--ws', 'HQ', '--cwd', cwd, '--title', title, '--', 'sh', '-c', `printf %s "$ELANOUS_ELS_PANE_TOKEN" > '${tokenFile}'; exec sh`]);
@@ -77,9 +79,10 @@ test('panes built from an ancestor of the desired SHA show the older badge and `
     if (!sha) return pane;
     const tokenDeadline = Date.now() + SERVE_READY_MS;
     while (Date.now() < tokenDeadline && !(existsSync(tokenFile) && readFileSync(tokenFile, 'utf8').length > 0)) await Bun.sleep(20);
-    process.env.ELANOUS_ELS_PANE_TOKEN = readFileSync(tokenFile, 'utf8');
+    // 실측 기대값(11-24): the pane env carries the minted 48-hex descent credential — the token is real; only the
+    // test's presentation path was stale.
+    expect(readFileSync(tokenFile, 'utf8')).toMatch(/^[0-9a-f]{48}$/);
     expect((await requestEls(socket, { op: 'build', pane, sha })).message).toBe('els build: recorded');
-    delete process.env.ELANOUS_ELS_PANE_TOKEN;
     return pane;
   };
   const paneOlder = await open('p-older', older);
@@ -88,8 +91,17 @@ test('panes built from an ancestor of the desired SHA show the older badge and `
   await open('p-silent', undefined);
 
   type Row = { pane: string; title: string; build: { sha: string | null; age: string; desired: string | null; trusted: boolean } };
-  const all = JSON.parse((await side(['ls'])).stdout) as { panes: Row[] };
-  expect(Object.fromEntries(all.panes.map((row) => [row.title, row.build.age]))).toEqual({ 'p-older': 'older', 'p-current': 'current', 'p-stray': 'different', 'p-silent': 'unknown' });
+  // build-badge 의 createGitAncestor 는 비동기 캐시다(ELS-SERVER-MAINLOOP-STARVATION): 첫 ls 가 git
+  // 자식의 답보다 빠르면 age 는 아직 'unknown' 이고 이후 macrotask 에 영구 memoize 된다. 확정될 때까지
+  // 재요청한다 — deadline 폴(시험만, 제품 0행)이지 성능 단언이 아니다. --list 라인과 --older 필터는 이 확정 뒤에.
+  const expectedAges: Record<string, string> = { 'p-older': 'older', 'p-current': 'current', 'p-stray': 'different', 'p-silent': 'unknown' };
+  const settled = (rows: Row[]): boolean => (Object.keys(expectedAges) as string[]).every((title) => rows.find((row) => row.title === title)?.build.age === expectedAges[title]);
+  let all = JSON.parse((await side(['ls'])).stdout) as { panes: Row[] };
+  for (const deadline = Date.now() + 10_000; !settled(all.panes) && Date.now() < deadline;) {
+    await Bun.sleep(50);
+    all = JSON.parse((await side(['ls'])).stdout) as { panes: Row[] };
+  }
+  expect(Object.fromEntries(all.panes.map((row) => [row.title, row.build.age]))).toEqual(expectedAges);
   expect(all.panes.find((row) => row.pane === paneOlder)!.build).toMatchObject({ sha: older, desired, trusted: false });
 
   // The badge `els --list` prints: self-reported and unauthenticated, sha7 + age.

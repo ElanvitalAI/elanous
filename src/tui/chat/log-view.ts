@@ -1,6 +1,7 @@
 import type { SerializedMessage } from '../../session/index.js';
 import { redactSecretText } from '../../debug/log.js';
-import { continueBanner, dimContinueBanner } from './continue-banner.js';
+import { continueBanner, continueLabel, dimContinueBanner } from './continue-banner.js';
+import { suppressedNoticeKind } from './notice-gate.js';
 import { planInterimDisplay, type InterimDisplay } from './goal-interim.js';
 import { parseToolResultEnvelope, toolResultBodyText, toolResultErrorText } from '../../chat/tool-render/result-text.js';
 import { agentTraceLine } from '../core/agents.js';
@@ -8,12 +9,14 @@ import chalk from 'chalk';
 import { renderMarkdown } from '../../render.js';
 import { nextTuiErrorCard } from './error-card.js';
 import { userTurnBandSgr } from './turn-band-theme.js';
+import { machineGlyph, machineRowStyle, noticeFoldSummary, noticeOfRow, noticePartHead, noticePartLine, type NoticeDisplayRow } from './notice-fold.js';
+import type { QueueNoticeHead, QueueNoticePart } from '../../chat/interjection.js';
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 const wordSegmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
 
-/** The user's own turn reads like the classic prompt line. */
-export const USER_PROMPT_MARK = '> ';
+/** The person's own turn: «❯ » on a band (PERSON-VS-MACHINE 대표 11-24) — a machine row never carries it. */
+export const USER_PROMPT_MARK = '❯ ';
 
 // NEXT-TUI-USER-TURN-COLOR (대표 11-17): a person's turn is a band across the whole row so it stands apart from
 // answers and tool rows. 대표 11-18: toned down to a neutral grey just off the terminal background — the colours are the
@@ -33,21 +36,30 @@ function agentBandRow(row: string, columns: number): string {
   return `\x1b[${AGENT_TURN_BAND_SGR}m${body}${pad}\x1b[0m`;
 }
 
+/** TUI-NOTICE-QUIET (대표 11-24): a scheduled/woken resume is bookkeeping — no row (the answer that follows is the surface);
+ *  a goal-continue «↻ Continuing (…)» keeps its one dim line. */
+function systemTurnLines(origin: string, columns: number): string[] {
+  const banner = continueBanner(origin);
+  if (suppressedNoticeKind(banner) === 'resume-banner') return [];
+  // PERSON-VS-MACHINE — a shown internal turn is a machine row: dim, its icon from the structured origin.
+  return [machineRowStyle(fitLogLine(`${machineGlyph(origin)} ${continueLabel(origin)}`, columns)), ''];
+}
+
 /** Rows for a user-role message by its structured source (never by its wording); null = the person's own turn. */
 function sourcedUserLines(message: SerializedMessage, columns: number): string[] | null {
   const from = message.from;
   if (!from || from.kind === 'human') return null;
   // The harness's own turn (waker, automatic continue, mail wake): one dim line, the internal instruction stays hidden.
-  if (from.kind === 'system') return [dimContinueBanner(fitLogLine(continueBanner(from.origin ?? 'internal'), columns)), ''];
+  if (from.kind === 'system') return systemTurnLines(from.origin ?? 'internal', columns);
   const head = [`${AGENT_MARK} ${from.seat ?? 'agent'}`, from.intent, from.due ? `due ${from.due}` : undefined, from.msgId ? `#${from.msgId}` : undefined].filter(Boolean).join(' · ');
   const rows = [...wrapLine(head, columns), ...safeLogText(message.content).split('\n').flatMap((part) => wrapLine(`  ${part}`, columns))];
   return [...(userTurnBandEnabled() ? rows.map((row) => agentBandRow(row, columns)) : rows), ''];
 }
 
-/** Paint one wrapped user row as a band to `columns`; «>» is bold, the body keeps normal weight. */
+/** Paint one wrapped user row as a band to `columns`; «❯» is bold, the body keeps normal weight. */
 export function userTurnBandRow(row: string, columns: number): string {
   const pad = ' '.repeat(Math.max(0, columns - Bun.stringWidth(row)));
-  const body = row.startsWith(USER_PROMPT_MARK) ? `\x1b[1m>\x1b[22m${row.slice(1)}` : row;
+  const body = row.startsWith(USER_PROMPT_MARK) ? `\x1b[1m❯\x1b[22m${row.slice(1)}` : row;
   return `\x1b[${userTurnBandSgr()}m${body}${pad}\x1b[0m`;
 }
 
@@ -359,17 +371,31 @@ function messageLines(
     if (agentLine) return [fitLogLine(agentLine, columns), ''];
     const running = message.toolResult === undefined;
     const outputLines = running ? 0 : toolOutputLineCount(message, columns);
-    if (running || outputLines <= TOOL_FOLD_LINE_LIMIT || expandedToolIndexes?.has(index)) {
+    if (running || expandedToolIndexes?.has(index)) {
       return [...toolLinesUnfolded(message, columns), ''];
     }
     return [toolFoldSummary(message.toolName || 'run', outputLines, columns), ''];
+  }
+  // NOTICE-FOLD-1LINE — an incoming notice is one summary line (a fold block like a tool call); expanded, its full text.
+  const notice = noticeOfRow(message);
+  if (notice) {
+    // 대표 12:2x — a mail notice folds PER MESSAGE: one dim «✉ #id from · first line…» row per mail, each opens alone.
+    if (notice.parts?.length) {
+      const open = new Set((message as NoticeDisplayRow).noticeOpenParts ?? []);
+      return [...notice.parts.flatMap((part) => noticePartRows(notice, part, columns, open.has(part.msgId))), ''];
+    }
+    const failed = (notice.failed ?? 0) > 0;
+    const head = machineRowStyle(fitLogLine(noticeFoldSummary(notice), columns), failed);
+    if (!expandedToolIndexes?.has(index)) return [head, ''];
+    return [head, ...safeLogText(notice.body).split('\n').flatMap((part) => wrapLine(`  ${part}`, columns))
+      .map((row) => machineRowStyle(row, failed)), ''];
   }
   // TUI-GOAL-INTERIM-QUIET — 내부 턴 입력은 사람 머리 없이 출처 한 줄 · 이어가기 앞 중간 보고는 한 줄로 접는다.
   if (message.role === 'user') {
     const sourced = sourcedUserLines(message, columns);
     if (sourced) return sourced;
   }
-  if (display?.kind === 'internal-input') return [dimContinueBanner(fitLogLine(continueBanner(display.origin), columns)), ''];
+  if (display?.kind === 'internal-input') return systemTurnLines(display.origin, columns);
   if (display?.kind === 'folded') return [...wrapLine(`  ${display.line}`, columns), ''];
   if (message.role === 'assistant' && message.replyFailure === true) {
     return [...nextTuiErrorCard(message.content, message.replyFailureKind)
@@ -390,6 +416,14 @@ function messageLines(
   }
   lines.push('');
   return lines;
+}
+
+/** One mail of a notice row: its folded line, or (open) its head and its whole text — dim, no band, never «❯». */
+function noticePartRows(notice: QueueNoticeHead, part: QueueNoticePart, columns: number, open: boolean): string[] {
+  const text = safeLogText(notice.body.slice(part.start, part.start + part.length));
+  if (!open) return [machineRowStyle(noticePartLine(part, text, columns))];
+  return [machineRowStyle(noticePartHead(part, columns)),
+    ...text.split('\n').flatMap((line) => wrapLine(`  ${line}`, columns)).map((row) => machineRowStyle(row))];
 }
 
 /** Classic dashboard resume stored its runtime context inside the user turn. Show the actual question only. */
@@ -430,13 +464,14 @@ export function logViewLinesWithInsertions(
   return lines.length > 0 ? lines : ['No chat history'];
 }
 
-/** Message indexes of tool blocks that would render collapsed (long + finished). */
+/** Message indexes of the fold blocks: finished tool blocks and incoming notice rows (NOTICE-FOLD-1LINE). */
 export function toolFoldBlockStarts(messages: readonly SerializedMessage[], columns: number): number[] {
   const starts: number[] = [];
   for (const [index, message] of messages.entries()) {
+    if (noticeOfRow(message)) { starts.push(index); continue; }
     if (message.role !== 'tool' || message.toolResult === undefined) continue;
     if (agentTraceLine(message)) continue;
-    if (toolOutputLineCount(message, columns) > TOOL_FOLD_LINE_LIMIT) starts.push(index);
+    starts.push(index);
   }
   return starts;
 }
@@ -447,7 +482,7 @@ export function isToolFoldToggleKey(name: string | undefined): boolean {
 }
 
 /** A foldable tool block's message index and its rendered line range [start, end] in logViewLines. */
-export interface ToolFoldBlockRange { index: number; start: number; end: number }
+export interface ToolFoldBlockRange { index: number; start: number; end: number; /** One mail of a notice row. */ part?: number }
 
 /**
  * Line ranges of the foldable tool blocks as logViewLines renders them with `expanded`.
@@ -467,7 +502,17 @@ export function toolFoldBlockRanges(
     if (!isLogRole(message)) continue;
     // Same per-message rendering as logViewLines (lines + one blank separator), interim plan included.
     const height = messageLines(message, index, columns, expanded, plan.get(index)).length;
-    if (foldable.has(index)) ranges.push({ index, start: line, end: line + height - 2 });
+    const notice = foldable.has(index) ? noticeOfRow(message) : null;
+    if (notice?.parts?.length) {
+      // NOTICE-FOLD-1LINE — each mail of the notice is its own fold target, at the rows it renders.
+      const open = new Set((message as NoticeDisplayRow).noticeOpenParts ?? []);
+      let at = line;
+      for (const part of notice.parts) {
+        const rows = noticePartRows(notice, part, columns, open.has(part.msgId)).length;
+        ranges.push({ index, part: part.msgId, start: at, end: at + rows - 1 });
+        at += rows;
+      }
+    } else if (foldable.has(index)) ranges.push({ index, start: line, end: line + height - 2 });
     line += height;
   }
   return ranges;

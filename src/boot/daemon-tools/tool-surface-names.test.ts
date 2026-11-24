@@ -9,6 +9,8 @@
 // ⚠️ 환경 의존 통제: finance 팩은 cfg.finance.enabled 게이트(Phase 0)라 cfg 를 명시 주입해 결정화하고,
 //    webterm 의 PtyShell* 는 ptyAvailable() 게이트라 조건부 단언한다. nest-cap 은 정상 테스트 프로세스
 //    (미-nested)에서 off 이므로 delegate/자율tool 이 노출됨을 전제.
+//    ElsControl(#39087)은 ELANOUS_ELS_SOCKET 게이트라 '' 로 고정해 결정화한다 — 데몬 라이브 셸에 소켓이
+//    있으면 챗 서피스 배열 끝에 ElsControl 이 끼어들어 정확배열 단언이 호스트 환경에 좌우된다.
 
 import { describe, test, expect, spyOn } from 'bun:test';
 import type { UserConfig } from '../../user-config/types.js';
@@ -18,6 +20,7 @@ import { toolSurface } from './index.js';
 import * as ptyRegistry from '../../pty-shell/registry.js';
 import { ptyAvailable } from '../../pty-shell/registry.js';
 import { isDevHarnessModelSurfaceEnabled } from '../../skills/tools/dev-harness.js';
+import * as elsControlTool from '../../els/els-control-tool.js';
 import { createChildPluginRoutes, routeOnlyHostToolSpecs } from '../../cli/child-plugin-runtime.js';
 import { DAEMON_MEMBER_ROUTE_TOOL_ALLOWLIST } from './plugin-routes.js';
 
@@ -115,14 +118,20 @@ describe('daemon toolSurface — Phase 3 골든룰(이름배열 diff=0·서피�
   });
 
   test("'chat' 서피스(finance off) = readonly + Edit/Write/Bash/delegate + L2 core (PTY 가용·불가 각각 정확히)", () => {
-    for (const available of [false, true]) {
-      const pty = spyOn(ptyRegistry, 'ptyAvailable').mockReturnValue(available);
-      try {
-        const names = toolSurface('chat', financeOff).specs.map((s) => s.name);
-        expect(names).toEqual([...CHAT_CORE, ...(available ? CHAT_PTY_EXTRA : []), ...CHAT_PLUGIN_ROUTES]);
-      } finally {
-        pty.mockRestore();
+    // #39087 ELN-ELS-NATIVE-TOOL — freeze the ElsControl gate off (see the 환경 의존 통제 header note).
+    const els = spyOn(elsControlTool, 'elsControlSocketPath').mockReturnValue('');
+    try {
+      for (const available of [false, true]) {
+        const pty = spyOn(ptyRegistry, 'ptyAvailable').mockReturnValue(available);
+        try {
+          const names = toolSurface('chat', financeOff).specs.map((s) => s.name);
+          expect(names).toEqual([...CHAT_CORE, ...(available ? CHAT_PTY_EXTRA : []), ...CHAT_PLUGIN_ROUTES]);
+        } finally {
+          pty.mockRestore();
+        }
       }
+    } finally {
+      els.mockRestore();
     }
   });
 
@@ -154,17 +163,23 @@ describe('daemon toolSurface — Phase 3 골든룰(이름배열 diff=0·서피�
   });
 
   test("'chat' finance 게이트 — off 는 finance_ 없음 / on 은 finance_quote 노출(Phase 0 게이팅)", () => {
-    const off = toolSurface('chat', financeOff).specs.map((s) => s.name);
-    const on = toolSurface('chat', financeOn).specs.map((s) => s.name);
-    expect(off.some((n) => n.startsWith('finance_'))).toBe(false);
-    expect(on).toContain('finance_quote');
-    // shared-app-tools contract: core, then the complete finance pack, then skill discovery/execution.
-    expect(on).toEqual([
-      ...CHAT_CORE.slice(0, -5),
-      ...buildFinanceTools().specs.map((spec) => spec.name),
-      'elanous_skills_list', 'skill_exec', 'app_build_plan', 'app_build', 'app_deploy',
-      ...off.slice(CHAT_CORE.length),
-    ]);
+    // Same ElsControl gate freeze as the exact-array test above — both arrays stay host-deterministic.
+    const els = spyOn(elsControlTool, 'elsControlSocketPath').mockReturnValue('');
+    try {
+      const off = toolSurface('chat', financeOff).specs.map((s) => s.name);
+      const on = toolSurface('chat', financeOn).specs.map((s) => s.name);
+      expect(off.some((n) => n.startsWith('finance_'))).toBe(false);
+      expect(on).toContain('finance_quote');
+      // shared-app-tools contract: core, then the complete finance pack, then skill discovery/execution.
+      expect(on).toEqual([
+        ...CHAT_CORE.slice(0, -5),
+        ...buildFinanceTools().specs.map((spec) => spec.name),
+        'elanous_skills_list', 'skill_exec', 'app_build_plan', 'app_build', 'app_deploy',
+        ...off.slice(CHAT_CORE.length),
+      ]);
+    } finally {
+      els.mockRestore();
+    }
   });
 
   test("'webterm' ⊇ 'chat' + 자율tool/웹터미널 (+ pty 가용 시 PtyShell·헤드리스)", () => {
