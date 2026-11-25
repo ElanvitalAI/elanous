@@ -176,11 +176,11 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
   };
 
   /** null = may open; else the paced rejection. */
-  const pacingRejection = (origin: InternalTurnOrigin): StartTurnIfIdleResult | null => {
+  const pacingRejection = (origin: InternalTurnOrigin, ownLimit = false): StartTurnIfIdleResult | null => {
     const pacing = deps.pacing;
     if (!pacing) return null;
     const external = EXTERNAL_EVENT_ORIGINS.has(origin);
-    if (!external && !ALARM_ORIGINS.has(origin) && consecutiveSelfStarted >= pacing.maxConsecutive) {
+    if (!external && !ownLimit && !ALARM_ORIGINS.has(origin) && consecutiveSelfStarted >= pacing.maxConsecutive) {
       return reject(origin, 'Cap', `pacing:run-cap ${consecutiveSelfStarted}/${pacing.maxConsecutive}`);
     }
     // The gap runs from the end of the last automatic turn (a long turn earns no free rest); before any end, from its open.
@@ -236,7 +236,7 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
       if (typing) return reject(origin, 'HumanTyping', typing);
       const text = input.trim();
       if (!text) return reject(origin, 'NotIdle', 'empty-input');
-      const paced = pacingRejection(origin);
+      const paced = pacingRejection(origin, opts.ownLimit === true);
       if (paced) return paced;
 
       const turnId = `auto-${++seq}`;
@@ -258,7 +258,7 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
       idUnclaimed = true;
       lastAutoOpenedAt = now();
       if (EXTERNAL_EVENT_ORIGINS.has(origin)) consecutiveSelfStarted = 0;
-      else if (!ALARM_ORIGINS.has(origin)) consecutiveSelfStarted += 1;
+      else if (!ALARM_ORIGINS.has(origin) && opts.ownLimit !== true) consecutiveSelfStarted += 1;
       log('tui.autoturn', 'opened', { origin, reason: opts.reason ?? null, turnId, ...(deps.pacing ? { run: consecutiveSelfStarted } : {}) });
       return { opened: true, turnId };
     },
@@ -289,6 +289,9 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
     noteTurnStarted() {
       if (idUnclaimed && lastId !== null) { idUnclaimed = false; return lastId; }
       // 문을 거치지 않고 시작된 턴(알림·우편·큐 재생·늦은 깨움) — 새 id. 안 그러면 마지막 사람 id 가 영원히 «이번 턴»으로 남는다.
+      // SEAT-TURN-FOLLOWUPS H4 — such a turn (mail · queued notice · child) is an outside event: the self-started run starts
+      // over. Before, queued-mail turns never reset it and the goal drive stayed refused at «run-cap 5/5» for hours.
+      consecutiveSelfStarted = 0;
       const id = `turn-${++seq}`;
       lastId = id;
       internalActive = false;

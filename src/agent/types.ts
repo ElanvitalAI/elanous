@@ -99,6 +99,8 @@ export interface AgentTask {
    *  `messages` only grows when a tool loop completes (and never on abort/error),
    *  so a roster that counted messages alone showed «0 tools» for a working child. */
   toolCallCount?: number;
+  /** AGENT-STEER — corrections sent to this task (AgentSend · /agent). Shown as «✉ n corrections». */
+  corrections?: number;
   /** Final assistant text once the run completes. */
   result?: string;
   /** Error message when state === 'error'. */

@@ -2,6 +2,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { debug, getAmbientParentSessionId, getAmbientSessionId } from '../debug/log.js';
 import { processTuiLogTag } from '../debug/tui-log-tag.js';
+import { noteLlmRoute } from '../llm/fallback-active.js';
 
 export type LlmCallSelectionSource = 'session' | 'config' | 'explicit' | 'fallback';
 export type LlmCallBilling = 'subscription' | 'credits' | 'apikey';
@@ -83,6 +84,13 @@ function observeSend<T>(
     const providerDiffers = scoped.requestedProvider !== undefined
       && canonicalProviderName(scoped.requestedProvider) !== canonicalProviderName(provider);
     const modelDiffers = scoped.requestedModel !== undefined && scoped.requestedModel !== model;
+    // 조용한 폴백을 화면에 — 공급자가 바뀌었거나(폴백 사다리) 폴백 선택으로 모델이 바뀌면 세션의 활성 폴백(상태줄 «⚠ fallback»).
+    if (category === 'llm.call' && scoped.requestedProvider !== undefined) {
+      noteLlmRoute(sessionId, {
+        fallback: providerDiffers || (modelDiffers && scoped.selectionSource === 'fallback'),
+        requestedProvider: scoped.requestedProvider, requestedModel: scoped.requestedModel ?? null, provider, model,
+      });
+    }
     if (providerDiffers || modelDiffers) {
       debug.log(category, 'mismatch', {
         requestedProvider: scoped.requestedProvider ?? null, provider, requestedModel: scoped.requestedModel ?? null, model,

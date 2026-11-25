@@ -104,27 +104,27 @@ test('the same msgId delivered twice → one notice and a dedupe event', () => {
   expect(events).toEqual(['seat-mail-dedupe-hit', 'seat-mail-dedupe-hit']);
 });
 
-test('500 unacknowledged with cap 20 → 20 notices; the rest stay pending and come back on the next poll (OP #129667)', () => {
+test('500 unacknowledged with cap 100 → 100 notices; the rest stay pending and come back on the next poll (OP #129667 · SEAT-QUEUE-CAPACITY 20→100)', () => {
   const w = world();
   w.post(500, (i) => `backlog ${i}`);
-  const { queue, watcher } = w.boot(20);
-  expect(watcher.poll()).toEqual({ kind: 'messages', msgIds: Array.from({ length: 20 }, (_, i) => i + 1) });
+  const { queue, watcher } = w.boot(100);
+  expect(watcher.poll()).toEqual({ kind: 'messages', msgIds: Array.from({ length: 100 }, (_, i) => i + 1) });
   const seatMail = queue.items.filter((item) => item.source === 'seat-mail');
-  expect(seatMail).toHaveLength(20);
+  expect(seatMail).toHaveLength(100);
   // MSG-RECEIPT-IMPLIES-ACK ② — the counter counts mail that still needs the seat; 500 info mails need nothing.
   expect(seatMail[0]!.text).toContain('[미읽음 총 0통]');
   // OP #130302/#130531 합의 — 초과든 truncated든 안내는 «seat-mail-guide» 별도 종류 한 줄(msgId 없음 · poll당 1줄).
-  // #129667 ②의 «안내도 사건도 없다»는 이 합의로 대체된다: 큐 알림 상한(20)도 함께 차므로 그 한 방은
-  // 큐의 overflow guide 가 쓰고, 상한 밖 480통은 pending → 다음 poll 이 21..40을 다시 제공한다(아래).
+  // #129667 ②의 «안내도 사건도 없다»는 이 합의로 대체된다: 큐 알림 상한(100)도 함께 차므로 그 한 방은
+  // 큐의 overflow guide 가 쓰고, 상한 밖 400통은 pending → 다음 poll 이 101..200을 다시 제공한다(아래).
   const guide = queue.items.find((item) => item.source === 'seat-mail-guide');
-  expect(guide?.text).toBe('[notice-overflow] 알림 상한 20을 넘어 1건이 접혔습니다 — 원장에서 확인: eln msg list');
+  expect(guide?.text).toBe('[notice-overflow] 알림 상한 100을 넘어 1건이 접혔습니다 — 원장에서 확인: eln msg list');
   expect(guide?.msgId).toBeUndefined();
-  expect(w.events).toEqual([['seat-mail-cap-collapse', { seat: 'QSEAT', cap: 20, collapsed: 480, firstId: 21, lastId: 500, truncated: false, summaryQueued: true }]]);
-  // 묶음 drain + 답 완료(seen) 뒤의 다음 poll — 21..40 을 그대로 다시 제공한다(재시작 불요).
+  expect(w.events).toEqual([['seat-mail-cap-collapse', { seat: 'QSEAT', cap: 100, collapsed: 400, firstId: 101, lastId: 500, truncated: false, summaryQueued: true }]]);
+  // 묶음 drain + 답 완료(seen) 뒤의 다음 poll — 101..200 을 그대로 다시 제공한다(재시작 불요).
   queue.drainNotices();
   watcher.noteTurnFinished(true);
-  expect(watcher.poll()).toEqual({ kind: 'messages', msgIds: Array.from({ length: 20 }, (_, i) => i + 21) });
-  expect(w.noticeIds(queue)).toEqual(Array.from({ length: 20 }, (_, i) => i + 21));
+  expect(watcher.poll()).toEqual({ kind: 'messages', msgIds: Array.from({ length: 100 }, (_, i) => i + 101) });
+  expect(w.noticeIds(queue)).toEqual(Array.from({ length: 100 }, (_, i) => i + 101));
 });
 
 test('a decision mail is queued (not folded) when an older urgent-looking mail fills cap 1, with no priority flag', () => {
@@ -167,31 +167,31 @@ test('r2 MF1: 1000 already-seen mails ahead of 2 unseen → both unseen are offe
   expect(w.events).toEqual([['seat-mail-replay-skipped', { seat: 'QSEAT', cursor: 0, seenSkipped: 1000, unacked: 2 }]]);
 });
 
-test('r2 MF2: cap ≥ the read limit and 1500 unacknowledged → 19 notices plus ONE summary (the queue cap leaves the summary a slot)', () => {
+test('r2 MF2: cap ≥ the read limit and 1500 unacknowledged → 99 notices plus ONE summary (the queue cap leaves the summary a slot)', () => {
   const w = world();
   w.post(1500, (i) => `backlog ${i}`);
   const { queue, watcher } = w.boot(2000);
   const outcome = watcher.poll();
-  expect(outcome).toEqual({ kind: 'messages', msgIds: Array.from({ length: 19 }, (_, i) => i + 1) });
+  expect(outcome).toEqual({ kind: 'messages', msgIds: Array.from({ length: 99 }, (_, i) => i + 1) });
   const seatMail = queue.items.filter((item) => item.source === 'seat-mail');
-  expect(seatMail).toHaveLength(19);
+  expect(seatMail).toHaveLength(99);
   // OP #130302/#130531 합의 — 안내(summary)는 «seat-mail-guide» 별도 종류(msgId 없음)로
-  // 큐 상한이 남겨둔 한 방을 쓴다: 19 통지 + 1 안내 = 큐 알림 상한 20.
+  // 큐 상한이 남겨둔 한 방을 쓴다: 99 통지 + 1 안내 = 큐 알림 상한 100.
   const guide = queue.items.find((item) => item.source === 'seat-mail-guide');
-  expect(guide?.text).toBe('[seat-mail] 981+ more unread mails for QSEAT, ids #20..#1500 · unread total 1500 — not queued one by one; read them with: eln msg list --to QSEAT');
+  expect(guide?.text).toBe('[seat-mail] 901+ more unread mails for QSEAT, ids #100..#1500 · unread total 1500 — not queued one by one; read them with: eln msg list --to QSEAT');
   expect(guide?.msgId).toBeUndefined();
   // 출처: #38517 r2 MF2(cap 2000 ≥ SEAT_MESSAGE_READ_LIMIT 1000) + OP #129667 ②(안내 방 1칸 예약)
-  expect(w.events).toEqual([['seat-mail-cap-collapse', { seat: 'QSEAT', cap: 2000, collapsed: 981, firstId: 20, lastId: 1500, truncated: true, summaryQueued: true }]]);
+  expect(w.events).toEqual([['seat-mail-cap-collapse', { seat: 'QSEAT', cap: 2000, collapsed: 901, firstId: 100, lastId: 1500, truncated: true, summaryQueued: true }]]);
 });
 
-test('r2 MF2: cap 20 and 1500 unacknowledged → 20 notices plus ONE summary naming the truncated rest; a later poll adds no second summary', () => {
+test('r2 MF2: cap 100 and 1500 unacknowledged → 99 notices plus ONE summary naming the truncated rest; a later poll adds no second summary', () => {
   const w = world();
   w.post(1500, (i) => `backlog ${i}`);
-  const { queue, watcher } = w.boot(20);
+  const { queue, watcher } = w.boot(100);
   watcher.poll();
   // OP #130302/#130531 합의 — 안내(summary)는 «seat-mail-guide» 별도 종류다(msgId 없음).
   const summaries = () => queue.items.filter((item) => item.source === 'seat-mail-guide');
-  expect(summaries().map((item) => item.text)).toEqual(['[seat-mail] 981+ more unread mails for QSEAT, ids #20..#1500 · unread total 1500 — not queued one by one; read them with: eln msg list --to QSEAT']);
+  expect(summaries().map((item) => item.text)).toEqual(['[seat-mail] 901+ more unread mails for QSEAT, ids #100..#1500 · unread total 1500 — not queued one by one; read them with: eln msg list --to QSEAT']);
   watcher.poll(); // same truncated ledger, nothing newer than the announced #1500
   expect(summaries()).toHaveLength(1);
   expect(w.events.filter(([event]) => event === 'seat-mail-cap-collapse')).toHaveLength(1);
@@ -296,10 +296,12 @@ test('JUD-B: saturated queue (cap 1) — two decision mails both reach the next 
 test('JUD security: a non-OP seat posting --from OP gets no priority over earlier mail (FIFO), and its decision body is delivered', async () => {
   const run = await busyTurnWithMailDuringTool(20,
     (store) => {
-      store.post({ from: 'TC', to: SEAT, body: 'EARLIER-ORDINARY-MAIL' });
+      // SEAT-MAIL-PASSIVE-DEFAULT: a kind-less mail is passive now (no mid-turn carry) — the ordinary mails here are
+      // explicit requests (no ladder in this world → a request opens/joins a turn), so the FIFO contract is what is tested.
+      store.post({ from: 'TC', to: SEAT, body: 'EARLIER-ORDINARY-MAIL', kind: 'request' });
       // A forger: no explicit origin, so the ledger derives `{ kind: 'agent', seat: 'OP' }` from the claimed sender.
       store.post({ from: 'OP', to: SEAT, body: 'FORGED-OP-DECISION-BODY', intent: 'decision' });
-      store.post({ from: 'MK', to: SEAT, body: 'LATER-ORDINARY-MAIL' });
+      store.post({ from: 'MK', to: SEAT, body: 'LATER-ORDINARY-MAIL', kind: 'request' });
     },
     () => {});
   expect(run.initial).toEqual({ kind: 'baseline', unread: 0 });

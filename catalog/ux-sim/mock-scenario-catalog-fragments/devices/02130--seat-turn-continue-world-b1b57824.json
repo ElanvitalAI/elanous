@@ -1,0 +1,27 @@
+{
+  "id": "seat-turn-continue-world",
+  "name": "SIM-SEAT-TURN-CONTINUE seat turn device (budget · goal drive · idle queue · stationarity · delegated results · seat prose)",
+  "audience": "internal",
+  "implementation": [
+    "src/ux-sim/seat-turn-continue-world.ts"
+  ],
+  "tests": [
+    "src/ux-sim/seat-turn-continue-world.test.ts"
+  ],
+  "target": "replays OP seat turn cases before vs after through the production decisions — turn budget, goal drive, idle queue, the real streamLLMWithTools loop with a scripted provider (tool rounds, identical-call stationarity 8/12), the seat-mail delegated-result route with the 60 s P1 join, and the seat prose that used to end a turn early; plus wake back-off and same-cause dedupe (fake clock over the real scheduler), the internal-turn pacing run reset, fresh re-reads, the hand pull-first drive and the leader card for space leads and kingdom seats",
+  "inputs": [
+    "scripted provider (codex-family terra and claude-family opus) that requests tools for N rounds or repeats one identical call",
+    "synthetic seat mails (crown steer · 28 passive held · 3 delegated results from below)",
+    "fixed clock 2026-11-25T07:10:00Z"
+  ],
+  "observations": [
+    "one table row per case × arm: tool rounds allowed · fact instruction · allowlist narrowed · turn end · continued · queue drained",
+    "drive guard verdicts (same reply · repeated tool · failure · person · approval · cap · no goal)"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/seat-turn-continue-world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

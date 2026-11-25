@@ -11,7 +11,13 @@ export interface CapsulePolicyOptions {
   correlation?: { turnId?: string; capsuleId?: string; eventId?: string };
   /** Optional observer; failures must not affect the decision. */
   log?: (event: string, data: Record<string, unknown>) => void;
+  /** RUNSHELL-BG-ENDS-TURN — a tool family's own cap: `turn[capKey]` (else `defaultCapMs`) replaces `turn.syncCapMs`;
+   *  `turn.syncCapMs: 0` («never detach by policy») still holds for every family. */
+  readonly capKey?: string;
+  readonly defaultCapMs?: number;
 }
+
+const validCap = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 
 /**
  * The capsule policy (A1) — the one switchless decision every capsule tool asks before it blocks the turn: Bash and RunShell
@@ -24,10 +30,13 @@ export function createCapsulePolicy(options: CapsulePolicyOptions): CapsulePolic
     decide(input: CapsuleDecisionInput): CapsuleDecision {
       let turn: unknown;
       try { turn = options.turnConfig(); } catch { turn = undefined; }
-      const configured = typeof turn === 'object' && turn !== null
-        ? (turn as { syncCapMs?: unknown }).syncCapMs : undefined;
-      const cap = typeof configured === 'number' && Number.isFinite(configured) && configured >= 0
-        ? configured : CAPSULE_SYNC_CAP_MS;
+      const section = typeof turn === 'object' && turn !== null ? turn as Record<string, unknown> : {};
+      const configured = section.syncCapMs;
+      const own = options.capKey === undefined ? undefined : section[options.capKey];
+      const cap = options.capKey !== undefined
+        // Terra MF2: an explicit «never detach» (`turn.syncCapMs: 0`) wins over the family cap.
+        ? (configured === 0 ? 0 : validCap(own) ? own : options.defaultCapMs ?? CAPSULE_SYNC_CAP_MS)
+        : validCap(configured) ? configured : CAPSULE_SYNC_CAP_MS;
       let decision: CapsuleDecision;
       if (cap === 0) {
         // syncCapMs 0 = never detach by policy (an explicit background request still detaches).

@@ -94,6 +94,9 @@ export interface FetchApiWithRetryOpts {
   /** BEDROCK-PROVIDER — 재시도 «직전»마다 요청을 다시 만든다(SigV4 서명은 `x-amz-date` 기준 수 분만 유효 —
    *  `retry-after` 대기가 길면 옛 서명은 403). 없으면 종전처럼 같은 `init` 을 다시 쓴다(다른 provider 불변). */
   refreshInit?: () => Promise<RequestInit>;
+  /** ZAI-OVERAGE-STOP-RETRY (11-25) — 공급자가 «다시 보내도 같은 답»이라고 아는 오류(예: Z.ai 플랜 한도 1308/1310)면 true.
+   *  true 면 재시도 없이 곧바로 던진다 — 정책(stop·폴백)은 호출자 층이 정한다. 없으면 종전과 같다. */
+  nonRetryable?: (err: ApiHttpError) => boolean;
 }
 
 /** Raised when overload repeats k times and a fallback is still unused.
@@ -230,6 +233,10 @@ export async function fetchApiWithRetry(
       // expectedCount 2): a codex 400 must still reach decideRetry's unknown-error
       // single retry (retry-policy.ts — attempt 0 → retry, attempt ≥1 → abort).
       // Other providers keep the terminal format-error classification.
+      if (opts.nonRetryable && err instanceof ApiHttpError && opts.nonRetryable(err)) {
+        debug.log('llm.retry', 'abort', { provider: opts.provider, status: err.status, attempt, reason: 'provider-terminal-limit' });
+        throw err;
+      }
       if (err instanceof ApiHttpError && err.status === 400 && opts.provider !== 'codex') {
         debug.log('llm.retry', 'abort', { provider: opts.provider, status: 400, reason: 'non-retryable-format-error' });
         throw err;

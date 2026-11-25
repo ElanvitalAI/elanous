@@ -9,7 +9,7 @@ import { layoutSpaceList, withCommands } from './space-tabs-view.js';
 const plain = (s: string) => s.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '');
 const agentsSection = (lines: readonly string[]): string[] => {
   const all = lines.map((line) => plain(line).trimEnd());
-  const head = all.findIndex((line) => line.startsWith(' agents'));
+  const head = all.findIndex((line) => line.startsWith(' ○ All') || line.startsWith(' ◉ Active'));
   return head < 0 ? [] : all.slice(head + 1).filter((line) => line !== '' && line !== ' new · menu');
 };
 const draw = (ls: object): string[] => {
@@ -23,8 +23,8 @@ test('seat OP with a live eln pane and a dead-eln shell pane: exactly one row, t
     pane('p1', { seat: 'OP', kind: 'eln', command: ['eln'], fgCommand: ['eln'] }),
     pane('p2', { seat: 'OP', kind: 'shell', command: ['eln'] }),
   ] })).toEqual([
+    ' ▾ OP · 1',
     ' ⚪ OP',
-    '       eln · op',
   ]);
 });
 
@@ -33,8 +33,8 @@ test('seat whose only pane is an exited shell: one «⏹ OP exited» row, even w
     pane('p2', { seat: 'OP', kind: 'shell', command: ['eln'] }),
     pane('p3', { seat: 'OP', state: 'exited', activityState: 'exited', command: ['eln'] }),
   ] })).toEqual([
+    ' ▾ OP · 1',
     ' ⏹ OP exited',
-    '       shell · op',
   ]);
 });
 
@@ -51,9 +51,11 @@ test('a seat that lives in another space keeps only its live row; another seat\'
     { address: 'w2/t9/p9', workspace: 'tc', tab: 't9', pane: 'p9', title: 'OP', state: 'working', activityState: 'working', seat: 'OP', kind: 'codex', command: ['codex'], fgCommand: ['codex'] },
     pane('p5', { title: 'TC', seat: 'TC', kind: 'claude', command: ['claude'], fgCommand: ['claude'] }),
   ] })).toEqual([
+    ' ▾ OP · 1',
     ' ⚪ TC',
-    '       claude · op',
+    '    claude-code',
+    ' ▾ TC · 1',
     ' 🟢 OP',
-    '       codex · tc',
+    '    codex-cli',
   ]);
 });

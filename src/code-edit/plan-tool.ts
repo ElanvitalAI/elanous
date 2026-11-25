@@ -1,5 +1,5 @@
 import type { LLMToolSpec } from '../llm/tool-spec.js';
-import { BLOCK_REASONS, isBlockReason, type BlockReason } from '../agent-events/protocol.js';
+import { BLOCK_REASONS, HAND_CAUSES, isBlockReason, isHandCause, type BlockReason, type HandCause } from '../agent-events/protocol.js';
 // update_plan tool — Phase WF2.
 //
 // Progress checklist for multi-step tasks. Adapted from codex-rs's
@@ -39,6 +39,8 @@ export interface PlanStep {
   reason?: string;
   /** SEAT-STATE-ENUM: optional code for a `blocked` step — what kind of block it is (the seat reports this code, not `reason`). */
   code?: BlockReason;
+  /** WRITER-CHECK-RESOLVER: optional structured cause of a `blocked` step (the steward answers this family itself). */
+  cause?: HandCause;
   /** Required when `waiting`: the wake condition. */
   wake?: PlanWake;
 }
@@ -134,7 +136,11 @@ export function parseUpdatePlanArgs(
     if (status === 'blocked' && s.code !== undefined && !isBlockReason(s.code)) {
       return { ok: false, reason: `step ${i}: "code" must be one of ${BLOCK_REASONS.join(' | ')}` };
     }
+    if (status === 'blocked' && s.cause !== undefined && !isHandCause(s.cause)) {
+      return { ok: false, reason: `step ${i}: "cause" must be one of ${HAND_CAUSES.join(' | ')}` };
+    }
     const code = status === 'blocked' && isBlockReason(s.code) ? s.code : undefined;
+    const cause = status === 'blocked' && isHandCause(s.cause) ? s.cause : undefined;
     const wakeRaw = s.wake !== null && typeof s.wake === 'object' ? s.wake as Record<string, unknown> : undefined;
     const wakeKind = typeof wakeRaw?.kind === 'string' ? wakeRaw.kind.trim() : '';
     const wakeTarget = typeof wakeRaw?.target === 'string' ? wakeRaw.target.trim() : '';
@@ -146,6 +152,7 @@ export function parseUpdatePlanArgs(
       step, status: status as PlanStepStatus,
       ...(status === 'blocked' ? { reason } : {}),
       ...(code ? { code } : {}),
+      ...(cause ? { cause } : {}),
       ...(status === 'waiting' ? { wake: { kind: wakeKind, target: wakeTarget, ...(until ? { until } : {}) } } : {}),
     });
   }
@@ -197,6 +204,13 @@ export function buildUpdatePlanTool(): LLMToolSpec {
                 description: 'For `blocked`: the kind of block. OWNER_UNKNOWN = the work\'s owner is not confirmed, '
                   + 'APPROVAL_PENDING = waiting for an approval, TOOL_DENIED = a tool was refused, PROVIDER_ERROR = the model call failed, '
                   + 'NO_WORK = nothing to do, DEPENDENCY_WAIT = another PR or task must land first, HUMAN_DECISION = only a person can decide.',
+              },
+              cause: {
+                type: 'string',
+                enum: [...HAND_CAUSES],
+                description: 'For `blocked`, when it fits: writer-handover = unsure who owns the files or an earlier writer\'s work, '
+                  + 'worktree-path = the worktree or file path is unknown, slot-isolation = waiting for a free root / slot / write scope, '
+                  + 'res-approval = waiting for an RES approval to run. The steward answers these itself.',
               },
               wake: {
                 type: 'object',

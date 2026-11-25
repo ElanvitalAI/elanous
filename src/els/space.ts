@@ -63,10 +63,19 @@ export interface Pane {
   readonly scrollback: string;
   /** Millisecond wall clock when the PTY exited; legacy exited rows receive this on server start. */
   readonly exitedAt?: number;
+  /** DEMO-PANE-EXIT-VISIBLE: the child's exit code (null = signal or the holder never reported). */
+  readonly exitCode?: number | null;
+  /** DEMO-PANE-EXIT-VISIBLE: why the pane ended, one line («exit 3» · «holder connection lost …»). */
+  readonly exitReason?: string;
+  /** DEMO-PANE-EXIT-VISIBLE: the last non-empty lines of the final screen (≤ 5) — usually the error. */
+  readonly exitTail?: readonly string[];
   /** Verified creator seat; absent on legacy or unverified panes. */
   readonly ownerSeat?: string;
   /** Seat launched by `els seat`, distinct from the verified creator's authority. */
   readonly seatIdentity?: string;
+  /** DEMO-FANOUT-LIVE-OP-SEAT: the pane whose agent opened this one through the tool door (ElsControl new) — a worker child
+   *  of that pane, never a seat of its own. Server-set from the verified caller pane, never from request data. */
+  readonly parentPane?: string;
   /** ELS-POD-TAB: the physical place; absent = the stage-1 default, a process on its own host. */
   readonly place?: PanePlace;
   /** ELS-POD-TAB: a pod pane's control inbox — soft memos, newest last, bounded (POD_INBOX_MAX); persisted in the

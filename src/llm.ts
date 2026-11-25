@@ -5,6 +5,7 @@
 import { modelOrchestrationCore } from './model-tier/model-orchestration.js';
 import type { LLMToolSpec } from './llm/tool-spec.js';
 import { textOnly } from './llm/stream-text.js';
+import { createSideEffectBudget, createStationarityTracker, retractedTargetOf, sideEffectFallbackSummary, sideEffectSummaryPrompt, takeDriveContinuation, toolFreshnessToken, stationarityFallbackSummary, stationarityNudgeNote, stationaritySummaryPrompt } from './llm/seat-action-stationarity.js';
 import { resolveModelProfile, type ModelProfile } from './llm-model-profiles.js';
 import { resolveRequestMaxTokens } from './llm/output-budget.js';
 import { STREAM_DISCONNECT_MAX_RETRIES, STREAM_IDLE_TIMEOUT_MAX_RETRIES, StreamIdleTimeoutError, StreamTotalTimeoutError, streamDisconnectRetryDelayMs, isStreamDisconnectRetryable, sleepUnlessAborted } from './llm/stream-fallback.js';
@@ -76,10 +77,12 @@ import {
 import { ApiHttpError, fetchApiWithRetry, OverloadFailoverError, type FetchApiWithRetryOpts } from './session-runtime/retry-api.js';
 import { providerFailureEvidence } from './llm/provider-failure-evidence.js';
 import { isShapeRelevantRejection, summarizeCodexRequestShape } from './llm-request-shape.js';
+import { enforceResponsesImageBudget, imageDroppedText, requestTextChars, summarizeRequestParts } from './llm-request-images.js';
+import { prepareRequestImage } from './image/request-image-normalize.js';
 import { BedrockProvider, isBedrockCompatibleModel, makeBedrockProvider } from './llm/bedrock-provider.js';
 import { HarmonyChannelFilter, type HarmonyToolCall } from './llm/wire/harmony.js';
 import { OPEN_WEIGHT_TOOL_DISCIPLINE } from './llm/open-weight-discipline.js';
-import { makeZaiCodingPlanProvider, ZAI_CREDENTIAL_MISSING_REASON, zaiCodingPlanAvailable } from './llm/zai-coding-plan.js';
+import { isZaiCodingPlanUrl, makeZaiCodingPlanProvider, ZAI_CREDENTIAL_MISSING_REASON, zaiCodingPlanAvailable, zaiLimitStopsRetry } from './llm/zai-coding-plan.js';
 import { makeHqProxyProvider } from './llm/hq-proxy-provider.js';
 import { isOpenRouterDeepSeekWireModel, nonEmptyReasoningDetails, openRouterDeepSeekCatalogEffort, openRouterDeepSeekEffort, openRouterDeepSeekRequestExtras, openRouterNeedsKimiToolSchema } from './llm/openrouter-deepseek.js';
 import { resolveModelAlias } from './intelligence-map/model-alias.js';
@@ -96,7 +99,8 @@ import { takeHydratedTools } from './skills/tools/tool-search-spec.js';
 import { isPlanModeActive } from './plan-mode/session.js';
 import { mintTurnUri } from './mss/uri/builder.js';
 import type { TurnUri } from './mss/uri/brand.js';
-import { acceptsToolResultImage, isVisionCapableModel } from './llm-vision-capability.js';
+import { acceptsToolResultImage, glmVisionFact, isVisionCapableModel, openRouterVisionFact } from './llm-vision-capability.js';
+import { lookupOpenRouterVision } from './llm/openrouter-vision-lookup.js';
 import {
   maybeCaptureDecision,
   type TurnCheckpointLoopSnapshot,
@@ -390,6 +394,10 @@ export interface LLMOpts {
   /** Explicit research surface verdict from the turn router. Relaxes early
    *  exploration guards while retaining a finite tool-loop hard stop. */
   researchTurn?: boolean;
+  /** GOAL-DRIVE-NARROW — this turn is a goal-drive continuation (side-effect budget); default = the TUI's one-shot mark. */
+  driveContinuation?: boolean;
+  /** SEAT-TOOL-LOOP — override the seat-loop detection ({@link isSeatToolLoop}); tests and sims pass it explicitly. */
+  seatLoop?: boolean;
   /** Reports the provider and model actually attempted, including fallbacks. */
   onResolvedProvider?(provider: string, model: string): void;
   temperature?: number;
@@ -1243,6 +1251,9 @@ export async function* streamOpenAIEvents(
         headerTimeoutMs ?? (typeof body?.model === 'string' ? profileTimeoutMs(body.model, 'header_s') : undefined)),
       callContext: { model: typeof body?.model === 'string' ? body.model : undefined,
         ...(inferOpenAIProviderName(url) === 'grok' && extraHeaders ? { billing: 'subscription' as const } : {}) },
+      // ZAI-OVERAGE-STOP-RETRY (11-25) — Z.ai 플랜·잔액 한도(1308/1310 …)는 다시 보내도 같다 — 재시도 0, 정책은 zai 층이 정한다.
+      //   🩸 종전엔 code 1310 · overage=stop 인데 같은 요청이 3번 나갔다(smoke 11-25).
+      ...(isZaiCodingPlanUrl(url) ? { nonRetryable: (e: ApiHttpError) => zaiLimitStopsRetry(e.status, e.bodyText) } : {}),
     },
   );
 
@@ -2218,6 +2229,14 @@ export async function* streamCodexResponsesEvents(
     requestSha256: createHash('sha256').update(wireJson).digest('hex'),
     store: body.store === true,
     previousResponseId: body.previousResponseId ? `${body.previousResponseId.slice(0, 12)}…` : null,
+  });
+  // IMAGE-REQUEST-BUDGET — success-path request shape (part kinds and sizes, never content). Before this only a 4xx
+  // logged the shape, so an image sent as text (base64 inside an input_text part) was invisible.
+  const wireInputItems = (wireBody as { input?: unknown }).input;
+  debug.log('llm.request', 'request-shape', {
+    provider: 'openai-codex',
+    textChars: requestTextChars(wireJson),
+    ...summarizeRequestParts(Array.isArray(wireInputItems) ? wireInputItems : []),
   });
   const response = await fetchApiWithRetry(
     url,
@@ -3559,7 +3578,7 @@ export const AnthropicProvider: LLMProvider = {
     convo = applyHistoryCacheBreakpoint(convo, { cache, ttl });
     const tools = toAnthropicToolsCached(opts.tools, { cache, ttl });
 
-    yield* streamAnthropicEvents(apiKey, {
+    yield* withAnthropicKeyRejection(streamAnthropicEvents(apiKey, {
       model: anthropicModel,
       messages: convo,
       ...(system !== undefined ? { system } : {}),
@@ -3569,7 +3588,7 @@ export const AnthropicProvider: LLMProvider = {
       // (dogfood 2026-07-13: base AnthropicProvider 로 claude-opus-4-8 직접 호출 시 400).
       ...anthropicTemperatureField(anthropicModel, false, opts.temperature),
       ...(tools ? { tools } : {}),
-    }, opts.signal);
+    }, opts.signal));
   },
   async *chat(messages, opts = {}) { yield* textOnly(this.streamChat!(messages, opts)); },
 };
@@ -4824,6 +4843,21 @@ export function isLikelyVisionModel(model: string | undefined): boolean {
   // Google: Gemini 1.5+ is multimodal.
   if (m.startsWith('gemini-')) return true;
 
+  // Z.ai GLM (VISION-CATALOG-BUILTIN 11-25): glm-5.3-flash · GLM-V 변형만 이미지 — 같은 규칙을 공유한다.
+  if (m.startsWith('glm-') || m.startsWith('z-ai/glm-')) return glmVisionFact(m) === true;
+
+  return false;
+}
+
+/** 이 대화가 이미지(사용자 첨부 또는 도구 결과 안의 이미지)를 싣는가 — 비전 판정을 «필요할 때만» 묻기 위한 값싼 훑기. */
+export function messagesCarryImages(messages: readonly LLMMessage[]): boolean {
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      if (b.type === 'image') return true;
+      if (b.type === 'tool_result' && Array.isArray(b.content) && b.content.some(c => c.type === 'image')) return true;
+    }
+  }
   return false;
 }
 
@@ -5132,7 +5166,7 @@ async function streamLLMCore(
     const activeModel = finalized.model;
     const maxTokens = requestMaxTokens(activeProvider, activeModel, opts);
     logLlmProviderSelection(activeProvider);
-    if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(opts.tools);
+    if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(opts.tools, { provider: activeProvider.name, model: activeModel });
     opts.onResolvedProvider?.(activeProvider.name, activeModel);
     await recordChildFirstLlmStart({
       provider: activeProvider.name, model: activeModel,
@@ -5701,6 +5735,26 @@ export function summarizeWalkerToolArgs(name: string, args: Record<string, unkno
  *  whatever AgentSpawnOpts.maxTurns specifies. */
 export const TOOL_LOOP_MAX_TURNS_DEFAULT = 6;
 
+/**
+ * SEAT-TOOL-LOOP (대표 11-25 16:2x «OP 턴이 왜 이렇게 빨리 끝나나») — a federation seat's tool loop.
+ * Measured (OP session be2bc47e, 11-25 14:2x–16:2x KST): 46 turns ended by W5-G «no-content-read-streak» force synthesis
+ * at tool round 4 — a seat works through Bash (`eln …`), never Read/Edit, so every round counted as the codex search
+ * pathology. A seat loop takes neither that taming nor the exploration/family caps: it runs until the model stops calling
+ * tools (codex-rs core/src/session/turn.rs:737 `needs_follow_up`), bounded by {@link SEAT_TOOL_LOOP_MAX_TURNS} (grok-cli
+ * 400 · hermes 500 · codex/opencode/openclaw unlimited) and the same-args dedup guard.
+ */
+export const SEAT_TOOL_LOOP_MAX_TURNS = 400;
+
+/**
+ * Structured seat signal for the tool loop: the seat launcher's `COORD_ID`, or a cwd under `…/seats/<SEAT>/` (the seat
+ * TUI and its repl child run there). A harness executor child is never a seat loop (its own budget rules).
+ */
+export function isSeatToolLoop(env: NodeJS.ProcessEnv = process.env, cwd: string = process.cwd()): boolean {
+  if (env.ELANOUS_HARNESS_ROLE?.trim() === 'executor') return false;
+  if (/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test((env.COORD_ID ?? '').trim())) return true;
+  return /(?:^|\/)seats\/[A-Za-z][A-Za-z0-9_-]{0,63}(?:\/|$)/.test(cwd);
+}
+
 /** Anthropic-family default — claude-code-fork ships interactive chat
  *  with no cap (Opus self-terminates by emitting text-only). elanous
  *  keeps a hard cap as runaway insurance, but raises it well above
@@ -6050,6 +6104,8 @@ async function tryForceSynthesisPass(args: {
    *  it reuses the cached prefix instead of rewriting it with tools dropped. */
   sessionId?: string;
   tools?: LLMToolSpec[];
+  /** SEAT-TURN-FOLLOWUPS ① — the user prompt of this tools-off step (default: the budget-exhausted synthesis prompt). */
+  promptText?: string;
 }): Promise<string | null> {
   const { provider, model, history, turn, modelFamily, streamingHandlers } = args;
   const keepToolsNoCall = provider.name === 'openai-codex' && (args.tools?.length ?? 0) > 0;
@@ -6060,7 +6116,7 @@ async function tryForceSynthesisPass(args: {
   };
   const synthesisPromptMsg: LLMMessage = {
     role: 'user',
-    content:
+    content: args.promptText ??
       'Your tool budget is exhausted and the dispatcher will reject any further tool calls. ' +
       'Based on the file contents and search results already in your prior tool_result blocks, ' +
       'write the final answer NOW as plain text — concise but useful. Do NOT request any tools; ' +
@@ -8283,6 +8339,16 @@ function isExploratoryTurn(
   return pendingCalls.length > 0 && pendingCalls.every((call) => EXPLORATORY_TOOLS.has(call.name));
 }
 
+/** 탐색 예산(EXPLORATION BUDGET)이 세는 라운드 — 읽기/검색 도구만 있고 Read 가 «없는» 턴.
+ *  Read 는 검색이 돌려준 후보를 실제로 여는 수렴 동작이라 예산을 태우지도 막히지도 않는다
+ *  (5497ec9 재측정: Read 가 섞인 다섯째 라운드가 막혀 둘째 문서를 못 읽고 답이 반쪽이 됐다).
+ *  Read 가 섞인 턴은 예산 연속을 0 으로 되돌린다. */
+function isExplorationBudgetTurn(
+  pendingCalls: Array<{ id: string; name: string; args: Record<string, unknown> }>,
+): boolean {
+  return isExploratoryTurn(pendingCalls) && !pendingCalls.some((call) => call.name === 'Read');
+}
+
 /** W6-A (2026-05-03 PM, post-PR-1396) — Search-only turn predicate. A
  *  turn is "search-only" when EVERY pending call is Grep / Glob / ListDir
  *  (no Read / Lsp / Bash / Edit). Counts toward `searchOnlyTurnStreak`
@@ -8894,9 +8960,11 @@ export async function streamLLMWithTools(
   const familyDefaultMaxTurns = resolved === 0 ? Number.POSITIVE_INFINITY : (resolved || baselineForFamily);
   // `let` (not const) — the conditional budget-grant hook (opts.budgetGrant)
   // may extend this mid-loop when a designated multi-round tool is called.
+  // SEAT-TOOL-LOOP — a seat loop gets the seat safety cap instead of the family / exploration taming.
+  const seatLoop = opts.seatLoop ?? isSeatToolLoop();
   let maxTurns = opts.maxTurns ?? (opts.researchTurn
     ? Math.min(32, Math.max(16, familyDefaultMaxTurns))
-    : familyDefaultMaxTurns);
+    : seatLoop ? SEAT_TOOL_LOOP_MAX_TURNS : familyDefaultMaxTurns);
   const budgetGrant = opts.budgetGrant;
   // ⭐ Hydration-capable tool list (F2 gap④ · 2026-07-26). The provider tool
   // array used to be `opts.tools`, FIXED for the whole loop. That made
@@ -8913,9 +8981,10 @@ export async function streamLLMWithTools(
   try {
     codexInspectExemptFlag = (require('./user-config.js') as typeof import('./user-config.js')).getUserConfig().llm.codexInspectExempt === true;
   } catch { /* config unreadable — default 비-면제·hot-path 는 config 손상에 안 막힌다 */ }
-  const inspectBudgetThreshold = getInspectBudgetThreshold(history, modelFamily, codexInspectExemptFlag);
+  // SEAT-TURN-FOLLOWUPS — a seat loop (any family, gpt included) is exempt from the inspect-budget wall like the exploration cut.
+  const inspectBudgetThreshold = getInspectBudgetThreshold(history, modelFamily, codexInspectExemptFlag || seatLoop);
   const inspectFollowupMode = getInspectFollowupMode(history);
-  const explorationThresholdForTurn = opts.researchTurn
+  const explorationThresholdForTurn = opts.researchTurn || seatLoop
     ? Number.POSITIVE_INFINITY
     : getExplorationThreshold(history, maxTurns, modelFamily);
   const maxTurnsUnbounded = maxTurns === Infinity;
@@ -8933,6 +9002,7 @@ export async function streamLLMWithTools(
       inspectFollowupMode,
       explorationThresholdForTurn,
       researchTurn: opts.researchTurn === true,
+      seatLoop,
       // ★ Infinity 는 JSON 직렬화 시 null 이 되므로 boolean 으로도 남긴다(관측·제1원칙).
       //   true = 프론티어 면제로 read/search 스트릭 컷 없음(대표 방침 2026-07-17).
       explorationUnbounded,
@@ -9154,6 +9224,12 @@ export async function streamLLMWithTools(
   // so the open-exploration policy stays intact.
   const TOOL_REPEAT_WINDOW = 5;
   const toolRepeatTracker = new DoomLoopTracker(TOOL_REPEAT_WINDOW);
+  // SEAT-TURN-FOLLOWUPS ① — a seat loop replaces the 3× same-args dedup and the 5-window nudge with action stationarity
+  // (8 identical consecutive calls → one note · 12 → one tools-off summary step). Member chat keeps both guards above.
+  const seatStationarity = seatLoop ? createStationarityTracker() : null;
+  // GOAL-DRIVE-NARROW ② — a goal-drive continuation (armed by the TUI when the drive opened) gets a side-effect budget.
+  const driveSideEffects = seatLoop && (opts.driveContinuation ?? takeDriveContinuation()) ? createSideEffectBudget() : null;
+  let driveSideEffectStop: { tool: string; why: 'duplicate' | 'over-budget' } | null = null;
   const executionLoopState = createExecutionLoopState();
   // Debugging execution loop (PR #659) — tracks the last failed
   // RunShell/Bash command so repair + verify fallbacks can reference
@@ -9228,16 +9304,19 @@ export async function streamLLMWithTools(
       try {
         const pending = opts.drainPendingUserInput();
         if (pending.length > 0) {
-          const { buildInterjectionMessage } = require('./chat/interjection.js') as typeof import('./chat/interjection.js');
-          const message = buildInterjectionMessage(pending, 'mid-turn');
-          if (message) {
-            history.push({ role: 'user', content: message });
+          const { buildInterjectionContent } = require('./chat/interjection.js') as typeof import('./chat/interjection.js');
+          // IMAGE-IN-STEER-FU — operator items may carry images: they join this user message as real image parts.
+          const content = buildInterjectionContent(pending, 'mid-turn');
+          if (content) {
+            const message = typeof content === 'string' ? content : content.flatMap((part) => (part.type === 'text' ? [part.text] : [])).join('\n');
+            const imageParts = typeof content === 'string' ? 0 : content.filter((part) => part.type === 'image').length;
+            history.push({ role: 'user', content: typeof content === 'string' ? content : content.map((part) => ({ ...part })) });
             // A queued user message begins a fresh request. Keep the repair
             // allowlist narrow for the failed request, but do not let its
             // one-turn gate reject tools requested by this new user turn.
             repairActionArmed = false;
             debug.log('llm.interjection', 'drained-mid-turn', {
-              turn, count: pending.length, chars: message.length,
+              turn, count: pending.length, chars: message.length, images: imageParts,
             }, { level: 'info' });
             // OBSERVE-TURN-EVENT-LIFECYCLE — 조향 배달(같은 자리·같은 필드의 turn-life 사본).
             try { emitTurnLife('turn-life:steer-delivered', { turn, count: pending.length, chars: message.length }); } catch { /* observability is fail-open */ }
@@ -9523,7 +9602,7 @@ export async function streamLLMWithTools(
       let offUrgent: (() => void) | undefined;
       // Validate before entering the provider stream's catch/fallback boundary.
       // An incompatible request is deterministic and must not be retried elsewhere.
-      if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(turnOpts.tools);
+      if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(turnOpts.tools, { provider: activeProvider.name, model: activeModel });
       try {
         if (!streamIter) {
           turnUsageSeen = false;
@@ -10323,7 +10402,7 @@ export async function streamLLMWithTools(
     const terminalOnlyTurn = terminalToolNames.size > 0
       && pendingCalls.length > 0
       && pendingCalls.every((call) => terminalToolNames.has(call.name));
-    const wasExploratoryTurn = isExploratoryTurn(pendingCalls);
+    const wasExploratoryTurn = isExplorationBudgetTurn(pendingCalls);
     const prevExploratoryStreak = exploratoryTurnStreak;
     exploratoryTurnStreak = wasExploratoryTurn ? exploratoryTurnStreak + 1 : 0;
     // W6-A — Track search-only streak (Grep / Glob / ListDir only).
@@ -10331,6 +10410,7 @@ export async function streamLLMWithTools(
     // tool fires (Read / Lsp / Bash / Edit). The dispatchOne layer
     // reads this counter to decide when to inject a force-Read stub.
     const wasSearchOnlyTurn = isSearchOnlyTurn(pendingCalls);
+    const prevSearchOnlyTurnStreak = searchOnlyTurnStreak;
     searchOnlyTurnStreak = wasSearchOnlyTurn ? searchOnlyTurnStreak + 1 : 0;
     // W5-G — Tool-agnostic content-fetch-absent streak. Resets only when
     // codex actually fires Read/Edit/Write/Lsp; Bash(`rg --files`) /
@@ -10398,7 +10478,7 @@ export async function streamLLMWithTools(
       effectiveModel,
       !terminalOnlyTurn
         && exploratoryTurnStreak >= explorationThresholdForTurn
-        && isExploratoryTurn(pendingCalls)
+        && isExplorationBudgetTurn(pendingCalls)
         && !codexInspectionStillProgressing,
       true,
     );
@@ -10422,8 +10502,11 @@ export async function streamLLMWithTools(
       && !verifyActionArmed
       && pendingCalls.length > 0
       && !isExecutionActionTurn(pendingCalls);
+    // SEAT-TURN-FOLLOWUPS — a seat loop is not a code-repair pipeline: a failed shell step (e.g. a non-zero `eln` exit)
+    // must not reject its next ops/search calls (terra test universe: repair-phase rejection ended seat turns early).
     const inRepairActionPhase =
-      !terminalOnlyTurn
+      !seatLoop
+      && !terminalOnlyTurn
       && repairActionArmed
       && !verifyActionArmed
       && pendingCalls.length > 0
@@ -10449,6 +10532,8 @@ export async function streamLLMWithTools(
     // order intact. Set by the doom-loop ASK routing when the user
     // chose retry or supplied guidance.
     let postToolResultUserNote: string | null = null;
+    /** SEAT-TURN-FOLLOWUPS ① — set when a seat loop called the same tool with the same args SEAT_REPEAT_STOP_AT times in a row. */
+    let seatStationaryStop: { tool: string; run: number; why?: 'duplicate' | 'over-budget' } | null = null;
 
     if (inInspectFollowupPhase || inExplorationSynthesisPhase || inSynthesisPhase) {
       debug.log('llm.router', 'tool-loop.followup-phase-entered', {
@@ -11218,6 +11303,20 @@ export async function streamLLMWithTools(
         if (phaseRejectionMessage !== null && phaseRejectedCallIds.has(call.id)) {
           return { result: phaseRejectionMessage, isError: false, phaseRejected: true };
         }
+        // SEAT-TURN-FOLLOWUPS — a retracted target (cell / PR named by a retracted mail) takes no outward action in a seat loop.
+        const retracted = seatLoop ? retractedTargetOf(call.name, call.args) : null;
+        if (retracted !== null) {
+          debug.log('llm.router', 'tool-loop.retracted-target-refused', { turn, tool: call.name, target: retracted }, { level: 'warn' });
+          return { result: `[not dispatched] ${retracted} was retracted by a newer directive — drop every pending action on it and continue with the rest.`, isError: false, phaseRejected: false };
+        }
+        if (driveSideEffects) {
+          const verdict = driveSideEffects.check(call.name, call.args);
+          if (verdict === 'duplicate' || verdict === 'over-budget') {
+            driveSideEffectStop ??= { tool: call.name, why: verdict };
+            debug.log('llm.router', 'tool-loop.drive-side-effect-stop', { turn, tool: call.name, verdict, count: driveSideEffects.count }, { level: 'warn' });
+            return { result: `[not dispatched] continuation side-effect ${verdict} — end this continuation with a summary.`, isError: false, phaseRejected: false };
+          }
+        }
         // Wave 6 (2026-05-04) — toolName repair + invalid-tool
         // absorption. ref/opencode `experimental_repairToolCall`
         // pattern (`session/llm.ts:317-337`). Two failure modes
@@ -11325,7 +11424,7 @@ export async function streamLLMWithTools(
         // reproduction: docs/CAPABILITIES → PLAN → HANDOFF → ROADMAP
         // → src/code-edit/{index,apply,safety}.ts across 5 turns).
         // TUI-INITIATIVE-S ② — 같은 호출이 같은 오류로 DEDUP_THRESHOLD 번 끝났으면 계열·도구 무관(openai-codex·gpt 계열)하게 같은 RE-CALL 차단을 건다.
-        const repeatedError = (modelFamily === 'codex' || modelFamily === 'gpt' || activeProvider.name === 'openai-codex')
+        const repeatedError = !seatLoop && (modelFamily === 'codex' || modelFamily === 'gpt' || activeProvider.name === 'openai-codex')
           ? erroredToolCallSignatures.get(signatureOf(call)) : undefined;
         if (repeatedError && repeatedError.count >= DEDUP_THRESHOLD) {
           debug.log('llm.router', 'tool-loop.dedup-blocked', { turn, tool: call.name, signature: signatureOf(call), priorCount: repeatedError.count, threshold: DEDUP_THRESHOLD, reason: 'repeated-error' });
@@ -11527,7 +11626,7 @@ export async function streamLLMWithTools(
           const sig = signatureOf(call);
           const priorCount = seenToolCallSignatures.get(sig) ?? 0;
           seenToolCallSignatures.set(sig, priorCount + 1);
-          if (priorCount + 1 >= DEDUP_THRESHOLD
+          if (priorCount + 1 >= DEDUP_THRESHOLD && !seatLoop
             && applyCodexBehaviorGuard('same-args-dedup', effectiveModel, true, true)) {
             const stub = buildDedupStub(call, priorCount);
             if (debug.enabled) {
@@ -11949,12 +12048,39 @@ export async function streamLLMWithTools(
           break;
         }
       }
+      // 탐색 예산은 «성공한» 검색 라운드만 센다 — 실패·오류·타임아웃만 난 라운드(`~` 경로 미확장,
+      // rg 30s 타임아웃 등)는 아무것도 찾지 못했으므로 연속에서 되돌린다(5497ec9 재측정 A-stale).
+      if (wasExploratoryTurn && callsToDispatch.length > 0) {
+        const roundFailed = callsToDispatch.every((_, i) => {
+          const r = dispatchedResults[i];
+          if (!r || r.phaseRejected) return true;
+          if (r.isError) return true;
+          return !!r.result && typeof r.result === 'object'
+            && typeof (r.result as { error?: unknown }).error === 'string';
+        });
+        if (roundFailed && exploratoryTurnStreak > prevExploratoryStreak) {
+          exploratoryTurnStreak = prevExploratoryStreak;
+          if (wasSearchOnlyTurn) searchOnlyTurnStreak = prevSearchOnlyTurnStreak;
+          debug.log('llm.router', 'tool-loop.exploratory-streak-failed-round', {
+            turn, streak: exploratoryTurnStreak, tools: callsToDispatch.map((c) => c.name),
+          });
+        }
+      }
       // A — identical successful-call repeat detection (gemini-style; see
       // toolRepeatTracker). Successful dispatch results and non-error guard
       // stubs are recorded here; 5 identical (same tool + same args) in a row
       // → a one-shot converge nudge for the next turn. Does not hard-stop and
       // does not touch exploration budget.
-      for (let i = 0; i < callsToDispatch.length; i += 1) {
+      if (driveSideEffectStop && !seatStationaryStop) seatStationaryStop = { tool: driveSideEffectStop.tool, run: driveSideEffects?.count ?? 0, why: driveSideEffectStop.why };
+      for (let i = 0; i < callsToDispatch.length && seatStationarity !== null && !seatStationaryStop?.why; i += 1) {
+        const call = callsToDispatch[i]!;
+        const verdict = seatStationarity.record(call.name, call.args, toolFreshnessToken(call.name, call.args));
+        if (verdict === 'ok') continue;
+        debug.log('llm.router', 'tool-loop.seat-stationarity', { turn, verdict, tool: call.name, run: seatStationarity.run }, { level: 'warn' });
+        if (verdict === 'nudge' && !postToolResultUserNote) postToolResultUserNote = stationarityNudgeNote(call.name, seatStationarity.run);
+        if (verdict === 'stop') seatStationaryStop = { tool: call.name, run: seatStationarity.run };
+      }
+      for (let i = 0; i < callsToDispatch.length && seatStationarity === null; i += 1) {
         const r = dispatchedResults[i];
         if (!r || r.isError) continue;
         const call = callsToDispatch[i]!;
@@ -12178,7 +12304,24 @@ export async function streamLLMWithTools(
               ? Math.min(opts.toolResultInlineLimitBytes, 10 * 1024)
               : opts.toolResultInlineLimitBytes;
         const imageBearing = maybeImageBearingResult(result);
-        if (imageBearing) {
+        // IMAGE-REQUEST-BUDGET — an image-bearing tool result (Read on a PNG · screenshots) is downscaled to 2048 px and
+        // re-encoded before it joins the request; one that still cannot fit goes as its metadata text plus a visible note.
+        const preparedToolImage = imageBearing
+          ? await prepareRequestImage(Buffer.from(imageBearing.dataB64, 'base64'),
+            typeof imageBearing.rest.output === 'string' ? imageBearing.rest.output : call.name,
+            { mediaType: imageBearing.mediaType, where: 'tool output' })
+          : null;
+        if (imageBearing && preparedToolImage && preparedToolImage.block.type !== 'image') {
+          try { handlers.onStatus?.(imageDroppedText()); } catch { /* status is fail-soft */ }
+          resultBlocks.push({
+            type: 'tool_result',
+            tool_use_id: call.id,
+            content: toolResultContentForCall(call.name,
+              `${JSON.stringify(imageBearing.rest)}\n${imageDroppedText()}`, toolResultInlineLimitBytes),
+            ...(isError ? { isError: true } : {}),
+          });
+        } else if (imageBearing && preparedToolImage?.block.type === 'image') {
+          const imageBlock = preparedToolImage.block;
           // Image-bearing tool result (Phase 1, 2026-05-05) — see
           // ToolRunResult docstring. Repackage as Anthropic-style
           // content array so vision-capable models receive the PNG
@@ -12188,8 +12331,9 @@ export async function streamLLMWithTools(
             type: 'tool_result',
             tool_use_id: call.id,
             content: [
-              { type: 'image', mediaType: imageBearing.mediaType, base64: imageBearing.dataB64 },
+              { type: 'image', mediaType: imageBlock.mediaType, base64: imageBlock.base64 },
               { type: 'text', text: toolResultContentForCall(call.name, JSON.stringify(imageBearing.rest), toolResultInlineLimitBytes) },
+              ...(preparedToolImage.notice ? [{ type: 'text' as const, text: preparedToolImage.notice }] : []),
             ],
             ...(isError ? { isError: true } : {}),
           });
@@ -12415,8 +12559,25 @@ export async function streamLLMWithTools(
     // W5-F so each streamLLMWithTools invocation gets at most one
     // synthesis attempt. Extended to gemini 2026-05-04 alongside
     // W5-E/W5-F for the same pathology shape.
+    // SEAT-TURN-FOLLOWUPS ① — stationary seat loop: one tools-off summary step (done / remaining / next) ends the turn.
+    if (seatStationaryStop !== null && !hardStopText) {
+      const { tool, run, why } = seatStationaryStop;
+      const summary = forceSynthesisAttempted ? null : await tryForceSynthesisPass({
+        provider, model: effectiveModel, history, turn, modelFamily, streamingHandlers: handlers,
+        ...(opts.sessionId ? { sessionId: opts.sessionId } : {}), tools: activeTools,
+        promptText: why ? sideEffectSummaryPrompt(why, tool, run) : stationaritySummaryPrompt(tool, run),
+      });
+      forceSynthesisAttempted = true;
+      const emitted = summary ?? (why ? sideEffectFallbackSummary(why, tool, run) : stationarityFallbackSummary(tool, run));
+      const finalText = finalizeVisibleAssistantText(appendFinalSynthesisNotice(fullText, emitted), emitted, sawToolRound);
+      if (summary === null || finalText !== summary) handlers.onText('', finalText);
+      debug.log('llm.router', 'tool-loop.seat-stationarity-stop', { turn, tool, run, summarized: summary !== null }, { level: 'warn' });
+      emitTurnComplete(finalText);
+      return finalText;
+    }
     if (
       !opts.researchTurn
+      && !seatLoop
       && !forceSynthesisAttempted
       && noContentReadTurnStreak >= 4
       && (modelFamily === 'gemini'
@@ -12681,7 +12842,7 @@ function makeOpenAICompatProvider(
       const activeModel = opts.model || model;
       const profile = resolveModelProfile(activeModel);
       const { temperature: profiledTemperature, frequencyPenalty: profiledFrequencyPenalty } = modelProfileSampling(profile, opts);
-      if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(opts.tools);
+      if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(opts.tools, { provider: name, model: activeModel });
       const wireModel = name === 'openrouter' ? openRouterWireModel(activeModel) : activeModel;
       const solar = name === 'openrouter' && solarOptimizationEnabled() && isSolarPro4Model(activeModel);
       const tools = toOpenAITools(
@@ -12704,6 +12865,12 @@ function makeOpenAICompatProvider(
       // P-3 §6.9 (2026-05-07) — same lookup also gates user-message
       // image blocks in the wire.
       const brand = name as Parameters<typeof isVisionCapableModel>[0];
+      // VISION-CATALOG-BUILTIN (11-25) — OpenRouter 모델이 카탈로그·내장 표 어디에도 없고 이 요청이 이미지를 싣는다면
+      //   공급자 메타데이터(`/api/v1/models` input_modalities)를 한 번 묻고 캐시한다(실패 = 종전처럼 «모른다»).
+      if (name === 'openrouter' && messagesCarryImages(messages) && openRouterVisionFact(activeModel) === undefined) {
+        const fact = await lookupOpenRouterVision(activeModel);
+        debug.log('llm.openrouter', 'vision-lookup', { model: openRouterWireModel(activeModel), vision: fact ?? null });
+      }
       const followup = isVisionCapableModel(brand, activeModel, 'userMessage');
       // 구독이 있으면 «엔드포인트와 자격이 통째로» 바뀐다(cli-chat-proxy + Bearer).
       // 모델별 라우팅은 본문이 아니라 헤더로 가므로 활성 모델로 다시 만든다.
@@ -13125,6 +13292,18 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
           store: useStore,
           ...(wirePrevId ? { previousResponseId: wirePrevId } : {}),
         };
+        // IMAGE-REQUEST-BUDGET — images have their own budget (per-image size · per-request count); an image over it
+        // becomes a one-line text part here rather than pushing the request over the text cap and failing the turn.
+        const applyImageBudget = <I,>(items: I[], stage: string): I[] => {
+          const budget = enforceResponsesImageBudget(items);
+          if (budget.dropped > 0) {
+            debug.log('llm.request', 'request-images-dropped', {
+              provider: 'openai-codex', stage, kept: budget.kept, dropped: budget.dropped, reasons: budget.droppedReasons,
+            }, { level: 'warn' });
+          }
+          return budget.input;
+        };
+        requestBody = { ...requestBody, input: applyImageBudget(requestBody.input, 'initial') };
         const requestGuard = opts.requestSizeGuard;
         const promptCache = opts.promptCache !== false;
         // TUI-PROMPT-CACHE-PREFIX — the preflight must measure the same body
@@ -13133,7 +13312,8 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
         let serializedWireBody: string | undefined;
         if (requestGuard) {
           serializedWireBody = serializeCodexResponsesWireBody(requestBody, promptCache, sessionCacheKey);
-          let requestChars = serializedWireBody.length;
+          // The cap protects TEXT context: inline image payloads are not counted (they have their own budget above).
+          let requestChars = requestTextChars(serializedWireBody);
           const initialRequestChars = requestChars;
           const compactAtChars = Number.isFinite(requestGuard.compactAtChars)
             && requestGuard.compactAtChars! > 0
@@ -13157,9 +13337,9 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
                   replayCodexReasoning: !useStore,
                   stablePrefix: true,
                 });
-                const compactBody = { ...requestBody, instructions: compactInput.instructions, input: compactInput.input };
+                const compactBody = { ...requestBody, instructions: compactInput.instructions, input: applyImageBudget(compactInput.input, 'compacted') };
                 const compactWireBody = serializeCodexResponsesWireBody(compactBody, promptCache, sessionCacheKey);
-                const compactChars = compactWireBody.length;
+                const compactChars = requestTextChars(compactWireBody);
                 if (compactChars < requestChars) {
                   await compacted.commit?.();
                   messages.splice(0, messages.length, ...compacted.messages);
@@ -13198,14 +13378,15 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
                   replayCodexReasoning: !useStore,
                   stablePrefix: true,
                 });
-                const body = { ...requestBody, instructions: converted.instructions, input: converted.input };
+                const body = { ...requestBody, instructions: converted.instructions, input: applyImageBudget(converted.input, 'compact-next') };
                 const wire = serializeCodexResponsesWireBody(body, promptCache, sessionCacheKey);
-                if (wire.length >= requestChars) continue;
+                const wireTextChars = requestTextChars(wire);
+                if (wireTextChars >= requestChars) continue;
                 messages.splice(0, messages.length, ...candidate.messages);
                 await requestGuard.onCompacted?.(messages);
                 requestBody = body;
                 serializedWireBody = wire;
-                requestChars = wire.length;
+                requestChars = wireTextChars;
                 requestCompacted = true;
                 requestCompactReason = requestChars > requestGuard.maxChars
                   ? `compaction-still-over-cap:${candidate.reason}` : candidate.reason;
@@ -13299,6 +13480,22 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
   };
 }
 
+/** ANTHROPIC 401 (대표 11-25 · 키 경로 수리는 «나중에») — invalid x-api-key 를 «키를 바꿔야 한다»가 보이는 문면으로 바꾼다.
+ *  타입·status·본문은 그대로(ApiHttpError 401) — 재시도·폴백 판정은 종전과 같다. ⛔ 키 값은 싣지 않는다. */
+async function* withAnthropicKeyRejection(events: AsyncGenerator<LLMStreamEvent, void, unknown>): AsyncGenerator<LLMStreamEvent, void, unknown> {
+  try {
+    yield* events;
+  } catch (err) {
+    if (err instanceof ApiHttpError && err.status === 401) {
+      throw new ApiHttpError({
+        status: 401, bodyText: err.bodyText, provider: err.provider, retryAfter: err.retryAfter,
+        errorPrefix: 'Anthropic API key rejected — replace the key (`elanous setup` or scripts/add-api-key.sh ANTHROPIC_API_KEY) ·',
+      });
+    }
+    throw err;
+  }
+}
+
 function makeAnthropicProvider(cfg: UCLLMConfig): LLMProvider {
   const apiKey = cfg.apiKey;
   const model = cfg.model || ANTHROPIC_MODEL;
@@ -13378,7 +13575,7 @@ function makeAnthropicProvider(cfg: UCLLMConfig): LLMProvider {
         : effort
           ? Math.max(opts.maxTokens ?? 8192, 8192)
           : (opts.maxTokens ?? 2048);
-      yield* streamAnthropicEvents(apiKey, {
+      yield* withAnthropicKeyRejection(streamAnthropicEvents(apiKey, {
         model: anthropicModel,
         messages: convo,
         ...(system !== undefined ? { system } : {}),
@@ -13387,7 +13584,7 @@ function makeAnthropicProvider(cfg: UCLLMConfig): LLMProvider {
         ...(effort ? { thinking: { type: 'adaptive' }, output_config: { effort } } : {}),
         ...anthropicTemperatureField(anthropicModel, thinkingActive, opts.temperature),
         ...(tools ? { tools } : {}),
-      }, opts.signal, opts.remainingFallbacks);
+      }, opts.signal, opts.remainingFallbacks));
     },
     async *chat(messages, opts = {}) { yield* textOnly(this.streamChat!(messages, opts)); },
   };

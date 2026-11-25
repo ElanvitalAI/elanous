@@ -1,7 +1,34 @@
 import { maskEnvAssignments, simpleArgv } from '../../security/shell-argv-policy.js';
 import { safeStatusText } from './log-view.js';
 
-export interface PublicToolCall { id: string; name: string; target?: string; /** A finished sub-agent's one-line result (Agent rows only). */ summary?: string }
+export interface PublicToolCall {
+  id: string; name: string; target?: string;
+  /** A finished sub-agent's one-line result (Agent rows only). */ summary?: string;
+  /** Agent rows only: «3k tok · goal 45k tok» — this agent's spend and the seat's total for the goal. */ spend?: string;
+  /** The finished call returned an error (TOOL-RUN-FOLD keeps a folded run marked ✗ with this call's name). */ failed?: boolean;
+}
+
+/** What a guarded Agent spawn reports: this agent's tokens so far and the seat's total for the current goal. */
+export interface AgentSpend { tokens: number; goalTokens: number }
+
+/** «850 tok» · «42k tok» */
+export function formatTokens(tokens: number): string {
+  return tokens < 1000 ? `${Math.max(0, Math.round(tokens))} tok` : `${Math.round(tokens / 1000)}k tok`;
+}
+
+/** The Agent row's spend label from a tool result carrying `spend`, else undefined. */
+export function agentSpendLabel(result: unknown): string | undefined {
+  const spend = result !== null && typeof result === 'object' ? (result as { spend?: unknown }).spend : undefined;
+  if (spend === null || typeof spend !== 'object') return undefined;
+  const { tokens, goalTokens } = spend as Partial<AgentSpend>;
+  if (typeof tokens !== 'number' || typeof goalTokens !== 'number' || !Number.isFinite(tokens) || !Number.isFinite(goalTokens)) return undefined;
+  return `${formatTokens(tokens)} \u00b7 goal ${formatTokens(goalTokens)}`;
+}
+
+/** Only a label shaped exactly like agentSpendLabel's output crosses the progress boundary. */
+export function safeAgentSpend(value: unknown): string | undefined {
+  return typeof value === 'string' && /^\d+k? tok \u00b7 goal \d+k? tok$/u.test(value) ? value : undefined;
+}
 export type PublicToolActivity =
   | ({ phase: 'start' | 'finish' } & PublicToolCall)
   | { phase: 'snapshot'; calls: PublicToolCall[] };
@@ -22,6 +49,12 @@ function fileTool(name: string): boolean {
 }
 function agentTool(name: string): boolean {
   return name === 'Agent' || name === 'spawn_agent';
+}
+/** TOOL-SEARCH-FOLD — capability lookups (ToolSearch · capability_search) are plumbing, not work: they never take their
+ *  own row on screen. Display only; the model still sees every call and result. */
+const CAPABILITY_DISCOVERY_TOOLS = new Set(['ToolSearch', 'tool_search', 'toolSearch', 'capability_search', 'CapabilitySearch']);
+export function isCapabilityDiscoveryTool(name: string | undefined): boolean {
+  return CAPABILITY_DISCOVERY_TOOLS.has(name ?? '');
 }
 function shellTool(name: string): boolean {
   return ['Bash', 'RunShell', 'bash', 'run_shell', 'shell', 'exec_argv'].includes(name);
@@ -151,6 +184,21 @@ export function safeAgentDescription(value: unknown): string | undefined {
   return text.split(' ').some(secretLikeWord) ? undefined : text;
 }
 
+/** Joins a spawn's name and its stated reason on the Agent row: «🤖 name — reason». */
+export const AGENT_REASON_SEPARATOR = ' \u2014 ';
+export const AGENT_SPAWN_GLYPH = '\u{1F916}';
+
+/** Agent row target: the name alone, or «name — reason» with each half projected on its own (re-projection is a fixed point). */
+export function safeAgentTarget(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const at = value.indexOf(AGENT_REASON_SEPARATOR);
+  if (at < 0) return safeAgentDescription(value);
+  const name = safeAgentDescription(value.slice(0, at));
+  if (!name) return undefined;
+  const reason = safeAgentSummary(value.slice(at + AGENT_REASON_SEPARATOR.length));
+  return reason ? `${name}${AGENT_REASON_SEPARATOR}${reason}` : name;
+}
+
 /**
  * One line of a finished sub-agent's answer for its row: the first non-empty line, plain words only, secret-looking words and
  * anything but letters, digits and common punctuation replaced by «…», at most 60 characters. The child's tool output never gets here —
@@ -170,7 +218,7 @@ export function safeAgentSummary(value: unknown): string | undefined {
 
 export function safeToolActivityTarget(name: string, value: unknown): string | undefined {
   if (publicToolName(name) === HIDDEN_TOOL_LABEL) return undefined;
-  if (agentTool(name)) return safeAgentDescription(value);
+  if (agentTool(name)) return safeAgentTarget(value);
   return shellTool(name) ? safeCommandSummary(value) : safeToolTarget(value);
 }
 
@@ -211,7 +259,12 @@ export function safeToolTarget(value: unknown): string | undefined {
   return tokenLayerGate(name).slice(0, 80);
 }
 export function toolActivityTarget(name: string, args: Record<string, unknown>): string | undefined {
-  if (agentTool(name)) return safeAgentDescription(args.description);
+  if (agentTool(name)) {
+    const reason = typeof args.reason === 'string' ? args.reason.trim() : '';
+    if (!reason) return safeAgentDescription(args.description);
+    const label = typeof args.name === 'string' && args.name.trim() ? args.name : args.description;
+    return safeAgentTarget(`${typeof label === 'string' ? label : ''}${AGENT_REASON_SEPARATOR}${reason}`);
+  }
   if (shellTool(name)) return safeCommandSummary(args.command ?? args.cmd
     ?? (Array.isArray(args.argv) ? args.argv.map(arg => (typeof arg === 'string' && /\s/.test(arg) && !/["']/.test(arg) ? `"${arg}"` : String(arg))).join(' ') : undefined));
   if (!fileTool(name)) return undefined;
@@ -235,6 +288,8 @@ export function updateToolActivity(rows: readonly ToolActivityRow[], event: Publ
     startedAt: previous?.startedAt ?? now,
     ...(event.phase === 'finish' ? { finishedAt: now } : {}),
     ...(agentTool(event.name) && (event.summary ?? previous?.summary) !== undefined ? { summary: safeAgentSummary(event.summary ?? previous?.summary) } : {}),
+    ...(agentTool(event.name) && safeAgentSpend(event.spend ?? previous?.spend) ? { spend: safeAgentSpend(event.spend ?? previous?.spend) } : {}),
+    ...(event.phase === 'finish' && event.failed === true ? { failed: true } : {}),
   };
   // Completion updates its existing line; it never reorders earlier starts.
   return (previous ? rows.map(item => item.id === event.id ? row : item) : [...rows, row]).slice(-RECENT_CALL_LIMIT);
@@ -245,11 +300,58 @@ export function updateToolActivity(rows: readonly ToolActivityRow[], event: Publ
  *  fitting (fitLogLine strips SGR). English on purpose — these are tool names, not prose. */
 export const TOOL_RUNNING_GLYPH = process.platform === 'darwin' ? '\u23FA' : '\u25CF';
 export const TOOL_DONE_GLYPH = '\u2713';
+/** A finished call (or a folded run holding one) that returned an error. */
+export const TOOL_FAILED_GLYPH = '\u2717';
+/** TOOL-RUN-FOLD — how a folded run of calls says it can be opened. */
+export const TOOL_RUN_EXPAND_HINT = '(ctrl+o / click to expand)';
+/** A folded run line: «⏺ 3 tools · …» / «✓ 4 tools · …» / «✗ 2 tools · …». */
+const TOOL_RUN_LINE = /^(?:\u23FA|\u25CF|\u2713|\u2717) \d+ tools · /u;
+
+/** A tool result shaped like an error: a string starting «error:», or an object whose `error` is set (display only). */
+export function toolResultFailed(result: unknown): boolean {
+  let value = result;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (/^error\s*:/i.test(text)) return true;
+    if (!text.startsWith('{')) return false;
+    try { value = JSON.parse(text); } catch { return false; }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const error = (value as Record<string, unknown>).error;
+  if (typeof error === 'string') return error.trim().length > 0;
+  return error !== null && error !== undefined && error !== false;
+}
 /** A run of this many consecutive finished calls of one tool folds into a single «Read ×N» row. */
 export const TOOL_FOLD_MIN_RUN = 3;
 
 export function isToolActivityLine(line: string): boolean {
-  return line.startsWith(`${TOOL_RUNNING_GLYPH} `) || line.startsWith(`${TOOL_DONE_GLYPH} `);
+  return line.startsWith(`${TOOL_RUNNING_GLYPH} `) || line.startsWith(`${TOOL_DONE_GLYPH} `) || line.startsWith(`${TOOL_FAILED_GLYPH} `);
+}
+
+/** True for a folded run line (SGR stripped first) — a click on it opens or folds the runs. */
+export function isToolRunLine(line: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  return TOOL_RUN_LINE.test(line.replace(/\x1b\[[0-9;]*m/g, '').trimStart());
+}
+
+export interface ToolActivityLineOptions {
+  /** TOOL-RUN-FOLD — true shows every call on its own row (the per-call view); false/absent folds each run into one line. */
+  readonly expanded?: boolean;
+}
+
+/** One line for a run of consecutive calls: count, names in first-seen order with «×k», wall time, and a failure mark. */
+function toolRunLine(rows: readonly ToolActivityRow[], now: number): string {
+  const counts = new Map<string, number>();
+  for (const row of rows) { const name = publicToolName(row.name); counts.set(name, (counts.get(name) ?? 0) + 1); }
+  const names = [...counts].map(([name, count]) => count > 1 ? `${name} ×${count}` : name).join(' · ');
+  const running = rows.some((row) => row.finishedAt === undefined);
+  const failed = [...new Set(rows.filter((row) => row.failed === true).map((row) => publicToolName(row.name)))];
+  const start = Math.min(...rows.map((row) => row.startedAt));
+  const end = Math.max(...rows.map((row) => row.finishedAt ?? now));
+  const seconds = Math.max(0, Math.floor((end - start) / 1000));
+  const glyph = running ? TOOL_RUNNING_GLYPH : failed.length > 0 ? TOOL_FAILED_GLYPH : TOOL_DONE_GLYPH;
+  return `${glyph} ${rows.length} tools · ${names}${seconds > 0 ? ` · ${seconds}s` : ''}`
+    + `${failed.length > 0 ? ` · failed ${failed.join(', ')}` : ''}${running ? ` ${TOOL_RUN_EXPAND_HINT}` : ''}`;
 }
 
 function projectedTarget(row: ToolActivityRow): string | undefined {
@@ -264,20 +366,42 @@ function elapsed(row: ToolActivityRow, now: number): string {
 
 /** The newest still-running call, labelled exactly as its row is (public name, projected target). */
 export function runningToolLabel(rows: readonly ToolActivityRow[]): { name: string; target?: string } | undefined {
-  const running = [...rows].reverse().find((row) => row.finishedAt === undefined);
+  const running = [...rows].reverse().find((row) => row.finishedAt === undefined && !isCapabilityDiscoveryTool(row.name));
   if (!running) return undefined;
   const target = projectedTarget(running);
   return { name: publicToolName(running.name), ...(target ? { target } : {}) };
 }
 
-export function toolActivityLines(rows: readonly ToolActivityRow[], now: number): string[] {
+export function toolActivityLines(allRows: readonly ToolActivityRow[], now: number, options: ToolActivityLineOptions = {}): string[] {
+  // A capability lookup folds into the next real call: dropped here, so «Read, ToolSearch, Read, Read» still reads «Read ×3».
+  const rows = allRows.filter((row) => !isCapabilityDiscoveryTool(row.name));
+  if (options.expanded === true) return perCallLines(rows, now);
+  // TOOL-RUN-FOLD (대표 «Claude 처럼 한 줄»): consecutive calls fold into ONE line from the first call; a sub-agent keeps its own row.
+  // Display only — the rows (and the session messages behind them) are never changed.
+  const lines: string[] = [];
+  let run: ToolActivityRow[] = [];
+  const flush = (): void => {
+    if (run.length >= 2) lines.push(toolRunLine(run, now));
+    else lines.push(...perCallLines(run, now));
+    run = [];
+  };
+  for (const row of rows) {
+    if (agentTool(row.name)) { flush(); lines.push(...perCallLines([row], now)); continue; }
+    run.push(row);
+  }
+  flush();
+  return lines;
+}
+
+/** Today's per-call rows (the expanded view): one row per call, a finished same-tool run of 3+ as «Read ×N». */
+function perCallLines(rows: readonly ToolActivityRow[], now: number): string[] {
   const lines: string[] = [];
   for (let index = 0; index < rows.length;) {
     const row = rows[index]!;
     const name = publicToolName(row.name);
     let end = index + 1;
-    if (row.finishedAt !== undefined && !agentTool(row.name)) {
-      while (end < rows.length && rows[end]!.finishedAt !== undefined && publicToolName(rows[end]!.name) === name) end++;
+    if (row.finishedAt !== undefined && row.failed !== true && !agentTool(row.name)) {
+      while (end < rows.length && rows[end]!.finishedAt !== undefined && rows[end]!.failed !== true && publicToolName(rows[end]!.name) === name) end++;
     }
     if (end - index >= TOOL_FOLD_MIN_RUN) {
       const last = projectedTarget(rows[end - 1]!);
@@ -287,10 +411,12 @@ export function toolActivityLines(rows: readonly ToolActivityRow[], now: number)
       continue;
     }
     const target = projectedTarget(row);
-    const call = target ? `${name}(${target})` : name;
+    const call = agentTool(row.name) && target?.includes(AGENT_REASON_SEPARATOR)
+      ? `${AGENT_SPAWN_GLYPH} ${target}`
+      : target ? `${name}(${target})` : name;
     lines.push(row.finishedAt === undefined
       ? `${TOOL_RUNNING_GLYPH} ${call}${elapsed(row, now)}`
-      : `${TOOL_DONE_GLYPH} ${call}${elapsed(row, now)}${agentTool(row.name) && row.summary ? ` · ${safeAgentSummary(row.summary) ?? ''}`.replace(/ · $/, '') : ''}`);
+      : `${row.failed === true ? TOOL_FAILED_GLYPH : TOOL_DONE_GLYPH} ${call}${elapsed(row, now)}${agentTool(row.name) && safeAgentSpend(row.spend) ? ` \u00b7 ${row.spend}` : ''}${agentTool(row.name) && row.summary ? ` · ${safeAgentSummary(row.summary) ?? ''}`.replace(/ · $/, '') : ''}`);
     index++;
   }
   return lines;
@@ -304,7 +430,7 @@ export function toolActivityLines(rows: readonly ToolActivityRow[], now: number)
  */
 export function interleavedTurnLines(
   rows: readonly ToolActivityRow[], offsets: ReadonlyMap<string, number>, text: string,
-  now: number, textLines: (chunk: string) => string[],
+  now: number, textLines: (chunk: string) => string[], options: ToolActivityLineOptions = {},
 ): string[] {
   const anchored = rows.map((row, index) => ({ row, index,
     at: Math.min(text.length, Math.max(0, offsets.get(row.id) ?? text.length)) }))
@@ -312,7 +438,7 @@ export function interleavedTurnLines(
   const lines: string[] = [];
   let cursor = 0;
   let pending: ToolActivityRow[] = [];
-  const flush = (): void => { if (pending.length) { lines.push(...toolActivityLines(pending, now)); pending = []; } };
+  const flush = (): void => { if (pending.length) { lines.push(...toolActivityLines(pending, now, options)); pending = []; } };
   for (const { row, at } of anchored) {
     if (at > cursor) {
       const chunk = text.slice(cursor, at);

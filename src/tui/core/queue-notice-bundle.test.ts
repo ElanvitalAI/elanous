@@ -3,31 +3,43 @@ import { createNextTuiQueue, NEXT_TUI_NOTICE_CAP } from './queue.js';
 
 /**
  * SEAT-NOTICE-BUNDLE-DRAIN (OP #128938, DIAG §107 «대기 88») — 실패 먼저 시험.
- * 완료선: 알림 상한 20(넘치면 원장 안내 한 줄) · 쌓인 알림 전부 한 턴 묶음 drain ·
+ * 완료선: 알림 상한 100(CEO 11-25 · 옛 20)(넘치면 원장 안내 한 줄) · 쌓인 알림 전부 한 턴 묶음 drain ·
  * 사람 줄은 묶지 않고 먼저 · 순서 보존(회귀 = 알림 50건 → 1턴 비움).
  */
 
 describe('SEAT-NOTICE-BUNDLE-DRAIN — notice cap', () => {
-  test('50 notice arrivals cap waiting notices at 20 plus ONE ledger-guide line', () => {
+  test('150 notice arrivals cap waiting notices at 100 plus ONE ledger-guide line', () => {
     const queue = createNextTuiQueue({ log: () => {} });
-    for (let i = 1; i <= 50; i += 1) queue.enqueueNotice(`알림 ${i}`, 'seat-mail');
+    for (let i = 1; i <= 150; i += 1) queue.enqueueNotice(`알림 ${i}`, 'seat-mail');
     const waiting = queue.items.filter((item) => item.kind === 'notice' && item.status === 'queued');
-    // 상한: notice 20건 + 안내 1줄 — 안내도 notice 항목이므로 총 21을 넘지 않는다.
-    expect(waiting.length).toBe(NEXT_TUI_NOTICE_CAP + 1);
-    // 넘친 30건은 안내 한 줄로 접힌다 — 마지막 항목이 원장 안내(msg list)를 지칭하고 초과 수를 밝힌다.
+    // 상한: notice 100건 + 안내 1줄 — 안내도 notice 항목이므로 총 101을 넘지 않는다.
+    expect(NEXT_TUI_NOTICE_CAP).toBe(100);
+    expect(waiting.length).toBe(101);
+    // 넘친 50건은 안내 한 줄로 접힌다 — 마지막 항목이 원장 안내(msg list)를 지칭하고 초과 수를 밝힌다.
     const last = queue.items.at(-1)!;
     expect(last.kind).toBe('notice');
     expect(last.text).toContain('msg list');
-    expect(last.text).toContain('30');
+    expect(last.text).toContain('50건이 접혔습니다');
   });
 
   test('the cap counts only notices — a queued person line is never dropped nor counted', () => {
     const queue = createNextTuiQueue({ log: () => {} });
     queue.enqueue('사람 줄');
-    for (let i = 1; i <= 50; i += 1) queue.enqueueNotice(`알림 ${i}`, 'seat-mail');
+    for (let i = 1; i <= 150; i += 1) queue.enqueueNotice(`알림 ${i}`, 'seat-mail');
     expect(queue.items.filter((item) => item.kind === 'user' && item.status === 'queued').length).toBe(1);
     const notices = queue.items.filter((item) => item.kind === 'notice' && item.status === 'queued');
-    expect(notices.length).toBe(NEXT_TUI_NOTICE_CAP + 1);
+    expect(notices.length).toBe(101);
+  });
+
+  test('SEAT-QUEUE-CAPACITY — 100 seat mails fill the queue to the cap and none is folded', () => {
+    const events: string[] = [];
+    const queue = createNextTuiQueue({ log: (event) => { events.push(event); } });
+    for (let i = 1; i <= 100; i += 1) queue.enqueueNotice(`우편 ${i}`, 'seat-mail', { msgId: i });
+    const waiting = queue.items.filter((item) => item.kind === 'notice' && item.status === 'queued');
+    expect(waiting).toHaveLength(100);
+    expect(waiting.map((item) => item.text)).toEqual(Array.from({ length: 100 }, (_, i) => `우편 ${i + 1}`));
+    expect(waiting.every((item) => item.source === 'seat-mail')).toBe(true);
+    expect(events).not.toContain('notice-cap-overflow');
   });
 });
 
@@ -75,5 +87,27 @@ describe('SEAT-NOTICE-BUNDLE-DRAIN — bundle drain at the idle boundary', () =>
     if (bundle.kind !== 'notices') throw new Error(`expected a notices bundle, got ${bundle.kind}`);
     expect(bundle.notices[0]!.msgId).toBe(101); // 출처: #38804 — msgId 사슬 유지
     expect(bundle.notices[1]!.occurredAt).toBe(2_000);
+  });
+});
+
+describe('11-25 OP deaf — overflow folds mail into the digest, never drops it', () => {
+  test('102 seat mails: 100 kept + ONE digest that carries mail 101 and 102 in full', () => {
+    const queue = createNextTuiQueue({ log: () => {} });
+    for (let i = 1; i <= 102; i += 1) queue.enqueueNotice(`OP relay ${i}`, 'seat-mail');
+    const waiting = queue.items.filter((item) => item.kind === 'notice' && item.status === 'queued');
+    expect(waiting.length).toBe(101);
+    expect(waiting.at(-1)!.text).toBe([
+      '[notice-overflow] 알림 상한 100을 넘어 2건이 접혔습니다 — 원장에서 확인: eln msg list',
+      '- OP relay 101',
+      '- OP relay 102',
+    ].join('\n'));
+    expect(waiting.at(-1)!.msgId).toBeUndefined();
+  });
+
+  test('the overflow logs say how many were folded', () => {
+    const events: Array<[string, Record<string, unknown>]> = [];
+    const queue = createNextTuiQueue({ log: (event, data) => { events.push([event, data]); } });
+    for (let i = 1; i <= 102; i += 1) queue.enqueueNotice(`m${i}`, 'seat-mail');
+    expect(events.filter(([e]) => e === 'notice-cap-folded').map(([, d]) => d)).toEqual([{ folded: 2, guide: 'q101' }]);
   });
 });

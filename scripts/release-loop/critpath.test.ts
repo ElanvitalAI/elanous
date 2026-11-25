@@ -254,3 +254,127 @@ describe('release critpath', () => {
     await expect(runCritpath(opts({ cutCommit: undefined, branch: 'release/other' }), w.deps)).rejects.toThrow('--branch must be');
   });
 });
+
+describe('release critpath auto-publish on green (owner opt-in)', () => {
+  /** The world above plus the owner switch and the four green facts; decide() closes the open card as an AUTO decision. */
+  function autoWorld(f: { mode?: 'off' | 'on-green'; red?: number; holds?: string[]; branchHead?: string } = {}) {
+    const w = world({ branchHead: f.branchHead });
+    const decided: Array<{ id: string; reason: string }> = [];
+    const notices: string[] = [];
+    const lines: string[] = [];
+    w.deps.log = (line) => lines.push(line);
+    w.deps.autoPublish = {
+      mode: () => f.mode ?? 'on-green',
+      redCount: () => f.red ?? 0,
+      openHolds: () => f.holds ?? [],
+      decide: (id, reason) => {
+        decided.push({ id, reason });
+        const card = w.s.records.find((r) => r.id === id)!;
+        Object.assign(card, { status: 'decided', choice: 'a', decidedBy: { kind: 'auto', agent: 'release-auto' } });
+      },
+      notify: (body) => notices.push(body),
+    };
+    return { ...w, decided, notices, lines };
+  }
+  const at = (iso: string) => () => new Date(iso);
+
+  test('switch off: a green dry run still waits for a human card, publishes nothing', async () => {
+    const w = autoWorld({ mode: 'off' });
+    await runCritpath(opts({ dryRun: true }), w.deps);
+    const r = await runCritpath(opts(), w.deps);
+    expect(r.status).toBe('waiting-approval');
+    expect(r.exitCode).toBe(75);
+    expect(w.decided).toEqual([]);
+    expect(w.calls).not.toContain('publish --yes');
+    expect(w.calls).not.toContain('npm publish');
+    expect(w.notices).toEqual([]);
+  });
+
+  test('switch on + all green: AUTO decision on the card, then publish → npm → verify, then an after-the-fact report', async () => {
+    const w = autoWorld();
+    const dry = await runCritpath(opts({ dryRun: true }), w.deps);
+    expect(dry.status).toBe('dry-run');
+    expect(ledger().dryRunPass).toEqual({ cutSha: CUT, notesSha256: notesSha(), tgzSha1: TGZ_SHA1, at: '2026-11-19T00:00:00.000Z' });
+    w.deps.now = at('2026-11-19T05:59:00Z');
+    const r = await runCritpath(opts(), w.deps);
+    expect(r.status).toBe('done');
+    expect(w.decided.map((d) => d.id)).toEqual(['D-NEW']);
+    expect(w.decided[0]!.reason).toContain('checklist 🔴 0');
+    expect(w.decided[0]!.reason).toContain('no open HOLD');
+    expect(w.calls.slice(-4)).toEqual(['request approval', 'publish --yes', 'npm publish', 'verify']);
+    expect(ledger().entries.find((e) => e.step === 'approval')).toMatchObject({ outcome: 'ok', detail: 'card D-NEW · AUTO release-auto' });
+    expect(w.notices).toHaveLength(1);
+    expect(w.notices[0]).toStartWith('auto-published v9.9.9 · cut aaaaaaaaaaaa · checks ');
+  });
+
+  test('an AUTO record without the switch is not approval', async () => {
+    const w = autoWorld();
+    await runCritpath(opts({ dryRun: true }), w.deps);
+    w.s.records.push({ id: 'D-AUTO', refs: [approvalRef(binding())], status: 'decided', choice: 'a', decidedBy: { kind: 'auto', agent: 'release-auto' } });
+    expect(approvalState(w.s.records, binding())).toEqual({ state: 'auto', id: 'D-AUTO' });
+    w.deps.autoPublish!.mode = () => 'off';
+    const r = await runCritpath(opts(), w.deps);
+    expect(r.status).toBe('waiting-approval');
+    expect(w.calls).not.toContain('publish --yes');
+  });
+
+  const red: Array<[string, Parameters<typeof autoWorld>[0], string | null, string]> = [
+    ['checklist has a 🔴', { red: 1 }, null, 'checklist 🔴 1'],
+    ['dry run older than 6 h', {}, '2026-11-19T06:00:01Z', 'dry run stale'],
+    // release/9.9.9 moved after the --cut-commit dry run (set after the dry run below).
+    ['cut branch head moved', {}, null, 'cut branch head moved: release/9.9.9 bbbbbbbbbbbb ≠ prepared aaaaaaaaaaaa'],
+    ['open HOLD decision', { holds: ['D-HOLD-1'] }, null, 'open HOLD decision D-HOLD-1'],
+  ];
+  for (const [name, facts, later, reason] of red) {
+    test(`one red check keeps the human wait with the skip reason: ${name}`, async () => {
+      const w = autoWorld(facts);
+      await runCritpath(opts({ dryRun: true }), w.deps);
+      if (later) w.deps.now = at(later);
+      if (name === 'cut branch head moved') w.s.branchHead = OTHER_CUT;
+      const r = await runCritpath(opts(), w.deps);
+      expect(r.status).toBe('waiting-approval');
+      expect(r.exitCode).toBe(75);
+      expect(w.decided).toEqual([]);
+      expect(w.calls).not.toContain('publish --yes');
+      expect(w.calls).not.toContain('npm publish');
+      expect(w.notices).toEqual([]);
+      const skip = w.lines.find((l) => l.startsWith('· release.auto-publish skipped {'));
+      expect(skip).toBeDefined();
+      expect(skip).toContain(reason);
+    });
+  }
+
+  test('no dry run for this cut + notes: waits with the skip reason', async () => {
+    const w = autoWorld();
+    const r = await runCritpath(opts(), w.deps);
+    expect(r.status).toBe('waiting-approval');
+    expect(w.lines.find((l) => l.startsWith('· release.auto-publish skipped {'))).toContain('no green dry run recorded');
+  });
+
+  test('--branch head unreadable: switch on waits rc 75 with branch-read-failed; switch off still fails as before', async () => {
+    const on = autoWorld();
+    on.deps.resolveBranch = () => { throw new Error('ssh: connect to host github.com port 22: Operation timed out'); };
+    const r = await runCritpath(opts({ cutCommit: undefined, branch: 'release/9.9.9' }), on.deps);
+    expect(r.status).toBe('waiting-approval');
+    expect(r.exitCode).toBe(75);
+    expect(on.lines).toContain('· release.auto-publish skipped {branch-read-failed: ssh: connect to host github.com port 22: Operation timed out}');
+    expect(on.calls).not.toContain('prepare');
+    expect(on.calls).not.toContain('publish --yes');
+    expect(on.decided).toEqual([]);
+    const off = autoWorld({ mode: 'off' });
+    off.deps.resolveBranch = () => { throw new Error('ssh: connect to host github.com port 22: Operation timed out'); };
+    const r2 = await runCritpath(opts({ cutCommit: undefined, branch: 'release/9.9.9' }), off.deps);
+    expect(r2.status).toBe('failed');
+    expect(r2.exitCode).toBe(1);
+    expect(r2.step).toBe('prepare');
+  });
+
+  test('notes changed after the dry run: waits (dry run was for another cut/notes)', async () => {
+    const w = autoWorld();
+    await runCritpath(opts({ dryRun: true }), w.deps);
+    writeFileSync(notes, '# elanous v9.9.9\n\nEdited after the dry run.\n');
+    const r = await runCritpath(opts(), w.deps);
+    expect(r.status).toBe('waiting-approval');
+    expect(w.lines.find((l) => l.startsWith('· release.auto-publish skipped {'))).toContain('dry run was for another cut/notes');
+  });
+});

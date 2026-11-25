@@ -91,15 +91,15 @@ test('fake remote world: grok, codex, claude, and eln all wake the seat registry
     for (const receiver of receiverRuntimes) {
       receiverAgent = receiver;
       process.env.ELANOUS_AGENT_RUNTIME = senderRuntime;
-      await program.parseAsync(['msg', 'post', 'cross-runtime wake', '--from', 'OP', '--to', 'MVP-B', '--json'], { from: 'user' });
+      await program.parseAsync(['msg', 'post', 'cross-runtime wake', '--from', 'OP', '--to', 'MVP-B', '--kind', 'info', '--json'], { from: 'user' });
       now += 5 * 60_000 + 1;
     }
   }
   process.env.ELANOUS_AGENT_RUNTIME = 'codex';
   receiverStatus = 'working';
-  await program.parseAsync(['msg', 'post', 'busy recipient remains durable', '--from', 'grok', '--to', 'MVP-B', '--json'], { from: 'user' });
+  await program.parseAsync(['msg', 'post', 'busy recipient remains durable', '--from', 'grok', '--to', 'MVP-B', '--kind', 'info', '--json'], { from: 'user' });
   process.env.ELANOUS_AGENT_RUNTIME = 'claude';
-  await program.parseAsync(['msg', 'post', 'unknown remains durable', '--from', 'grok', '--to', 'UNDECLARED', '--json'], { from: 'user' });
+  await program.parseAsync(['msg', 'post', 'unknown remains durable', '--from', 'grok', '--to', 'UNDECLARED', '--kind', 'info', '--json'], { from: 'user' });
 
   const saved = new MsgStore(join(root, 'messages.db'));
   try {

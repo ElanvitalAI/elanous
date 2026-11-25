@@ -273,7 +273,7 @@ describe('coding surface — shell 실행 tool 노출', () => {
     const spawn = spyOn(globalAgentRegistry, 'spawn').mockImplementation(spawnOpts => realSpawn({ ...spawnOpts, provider: spawnOpts.provider ?? hangingProvider() }));
 
     try {
-      const result = await dispatchSessionRuntimeTool('Agent', { description: 'inherit tools', prompt: 'inspect', run_in_background: true, isolation: 'cwd' }, runtimeDispatchDeps({
+      const result = await dispatchSessionRuntimeTool('Agent', { description: 'inherit tools', prompt: 'inspect inherited tools', reason: 'fixture', run_in_background: true, isolation: 'cwd' }, runtimeDispatchDeps({
         signal: controller.signal,
         agentHostTools: hostTools,
         agentDispatchTool: dispatchTool,
@@ -295,7 +295,7 @@ describe('coding surface — shell 실행 tool 노출', () => {
       controller.abort();
       expect(globalAgentRegistry.get(result.taskId)?.controller.signal.aborted).toBe(true);
 
-      await dispatchSessionRuntimeTool('Agent', { description: 'no child catalog', prompt: 'inspect', run_in_background: true, isolation: 'cwd' }, runtimeDispatchDeps({
+      await dispatchSessionRuntimeTool('Agent', { description: 'no child catalog', prompt: 'inspect missing catalog', reason: 'fixture', run_in_background: true, isolation: 'cwd' }, runtimeDispatchDeps({
         agentHostTools: hostTools,
         agentDispatchTool: dispatchTool,
       }));
@@ -382,7 +382,7 @@ describe('coding surface — shell 실행 tool 노출', () => {
   it('runtime 없는 Agent 폴백은 부모 도구가 없을 때만 빈손 강등을 관측한다', async () => {
     debug.clear();
 
-    await dispatchSessionRuntimeTool('Agent', { description: 'no inherited tools', prompt: 'inspect', run_in_background: true }, runtimeDispatchDeps());
+    await dispatchSessionRuntimeTool('Agent', { description: 'no inherited tools', prompt: 'report an empty host catalog', reason: 'fixture', run_in_background: true }, runtimeDispatchDeps());
 
     expect(agentSpawnEvents()).toEqual([expect.objectContaining({ data: expect.objectContaining({ tools: [], noTools: true }) })]);
     expect(debug.events()).toContainEqual(expect.objectContaining({
@@ -408,9 +408,9 @@ describe('coding surface — shell 실행 tool 노출', () => {
       },
     });
 
-    expect(await dispatchSessionRuntimeTool('Agent', { description: 'runtime path', prompt: 'inspect' }, deps)).toEqual({ dispatched: 'runtime' });
+    expect(await dispatchSessionRuntimeTool('Agent', { description: 'runtime path', prompt: 'inspect runtime path', reason: 'fixture' }, deps)).toEqual({ dispatched: 'runtime' });
     expect(await dispatchSessionRuntimeTool('Read', { file_path: '/tmp/ignored' }, deps)).toEqual({ dispatched: 'native' });
-    expect(await dispatchSessionRuntimeTool('Agent', { description: 'native path', prompt: 'inspect' }, runtimeDispatchDeps({
+    expect(await dispatchSessionRuntimeTool('Agent', { description: 'native path', prompt: 'inspect native path', reason: 'fixture' }, runtimeDispatchDeps({
       dispatchNativeTool: async name => {
         nativeCalls.push(name);
         return { dispatched: 'native' };

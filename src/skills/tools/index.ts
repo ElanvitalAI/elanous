@@ -46,7 +46,7 @@ import {
   SHELL_DEFAULT_TIMEOUT_MS, SHELL_KILL_GRACE_MS, SHELL_MAX_TIMEOUT_MS, SHELL_MIN_TIMEOUT_MS,
   createShellWatchdog, reportShellWatchdog, resolveShellStallMs, type ShellWatchdogResult,
 } from '../../tool-runtime/shell-watchdog.js';
-import type { CapsulePolicy, CapsuleStatus } from '../../turn-capsule/contract.js';
+import { knownLongShellRunner, type CapsulePolicy, type CapsuleStatus } from '../../turn-capsule/contract.js';
 import { runShellCapsule, shellCapsulePolicy, type ShellCapsuleDeps } from '../../turn-capsule/shell-capsule.js';
 import { terminateTree } from '../../shell-primitive/terminate-tree.js';
 import { gateShellCommand } from '../../shell-primitive/runtime.js';
@@ -177,6 +177,10 @@ export function buildBashTool(): LLMToolSpec {
         timeout: {
           type: 'number',
           description: 'Optional per-call timeout in milliseconds. Capped by the skill runner\'s max (default 600000).',
+        },
+        run_in_background: {
+          type: 'boolean',
+          description: 'true = start in the background now (for a command you know runs for minutes). The turn gets a capsule id at once; continue other work or end the turn — a new turn opens with the output when it finishes. Known long runners (bun run test:deterministic, pregate, els update-all, rail scripts) start in the background on their own.',
         },
         sandbox: {
           type: 'string',
@@ -534,15 +538,16 @@ export function bashCapsuleStatus(result: BashResult): CapsuleStatus {
 }
 
 /** CAPSULE-A2 — what the turn reads when its Bash call moved to the background. Wording is the model contract (A5 owns
- *  the tool descriptions): do not wait, do not poll, the completion opens a new turn. */
+ *  the tool descriptions): do not poll, continue other work or end the turn — the completion wakes a new turn. */
 export function bashCapsuleStartedResult(capsuleId: string, syncCapMs: number): BashResult {
-  const output = `[capsule shell ${capsuleId} started] Still running after ${Math.round(syncCapMs / 1000)}s, so it moved to the `
-    + 'background (same process, same timeout). Do not wait or poll for it: finish this turn. Its result arrives as a new '
-    + `turn event (capsule-done ${capsuleId}).`;
+  const output = `[capsule shell ${capsuleId} started] Running in background · will wake on completion — still running after `
+    + `${Math.round(syncCapMs / 1000)}s (same process, same timeout). If this turn has other work, continue it; otherwise `
+    + 'end the turn with one line saying you are waiting for it — a new turn opens with its output '
+    + `(capsule-done ${capsuleId}) when it finishes. Do not poll or sleep for it.`;
   return { stdout: '', stderr: '', output, exitCode: null, timedOut: false, aborted: false, durationMs: syncCapMs };
 }
 
-/** CAPSULE-A2-BASH-DETACH — `dispatchBash` under the capsule policy: past `syncCapMs` (10s) the same process continues
+/** CAPSULE-A2-BASH-DETACH — `dispatchBash` under the capsule policy: past `syncCapMs` (shell: 60s) the same process continues
  *  as a shell capsule (no switch since CAPSULE-FLAGS-REMOVE-DEFAULT). */
 export function dispatchBashCapsule(
   args: Record<string, unknown>,
@@ -554,6 +559,9 @@ export function dispatchBashCapsule(
   return runShellCapsule<BashResult>({
     tool: 'Bash',
     command: typeof args.command === 'string' ? args.command : '',
+    // RUNSHELL-BG-ENDS-TURN ② — explicit request or a known long runner (executable + subcommand) starts detached.
+    ...(args.run_in_background === true || knownLongShellRunner(typeof args.command === 'string' ? args.command : '') !== null
+      ? { requestedBackground: true } : {}),
     ...(signal ? { turnSignal: signal } : {}),
     clockFromSpawn: true,
     start: (own, spawned) => dispatchBash(args, own ? { ...rest, signal: own, onSpawn: spawned } : { ...rest, onSpawn: spawned }),

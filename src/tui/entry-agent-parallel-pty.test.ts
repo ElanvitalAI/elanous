@@ -18,7 +18,7 @@ test('a batch of Agent calls shows every child running at once and then the pare
     writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
     // #38772: an Agent call without run_in_background runs in the background, and the parent would answer at once.
     // This test proves the parent answers only after every child returns, so it asks for the blocking call explicitly.
-    const batch = CHILDREN.map((name) => ({ name: 'Agent', args: { description: `probe ${name}`, prompt: `Investigate ${name} and answer in one line`, run_in_background: false } }));
+    const batch = CHILDREN.map((name) => ({ name: 'Agent', args: { description: `probe ${name}`, prompt: `Investigate ${name} and answer in one line`, reason: 'parallel probe', run_in_background: false } }));
     const seen: Record<string, string> = {};
     const run = await mockSeatPtySequence({
       executable: process.execPath,
@@ -34,7 +34,7 @@ test('a batch of Agent calls shows every child running at once and then the pare
       ready: { label: 'boot', until: (screen) => /Ctrl\+Q (종료|quit)/.test(screen) },
       steps: [
         { label: 'all children in flight', text: 'DELEGATE please', until: (screen) => {
-          const running = screen.split('\n').filter((line) => /⏺ Agent/.test(line)).length;
+          const running = screen.split('\n').filter((line) => /⏺ 🤖 probe /u.test(line)).length;
           if (running === CHILDREN.length && /Running Agent/.test(screen)) seen.together = screen;
           return seen.together !== undefined;
         } },
@@ -56,7 +56,7 @@ function filesUnder(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-// O8 (a)(b): each child's row reads «Agent(<label>) · <one-line result>», and what the child's own tools read never reaches the parent.
+// O8 (a)(b): each child's row reads «🤖 <label> — <reason> · <one-line result>», and what the child's own tools read never reaches the parent.
 test('Agent rows show the label and a one-line result, and the child\'s tool output stays out of the parent session', async () => {
   const root = mkdtempSync(join(tmpdir(), 'agent-rows-'));
   try {
@@ -66,7 +66,7 @@ test('Agent rows show the label and a one-line result, and the child\'s tool out
     writeFileSync(childData, `${CHILD_TOOL_OUTPUT} the child read this file\n`);
     // #38772: an Agent call without run_in_background runs in the background. This test reads each child's
     // completed one-line result on its row, so it asks for the blocking call explicitly.
-    const batch = CHILDREN.map((name) => ({ name: 'Agent', args: { description: `probe ${name}`, prompt: `Investigate ${name} and answer in one line`, run_in_background: false } }));
+    const batch = CHILDREN.map((name) => ({ name: 'Agent', args: { description: `probe ${name}`, prompt: `Investigate ${name} and answer in one line`, reason: 'parallel probe', run_in_background: false } }));
     const summaryOf = (name: string): string => `CHILD-SUMMARY-${name} found the answer`;
     const seen: Record<string, string> = {};
     const run = await mockSeatPtySequence({
@@ -89,10 +89,10 @@ test('Agent rows show the label and a one-line result, and the child\'s tool out
       ],
     });
     expect(run.exitCode).toBe(0);
-    const rows = seen.done!.split('\n').filter((line) => /✓ Agent/.test(line));
+    const rows = seen.done!.split('\n').filter((line) => /✓ 🤖 probe /u.test(line));
     expect(rows).toHaveLength(CHILDREN.length);
     for (const name of CHILDREN) {
-      expect(rows.some((line) => line.includes(`Agent(probe ${name}) `) && line.includes(`· ${summaryOf(name)}`))).toBe(true);
+      expect(rows.some((line) => line.includes(`🤖 probe ${name} \u2014 parallel probe `) && line.includes(`· ${summaryOf(name)}`))).toBe(true);
     }
     expect(seen.done).not.toContain(CHILD_TOOL_OUTPUT);
     // The parent's saved session holds the children's final answers, not what their tools read.

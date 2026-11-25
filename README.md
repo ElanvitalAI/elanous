@@ -29,10 +29,12 @@ elanous harness say "add a --json flag to the status command"
 
 One line — the installer fetches the latest release, verifies it against
 `SHA256SUMS`, installs Bun first if it is missing (the pinned version in
-[`.bun-version`](.bun-version)), and puts `elanous` on your `PATH`:
+[`.bun-version`](.bun-version)), and puts `elanous` on your `PATH`.
+The `--yes` flag consents to installation and automatic doctor repairs, including
+when the command is run without a terminal:
 
 ```bash
-curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash -s -- --yes
 ```
 
 Windows (PowerShell):
@@ -55,7 +57,7 @@ install line (without `sudo` when you are root):
 
 ```bash
 sudo apt-get update && sudo apt-get install -y curl ca-certificates unzip git
-curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash -s -- --yes
 source ~/.bashrc                      # or open a new shell
 elanous --version && elanous doctor
 ```

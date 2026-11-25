@@ -1,0 +1,24 @@
+graph_id: res-patrol
+loop:
+  title: RES guardian patrol
+  root: 수호자
+  stage: shadow
+  owner: RES
+  description: >-
+    Every 5 minutes the RES guardian (thin resident executor) reads the RES policy and patrols restart chains, bun
+    process count / RSS, free memory and load per host (alerts before load 100), credential/quota expiry, pregate
+    slots and VM pressure. In-policy actions run without asking RES (`res.policy allowed {rule}`): chains with no
+    terminal or a frozen root are reaped; VM start/stop within budget runs only in res.mode live. Everything else is
+    one batched «[수호자 · RES]» card to RES (OP when res.dormant). Shadow day: compare with `eln res shadow-report`.
+  trigger:
+    cron: '*/5 * * * *'
+    events: [manual]
+version: 1
+entry_node: patrol
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: patrol, kind: agent, recipe: 'cmd:res-patrol', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: patrol, on: outcome, map: { ok: done, partial: done, fail: failed, error: failed } }

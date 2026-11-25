@@ -26,6 +26,9 @@ import type { ToolRuntime } from './types.js';
 import { buildMsgAskTool, dispatchMsgAsk, type MsgAskResult } from '../skills/tools/msg-ask.js';
 import { dispatchMsgInbox, type MsgInboxResult } from '../skills/tools/msg-inbox.js';
 import { canonicalSeatId } from '../msg/msg-store.js';
+import { buildCommitmentCloseTool, dispatchCommitmentClose, type CommitmentCloseToolResult } from '../commitment/close.js';
+import { buildHandRaiseTool, dispatchHandRaise, type HandRaiseToolResult } from '../skills/tools/hand-raise-tool.js';
+import { buildSeatAssignTool, dispatchSeatAssign, type SeatAssignToolResult } from '../skills/tools/seat-assign-tool.js';
 
 export const msgListRuntime: ToolRuntime<Record<string, unknown>, MsgListResult> = {
   id: 'msg_list',
@@ -36,7 +39,7 @@ export const msgListRuntime: ToolRuntime<Record<string, unknown>, MsgListResult>
 export const msgPostRuntime: ToolRuntime<Record<string, unknown>, MsgPostResult> = {
   id: 'msg_post',
   spec: buildMsgPostTool(),
-  async run(req) { return observeLedgerCall('MsgPost', req, () => dispatchMsgPost(req), (a, r) => ({ from: a.from, to: a.to, ...(r ? { id: r.message.id } : {}) })); },
+  async run(req) { return observeLedgerCall('MsgPost', req, () => dispatchMsgPost(req), (a, r) => ({ from: a.from, to: a.to, ...(r ? (r.message ? { id: r.message.id } : { diverted: r.diverted }) : {}) })); },
 };
 
 export const msgAskRuntime: ToolRuntime<Record<string, unknown>, MsgAskResult> = {
@@ -52,10 +55,10 @@ export const msgAckRuntime: ToolRuntime<Record<string, unknown>, MsgAckResult> =
     if (ctx.surface === 'mcp') {
       const seat = ctx.authenticatedSeat;
       if (!seat) throw new Error('MsgAck requires a host-authenticated seat');
-      if (Object.keys(req).some(key => key !== 'id' && key !== 'ids' && key !== 'receipted')) throw new Error('MCP MsgAck accepts id, ids and receipted; recipient is bound by the host');
+      if (Object.keys(req).some(key => key !== 'id' && key !== 'ids' && key !== 'receipted' && key !== 'apply')) throw new Error('MCP MsgAck accepts id, ids, receipted and apply; recipient is bound by the host');
       const to = canonicalSeatId(seat);
       if (to === 'ALL') throw new Error('ALL is a topic, not an authenticated seat');
-      const bound = { to, ...(req.id === undefined ? {} : { id: req.id }), ...(req.ids === undefined ? {} : { ids: req.ids }), ...(req.receipted === undefined ? {} : { receipted: req.receipted }) };
+      const bound = { to, ...(req.id === undefined ? {} : { id: req.id }), ...(req.ids === undefined ? {} : { ids: req.ids }), ...(req.receipted === undefined ? {} : { receipted: req.receipted }), ...(req.apply === undefined ? {} : { apply: req.apply }) };
       return observeLedgerCall('MsgAck', bound, () => dispatchMsgAck(bound), (a, r) => ({ to: a.to, id: a.id, ...(r ? { cursor: r.cursor, acked: r.acked.length } : {}) }));
     }
     return observeLedgerCall('MsgAck', req, () => dispatchMsgAck(req), (a, r) => ({ to: a.to, id: a.id, ...(r ? { cursor: r.cursor, acked: r.acked.length } : {}) }));
@@ -110,6 +113,35 @@ export const checklistMoveRuntime: ToolRuntime<Record<string, unknown>, Checklis
   async run(req) { return observeLedgerCall('ChecklistMove', req, () => dispatchChecklistMove(req), (a) => ({ id: a.id, from: a.from, to: a.to })); },
 };
 
+// COMMITMENT-CLOSE — close a commitment (done|blocked ⊕ evidence) and cancel its waker.
+export const commitmentCloseRuntime: ToolRuntime<Record<string, unknown>, CommitmentCloseToolResult> = {
+  id: 'commitment_close',
+  spec: buildCommitmentCloseTool(),
+  async run(req) { return dispatchCommitmentClose(req); },
+};
+
+// HAND-RAISE-LADDER — give a ✋ NEED HUMAN mail its one outcome (resolve · reject · escalate up the federation ladder).
+export const handRaiseRuntime: ToolRuntime<Record<string, unknown>, HandRaiseToolResult> = {
+  id: 'hand_raise',
+  spec: buildHandRaiseTool(),
+  async run(req, ctx) {
+    const actor = ctx.surface === 'mcp' ? ctx.authenticatedSeat ?? undefined : undefined;
+    return observeLedgerCall('HandRaise', req, async () => dispatchHandRaise(req, actor ? { actor } : {}),
+      (a, r) => ({ action: a.action, msgId: a.msgId, ...(r ? { to: r.to, mailId: r.mailId } : {}) }));
+  },
+};
+
+// OP-HANDLES-L2b — assign a checklist cell to a hand seat in one call (owner ⊕ mail ⊕ idle wake · built-in writer check).
+export const seatAssignRuntime: ToolRuntime<Record<string, unknown>, SeatAssignToolResult> = {
+  id: 'seat_assign',
+  spec: buildSeatAssignTool(),
+  async run(req, ctx) {
+    const actor = ctx.surface === 'mcp' ? ctx.authenticatedSeat ?? undefined : undefined;
+    return observeLedgerCall('SeatAssign', req, () => dispatchSeatAssign(req, actor ? { actor } : {}),
+      (a, r) => ({ seat: a.seat, cellId: a.cellId, ...(r ? { ok: r.result.ok, ...(r.result.ok ? { mailId: r.result.mailId } : { code: r.result.code }) } : {}) }));
+  },
+};
+
 export const ALL_OPS_LEDGER_RUNTIMES: ToolRuntime<any, any>[] = [
   msgListRuntime,
   msgPostRuntime,
@@ -121,4 +153,7 @@ export const ALL_OPS_LEDGER_RUNTIMES: ToolRuntime<any, any>[] = [
   checklistSetRuntime,
   checklistEditRuntime,
   checklistMoveRuntime,
+  commitmentCloseRuntime,
+  handRaiseRuntime,
+  seatAssignRuntime,
 ];

@@ -28,6 +28,15 @@ describe('clipboard image-path paste', () => {
     expect(result).toEqual({ kind: 'image', token: '[Image #1]', attachment: expect.objectContaining({ kind: 'image', sourcePath: realpathSync(pngPath), filename: 'shot.png', sizeBytes: 12 }), isNew: true, format: 'png' }); // 출처: #38867 시험 픽스처 png 의 실측 바이트 수(아래 12바이트 버퍼)
   });
 
+  test('a leading @ mention and a drag-and-drop escaped space still attach the image', async () => {
+    const pngPath = join(root, 'my shot.png');
+    writeFileSync(pngPath, PNG_HEAD);
+    const registry = createContextRegistry();
+    expect(await pasteImagePath(`@${pngPath}`, { registry })).toMatchObject({ kind: 'image', token: '[Image #1]', format: 'png' });
+    expect(await pasteImagePath(pngPath.replace('my shot', 'my\\ shot'), { registry })).toMatchObject({ kind: 'image', token: '[Image #1]', isNew: false });
+    expect(await pasteImagePath('@notes about it', { registry })).toMatchObject({ kind: 'text', reason: 'not-a-path' });
+  });
+
   test('re-pasting the same path dedups to the existing image token', async () => {
     const pngPath = join(root, 'twice.png');
     writeFileSync(pngPath, PNG_HEAD);

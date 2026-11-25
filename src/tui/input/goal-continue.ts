@@ -17,13 +17,15 @@
 
 import { compareTurnOutcome } from '../../commitment/turn-outcome-shadow.js';
 import type { PlanTurnOutcome } from '../../code-edit/plan-outcome.js';
-import type { BlockReason } from '../../agent-events/protocol.js';
+import type { BlockReason, HandCause } from '../../agent-events/protocol.js';
 import { outcomeOfPlanWire, type PlanWire } from '../../code-edit/plan-wire.js';
 import type { TextInputInternalTurnYieldPort } from '../../chat/index.js';
 import { debug } from '../../debug/log.js';
 import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from './internal-turn.js';
 import { classifyReplyTail, replyTailFromLines, type GoalContinueVerdict } from '../../chat/goal-continue-verdict.js';
 import { CONTINUE_REASON } from '../chat/continue-banner.js';
+import { isReadOnlyCommand } from '../../loops/orchestrator/knowhow-pack.js';
+import { isHandCellWait } from '../../seat/hand-block-pull.js';
 export { classifyReplyTail, replyTailFromLines } from '../../chat/goal-continue-verdict.js';
 export type { GoalContinueVerdict } from '../../chat/goal-continue-verdict.js';
 
@@ -75,6 +77,71 @@ export function replyLinesOfThisTurn(messages: ReadonlyArray<{ role: string; con
   return typeof reply?.content === 'string' ? reply.content.split('\n') : [];
 }
 
+/**
+ * AUTOPILOT-GOAL-CONTINUE-CAP follow-up (#154036): only these change state — file edits, commits/PRs, mail posts.
+ * A shell call counts only when its command is not read-only. Anything else (reads, lists, plan bookkeeping, unknown
+ * tools) is not progress.
+ */
+const STATE_CHANGING_TOOLS = new Set(['edit', 'write', 'multiedit', 'notebookedit', 'apply_patch', 'applypatch', 'edit_file',
+  'write_file', 'gitcommit', 'openpullrequest', 'mergepullrequest', 'goalauthor', 'msgpost', 'msgsend', 'send_message']);
+const SHELL_TOOLS = new Set(['bash', 'shell', 'exec', 'runshell', 'run_shell']);
+
+function parsed(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const text = value.trim();
+  if (!text.startsWith('{')) return value;
+  try { return JSON.parse(text); } catch { return value; }
+}
+
+function shellCommandOf(args: unknown): string | null {
+  const value = parsed(args);
+  if (!value || typeof value !== 'object') return null;
+  const cmd = (value as Record<string, unknown>).command ?? (value as Record<string, unknown>).cmd;
+  if (Array.isArray(cmd)) return cmd.map(String).join(' ');
+  return typeof cmd === 'string' && cmd.trim() ? cmd : null;
+}
+
+/** The dispatch result said it worked: present, no `error`, `ok`/`success` not false, `exitCode` 0 when given. */
+export function toolResultSucceeded(result: unknown): boolean {
+  if (result === undefined || result === null) return false;
+  const value = parsed(result);
+  if (typeof value === 'string') return !/^\s*(error|failed)\b/i.test(value);
+  if (typeof value !== 'object') return true;
+  const r = value as Record<string, unknown>;
+  if (typeof r.error === 'string' && r.error.trim() !== '') return false;
+  if (r.ok === false || r.success === false || r.isError === true) return false;
+  if (typeof r.exitCode === 'number' && r.exitCode !== 0) return false;
+  return true;
+}
+
+export interface ProgressRow { role: string; toolName?: string; toolArgs?: unknown; toolResult?: unknown }
+
+/** The rows this turn added (from the turn-start length, or after the last person line when compaction shrank it). */
+export function rowsOfThisTurn<T extends { role: string }>(messages: ReadonlyArray<T>, startIndex: number | 'after-last-user'): T[] {
+  let from = typeof startIndex === 'number' ? Math.max(0, startIndex) : -1;
+  if (from < 0) { for (let i = messages.length - 1; i >= 0; i--) if (messages[i]!.role === 'user') { from = i + 1; break; } }
+  return from < 0 ? [] : messages.slice(from);
+}
+
+/**
+ * One tool row that changed state and succeeded (a non-read-only shell call, or a state-changing tool). `extra` adds tool
+ * names a caller also counts (e.g. the resource-opt gate's SeatAssign).
+ */
+export function isSucceededStateChange(m: ProgressRow, extra: ReadonlySet<string> = new Set()): boolean {
+  if (m.role !== 'tool' || !m.toolName) return false;
+  const name = m.toolName.toLowerCase();
+  if (SHELL_TOOLS.has(name)) {
+    const cmd = shellCommandOf(m.toolArgs);
+    if (!cmd || isReadOnlyCommand(cmd).ok) return false;
+  } else if (!STATE_CHANGING_TOOLS.has(name) && !extra.has(name)) return false;
+  return toolResultSucceeded(m.toolResult);
+}
+
+/** AUTOPILOT-GOAL-CONTINUE-CAP: progress = a state-changing tool call whose dispatch result succeeded. */
+export function turnMadeProgress(rows: ReadonlyArray<ProgressRow>): boolean {
+  return rows.some((m) => isSucceededStateChange(m));
+}
+
 export function formatGoalContinuePrompt(phrase: string): string {
   return `[골 이어가기] 방금 답이 «${phrase}» 로 끝났다 — 약속만 하고 턴을 끝내지 말고, 그 일을 지금 도구로 실행해 결과물을 만든다. `
     + '원래 사용자 요청 범위 안에서만 이어간다. 정말 사람 판단·권한이 필요하면 무엇이 필요한지 한 줄로 묻고 멈춘다.';
@@ -93,6 +160,8 @@ export interface GoalContinueDeps {
   startTurnIfIdle: (input: string, opts: StartTurnIfIdleOptions) => StartTurnIfIdleResult;
   isEnabled?: () => boolean;
   consecutiveCap?: number;
+  /** AUTOPILOT-GOAL-CONTINUE-CAP: autopilot AUTO → stop only after `consecutiveCap` continuations in a row without progress. */
+  autopilotActive?: () => boolean;
   /** When the plan was not touched, ask for its state once before the wording rules continue (the Next TUI turns this on). */
   planNudge?: boolean;
   /** Plan-driven automatic continues allowed in a row (default 10). */
@@ -108,7 +177,18 @@ export interface GoalContinueDeps {
    * SEAT-STATE-ENUM: the same «a person is needed» stop as a code — BLOCKED with one reason — so a coordinator never reads the
    * notice wording. A plan block carries the model's own `code`; the automatic-continue limits are a person's decision.
    */
-  onBlocked?: (reason: BlockReason, detail: string) => void;
+  onBlocked?: (reason: BlockReason, detail: string, text?: string, cause?: HandCause) => void;
+  /**
+   * NEED-HUMAN chain (11-25 05:5x): a later turn of the seat's own (a coordinator's mail, a wake) ended with the plan moving again
+   * (continue · waiting · done) — the earlier block is over, so its ✋ mark and its escalation timer must end too.
+   */
+  onUnblocked?: () => void;
+  /**
+   * GOAL-BLOCK-NOT-HUMAN (rail 31) — this session is a HAND seat: a plan that ends blocked on someone else / waiting is the
+   * cell waiting, never «a person is needed». No ✋ (onBlocked) — `onHandCellWait` gets the stop instead (block + work next).
+   */
+  handSeat?: boolean;
+  onHandCellWait?: (stop: import('../../seat/hand-block-pull.js').HandPlanStop, progressed: boolean) => void;
   /** Clock for a paced retry (`retryAt`). Default Date.now. */
   now?: () => number;
   /** 사람 입력 직후 거부(HumanTyping)면 다시 잴 시각까지 미룬다(기본 setTimeout · unref). */
@@ -134,6 +214,8 @@ export interface GoalContinueTurnEnd {
   /** The plan state at turn end (DECISION-GATE v2): the structured outcome, read instead of the reply's wording. */
   plan?: PlanWire;
   turnId?: string;
+  /** This turn's session rows (rowsOfThisTurn) — progress is judged from their dispatch results while autopilot is AUTO. */
+  rows?: ReadonlyArray<ProgressRow>;
 }
 
 export interface GoalContinueController {
@@ -169,7 +251,8 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
   const retryFromEnv = Number(process.env.ELANOUS_TEST_GOAL_CONTINUE_RETRY_MS);
   const retryMs = deps.retryMs ?? (Number.isFinite(retryFromEnv) && retryFromEnv >= 0 ? retryFromEnv : 10_500);
   const log = deps.log ?? ((c, e, d) => debug.log(c, e, d));
-  const blockedFor = (reason: BlockReason, detail: string): void => { try { deps.onBlocked?.(reason, detail); } catch { /* reporting cannot break a turn end */ } };
+  const blockedFor = (reason: BlockReason, detail: string, text?: string, cause?: HandCause): void => { try { deps.onBlocked?.(reason, detail, text, cause); } catch { /* reporting cannot break a turn end */ } };
+  const unblocked = (): void => { try { deps.onUnblocked?.(); } catch { /* reporting cannot break a turn end */ } };
 
   const seatCapLimit = (() => {
     const raw = Number((process.env[SEAT_CAP_CONTINUE_ENV] ?? '').trim());
@@ -179,9 +262,18 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
   type Armed = { tail: string; phrase: string; fingerprint: string; mode: 'pledge' | 'remaining' | 'seat-cap' | 'plan' | 'plan-nudge' };
   let armed: Armed | null = null;
   let planConsecutive = 0;
+  // Only newly completed steps on the same plan are evidence of progress. Version bumps,
+  // changed wording, and completing the same step twice cannot buy another budget.
+  let planIdentity: string | undefined;
+  const completedPlanSteps = new Set<number>();
   let planNudged = false;
   const planLimit = deps.planContinueLimit ?? DEFAULT_PLAN_CONTINUE_LIMIT;
   let consecutive = 0;
+  /** AUTOPILOT-GOAL-CONTINUE-CAP: continuations in a row that moved nothing. */
+  let noProgress = 0;
+  /** The turn now ending was opened by this controller (pledge · remaining · plan · seat-cap continuation). */
+  let continuationOpen = false;
+  const autopilotOn = (): boolean => { try { return deps.autopilotActive?.() === true; } catch { return false; } };
   /** 사람 턴 이후 이미 이어간 답들의 지문 — A→B→A 에서도 같은 답으로 두 번 열지 않는다(r2 must-fix). */
   const openedFingerprints = new Set<string>();
   let capNotified = false;
@@ -215,8 +307,19 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
     if (completedGoal) return { opened: false, reason: 'goal-completed' };
     if (!armed) return { opened: false, reason: 'not-armed' };
     const { tail, phrase, fingerprint, mode } = armed;
+    // Under autopilot AUTO the no-progress rule decides first — the plan / seat-cap / same-reply limits ask a person and do not apply.
+    const autopilot = autopilotOn();
+    if (autopilot && noProgress >= cap) {
+      // Autopilot AUTO: no person to ask — one retro line, then the autopilot cadence wake takes over.
+      armed = null;
+      const retro = `🚗 회고 · 이어가기 ${noProgress}회 연속 진척 없음(상태 변경·우편·증거 0) — 이어가기 멈춤 · 자율주행 깨움 주기로 넘긴다 · 마지막: ${tail.slice(-60)}`;
+      if (!capNotified) { capNotified = true; deps.notify?.(retro); }
+      log('tui.goal-continue', 'decided', { rejected: true, reason: 'no-progress-autopilot', tail, consecutive, noProgress });
+      log('tui.goal-continue', 'retro', { line: retro, noProgress, consecutive });
+      return { opened: false, reason: 'no-progress' };
+    }
     if (mode === 'plan' || mode === 'plan-nudge') {
-      if (mode === 'plan' && planConsecutive >= planLimit) {
+      if (!autopilot && mode === 'plan' && planConsecutive >= planLimit) {
         armed = null;
         log('tui', 'turn.auto-continue', { rejected: true, reason: 'plan-limit', n: planConsecutive, limit: planLimit });
         deps.notify?.(`⏸ Plan still has open steps after ${planConsecutive} automatic continues — a person is needed · any key resumes`);
@@ -227,6 +330,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
         { origin: 'goal-continue', reason: mode === 'plan' ? 'plan has open steps · continuing' : 'plan not updated · asking for its state' });
       if (planResult.opened) {
         armed = null;
+        continuationOpen = true;
         if (mode === 'plan') planConsecutive += 1; else planNudged = true;
         log('tui', 'turn.auto-continue', { opened: true, reason: mode === 'plan' ? 'plan-open' : 'plan-nudge', n: planConsecutive, limit: planLimit, turnId: planResult.turnId });
         return { opened: true, reason: mode === 'plan' ? 'plan-open' : 'plan-nudge' };
@@ -236,7 +340,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
     }
     if (mode === 'seat-cap') {
       // A capped seat turn is not a repeated answer: progress is judged by the counter, not the reply fingerprint.
-      if (seatCapConsecutive >= seatCapLimit) {
+      if (!autopilot && seatCapConsecutive >= seatCapLimit) {
         armed = null;
         log('tui', 'turn.auto-continue', { rejected: true, reason: 'seat-cap-limit', n: seatCapConsecutive, limit: seatCapLimit });
         deps.notify?.(`⏸ Seat turn cap reached ${seatCapConsecutive} times in a row — a person is needed · any key resumes`);
@@ -250,6 +354,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
         if (deps.confirmSeatCapTurnStarted && capResult.turnId) {
           const turnId = capResult.turnId;
           armed = null;
+          continuationOpen = true;
           void deps.confirmSeatCapTurnStarted(turnId).then((started) => {
             if (started) {
               seatCapConsecutive += 1;
@@ -262,6 +367,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
           return { opened: true, reason: 'seat-cap-pending' };
         }
         armed = null;
+        continuationOpen = true;
         seatCapConsecutive += 1;
         log('tui', 'turn.auto-continue', { opened: true, reason: 'seat-cap', n: seatCapConsecutive, limit: seatCapLimit, turnId: capResult.turnId });
         return { opened: true, reason: 'seat-cap' };
@@ -270,7 +376,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
       return { opened: false, reason: capResult.reason };
     }
     // 초기화는 실제 사람 턴(noteHumanTurn)에서만 — 키만 치고 안 보낸 것으로 상한을 우회하지 못한다(r2 must-fix).
-    if (openedFingerprints.has(fingerprint)) {
+    if (!autopilot && openedFingerprints.has(fingerprint)) {
       armed = null;
       log('tui.goal-continue', 'decided', { rejected: true, reason: 'same-reply', tail, consecutive });
       if (mode === 'remaining') {
@@ -279,7 +385,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
       }
       return { opened: false, reason: 'same-reply' };
     }
-    if (consecutive >= cap) {
+    if (!autopilot && consecutive >= cap) {
       armed = null;
       if (!capNotified) {
         capNotified = true;
@@ -294,6 +400,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
     if (result.opened) {
       armed = null;
       turnRunningStreak = 0;
+      continuationOpen = true;
       consecutive += 1;
       openedFingerprints.add(fingerprint);
       log('tui.goal-continue', 'decided', { opened: true, reason: 'pledge-without-result', phrase, tail, consecutive, turnId: result.turnId });
@@ -341,6 +448,13 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
       turnRunningStreak = 0;
       if (completedGoal) return;
       if (!isEnabled()) return;
+      if (continuationOpen && autopilotOn()) {
+        // A continuation that moved something (a state-changing call that succeeded) resets the streak.
+        const progressed = turnMadeProgress(end.rows ?? []);
+        noProgress = progressed ? 0 : noProgress + 1;
+        log('tui.goal-continue', 'progress', { progressed, noProgress, consecutive });
+      }
+      continuationOpen = false;
       if (end.failed) {
         log('tui.goal-continue', 'decided', { rejected: true, reason: 'turn-failed' });
         return;
@@ -355,15 +469,42 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
           extractedPatterns: legacy.pledge || remainingWorkTail(tail) ? ['declared-next-step'] : [],
           plan: { items: (end.plan?.steps ?? []).map((step, index) => ({ id: `s${index}`, status: step.status === 'completed' ? 'done' as const : step.status })) },
         }, { emit: log });
+        if (planOutcome.kind !== 'blocked') unblocked();
         if (planOutcome.kind === 'continue') {
+          const steps = end.plan!.steps;
+          const identity = JSON.stringify(steps.map((step) => step.step));
+          if (planIdentity === undefined) {
+            planIdentity = identity;
+            steps.forEach((step, index) => { if (step.status === 'completed') completedPlanSteps.add(index); });
+          } else if (identity === planIdentity) {
+            let progressed = false;
+            steps.forEach((step, index) => {
+              if (step.status === 'completed' && !completedPlanSteps.has(index)) {
+                completedPlanSteps.add(index);
+                progressed = true;
+              }
+            });
+            if (progressed) {
+              log('tui', 'turn.auto-continue', { reason: 'plan-progress', completed: completedPlanSteps.size, previousStreak: planConsecutive });
+              planConsecutive = 0;
+            }
+          }
           armed = { tail: tail ?? '', phrase: 'plan open', fingerprint: goalContinueFingerprint(planOutcome.step), mode: 'plan' };
           return;
         }
         planConsecutive = 0;
         log('tui', 'turn.plan-outcome', { kind: planOutcome.kind, ...(planOutcome.kind === 'blocked' ? { reasonChars: planOutcome.reason.length } : {}) });
-        if (planOutcome.kind === 'blocked') {
+        // GOAL-BLOCK-NOT-HUMAN — a hand's blocked/waiting plan is its cell waiting on another seat: park it and pull, no ✋.
+        const handWait = deps.handSeat === true && (planOutcome.kind === 'blocked' || planOutcome.kind === 'waiting')
+          && isHandCellWait(planOutcome);
+        if (handWait && (planOutcome.kind === 'blocked' || planOutcome.kind === 'waiting')) {
+          const progressed = turnMadeProgress(end.rows ?? []);
+          deps.notify?.(`⏭ Cell waits on another seat: ${planOutcome.kind === 'blocked' ? planOutcome.reason || planOutcome.step : `${planOutcome.wake.kind} ${planOutcome.wake.target}`} — parking it and pulling the next cell`);
+          log('tui.goal-continue', 'hand-cell-wait', { kind: planOutcome.kind, progressed, ...(planOutcome.kind === 'blocked' ? { code: planOutcome.code ?? null } : {}) });
+          try { deps.onHandCellWait?.(planOutcome, progressed); } catch { /* the host's reaction cannot break a turn end */ }
+        } else if (planOutcome.kind === 'blocked') {
           deps.notify?.(`⏸ Blocked: ${planOutcome.reason || planOutcome.step} — a person is needed · any key resumes`);
-          blockedFor(planOutcome.code ?? 'HUMAN_DECISION', 'plan-blocked');
+          blockedFor(planOutcome.code ?? 'HUMAN_DECISION', 'plan-blocked', planOutcome.reason || planOutcome.step, planOutcome.cause);
         }
         else if (planOutcome.kind === 'waiting') deps.notify?.(`⏳ Waiting for ${planOutcome.wake.kind} ${planOutcome.wake.target}`);
         try { if (end.plan) deps.onPlanOutcome?.(planOutcome, end.plan); } catch { /* the host's reaction cannot break a turn end */ }
@@ -383,8 +524,12 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
       completedGoal = false;
       armed = null;
       consecutive = 0;
+      noProgress = 0;
+      continuationOpen = false;
       seatCapConsecutive = 0;
       planConsecutive = 0;
+      planIdentity = undefined;
+      completedPlanSteps.clear();
       planNudged = false;
       openedFingerprints.clear();
       capNotified = false;

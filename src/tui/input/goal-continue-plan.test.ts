@@ -84,6 +84,30 @@ test('plan continues are bounded, a person resets them, and an untouched plan ne
   expect(untouched.gc.check().opened).toBe(false);
 });
 
+test('newly completed structured steps renew the stagnant budget beyond the old total cap', () => {
+  const h = harness({ planContinueLimit: 2 });
+  const steps = Array.from({ length: 14 }, (_, i) => ({ step: `step ${i}`, status: 'pending' as const }));
+  for (let done = 0; done < steps.length; done++) {
+    h.gc.noteTurnEnded({ lines: ['…'], plan: plan(steps.map((step, i) => ({ ...step, status: i < done ? 'completed' : 'pending' }))) });
+    expect(h.gc.check()).toEqual({ opened: true, reason: 'plan-open' });
+  }
+  expect(h.opened.length).toBeGreaterThan(DEFAULT_PLAN_CONTINUE_LIMIT);
+  expect(h.events.some((event) => event.data.reason === 'plan-progress')).toBe(true);
+});
+
+test('version bumps, changed plan labels, and re-completion cannot fake progress', () => {
+  const h = harness({ planContinueLimit: 2 });
+  const state = (a: PlanWireStep['status'], label = 'a') => plan([{ step: label, status: a }, { step: 'b', status: 'pending' }]);
+  h.gc.noteTurnEnded({ lines: ['…'], plan: state('pending') }); expect(h.gc.check().opened).toBe(true);
+  h.gc.noteTurnEnded({ lines: ['…'], plan: state('completed') }); expect(h.gc.check().opened).toBe(true);
+  h.gc.noteTurnEnded({ lines: ['…'], plan: state('pending') }); expect(h.gc.check().opened).toBe(true);
+  h.gc.noteTurnEnded({ lines: ['…'], plan: state('completed') }); expect(h.gc.check().reason).toBe('plan-limit');
+  h.gc.noteHumanTurn();
+  h.gc.noteTurnEnded({ lines: ['…'], plan: state('pending') }); expect(h.gc.check().opened).toBe(true);
+  h.gc.noteTurnEnded({ lines: ['…'], plan: state('completed', 'renamed') }); expect(h.gc.check().opened).toBe(true);
+  h.gc.noteTurnEnded({ lines: ['…'], plan: state('completed', 'renamed') }); expect(h.gc.check().reason).toBe('plan-limit');
+});
+
 test('no plan: ordinary chat is untouched; when the old rules would continue, one plan nudge comes first, then the old rules', () => {
   const plain = harness({ planNudge: true });
   plain.gc.noteTurnEnded({ lines: ['  Here is the answer.'] });

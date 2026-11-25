@@ -16,12 +16,12 @@ export interface FirecrawlKeySetupDeps {
 /** No provider probe/charge, CLI dependency, plaintext config or key prefix output. */
 export async function configureFirecrawlKey(deps: FirecrawlKeySetupDeps): Promise<'saved' | 'skipped' | 'failed'> {
   try {
-    const key = (await deps.promptSecret('Firecrawl API key (Enter = 건너뛰기; 나중에 elanous setup firecrawl): '))?.trim();
-    if (!key) { deps.print('Firecrawl 건너뜀 · elanous setup firecrawl 로 언제든 설정'); return 'skipped'; }
-    if (/\s|[\u0000-\u001f\u007f]/.test(key)) { deps.print('Firecrawl 키 형식이 올바르지 않습니다.'); return 'failed'; }
+    const key = (await deps.promptSecret('Optional Firecrawl API key for web search (Enter to skip; later: elanous setup firecrawl): '))?.trim();
+    if (!key) { deps.print('Firecrawl skipped · set it any time with `elanous setup firecrawl`'); return 'skipped'; }
+    if (/\s|[\u0000-\u001f\u007f]/.test(key)) { deps.print('The Firecrawl key format is not valid.'); return 'failed'; }
     const write = deps.setSecret ?? (await import('../nexus/config/secrets/cred-slots.js')).setCredentialSlotAsync;
     await write(FIRECRAWL_CREDENTIAL_SLOT, key);
-    deps.print('Firecrawl 키를 secret 저장소에 저장했습니다.');
+    deps.print('Firecrawl key saved to the secret store.');
     return 'saved';
-  } catch { deps.print('Firecrawl 키를 저장하지 못했습니다. 민감한 오류는 숨겼습니다.'); return 'failed'; }
+  } catch { deps.print('Could not save the Firecrawl key. Sensitive error details are hidden.'); return 'failed'; }
 }

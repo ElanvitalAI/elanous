@@ -65,7 +65,7 @@ applyConfigDirFlagFromArgv();
 
 // Only unambiguous root commands take the small registrar path. Root help,
 // unknown commands and unrecognized global flags keep the complete tree.
-const INDEX_FAST_ROOTS = new Set(['a2a', 'agent-env', 'away', 'bench', 'brief', 'card', 'connect', 'control', 'docs', 'doctor', 'fleet', 'flow', 'freeze', 'graph', 'guardian', 'import', 'intake', 'know', 'labels', 'launch-head', 'leader', 'live', 'llm', 'loop', 'machine', 'make', 'memory', 'msg', 'notify', 'ops', 'outputs', 'plugin', 'pod', 'provider', 'pty', 'publish', 'questions', 'relay', 'release', 'repo', 'research', 'resource', 'retro', 'role', 'runs', 'schedule', 'seat', 'shadow', 'skills', 'start', 'statusline', 'storage', 'tasks', 'where']);
+const INDEX_FAST_ROOTS = new Set(['a2a', 'agent-env', 'away', 'bench', 'brief', 'card', 'connect', 'control', 'docs', 'doctor', 'fleet', 'flow', 'freeze', 'graph', 'guardian', 'import', 'intake', 'know', 'labels', 'launch-head', 'leader', 'live', 'llm', 'loop', 'machine', 'make', 'memory', 'msg', 'notify', 'ops', 'outputs', 'plugin', 'pod', 'provider', 'pty', 'publish', 'questions', 'relay', 'release', 'repo', 'research', 'res', 'resource', 'retro', 'role', 'runs', 'schedule', 'seat', 'shadow', 'skills', 'start', 'statusline', 'storage', 'tasks', 'watch', 'where']);
 function selectedIndexFastRoot(args: readonly string[]): string | undefined {
   if (process.env.ELANOUS_TEST_FLAG_AUDIT === '1') return undefined;
   let index = 0;
@@ -213,6 +213,12 @@ const registerScheduleCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'schedu
 const registerGuardianCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'guardian'
   ? (() => undefined)
   : (require('./cli/guardian-cli.js') as typeof import('./cli/guardian-cli.js')).registerGuardianCommands) as typeof import('./cli/guardian-cli.js').registerGuardianCommands;
+const registerResCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'res'
+  ? (() => undefined)
+  : (require('./cli/res-cli.js') as typeof import('./cli/res-cli.js')).registerResCommands) as typeof import('./cli/res-cli.js').registerResCommands;
+const registerWatchCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'watch'
+  ? (() => undefined)
+  : (require('./cli/watch-cli.js') as typeof import('./cli/watch-cli.js')).registerWatchCommands) as typeof import('./cli/watch-cli.js').registerWatchCommands;
 const registerCapabilitiesCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
   ? (() => undefined)
   : (require('./agent-mission/capabilities-cli.js') as typeof import('./agent-mission/capabilities-cli.js')).registerCapabilitiesCommand) as typeof import('./agent-mission/capabilities-cli.js').registerCapabilitiesCommand;
@@ -299,6 +305,9 @@ const registerProviderCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'provid
 const registerCatalogCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'catalog'
   ? (() => undefined)
   : (require('./cli/catalog-cli.js') as typeof import('./cli/catalog-cli.js')).registerCatalogCommands) as typeof import('./cli/catalog-cli.js').registerCatalogCommands;
+const registerOrgCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'org'
+  ? (() => undefined)
+  : (require('./cli/org-cli.js') as typeof import('./cli/org-cli.js')).registerOrgCommands) as typeof import('./cli/org-cli.js').registerOrgCommands;
 const registerHostsCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'hosts'
   ? (() => undefined)
   : (require('./cli/hosts-cli.js') as typeof import('./cli/hosts-cli.js')).registerHostsCommands) as typeof import('./cli/hosts-cli.js').registerHostsCommands;
@@ -368,6 +377,7 @@ import type { AcpPermissionApprover } from './acp/client.js';
 import { runGitCommand } from './git-fs/runner.js';
 import { loadWarmReuseEvidenceByConsumer } from './task-orchestrator/surfaces/warm-reuse-evidence.js';
 import { debug, redactSecretText, redactSecrets } from './debug/log.js';
+import { thawFrozenRestartRoot } from './tui/restart-chain.js';
 import type { HarnessAskSayChildLlmOptions, HarnessAskSayOptions, HarnessPlanOptions } from './harness/harness-cli-command.js';
 import { CliUserError, formatCliUserError, isCliUserError } from './cli/cli-user-error.js';
 import { classifyFriendlyError, formatFriendlyError } from './cli/friendly-errors.js';
@@ -393,7 +403,7 @@ import { reviewReasoningEffort } from './model-tier/review-effort.js';
 import { configuredOpenGatewayKeys, isKeylessProvider, resolveProviderCredential } from './llm/provider-credentials.js';
 import {
   listSessions, loadSession, deleteSession, resolveSessionId,
-  setActiveSessionId, getActiveSessionId,
+  setActiveSessionId, getActiveSessionId, setPendingAttachSessionId, takePendingAttachSessionId,
   lastConversationMessage, isSessionSource,
 } from './session/index.js';
 import { requestSessionTurnControl } from './session/session-turn-control.js';
@@ -1532,6 +1542,11 @@ const seatCmd = program.command('seat').description('분배된 자리의 하루 
 registerSeatBootCommands(seatCmd);
 if (!INDEX_FAST_ROOT || INDEX_FAST_ROOT === 'seat') (require('./cli/seat-control-cli.js') as typeof import('./cli/seat-control-cli.js')).registerSeatControlCommand(seatCmd);
 registerSeatRequestsCommands(seatCmd);
+if (!INDEX_FAST_ROOT || INDEX_FAST_ROOT === 'seat') {
+  // ELS-PEEK-WATCH: `eln seat peek|watch` = `els peek|watch` (same runners, same read-only doors).
+  const elsCli = require('./cli/els-cli.js') as typeof import('./cli/els-cli.js');
+  (require('./cli/els-peek-cli.js') as typeof import('./cli/els-peek-cli.js')).registerPeekWatchCommands(seatCmd, elsCli.peekDeps);
+}
 if (!INDEX_FAST_ROOT || INDEX_FAST_ROOT === 'seat') (require('./cli/seat-say-cli.js') as typeof import('./cli/seat-say-cli.js')).registerSeatSayCommand(seatCmd);
 seatCmd.command('asks').description('최근 CTO 되묻기 왕복과 10분 판정')
   .option('--since <duration>', '조회 창 (예: 24h)', '24h')
@@ -1764,6 +1779,63 @@ stewardCmd.command('mode [mode]').description('Show or set the steward mode: off
   .option('--json', 'JSON output')
   .action(async (mode: string | undefined, opts: { json?: boolean }) => {
     process.exitCode = await (await import('./steward/rescue.js')).runStewardModeCli(mode, opts);
+  });
+const workCmd = program.command('work').description('PULL work: claim your next READY cell');
+workCmd.command('next').description('Claim the next READY cell from the federation hand pool: P0/priority cells in any space → your space board → other spaces (borrow · pool.lend) · WIP 1 counts active cells only — cells waiting on a verdict/receipt/HOLD do not block (exit 4 = continue your active cell) · exit 3 = 일감 0')
+  .option('--scope <space>', 'coordinator scope (default: your seat\'s coordinator)')
+  .option('--seat <seat>', 'calling seat (default: ELANOUS_TRACK, then this directory\'s seat)')
+  .option('--version <v>', 'checklist version (default: current dev)')
+  .option('--json', 'JSON result')
+  .action(async (opts: { scope?: string; seat?: string; version?: string; json?: boolean }) => {
+    process.exitCode = await (await import('./steward/space/work-next-cli.js')).runWorkNextCli(opts);
+  });
+workCmd.command('priority [entries...]').description('Show or set federation.priorityOrder — the OP pulse ranking of pool P0 work (cell ids or id/title substrings, e.g. demo main-red land)')
+  .option('--clear', 'Back to the default (P0 by version then age)')
+  .option('--by <seat>', 'who set it (default: ELANOUS_TRACK or OP)')
+  .option('--json', 'JSON output')
+  .action(async (entries: string[], opts: { clear?: boolean; by?: string; json?: boolean }) => {
+    process.exitCode = (await import('./steward/space/work-next-cli.js')).runWorkPriorityCli(entries ?? [], opts);
+  });
+workCmd.command('block <cell>').description('My cell waits on another seat (approval · HOLD · decision): park it on my coordinator\'s board as blocked-on:<seat> (lease released · one exception mail to that seat\'s coordinator) — then run `eln work next`. The cell comes back to me first when that seat answers.')
+  .requiredOption('--on <seat>', 'the seat the cell waits on (e.g. RES)')
+  .requiredOption('--reason <text>', 'one line: what it waits for')
+  .option('--seat <seat>', 'calling seat (default: ELANOUS_TRACK, then this directory\'s seat)')
+  .option('--version <v>', 'checklist version (default: current dev)')
+  .option('--json', 'JSON result')
+  .action(async (cell: string, opts: { on?: string; reason?: string; seat?: string; version?: string; json?: boolean }) => {
+    process.exitCode = await (await import('./steward/space/work-next-cli.js')).runWorkBlockCli(cell, opts);
+  });
+// OP-PULSE — `eln pulse status|verify|burst …` (structural pulse that replaces OP's pinned standing goal).
+(await import('./loops/op-pulse-cli.js')).registerPulseCommands(program);
+// COACH-CONTEXT-AUTO-INJECT — `eln coach act|list` · `eln op world [--write]`.
+(await import('./op-world/op-world-cli.js')).registerOpWorldCommands(program);
+const fedCmd = program.command('fed').description('Federation state ledger (fed-state) — state answers without mail');
+fedCmd.command('record <type>').description('Append one typed fact (land|green|cell|hand|judge|slot|mail|turn|beat|phase|steward|work) — fail-open, for scripts')
+  .option('--seat <seat>').option('--cell <id>').option('--state <s>').option('--from <seat>').option('--to <seat>').option('--kind <k>').option('--ref <ref>')
+  .option('--work-ready', 'hand idle with READY work waiting').option('--at <iso>', 'fact time (default now)').option('--source <id>')
+  .action(async (type: string, opts: Record<string, string | boolean | undefined>) => {
+    process.exitCode = (await import('./fed-state/fed-cli.js')).runFedRecordCli(type, opts as never);
+  });
+fedCmd.command('kpi').description('The four federation KPIs: idle-with-work hands · landed/h · OP inbound/h · % OP turns opened by mail (+aux)')
+  .option('--window <w>', '30m · 1h · 1d', '1h').option('--json', 'JSON output')
+  .action(async (opts: { window?: string; json?: boolean }) => { process.exitCode = (await import('./fed-state/fed-cli.js')).runFedKpiCli(opts); });
+fedCmd.command('show <id>').description('Latest facts for a cell or seat').option('--limit <n>', 'rows', '20').option('--json', 'JSON output')
+  .action(async (id: string, opts: { limit?: string; json?: boolean }) => { process.exitCode = (await import('./fed-state/fed-cli.js')).runFedShowCli(id, opts); });
+fedCmd.command('backfill').description('Backfill mail posts (msg store) and lands (origin/main «(#N)») for a window — idempotent').option('--window <w>', 'lookback', '24h').option('--repo <dir>', 'git repo for lands').option('--dry-run')
+  .action(async (opts: { window?: string; repo?: string; dryRun?: boolean }) => { process.exitCode = await (await import('./fed-state/fed-cli.js')).runFedBackfillCli(opts); });
+const stewardSpaceCmd = stewardCmd.command('space').description('행정관 — per-coordinator steward graph (graphs/steward/space.yaml)');
+stewardSpaceCmd.command('status').description('Last tick per scope: counts · rollup · escalations')
+  .option('--scope <seat>', 'One coordinator scope, e.g. TC')
+  .option('--json', 'JSON output')
+  .action(async (opts: { scope?: string; json?: boolean }) => {
+    process.exitCode = (await import('./steward/space/status.js')).runStewardSpaceStatusCli(opts);
+  });
+stewardSpaceCmd.command('tick').description('Run the steward graph now for one scope or every scope')
+  .option('--scope <seat>', 'One coordinator scope, e.g. TC')
+  .option('--shadow', 'Record «would do» rows only — no mail, no assignment, no pregate')
+  .option('--json', 'Print run state as JSON')
+  .action(async (opts: { scope?: string; shadow?: boolean; json?: boolean }) => {
+    process.exitCode = (await import('./steward/space/status.js')).runStewardSpaceTickCli(opts);
   });
 
 program.command('directive').description('Turn instructions into Linear issues')
@@ -3814,6 +3886,9 @@ selfCmd.command('repair-commit-export <pr> <base-head> <child-output> <repo> <ou
 
 // ELN-OP-SELF-HEAL-LOOP — 자기 관측 집계 `elanous self observe [--since] [--seat] [--json]`(읽기만 · 칸 초안은 출력만).
 { const { registerSelfObserveCommand } = await import('./cli/self-observe.js'); registerSelfObserveCommand(selfCmd); }
+
+// TUI-RESTART-NESTED-CHAIN — `elanous self reap-chains --dry-run|--yes` (one-shot cleanup of nested TUI restart chains).
+{ const { registerSelfReapChainsCommand } = await import('./cli/self-reap-chains.js'); registerSelfReapChainsCommand(selfCmd); }
 
 function printExtendedOrchestrateHelp(command: Command, positional = '[goals...]'): void {
   const optionLines = command.options
@@ -6949,6 +7024,8 @@ program
 
 registerScheduleCommands(program);
 registerGuardianCommands(program);
+registerResCommands(program);
+registerWatchCommands(program);
 
 /** `elanous decide*` 공통 — 보낼 곳과 자격을 정한다(설정 decide.endpoint > ELANOUS_JEV_ENDPOINT > Typesafe). 없으면 안내하고 rc 2. */
 async function loadJevAccessOrExit(): Promise<import('./decide/jev.js').JevAccess> {
@@ -7140,6 +7217,7 @@ registerFleetCommands(program);
 registerOpsCommands(program);
 registerCatalogCommands(program);
 registerHostsCommands(program);
+registerOrgCommands(program);
 registerAppCommands(program);
 registerOutputsCommands(program);
 
@@ -8854,6 +8932,14 @@ configCmd
       process.exit(1);
     }
     // CFG-STORE2 — 저장 «성공» 뒤 감사 이력 한 줄 · fail-open(기록 실패가 set 을 막지 않는다).
+    // COACH-CONTEXT-AUTO-INJECT — a config set run by the coach (ELANOUS_COACH_ACTOR marker) lands in the coach ledger (key only, never the value).
+    try {
+      const coachActor = process.env.ELANOUS_COACH_ACTOR?.trim();
+      if (coachActor) {
+        const { appendCoachAction, coachLedgerPath } = await import('./op-world/coach-ledger.js');
+        appendCoachAction(coachLedgerPath((await import('./instance/resolve.js')).effectiveInstanceRoot()), { what: `config set ${path}`, why: 'coach config change', by: coachActor, source: 'config-set' });
+      }
+    } catch { /* fail-open: the ledger never blocks a set */ }
     try { (await import('./cli/config-audit.js')).recordConfigChange({ key: path, prev, next: parsed, why: 'config set' }); } catch (err) { ui.warn(`config 감사 이력 기록 실패(무시): ${err instanceof Error ? err.message : String(err)}`); }
     if (credential?.apiKey && (credential.source === 'rotation' || credential.source === 'env')) {
       ui.info(`provider credential updated: ${parsed} via ${credential.source} (${credential.apiKey.length} chars)`);
@@ -9120,8 +9206,15 @@ if (!INDEX_FAST_ROOT) {
 
 registerTasksCommands(program);
 registerBriefCommands(program);
+if (!INDEX_FAST_ROOT) (await import('./cli/burst-board-cli.js')).registerBurstBoardCommand(program);
 registerLabelsCommands(program);
 registerMsgCommands(program);
+// CROWN-GOAL-APPLY — `autopilot goal set --seat <SEAT> "<goal>" --from OP`: a structured goal mail the seat's TUI applies.
+if (!INDEX_FAST_ROOT) (require('./cli/autopilot-goal-cli.js') as typeof import('./cli/autopilot-goal-cli.js')).registerAutopilotGoalCommands(program);
+// ANNOUNCE-UPTAKE — `announce status`: per-seat uptake of one federation announce.
+if (!INDEX_FAST_ROOT || INDEX_FAST_ROOT === 'announce') (require('./cli/announce-cli.js') as typeof import('./cli/announce-cli.js')).registerAnnounceCommands(program);
+// COMMITMENT-CLOSE — `commitment list|done|blocked`: the CLI twin of the CommitmentClose seat tool.
+if (!INDEX_FAST_ROOT || INDEX_FAST_ROOT === 'commitment') (require('./cli/commitment-cli.js') as typeof import('./cli/commitment-cli.js')).registerCommitmentCommands(program);
 registerStatuslineCommands(program);
 
 if (!INDEX_FAST_ROOT) {
@@ -9598,6 +9691,8 @@ sessionCmd
       process.exit(1);
     }
     setActiveSessionId(id);
+    // 다음 `elanous --name <x>` 한 번이 이 세션에 붙는다(10분 · one-shot).
+    setPendingAttachSessionId(id);
     const loaded = loadSession(id)!;
     ui.info(`Active: ${id.slice(0, 8)}  ${loaded.meta.messageCount} messages  ${loaded.meta.title}`);
   });
@@ -10028,10 +10123,16 @@ sessionCmd
     console.log(res.formatted ?? '(no context)');
   });
 
+/** DEMO-ZEROBASE-FIXES: «Choose setup» answered with Terminal is remembered (onboarding.webFirst=false). */
+function rememberTerminalSetupChoice(): void {
+  const current = getUserConfig();
+  saveUserConfig({ ...current, onboarding: { ...current.onboarding, webFirst: false } });
+}
+
 async function runFirstSetupForCli(cfg: ReturnType<typeof getUserConfig>, announceFallback = false): Promise<boolean> {
   if (cfg.onboarding.webFirst !== false) {
     const { runWebFirstSetup } = await import('./onboarding/web-first.js');
-    if (await runWebFirstSetup({ config: cfg }) === 'link-shown') return false;
+    if (await runWebFirstSetup({ config: cfg, rememberTerminalChoice: rememberTerminalSetupChoice }) === 'link-shown') return false;
     if (announceFallback) ui.info('No config yet — launching setup wizard first.');
   }
   return runOnboardingForCli();
@@ -13014,15 +13115,12 @@ async function main(): Promise<void> {
   const rootResume = resolveRootResumeSessionId({
     ...(resumeFromFlag !== undefined ? { flagId: resumeFromFlag } : {}),
     continueLatest,
-    // `session resume <id>` marks the selected transcript active. A named
-    // dashboard is an explicit seat attachment, so it resumes that marker;
-    // an unnamed bare launch still starts clean as required by #73.
+    // `--name` starts a new session. It attaches only to the session the operator just picked
+    // with `session resume <id>` (one-shot pending-attach marker) — never to the global active
+    // marker, which a live seat TUI keeps pointing at its own session (11-25 be2bc47e).
     ...(dashboardName.name ? {
       namedDashboard: true,
-      activeSessionId: () => {
-        const id = getActiveSessionId();
-        return id;
-      },
+      pendingAttachSessionId: () => takePendingAttachSessionId(),
       sessionExists: (id) => loadSession(id) !== null,
     } : {}),
     // 명시 인자가 있으면 env 를 «읽지도» 않는다(폐기 경고가 명시 이어하기에 섞이지 않게).
@@ -13159,7 +13257,8 @@ async function main(): Promise<void> {
     const alreadyChats = (await (await import('./onboarding/first-run.js')).configuredFirstRunProvider(cfg)) !== undefined;
     if (cfg.onboarding.webFirst !== false && !alreadyChats) {
       const { runWebFirstSetup } = await import('./onboarding/web-first.js');
-      if (await runWebFirstSetup({ config: cfg, startedAt: firstRunStartedAt, startIfMissing: true }) === 'link-shown') return;
+      if (await runWebFirstSetup({ config: cfg, startedAt: firstRunStartedAt, startIfMissing: true,
+        rememberTerminalChoice: rememberTerminalSetupChoice }) === 'link-shown') return;
     }
     const { runFirstRun } = await import('./onboarding/first-run.js');
     if (process.stdin.isTTY === true) {
@@ -13177,6 +13276,9 @@ async function main(): Promise<void> {
           },
           promptSecret: async (message) => setupIO.askSecret?.(message),
           setupWhenNoProvider: async (config) => {
+          // DEMO-ZEROBASE-FIXES: inside an els pane the menu prompt cannot take `els send`; open the chat screen instead,
+          // where the first turn names the next step (login / key).
+          if (process.env.ELANOUS_ELS_PANE) return null;
           const { runFirstRunProviderSetup } = await import('./cli/setup-keys.js');
           return runFirstRunProviderSetup(setupIO, { config, loginWithCodex });
           },
@@ -13283,6 +13385,11 @@ async function main(): Promise<void> {
     const nextOpts = { resumeSessionId, sidetabMode: tuiConfig?.sidetab ?? 'collapsed', compactHeight: tuiConfig?.next?.compactHeight,
       ...(rootProvider.provider ? { initialProvider: { provider: rootProvider.provider, model: rootProvider.model } } : {}),
       getNexusMemberSession, memberBoardSession: getNexusMemberSession };
+    // TUI-RESTART-NESTED-CHAIN — start guard: a leaf of a nested restart chain (older restarts spawned waiting children)
+    // logs `tui.restart nested-chain {depth}` and collapses its own chain off the boot path.
+    setTimeout(() => {
+      void collapseOwnRestartChainAsync();
+    }, 5_000).unref?.();
     await showNextTui(nextOpts);
     bootTimer.phase('show-next');
     bootTimer.done();
@@ -13330,7 +13437,12 @@ export async function exitTuiRun(
     readonly takeRestartRequest?: () => { readonly reason: string; readonly requestId?: string } | null;
   } = {},
 ): Promise<void> {
-  const exit = deps.exit ?? ((code: number): never => process.exit(code));
+  const finalExit = deps.exit ?? ((code: number): never => process.exit(code));
+  // TUI-RESTART-NESTED-CHAIN: a chain root frozen by the collapse (restart-chain.ts) resumes and exits with this TUI.
+  const exit = (code: number): never => {
+    if (!deps.exit) { try { thawFrozenRestartRoot(); } catch { /* exit must not depend on it */ } }
+    return finalExit(code);
+  };
   const take = deps.takeRestartRequest
     ?? (await import('./capture/tui-self-report.js')).takeTuiSelfRestartRequest;
   const request = take();
@@ -13342,8 +13454,15 @@ export async function exitTuiRun(
     } catch { /* 관측 실패가 종료를 막지 않는다 */ }
     exit(0);
   }
+  // SEAT-INPLACE-UPDATE: under the pane launcher the update is «exit 75 → the launcher relaunches the current install in
+  // this pane»; without it the same request takes the seat-control migrate door (execve in place · same pane).
+  const inPlacePrefix = 'seat-inplace-update:';
+  if (request?.reason.startsWith(inPlacePrefix) && process.env.ELANOUS_SEAT_LAUNCHER === '1') {
+    exit((await import('./seat/inplace-update.js')).SEAT_UPDATE_EXIT_CODE);
+  }
   const migratePrefix = 'seat-stop:migrate:';
-  const migrateSessionId = request?.reason.startsWith(migratePrefix) ? request.reason.slice(migratePrefix.length) : undefined;
+  const requestReason = request?.reason.startsWith(inPlacePrefix) ? `${migratePrefix}${request.reason.slice(inPlacePrefix.length)}` : request?.reason;
+  const migrateSessionId = requestReason?.startsWith(migratePrefix) ? requestReason.slice(migratePrefix.length) : undefined;
   const selfRestart = await runTuiSelfRestartOnStaleBuild({ ...deps, ...(migrateSessionId !== undefined ? { migrateSessionId } : {}), ...(request?.requestId ? { migrateRequestId: request.requestId } : {}) });
   if (selfRestart.outcome === 'relaunch') {
     // 자식이 화면을 이어받았다 — 부모는 자식 종료 코드로 끝난다.
@@ -13382,6 +13501,13 @@ export interface TuiSelfRestartDeps {
   /** 관측 전용 — «전역 최신»이 무엇이든 재기동 id 는 여기서 고르지 않는다(로그·사유 문면에만 적는다). */
   readonly globalLatestSessionId?: () => string | null;
   readonly spawnChild?: (command: string, argv: readonly string[], env: Record<string, string>) => Promise<number>;
+  /**
+   * TUI-RESTART-NESTED-CHAIN — replace this process with the new TUI (execve: same pid · same pty · same parent); returns
+   * only on failure. Default (no `spawnChild` injected) = `execInPlace`. The waiting-child spawn is only the fallback.
+   */
+  readonly replaceProcess?: (argv: readonly string[], env: Record<string, string>) => string;
+  /** Can the target entry start at all (`bun <entry> --version` exits 0)? The exec path has no fast-fail retry after it. */
+  readonly probeEntry?: (command: string, scriptPath: string) => boolean;
   /** The session-scoped provider choice to carry into the child — default = this process's `/provider` selection. */
   readonly sessionProvider?: (sessionId: string) => { readonly provider: string; readonly model?: string } | undefined;
   /** The old TUI no longer owns the screen while its replacement runs on the same PTY. */
@@ -13537,6 +13663,26 @@ export async function runTuiSelfRestartOnStaleBuild(deps: TuiSelfRestartDeps = {
     report('blocked', { reason: 'owner-retire-failed', error: String(error).slice(0, 200) });
     return { outcome: 'blocked', reason: 'owner-retire-failed' };
   }
+  // TUI-RESTART-NESTED-CHAIN: a restart REPLACES this process. Spawning the new TUI as a waiting child left one idle
+  // `elanous.mjs --resume` per restart in every pane (38 nested on one mshq session · 733 processes · ~53 GB).
+  const replace = deps.replaceProcess ?? (deps.spawnChild ? undefined : (await import('./tui/exec-in-place.js')).execInPlace);
+  if (replace) {
+    const probe = deps.probeEntry ?? (deps.replaceProcess ? () => true : defaultTuiEntryProbe);
+    let target = argv;
+    if (!probe(process.execPath, argv[0] ?? '')) {
+      // The new entry cannot even print its version: exec the command this tab was started with instead (same rule as
+      // the child-fast-exit fallback below, decided before the exec because nothing runs after a successful exec).
+      target = planTuiRestartArgv({
+        scriptPath: deps.fallbackScriptPath ?? process.argv[1] ?? argv[0] ?? '',
+        args: deps.args ?? process.argv.slice(2),
+        sessionId: decision.sessionId,
+      });
+      report('fallback', { reason: 'entry-probe-failed', argv, fallbackArgv: target, sessionId: decision.sessionId });
+    }
+    report('exec', { pid: process.pid, argv: target, sessionId: decision.sessionId, generation });
+    const failure = replace([process.execPath, ...target], env);
+    report('exec-failed', { failure, argv: target });
+  }
   const spawnChild = deps.spawnChild ?? defaultTuiSelfRestartSpawn;
   const startedAt = now();
   const exitCode = await spawnChild(process.execPath, argv, env);
@@ -13557,7 +13703,26 @@ export async function runTuiSelfRestartOnStaleBuild(deps: TuiSelfRestartDeps = {
   return { outcome: 'relaunch', reason: staleness.reason, sessionId: decision.sessionId, argv, exitCode };
 }
 
-/** 재기동 자식 — 같은 터미널(stdio inherit)을 물려받는다. 부모는 자식 종료를 기다린 뒤 그 코드로 끝난다. */
+async function collapseOwnRestartChainAsync(): Promise<void> {
+  try {
+    const { collapseOwnRestartChain } = await import('./tui/restart-chain.js');
+    await collapseOwnRestartChain({ log: (event, data) => debug.log('tui.restart', event, data, { level: 'warn' }) });
+  } catch { /* the guard never affects the TUI */ }
+}
+
+/** `bun <entry> --version` exits 0 within 20 s — the new install can at least load its entry. */
+function defaultTuiEntryProbe(command: string, scriptPath: string): boolean {
+  if (!scriptPath) return false;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { spawnSync } = require('node:child_process') as typeof import('node:child_process');
+    return spawnSync(command, [scriptPath, '--version'], { stdio: 'ignore', timeout: 20_000 }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** 재기동 자식(폴백 전용 — execve 실패 때만) — 같은 터미널(stdio inherit)을 물려받는다. 부모는 자식 종료를 기다린 뒤 그 코드로 끝난다. */
 async function defaultTuiSelfRestartSpawn(command: string, argv: readonly string[], env: Record<string, string>): Promise<number> {
   const childProcess = await import('node:child_process');
   const child: import('node:child_process').ChildProcess = childProcess.spawn(

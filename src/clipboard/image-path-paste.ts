@@ -38,13 +38,15 @@ const WEBP_TAG_BYTES = [0x57, 0x45, 0x42, 0x50]; // "WEBP"
 const MAGIC_HEAD_BYTES = 12; // head length covering every signature above (WebP needs 12). Source: same specs.
 
 /** Whole-paste path candidate: the paste must be exactly one path (Finder-style
- *  quotes allowed), absolute or ~/ ./ ../ relative, with a supported image
- *  extension. Multiline pastes and URLs never match. */
+ *  quotes allowed, an optional leading «@»), absolute or ~/ ./ ../ relative, with
+ *  a supported image extension. Multiline pastes and URLs never match. */
 export function extractImagePathCandidate(text: string): string | null {
-  const trimmed = text.trim();
+  // A leading «@» (file mention) is accepted too: «@/tmp/shot.png» attaches like «/tmp/shot.png».
+  const trimmed = text.trim().replace(/^@(?=["'/~.])/, '');
   if (!trimmed || trimmed.includes('\n')) return null;
   const quoted = /^"(.+)"$/.exec(trimmed) ?? /^'(.+)'$/.exec(trimmed);
-  const inner = quoted ? quoted[1] : trimmed;
+  // Terminal drag-and-drop escapes spaces («/a/my\ shot.png»); unquoted pastes drop those escapes.
+  const inner = quoted ? quoted[1]! : trimmed.replace(/\\ /g, ' ');
   const ext = inner.split('.').pop()?.toLowerCase() ?? '';
   if (!IMAGE_EXTENSIONS.has(ext)) return null;
   return inner.startsWith('/') || inner.startsWith('~/') || inner.startsWith('./') || inner.startsWith('../') ? inner : null;

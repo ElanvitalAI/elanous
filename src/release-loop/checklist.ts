@@ -2,14 +2,16 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
+import { homedir } from 'node:os';
 import * as store from './feature-store.js';
+import { recordFact } from '../fed-state/ledger.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
 import { parseTargetPathHintLine } from './checklist-target-path-hint.js';
 import { parseProvenanceEvidenceLine, provenanceEvidenceLine, validateProvenance, type Provenance } from '../provenance/provenance.js';
 import { messageRouteFor } from '../loops/msg-address.js';
 import { resolveSeatStateRoot } from '../loops/msg-wake.js';
-import { readSeatRegistry, seatRegistryPath } from '../loops/seat-registry.js';
+import { readSeatRegistry, readSeatRegistryV2, seatRegistryPath } from '../loops/seat-registry.js';
 import { openMsgStore, type MsgStore } from '../msg/msg-store.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 import { assertNotTestWritingOps } from '../instance/test-write-guard.js';
@@ -49,6 +51,12 @@ export interface ChecklistItem {
   evidence?: string;
   /** Public known-issue wording, independent from the internal checklist title. */
   knownIssue?: string;
+  /** What the cell is and why it exists — free text beyond the one-line title. */
+  body?: string;
+  /** The completion criterion: what must be observed to call this cell done. */
+  doneCriterion?: string;
+  /** Where the cell came from — the original request wording or the origin message id. */
+  source?: string;
   disposition?: ChecklistDisposition;
   kind?: ChecklistKind;
   /** Whether the seat dispatcher should launch a coding task. Missing in old rows means code. */
@@ -174,6 +182,32 @@ function runtimeMessageSeats(): ReadonlySet<string> {
   return registry.status === 'ready' ? new Set(registry.registry.seats.map(({ address }) => address)) : new Set();
 }
 
+/**
+ * CHECKLIST-OWNER-HAND-SEATS (TRACE-OP-RESOURCE-OPTIMIZATION-1125 §6-2): a registered hand seat may own a cell. The v1
+ * reader above misses v2 registries and seats declared only in federation.yaml, so the owner validator also takes the
+ * declared federation seat set (seat registry v1|v2 ⊕ federation.yaml) — the same set seat mail trusts.
+ */
+function federationOwnerSeats(): ReadonlySet<string> {
+  // Uncached on purpose: an owner write must see a seat the moment it is registered (and stop seeing a removed one).
+  const seats = new Set<string>();
+  try {
+    const read = readSeatRegistryV2(seatRegistryPath(resolveSeatStateRoot()));
+    if (read.status === 'ready') for (const entry of read.registry.seats) seats.add(entry.address);
+  } catch { /* an unreadable registry declares nothing */ }
+  try {
+    const { effectiveInstanceRoot, prodInstanceRoot } = require('../instance/resolve.js') as typeof import('../instance/resolve.js');
+    const { readWorkspaceFile } = require('../els/workspace-config.js') as typeof import('../els/workspace-config.js');
+    const root = effectiveInstanceRoot();
+    // The test universe never reads the operator's HOME declaration (same rule as seat-mail trust).
+    const decl = readWorkspaceFile(process.cwd(), root === prodInstanceRoot() ? homedir() : root);
+    if (decl.path && decl.config) {
+      for (const id of Object.keys(decl.config.seats)) seats.add(id.toUpperCase());
+      for (const space of Object.values(decl.config.spaces)) for (const id of space.seats) seats.add(id.toUpperCase());
+    }
+  } catch { /* an unreadable declaration declares nothing */ }
+  return seats;
+}
+
 export function parseOwner(value: string): { seat: string; sub?: string } {
   // Match seat-registry.ts ADDRESS; the legacy wildcard branch is gated by MANUAL_CHECKLIST_SEATS.
   const match = /^([A-Z][A-Z0-9_-]{0,63}|[A-Z]{2,8}-\*)(?:\/([a-z][a-z0-9-]{0,31}))?$/.exec(value);
@@ -181,7 +215,7 @@ export function parseOwner(value: string): { seat: string; sub?: string } {
   const legacySeat = seat !== undefined && /^[A-Z]{2,8}(?:-[0-9]{1,8})?$/.test(seat);
   const manualSeat = seat !== undefined && MANUAL_CHECKLIST_SEATS.has(seat);
   const declaredAddress = seat !== undefined && !legacySeat && !manualSeat &&
-    (messageRouteFor(seat) !== null || runtimeMessageSeats().has(seat));
+    (messageRouteFor(seat) !== null || runtimeMessageSeats().has(seat) || federationOwnerSeats().has(seat));
   if (!match || match[0] !== value || (!legacySeat && !manualSeat && !declaredAddress))
     throw new CliUserError(`잘못된 담당: ${value}`, '자리 이름(예: TC-1, MVP-D, MVP-*, GATE-G) 또는 자리/하위자리(예: TC/rel)');
   return match[2] ? { seat: seat!, sub: match[2] } : { seat: seat! };
@@ -489,10 +523,20 @@ function assertNoOuterWhitespaceCellId(id: string): void {
   if (id !== id.trim()) throw new CliUserError('checklist id must not carry leading or trailing whitespace', '칸 id 앞뒤 공백을 직접 없애 준다 — 자동 손질은 조용한 별칭(aliasing)이 된다');
 }
 
-export function addItem(v: string, input: { id: string; title: string; refs?: string[]; owner?: string; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean }, options: { allowDuplicateId?: boolean } = {}): Checklist {
-  if (!input.id.trim()) throw new CliUserError('칸 id 가 비었다');
+export type ChecklistAddInput = { id: string; title: string; refs?: string[]; owner?: string; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean; body?: string; doneCriterion?: string; source?: string };
+
+/** Content fields (body · done criterion · source) are free text; an empty or whitespace-only value is not stored. */
+function contentText(value: string | undefined, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') throw new CliUserError(`${label} 은 문자열이어야 한다`);
+  return value.trim() ? value : undefined;
+}
+
+/** Row-local checks (no ledger read). Returns the normalized refs. */
+function validateAddInput(input: ChecklistAddInput): string[] | undefined {
+  if (typeof input.id !== 'string' || !input.id.trim()) throw new CliUserError('칸 id 가 비었다');
   assertNoOuterWhitespaceCellId(input.id);
-  if (!input.title.trim()) throw new CliUserError('칸 제목이 비었다');
+  if (typeof input.title !== 'string' || !input.title.trim()) throw new CliUserError('칸 제목이 비었다');
   if (input.kind !== undefined && !CHECKLIST_KINDS.includes(input.kind)) throw new CliUserError(`잘못된 종류: ${input.kind}`, 'screen|postpub');
   if (input.dispatchKind !== undefined && !CHECKLIST_DISPATCH_KINDS.includes(input.dispatchKind)) throw new CliUserError(`잘못된 발사 종류: ${input.dispatchKind}`, 'code|ops|measure|decision|umbrella');
   if (input.owner !== undefined) parseOwner(input.owner);
@@ -500,8 +544,19 @@ export function addItem(v: string, input: { id: string; title: string; refs?: st
   if (input.predecessors !== undefined && (!Array.isArray(input.predecessors) || input.predecessors.some((p) => typeof p !== 'string' || !p.trim() || p === input.id))) throw new CliUserError('잘못된 선행 칸');
   if (input.deadlineVersion !== undefined) store.validateVersion(input.deadlineVersion);
   if (input.accelerator !== undefined && input.accelerator !== true) throw new CliUserError('가속 등급은 true 이거나 생략한다');
+  if (input.refs !== undefined && (!Array.isArray(input.refs) || input.refs.some((ref) => typeof ref !== 'string'))) throw new CliUserError('잘못된 근거 문서 목록');
+  contentText(input.body, 'body'); contentText(input.doneCriterion, 'done'); contentText(input.source, 'source');
   validateCeoLoad(input);
-  const refs = input.refs !== undefined && input.refs.length ? normalizeRefs(input.refs) : undefined;
+  return input.refs !== undefined && input.refs.length ? normalizeRefs(input.refs) : undefined;
+}
+
+function buildAddedItem(input: ChecklistAddInput, refs: string[] | undefined, by: string, at: string): ChecklistItem {
+  const body = contentText(input.body, 'body'), doneCriterion = contentText(input.doneCriterion, 'done'), source = contentText(input.source, 'source');
+  return { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), ...(input.kind !== undefined ? { kind: input.kind } : {}), ...(input.dispatchKind !== undefined ? { dispatchKind: input.dispatchKind } : {}), ...(input.priority !== undefined ? { priority: input.priority } : {}), ...(input.predecessors !== undefined ? { predecessors: input.predecessors } : {}), ...(input.deadlineVersion !== undefined ? { deadlineVersion: input.deadlineVersion } : {}), ...(input.ceoMinutes !== undefined ? { ceoMinutes: input.ceoMinutes } : {}), ...(input.ceoDate !== undefined ? { ceoDate: input.ceoDate } : {}), ...(input.accelerator === true ? { accelerator: true as const } : {}), ...(refs ? { refs } : {}), ...(body !== undefined ? { body } : {}), ...(doneCriterion !== undefined ? { doneCriterion } : {}), ...(source !== undefined ? { source } : {}), updatedAt: at, updatedBy: by };
+}
+
+export function addItem(v: string, input: ChecklistAddInput, options: { allowDuplicateId?: boolean } = {}): Checklist {
+  const refs = validateAddInput(input);
   return mutate(v, (data, otherItems) => {
     if (data.items.some((item) => item.id === input.id)) throw new CliUserError(`이미 있는 칸: ${input.id}`, 'set <id> 로 고친다');
     const collisions = otherItems(input.id);
@@ -513,15 +568,181 @@ export function addItem(v: string, input: { id: string; title: string; refs?: st
     assertPredecessorsExist(input.predecessors, data, otherItems);
     const by = process.env.ELANOUS_TRACK || 'cli';
     const at = new Date().toISOString();
-    const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), ...(input.kind !== undefined ? { kind: input.kind } : {}), ...(input.dispatchKind !== undefined ? { dispatchKind: input.dispatchKind } : {}), ...(input.priority !== undefined ? { priority: input.priority } : {}), ...(input.predecessors !== undefined ? { predecessors: input.predecessors } : {}), ...(input.deadlineVersion !== undefined ? { deadlineVersion: input.deadlineVersion } : {}), ...(input.ceoMinutes !== undefined ? { ceoMinutes: input.ceoMinutes } : {}), ...(input.ceoDate !== undefined ? { ceoDate: input.ceoDate } : {}), ...(input.accelerator === true ? { accelerator: true as const } : {}), ...(refs ? { refs } : {}), updatedAt: at, updatedBy: by };
+    const item = buildAddedItem(input, refs, by, at);
     data.items.push(item);
     change(data, item.id, 'add', null, item, by, at);
     return true;
   });
 }
 
-export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; provenance?: Provenance; knownIssue?: string | null; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
-  return setItemGuarded(v, id, patch, by);
+/** One rejected row of a bulk add: its 1-based position in the input, its id (if any) and every reason. */
+export interface ChecklistBulkAddError { row: number; id: string | null; errors: string[] }
+export interface ChecklistBulkAddResult { version: string; dryRun: boolean; added: ChecklistItem[]; errors: ChecklistBulkAddError[]; checklist?: Checklist }
+
+/**
+ * CHECKLIST-BULK-ADD — validate every row first (row-local checks, then ledger checks: same-version duplicate,
+ * other-version collision, predecessors that exist in the ledger or earlier/later in the same batch), then add them all
+ * in ONE ledger transaction. Any bad row → nothing is written and every bad row is reported. `dryRun` writes nothing.
+ */
+export function addItems(v: string, inputs: readonly ChecklistAddInput[], options: { allowDuplicateId?: boolean; dryRun?: boolean } = {}): ChecklistBulkAddResult {
+  if (!inputs.length) throw new CliUserError('추가할 칸이 없다');
+  const errors = new Map<number, ChecklistBulkAddError>();
+  const fail = (index: number, message: string) => {
+    const id = typeof inputs[index]!.id === 'string' ? inputs[index]!.id : null;
+    const entry = errors.get(index) ?? { row: index + 1, id, errors: [] };
+    entry.errors.push(message);
+    errors.set(index, entry);
+  };
+  const refs = inputs.map((input, index) => {
+    try { return validateAddInput(input); } catch (error) { fail(index, error instanceof Error ? error.message : String(error)); return undefined; }
+  });
+  const firstRow = new Map<string, number>();
+  inputs.forEach((input, index) => {
+    if (typeof input.id !== 'string') return;
+    const first = firstRow.get(input.id);
+    if (first === undefined) firstRow.set(input.id, index);
+    else fail(index, `같은 파일에 이미 있는 id: ${input.id} (행 ${first + 1})`);
+  });
+  const by = process.env.ELANOUS_TRACK || 'cli';
+  const at = new Date().toISOString();
+  const added: ChecklistItem[] = [];
+  const batchIds = new Set(inputs.map((input) => input.id));
+  let invalid = false;
+  const checklist = mutate(v, (data, otherItems) => {
+    inputs.forEach((input, index) => {
+      if (typeof input.id !== 'string' || !input.id.trim()) return;
+      if (data.items.some((item) => item.id === input.id)) fail(index, `이미 있는 칸: ${input.id} — set <id> 로 고친다`);
+      const collisions = otherItems(input.id);
+      if (collisions.length && !options.allowDuplicateId) fail(index, `다른 판에 이미 있는 칸: ${input.id} (${collisions.map((item) => item.version).join(', ')}) — --allow-duplicate-id 로 허용`);
+      for (const predecessor of Array.isArray(input.predecessors) ? input.predecessors : []) {
+        if (batchIds.has(predecessor) || data.items.some((item) => item.id === predecessor) || otherItems(predecessor).length) continue;
+        fail(index, `없는 선행 칸: ${predecessor}`);
+      }
+    });
+    if (errors.size) { invalid = true; return false; }
+    inputs.forEach((input, index) => {
+      const item = buildAddedItem(input, refs[index], by, at);
+      added.push(item);
+      if (options.dryRun) return;
+      data.items.push(item);
+      change(data, item.id, 'add', null, item, by, at);
+    });
+    return !options.dryRun;
+  });
+  const rows = [...errors.values()].sort((a, b) => a.row - b.row);
+  if (invalid) return { version: v, dryRun: Boolean(options.dryRun), added: [], errors: rows };
+  debug.log('release-loop.checklist', options.dryRun ? 'bulk-add-dry-run' : 'bulk-add', { version: v, count: added.length, by });
+  return { version: v, dryRun: Boolean(options.dryRun), added, errors: [], ...(options.dryRun ? {} : { checklist }) };
+}
+
+/** Parse a bulk-add file: JSONL (one object per line) or a Markdown table whose header names the row fields. */
+export function parseChecklistBulkFile(text: string, format?: 'jsonl' | 'md'): ChecklistAddInput[] {
+  const lines = text.split(/\r?\n/);
+  const firstLine = lines.find((line) => line.trim())?.trim() ?? '';
+  const detected = format ?? (firstLine.startsWith('{') ? 'jsonl' : lines.some((line) => line.trim().startsWith('|')) ? 'md' : undefined);
+  if (!detected) throw new CliUserError('파일 형식을 알 수 없다', 'JSONL(한 줄에 객체 하나) 또는 | id | title | … | 마크다운 표');
+  return detected === 'jsonl' ? parseBulkJsonl(lines) : parseBulkMarkdown(lines);
+}
+
+const BULK_FIELDS = ['id', 'title', 'priority', 'owner', 'body', 'done', 'source', 'refs', 'deadline-version', 'accelerator', 'predecessors', 'kind'] as const;
+type BulkField = typeof BULK_FIELDS[number];
+const BULK_FIELD_ALIASES: Record<string, BulkField> = { deadlineversion: 'deadline-version', deadline_version: 'deadline-version', ref: 'refs', predecessor: 'predecessors', donecriterion: 'done' };
+
+function bulkField(name: string, where: string): BulkField {
+  const key = name.trim().toLowerCase();
+  const field = (BULK_FIELDS as readonly string[]).includes(key) ? key as BulkField : BULK_FIELD_ALIASES[key];
+  if (!field) throw new CliUserError(`${where}: 모르는 필드 «${name}»`, BULK_FIELDS.join(' · '));
+  return field;
+}
+
+function bulkRow(values: Partial<Record<BulkField, unknown>>, where: string): ChecklistAddInput {
+  const text = (field: BulkField): string | undefined => {
+    const value = values[field];
+    if (value === undefined || value === null || value === '') return undefined;
+    if (typeof value !== 'string') throw new CliUserError(`${where}: ${field} 는 문자열이어야 한다`);
+    return value;
+  };
+  const list = (field: BulkField): string[] | undefined => {
+    const value = values[field];
+    if (value === undefined || value === null || value === '') return undefined;
+    if (Array.isArray(value)) return value as string[];
+    if (typeof value === 'string') return value.split(',').map((part) => part.trim()).filter(Boolean);
+    throw new CliUserError(`${where}: ${field} 는 목록이어야 한다`);
+  };
+  const accelerator = values.accelerator;
+  let accel: boolean | undefined;
+  if (accelerator === true || (typeof accelerator === 'string' && /^(true|yes|y|1|o|✓|✔)$/i.test(accelerator.trim()))) accel = true;
+  else if (accelerator === undefined || accelerator === null || accelerator === false || (typeof accelerator === 'string' && /^(|false|no|n|0|-|x)$/i.test(accelerator.trim()))) accel = undefined;
+  else throw new CliUserError(`${where}: accelerator 는 true/false 다`);
+  const kind = text('kind');
+  const dispatchKind = kind && !['screen', 'postpub'].includes(kind) ? kind as ChecklistDispatchKind : undefined;
+  return {
+    id: values.id as string, title: values.title as string,
+    ...(text('priority') !== undefined ? { priority: text('priority') as ChecklistItem['priority'] } : {}),
+    ...(text('owner') !== undefined ? { owner: text('owner') } : {}),
+    ...(values.body !== undefined && values.body !== null && values.body !== '' ? { body: values.body as string } : {}),
+    ...(values.done !== undefined && values.done !== null && values.done !== '' ? { doneCriterion: values.done as string } : {}),
+    ...(values.source !== undefined && values.source !== null && values.source !== '' ? { source: values.source as string } : {}),
+    ...(list('refs') !== undefined ? { refs: list('refs') } : {}),
+    ...(list('predecessors') !== undefined ? { predecessors: list('predecessors') } : {}),
+    ...(text('deadline-version') !== undefined ? { deadlineVersion: text('deadline-version') } : {}),
+    ...(accel ? { accelerator: true } : {}),
+    ...(kind !== undefined && !dispatchKind ? { kind: kind as ChecklistKind } : {}),
+    ...(dispatchKind ? { dispatchKind } : {}),
+  };
+}
+
+/** Parse every row; a malformed row does not stop the others — all row errors are reported together. */
+function collectRows<T>(entries: readonly T[], parse: (entry: T) => ChecklistAddInput): ChecklistAddInput[] {
+  const rows: ChecklistAddInput[] = [];
+  const problems: string[] = [];
+  for (const entry of entries) {
+    try { rows.push(parse(entry)); } catch (error) { problems.push(error instanceof Error ? error.message : String(error)); }
+  }
+  if (problems.length) throw new CliUserError(`파일 행 ${problems.length}개를 읽지 못했다 — 아무것도 쓰지 않았다\n${problems.map((problem) => `  ⛔ ${problem}`).join('\n')}`);
+  return rows;
+}
+
+function parseBulkJsonl(lines: string[]): ChecklistAddInput[] {
+  return collectRows(lines.map((line, index) => ({ line, index })).filter(({ line }) => line.trim()), ({ line, index }) => {
+    const where = `${index + 1}번째 줄`;
+    let parsed: unknown;
+    try { parsed = JSON.parse(line); } catch { throw new CliUserError(`${where}: JSON 이 아니다`); }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new CliUserError(`${where}: 객체가 아니다`);
+    const values: Partial<Record<BulkField, unknown>> = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) values[bulkField(key, where)] = value;
+    return bulkRow(values, where);
+  });
+}
+
+function splitMarkdownRow(line: string): string[] {
+  const trimmed = line.trim().replace(/^\|/, '').replace(/(?<!\\)\|$/, '');
+  return trimmed.split(/(?<!\\)\|/).map((cell) => cell.trim().replace(/\\\|/g, '|').replace(/<br\s*\/?>/gi, '\n'));
+}
+
+function parseBulkMarkdown(lines: string[]): ChecklistAddInput[] {
+  const tableLines = lines.map((line, index) => ({ line, index })).filter(({ line }) => line.trim().startsWith('|'));
+  if (tableLines.length < 2) throw new CliUserError('마크다운 표가 없다', '| id | title | … | 머리줄 · | --- | 구분줄 · 행');
+  const header = splitMarkdownRow(tableLines[0]!.line).map((name) => bulkField(name, '머리줄'));
+  if (!header.includes('id') || !header.includes('title')) throw new CliUserError('머리줄에 id 와 title 이 필요하다');
+  const separator = splitMarkdownRow(tableLines[1]!.line);
+  if (!separator.every((cell) => /^:?-{3,}:?$/.test(cell))) throw new CliUserError('머리줄 다음 줄은 | --- | 구분줄이어야 한다');
+  return collectRows(tableLines.slice(2), ({ line, index }) => {
+    const where = `${index + 1}번째 줄`;
+    const cells = splitMarkdownRow(line);
+    if (cells.length !== header.length) throw new CliUserError(`${where}: 칸 수 ${cells.length} ≠ 머리줄 ${header.length}`);
+    const values: Partial<Record<BulkField, unknown>> = {};
+    header.forEach((field, column) => { values[field] = cells[column]; });
+    return bulkRow(values, where);
+  });
+}
+
+export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; provenance?: Provenance; knownIssue?: string | null; body?: string | null; doneCriterion?: string | null; source?: string | null; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
+  const out = setItemGuarded(v, id, patch, by);
+  // fed-state (SIGNAL-STATE-NOT-MAIL) — fail-open: green / owner change become typed cell facts.
+  if (patch.status === 'green') recordFact({ type: 'cell', cell: id, state: 'green', seat: by, ref: v, source: 'checklist' });
+  else if (patch.owner !== undefined) recordFact({ type: 'cell', cell: id, state: patch.owner && patch.owner !== '-' ? 'claim' : 'release', seat: by, ref: v, source: 'checklist' });
+  return out;
 }
 
 /** 효과 없는 MUST 는 게이트가 판단할 근거가 없다 — 거부한다. */
@@ -671,14 +892,14 @@ function setItemsGuarded(v: string, ids: string[], originalPatch: Parameters<typ
           throw new CliUserError(`지금 주인: ${item.owner} — --force 로만 바꾼다`, 'release checklist claim <id> --by <자리> --force');
         }
       }
-      const fields = (['evidence', 'knownIssue', 'owner', 'status', 'disposition', 'kind', 'dispatchKind', 'priority', 'predecessors', 'deadlineVersion', 'ceoMinutes', 'ceoDate', 'accelerator', 'refs'] as const).filter((field) => patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(item[field] ?? null));
+      const fields = (['evidence', 'knownIssue', 'body', 'doneCriterion', 'source', 'owner', 'status', 'disposition', 'kind', 'dispatchKind', 'priority', 'predecessors', 'deadlineVersion', 'ceoMinutes', 'ceoDate', 'accelerator', 'refs'] as const).filter((field) => patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(item[field] ?? null));
       if (fields.length === 0) continue;
       changed = true;
       const at = new Date().toISOString();
       for (const field of fields) {
         const from = item[field];
         const to = patch[field]!;
-        if ((field === 'accelerator' || field === 'knownIssue') && to === null) delete (item as unknown as Record<string, unknown>)[field];
+        if ((field === 'accelerator' || field === 'knownIssue' || field === 'body' || field === 'doneCriterion' || field === 'source') && to === null) delete (item as unknown as Record<string, unknown>)[field];
         else (item as unknown as Record<string, unknown>)[field] = to;
         item.updatedAt = at;
         item.updatedBy = by;
@@ -725,6 +946,67 @@ export function claimItem(v: string, id: string, by: string, options: { force?: 
   } finally {
     debug.log('release-loop.checklist', 'claim', { version: v, id, from, to: by, force: options.force === true, outcome });
   }
+}
+
+/**
+ * OP-HANDLES-L2b — `eln seat assign`: the coordinator sets a cell's owner to a hand seat in one step. The caller (the
+ * seat-assign command) has already checked the actor is a coordinator and that no other live writer holds the cell's
+ * paths. A changed owner is recorded like an OP-forced claim (actor ⊕ reason) so history shows who moved it and why.
+ */
+export function assignItem(v: string, id: string, seat: string, options: { actor: string; reason: string }): { checklist: Checklist; from: string | null; outcome: 'assigned' | 'same' } {
+  parseOwner(seat);
+  const actor = options.actor.trim();
+  const reason = options.reason.trim() || 'seat assign';
+  let from: string | null = null;
+  let outcome: 'assigned' | 'same' = 'same';
+  const checklist = mutate(v, (data) => {
+    const item = data.items.find((i) => i.id === id);
+    if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
+    from = item.owner ?? null;
+    if (from === seat) return false;
+    const at = new Date().toISOString();
+    item.owner = seat;
+    item.updatedAt = at;
+    item.updatedBy = actor;
+    const forced = from !== null;
+    data.history.push({ at, by: actor, id, field: 'claim', from, to: forced ? { owner: seat, force: true, actor, reason } : seat,
+      released: data.released, dev: data.dev, ...(forced ? { force: true as const, reason } : {}) });
+    outcome = 'assigned';
+    return true;
+  });
+  debug.log('release-loop.checklist', 'assign', { version: v, id, from, to: seat, actor, outcome });
+  return { checklist, from, outcome };
+}
+
+/**
+ * PULL (대표 11-25 17:1x) — compare-and-set on a cell's owner inside the ledger's write transaction (BEGIN IMMEDIATE): the
+ * owner changes to `to` (null = back to the board) only while it still equals `expectedOwner` and the cell is yellow. Two
+ * seats racing for one cell: the first commit wins, the second sees a changed owner and gets `lost`. History keeps a
+ * `claim` row (actor ⊕ reason) like a forced claim.
+ */
+export function swapOwnerIf(v: string, id: string, input: { expectedOwner: string | null; to: string | null; actor: string; reason: string }):
+  { outcome: 'swapped' | 'lost' | 'missing'; owner: string | null } {
+  if (input.to !== null) parseOwner(input.to);
+  let outcome: 'swapped' | 'lost' | 'missing' = 'missing';
+  let owner: string | null = null;
+  mutate(v, (data) => {
+    const item = data.items.find((i) => i.id === id);
+    if (!item) return false;
+    owner = item.owner ?? null;
+    if (owner !== input.expectedOwner || item.status !== 'yellow') { outcome = 'lost'; return false; }
+    const at = new Date().toISOString();
+    if (input.to === null) delete item.owner; else item.owner = input.to;
+    item.updatedAt = at;
+    item.updatedBy = input.actor;
+    const forced = owner !== null;
+    data.history.push({ at, by: input.actor, id, field: 'claim', from: owner, to: forced ? { owner: input.to, force: true, actor: input.actor, reason: input.reason } : input.to,
+      released: data.released, dev: data.dev, ...(forced ? { force: true as const, reason: input.reason } : {}) });
+    outcome = 'swapped';
+    owner = input.to;
+    return true;
+  });
+  debug.log('release-loop.checklist', 'swap-owner', { version: v, id, expected: input.expectedOwner, to: input.to, actor: input.actor, outcome });
+  return { outcome, owner };
 }
 
 export function removeItem(v: string, id: string, by: string): Checklist {

@@ -28,3 +28,31 @@ steward-release-day:
 steward-entrance-dispatch-shadow:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/entrance-dispatch-shadow.ts"'
   timeout_ms: 120000
+# STEWARD-SPACE (행정관 · 대표 11-25) — graphs/steward/space.yaml · one node script, deterministic, no LLM.
+steward-space-r0:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/space/tick.ts" r0'
+  # els ls · checklist status · two gh lists · receipt/verdict dirs — each child has its own 60 s bound.
+  timeout_ms: 300000
+steward-space-r1:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/space/tick.ts" r1'
+  # Live assignment = one `seat assign` / `checklist set` child per row (cap 4 per scope).
+  timeout_ms: 300000
+steward-space-r2:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/space/tick.ts" r2'
+  # Pregate children are detached — this node never waits for a gate.
+  timeout_ms: 60000
+steward-space-r3:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/space/tick.ts" r3'
+  timeout_ms: 60000
+steward-space-r4:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/space/tick.ts" r4'
+  timeout_ms: 60000
+steward-space-r5:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/space/tick.ts" r5'
+  timeout_ms: 60000
+steward-space-r6:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/space/tick.ts" r6'
+  timeout_ms: 60000
+steward-space-x:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/space/tick.ts" x'
+  timeout_ms: 60000

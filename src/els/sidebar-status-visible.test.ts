@@ -37,15 +37,15 @@ test('sidebar: space lines carry no status mark, the coordinator is ⭐, and the
   expect(spaceLine!.trim()).not.toContain('●');
   expect(spaceLine!.trim()).not.toContain('🟢');          // 스페이스 줄에는 동작 상태가 없다(OP #134203)
   expect(lines.find((line) => line.includes('NAME-W2'))!.trim()).toContain('⭐');   // 조율자 표식 = ⭐(OP #134199 ①)
-  const agentsHead = lines.findIndex((line) => line.trim().startsWith('agents'));
+  const agentsHead = lines.findIndex((line) => /^(○ All|◉ Active)/.test(line.trim()));
   expect(agentsHead).toBeGreaterThan(0);
-  expect(lines[agentsHead]!).toContain('grouped');        // 머리 «agents … grouped»(OP #134223)
+  expect(lines[agentsHead]!).toContain('grouped');        // 머리 «○ All · n … grouped»(OP #134223 · ELS-ACTIVE-ONLY-FILTER)
   const workingAt = lines.findIndex((line, at) => at > agentsHead && line.includes('🟢'));
   const idleAt = lines.findIndex((line, at) => at > agentsHead && line.includes('⚪'));
   expect(workingAt).toBeGreaterThan(-1);
   expect(idleAt).toBeGreaterThan(workingAt);               // 같은 스페이스 안: 일하는 것 → 쉬는 것(OP #134199 ②)
   expect(lines.findIndex((line, at) => at > agentsHead && line.includes('🟡'))).toBeGreaterThan(-1);
-  expect(lines[workingAt + 1]!).toContain('· name-w1');  // 2단 행: 흐린 부제 «런타임 · 소속 스페이스»
+  expect(lines[workingAt - 1]!.trim()).toBe('▾ NAME-W1 · 2'); // ELS-PANE-LABEL-MODEL-FIRST: a «▾ SPACE · n» head per space
 });
 
 test('focused space expands to «N agents · branch» and no space shows more than two lines', () => {

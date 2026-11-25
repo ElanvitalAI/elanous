@@ -14,12 +14,13 @@
 
 import type { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
+import { noteAnnounceReceipt } from './announce.js';
 
 export const RECEIPT_STATES = ['posted', 'delivered', 'seen', 'started', 'accepted', 'rejected', 'done', 'expired', 'overdue'] as const;
 export type ReceiptState = typeof RECEIPT_STATES[number];
 
 /** Who wrote the row — a structural actor name, never derived from message text. */
-export type ReceiptSource = 'ledger' | 'tui-queue' | 'tui-mail-wake' | 'dashboard-inbox' | 'cli' | 'cli-ack' | 'tool-ack' | 'plan';
+export type ReceiptSource = 'ledger' | 'tui-queue' | 'tui-mail-wake' | 'dashboard-inbox' | 'cli' | 'cli-ack' | 'tool-ack' | 'plan' | 'turn-snapshot';
 
 export interface ReceiptInput {
   messageId: number;
@@ -214,6 +215,8 @@ export function recordReceiptOn(db: Database, input: ReceiptInput, now: () => Da
         .run(input.messageId, input.recipient, input.state === 'done' ? 'done' : 'acked');
     }
     const row = db.query(`${SELECT_RECEIPT} WHERE r.id = ?`).get(Number(result.lastInsertRowid)) as ReceiptRow;
+    // ANNOUNCE-UPTAKE — a forward receipt on an announce leaves its uptake event (delivered · turn) in the same transaction.
+    if (message.kind === 'announce') noteAnnounceReceipt(db, input, now);
     return { outcome: { recorded: true, receipt: fromReceiptRow(row) }, message };
   }).immediate();
   if (outcome.outcome.recorded && outcome.message) {

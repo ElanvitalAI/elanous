@@ -70,6 +70,7 @@ export function validJournal(raw: unknown): SpaceJournal {
       || (pane.exitedAt !== undefined && (!Number.isSafeInteger(pane.exitedAt) || (pane.exitedAt as number) < 0))
       || (pane.ownerSeat !== undefined && (typeof pane.ownerSeat !== 'string' || !pane.ownerSeat.trim()))
       || (pane.seatIdentity !== undefined && (typeof pane.seatIdentity !== 'string' || !/^[A-Z][A-Z0-9_-]{0,63}$/.test(pane.seatIdentity)))
+      || (pane.parentPane !== undefined && (typeof pane.parentPane !== 'string' || !pane.parentPane.trim()))
       || (pane.cwdOsc7 !== undefined && pane.cwdOsc7 !== true)
       || (pane.cwdOscPending !== undefined && (!Array.isArray(pane.cwdOscPending) || pane.cwdOscPending.length > 65
         || !pane.cwdOscPending.every((path: unknown) => isString(path) && path.startsWith('/') && !path.includes('\0') && path.length <= 8192)))
@@ -88,10 +89,14 @@ export function validJournal(raw: unknown): SpaceJournal {
       cwd: pane.cwd as string, command: pane.command as string[], state: pane.state as Pane['state'], restore: pane.restore as Pane['restore'],
       ptyId: pane.ptyId as string, scrollback: pane.scrollback as string,
       ...(pane.exitedAt !== undefined ? { exitedAt: pane.exitedAt as number } : {}),
+      ...(pane.exitCode === null || Number.isSafeInteger(pane.exitCode) ? { exitCode: pane.exitCode as number | null } : {}),
+      ...(isString(pane.exitReason) ? { exitReason: (pane.exitReason as string).slice(0, 200) } : {}),
+      ...(Array.isArray(pane.exitTail) && pane.exitTail.every(isString) ? { exitTail: (pane.exitTail as string[]).slice(-5) } : {}),
       ...(pane.cwdOsc7 === true ? { cwdOsc7: true as const } : {}),
       ...(Array.isArray(pane.cwdOscPending) ? { cwdOscPending: pane.cwdOscPending as string[] } : {}),
       ...(typeof pane.ownerSeat === 'string' ? { ownerSeat: pane.ownerSeat } : {}),
       ...(typeof pane.seatIdentity === 'string' ? { seatIdentity: pane.seatIdentity } : {}),
+      ...(typeof pane.parentPane === 'string' ? { parentPane: pane.parentPane } : {}),
       ...(isRecord(pane.place) ? { place: pane.place as unknown as Pane['place'] } : {}),
       ...(Array.isArray(pane.inbox) ? { inbox: pane.inbox as unknown as Pane['inbox'] } : {}) };
   });

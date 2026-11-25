@@ -191,11 +191,80 @@ export function hqTypingRequest(request: { readonly op: string; readonly bytes?:
   return request.op === 'input' && typeof request.bytes === 'string' && !/[\x03\x04\x1a\x1b\x1c]/.test(request.bytes);
 }
 
+/**
+ * OP-HANDLES-L2 (TRACE-OP-RESOURCE-OPTIMIZATION-1125 §5: ElsControl send/new refused 12/12 «no rule grants …»).
+ * The coordinator grant: the HQ coordinator (the OP seat, the journal's / federation.yaml's HQ coordinator seat, or a
+ * seatless pane in an HQ-coordinated workspace — `hqReadObserver`) may `new`, type (`hqTypingRequest`) and `close` on
+ * panes owned by a federation seat in every space; a space coordinator gets the same inside the spaces it coordinates.
+ * The federation seat set comes from the seat registry ⊕ federation.yaml (never a literal list here). Interrupt and raw
+ * control bytes stay owner-only; the OP tab itself still needs a person (authorizeRequest refuses it first).
+ */
+export interface FederationJournal {
+  readonly hqCoordinatorSeat?: string;
+  readonly workspaces: readonly { readonly id: string; readonly name: string; readonly coordinatorSeat?: string }[];
+  readonly tabs: readonly { readonly id: string; readonly workspaceId: string }[];
+  readonly panes: readonly { readonly id: string; readonly tabId: string; readonly ownerSeat?: string }[];
+}
+
+export type CoordinatorAuthority =
+  | { readonly scope: 'hq'; readonly seat: string }
+  | { readonly scope: 'space'; readonly seat: string; readonly workspaceIds: readonly string[] };
+
+/** Who coordinates: HQ (everywhere) or a space coordinator (its own spaces). `declaredHq` = federation.yaml `hq.coordinator`. */
+export function coordinatorAuthority(seat: string | undefined, callerPane: string | undefined, journal: FederationJournal, declaredHq?: string): CoordinatorAuthority | undefined {
+  const hq = journal.hqCoordinatorSeat ?? declaredHq;
+  if (hqReadObserver(seat, callerPane, { ...journal, ...(hq ? { hqCoordinatorSeat: hq } : {}) }))
+    return { scope: 'hq', seat: seat && seat !== 'unknown' ? seat : hq ?? 'OP' };
+  if (!seat || seat === 'unknown') return undefined;
+  const workspaceIds = journal.workspaces.filter(ws => ws.coordinatorSeat === seat).map(ws => ws.id);
+  return workspaceIds.length ? { scope: 'space', seat, workspaceIds } : undefined;
+}
+
+export interface CoordinatorGrant { readonly allow: true; readonly audit: Record<string, unknown> }
+
+/**
+ * The grant for one request, or undefined (the ordinary rules decide). `paneId` resolves a request pane ref (id, name or
+ * address) to the journal pane id. Every grant carries its `els.coordinator-grant` audit line — the caller writes it.
+ */
+export function coordinatorGrant(authority: CoordinatorAuthority | undefined,
+  request: { readonly op: string; readonly pane?: string; readonly tab?: string; readonly ws?: string; readonly bytes?: unknown },
+  journal: FederationJournal, federationSeats: ReadonlySet<string>, paneId: (ref: string) => string | undefined = ref => ref): CoordinatorGrant | undefined {
+  if (!authority) return undefined;
+  const inScope = (workspaceId: string | undefined): boolean => !!workspaceId
+    && journal.workspaces.some(ws => ws.id === workspaceId)
+    && (authority.scope === 'hq' || authority.workspaceIds.includes(workspaceId));
+  const federated = (owner: string | undefined): boolean => !!owner && owner !== 'unknown' && federationSeats.has(owner.toUpperCase());
+  const audit = (target: Record<string, unknown>): CoordinatorGrant => ({ allow: true,
+    audit: { ts: new Date().toISOString(), event: 'els.coordinator-grant', scope: authority.scope, seat: authority.seat, op: request.op, ...target, result: 'allowed' } });
+  const workspaceOfTab = (tab: string | undefined) => journal.tabs.find(t => t.id === tab)?.workspaceId;
+  if (request.op === 'new') {
+    const ws = journal.workspaces.find(row => row.id === request.ws || row.name === request.ws);
+    return ws && inScope(ws.id) ? audit({ workspace: ws.name }) : undefined;
+  }
+  if (hqTypingRequest(request) || request.op === 'close') {
+    const id = typeof request.pane === 'string' ? paneId(request.pane) : undefined;
+    const row = id ? journal.panes.find(p => p.id === id) : undefined;
+    if (!row || !federated(row.ownerSeat) || !inScope(workspaceOfTab(row.tabId))) return undefined;
+    // Closing the HQ coordinator's own pane stays a person's call.
+    if (request.op === 'close' && (row.ownerSeat === 'OP' || row.ownerSeat === journal.hqCoordinatorSeat)) return undefined;
+    return audit({ pane: row.id, owner: row.ownerSeat });
+  }
+  if (request.op === 'close-tab') {
+    const panes = journal.panes.filter(p => p.tabId === request.tab);
+    if (!panes.length || !inScope(workspaceOfTab(request.tab)) || !panes.every(p => federated(p.ownerSeat))) return undefined;
+    if (panes.some(p => p.ownerSeat === 'OP' || p.ownerSeat === journal.hqCoordinatorSeat)) return undefined;
+    return audit({ tab: request.tab, owners: [...new Set(panes.map(p => p.ownerSeat))] });
+  }
+  return undefined;
+}
+
 /** Assignment is server journal state; a claimed seat, cwd or request tag is never authority. */
 export function coordinatorTabScope(role: ServerRole, request: { readonly op: string; readonly ws?: string; readonly kind?: string; readonly id?: string; readonly before?: string },
-  journal: { readonly workspaces: readonly { readonly id: string; readonly name: string; readonly coordinatorSeat?: string }[]; readonly tabs: readonly { readonly id: string; readonly workspaceId: string }[] }): AuthVerdict | undefined {
+  journal: { readonly hqCoordinatorSeat?: string; readonly workspaces: readonly { readonly id: string; readonly name: string; readonly coordinatorSeat?: string }[]; readonly tabs: readonly { readonly id: string; readonly workspaceId: string }[] }): AuthVerdict | undefined {
   if (role.kind !== 'hand' && role.kind !== 'peer') return undefined;
   if (!role.seat || role.seat === 'unknown' || role.seat === 'OP') return undefined;
+  // OP-HANDLES-L2: the HQ coordinator seat is not confined to the one space it also coordinates.
+  if (journal.hqCoordinatorSeat && role.seat === journal.hqCoordinatorSeat) return undefined;
   const spaces = journal.workspaces.filter(ws => ws.coordinatorSeat === role.seat);
   if (!spaces.length) return undefined;
   if (request.op !== 'new' && !(request.op === 'reorder' && request.kind === 'tab')) return undefined;
@@ -243,7 +312,7 @@ export function resolveTabCloseScope(
 }
 
 // Payload fields (text/pattern/from) ride along so callers pass real op shapes; the door itself never reads them.
-interface RequestShape { readonly op: string; readonly kind?: string; readonly id?: string; readonly pane?: string; readonly tab?: string; readonly ws?: string; readonly at?: { readonly ws: string }; readonly action?: string; readonly seat?: string; readonly runtime?: unknown; readonly text?: string; readonly pattern?: string; readonly from?: string; readonly confirmed?: boolean }
+interface RequestShape { readonly op: string; readonly kind?: string; readonly id?: string; readonly pane?: string; readonly tab?: string; readonly ws?: string; readonly at?: { readonly ws: string }; readonly action?: string; readonly seat?: string; readonly runtime?: unknown; readonly text?: string; readonly pattern?: string; readonly from?: string; readonly confirmed?: boolean; readonly bytes?: unknown }
 
 /** op → control door action vocabulary (control.ts CONTROL_ACTIONS). */
 function doorAction(op: string): 'read' | 'do' | 'input' | 'new' | 'close' | 'move' | undefined {
@@ -263,7 +332,7 @@ export function isMutating(request: RequestShape): boolean {
 }
 
 /** The one rule set: reuse the door's defaultDecision + allow-list file so client and server cannot drift. */
-export function authorizeRequest(role: ServerRole, request: RequestShape, workspace: string | undefined, rules: readonly AllowRule[] | undefined, tabScope?: TabCloseScope, acting = false): AuthVerdict {
+export function authorizeRequest(role: ServerRole, request: RequestShape, workspace: string | undefined, rules: readonly AllowRule[] | undefined, tabScope?: TabCloseScope, acting = false, granted = false): AuthVerdict {
   // `acting` is computed by the server from its verified role and the current baton, never from a request.
   const actingOp = acting && (role.kind === 'hand' || role.kind === 'peer');
   // A server-minted OP pane may attempt registration only with a runtime claim;
@@ -311,7 +380,8 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
   if (!action) return { allow: false, reason: `els: ${request.op} is mutating but has no door action mapping` };
   // ELS-OP-CLOSE-TAB (대표 11-24 «보안 기본 완화»): closing a seat tab is a routine coordinator action — the OP pane, a
   // ledger-verified OP peer and the baton's acting OP close a non-OP tab without a person (the OP tab is refused above).
-  const coordinator = role.kind === 'op' || (role.kind === 'peer' && role.seat === 'OP') || actingOp;
+  // OP-HANDLES-L2: `granted` = the server found a coordinator grant (coordinatorGrant) for this exact request.
+  const coordinator = role.kind === 'op' || (role.kind === 'peer' && role.seat === 'OP') || actingOp || granted;
   if (request.op === 'close-tab') {
     if (request.confirmed !== true && !coordinator) return { allow: false, reason: 'els: close-tab denied — close needs confirm:true (human confirmation)' };
     if (!tabScope || tabScope.tabId !== request.tab || tabScope.workspace !== workspace || !tabScope.workspace)
@@ -320,6 +390,8 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
       && (!tabScope.ownerSeats.length || tabScope.ownerSeats.some((seat) => seat !== role.seat)))
       return { allow: false, reason: 'els: close-tab denied — tab contains another or unverified seat owner' };
   }
+  // OP-HANDLES-L2: a coordinator grant covers new / non-destructive typing / close on federation seat panes in scope.
+  if (granted && (action === 'new' || action === 'close' || (action === 'input' && hqTypingRequest(request)))) return { allow: true };
   // JUD #39096 ⓑ: a ledger-verified peer seat is a principal — «토큰 역할 ∨ peer seat». The control
   // 문 still makes the final adjudication; the role door only refuses to block the verified peer.
   const principal: Principal = role.kind === 'op'

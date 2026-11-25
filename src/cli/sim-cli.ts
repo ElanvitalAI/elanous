@@ -237,6 +237,39 @@ export function registerSimCommands(program: Command, simAppRuntime: SimAppRunti
         process.exitCode = 2;
       }
     });
+  // SEARCH-BENCH — native tool 검색 방법론 시뮬레이션 장치(owner 11-25). ⛔ 모듈은 액션 안에서만 불러온다.
+  sim.command('search-bench')
+    .description('검색 방법론 벤치: 고정 sha 코퍼스 × 금본 × 전략(Grep/Glob/Read·docs 색인·RunShell 엔진·외부 도구) → 점수표 · 런 이력')
+    .option('--corpus <kind>', 'elanous (기본) | ref (~/source/ref 표본 저장소)')
+    .option('--sha <ref>', 'elanous 코퍼스 커밋 (기본 origin/main)')
+    .option('--repo-source <id>', 'elanous 코퍼스 출처 id (knowledge.sources / ELANOUS_SOURCES · 기본 첫 repo 출처, 없으면 이 트리)')
+    .option('--repo <dir>', 'elanous 저장소 경로 (custom 출처로 해석)')
+    .option('--ref-sources <ids>', 'ref 출처 id 목록 (기본 모든 ref 출처, 없으면 ~/source/ref)')
+    .option('--ref-root <dir>', 'ref 뿌리 경로 (custom 출처로 해석 · 읽기만)')
+    .option('--strategies <spec>', '쉼표 목록 · 접두* (기본 전부)')
+    .option('--label <text>', '런 이름 꼬리표')
+    .option('--categories', '범주별 recall@5 표도 찍는다')
+    .option('--replay <transcript>', '에이전트 기록(search-bench.transcript/1)을 같은 채점기로')
+    .option('--llm-arm', 'LLM 팔(OpenRouter · 기본 꺼짐) — 도구 노출·설명 변형')
+    .option('--llm-model <id>', 'LLM 팔 모델 (기본 openai/gpt-4.1-mini)')
+    .option('--llm-exposures <list>', 'A-native-first,B-docs-first,C-runshell-only,D-ops-ui-deferred')
+    .option('--llm-descriptions <list>', 'D1-current,D2-short,D3-examples,D4-korean')
+    .option('--llm-max-queries <n>', 'LLM 팔 질의 수 (기본 10 · 문서/코드 반반)')
+    .option('--history', '런 이력 표')
+    .option('--compare <runs...>', '두 런 비교')
+    .option('--out <file>', '점수표 JSON 사본')
+    .option('--json', '점수표 JSON 출력')
+    .option('--keep-corpus', '코퍼스 임시 디렉터리를 남긴다')
+    .action(async (opts: Record<string, unknown>) => {
+      try {
+        if (!getTestStateRoot()) throw new Error('search-bench requires --test isolated mode');
+        const { runSearchBenchCli } = await import('../ux-sim/search-bench/cli.js');
+        process.exitCode = await runSearchBenchCli(resolve(getTestStateRoot()!), opts);
+      } catch (error) {
+        console.error(`sim search-bench: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 2;
+      }
+    });
   // SIM-EVENT-MONKEY — 사건 주입(L0). ⛔ 모듈은 액션 안에서만 불러온다(다른 명령 기동 경로에 안 올라오게).
   sim.command('emit <kind>')
     .allowExcessArguments(false)

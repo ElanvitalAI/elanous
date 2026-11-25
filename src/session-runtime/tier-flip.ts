@@ -148,6 +148,12 @@ function isImplicitlyDeferredByName(name: string): boolean {
   return IMPLICIT_DEFERRED_BY_NAME.has(name);
 }
 
+/** Search/read tools every seat surface needs on the first call. A coordinator-defer
+ *  mark never hides these: deferring them made seats shell out or hydrate before each
+ *  lookup (A/B docsearch experiment, 11-25). DocsSearch sits next to them: before it shipped only in
+ *  the Agent capsule toolkit, so no seat turn ever saw it (5497ec9 re-measure). */
+export const SEAT_IMMEDIATE_SEARCH_TOOLS: ReadonlySet<string> = new Set(['Grep', 'Glob', 'ListDir', 'Read', 'DocsSearch']);
+
 function isDynamicallyDeferred(spec: LLMToolSpec): boolean {
   const policy = spec as LLMToolSpec & { alwaysLoad?: boolean; shouldDefer?: boolean };
   return policy.alwaysLoad === false && policy.shouldDefer === true;
@@ -192,7 +198,7 @@ function splitDeferredToolSpecsInternal(
       seen.add(name);
       continue;
     }
-    if (spec.coordinatorDefer && entry?.toolSearchable !== false) {
+    if (spec.coordinatorDefer && entry?.toolSearchable !== false && !SEAT_IMMEDIATE_SEARCH_TOOLS.has(spec.name)) {
       const name = entry?.displayName ?? spec.name;
       if (!seen.has(name)) deferred.push({ name, summary: entry?.promptSummary ?? synthesiseFallbackSummary(spec) });
       seen.add(name);

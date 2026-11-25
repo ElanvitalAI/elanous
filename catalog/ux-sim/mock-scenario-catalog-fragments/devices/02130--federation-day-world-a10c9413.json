@@ -1,0 +1,26 @@
+{
+  "id": "federation-day-world",
+  "name": "Federation day world (long-turn OP ⊕ sub-coordinators ⊕ stewards ⊕ mail · arms A before #40092 · B after · C +#40096 · D retunes)",
+  "audience": "internal",
+  "implementation": [
+    "src/ux-sim/federation-day-world.ts"
+  ],
+  "tests": [
+    "src/ux-sim/federation-day-world.test.ts"
+  ],
+  "target": "one compressed federation day (27 seats · ranked board · 11-25 ledger mail shape) that measures which wake / pacing / dedup / back-pressure devices turn excessive once seat turns run long, per coordinator (OP · TC/UX/MK · JUD/RES/REL)",
+  "inputs": [
+    "seed ⊕ arm (FLAGS) ⊕ Scenario switches (crown steers · demo push · flood burst · P0 incident · rail migration · dead hand · repeating hand · delegated results)"
+  ],
+  "observations": [
+    "real createInternalTurnGate pacing, decideGoalDrive, classifySeatMail/midTurnMailAction, isUrgentPost/backpressureVerdict, shouldAutoCompact",
+    "real streamLLMWithTools same-args dedup on a scripted 30-round OP check turn (runDedupCase)",
+    "coverage four (idle-with-work · OP inbound/h · mail-opened turns · landed/h) ⊕ H1–H8 ⊕ per-coordinator turn/drive/pacing/dedup/✋/card/readiness rows"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/federation-day-world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

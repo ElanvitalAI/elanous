@@ -279,7 +279,7 @@ describe('bootDashboardAcpSession — getter injection (fresh reads)', () => {
         data: record.data,
       }),
     });
-    const names = ['Read', 'Grep', 'Glob', 'ListDir', 'Edit', 'Write', 'SelfImplement', 'ToolSearch'];
+    const names = ['Glob', 'Grep', 'Read', 'ListDir', 'Edit', 'Write', 'SelfImplement', 'ToolSearch'];
 
     try {
       await bootDashboardAcpSession(makeMinimalDeps({

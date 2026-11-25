@@ -44,7 +44,7 @@ function cli(dir: string, openStore: () => MsgStore) {
     wake: async (address, msgId) => ({ wake: 'none', source: 'unresolved', address, msgId, result: 'skipped-test-universe' }),
     postOfficeStateRoot: dir,
   });
-  return { stdout, stderr, exits, run: (...args: string[]) => program.parseAsync(['msg', 'post', ...args], { from: 'user' }) };
+  return { stdout, stderr, exits, run: (...args: string[]) => program.parseAsync(['msg', 'post', '--kind', 'info', ...args], { from: 'user' }) };
 }
 
 /** A real store whose close() fails the way a busy ledger does — after the write already committed. */
@@ -62,7 +62,7 @@ test('a lock that hits after the commit is reported as success with the stored i
   await c.run('--from', 'JUD', '--to', 'OP', '--body', 'report that quotes «database is locked»');
   expect(c.exits).toEqual([]);
   expect(c.stdout).toHaveLength(1);
-  expect(c.stdout[0]).toMatch(/^#1 \S+ JUD → OP · 41 bytes$/);
+  expect(c.stdout[0]).toMatch(/^#1 \S+ JUD → OP \S*\[info\] · 41 bytes$/);
   expect(rows(path)).toEqual([{ id: 1, recipient: 'OP', body: 'report that quotes «database is locked»' }]);
 });
 
@@ -83,7 +83,7 @@ test('a retried identical post returns the stored id, flagged deduped — no new
   await c.run('--from', 'JUD', '--to', 'OP', '--body', '13:02 report');
   await c.run('--from', 'JUD', '--to', 'OP', '--body', '13:02 report', '--json');
   expect(c.exits).toEqual([]);
-  expect(c.stdout[1]).toMatch(/^#1 \S+ JUD → OP · 12 bytes · deduped: already stored within the dedupe window/);
+  expect(c.stdout[1]).toMatch(/^#1 \S+ JUD → OP \S*\[info\] · 12 bytes · deduped: already stored within the dedupe window/);
   expect(JSON.parse(c.stdout[2]!)).toMatchObject({ id: 1, deduped: true });
   expect(rows(path).map(row => row.id)).toEqual([1]);
   await c.run('--from', 'JUD', '--to', 'OP', '--body', '13:02 report', '--no-dedupe');
@@ -257,9 +257,9 @@ test('r2 MF2: a TA follow-up failure after the commit is a warning with the stor
     postOfficeStateRoot: dir,
     readCard: () => ({ id: 'ta-20261118-abc123', status: 'launched' as const, runId: 'run-1', text: 't', createdAt: '2026-11-18T00:00:00.000Z', history: [] }),
   });
-  await program.parseAsync(['msg', 'post', '--from', 'OP', '--to', 'TA', '--body', 'status ta-20261118-abc123'], { from: 'user' });
+  await program.parseAsync(['msg', 'post', '--from', 'OP', '--to', 'TA', '--kind', 'request', '--body', 'status ta-20261118-abc123'], { from: 'user' });
   expect(exits).toEqual([]);
-  expect(stdout[0]).toMatch(/^#1 \S+ OP → TA · 25 bytes$/);
+  expect(stdout[0]).toMatch(/^#1 \S+ OP → TA \S*\[request\] · 25 bytes$/);
   expect(stderr).toContain('msg post: #1 stored; the TA follow-up failed: ledger reopen failed (do not resend — it would be a second message; the request is #1)');
   expect(rows(path).map(row => row.body)).toEqual(['status ta-20261118-abc123']);
 });
@@ -294,7 +294,7 @@ test('r2 MF3: a commit identified by its attempt token + a lock after it → suc
   const c = cli(dir, () => new ThrowAfterCommitStore(path));
   await c.run('--from', 'JUD', '--to', 'OP', '--body', 'landed then locked', '--no-dedupe');
   expect(c.exits).toEqual([]);
-  expect(c.stdout[0]).toMatch(/^#1 \S+ JUD → OP · 18 bytes$/);
+  expect(c.stdout[0]).toMatch(/^#1 \S+ JUD → OP \S*\[info\] · 18 bytes$/);
   expect(rows(path).map(row => row.body)).toEqual(['landed then locked']);
 });
 
@@ -333,7 +333,7 @@ test('r2 MF4: --origin-key + a lock after the commit → recovered by the key, s
   const c = cli(dir, () => new KeyedThrowAfterCommitStore(path));
   await c.run('--from', 'OP', '--to', 'MK', '--body', 'keyed then locked', '--origin-key', 'coord:43:MK');
   expect(c.exits).toEqual([]);
-  expect(c.stdout[0]).toMatch(/^#1 \S+ OP → MK · 17 bytes$/);
+  expect(c.stdout[0]).toMatch(/^#1 \S+ OP → MK \S*\[info\] · 17 bytes$/);
   expect(rows(path).map(row => row.body)).toEqual(['keyed then locked']);
 });
 
@@ -396,7 +396,7 @@ test('SEAT-MAIL #16: no origin-key, same body twice → 1 row, counter 2 on the 
   } finally { db.close(); }
   const store = new MsgStore(path);
   try {
-    const third = store.post({ from: 'JUD', to: 'OP', body: 'gate 🟢 +0' }, { dedupe: true });
+    const third = store.post({ from: 'JUD', to: 'OP', body: 'gate 🟢 +0', kind: 'info', needsAck: false }, { dedupe: true });
     expect([third.id, third.deduped, third.repeatCount]).toEqual([1, true, 3]);
     expect(third.repeatReason).toBe('repeat of #1 (×3 · same sender/body/evidence sha/meta within 30 min · no new row)');
   } finally { store.close(); }

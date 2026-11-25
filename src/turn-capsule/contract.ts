@@ -132,6 +132,51 @@ export interface TurnDoor {
 // ── Capsule policy (lane A · CAPSULE-A1) ──────────────────────────────────────────────────────────────────
 /** Longest a capsule may hold the main turn synchronously before it is detached. 출처: CEO principle 11-18 18:1x («짧은 상한 · 예 10초»). */
 export const CAPSULE_SYNC_CAP_MS = 10_000;
+/**
+ * RUNSHELL-BG-ENDS-TURN (0.3.37 P1) — a shell call (RunShell · Bash) holds the turn this long before it detaches.
+ * 출처: codex keeps the turn while a command runs; Claude Code waits up to a timeout — 10s cut seat `eln` bundles,
+ * focused tests and pregate mid-answer (opus «shell only» 8/12 runs ended early). Tuned by `turn.shellSyncCapMs`.
+ */
+export const SHELL_SYNC_CAP_MS = 60_000;
+
+/**
+ * RUNSHELL-BG-ENDS-TURN ② — the repo's known long runners start in the background (completion wake armed) instead of
+ * holding the turn for the cap first. Matched on the argv's executable + subcommand, never on prose.
+ * 출처: 대표 safeguard (OP 11-25) — pregate, `els update-all`, rail scripts, `bun run test:deterministic` (unambiguous runners only).
+ */
+export const KNOWN_LONG_SHELL_RUNNERS: readonly { readonly label: string; readonly match: (argv: readonly string[]) => boolean }[] = [
+  { label: 'bun run test:deterministic', match: (a) => a[0] === 'bun' && a[1] === 'run' && a[2] === 'test:deterministic' },
+  // Plain `bun test` / `bun run test` are not listed (Terra r3): whether a run is full or focused depends on its
+  // arguments, so they take the 60 s wait → background + wake like any other command.
+  { label: 'pregate', match: (a) => /^python3?$/.test(a[0] ?? '') && baseName(a[1]) === 'pregate.py' },
+  { label: 'els update-all', match: (a) => a[0] === 'els' && a[1] === 'update-all' },
+  { label: 'rail script', match: (a) => isRailScript(a[0]) || ((a[0] === 'bash' || a[0] === 'sh' || a[0] === 'zsh') && isRailScript(a[1])) },
+];
+
+function baseName(path: string | undefined): string { return (path ?? '').split('/').pop() ?? ''; }
+function isRailScript(path: string | undefined): boolean { const b = baseName(path); return b.startsWith('rail-') && b.endsWith('.sh'); }
+
+/** argv of a shell call: RunShell's array as is; a Bash string split on whitespace (leading `VAR=x` and `timeout N`
+ *  wrappers skipped). Only the leading words matter, so quoting inside later arguments never changes the verdict. */
+export function shellArgvOf(command: string | readonly string[]): readonly string[] {
+  const words = typeof command === 'string' ? command.trim().split(/\s+/).filter(Boolean) : [...command];
+  let i = 0;
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!)) i++;
+  if (words[i] === 'timeout' && /^\d+[smh]?$/.test(words[i + 1] ?? '')) i += 2;
+  return words.slice(i).map((word, n) => (n === 0 ? baseName(word) || word : word));
+}
+
+/** The known-long runner this command is, or null. */
+export function knownLongShellRunner(command: string | readonly string[]): string | null {
+  const argv = shellArgvOf(command);
+  return KNOWN_LONG_SHELL_RUNNERS.find((runner) => runner.match(argv))?.label ?? null;
+}
+
+/** RUNSHELL-BG-ENDS-TURN — an A2 shell capsule id (`shell-<b36>-<n>`): its started result promised the turn a wake on
+ *  completion. `shell:<handle>` (explicit `mode:'bg'`) and other kinds stay passive results. */
+export function isPromisedWakeCapsule(event: { readonly kind: string; readonly capsuleId: string }): boolean {
+  return event.kind === 'shell' && /^shell-[0-9a-z]+-\d+$/.test(event.capsuleId);
+}
 
 export interface CapsuleDecisionInput {
   readonly tool: string;

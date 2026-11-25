@@ -289,33 +289,30 @@ export function createToolLoader(blinkIntervalMs = 500) {
 // 6. MARKDOWN RENDERER — Terminal markdown (from utils/markdown.ts)
 // ═══════════════════════════════════════════════════════════
 
-/** Visible width accounting for CJK and ANSI codes */
+/** Visible width — the same cell count the TUI log view wraps by (Bun.stringWidth: CJK, emoji, VS16, ANSI).
+ *  DEMO-ENGLISH-TABLE: a hand-rolled CJK-only count put emoji (🌐 ⭐ ⚡) at 1 cell and broke every border to its right. */
 function visibleWidth(str: string): number {
-  // Strip ANSI
   const clean = str.replace(/\x1b\[[0-9;]*m/g, '');
-  let w = 0;
-  for (const ch of clean) {
-    const cp = ch.codePointAt(0)!;
-    // CJK ranges
-    if (
-      (cp >= 0x1100 && cp <= 0x115F) ||
-      (cp >= 0x2E80 && cp <= 0x303E) ||
-      (cp >= 0x3040 && cp <= 0x33BF) ||
-      (cp >= 0x3400 && cp <= 0x4DBF) ||
-      (cp >= 0x4E00 && cp <= 0xA4CF) ||
-      (cp >= 0xAC00 && cp <= 0xD7A3) ||
-      (cp >= 0xF900 && cp <= 0xFAFF) ||
-      (cp >= 0xFE30 && cp <= 0xFE6F) ||
-      (cp >= 0xFF01 && cp <= 0xFF60) ||
-      (cp >= 0xFFE0 && cp <= 0xFFE6) ||
-      (cp >= 0x20000 && cp <= 0x2FA1F)
-    ) {
-      w += 2;
-    } else {
-      w += 1;
+  return Bun.stringWidth(clean);
+}
+
+const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/** Cut `str` to at most `max` cells, keeping ANSI styles, ending in «…» when anything was cut. */
+function truncateCells(str: string, max: number): string {
+  if (visibleWidth(str) <= max) return str;
+  let out = '';
+  let used = 0;
+  for (const part of str.split(/(\x1b\[[0-9;]*m)/)) {
+    if (part.startsWith('\x1b[')) { out += part; continue; }
+    for (const { segment } of graphemes.segment(part)) {
+      const w = Bun.stringWidth(segment);
+      if (used + w > max - 1) return `${out}\x1b[0m…`;
+      out += segment;
+      used += w;
     }
   }
-  return w;
+  return out;
 }
 
 /** Pad string to target width accounting for ANSI codes */
@@ -356,6 +353,8 @@ function padAligned(content: string, displayWidth: number, targetWidth: number, 
 export function renderTable(headers: string[], rows: string[][], opts?: {
   align?: (string | null)[];
   headerStyle?: (s: string) => string;
+  /** Terminal columns the whole table must fit in; the widest columns give way and their cells end in «…». */
+  maxWidth?: number;
 }): string {
   const headerStyle = opts?.headerStyle ?? chalk.bold;
 
@@ -367,6 +366,18 @@ export function renderTable(headers: string[], rows: string[][], opts?: {
     }
     return Math.max(max, 3);
   });
+  // A table wider than the terminal wraps mid-row and every border breaks — shrink the widest column until it fits
+  // (frame = 1 + 3 per column: «│ » … « │ » … « │»).
+  if (opts?.maxWidth !== undefined) {
+    const budget = opts.maxWidth - (1 + 3 * colWidths.length);
+    while (colWidths.reduce((sum, w) => sum + w, 0) > budget) {
+      const widest = colWidths.indexOf(Math.max(...colWidths));
+      if (colWidths[widest]! <= 3) break;
+      colWidths[widest] = colWidths[widest]! - 1;
+    }
+    headers = headers.map((h, i) => truncateCells(h, colWidths[i]!));
+    rows = rows.map((row) => row.map((cell, i) => truncateCells(cell, colWidths[i] ?? 3)));
+  }
 
   // Build a horizontal border using the supplied corner/junction chars.
   // Each segment spans `colWidth + 2` (1-cell gutter on each side of
@@ -413,7 +424,7 @@ export function renderTable(headers: string[], rows: string[][], opts?: {
  * Simple markdown-to-ANSI converter.
  * Handles: **bold**, *italic*, `code`, headings, lists, blockquotes, tables.
  */
-export function renderMarkdown(text: string): string {
+export function renderMarkdown(text: string, opts?: { readonly columns?: number }): string {
   const lines = text.split('\n');
   const result: string[] = [];
   let codeFenceWidth = 0;
@@ -493,7 +504,7 @@ export function renderMarkdown(text: string): string {
         i++;
         tableLines.push(lines[i]!.trimStart());
       }
-      result.push(parseAndRenderTable(tableLines));
+      result.push(parseAndRenderTable(tableLines, opts?.columns));
       continue;
     }
 
@@ -557,7 +568,7 @@ function applyInlineStyles(text: string): string {
 }
 
 /** Parse markdown table lines and render */
-function parseAndRenderTable(lines: string[]): string {
+function parseAndRenderTable(lines: string[], maxWidth?: number): string {
   const parseRow = (line: string) =>
     line.split('|').slice(1, -1).map(cell => cell.trim());
 
@@ -579,7 +590,7 @@ function parseAndRenderTable(lines: string[]): string {
   return renderTable(
     headers.map(h => applyInlineStyles(h)),
     rows.map(r => r.map(c => applyInlineStyles(c))),
-    { align },
+    { align, ...(maxWidth !== undefined ? { maxWidth } : {}) },
   );
 }
 

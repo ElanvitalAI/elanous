@@ -1,0 +1,54 @@
+graph_id: op-pulse
+version: 1
+loop:
+  title: OP structural pulse
+  root: 조율자
+  managed_by: trigger-registry
+  description: >-
+    Replaces OP's pinned standing goal («씨앗 두 문서»). The phase (build · pre-cut · release-window · post-release ·
+    demo-freeze · night · burst) picks a rhythm row from op-pulse.rhythm.yaml (cadence · targets · levers · beat).
+    Fires when the phase changes (at once), when the phase cadence elapsed, or when a CEO crown line carries urgency
+    urgent/all-in. The measure step (no LLM) writes the pulse table and routes: a gap, a phase change or a burst entry →
+    ONE internal OP turn (origin pulse, via the pulse inbox — not a mail, not a wake); all green → one heartbeat line,
+    no turn. Done-when = the pulse ledger has the window's goal line (all green, or beat mails verified by
+    `eln pulse verify`). Shadow until two goal-verified fires; the legacy path is the pinned standing goal (marker).
+  owner: OP
+  trigger:
+    condition:
+      predicate: { kind: pulse-due, rhythm: op-pulse.rhythm.yaml } # relative = beside this graph (graphs/triggers/)
+      # The phase cadence (15–90 min) owns the spacing; the cooldown only damps a flapping phase edge.
+      cooldown_min: 5
+      max_wait_min: 70
+      on_max_wait: fire
+  goal:
+    kind: ledger-line
+    path: '{stateRoot}/loops/op-pulse.jsonl'
+    contains: '"goal":"met","window":"{window}"'
+  failure:
+    goal_deadline_min: 20
+    max_attempts: 2
+    backoff_sec: [300]
+  legacy:
+    # The pinned «상시 목표» (seed docs) — OP clears it after cutover: eln seat goal-done OP '씨앗 두 문서' --from CLAUDE-OP --reason 'op-pulse live'.
+    kind: marker
+    path: '{seatState}/OP/tools/.graph-cutover/op-pulse'
+  cutover_after: 1 # registry minimum; immediate live = `eln loop trigger promote op-pulse` (separate PR)
+entry_node: measure
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: measure
+    kind: agent
+    recipe: 'cmd:trigger-pulse-measure'
+    max_visits: 1
+    input:
+      rhythm: op-pulse.rhythm.yaml
+  - node_id: turn
+    kind: agent
+    recipe: 'cmd:trigger-pulse-turn'
+    max_visits: 1
+    input: {}
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: measure, on: outcome, map: { turn: turn, green: done, fail: failed, error: failed } }
+  - { from: turn, on: outcome, map: { ok: done, fail: failed, error: failed } }

@@ -15,7 +15,8 @@ async function defaultWriteJson(text: string): Promise<void> {
   await writeStdoutJson(text);
 }
 
-export function parseEvidenceFlags(opts: { pr?: string; checklist?: string; measured?: string; unit?: string }): unknown {
+export function parseEvidenceFlags(opts: { pr?: string; checklist?: string; measured?: string; unit?: string; answeredBy?: string; done?: string }): unknown {
+  if (opts.answeredBy !== undefined || opts.done !== undefined) return { kind: 'answered', ...(opts.answeredBy ? { replyTurnId: opts.answeredBy } : {}), ...(opts.done ? { done: opts.done } : {}) };
   if (opts.pr !== undefined) return { kind: 'pr', number: Number(opts.pr.replace(/^#/, '')) };
   if (opts.checklist !== undefined) {
     const at = opts.checklist.lastIndexOf(':');
@@ -58,6 +59,8 @@ export function registerMsgRequirementCommands(msg: Command, deps: MsgRequiremen
   req.command('close <id>').option('--seat <seat>', 'seat', 'OP')
     .option('--pr <number>', 'PR number').option('--checklist <cell:status>', 'checklist cell and status (green|done)')
     .option('--measured <metric=value>', 'measured number').option('--unit <unit>')
+    .option('--answered-by <turnId>', 'a person\'s line with no cell/PR/metric: the reply turn that addressed it')
+    .option('--done <line>', 'a person\'s line with no cell/PR/metric: one line saying what was done')
     .option('--superseded-by <newer-id>', 'close this CEO item as superseded by a newer CEO item')
     .option('--supersedes <older-ids...>', 'after closing this CEO item, mark older CEO items it replaces as superseded')
     .action(run('close', async (id: string, opts: { seat: string; pr?: string; checklist?: string; measured?: string; unit?: string; supersededBy?: string; supersedes?: string[] }) => {

@@ -235,7 +235,7 @@ test('first-run setup uses one consent and does not prompt for starter topics', 
       out: { log: (line) => output.push(line) }, setExitCode: () => {}, runDoctorFix: async () => { fixes += 1; return 0; },
     });
     await program.parseAsync(['node', 'elanous', 'setup']);
-    expect(prompts).toEqual(['첫 설정을 적용할까요? [y/N] ']);
+    expect(prompts).toEqual(['Apply first-time setup? [y/N] ']);
     expect(output.filter(line => line.startsWith('First setup '))).toHaveLength(1);
     expect(fixes).toBe(1);
     expect(cfg.starter?.topics).toBeUndefined();
@@ -259,7 +259,7 @@ test('first-run acceptance does not ask a second question for starter topics', a
       out: { log: () => {} }, setExitCode: () => {}, runDoctorFix: async () => { fixes += 1; return 0; },
     });
     await program.parseAsync(['node', 'elanous', 'setup']);
-    expect(prompts).toEqual(['첫 설정을 적용할까요? [y/N] ']);
+    expect(prompts).toEqual(['Apply first-time setup? [y/N] ']);
     expect(fixes).toBe(1);
     expect(listSources({ seat: 'user' }, root)).toEqual([]);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -406,19 +406,20 @@ describe('setup CLI', () => {
 
   test('first-run setup has one consent, is a no-op on decline, and prints one outcome even when a write or doctor fails', async () => {
     const declined = await runSetup({ firstRunTopics: true, nonInteractive: false, stdinTty: true, answer: 'n' });
-    expect(declined.prompts).toEqual(['첫 설정을 적용할까요? [y/N] ']);
+    expect(declined.prompts).toEqual(['Apply first-time setup? [y/N] ']);
     expect(declined.writes).toEqual([]);
     expect(declined.doctorFixCalls).toEqual([]);
     expect(declined.output).toHaveLength(1);
 
     const accepted = await runSetup({ firstRunTopics: true, nonInteractive: false, stdinTty: true, answer: 'y' });
-    expect(accepted.prompts).toEqual(['첫 설정을 적용할까요? [y/N] ']);
+    expect(accepted.prompts).toEqual(['Apply first-time setup? [y/N] ']);
     expect(accepted.writes).toHaveLength(1);
     expect(accepted.doctorFixCalls).toEqual([['doctor', '--fix', '--yes']]);
     expect(accepted.output.filter(line => line.startsWith('First setup '))).toHaveLength(1);
 
     const fixFailed = await runSetup({ firstRunTopics: true, nonInteractive: false, stdinTty: true, answer: 'y', doctorFixThrows: true });
-    expect(fixFailed.output).toHaveLength(1);
+    expect(fixFailed.output.filter(line => line !== 'Applying recommended setup (permissions, PATH, services)… this can take up to a minute.')).toHaveLength(1);
+    expect(fixFailed.output[0]).toBe('Applying recommended setup (permissions, PATH, services)… this can take up to a minute.');
     expect(fixFailed.exitCodes).toEqual([1]);
 
     const saveFailed = await runSetup({ firstRunTopics: true, nonInteractive: false, stdinTty: true, answer: 'y', providerWriteThrows: true });
@@ -554,7 +555,7 @@ describe('setup CLI', () => {
     expect(result.writes).toEqual([]);
     expect(result.output).toEqual([]);
     expect(result.exitCodes).toEqual([1]);
-    expect(result.errors).toEqual(['대화형 온보딩은 stdin TTY가 있는 자리에서만 실행할 수 있다. 무인 설정은 `elanous setup --non-interactive`를 사용하라.']);
+    expect(result.errors).toEqual(['Interactive setup needs a terminal (stdin TTY). Unattended: `elanous setup --yes` to apply, or `elanous setup --non-interactive` to report only.']);
     expect(result.errors.join('\\n')).not.toContain('at ');
   });
 
@@ -586,7 +587,7 @@ describe('setup CLI', () => {
     expect(result.text).not.toContain('묶음 1/1:');
     expect(result.writes).toEqual([]);
     expect(result.doctorFixCalls).toEqual([['doctor', '--fix', '--yes']]);
-    expect(result.prompts).toEqual(['첫 설정을 적용할까요? [y/N] ']);
+    expect(result.prompts).toEqual(['Apply first-time setup? [y/N] ']);
     expect(result.exitCodes).toEqual([0]);
   });
 

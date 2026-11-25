@@ -1,0 +1,76 @@
+# Command recipes for trigger-registry graphs (src/loops/trigger-registry.ts · SCHEDULER-TO-GRAPH-RUNNER).
+trigger-wake:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/trigger-nodes.ts" wake'
+  timeout_ms: 60000 # One msg post (or one shadow receipt) — a stuck post must not hold the tick.
+trigger-idle-probe:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/trigger-nodes.ts" idle-probe'
+  timeout_ms: 30000 # A few stat() calls and one ledger append.
+trigger-pulse-measure:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/trigger-nodes.ts" pulse-measure'
+  timeout_ms: 120000 # One git fetch + ledger reads + unified usage (each probe fails open).
+trigger-pulse-turn:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/trigger-nodes.ts" pulse-turn'
+  timeout_ms: 30000 # One inbox file write (or one shadow receipt).
+trigger-retro-draft:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/trigger-nodes.ts" retro-draft'
+  timeout_ms: 600000 # Up to four measure commands (each ≤150 s) and one file append.
+trigger-watchers-check:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/trigger-nodes.ts" watchers-check'
+  timeout_ms: 60000 # One ledger read, one msg-store max id, at most one card post.
+# RES burst pool (src/res-graphs/res-nodes.ts · RES-READY-POOL-RESERVATION). Machines only via $ELANOUS_RES_ACTUATOR.
+res-ready-pick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" ready-pick'
+  timeout_ms: 30000 # Reads ready/lease files, writes one lease row.
+res-step-start:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" step:start'
+  timeout_ms: 660000 # cloud-vm.sh start waits for the instance state.
+res-step-sanitize:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" step:sanitize'
+  timeout_ms: 360000 # ssh late boot ≤ 5 min + cleanup.
+res-step-catchup:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" step:catchup'
+  timeout_ms: 1960000 # rail-catchup: ssh wait 5 min + rail ≤ 25 min.
+res-step-auth:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" step:auth'
+  timeout_ms: 360000 # One codex mirror push.
+res-step-smoke:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" step:smoke'
+  timeout_ms: 2760000 # One light pregate.
+res-ready-mark:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" ready-mark'
+  timeout_ms: 60000 # ready.json + board (+ optional image request).
+res-run-fail:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" run-fail'
+  timeout_ms: 660000 # Marks failed and stops the host it started.
+res-run-stop:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" run-stop'
+  timeout_ms: 660000 # cloud-vm.sh stop + receipt.
+res-lease-route:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" lease-route'
+  timeout_ms: 30000 # Reads leases.json.
+res-lease-start:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" lease-start'
+  timeout_ms: 660000 # cloud-vm.sh start + permit.
+res-lease-register:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" lease-register'
+  timeout_ms: 30000 # burst-hosts.json row.
+res-lease-drain:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" lease-drain'
+  timeout_ms: 90000 # Unregister + one inflight probe.
+res-reservation-sync:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" reservation-sync'
+  timeout_ms: 30000 # Reads release graph state, writes reservation.json.
+res-window-done:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" window-done'
+  timeout_ms: 30000 # One goal ledger line.
+# BOARD-STEWARD (src/steward/board · steward:BOARD · OP-direct). One federation board: rank · cut list · health · cards.
+board-steward-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/board/nodes.ts"'
+  timeout_ms: 90000 # Checklist read + els panes + one gh release view (each fails open).
+space-advisor-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/space/advisor-node.ts"'
+  timeout_ms: 90000 # One gh pr list + git log/worktree (writer-check ports, each 20 s bounded) + msg ledger writes.
+# RELEASE-TRAFFIC (src/res-graphs/release-traffic.ts · SCHEDULER-TO-GRAPH-RUNNER). Converges pregate slots to the release phase.
+release-traffic-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/release-traffic.ts"'
+  timeout_ms: 1900000 # A few config get/set + one ssh probe; update-all after publish can take ≤30 min.

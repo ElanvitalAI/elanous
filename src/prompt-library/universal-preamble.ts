@@ -19,6 +19,7 @@
 // sandbox, conciseness, impl-discipline) move here as they're verified
 // surface-agnostic.
 
+import { leaderCard } from './leader-card.js';
 import { execFileSync } from 'node:child_process';
 import { closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -211,7 +212,7 @@ Act, don't ask (within policy)
 
 Waiting without polling
 - A pending, running, or unchanged result is not completion and not a reason to idle. While you wait, do the useful authorized work that does not depend on it.
-- When nothing independent is left, close the turn with one line "next check HH:MM — <what>". Rely on the completion notice or the scheduled wake. Do not re-run the same status query in the same turn.
+- Keep working in this turn while a next step you can take now remains. End the turn only at the done criterion or a real blocker (another seat, an external result, a human decision); only then close with one line "waiting on <what> · next check HH:MM". Rely on the completion notice or the scheduled wake. Do not re-run the same status query in the same turn.
 
 Inbox
 - When woken by mail, read the whole unread inbox in one call, triage it (act now / delegate / info-only), handle every actionable item in this turn, and bulk-ack the info-only ones. Never one mail per turn.
@@ -283,6 +284,8 @@ export interface UniversalPreambleContext {
   /** SEAT-COORDINATOR-PROMPT-PROFILE — 호출부가 자리 원장(`seat/seat-role.ts`)으로 정한 자리 성격.
    *  `coordinator` 면 트리·코딩 lifecycle·GPT-6 persist/허락 덧말 대신 조율자 프로필을 싣는다. 생략·`hand` = 종전 그대로. */
   seatRole?: SeatRole;
+  /** SEAT-TURN-FOLLOWUPS Q10 — a space lead or kingdom seat (seat/seat-leadership.ts): the leader card replaces the hand coding profile. */
+  seatLeader?: import('../seat/seat-leadership.js').SeatLeadership | null;
   /** ELN-PROMPT-CACHE-PIN — the caller builds this preamble ONCE per session and reuses the same bytes every turn
    *  (repl / Next TUI path). Then (a) the per-turn «my els location» block is left out here — the caller sends it in
    *  the turn's volatile context instead — and (b) the anchor header says local-file edits load next session. */
@@ -1173,11 +1176,32 @@ export function loadProjectAnchor(cwd: string): ProjectAnchorResult {
  *  ];
  *  ```
  */
+/**
+ * DEMO-FANOUT-LIVE-OP-SEAT: a worker tab — a pane another agent opened through ElsControl (els sets the parent pane, the
+ * parent's seat and this worker's own mail id). Without this the worker saw «no seat identity» and left its result on
+ * screen instead of mailing it back. Empty outside a worker tab.
+ */
+export function buildWorkerTabAddendum(env: Readonly<Record<string, string | undefined>> = process.env): LLMMessage[] {
+  const parentPane = env.ELANOUS_ELS_PARENT_PANE?.trim();
+  const workerId = env.ELANOUS_ELS_WORKER_ID?.trim();
+  if (!parentPane || !workerId) return [];
+  const parentSeat = env.ELANOUS_ELS_PARENT_SEAT?.trim();
+  return [{ role: 'system', content: [
+    '## Worker tab',
+    `You run in a worker tab that ${parentSeat ? `${parentSeat} (pane ${parentPane})` : `pane ${parentPane}`} opened to hand you one task. You are not a seat.`,
+    `Your own mail identity is ${workerId} — using it is not impersonation.`,
+    parentSeat
+      ? `When the task is done, send the result with MsgPost from="${workerId}" to="${parentSeat}" (sources included), then stop.`
+      : 'When the task is done, leave the result as your final answer in this tab, then stop.',
+  ].join('\n') }];
+}
+
 export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessage[] {
   const out: LLMMessage[] = [];
   // ★ 자기인지 공간 프레임(2026-07-21) — 격리 하니스 공간 안이면 최상단에 실행-맥락 자기인지를 심는다
   //   (프로젝트 앵커보다 먼저 = "너는 격리 샌드박스의 elanous"라는 정체성이 나머지를 프레이밍). 공간 밖=무주입.
   out.push(...buildHarnessSpaceAddendum());
+  out.push(...buildWorkerTabAddendum());
   // Keep the runtime path cached while loadProjectAnchorWithMeta remains the test/debug reader.
   const result = loadProjectAnchor(ctx.cwd);
   if (result.content) {
@@ -1238,11 +1262,13 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
   // Keep the established message order/count for callers that splice this
   // preamble into a larger conversation; Environment is its own section.
   const environment = environmentContext(ctx.cwd);
-  out.push(...(coordinator ? buildCoordinatorProfileAddendum() : buildCodingLifecycleAddendum()).map(message => ({
+  const leader = !coordinator && ctx.seatLeader ? ctx.seatLeader : null;
+  out.push(...(coordinator ? buildCoordinatorProfileAddendum()
+    : leader ? [{ role: 'system' as const, content: leaderCard(leader) }] : buildCodingLifecycleAddendum()).map(message => ({
     ...message,
     content: `${String(message.content)}\n\n${environment}`,
   })));
-  if (ctx.seatRole) out.push({ role: 'system', content: SEAT_OPERATING_CONTRACT });
+  if (ctx.seatRole || leader) out.push({ role: 'system', content: SEAT_OPERATING_CONTRACT });
   // Family-specific behavioral addendums. Append after the anchor +
   // lifecycle so the model sees project context first, then the generic
   // pipeline shape, then per-family discipline.

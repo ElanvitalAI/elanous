@@ -73,7 +73,7 @@ const c4Agent: SimWorldScenario = {
           ELANOUS_TEST_FAKE_LLM_DELAY_MS: REALTIME ? '0' : String(AGENT_HOLD_MS),
           ELANOUS_TEST_FAKE_LLM_DELAY_WHEN: 'slow-child',
           ELANOUS_TEST_FAKE_LLM_TOOL_CALL: JSON.stringify([
-            { when: 'c4-parent', name: 'Agent', args: { description: 'c4 worker', prompt: 'slow-child task', max_turns: REALTIME ? 5 : 1 } },
+            { when: 'c4-parent', name: 'Agent', args: { description: 'c4 worker', prompt: 'slow-child task', reason: 'c4 fixture', max_turns: REALTIME ? 5 : 1 } },
             ...(REALTIME ? [{ when: 'slow-child task', calls: [1, 2, 3].map(segment => ({
               name: 'Bash', args: { command: `${segment === 1 ? `: > '${workStartedMarker}'; ` : ''}printf '%s' "$$" > '${workPid}'; for tick in 1 2 3 4; do sleep ${AGENT_SEGMENT_SECONDS / 4}; printf 'C4_WORK_PROGRESS_%s\\n' "$tick"; done; echo ${segment} >> '${workMarker}'${segment === 3 ? `; : > '${workEndedMarker}'` : ''}`, timeout: 500_000 },
             })) }] : []),

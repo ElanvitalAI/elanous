@@ -2,10 +2,14 @@
  * ELN-EXTERNAL-EVENTS-BETWEEN-TURNS — one row per external event:
  * received, then injected, then handled. A miss is a received row that
  * never reaches handled. The count is the number the seat can report.
- * Append-only. A full book refuses a new id instead of dropping an old one.
+ * Append-only. A full book first evicts its oldest HANDLED row (a finished event is no miss and no
+ * longer needs the book); only a book full of unhandled rows refuses a new id.
+ * (11-25 04:4x OP deaf: a long session hit 200 handled rows and every later notice was refused.)
  */
 
-export const EXTERNAL_EVENT_LEDGER_CAP = 200;
+/** SEAT-QUEUE-CAPACITY (CEO 11-25): 200 → 1000 rows (small id/timestamp rows · in-memory) — a full-day coordinator
+ *  session must not refuse events because of unhandled backlog. */
+export const EXTERNAL_EVENT_LEDGER_CAP = 1000;
 
 export type ExternalEventKind = 'mail' | 'wakeup' | 'child-exit' | 'graph-end';
 
@@ -57,6 +61,13 @@ export function createExternalEventLedger(cap = EXTERNAL_EVENT_LEDGER_CAP): Exte
       if (byId.has(input.id)) {
         refused += 1;
         return { ok: false, reason: 'duplicate' };
+      }
+      if (rows.length >= cap) {
+        const done = rows.findIndex((row) => row.handledAt !== null);
+        if (done >= 0) {
+          byId.delete(rows[done]!.id);
+          rows.splice(done, 1);
+        }
       }
       if (rows.length >= cap) {
         refused += 1;

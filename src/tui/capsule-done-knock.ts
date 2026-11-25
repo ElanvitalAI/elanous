@@ -13,12 +13,13 @@
 import type { CapsuleDoneEvent, CapsuleEvent } from '../turn-capsule/contract.js';
 import { emitTurnLife } from '../debug/turn-life.js';
 import { capsuleDoneNotice } from './core/notice-producers.js';
+import { isPromisedWakeCapsule } from '../turn-capsule/contract.js';
 
 export interface CapsuleDoneKnockDeps {
   readonly sessionId: string;
   readonly subscribe: (sessionId: string, listener: (event: CapsuleEvent) => void) => () => void;
-  /** Queues the notice; null = already queued (duplicate). */
-  readonly enqueue: (event: CapsuleDoneEvent) => unknown;
+  /** Queues the notice; null = already queued (duplicate). `wake` = the row is actionable at once (promised wake). */
+  readonly enqueue: (event: CapsuleDoneEvent, wake?: boolean) => unknown;
   readonly knock: () => void;
   /** SEAT-TURN-MIDTURN-MAIL 어댑터 — 턴 중 완료는 이벤트함에도 한 건(모두 지정해야 켠다). */
   readonly busy?: () => boolean;
@@ -31,9 +32,12 @@ export interface CapsuleDoneKnockDeps {
 export function wireCapsuleDoneKnock(deps: CapsuleDoneKnockDeps): () => void {
   return deps.subscribe(deps.sessionId, (event) => {
     if (event.type !== 'capsule-done') return;
-    const queued = deps.enqueue(event);
+    // RUNSHELL-BG-ENDS-TURN — an A2 shell detach told the model «will wake on completion»: that promise is kept here.
+    const promised = isPromisedWakeCapsule(event);
+    const queued = promised ? deps.enqueue(event, true) : deps.enqueue(event);
     emitTurnLife('turn-life:capsule-done-knock', {
       sessionId: deps.sessionId, capsuleId: event.capsuleId, kind: event.kind, status: event.status, queued: Boolean(queued),
+      ...(promised ? { promisedWake: true } : {}),
     });
     if (deps.busy?.() && deps.enqueueMidTurn !== undefined) {
       // OP #106762 ⓐ — 이벤트 문면 = 큐 노티스 문면(capsuleDoneNotice). 배수 시 원본 큐에서 그 노티스를 지운다.
@@ -44,6 +48,9 @@ export function wireCapsuleDoneKnock(deps: CapsuleDoneKnockDeps): () => void {
       );
     }
     // OPS-RULES token cost: result-only notifications wait for a person or another actual event turn.
-    // The task notification drain carries the result into that turn; this frame never opens one.
+    // The task notification drain carries the result into that turn; this frame never opens one —
+    // except a promised wake (RUNSHELL-BG-ENDS-TURN): an idle seat resumes now with the command's output.
+    // A busy turn keeps it (mid-turn box above, or the turn end's own door offer — the row is actionable).
+    if (promised && queued && !deps.busy?.()) deps.knock();
   });
 }

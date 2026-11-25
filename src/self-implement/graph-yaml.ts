@@ -35,6 +35,8 @@ export interface GraphV2Declaration {
 
 export interface GraphNodeContract {
   readonly inputs: readonly string[];
+  /** Label only — recorded and shown, never used to grant or strip tools. Capsule tools come from the
+   *  child tool catalog (search toolkit: src/agent/search-toolkit.ts), not from this string. */
   readonly tools: string;
   readonly outputs: readonly string[];
   /** Portable JSON Schema subset checked at the child call boundary. */

@@ -198,6 +198,34 @@ export function parseNextFlushTime(field: unknown, message: string): { at: numbe
   return { at: null, raw: null };
 }
 
+/** ZAI-OVERAGE-STOP-RETRY (11-25) — 이 오류는 «다시 보내도 같은가»(플랜·잔액 한도·플랜 불가). 속도 제한(1302/1305)·기타는 false
+ *  — 종전 재시도 정책을 그대로 탄다. 전송 층(fetchApiWithRetry)이 재시도 «전»에 묻는다. */
+export function zaiLimitStopsRetry(status: number, bodyText: string): boolean {
+  const cls = classifyZaiError(status, bodyText);
+  return cls !== null && (cls.kind === 'plan-limit' || cls.kind === 'balance-limit' || cls.kind === 'plan-unavailable');
+}
+
+/** 이 URL 이 Z.ai 코딩 엔드포인트(api.z.ai)인가 — 호스트만 본다. */
+export function isZaiCodingPlanUrl(url: string): boolean {
+  try { return new URL(url).hostname === 'api.z.ai'; } catch { return false; }
+}
+
+/** VISION-CATALOG-BUILTIN (11-25) — 코딩 엔드포인트의 비전 모델. glm-5.3 은 text-only(OpenRouter input_modalities 실측 11-25),
+ *  glm-5.3-flash 는 text+image+video. 이미지가 든 요청이 text-only 모델로 가면 비전 형제로 돌린다. */
+export const ZAI_VISION_MODEL = 'glm-5.3-flash';
+export const ZAI_OPENROUTER_VISION_FALLBACK_MODEL = 'openrouter/z-ai/glm-5.3-flash';
+
+function zaiMessagesCarryImages(messages: readonly LLMMessage[]): boolean {
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      if (b.type === 'image') return true;
+      if (b.type === 'tool_result' && Array.isArray(b.content) && b.content.some(c => c.type === 'image')) return true;
+    }
+  }
+  return false;
+}
+
 export type ZaiAction = 'call' | 'stop' | 'openrouter';
 
 /** 정책 결정표 — `pre` = 호출 전(기록된 한도가 아직 살아 있다) · `post` = 방금 서버가 한도 오류를 냈다.
@@ -538,7 +566,8 @@ export function makeZaiCodingPlanProvider(cfg: UCLLMConfig, deps: ZaiProviderDep
     info: { code: number; limitKind: ZaiLimitKind; resetAt: number | null; phase: 'pre' | 'post' },
   ): AsyncGenerator<LLMStreamEvent, void, unknown> {
     const or = await openRouter();
-    const orModel = openRouterModelFor(wireModel);
+    // 폴백 대상은 사양대로 하나(glm-5.3) — 단, 이미지가 든 요청만은 text-only 로 보내지 않고 비전 형제로(11-25).
+    const orModel = zaiMessagesCarryImages(messages) ? ZAI_OPENROUTER_VISION_FALLBACK_MODEL : openRouterModelFor(wireModel);
     debug.log('zai.coding-plan', 'fallback', {
       code: info.code, limitKind: info.limitKind, resetAt: info.resetAt, phase: info.phase,
       model: wireModel, to: orModel, policy: settings.overage, openRouterKey: or !== null,
@@ -554,7 +583,12 @@ export function makeZaiCodingPlanProvider(cfg: UCLLMConfig, deps: ZaiProviderDep
     defaultModel,
     available: () => zaiCodingPlanAvailable(deps),
     async *streamChat(messages, opts = {}) {
-      const wireModel = zaiWireModel(opts.model || defaultModel);
+      const requestedModel = zaiWireModel(opts.model || defaultModel);
+      // 이미지가 든 요청은 비전 모델로(glm-5.3 은 이미지를 못 본다) — 관측에 남긴다.
+      const wireModel = requestedModel !== ZAI_VISION_MODEL && zaiMessagesCarryImages(messages) ? ZAI_VISION_MODEL : requestedModel;
+      if (wireModel !== requestedModel) {
+        debug.log('zai.coding-plan', 'vision-reroute', { from: requestedModel, to: wireModel });
+      }
       // ⭐ 슬롯을 «먼저» 잡고 한도를 본다 — 기다리는 동안 앞선 호출이 429 를 적었으면 그 판단을 따른다.
       const release = await gate.acquire(opts.signal);
       const startedAt = now();

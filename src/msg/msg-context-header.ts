@@ -7,6 +7,7 @@
 
 // msg-store 를 값으로 싣지 않는다 — TUI 부트가 이 파일을 싣는 동안 bun:sqlite 를 끌어오지 않게(seat-mail-boot 의 지연 require 와 같은 결).
 import { legacyIntent } from './msg-receipts.js';
+import { ANNOUNCE_KIND, announceIdOf, announceNoticeRule } from './announce.js';
 import type { MessageOrigin } from './msg-store.js';
 
 export type MessageFromKind = 'human' | 'agent' | 'system' | 'tool';
@@ -24,6 +25,8 @@ export interface ContextHeaderInput {
   intent?: string | null;
   /** B1-A `crown_directive` column — only a verified directive id marks the header «crown» (§5c). */
   crownDirective?: string | null;
+  /** ANNOUNCE-UPTAKE — the announce id (ref `announce:<id>`) of a kind=announce mail. */
+  announceId?: string | null;
 }
 
 /**
@@ -40,6 +43,8 @@ export interface StructuredMessageFields {
   origin?: Pick<MessageOrigin, 'kind' | 'seat'>;
   intent?: string | null;
   crownDirective?: string | null;
+  kind?: string | null;
+  refs?: readonly string[];
 }
 
 /**
@@ -51,6 +56,7 @@ export function headerFieldsOf(message: StructuredMessageFields): Partial<Contex
     ...(message.origin === undefined ? {} : { fromKind: message.origin.kind, ...(message.origin.seat ? { fromSeat: message.origin.seat } : {}) }),
     ...(message.intent ? { intent: message.intent } : {}),
     ...(message.crownDirective ? { crownDirective: message.crownDirective } : {}),
+    ...(message.kind === ANNOUNCE_KIND && announceIdOf(message.refs) ? { announceId: announceIdOf(message.refs) } : {}),
   };
 }
 
@@ -63,9 +69,14 @@ export function modelContextHeader(input: ContextHeaderInput): string | null {
   return `[from ${seat} · ${intent}${input.crownDirective ? ' · crown' : ''}]`;
 }
 
-/** Header line ⊕ `msg:<id>` ⊕ the full body (never truncated — #38057 mustFix ①). */
+/**
+ * Header line ⊕ `msg:<id>` ⊕ the full body (never truncated — #38057 mustFix ①). ANNOUNCE-UPTAKE: a kind=announce mail
+ * gets one rule block before the body (apply line ⊕ memory) — announces only; every other mail is unchanged.
+ */
 export function seatMessageContextBlock(message: ContextHeaderInput & { id: number; body: string }): string {
   const header = modelContextHeader(message);
-  const body = `msg:${message.id} · ${message.body}`;
+  // The rule sits BEFORE the body: notice callers locate the body as the block's tail (bodyAt = length − body.length).
+  const rule = message.kind === ANNOUNCE_KIND ? `${announceNoticeRule(message.id, message.announceId)}\n` : '';
+  const body = `${rule}msg:${message.id} · ${message.body}`;
   return header === null ? body : `${header}\n${body}`;
 }

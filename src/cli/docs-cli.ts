@@ -8,10 +8,12 @@
 import type { Command } from 'commander';
 import { registerRfcStatusCommand } from './rfc-status.js';
 import { existsSync, readFileSync } from 'node:fs';
-import { relative, resolve } from 'node:path';
-import { docsIndexCount, hybridQueryKnowledge, ingestDocsCorpus, knowledgeDbPath, openKnowledgeDb } from '../domains/knowledge.js';
-import { getUserConfig } from '../user-config.js';
+import { join, relative, resolve } from 'node:path';
+import { defaultEmbed, docsIndexCount, hybridQueryKnowledge, ingestDocsCorpus, knowledgeDbPath, openKnowledgeDb, type DocsCorpusCounts, type EmbedFn } from '../domains/knowledge.js';
 import { debug } from '../debug/log.js';
+import { fallbackDocsSearch, isLowConfidence } from '../knowledge/docs-search-fallback.js';
+import { staleCwdFor, staleCwdHint } from '../knowledge/stale-cwd.js';
+import { resolveSearchRoots } from '../knowledge/search-roots.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import { assessDeclaredRevision, assessDocsStaleness, assessOneDocStaleness, emptyBranchCounts, enrichDocStalenessHistory, formatDocStaleness, formatRemovedIdentifierHistory, STALE_SCORE_THRESHOLD, type DeclaredRevisionAssessment, type DocStaleness } from '../autopilot/discovery/doc-staleness.js';
 
@@ -86,53 +88,172 @@ export async function runDocsRevision(
   }
 }
 
+/** 검색 한 번에 다시 색인할 변경 문서 상한 — 넘치면 다음 검색이 이어받는다(한 줄 안내). */
+export const DOCS_SEARCH_REFRESH_MAX_FILES = 25;
+
+/** 첫 임베딩 실패 뒤엔 바로 던진다 — 임베딩 서버가 죽었을 때 파일마다 타임아웃을 기다리지 않는다. */
+function breakerEmbed(embed: EmbedFn = defaultEmbed): EmbedFn {
+  let down = false;
+  return async (text) => {
+    if (down) throw new Error('embedding unavailable');
+    try { return await embed(text); } catch (error) { down = true; throw error; }
+  };
+}
+
+/** 색인 상태 한 줄(없으면 null) — 남은 변경 문서 · 정본 설계 문서(docs/conductor) 뿌리 부재. */
+export function docsIndexNotice(refresh: DocsCorpusCounts | null, exists: (path: string) => boolean = existsSync): string | null {
+  if (!refresh) return 'docs search: index refresh failed — results may be stale';
+  if (refresh.pending > 0) return `docs search: index stale — ${refresh.pending} changed doc(s) not indexed yet (embedding down or over the per-search limit ${DOCS_SEARCH_REFRESH_MAX_FILES}; next search continues)`;
+  if (!refresh.rootPaths.some((root) => exists(join(root, 'conductor')))) {
+    return 'docs search: no docs/conductor in the index roots — run from a repo worktree or set knowledge.docsRoots';
+  }
+  return null;
+}
+
+/** 설정 `knowledge.docsRoots` — 배열이면(빈 배열 포함) 설정이다. 없으면 undefined(자동 감지). */
+export function configuredDocsRoots(raw: unknown): string[] | undefined {
+  const knowledge = (raw && typeof raw === 'object' ? (raw as { knowledge?: unknown }).knowledge : undefined) as { docsRoots?: unknown } | undefined;
+  if (!knowledge || !Array.isArray(knowledge.docsRoots)) return undefined;
+  return knowledge.docsRoots.filter((p): p is string => typeof p === 'string');
+}
+
+/** 폴백 적중 한 줄씩 — `(fallback)` 표시 ⊕ 이름/본문 적중 수. */
+export function formatFallbackHits(hits: readonly { path: string; nameHits: number; contentHits: number }[]): string[] {
+  return hits.map((h) => `(fallback) ${h.nameHits > 0 ? 'name' : 'text'} [name ${h.nameHits} · text ${h.contentHits}] ${h.path}`);
+}
+
+/**
+ * 색인 결과가 약하면(0건·의미만) 같은 뿌리에서 이름 ⊕ 본문 폴백. 폴백까지 0건 = 진짜 빗나감 →
+ * `docs.search-miss {query, roots, hits: 0}` 로 남긴다(어떤 질의가 문서에 없는지 관측).
+ */
+export function docsSearchFallback(
+  query: string,
+  matches: readonly { matchedBy: string }[],
+  roots: readonly string[],
+  k: number,
+  log: (category: string, event: string, data: Record<string, unknown>) => void = (c, e, d) => debug.log(c, e, d, { level: 'warn' }),
+): ReturnType<typeof fallbackDocsSearch> {
+  const fallback = isLowConfidence(matches) ? fallbackDocsSearch(query, roots, k) : [];
+  if (matches.length === 0 && fallback.length === 0) log('docs', 'search-miss', { query, roots: [...roots], hits: 0 });
+  return fallback;
+}
+
 export async function runDocsSearch(
   query: string,
   opts: { limit?: string; domain?: string; kind?: string; json?: boolean },
 ): Promise<number> {
   if (!query?.trim()) { console.error('elanous docs search: 질의가 필요합니다'); return 1; }
-  // DOCS-SEARCH-INDEX-EMPTY — 색인 자가부트: db 없든 docs 색인 0이든 이 실행 안에서
-  // 1회 채운다. 뿌리 해석은 크론 knowledge-ingest 와 같은 ingestDocsCorpus(config
-  // knowledge.docsRoots 존중·현행 절 후보 포함). 그래도 0이면 기존 문구·rc 1 유지.
+  // DOCS-SEARCH-INDEX-EMPTY — 색인 자가부트 ⊕ DOCS-SEARCH-CONDUCTOR 증분 자가 갱신: 매 검색이
+  // ingestDocsCorpus 를 상한(DOCS_SEARCH_REFRESH_MAX_FILES)으로 돈다 — 무변경 파일은 stat 만(상시 폴링 0).
+  // 뿌리 해석은 크론 knowledge-ingest 와 같은 기계(config knowledge.docsRoots 존중·현행 절 후보 포함).
+  // 남은 변경·설계 문서 뿌리 부재는 한 줄로 알린다(조용한 잡음 결과 금지).
   const dbMissing = !existsSync(knowledgeDbPath());
   const db = openKnowledgeDb();
   try {
-    if (docsIndexCount(db) === 0) {
-      const knowledgeCfg = (getUserConfig().raw.knowledge ?? {}) as { docsRoots?: unknown };
-      // 배열이면 빈 배열도 설정이다. undefined 로 바꾸면 자동 감지로 넘어간다.
-      const configuredRoots = Array.isArray(knowledgeCfg.docsRoots)
-        ? knowledgeCfg.docsRoots.filter((p): p is string => typeof p === 'string')
-        : undefined;
-      try {
-        await ingestDocsCorpus(db, {
-          ...(configuredRoots !== undefined ? { docsRoots: configuredRoots } : {}),
-          toolModuleUrl: import.meta.url,
-          toolDocsSegments: ['..', '..', 'docs'],
-        });
-      } catch { /* fail-soft — 임베딩 다운이면 색인 0으로 아래 판정이 기존 문구로 안내 */ }
-    }
+    // 단일 해석기 — env ELANOUS_DOCS_ROOTS > config knowledge.docsRoots > 없음(자동 감지).
+    const configuredRoots = resolveSearchRoots().docsRoots;
+    let refresh: DocsCorpusCounts | null = null;
+    try {
+      refresh = await ingestDocsCorpus(db, {
+        ...(configuredRoots !== undefined ? { docsRoots: configuredRoots } : {}),
+        toolModuleUrl: import.meta.url,
+        toolDocsSegments: ['..', '..', 'docs'],
+        embed: breakerEmbed(),
+        maxFiles: DOCS_SEARCH_REFRESH_MAX_FILES,
+      });
+    } catch { /* fail-soft — 아래 판정이 안내 */ }
     if (dbMissing && docsIndexCount(db) === 0) {
       console.error(`elanous docs search: knowledge.db 없음 (${knowledgeDbPath()}) — knowledge-ingest 가 한 번은 돌아야 합니다.`);
       return 1;
     }
+    const notice = docsIndexNotice(refresh);
+    if (notice) console.error(notice);
+    // 낡은 cwd 트리 — 설정 뿌리(latest)가 이미 이겼으므로 «latest 도 찾았다» 한 줄만 알린다.
+    const stale = configuredRoots !== undefined ? staleCwdFor(process.cwd()) : null;
+    if (stale) console.error(`docs search: ${staleCwdHint(stale)}`);
     const k = Math.min(Math.max(Number(opts.limit ?? 8) || 8, 1), 20);
     const matches = await hybridQueryKnowledge(db, query.trim(), {
       k,
       domain: opts.domain ?? 'elanous',
       ...(opts.kind ? { kind: opts.kind as never } : {}),
     });
+    const fallback = docsSearchFallback(query.trim(), matches, refresh?.rootPaths ?? [], k);
     if (opts.json) { console.log(JSON.stringify(matches, null, 2)); return 0; }
-    if (matches.length === 0) { console.log('(매치 없음)'); return 0; }
+    if (matches.length === 0 && fallback.length === 0) { console.log('(매치 없음)'); return 0; }
     for (const m of matches) {
-      const tag = m.matchedBy === 'both' ? '◈' : m.matchedBy === 'vector' ? '≈' : '⌕';
+      const tag = m.matchedBy === 'both' ? '◈' : m.matchedBy === 'vector' ? '≈' : m.matchedBy === 'title' ? '#' : '⌕';
       const src = m.source_ref ? ` — ${m.source_ref}` : '';
       console.log(`${tag} [${m.ts.slice(0, 10)}·${m.kind}·rrf ${m.rrf.toFixed(3)}] ${m.text.replace(/\n+/g, ' / ').slice(0, 180)}${src}`);
     }
-    console.log(`\n(◈ 의미+키워드 · ≈ 의미 · ⌕ 키워드 — ${matches.length}건)`);
+    if (matches.length > 0) console.log(`\n(◈ 의미+키워드 · ≈ 의미 · ⌕ 키워드 · # 문서 이름/제목 — ${matches.length}건)`);
+    if (fallback.length > 0) {
+      console.log(`\n${formatFallbackHits(fallback).join('\n')}`);
+      console.log(`(fallback) index ${matches.length === 0 ? 'had no hits' : 'had only semantic hits'} — filename/content search over the same roots · ${fallback.length}건`);
+    }
     return 0;
   } finally {
     db.close();
   }
+}
+
+/** `elanous docs index` — 변경 문서 전부를 상한 없이 한 번에 색인한다(설치 직후 자동으로도 돈다). */
+export async function runDocsIndex(opts: { json?: boolean } = {}): Promise<number> {
+  const { refreshDocsIndex } = await import('../knowledge/docs-index-refresh.js');
+  const db = openKnowledgeDb();
+  try {
+    const configuredRoots = resolveSearchRoots().docsRoots;
+    const counts = await refreshDocsIndex(db, {
+      ...(configuredRoots !== undefined ? { docsRoots: configuredRoots } : {}),
+      toolModuleUrl: import.meta.url,
+      toolDocsSegments: ['..', '..', 'docs'],
+      embed: breakerEmbed(),
+    });
+    if (opts.json) console.log(JSON.stringify(counts));
+    else console.log(`docs index: ${counts.files} doc(s) indexed · ${counts.unchanged} unchanged · ${counts.pending} pending · ${counts.roots} root(s)`);
+    if (counts.pending > 0) console.error(`docs index: ${counts.pending} doc(s) still pending (embedding down?) — run again later; searches also catch up`);
+    return 0;
+  } catch (error) {
+    console.error(`elanous docs index: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  } finally {
+    db.close();
+  }
+}
+
+/** `docs search --scope/--path/--source` — DocsSearch 와 같은 출처 해석기 · 인용 붙은 결과. */
+export async function runDocsSourcesSearch(
+  query: string,
+  o: { limit?: string; json?: boolean; scope?: string; path?: string[]; source?: string[] },
+): Promise<number> {
+  const { dispatchDocsSearch } = await import('../skills/tools/docs-search.js');
+  try {
+    const result = await dispatchDocsSearch({
+      query, scope: o.path?.length || o.source?.length ? (o.scope ?? 'custom') : o.scope,
+      ...(o.limit ? { limit: Math.min(Math.max(Number(o.limit) || 8, 1), 20) } : {}),
+      ...(o.path?.length ? { paths: o.path } : {}), ...(o.source?.length ? { source_ids: o.source } : {}),
+    });
+    console.log(o.json ? JSON.stringify(result.hits, null, 2) : result.output);
+    return 0;
+  } catch (error) {
+    console.error(`elanous docs search: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+}
+
+/** `docs sources` — 출처 목록 ⊕ 실존 검사. 틀린 항목·빠진 경로가 있으면 rc=1. */
+export function runDocsSources(o: { json?: boolean }, opts: import('../knowledge/search-roots.js').SearchSourcesOpts = {}, print: (line: string) => void = (l) => console.log(l)): number {
+  const { loadSearchSources, sourceHealth, SEARCH_ROOTS_UNCONFIGURED_NOTE, SEARCH_SOURCES_LEGACY_NOTE } = require('../knowledge/search-roots.js') as typeof import('../knowledge/search-roots.js');
+  const loaded = loadSearchSources(opts);
+  const rows = loaded.sources.map((s) => ({ ...s, enabled: s.enabled !== false, health: sourceHealth(s, opts.exists) }));
+  if (o.json) print(JSON.stringify({ origin: loaded.origin, legacy: loaded.legacy, invalid: loaded.invalid, sources: rows }, null, 2));
+  else {
+    print(`sources (${loaded.origin}) — ${rows.length}`);
+    if (loaded.origin === 'none') print(SEARCH_ROOTS_UNCONFIGURED_NOTE);
+    for (const r of rows) print(`${r.health === 'ok' ? '✓' : '✗'} ${r.type}:${r.id}${r.enabled ? '' : ' (disabled)'} ${r.path}${r.health === 'ok' ? '' : ` — ${r.health}`}${r.label ? ` · ${r.label}` : ''}`);
+    for (const reason of loaded.invalid) print(`✗ invalid ${reason}`);
+    if (loaded.legacy) print(SEARCH_SOURCES_LEGACY_NOTE);
+  }
+  return loaded.invalid.length > 0 || rows.some((r) => r.enabled && r.health !== 'ok') ? 1 : 0;
 }
 
 /**
@@ -307,9 +428,28 @@ export function registerDocsCommands(program: Command): void {
     .option('--domain <d>', '도메인 (기본 elanous — finance 신호와 격리)')
     .option('--kind <k>', 'kind 필터 (docs|memory|signal|…)')
     .option('--json')
-    .action(async (query: string, o: { limit?: string; domain?: string; kind?: string; json?: boolean }) => {
-      const { runDocsSearch } = await import('./docs-cli.js');
+    .option('--scope <scope>', '출처 범위 repo(기본)|ref|both|custom — 출처는 knowledge.sources / ELANOUS_SOURCES')
+    .option('--path <dir>', 'custom 범위 경로(반복 가능 · 실존해야 함)', (v: string, acc: string[] = []) => [...acc, v])
+    .option('--source <id>', 'custom 범위 출처 id(반복 가능)', (v: string, acc: string[] = []) => [...acc, v])
+    .action(async (query: string, o: { limit?: string; domain?: string; kind?: string; json?: boolean; scope?: string; path?: string[]; source?: string[] }) => {
+      const { runDocsSearch, runDocsSourcesSearch } = await import('./docs-cli.js');
+      // 범위·경로·출처 id 를 주면 DocsSearch 와 같은 출처 해석기로 찾는다(인용 repo:/ref:/custom:).
+      if ((o.scope && o.scope !== 'repo') || o.path?.length || o.source?.length) process.exit(await runDocsSourcesSearch(query, o));
       process.exit(await runDocsSearch(query, o));
+    });
+  docsCmd.command('index')
+    .description('변경된 문서를 한 번에 전부 색인(검색 시 25개 증분 상한 없음) — 설치 직후 자동으로도 돈다')
+    .option('--json')
+    .action(async (o: { json?: boolean }) => {
+      const { runDocsIndex } = await import('./docs-cli.js');
+      process.exit(await runDocsIndex(o));
+    });
+  docsCmd.command('sources')
+    .description('검색 출처 목록 ⊕ 검사 — knowledge.sources [{ id, type: repo|ref, path, label?, include?, exclude?, enabled? }] (env ELANOUS_SOURCES 가 이긴다). 바꾸기는 사용자 설정 파일에서')
+    .option('--json')
+    .action(async (o: { json?: boolean }) => {
+      const { runDocsSources } = await import('./docs-cli.js');
+      process.exit(runDocsSources(o));
     });
   docsCmd.command('revision <path>')
     .description('문서가 선언한 현재 판과 해당 문서의 git 이력 판을 비교')

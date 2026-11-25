@@ -3,7 +3,7 @@ import { afterAll, beforeEach, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createAutopilot, readAutopilotState, resolveStandingGoal, type AutopilotDecisionCard } from './autopilot.js';
+import { autopilotPolicyParagraph, createAutopilot, readAutopilotState, resolveStandingGoal, type AutopilotDecisionCard } from './autopilot.js';
 import { dispatchAutopilotTool } from './autopilot-tool.js';
 import { runAutopilotSlash } from './autopilot-slash.js';
 import { readGoals } from './goals.js';
@@ -35,15 +35,18 @@ function harness(opts: { coordinator?: boolean; ledger?: boolean; installed?: st
 
 /** A fake model: for each person message it emits exactly the tool call scripted for it (the test asserts tool → state). */
 const fakeModel: Record<string, { name: string; args: Record<string, unknown> }> = {
-  '자율주행 시작': { name: 'autopilot_set', args: { on: true, goal: '0.3.35 발행' } },
+  '자율주행 시작': { name: 'autopilot_set', args: { on: true, goal: '0.3.35 발행', done_criterion: '판정 한 줄', kind: 'autopilot', deadline: '2026-11-30T00:00:00.000Z', expected_minutes: 60 } },
   '오토파일럿 켜줘': { name: 'autopilot_set', args: { on: true } },
-  'autopilot on': { name: 'autopilot_set', args: { on: true, goal: 'land the queue' } },
+  'autopilot on': { name: 'autopilot_set', args: { on: true, goal: 'land the queue', done_criterion: '판정 한 줄', kind: 'autopilot', deadline: '2026-11-30T00:00:00.000Z', expected_minutes: 60 } },
   '자율주행 꺼': { name: 'autopilot_set', args: { on: false } },
 };
 
 test('varied phrasings → fake model tool call → state change (ON persisted · OFF persisted)', async () => {
-  const deps = { cwd: dir, file, now: () => T0, raiseDecision: () => 'D-x' };
+  // AUTOPILOT-GOAL-CLEARING: ≤ 1 model-set autopilot goal per 30 min — each phrase comes 31 min after the last.
+  let t = T0;
+  const deps = { cwd: dir, file, now: () => t, raiseDecision: () => 'D-x' };
   for (const phrase of ['자율주행 시작', '오토파일럿 켜줘', 'autopilot on']) {
+    t += 31 * MIN;
     await dispatchAutopilotTool('autopilot_set', { on: false }, deps);
     const call = fakeModel[phrase]!;
     expect(await dispatchAutopilotTool(call.name, call.args, deps)).toMatchObject({ ok: true });
@@ -58,7 +61,7 @@ test('varied phrasings → fake model tool call → state change (ON persisted �
 test('tool call on → status chip; turn end with nothing scheduled → wake armed (30 min · 5 min with open work)', () => {
   const h = harness();
   const pilot = h.make();
-  expect(pilot.set({ on: true, goal: '0.3.35 발행' }, 'tool')).toEqual({ ok: true, text: '🚗 AUTO · 0.3.35 발행' });
+  expect(pilot.set({ on: true, goal: '0.3.35 발행', doneCriterion: '판정 한 줄', kind: 'autopilot', deadline: '2026-11-30T00:00:00.000Z', expectedMinutes: 60 }, 'tool')).toEqual({ ok: true, text: '🚗 AUTO · 0.3.35 발행' });
   expect(pilot.turnEnded({ selfInitiated: false, failed: false })).toEqual({ arm: { delayMs: 30 * MIN, reason: '🚗 자율주행: 목표를 향해 이어서 진행 — 0.3.35 발행' } });
   pilot.noteArmed('w1', T0 + 30 * MIN);
   expect(pilot.statusText()).toBe(`🚗 AUTO · 0.3.35 발행 · next ⏰${hhmm(T0 + 30 * MIN)}`);
@@ -67,24 +70,76 @@ test('tool call on → status chip; turn end with nothing scheduled → wake arm
   expect(h.logs.filter(([e]) => e === 'on')).toEqual([['on', { reason: 'tool', goal: '0.3.35 발행' }]]);
 });
 
-test('human input → PAUSED, auto-resume after 10 min of quiet (injected clock); hold stays paused', () => {
+test('keystrokes while AUTO → still AUTO (keystroke-ignored logged at most once a minute); explicit hold → PAUSED', () => {
   const h = harness();
   const pilot = h.make();
   pilot.set({ on: true, goal: 'g' }, 'slash');
   pilot.noteHuman();
-  expect(pilot.statusText()).toBe('🚗 PAUSED · 사람 운전');
-  expect(pilot.turnEnded({ selfInitiated: false, failed: false })).toEqual({ arm: null });
-  h.advance(9 * MIN);
-  expect(pilot.tick()).toBe(false);
-  h.advance(1 * MIN);
-  expect(pilot.tick()).toBe(true);
+  h.advance(10_000);
+  pilot.noteHuman();
+  h.advance(10_000);
+  pilot.noteHuman();
   expect(pilot.statusText()).toBe('🚗 AUTO · g');
-  expect(h.logs.map(([e]) => e)).toEqual(['on', 'pause', 'resume']);
+  h.advance(60_000);
+  pilot.noteHuman();
+  expect(pilot.statusText()).toBe('🚗 AUTO · g');
+  expect(h.logs).toEqual([['on', { reason: 'slash', goal: 'g' }], ['goal-derived', { tier: 'first-class', source: 'human', goal: 'g', reason: 'human-slash' }],
+    ['keystroke-ignored', { goal: 'g' }], ['keystroke-ignored', { goal: 'g' }]]);
   pilot.set({ on: true, hold: true }, 'tool');
+  expect(pilot.statusText()).toBe('🚗 PAUSED · you are driving');
   h.advance(60 * MIN);
   expect(pilot.tick()).toBe(false);
-  expect(pilot.statusText()).toBe('🚗 PAUSED · 사람 운전');
+  expect(pilot.statusText()).toBe('🚗 PAUSED · you are driving');
   expect(runAutopilotSlash(pilot, ['resume'])).toEqual(['🚗 AUTO · g']);
+});
+
+test('a submitted human turn → AUTO after it ends, wake armed; under hold the turn end stays PAUSED', () => {
+  const h = harness();
+  const pilot = h.make();
+  pilot.set({ on: true, goal: 'g' }, 'slash');
+  pilot.noteHuman();
+  expect(pilot.turnEnded({ selfInitiated: false, failed: false })).toEqual({ arm: { delayMs: 30 * MIN, reason: '🚗 자율주행: 목표를 향해 이어서 진행 — g' } });
+  expect(pilot.statusText()).toBe('🚗 AUTO · g');
+  pilot.set({ on: true, hold: true }, 'tool');
+  pilot.noteHuman();
+  expect(pilot.turnEnded({ selfInitiated: false, failed: false })).toEqual({ arm: null });
+  expect(pilot.statusText()).toBe('🚗 PAUSED · you are driving');
+});
+
+test('AUTOPILOT-GOAL-CONTINUE-CAP safety net: a legacy non-hold pause resumes when a person\'s turn ends', () => {
+  mkdirSync(join(dir, '.autopilot'), { recursive: true });
+  writeFileSync(file, JSON.stringify({ v: 1, on: true, goal: 'g', paused: { at: 1, hold: false, lastHumanAt: 1 } }));
+  const h = harness();
+  const pilot = h.make();
+  pilot.refresh();
+  expect(pilot.statusText()).toBe('🚗 PAUSED · you are driving');
+  expect(pilot.turnEnded({ selfInitiated: false, failed: false })).toEqual({ arm: { delayMs: 30 * MIN, reason: '🚗 자율주행: 목표를 향해 이어서 진행 — g' } });
+  expect(pilot.statusText()).toBe('🚗 AUTO · g');
+  expect(h.logs.find(([e]) => e === 'resume')).toEqual(['resume', { reason: 'human-turn-done', goal: 'g' }]);
+});
+
+test('a new / urgent directive while AUTO → still AUTO with the goal replaced; a plain request keeps the goal', () => {
+  const h = harness();
+  const pilot = h.make();
+  pilot.set({ on: true, goal: '0.3.35 발행', doneCriterion: '판정 한 줄', kind: 'autopilot', deadline: '2026-11-30T00:00:00.000Z', expectedMinutes: 60 }, 'tool');
+  pilot.noteHuman();
+  expect(pilot.turnEnded({ selfInitiated: false, failed: false })?.arm?.delayMs).toBe(30 * MIN);
+  expect(pilot.statusText()).toBe('🚗 AUTO · 0.3.35 발행');
+  pilot.noteHuman();
+  h.advance(31 * MIN);
+  expect(pilot.set({ on: true, goal: '긴급 결함 수리', doneCriterion: '판정 한 줄', kind: 'autopilot', deadline: '2026-11-30T00:00:00.000Z', expectedMinutes: 60 }, 'tool')).toEqual({ ok: true, text: '🚗 AUTO · 긴급 결함 수리' });
+  expect(pilot.turnEnded({ selfInitiated: false, failed: false })?.arm?.delayMs).toBe(30 * MIN);
+  expect(pilot.statusText()).toBe('🚗 AUTO · 긴급 결함 수리');
+  expect(h.logs.map(([e]) => e)).toEqual(['on', 'goal-derived', 'keystroke-ignored', 'on', 'goal-superseded', 'goal-derived']);
+});
+
+test('model-facing paragraph: ON says directives never pause (only explicit hold / off); paused text = explicit hold only', () => {
+  const on = autopilotPolicyParagraph({ v: 1, on: true, goal: 'g' }, [], T0) ?? '';
+  expect(on).toContain('사람의 새 요청·다른 방향·긴급 지시도 그냥 입력이다 — 처리하되 자율주행은 켜진 채로 둔다.');
+  expect(on).toContain('autopilot_set({on:true, goal:"<한 줄>", done_criterion:"<완료 판정 한 줄>", deadline:"HH:MM", expected_turns:N, done_check?})로 작업 골(핀 · 입력창 위 · 최대 3)을 세운다');
+  expect(on).toContain('멈추는 것은 사람이 «이제부터 내가 운전하겠다»(autopilot_set({on:true, hold:true})) 또는 «자율주행 멈춰»(autopilot_set({on:false}))라고 명시할 때뿐이다.');
+  const held = autopilotPolicyParagraph({ v: 1, on: true, goal: 'g', paused: { at: T0, hold: true, lastHumanAt: T0 } }, [], T0) ?? '';
+  expect(held).toBe('## 🚗 자율주행 일시정지 (사람이 «내가 운전하겠다»고 명시함) · 목표: g\n사람이 직접 운전하겠다고 말했다 — 사람의 말을 따른다. 사람이 «다시 자율주행»이라고 하면 autopilot_set({on:true})를 부른다.');
 });
 
 test('off → no further autonomous turns (no wake armed)', () => {
@@ -99,13 +154,13 @@ test('off → no further autonomous turns (no wake armed)', () => {
 test('3× the same failure → back off to 30-min wakes + one log, no stop, no card; a card only after 2 h of back-off', () => {
   const h = harness();
   const pilot = h.make();
-  pilot.set({ on: true, goal: 'g' }, 'tool');
+  pilot.set({ on: true, goal: 'g', doneCriterion: '판정 한 줄', kind: 'autopilot', deadline: '2026-11-30T00:00:00.000Z', expectedMinutes: 60 }, 'tool');
   expect(pilot.turnEnded({ selfInitiated: false, failed: true, failureSig: 'gate red 12', openWork: true })?.arm?.delayMs).toBe(5 * MIN);
   pilot.turnEnded({ selfInitiated: false, failed: true, failureSig: 'gate red 13' });
   expect(pilot.turnEnded({ selfInitiated: false, failed: true, failureSig: 'gate red 14', openWork: true })).toEqual({
     arm: { delayMs: 30 * MIN, reason: '🚗 자율주행: 목표를 향해 이어서 진행 — g' }, backoff: '같은 실패 3회: gate red #' });
   expect(pilot.state().on).toBe(true);
-  expect(pilot.statusText()).toBe('🚗 AUTO · g · 감속');
+  expect(pilot.statusText()).toBe('🚗 AUTO · g · slowed');
   expect(h.cards).toEqual([]);
   h.advance(119 * MIN);
   pilot.turnEnded({ selfInitiated: false, failed: true, failureSig: 'gate red 15' });
@@ -123,7 +178,7 @@ test('3× the same failure → back off to 30-min wakes + one log, no stop, no c
 test('30 mail/notice turns in an hour → not stopped, no card, no back-off (external events are not autopilot volume)', () => {
   const h = harness();
   const pilot = h.make();
-  pilot.set({ on: true, goal: 'g' }, 'tool');
+  pilot.set({ on: true, goal: 'g', doneCriterion: '판정 한 줄', kind: 'autopilot', deadline: '2026-11-30T00:00:00.000Z', expectedMinutes: 60 }, 'tool');
   for (let i = 0; i < 30; i += 1) {
     expect(pilot.turnEnded({ selfInitiated: false, failed: false, fingerprint: 'same mail reply' })?.arm?.delayMs).toBe(30 * MIN);
     h.advance(2 * MIN);
@@ -136,7 +191,7 @@ test('30 mail/notice turns in an hour → not stopped, no card, no back-off (ext
 test('13 self wakes: changing replies keep the 30-min cadence; 3 identical replies → back off (no stop, no card)', () => {
   const h = harness();
   const pilot = h.make();
-  pilot.set({ on: true, goal: 'g' }, 'tool');
+  pilot.set({ on: true, goal: 'g', doneCriterion: '판정 한 줄', kind: 'autopilot', deadline: '2026-11-30T00:00:00.000Z', expectedMinutes: 60 }, 'tool');
   for (let i = 0; i < 13; i += 1) {
     expect(pilot.turnEnded({ selfInitiated: true, failed: false, fingerprint: `step ${i} landed` })).toEqual({ arm: { delayMs: 30 * MIN, reason: '🚗 자율주행: 목표를 향해 이어서 진행 — g' } });
     h.advance(5 * MIN);
@@ -163,7 +218,7 @@ test('migration: a stored «시간당 자율 턴 상한» stop is cleared on loa
 
 test('restart keeps ON (a new controller on the same file)', () => {
   const h = harness();
-  h.make().set({ on: true, goal: 'keep going' }, 'tool');
+  h.make().set({ on: true, goal: 'keep going', doneCriterion: '판정 한 줄', kind: 'autopilot', deadline: '2026-11-30T00:00:00.000Z', expectedMinutes: 60 }, 'tool');
   const again = h.make();
   again.refresh();
   expect(again.statusText()).toBe('🚗 AUTO · keep going');
@@ -212,25 +267,25 @@ test('release cycle: cut prepared → «컷·발행»; publish-verified 0.3.35 �
   expect(pilot.state().goal).toBe('0.3.35 컷·발행');
   writeFileSync(join(dir, 'release', '0.3.35', 'release.json'), JSON.stringify({ version: '0.3.35', prerelease: false, publishedAt: '2026-11-25T21:00:00.000Z' }));
   pilot.tick();
-  expect(pilot.state().goal).toBe('0.3.36 개발');
+  expect(pilot.state().goal).toBe('0.3.36 개발 — 로스터 착지 · 초록 +10/h');
   expect(pilot.statusText().startsWith('🚗 AUTO · 0.3.36 개발')).toBe(true);
-  expect(h.logs.filter(([e]) => e === 'goal-rolled')).toEqual([['goal-rolled', { from: '0.3.35 컷·발행', to: '0.3.36 개발' }]]);
+  expect(h.logs.filter(([e]) => e === 'goal-rolled')).toEqual([['goal-rolled', { from: '0.3.35 컷·발행', to: '0.3.36 개발 — 로스터 착지 · 초록 +10/h' }]]);
 });
 
 test('goals: the person adds a mid goal → paragraph + status; due within 48 h → one progress card', async () => {
   const h = harness();
   const pilot = h.make();
-  pilot.set({ on: true, goal: '0.3.35 개발' }, 'tool');
+  pilot.set({ on: true, goal: '0.3.35 개발', doneCriterion: '판정 한 줄', kind: 'autopilot', deadline: '2026-11-30T00:00:00.000Z', expectedMinutes: 60 }, 'tool');
   pilot.noteTurnStart('human');
-  const added = await dispatchAutopilotTool('autopilot_goal_set', { level: 'mid', title: '11-26 20:00 AI&B 데모', due: '2026-11-26T11:00:00.000Z' }, { cwd: dir, file });
-  expect(added).toEqual({ ok: true, status: '목표 추가: [mid] 11-26 20:00 AI&B 데모 · 2026-11-26T11:00:00.000Z' });
-  expect(pilot.statusText()).toBe('🚗 AUTO · 0.3.35 개발 · 데모 D-2');
-  expect(pilot.paragraph()).toContain('- [mid] 11-26 20:00 AI&B 데모 · D-2');
+  const added = await dispatchAutopilotTool('autopilot_goal_set', { level: 'mid', title: '11-26 20:00 AI&B demo', due: '2026-11-26T11:00:00.000Z' }, { cwd: dir, file });
+  expect(added).toEqual({ ok: true, status: '목표 추가: [mid] 11-26 20:00 AI&B demo · 2026-11-26T11:00:00.000Z' });
+  expect(pilot.statusText()).toBe('🚗 AUTO · 0.3.35 개발 · demo D-2');
+  expect(pilot.paragraph()).toContain('- [mid] 11-26 20:00 AI&B demo · D-2');
   h.advance(6 * 60 * MIN); // 47 h before due
   pilot.tick();
   pilot.tick();
-  expect(h.progress).toEqual(['11-26 20:00 AI&B 데모 · D-1']);
-  expect(pilot.paragraph()).toContain('- ⚠ [mid] 11-26 20:00 AI&B 데모 · D-1 — 기한 임박: 관련 일을 먼저 한다');
+  expect(h.progress).toEqual(['11-26 20:00 AI&B demo · D-1']);
+  expect(pilot.paragraph()).toContain('- ⚠ [mid] 11-26 20:00 AI&B demo · D-1 — 기한 임박: 관련 일을 먼저 한다');
 });
 
 test('autopilot cannot create a goal without the person — an autonomous turn yields only a proposal card', async () => {
@@ -251,9 +306,9 @@ test('coordinator first start seeds the goal stack once (source=seed · deletabl
   const pilot = harness({ coordinator: true, ledger: true }).make();
   pilot.refresh();
   expect(pilot.goals().map((g) => `${g.level}|${g.title}|${g.source}`)).toEqual([
-    'mid|11-26 20:00 AI&B 데모|seed', 'mid|12월 무료 회원 오픈|seed', 'long|2027 Q1 유료 준비|seed', 'long|4월 유료 시작|seed']);
+    'mid|11-26 20:00 AI&B demo|seed', 'mid|Free membership opens December|seed', 'long|2027 Q1 paid launch prep|seed', 'long|Paid launch in April|seed']);
   pilot.noteTurnStart('human');
-  expect(await dispatchAutopilotTool('autopilot_goal_remove', { id: '4월-유료-시작' }, { cwd: dir, file })).toEqual({ ok: true, status: '목표 삭제: 4월-유료-시작' });
+  expect(await dispatchAutopilotTool('autopilot_goal_remove', { id: 'paid-launch-in-april' }, { cwd: dir, file })).toEqual({ ok: true, status: '목표 삭제: paid-launch-in-april' });
   pilot.refresh();
   expect(pilot.goals().length).toBe(3);
 });
@@ -261,7 +316,7 @@ test('coordinator first start seeds the goal stack once (source=seed · deletabl
 test('decided → one «decided» log, no state change', () => {
   const h = harness();
   const pilot = h.make();
-  pilot.set({ on: true, goal: 'g' }, 'tool');
+  pilot.set({ on: true, goal: 'g', doneCriterion: '판정 한 줄', kind: 'autopilot', deadline: '2026-11-30T00:00:00.000Z', expectedMinutes: 60 }, 'tool');
   pilot.set({ decided: { kind: 'retry', criterion: 'gate flake · same head' } }, 'tool');
   expect(h.logs.at(-1)).toEqual(['decided', { kind: 'retry', criterion: 'gate flake · same head', goal: 'g', source: 'tool' }]);
   expect(pilot.state().on).toBe(true);

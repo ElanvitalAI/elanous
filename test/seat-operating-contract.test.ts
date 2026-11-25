@@ -27,6 +27,9 @@ describe('seat operating contract', () => {
     const text = buildGpt6CoordinatorAddendum().map(m => String(m.content)).join('\n');
     expect(text).toContain('## When to ask for permission (GPT-6 guidance)');
     expect(text).not.toContain('## Autonomy and persistence (GPT-6 guidance)');
+    // SEAT-TURN-PERSIST — the coordinator keeps a role-adapted persistence block (codex gpt_5_2_prompt.md:111).
+    expect(text).toContain('## Persistence (coordinator seat)');
+    expect(text).toContain('take it in this turn instead of reporting it');
   });
   test('existing model default is high and explicit levels survive', () => {
     expect(effectiveReasoningLevel({}, 'openai-codex', 'gpt-6-terra')).toBe('high');

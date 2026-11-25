@@ -10,11 +10,15 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 //   - Text files: full parity — pagination + `cat -n` formatted
 //     output with right-padded line numbers. LLM can refer to line
 //     N when it builds a subsequent Edit call.
-//   - Binary / image / PDF: MVP returns a descriptive metadata
-//     string ("image: ..., 124KB, png"). Claude Code routes these
-//     as ContentBlock tool_results; elanous's streamLLMWithTools
-//     currently pipes a string through `dispatchTool`, so base64
-//     / DocumentBlockParam wiring lands in a separate phase.
+//   - Raster images (png/jpeg/gif/webp ≤ READ_IMAGE_MAX_BYTES): the
+//     result carries `mediaType` + `dataB64` (the image-bearing
+//     convention, see tool-runtime/types.ts ToolRunResult), so
+//     streamLLMWithTools packages the bytes as an image content item and
+//     vision-capable wires (Anthropic tool_result · Codex Responses
+//     function_call_output input_image) receive the actual pixels.
+//     Before this, a model that called Read on a screenshot got only a
+//     metadata line and answered «I can't see the image» (CEO 11-25).
+//   - Other image formats / PDF / binary: descriptive metadata string.
 //   - Notebook (.ipynb) cells: out of scope for MVP — skill can
 //     use Bash + jq.
 //
@@ -22,7 +26,7 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // catches + wraps them into `tool_result { isError: true }` — matches
 // claude-code's "exception → error tool_result" convention.
 
-import { statSync, openSync, readSync, closeSync, createReadStream, existsSync } from 'node:fs';
+import { statSync, openSync, readSync, closeSync, createReadStream, existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, extname } from 'node:path';
 
 import { debug } from '../../debug/log.js';
@@ -69,19 +73,42 @@ export interface ReadResult {
   truncated: boolean;
   /** 'text' | 'image' | 'pdf' | 'binary' — affects output shape. */
   kind: 'text' | 'image' | 'pdf' | 'binary';
+  /** Raster image reads only — `image/<sub>` detected from magic bytes. */
+  mediaType?: string;
+  /** Raster image reads only — the file bytes, base64. */
+  dataB64?: string;
+}
+
+/** Inline image ceiling for Read. Above it the result stays a metadata line
+ *  (a 20 MB data URL in every later request would crowd the context). */
+export const READ_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+
+/** Magic-byte sniff (PNG · JPEG SOI · GIF8 · RIFF....WEBP). Same signatures as
+ *  clipboard/image-path-paste.ts — the extension alone is not trusted. */
+function sniffImageMediaType(head: Buffer): string | null {
+  if (head.length >= 8 && head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47
+    && head[4] === 0x0d && head[5] === 0x0a && head[6] === 0x1a && head[7] === 0x0a) return 'image/png';
+  if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return 'image/jpeg';
+  if (head.length >= 4 && head.subarray(0, 4).toString('latin1') === 'GIF8') return 'image/gif';
+  if (head.length >= 12 && head.subarray(0, 4).toString('latin1') === 'RIFF'
+    && head.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
+  return null;
 }
 
 export function buildReadTool(): LLMToolSpec {
   return {
     name: 'Read',
     description:
-      'Read a file from disk. Use for inspecting source files, configs, logs. ' +
+      'Read a file from disk — the step after Glob / Grep picked a candidate. Use for inspecting source files, configs, logs. ' +
+      'Examples: `Read(file_path: "src/skills/tools/grep.ts")` (a Grep hit) · ' +
+      '`Read(file_path: "docs/conductor/CONDUCTOR.md", offset: 120, limit: 80)` (one section of a long doc). ' +
       'Returns content with `cat -n` line numbers so you can reference specific lines ' +
       'in a subsequent Edit call. ' +
       `Default budget is ${DEFAULT_LIMIT} lines per call (up to ${MAX_LIMIT} if you pass \`limit\` explicitly) — ` +
       'OMIT `offset` and `limit` for files ≤ 5k lines; you\'ll get the full content in one shot. ' +
       'Only paginate (offset = <prev endIdx + 1>) when a file is larger than the default budget. ' +
-      'Images and PDFs return metadata only — use Bash (`python3 -m pdfplumber`, `file`, `identify`) to process their contents.',
+      'PNG/JPEG/GIF/WebP images are returned as image input you can see (up to 10 MB). ' +
+      'PDFs and other binaries return metadata only — use Bash (`python3 -m pdfplumber`, `file`) to process them.',
     parameters: {
       type: 'object',
       properties: {
@@ -147,6 +174,17 @@ export async function dispatchRead(
   const kind = classify(resolved);
 
   if (kind === 'image') {
+    if (st.size > 0 && st.size <= READ_IMAGE_MAX_BYTES) {
+      const bytes = readFileSync(resolved);
+      const mediaType = sniffImageMediaType(bytes.subarray(0, 12));
+      if (mediaType) {
+        return {
+          output: `[image: ${resolved}, ${formatBytes(st.size)}, ${mediaType} — attached as image input]`,
+          linesRead: 0, totalLines: 0, totalBytes: st.size, truncated: false, kind,
+          mediaType, dataB64: bytes.toString('base64'),
+        };
+      }
+    }
     return {
       output: `[image: ${resolved}, ${formatBytes(st.size)}, ${extname(resolved).slice(1) || 'unknown'} — MVP: use Bash for base64/identify]`,
       linesRead: 0, totalLines: 0, totalBytes: st.size, truncated: false, kind,

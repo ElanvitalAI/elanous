@@ -115,10 +115,17 @@ describe('CAPSULE-A2 — 자리 턴 상한은 Bash 를 캡슐로 떼어 낸다 (
     sink.dispose();
   });
 
-  test('정책: 스위치 없음 — 기본 10s · turn.syncCapMs 가 상한 조절 · 0 = 분리 안 함', () => {
+  test('정책: 스위치 없음 — 셸 기본 60s · turn.shellSyncCapMs 가 상한 조절 · turn.syncCapMs 0 = 분리 안 함 (RUNSHELL-BG-ENDS-TURN)', () => {
     const shell = { tool: 'Bash', kind: 'shell' } as const;
-    expect(shellCapsulePolicy(undefined, () => ({ capsuleMode: false, capsuleStages: { A2: false } })).decide(shell)).toEqual({ mode: 'sync', syncCapMs: 10000, reason: 'capsule-sync-cap' });
-    expect(shellCapsulePolicy(undefined, () => ({ syncCapMs: 3000 })).decide(shell)).toEqual({ mode: 'sync', syncCapMs: 3000, reason: 'capsule-sync-cap' });
+    expect(shellCapsulePolicy(undefined, () => ({ capsuleMode: false, capsuleStages: { A2: false } })).decide(shell)).toEqual({ mode: 'sync', syncCapMs: 60000, reason: 'capsule-sync-cap' });
+    expect(shellCapsulePolicy(undefined, () => undefined).decide({ tool: 'RunShell', kind: 'shell' })).toEqual({ mode: 'sync', syncCapMs: 60000, reason: 'capsule-sync-cap' });
+    expect(shellCapsulePolicy(undefined, () => ({ syncCapMs: 3000 })).decide(shell)).toEqual({ mode: 'sync', syncCapMs: 60000, reason: 'capsule-sync-cap' });
+    expect(shellCapsulePolicy(undefined, () => ({ shellSyncCapMs: 3000 })).decide(shell)).toEqual({ mode: 'sync', syncCapMs: 3000, reason: 'capsule-sync-cap' });
+    expect(shellCapsulePolicy(undefined, () => ({ shellSyncCapMs: -5 })).decide(shell)).toEqual({ mode: 'sync', syncCapMs: 60000, reason: 'capsule-sync-cap' });
+    expect(shellCapsulePolicy(undefined, () => ({ shellSyncCapMs: 0 })).decide(shell)).toEqual({ mode: 'sync', syncCapMs: Infinity, reason: 'sync-cap-zero' });
+    // Terra MF2: explicit «never detach» wins over a shell cap set alongside it.
+    expect(shellCapsulePolicy(undefined, () => ({ syncCapMs: 0, shellSyncCapMs: 30000 })).decide(shell)).toEqual({ mode: 'sync', syncCapMs: Infinity, reason: 'sync-cap-zero' });
+    expect(shellCapsulePolicy(undefined, () => ({ syncCapMs: 0, shellSyncCapMs: 30000 })).decide({ ...shell, requestedBackground: true })).toEqual({ mode: 'detach', syncCapMs: 0, reason: 'requested-background' });
     expect(shellCapsulePolicy(undefined, () => ({ syncCapMs: 0 })).decide(shell)).toEqual({ mode: 'sync', syncCapMs: Infinity, reason: 'sync-cap-zero' });
   });
 });

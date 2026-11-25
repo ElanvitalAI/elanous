@@ -5,6 +5,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { requestEls } from '../els/client.js';
+import { attachRemote } from '../els/remote-attach-client.js';
 import { elsSocketPath } from '../els/server.js';
 import { simCli } from '../ux-sim/in-process-cli.js';
 
@@ -185,6 +186,145 @@ test('stage 2: ls and read reach a registered host through its read window; a ho
   expect((await sideAt(hostA, ['read', `hostb:${bPane.address}`], 'hosta')).stdout).toContain('from-host-b');
 }, 120_000);
 
+/** Environment capability probe (ELS-PREGATE-PTY): can this host spawn an els pane process and read its screen? Some
+ *  pregate hosts cannot (the read comes back empty / «els holder: connection lost») — the same failure the baseline
+ *  «one owner» test shows there. Where the capability exists, the stage-5 test runs with its full assertions. */
+async function panesRunHere(): Promise<boolean> {
+  const state = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-probe-'));
+  const stop = new AbortController();
+  let text = '';
+  const run = simCli(['side', 'serve'], {
+    mode: 'spawn', allowPaths: [['side']], stateRoot: state, cwd: state, env: { NODE_ENV: 'development', HERDR_ENV: '' },
+    signal: stop.signal, killSignal: 'SIGKILL', timeoutMs: SERVE_LIFETIME_MS, onStdout: (chunk) => { text += chunk; },
+  });
+  let exited = false;
+  void run.then(() => { exited = true; });
+  try {
+    const deadline = Date.now() + SERVE_READY_MS;
+    while (Date.now() < deadline && !text.includes('listening on') && !exited) await Bun.sleep(50);
+    if (!text.includes('listening on')) return false;
+    const made = await side(state, state, ['new', '--ws', 'PROBE', '--cwd', state, '--', 'sh', '-c', 'printf pane-probe-ok; exec cat']);
+    if (made.exitCode !== 0) return false;
+    const pane = (JSON.parse(made.stdout) as { pane: string }).pane;
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      if ((await side(state, state, ['read', pane])).stdout.includes('pane-probe-ok')) return true;
+      await Bun.sleep(100);
+    }
+    return false;
+  } catch { return false; }
+  finally { stop.abort(); await run.catch(() => undefined); rmSync(state, { recursive: true, force: true }); }
+}
+const PANES_RUN_HERE = await panesRunHere();
+if (!PANES_RUN_HERE) console.warn('SKIP stage 5: host cannot run pane processes (pregate PTY) — FU ELS-PREGATE-PTY');
+
+test.skipIf(!PANES_RUN_HERE)('stage 5: 원격 new · attach · close — host A opens, watches and closes a pane that lives on host B', async () => {
+  const hostA = tempDir('els5-a-');
+  const hostB = tempDir('els5-b-');
+  const sideAt = (state: string, args: string[], host: string, env: Record<string, string> = {}) => simCli(['side', ...args], {
+    mode: 'spawn', allowPaths: [['side']], stateRoot: state, cwd: state, env: { NODE_ENV: 'development', HERDR_ENV: '', ELANOUS_ELS_HOST: host, ...env },
+  });
+  // B's write doors open only to its do-allow list (written before serve boots: the policy is read once, at boot).
+  mkdirSync(join(hostB, 'els'), { recursive: true });
+  writeFileSync(join(hostB, 'els', 'do-allow.json'), JSON.stringify({ sources: ['127.0.0.1', '::1'] }));
+  const port = await freePort();
+  const b = await serve(hostB, ['--http', `127.0.0.1:${port}`], { ELANOUS_ELS_HOST: 'hostb' });
+  expect(b.output()).toContain('listening on');
+  const a = await serve(hostA, [], { ELANOUS_ELS_HOST: 'hosta' });
+  expect(a.output()).toContain('listening on');
+  mkdirSync(join(hostA, 'els'), { recursive: true });
+  // `sh` is registered as a host name on purpose (a command word must never be taken as a host); `relayhost` sits
+  // on a route kind this build has no transport for.
+  writeFileSync(join(hostA, 'els', 'hosts.json'), JSON.stringify({ hosts: [{ name: 'hostb', baseUrl: `http://127.0.0.1:${port}` },
+    { name: 'sh', baseUrl: 'http://127.0.0.1:9' }, { name: 'relayhost', baseUrl: 'http://127.0.0.1:9', route: 'relay' }] }));
+  const plainLocal = await sideAt(hostA, ['new', '--ws', 'LOCAL', '--cwd', hostA, '--', 'sh', '-c', 'printf stayed-local; exec cat'], 'hosta');
+  expect(plainLocal.exitCode, plainLocal.stderr).toBe(0);
+  const localMade = JSON.parse(plainLocal.stdout) as { address: string; pane: string; host?: string };
+  expect(localMade.host).toBe(undefined);
+  expect(localMade.address.includes(':')).toBe(false);
+  let localScreen = '';
+  for (let attempt = 0; attempt < 50 && !localScreen.includes('stayed-local'); attempt += 1) {
+    localScreen = (await sideAt(hostA, ['read', localMade.address], 'hosta')).stdout;
+    if (!localScreen.includes('stayed-local')) await Bun.sleep(100);
+  }
+  expect(localScreen).toContain('stayed-local');
+  const aOwner = await asOwner(hostA);   // a local close walks A's own door (#39143): the person's owner credential
+  const localClosed = await sideAt(hostA, ['pane', 'close', localMade.pane], 'hosta', aOwner);
+  expect(localClosed.exitCode, localClosed.stderr).toBe(0);
+  const relayAttach = await sideAt(hostA, ['attach', 'relayhost/p1'], 'hosta');
+  expect(relayAttach.exitCode).toBe(2);
+  expect(relayAttach.stderr).toContain('els attach: relayhost route relay is not available in this build');
+  const relayNew = await sideAt(hostA, ['new', '--host', 'relayhost', '--', 'sh'], 'hosta');
+  expect(relayNew.exitCode).toBe(1);
+  expect(relayNew.stderr).toContain('els new: relayhost route relay is not available in this build');
+  // Remote new: `els new --host hostb --ws GATE -- …` — B's owner makes the pane; it shows in B's list and in A's
+  // federated ls, and the answer already carries the federated address (`hostb:ws/tab/pane`).
+  const unknownHost = await sideAt(hostA, ['new', '--host', 'nowhere', '--', 'sh'], 'hosta');
+  expect(unknownHost.exitCode).toBe(2);
+  expect(unknownHost.stderr).toContain('els new: host nowhere is not registered in els/hosts.json');
+  const made = await sideAt(hostA, ['new', '--host', 'hostb', '--ws', 'GATE', '--cwd', hostB, '--', 'sh', '-c', 'printf remote-stage-5; exec cat'], 'hosta');
+  expect(made.exitCode, made.stderr).toBe(0);
+  const created = JSON.parse(made.stdout) as { pane: string; address: string; host: string };
+  expect(created.host).toBe('hostb');
+  expect(created.address.startsWith('hostb:')).toBe(true);
+  const bListed = JSON.parse((await sideAt(hostB, ['ls'], 'hostb')).stdout) as { panes: { pane: string }[] };
+  expect(bListed.panes.some((row) => row.pane === created.pane)).toBe(true);
+  const aListed = JSON.parse((await sideAt(hostA, ['ls'], 'hosta')).stdout) as { panes: { address: string; reach: string }[] };
+  expect(aListed.panes.map((row) => [row.address, row.reach])).toEqual([[created.address, 'up']]);
+  // `els read hostb:ws/tab/pane` straight from the created answer.
+  let read = '';
+  for (let attempt = 0; attempt < 50 && !read.includes('remote-stage-5'); attempt += 1) {
+    read = (await sideAt(hostA, ['read', created.address], 'hosta')).stdout;
+    if (!read.includes('remote-stage-5')) await Bun.sleep(100);
+  }
+  expect(read).toContain('remote-stage-5');
+  // Remote attach over the HTTP line-JSON stream: frames arrive, typed input echoes, detach is quiet and keeps the pane.
+  const screens: string[] = [];
+  let streamEnd: { code: number; reason: string } | undefined;
+  const attached = attachRemote({ name: 'hostb', baseUrl: `http://127.0.0.1:${port}` }, created.pane, { cols: 40, rows: 12 }, {
+    onFrame: (frame) => screens.push(frame.screen),
+    onEnd: (code, reason) => { streamEnd = { code, reason }; },
+  }, 'hosta/stage-5');
+  let saw = '';
+  for (let attempt = 0; attempt < 50 && !saw.includes('remote-stage-5'); attempt += 1) {
+    saw = screens[screens.length - 1] ?? '';
+    if (!saw.includes('remote-stage-5')) await Bun.sleep(100);
+  }
+  expect(saw).toContain('remote-stage-5');
+  attached.input('echo attached-input\n');
+  let echoed = '';
+  for (let attempt = 0; attempt < 50 && !echoed.includes('attached-input'); attempt += 1) {
+    echoed = screens[screens.length - 1] ?? '';
+    if (!echoed.includes('attached-input')) await Bun.sleep(100);
+  }
+  expect(echoed).toContain('attached-input');
+  attached.detach();
+  await Bun.sleep(400);
+  expect(streamEnd).toBe(undefined);   // a detach is quiet (the caller finishes); a closed window or an exit talks
+  const afterDetach = JSON.parse((await sideAt(hostB, ['ls'], 'hostb')).stdout) as { panes: { pane: string }[] };
+  expect(afterDetach.panes.some((row) => row.pane === created.pane)).toBe(true);   // the pane kept running on B
+  // Remote close: `host/pane` — B's owner closes it; B's list is empty again.
+  const closed = await sideAt(hostA, ['pane', 'close', `hostb/${created.pane}`], 'hosta');
+  expect(closed.exitCode, closed.stderr).toBe(0);
+  const bAfter = JSON.parse((await sideAt(hostB, ['ls'], 'hostb')).stdout) as { panes: unknown[] };
+  expect(bAfter.panes).toEqual([]);
+  // B's audit names every attempt (op new · attach · close) and never the typed bytes.
+  const audit = readFileSync(join(hostB, 'els', 'do-audit.jsonl'), 'utf8').trim().split('\n');
+  expect(audit.some((line) => line.includes('"op":"new"') && line.includes('"ws":"GATE"'))).toBe(true);
+  expect(audit.some((line) => line.includes('"op":"attach"') && line.includes(created.pane) && line.includes('attached'))).toBe(true);
+  expect(audit.some((line) => line.includes('"op":"close"') && line.includes(created.pane))).toBe(true);
+  expect(audit.some((line) => line.includes('attached-input'))).toBe(false);
+  // The federated address form attaches too (`els attach hostb:ws/tab/pane` sends B's own ws/tab/pane).
+  const second = JSON.parse((await sideAt(hostA, ['new', '--host', 'hostb', '--ws', 'GATE', '--cwd', hostB, '--', 'sh', '-c', 'printf by-address; exec cat'], 'hosta')).stdout) as { address: string };
+  const byAddress: string[] = [];
+  const viaAddress = attachRemote({ name: 'hostb', baseUrl: `http://127.0.0.1:${port}` }, second.address.slice('hostb:'.length), { cols: 40, rows: 12 }, {
+    onFrame: (frame) => byAddress.push(frame.screen), onEnd: () => {},
+  }, 'hosta/stage-5');
+  for (let attempt = 0; attempt < 50 && !(byAddress[byAddress.length - 1] ?? '').includes('by-address'); attempt += 1) await Bun.sleep(100);
+  expect(byAddress[byAddress.length - 1] ?? '').toContain('by-address');
+  viaAddress.detach();
+  expect((await sideAt(hostA, ['pane', 'close', second.address], 'hosta')).exitCode).toBe(0);
+}, 120_000);
+
 test('serve --http refuses a public bind address', async () => {
   const state = tempDir('els-pub-');
   const refused = await serve(state, ['--http', '0.0.0.0:8790']);
@@ -344,6 +484,7 @@ Options:
   -h, --help                                               display help for command
 
 Commands:
+  worktree [sub] [path]                                    Git worktrees: list panes per worktree, open one in a pane, or remove an empty one
   seat [seat]                                              Open a seat tab, or register OP with \`els seat set OP\`
   baton                                                    Delegate or return the OP acting lease
   supervisor                                               The launchd user agent that keeps the els server running: on · off · status

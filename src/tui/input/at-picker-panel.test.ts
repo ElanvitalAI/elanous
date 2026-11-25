@@ -53,7 +53,7 @@ test('cancel keeps the query dismissed until it changes; leaving the query permi
 
 test('empty and unreadable candidate lists leave Enter to the ordinary composer', async () => {
   const panel = createAtPickerPanel('/fixture', async () => []);
-  expect(await panel.refresh('@missing', 8)).toContain('후보 없음');
+  expect(await panel.refresh('@missing', 8)).toBe('@ no matching files · keep typing');
   expect(panel.handleKey(key('down'), '@missing')).toBeNull();
   expect(panel.handleKey(key('enter'), '@missing')).toBeNull();
   expect(panel.handleKey(key('escape'), '@missing')?.kind).toBe('dismissed');
@@ -74,4 +74,25 @@ test('late directory reads cannot reopen a closed panel or replace newer candida
   pending.get('c')!([candidate('c.txt')]);
   await closing;
   expect(panel.isOpen).toBe(false);
+});
+
+test('Enter or Tab on a folder descends into it and keeps the picker query live', async () => {
+  const listed: string[] = [];
+  const panel = createAtPickerPanel('/fixture', async (prefix) => {
+    listed.push(prefix);
+    return prefix === 'sr'
+      ? [{ label: 'src/', absPath: '/fixture/src', isDir: true }]
+      : [{ label: 'src/a.png', absPath: '/fixture/src/a.png', isDir: false }];
+  });
+  await panel.refresh('look @sr', 8);
+  expect(panel.panel?.rows).toEqual([{ label: 'src/', description: 'folder' }]);
+  const descended = panel.handleKey(key('tab'), 'look @sr');
+  expect(descended).toEqual({ kind: 'descended', text: 'look @src/', cursor: 10 });
+  expect(panel.isOpen).toBe(false);
+  await panel.refresh('look @src/', 10);
+  expect(panel.panel?.rows).toEqual([{ label: 'src/a.png', description: 'image' }]);
+  const picked = panel.handleKey(key('enter'), 'look @src/');
+  if (picked?.kind !== 'selected') throw new Error('image not selectable');
+  expect(picked.accept(1)).toEqual({ text: 'look [image 1: a.png] ', cursor: 22, token: '[image 1: a.png]', absPath: '/fixture/src/a.png' });
+  expect(listed).toEqual(['sr', 'src/']);
 });

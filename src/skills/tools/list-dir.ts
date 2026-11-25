@@ -25,6 +25,7 @@ import { readdirSync, statSync, lstatSync, readlinkSync } from 'node:fs';
 import { isAbsolute, resolve, join } from 'node:path';
 
 import { getSessionCwd } from '../../session/working-dir.js';
+import { expandHomePath } from '../../agent/path-policy.js';
 import { debug } from '../../debug/log.js';
 import { noteBroadSearch } from './search-loop-guard.js';
 
@@ -83,7 +84,7 @@ export function buildListDirTool(): LLMToolSpec {
 }
 
 export async function dispatchListDir(args: Record<string, unknown>): Promise<ListDirResult> {
-  const raw = String(args.path ?? '').trim();
+  const raw = expandHomePath(String(args.path ?? '').trim());
   if (!raw) throw new Error('path is required');
   // WD6 — relative path resolves against the session working dir.
   const abs = isAbsolute(raw) ? resolve(raw) : resolve(getSessionCwd(), raw);

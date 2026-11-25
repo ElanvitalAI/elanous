@@ -29,7 +29,7 @@ test('active acting seat is marked in spaces and agents, never inferred from tit
   const remote: SpaceTabRow = { ...rows[0]!, pane: 'remote:p1', wsId: 'remote:w1', workspace: 'remote', remote: 'remote' };
   const draw = (acting?: string) => trim(layoutSpaceList([...rows, remote], 'p1', 28, 20, undefined, 0, [], undefined, 'grouped', acting).lines);
   const active = draw('TC-1');
-  expect(active.filter(line => line.includes('[OP 대행]'))).toEqual([' [OP 대행] ALPHA', ' 🟢 [OP 대행] worker']);
+  expect(active.filter(line => line.includes('[OP 대행]'))).toEqual([' [OP 대행] ALPHA', ' 🟢 [OP 대행] TC-1']);
   expect(active.some(line => line.includes('[OP 대행] BETA') || line.includes('[OP 대행] REMOTE'))).toBe(false);
   expect(draw().some(line => line.includes('[OP 대행]'))).toBe(false);
 });
@@ -51,15 +51,15 @@ test('status mode: the agents panel flattens — every space\'s panes in one ran
     ' BETA',
     ' GAMMA',
     '────────────────────────────',
-    ' agents               status',
+    ' ○ All · 4            status',
     ' 🟢 build',
-    '       shell · alpha',
     ' 🟡 review',
-    '       shell · beta',
     ' ⚪ old',
-    '       shell · alpha',
     ' 🔴 seed',
-    '       shell · gamma',
+    '',
+    '',
+    '',
+    '',
     '',
     '',
     ' new · menu',
@@ -70,21 +70,21 @@ test('status mode: the agents panel flattens — every space\'s panes in one ran
 test('default stays grouped: each space\'s own panes together, status order inside the space, the head reads «grouped»', () => {
   const layout = layoutSpaceList(ROWS, 'p1', 28, 18, '/Users/me');
   expect(trim(layout.lines)).toEqual([
-    ' spaces',
+    ' spaces         ▾ all ▸ all',
     ' ALPHA',
     '   2 agents · alpha',
     ' BETA',
     ' GAMMA',
     '────────────────────────────',
-    ' agents              grouped',
+    ' ○ All · 4           grouped',
+    ' ▾ ALPHA · 2',
     ' 🟢 build',
-    '       shell · alpha',
     ' ⚪ old',
-    '       shell · alpha',
+    ' ▾ BETA · 1',
     ' 🟡 review',
-    '       shell · beta',
+    ' ▾ GAMMA · 1',
     ' 🔴 seed',
-    '       shell · gamma',
+    '',
     '',
     '',
     ' new · menu',
@@ -136,7 +136,7 @@ test('the app flips the panel on ctrl+b g and back: grouped (an earlier space\'s
   });
   await app.start('p1'); await Bun.sleep(20);
   const side = () => (screens.at(-1) ?? '').split('\r\n').map((line) => line.split('│')[0] ?? '');
-  const head = () => side().find((line) => /^agents\s/.test(line.trim()));
+  const head = () => side().find((line) => /^(○ All|◉ Active)/.test(line.trim()));
   const agentAt = (needle: string) => side().findIndex((line, at) => at > side().findIndex((l) => l === head()) && line.includes(needle));
   expect(head()).toContain('grouped');
   expect(agentAt('⚪')).toBeLessThan(agentAt('🟡'));          // grouped: w1's idle before w2's blocked

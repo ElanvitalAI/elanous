@@ -1,0 +1,89 @@
+# STEWARD-SPACE — 행정관 (대표 11-25 «서브 조율자 밑에 두는 행정관» · 조율자 L1 «규칙만» 층 · LOOP-AGENTS §1a 레시피 · §2 규칙 8·10·11)
+# One logical instance per coordinator scope (`steward:<scope>`, scopes from the federation ladder — els journal ⊕
+# federation.yaml, never a literal list). Input `{scope?, shadow?, seat?}` from `graph run --input` or the event payload;
+# no scope = every scope (sub-coordinators first, HQ last). Mode per scope = config `loops.stewardSpace` (off by default).
+# All nodes are deterministic `cmd:` recipes (src/steward/space/tick.ts) — no LLM, no new landing path (r4 = hand-off).
+graph_id: steward-space
+loop:
+  title: 행정관 (교통정리 위성)
+  # Registration root — `eln loop start steward-space --yes` installs the */10 cron (one `loop cron` line · guarded log).
+  # The cron runs with no input: a scope acts only when `loops.stewardSpace.scopes.<SCOPE>.mode` is shadow/live.
+  root: 조율자
+  trigger:
+    cron: '*/10 * * * *'
+    events: [pr-opened, pr-updated, pregate-done, landed, seat-idle, cell-changed, handraise-timeout]
+version: 1
+entry_node: snapshot
+terminal_nodes: [done, failed]
+nodes:
+  # R0 — one snapshot (els panes · checklist · open PRs · receipts · verdicts · UTIL · ladder · open ✋) + degrade check.
+  - node_id: snapshot
+    kind: agent
+    recipe: cmd:steward-space-r0
+    max_visits: 1
+  # R1 — idle hand × unowned / 2h-stalled yellow P0·P1 in scope; HQ lends idle hands across scopes.
+  - node_id: match
+    kind: agent
+    recipe: cmd:steward-space-r1
+    max_visits: 1
+  # R2 — non-draft PR without a same-head receipt → pregate --light on a pre-approved host slot under the load cap.
+  - node_id: receipt
+    kind: agent
+    recipe: cmd:steward-space-r2
+    max_visits: 1
+  # R3 — GREEN receipt, no verdict 30 min+ → an idle judge hand of the scope.
+  - node_id: judge
+    kind: agent
+    recipe: cmd:steward-space-r3
+    max_visits: 1
+  # R4 — PASS on the current head → the existing poller/train (rows only).
+  - node_id: land
+    kind: agent
+    recipe: cmd:steward-space-r4
+    max_visits: 1
+  # R5 — watch promises: assignment picked up · receipt arrived/stuck · REL cut readiness · RES VM pressure.
+  - node_id: watch
+    kind: agent
+    recipe: cmd:steward-space-r5
+    max_visits: 1
+  # R6 — 30-minute numbers to the scope's coordinator; HQ adds the one-line rollup of every scope.
+  - node_id: digest
+    kind: agent
+    recipe: cmd:steward-space-r6
+    max_visits: 1
+  # X — one batched exception card per scope to its coordinator; unresolved/cross-scope rows climb via HQ only.
+  - node_id: exceptions
+    kind: agent
+    recipe: cmd:steward-space-x
+    max_visits: 1
+  - node_id: done
+    kind: gate
+    max_visits: 1
+  - node_id: failed
+    kind: gate
+    max_visits: 1
+edges:
+  - from: snapshot
+    on: outcome
+    map: { ok: match, fail: failed }
+  - from: match
+    on: outcome
+    map: { ok: receipt, fail: failed }
+  - from: receipt
+    on: outcome
+    map: { ok: judge, fail: failed }
+  - from: judge
+    on: outcome
+    map: { ok: land, fail: failed }
+  - from: land
+    on: outcome
+    map: { ok: watch, fail: failed }
+  - from: watch
+    on: outcome
+    map: { ok: digest, fail: failed }
+  - from: digest
+    on: outcome
+    map: { ok: exceptions, fail: failed }
+  - from: exceptions
+    on: outcome
+    map: { ok: done, fail: failed }

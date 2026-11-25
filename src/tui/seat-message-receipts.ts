@@ -25,6 +25,23 @@ export interface SeatMailMessage extends StructuredMessageFields {
   createdAt?: string;
   /** QUEUE-FINISH-FIRST: ledger `reply_to` — a reply to a mail the current work waits on joins that work. */
   replyTo?: number;
+  /** BULK-TRIAGE: ledger `deadline_at` and `priority` (urgent 2 · p0 1 · normal 0) — ranking fields for the triage card. */
+  deadlineAt?: string;
+  priority?: number;
+  /** AUTOPILOT-GOAL-CLEARING: ledger refs (`goal-done:<ref>` · `goal:replace`) and the request's done condition. */
+  refs?: string[];
+  doneWhen?: string;
+  /** CROWN-GOAL-APPLY: the structured goal field (`msg post --goal`) — the receiving autopilot applies it. */
+  goal?: string;
+  /** HAND-RAISE-REPLY-GATE: the request↔reply correlation id (a ✋ mail carries its blockId). */
+  correlationId?: string;
+  /** MAIL-TRIAGE-TASKQUEUE: supersedes · result envelope state — the triage merge/close fields. */
+  supersedes?: number;
+  /** DIRECTIVE-EXPIRY (Q5): the structured expiry (ISO) — goal pins close when it passes. */
+  expiresAt?: string;
+  result?: { state: 'done' | 'failed' };
+  /** SEAT-MAIL-PASSIVE-DEFAULT: the sender's needs-reply flag (`needsAck`) — such a mail opens a turn. */
+  needsAck?: boolean;
 }
 
 export interface SeatMailMessageRead {
@@ -87,6 +104,11 @@ export function seatMailMessageOf(m: Message): SeatMailMessage {
     ...(m.origin === undefined ? {} : { origin: m.origin }), ...(m.intent === undefined ? {} : { intent: m.intent }),
     ...(m.crownDirective === undefined ? {} : { crownDirective: m.crownDirective }),
     ...(m.replyTo === undefined ? {} : { replyTo: m.replyTo }),
+    ...(m.deadlineAt ? { deadlineAt: m.deadlineAt } : {}), ...(typeof m.priority === 'number' && m.priority > 0 ? { priority: m.priority } : {}),
+    ...(m.refs?.length ? { refs: m.refs } : {}), ...(m.doneWhen ? { doneWhen: m.doneWhen } : {}),
+    ...(m.goal ? { goal: m.goal } : {}), ...(m.correlationId ? { correlationId: m.correlationId } : {}),
+    ...(typeof m.supersedes === 'number' ? { supersedes: m.supersedes } : {}), ...(m.expiresAt ? { expiresAt: m.expiresAt } : {}), ...(m.result ? { result: { state: m.result.state } } : {}),
+    ...(m.needsAck === true ? { needsAck: true } : {}),
   };
 }
 

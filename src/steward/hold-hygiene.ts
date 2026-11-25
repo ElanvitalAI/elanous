@@ -78,7 +78,7 @@ export function inspectHoldHygiene(deps: HygieneDeps): HygieneNotice[] {
     if (!finding) continue;
     const detail = Object.entries(finding.reasons).map(([reason, count]) => `${reason} ×${count}`).join(' · ') || '건너뜀 사유 미기록';
     const body = `${seat} 디스패처 굶주림: 최근 3주기 예산>0 · 발사 0 · 여유 없음 0. 건너뜀: ${detail}. 후보 칸·잠금·경로를 확인해 주세요.`;
-    for (const to of new Set<Seat>(['OP', seat])) notices.push({ to, key: `starve:${seat}:${to}`, body });
+    for (const to of new Set<Seat>([((require('../org/org-map.js') as typeof import('../org/org-map.js')).orgDuty('steward-cards')) as Seat, seat])) notices.push({ to, key: `starve:${seat}:${to}`, body });
   }
   const signal = readTrafficSignal(deps.trafficPath);
   if (!signal || 'unreadable' in signal) return notices;

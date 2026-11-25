@@ -6,8 +6,8 @@
 export type ButtonId = 'background' | 'quit';
 
 export const BUTTONS: readonly { readonly id: ButtonId; readonly label: string }[] = [
-  { id: 'background', label: '⏏ 백그라운드' },
-  { id: 'quit', label: '✕ 종료' },
+  { id: 'background', label: '⏏ Background' },
+  { id: 'quit', label: '✕ Quit' },
 ];
 const GAP = '  ';
 

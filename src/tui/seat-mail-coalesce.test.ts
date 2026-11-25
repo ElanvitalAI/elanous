@@ -121,7 +121,7 @@ function world() {
 }
 
 describe('synthesis — 30-mail burst on an idle seat', () => {
-  test('30 mails (10 request · 20 info) → 2 digest turns · all 30 acked by id after the turns that carried them (MSG-FILTERS-RELAX)', () => {
+  test('30 mails (10 request · 20 info) → 1 digest turn (queue cap 100 · SEAT-QUEUE-CAPACITY CEO 11-25 · was 2 turns at cap 20) · all 30 acked by id after the turns that carried them (MSG-FILTERS-RELAX)', () => {
     const w = world();
     w.watcher.poll(); // baseline
     const ids: number[] = [];
@@ -130,9 +130,8 @@ describe('synthesis — 30-mail burst on an idle seat', () => {
       ids.push(w.store.post({ from: 'TC', to: SEAT, body: `mail ${i}`, ...(action ? { kind: 'request' } : { kind: 'info' }) }).id);
     }
     w.runDoor();
-    expect(w.turns).toHaveLength(2);
-    expect(w.turns[0]!.startsWith('[seat-mail digest] 20 mails — 6 need action · 14 info')).toBe(true);
-    expect(w.turns[1]!.startsWith('[seat-mail digest] 10 mails — 4 need action · 6 info')).toBe(true);
+    expect(w.turns).toHaveLength(1);
+    expect(w.turns[0]!.startsWith('[seat-mail digest] 30 mails — 10 need action · 20 info')).toBe(true);
     const infoIds = ids.filter((_, index) => (index + 1) % 3 !== 0);
     const actionIds = ids.filter((_, index) => (index + 1) % 3 === 0);
     expect([...w.acks].sort((a, b) => a - b)).toEqual(ids);
@@ -143,12 +142,12 @@ describe('synthesis — 30-mail burst on an idle seat', () => {
     expect(w.store.unreadCount(SEAT)).toBe(0);
     expect(w.logs.filter((event) => event === 'seat-mail-info-acked')).toHaveLength(20);
     expect(w.logs.filter((event) => event === 'seat-mail-turn-acked')).toHaveLength(10);
-    // nothing comes back: the seat is quiet after the two digest turns
+    // nothing comes back: the seat is quiet after the one digest turn
     w.runDoor();
-    expect(w.turns).toHaveLength(2);
+    expect(w.turns).toHaveLength(1);
   });
 
-  test('info-only mail on an idle seat opens no turn before 120 s, then exactly one digest turn that acks them', () => {
+  test('info-only mail on an idle seat opens no turn before 10 min (SEAT-REPLY-DELTA-ONLY ② ⊕ SEAT-MAIL-PASSIVE-DEFAULT), then exactly one digest turn that acks them', () => {
     const T0 = new Date('2026-11-23T22:40:00Z').getTime();
     setSystemTime(new Date(T0));
     const w = world();
@@ -157,10 +156,10 @@ describe('synthesis — 30-mail burst on an idle seat', () => {
     w.runDoor();
     expect(w.turns).toHaveLength(0);
     expect(w.queue.count).toBe(5);
-    setSystemTime(new Date(T0 + 119_999));
+    setSystemTime(new Date(T0 + 599_999));
     w.runDoor();
     expect(w.turns).toHaveLength(0);
-    setSystemTime(new Date(T0 + 120_000));
+    setSystemTime(new Date(T0 + 600_000));
     w.runDoor();
     expect(w.turns).toHaveLength(1);
     expect(w.turns[0]!.startsWith('[seat-mail digest] 5 mails — 0 need action · 5 info')).toBe(true);
@@ -194,5 +193,24 @@ describe('synthesis — 30-mail burst on an idle seat', () => {
     expect(logs.filter((event) => event === 'seat-mail-requeued')).toHaveLength(1);
     expect(logs.filter((event) => event === 'seat-mail-gave-up')).toHaveLength(1);
     expect(store.unreadCount(SEAT)).toBe(1);
+  });
+});
+
+describe('SEAT-MAIL-PASSIVE-DEFAULT — passive lines are short and fold by sender', () => {
+  test('a passive digest line keeps 24 body chars', () => {
+    expect(seatMailDigestLine({ id: 7, sender: 'TC-H1', body: 'abcdefghijklmnopqrstuvwxyz0123', kind: 'notice' }, 24)).toBe('#7 · TC-H1 · notice · abcdefghijklmnopqrstuvwx…');
+  });
+  test('2+ passive mails from one sender fold into one line at the first one\'s place; action lines stay as they are', () => {
+    const text = seatMailBundleText([
+      { text: 'P1', source: 'seat-mail', msgId: 11, passive: true, digest: '#11 · TC-H1 · status · a', mail: { sender: 'TC-H1', digestBodyAt: 23 } },
+      { text: 'Q', source: 'seat-mail', msgId: 12, digest: '#12 · UX · question · go?', mail: { sender: 'UX', digestBodyAt: 22 } },
+      { text: 'P2', source: 'seat-mail', msgId: 13, passive: true, digest: '#13 · TC-H1 · - · b', mail: { sender: 'TC-H1', digestBodyAt: 18 } },
+      { text: 'P3', source: 'seat-mail', msgId: 14, passive: true, digest: '#14 · JUD · notice · c', mail: { sender: 'JUD', digestBodyAt: 21 } },
+    ]);
+    expect(text).toBe([
+      '[seat-mail digest] 4 mails — 1 need action · 3 info (every mail listed here is acked automatically after this turn)\n'
+        + '- TC-H1 ×2 · #11 status · #13 -\n- #12 · UX · question · go?\n- #14 · JUD · notice · c',
+      'Q',
+    ].join('\n\n'));
   });
 });

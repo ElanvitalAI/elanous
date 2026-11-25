@@ -37,13 +37,14 @@ test('HQ alone has a space star; each coordinator alone has a tab star and bold 
   expect(plain(buildTabRow(rows, 'lead', 80).line!)).not.toContain('⭐ MEMBER');
 });
 
+// ELS-SCROLL-MOUSE: an overflowing list carries the thin scrollbar (track │ · thumb ┃) in its last column.
 // 출처: OP #134199/#134203/#134223/#134227 — spaces 칸은 상태 없는 이름(조율자 ⭐만), 포커스된 스페이스만 2줄,
 // 아래 «agents grouped» 칸이 뒤따른다.
 test('left = herdr: «spaces» head, plain UPPERCASE name (no dot — OP #134203), the selected space\'s «N agents · branch» under it, then the agents panel, «new · menu» last', () => {
   const layout = layoutSpaceList(WITH_CWD, 'p2', 24, 8, '/Users/me');
-  expect(trim(layout.lines)).toEqual([' spaces', ' UX', '   3 agents · ux', ' OP', ' MSHQ', '────────────────────────', ' agents          grouped', ' new · menu']);
+  expect(trim(layout.lines)).toEqual([' spaces     ▾ all ▸ all', ' UX                    ┃', '   3 agents · ux       ┃', ' OP                    ┃', ' MSHQ                  ┃', '───────────────────────│', ' ○ All · 3       groupe│', ' new · menu']);
   expect(layout.lines.every((line) => Bun.stringWidth(line) === 24)).toBe(true);
-  expect(layout.lines.join('\n')).not.toMatch(/codex|zsh|Sessions|Harness|· \d/);
+  expect(layout.lines.join('\n')).not.toMatch(/codex|zsh|Sessions|Harness|[A-Z] · \d/);
   expect(ROWS[0]!.workspace).toBe('ux');                           // upper case is display only: the stored name is untouched
 });
 
@@ -58,10 +59,10 @@ test('hit boxes: each space name row (not the head, the path or the blank), and 
 });
 
 test('the path line belongs to the selected space only: selecting another moves it (none when that space has no folder); a long path keeps its tail, cut by cells', () => {
-  expect(trim(buildSpaceList(WITH_CWD, 'p4', 24, 5, '/Users/me'))).toEqual([' spaces', ' UX', ' OP', '   1 agent · op', ' new · menu']);
+  expect(trim(buildSpaceList(WITH_CWD, 'p4', 24, 5, '/Users/me'))).toEqual([' spaces     ▾ all ▸ all', ' UX                    ┃', ' OP                    │', '   1 agent · op        │', ' new · menu']);
   const long = WITH_CWD.map((row) => row.wsId === 'ux' ? { ...row, workspace: '아주긴작업공간이름입니다만더길게써서잘리는지', cwd: '/Users/me/프로젝트/아주아주긴폴더이름/그리고또긴하위폴더' } : row);
   const lines = buildSpaceList(long, 'p1', 24, 8, '/Users/me');
-  expect(trim(lines).slice(1, 3)).toEqual([' 아주긴작업공간이름입니…', '   …· 그리고또긴하위폴더']);
+  expect(trim(lines).slice(1, 3)).toEqual([' 아주긴작업공간이름입… ┃', '   …· 그리고또긴하위폴 ┃']);
   expect(lines.every((line) => Bun.stringWidth(line) === 24)).toBe(true);
 });
 
@@ -73,9 +74,9 @@ test('space lines carry no status dot any more (OP #134203): whatever the panes 
 });
 
 test('a short list scrolls to keep the selected space and its subtitle line in view; the head and the last line stay', () => {
-  expect(trim(buildSpaceList(ROWS, 'p5', 24, 4))).toEqual([' spaces', ' MSHQ', '   1 agent · mshq', ' new · menu']);
+  expect(trim(buildSpaceList(ROWS, 'p5', 24, 4))).toEqual([' spaces     ▾ all ▸ all', ' MSHQ', '   1 agent · mshq', ' new · menu']);
   const deep = ROWS.map((row) => row.wsId === 'mshq' ? { ...row, cwd: '/srv/mshq' } : row);
-  expect(trim(buildSpaceList(deep, 'p5', 24, 4))).toEqual([' spaces', ' MSHQ', '   1 agent · mshq', ' new · menu']);
+  expect(trim(buildSpaceList(deep, 'p5', 24, 4))).toEqual([' spaces     ▾ all ▸ all', ' MSHQ', '   1 agent · mshq', ' new · menu']);
   expect(trim(buildSpaceList(ROWS, 'p5', 24, 2))).toEqual([' MSHQ', ' new · menu']);
 });
 
@@ -111,7 +112,7 @@ test('overflow keeps the selected tab and shows ‹ ›; no panes = no row', () 
   expect(narrow.line).toBe(`‹${A}  ZSH 🟡  ${O}  +  `);
   expect(narrow.tabs).toEqual([{ from: 1, to: 11, pane: 'p3' }]);
   const first = buildTabRow(ROWS, 'p1', 16);
-  expect(first.line).toBe(`${A}  ELN  ${O}  ›      `);
+  expect(first.line).toBe(`${A}  ELN  ${O}        ›`);  // ELS-SCROLL-MOUSE: «›» pinned to the right end
   expect(buildTabRow([], undefined, 40)).toEqual({ tabs: [] });
 });
 

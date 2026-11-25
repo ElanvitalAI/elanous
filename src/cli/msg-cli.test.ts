@@ -20,6 +20,12 @@ setDefaultTimeout(60_000);
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
+const STRUCTURED_POST_FLAGS = ['--kind', '--intent', '--announce', '--crown-directive', '--origin-key', '--ref'];
+function withLegacyKind(args: string[]): string[] {
+  if (args[0] !== 'post' || args.some((a) => STRUCTURED_POST_FLAGS.includes(a) || a.startsWith('--kind='))) return args;
+  return [...args, '--kind', 'info'];
+}
+
 function fixture(stdin = '', overrides: (context: { path: string }) => Partial<MsgCliDeps> = () => ({})) {
   const dir = mkdtempSync(join(tmpdir(), 'msg-cli-'));
   dirs.push(dir);
@@ -45,7 +51,9 @@ function fixture(stdin = '', overrides: (context: { path: string }) => Partial<M
     ...overrides({ path }),
   });
   return {
-    run: async (...args: string[]) => { await program.parseAsync(['msg', ...args], { from: 'user' }); },
+    // MAIL-ANTI-FLOOD E: these posts predate --kind; the fixture names the passive class (info) the CLI would store anyway,
+    // so their stderr stays free of the kind-less warning. The warning itself is covered by «a kind-less post is stored …».
+    run: async (...args: string[]) => { await program.parseAsync(['msg', ...withLegacyKind(args)], { from: 'user' }); },
     store: () => new MsgStore(path), stdout, stderr, exits, signal, path,
     get sleeps() { return sleeps; },
   };
@@ -53,18 +61,18 @@ function fixture(stdin = '', overrides: (context: { path: string }) => Partial<M
 
 test('post reads piped stdin, accepts literal body and kind; human and JSON outputs preserve envelope', async () => {
   const f = fixture('  stdin with\nnew line  ');
-  await f.run('post', '--from', 's', '--to', 't', '--kind', 'memo');
+  await f.run('post', '--no-coalesce', '--from', 's', '--to', 't', '--kind', 'notice');
   expect(f.stderr).toEqual([]);
   // ELN-MSG-POST-IDEMPOTENT: the human line names the stored message without echoing its body.
-  expect(f.stdout[0]).toMatch(/^#1 \S+ OP → MK \[memo\] · 23 bytes$/);
+  expect(f.stdout[0]).toMatch(/^#1 \S+ OP → MK \[notice\] · 23 bytes$/);
   const store = f.store();
-  try { expect(store.list('MK')[0]).toMatchObject({ id: 1, from: 'OP', to: 'MK', body: '  stdin with\nnew line  ', kind: 'memo' }); }
+  try { expect(store.list('MK')[0]).toMatchObject({ id: 1, from: 'OP', to: 'MK', body: '  stdin with\nnew line  ', kind: 'notice' }); }
   finally { store.close(); }
   f.stdout.length = 0;
-  await f.run('post', 'explicit', '--from', 'ux', '--to', 'mk', '--json');
+  await f.run('post', '--no-coalesce', 'explicit', '--from', 'ux', '--to', 'mk', '--json');
   expect(JSON.parse(f.stdout[0]!)).toMatchObject({ id: 2, from: 'UX', to: 'MK', body: 'explicit' });
   f.stdout.length = 0;
-  await f.run('post', '--body', 'from flag', '--from', 'OP', '--to', 'MK', '--json');
+  await f.run('post', '--no-coalesce', '--body', 'from flag', '--from', 'OP', '--to', 'MK', '--json');
   expect(JSON.parse(f.stdout[0]!).body).toBe('from flag');
 });
 
@@ -72,8 +80,8 @@ test('post reads --body-file and explicit stdin without evaluating literal backt
   const f = fixture('stdin `bun test`', ({ path }) => ({ registerLogSink: async () => undefined }));
   const bodyPath = join(dirname(f.path), 'report.txt');
   writeFileSync(bodyPath, 'file `bun install`\nsecond line');
-  await f.run('post', '--from', 'OP', '--to', 'MK', '--body-file', bodyPath, '--json');
-  await f.run('post', '--from', 'OP', '--to', 'MK', '--body-file', '-', '--json');
+  await f.run('post', '--no-coalesce', '--from', 'OP', '--to', 'MK', '--body-file', bodyPath, '--json');
+  await f.run('post', '--no-coalesce', '--from', 'OP', '--to', 'MK', '--body-file', '-', '--json');
   const store = f.store();
   try { expect(store.list('MK').map(row => row.body)).toEqual(['file `bun install`\nsecond line', 'stdin `bun test`']); }
   finally { store.close(); }
@@ -102,18 +110,18 @@ test('post warns when shell substitution has erased command names from a report'
 
 test('post warns for a Unicode empty value and mixed interior whitespace', async () => {
   const f = fixture();
-  await f.run('post', '--from', 'OP', '--to', 'MK', '--body', '상태=, 다음', '--json');
+  await f.run('post', '--no-coalesce', '--from', 'OP', '--to', 'MK', '--body', '상태=, 다음', '--json');
   expect(f.stderr.some(line => line.includes('빈 값 패턴'))).toBe(true);
   f.stderr.length = 0;
-  await f.run('post', '--from', 'OP', '--to', 'MK', '--body', 'cafe\u0301=, 다음', '--json');
+  await f.run('post', '--no-coalesce', '--from', 'OP', '--to', 'MK', '--body', 'cafe\u0301=, 다음', '--json');
   expect(f.stderr.some(line => line.includes('빈 값 패턴'))).toBe(true);
   for (const separator of ['\u2028', '\u2029']) {
     f.stderr.length = 0;
-    await f.run('post', '--from', 'OP', '--to', 'MK', '--body', `상태=${separator}다음`, '--json');
+    await f.run('post', '--no-coalesce', '--from', 'OP', '--to', 'MK', '--body', `상태=${separator}다음`, '--json');
     expect(f.stderr.some(line => line.includes('빈 값 패턴'))).toBe(true);
   }
   f.stderr.length = 0;
-  await f.run('post', '--from', 'OP', '--to', 'MK', '--body', '앞  \t뒤', '--json');
+  await f.run('post', '--no-coalesce', '--from', 'OP', '--to', 'MK', '--body', '앞  \t뒤', '--json');
   expect(f.stderr.some(line => line.includes('문장 중간 연속 공백'))).toBe(true);
   const store = f.store();
   try { expect(store.list('MK').map(row => row.body)).toEqual(['상태=, 다음', 'cafe\u0301=, 다음', '상태=\u2028다음', '상태=\u2029다음', '앞  \t뒤']); }
@@ -278,7 +286,7 @@ test('post wakes the recipient after the durable save; a reply is passed through
   await f.run('post', 'hello', '--from', 'OP', '--to', 'opt', '--json');
   await f.run('post', 'answer', '--from', 'OPT', '--to', 'OP', '--kind', 'reply', '--json');
   expect(calls).toEqual([
-    { address: 'OPT', msgId: 1, message: { from: 'OP' }, stored: 1 },
+    { address: 'OPT', msgId: 1, message: { from: 'OP', kind: 'info' }, stored: 1 },
     { address: 'OP', msgId: 2, message: { from: 'OPT', kind: 'reply' }, stored: 1 },
   ]);
   expect(f.exits).toEqual([]);
@@ -335,7 +343,7 @@ test('unavailable Herdr census stays unknown; unread filters only confirmed dead
     runHerdrPaneList: () => herdrResult,
     readRegistry: () => ({ status: 'ready', registry: { version: 1, seats: [] } }),
   } }));
-  await f.run('post', 'preserve unknown', '--from', 'OP', '--to', 'pane:wT:p4', '--reject-undeclared');
+  await f.run('post', '--no-coalesce', 'preserve unknown', '--from', 'OP', '--to', 'pane:wT:p4', '--reject-undeclared');
   const store = f.store();
   try { expect(store.list('pane:wT:p4')).toHaveLength(1); } finally { store.close(); }
   await f.run('unread', '--json');
@@ -351,7 +359,7 @@ test('unavailable Herdr census stays unknown; unread filters only confirmed dead
   ] } }) };
   await f.run('route', 'pane:wT:p4', '--json');
   expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ reason: 'ambiguous-pane:candidates=2' });
-  await f.run('post', 'ambiguous durable', '--from', 'OP', '--to', 'pane:wT:p4', '--reject-undeclared');
+  await f.run('post', '--no-coalesce', 'ambiguous durable', '--from', 'OP', '--to', 'pane:wT:p4', '--reject-undeclared');
   expect(f.exits).toEqual([]);
   const afterAmbiguous = f.store();
   try { expect(afterAmbiguous.list('pane:wT:p4')).toHaveLength(2); } finally { afterAmbiguous.close(); }
@@ -361,14 +369,14 @@ test('unavailable Herdr census stays unknown; unread filters only confirmed dead
   herdrResult = { status: 0, stdout: JSON.stringify({ result: { panes: [{ pane_id: 'wT:p4', status: 'dead' }] } }) };
   await f.run('unread', '--to', 'pane:wT:p4', '--json');
   expect(JSON.parse(f.stdout.at(-1)!)).toEqual([]);
-  await f.run('post', 'dead reject', '--from', 'OP', '--to', 'pane:wT:p4', '--reject-undeclared');
+  await f.run('post', '--no-coalesce', 'dead reject', '--from', 'OP', '--to', 'pane:wT:p4', '--reject-undeclared');
   expect(f.exits.at(-1)).toBe(2);
 
   const missingRegistry = fixture('', () => ({ wakeDeps: {
     listHerdrPanes: () => [],
     readRegistry: () => ({ status: 'absent' }),
   } }));
-  await missingRegistry.run('post', 'keep unknown registry', '--from', 'OP', '--to', 'UX', '--reject-undeclared');
+  await missingRegistry.run('post', '--no-coalesce', 'keep unknown registry', '--from', 'OP', '--to', 'UX', '--reject-undeclared');
   expect(missingRegistry.exits).toEqual([]);
   const unknownStore = missingRegistry.store();
   try { expect(unknownStore.list('UX')).toHaveLength(1); } finally { unknownStore.close(); }
@@ -455,10 +463,10 @@ test('real msg post CLI wakes only the explicitly re-opted remote tmux seat', as
   } }));
   await f.run('address', 'register', 'TC-H-CX-15', '--herdr-pane', 'wJ:p10', '--host', 'node-b', '--wake');
   await f.run('address', 'register', 'TC-H-CX-15', '--tmux-session', 'seat-TC-H-CX-15', '--host', 'node-b', '--replace');
-  await f.run('post', '--from', 'OP', '--to', 'TC-H-CX-15', 'before consent');
+  await f.run('post', '--no-coalesce', '--from', 'OP', '--to', 'TC-H-CX-15', 'before consent');
   expect(sent).toHaveLength(0);
   await f.run('address', 'register', 'TC-H-CX-15', '--tmux-session', 'seat-TC-H-CX-15', '--host', 'node-b', '--wake');
-  await f.run('post', '--from', 'OP', '--to', 'TC-H-CX-15', 'after consent');
+  await f.run('post', '--no-coalesce', '--from', 'OP', '--to', 'TC-H-CX-15', 'after consent');
   expect(sent).toHaveLength(1);
   expect(sent[0]).toContain('%21');
   expect(sent[0]).not.toContain('%22');
@@ -1008,7 +1016,7 @@ test('real stdin piping and validation failure use process exit 2 without a stac
   dirs.push(dir);
   const script = `import { Command } from 'commander'; import { registerMsgCommands } from './src/cli/msg-cli.ts';\nconst cli = new Command(); registerMsgCommands(cli); await cli.parseAsync(process.argv.slice(1), { from: 'user' });`;
   const env = { ...process.env, ELANOUS_STATE_DIR: dir };
-  const post = spawnSync('bun', ['-e', script, 'msg', 'post', '--from', 'OP', '--to', 'MK', '--json'],
+  const post = spawnSync('bun', ['-e', script, 'msg', 'post', '--from', 'OP', '--to', 'MK', '--kind', 'info', '--json'],
     { cwd: process.cwd(), env, input: 'actual piped stdin', encoding: 'utf8' });
   expect(post.status, post.stderr).toBe(0);
   expect(JSON.parse(post.stdout).body).toBe('actual piped stdin');
@@ -1034,7 +1042,7 @@ test('real stdin piping and validation failure use process exit 2 without a stac
   expect(help.status, help.stderr).toBe(0);
   expect(help.stdout).toContain('--to <seat>');
   expect(help.stderr).toBe('');
-  const reply = spawnSync('bun', ['-e', script, 'msg', 'post', 'settled yesterday', '--from', 'MK', '--to', 'OP', '--reply-to', '1', '--json'],
+  const reply = spawnSync('bun', ['-e', script, 'msg', 'post', 'settled yesterday', '--from', 'MK', '--to', 'OP', '--reply-to', '1', '--kind', 'status', '--json'],
     { cwd: process.cwd(), env, encoding: 'utf8' });
   expect(reply.status, reply.stderr).toBe(0);
   expect(JSON.parse(reply.stdout)).toMatchObject({ id: 2, replyTo: 1 });
@@ -1448,7 +1456,7 @@ test('post --agent-reply produces one durable linked agent reply after the wake 
   expect(turns).toEqual(['1:OP:hold 신호 확인 필요']);
   // 깨움은 저장 «뒤» 그대로 한 번 — 자동 답은 그 뒤에 붙는다.
   expect(order).toEqual(['wake', 'turn']);
-  expect(wakes).toEqual([{ address: 'COORDINATOR', msgId: posted.id, message: { from: 'OP' } }]);
+  expect(wakes).toEqual([{ address: 'COORDINATOR', msgId: posted.id, message: { from: 'OP', kind: 'info' } }]);
   expect(JSON.parse(f.stdout[1]!)).toEqual({ agentReply: { address: 'COORDINATOR', requestId: posted.id, replyId: 2, posted: true } });
   expect(f.stderr).toEqual([]);
   expect(f.exits).toEqual([]);
@@ -1533,7 +1541,7 @@ test('a dead installed post office is restarted from post and the restarted SSE 
     postOfficeLaunch: input => { launched.push(input.port); },
   });
   writePostOffice(dir, { port: 47821, pid: 999_999 });
-  await program.parseAsync(['msg', 'post', 'durable while the service is down', '--from', 'OP', '--to', 'TC', '--json'], { from: 'user' });
+  await program.parseAsync(['msg', 'post', 'durable while the service is down', '--from', 'OP', '--to', 'TC', '--kind', 'info', '--json'], { from: 'user' });
   expect(exits).toEqual([]);
   expect(launched).toEqual([47821]);
   expect(stderr.at(-1)).toBe('msg: post office 재시작 (port 47821) — 원장이 정본이라 저장된 글은 다시 밀린다');
@@ -1579,7 +1587,7 @@ test('post office restart fires after the durable save, so the launch can alread
     },
   });
   writePostOffice(dir, { port: 47821, pid: 999_999 });
-  await program.parseAsync(['msg', 'post', 'restart must replay me', '--from', 'OP', '--to', 'TC', '--json'], { from: 'user' });
+  await program.parseAsync(['msg', 'post', 'restart must replay me', '--from', 'OP', '--to', 'TC', '--kind', 'info', '--json'], { from: 'user' });
   expect(exits).toEqual([]);
   // 발사는 등록 줄의 포트 그대로, 그리고 저장 «뒤» — 다시 띄운 서비스가 방금 저장한 글을 첫 재생에 민다(원장이 정본).
   expect(launched).toEqual([47821]);
@@ -1892,14 +1900,30 @@ test('real hook child exits 0 within HOOK_STDIN_READ_LIMIT_MS+margin with an unc
 });
 
 describe('MSG-FILTERS-RELAX — msg post accepts and stores instead of refusing', () => {
-  test('an unknown kind is stored lowercased; an unknown intent is stored as info with an intent: ref', async () => {
+  test('MAIL-ANTI-FLOOD E: an unknown kind is refused with the fix (nothing stored); an unknown intent is stored as info with an intent: ref', async () => {
     const f = fixture();
-    await f.run('post', 'hello', '--from', 'OP', '--to', 'TC', '--kind', 'Coord.Reply', '--intent', 'Heads-Up', '--json');
-    expect(f.exits).toEqual([]);
+    await f.run('post', 'hello', '--from', 'OP', '--to', 'TC', '--kind', 'Coord.Reply', '--json');
+    expect(f.exits).toEqual([2]);
+    expect(f.stderr.at(-1)).toStartWith('msg: msg post refused (unknown --kind "Coord.Reply"): add --kind <request|question|decision|alert|info|notice|status|report|announce|coord|ack|receipt|goal>');
+    await f.run('post', 'hello', '--from', 'OP', '--to', 'TC', '--kind', 'Coord', '--intent', 'Heads-Up', '--json');
     const posted = JSON.parse(f.stdout.at(-1)!);
-    expect([posted.kind, posted.intent, posted.refs]).toEqual(['coord.reply', 'info', ['intent:heads-up']]);
+    expect([posted.id, posted.kind, posted.intent, posted.refs]).toEqual([1, 'coord', 'info', ['intent:heads-up']]);
+  });
+
+  test('MAIL-ANTI-FLOOD E·F: a kind-less post is stored as passive info with one warning line (exit 0); self-mail becomes a scheduled wake; coach info becomes a note', async () => {
+    const f = fixture();
+    await f.run('post', 'hello', '--from', 'TC', '--to', 'OP', '--kind', '', '--json');
+    expect(f.exits).toEqual([]);
+    expect(f.stderr).toEqual(['msg post warning (no --kind): stored as --kind info (passive · needsReply=false · no turn) — add --kind <request|question|decision|alert|info|notice|status|report|announce|coord|ack|receipt|goal> and --needs-reply when you wait for an answer']);
+    expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ id: 1, kind: 'info', needsAck: false });
+    await f.run('post', '⏰ 13:20 check', '--from', 'OP', '--to', 'OP', '--kind', 'notice', '--json');
+    expect(JSON.parse(f.stdout.at(-1)!)).toEqual({ diverted: 'self-wake', to: 'OP', kind: 'notice', needsReply: false, line: 'self-mail → scheduled wake for OP (not a mailbox row)' });
+    await f.run('post', 'board', '--from', 'CLAUDE-OP', '--to', 'OP', '--kind', 'info');
+    expect(f.stdout.at(-1)).toBe('msg post: coach injection → coach note for OP (one line per 30 min in its next turn · not mail)');
+    await f.run('post', 'decide?', '--from', 'CLAUDE-OP', '--to', 'OP', '--kind', 'decision', '--json');
+    expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ id: 2, from: 'CLAUDE-OP', kind: 'decision', needsAck: true });
     const store = f.store();
-    try { expect(store.getMessage(posted.id)!.kind).toBe('coord.reply'); } finally { store.close(); }
+    try { expect(store.list('OP').map((m) => m.body)).toEqual(['hello', 'decide?']); } finally { store.close(); }
   });
 
   test('a --from that differs from the caller seat is stored with the caller in origin.seat', async () => {

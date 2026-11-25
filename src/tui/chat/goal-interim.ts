@@ -5,7 +5,7 @@
 //   (n8n 세션 10-22 22:4x), next TUI 는 내부 턴 입력을 «나: [골 이어가기] …» 로 사람 발화처럼 그렸다.
 // ⭐ 이 모듈은 «그리는 층»의 판정만 한다(순수):
 //   ① 내부 턴 입력 글(우리 포매터가 만든 접두)을 알아본다 → 사람 머리(«나:»·«❯») 대신 «↻ 자동 재개(<origin>)».
-//   ② 내부 이어가기 턴 «바로 앞» 답이 중간 보고(못 했다·약속)면 한 줄 «· 진행 — <첫 줄> (접힘)» 로 접는다.
+//   ② (classic 만) 내부 이어가기 턴 «바로 앞» 답이 중간 보고(못 했다·약속)면 한 줄 «· 진행 — <첫 줄> (접힘)» 로 접는다.
 //      마지막 답(골 끝·막힘)은 접지 않는다 → 미완 목록 문단은 한 번만 남는다.
 // ⛔ 세션 기록·모델 입력은 그대로다(화면만 접는다). 판정이 애매하면 접지 않는다(정보를 숨기지 않는 쪽).
 //
@@ -91,7 +91,13 @@ export type InterimDisplay =
   | { kind: 'internal-input'; origin: InternalTurnOrigin }
   | { kind: 'folded'; line: string };
 
-/** 메시지 인덱스 → 그리기 바꿈. 내부 턴 입력은 출처 한 줄, 그 «바로 앞» 중간 보고 답은 한 줄로 접는다. */
+/** 메시지 인덱스 → 그리기 바꿈. 내부 턴 입력은 출처 한 줄, 저장 때부터 중간 보고(`goalInterim`)인 답은 한 줄로 접는다.
+ *
+ *  TUI-ANSWER-VANISH-GOAL-CONTINUE (대표 11-25 «답이 사라진다» · OP be2bc47e 16:57·17:06·17:22): 예전에는 이어가기 입력이
+ *  도착하면 그 «바로 앞» 답을 되돌아가 접었다. #40092 골 드라이브가 약속으로 끝난 답(«…확인하겠습니다.»)마다 이어가기를
+ *  열면서, 사람이 막 읽던 최종 답이 다음 프레임에 «· in progress — … (folded)» 한 줄로 바뀌었다(화면에서 사라짐).
+ *  화면의 대화는 사람 눈으로 append-only 다 — 이미 그린 답을 뒤에 온 행이 접지 않는다. 접힘은 저장 시점의 표시
+ *  (`goalInterim`)로만 정한다(처음 그릴 때부터 접혀 있으니 사라짐이 아니다). */
 export function planInterimDisplay(messages: ReadonlyArray<{ role: string; content?: unknown; goalInterim?: boolean }>): Map<number, InterimDisplay> {
   const plan = new Map<number, InterimDisplay>();
   for (let i = 0; i < messages.length; i++) {
@@ -102,18 +108,7 @@ export function planInterimDisplay(messages: ReadonlyArray<{ role: string; conte
     }
     if (m.role !== 'user' || typeof m.content !== 'string') continue;
     const origin = internalTurnOriginOfText(m.content);
-    if (!origin) continue;
-    plan.set(i, { kind: 'internal-input', origin });
-    if (!isFoldingOrigin(origin)) continue;
-    // 앞 사람/내부 입력 뒤의 마지막 답 하나만 — 도구 블록은 그대로 둔다.
-    for (let j = i - 1; j >= 0; j--) {
-      const prev = messages[j]!;
-      if (prev.role === 'user') break;
-      if (prev.role !== 'assistant' || typeof prev.content !== 'string') continue;
-      const verdict = classifyInterimReply(prev.content.split('\n'));
-      if (verdict.interim) plan.set(j, { kind: 'folded', line: formatInterimFoldLine(verdict.summary) });
-      break;
-    }
+    if (origin) plan.set(i, { kind: 'internal-input', origin });
   }
   return plan;
 }

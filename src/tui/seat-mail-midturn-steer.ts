@@ -17,6 +17,9 @@ export interface SeatMailMidTurnEvent {
   text: string;
   from?: string;
   intent?: string | null;
+  crownDirective?: string | null;
+  originKind?: string | null;
+  viaLedger?: boolean;
 }
 
 /** entry.ts:2233 의 steer 오퍼 시그니처와 동일 — true = 오퍼가 접수됐다(이벤트함 폴백 없음). */
@@ -51,7 +54,9 @@ export function offerSeatMailSteer(
   const steerId = `mail-${msgId}-${nextSerial()}`;
   // 구조화 출처: 결정 여부와 무관하게 자식은 이 줄을 «operator input»이 아니라 «미신뢰 seat-mail 데이터»로
   // 그린다(next-tui-steer 계약 · entry.ts:845 주석과 동일).
-  const seatMail: PendingSeatMailSource = { msgId, from: event.from ?? '?', ...(event.intent !== undefined ? { intent: event.intent } : {}) };
+  const seatMail: PendingSeatMailSource = { msgId, from: event.from ?? '?', ...(event.intent !== undefined ? { intent: event.intent } : {}),
+    ...(event.crownDirective ? { crownDirective: event.crownDirective } : {}), ...(event.originKind ? { originKind: event.originKind } : {}),
+    ...(event.viaLedger === true ? { viaLedger: true } : {}) };
   const accepted = offer(steerId, event.text, decision, seatMail);
   return accepted ? steerId : null;
 }

@@ -1,0 +1,307 @@
+{
+ "schema": "search-bench.gold/1",
+ "corpus": "elanous",
+ "version": 1,
+ "pinnedSha": "6ac7d7b2cc3ebb60a604d36c9ec2eb2240951d76",
+ "items": [
+  {
+   "id": "d01",
+   "domain": "docs",
+   "category": "filename",
+   "query": "JUDGE-LOAD-REDUCTION",
+   "expected": [
+    "docs/conductor/JUDGE-LOAD-REDUCTION.md"
+   ]
+  },
+  {
+   "id": "d02",
+   "domain": "docs",
+   "category": "filename",
+   "query": "FEATURE-SHIP-ACCELERATION",
+   "expected": [
+    "docs/conductor/FEATURE-SHIP-ACCELERATION.md"
+   ]
+  },
+  {
+   "id": "d03",
+   "domain": "docs",
+   "category": "filename",
+   "query": "MEMORY-THREE-INDEXES",
+   "expected": [
+    "docs/conductor/MEMORY-THREE-INDEXES.md"
+   ]
+  },
+  {
+   "id": "d04",
+   "domain": "docs",
+   "category": "filename",
+   "query": "git-control manual",
+   "expected": [
+    "docs/manual/MANUAL-git-control-2026-08-02.md"
+   ]
+  },
+  {
+   "id": "d05",
+   "domain": "docs",
+   "category": "nl-ko",
+   "query": "판정국 부하 줄이기",
+   "expected": [
+    "docs/conductor/JUDGE-LOAD-REDUCTION.md"
+   ]
+  },
+  {
+   "id": "d06",
+   "domain": "docs",
+   "category": "nl-ko",
+   "query": "피처 가속",
+   "expected": [
+    "docs/conductor/FEATURE-SHIP-ACCELERATION.md"
+   ]
+  },
+  {
+   "id": "d07",
+   "domain": "docs",
+   "category": "nl-ko",
+   "query": "자격 금고 정적 키 임대",
+   "expected": [
+    "docs/conductor/HQ-CREDENTIAL-VAULT.md"
+   ]
+  },
+  {
+   "id": "d08",
+   "domain": "docs",
+   "category": "nl-ko",
+   "query": "착지 줄을 그래프로",
+   "expected": [
+    "docs/conductor/LAND-QUEUE-GRAPH.md"
+   ]
+  },
+  {
+   "id": "d09",
+   "domain": "docs",
+   "category": "nl-ko",
+   "query": "시간대 조회 창 0건 읽기",
+   "expected": [
+    "docs/manual/MANUAL-time-and-windows-2026-08-02.md"
+   ]
+  },
+  {
+   "id": "d10",
+   "domain": "docs",
+   "category": "nl-en",
+   "query": "ops heal card contract",
+   "expected": [
+    "docs/conductor/OPS-HEAL-CARD.md"
+   ]
+  },
+  {
+   "id": "d11",
+   "domain": "docs",
+   "category": "nl-en",
+   "query": "els ssh attach from anywhere",
+   "expected": [
+    "docs/conductor/ELS-SSH-ATTACH.md"
+   ]
+  },
+  {
+   "id": "d12",
+   "domain": "docs",
+   "category": "nl-en",
+   "query": "memory search with BM25 vector and ontology indexes",
+   "expected": [
+    "docs/conductor/MEMORY-THREE-INDEXES.md"
+   ]
+  },
+  {
+   "id": "d13",
+   "domain": "docs",
+   "category": "relation",
+   "query": "SMART-MERGE-V2 칸을 만든 문서",
+   "expected": [
+    "docs/conductor/JUDGE-LOAD-REDUCTION.md"
+   ]
+  },
+  {
+   "id": "d14",
+   "domain": "docs",
+   "category": "relation",
+   "query": "HQ-CRED-STATIC-LEASE 칸을 만든 문서",
+   "expected": [
+    "docs/conductor/HQ-CREDENTIAL-VAULT.md"
+   ]
+  },
+  {
+   "id": "d15",
+   "domain": "docs",
+   "category": "relation",
+   "query": "LANDING-20 을 흡수한 문서",
+   "expected": [
+    "docs/conductor/FEATURE-SHIP-ACCELERATION.md"
+   ]
+  },
+  {
+   "id": "d16",
+   "domain": "docs",
+   "category": "nl-ko",
+   "query": "트리거 그래프 레시피 예약",
+   "expected": [
+    "docs/conductor/GRAPH-SCHEDULER.md"
+   ]
+  },
+  {
+   "id": "c01",
+   "domain": "code",
+   "category": "symbol",
+   "query": "dispatchGlob",
+   "expected": [
+    "src/skills/tools/glob.ts"
+   ]
+  },
+  {
+   "id": "c02",
+   "domain": "code",
+   "category": "symbol",
+   "query": "hybridQueryKnowledge",
+   "expected": [
+    "src/domains/knowledge.ts"
+   ]
+  },
+  {
+   "id": "c03",
+   "domain": "code",
+   "category": "symbol",
+   "query": "noteBroadSearch",
+   "expected": [
+    "src/skills/tools/search-loop-guard.ts"
+   ]
+  },
+  {
+   "id": "c04",
+   "domain": "code",
+   "category": "symbol",
+   "query": "createNextTuiQueue",
+   "expected": [
+    "src/tui/core/queue.ts"
+   ]
+  },
+  {
+   "id": "c05",
+   "domain": "code",
+   "category": "filename",
+   "query": "graph-approval-card",
+   "expected": [
+    "src/graph-runner/graph-approval-card.ts"
+   ]
+  },
+  {
+   "id": "c06",
+   "domain": "code",
+   "category": "filename",
+   "query": "ripgrep-core",
+   "expected": [
+    "src/tool-runtime/ripgrep-core.ts"
+   ]
+  },
+  {
+   "id": "c07",
+   "domain": "code",
+   "category": "impl-where",
+   "query": "반복 검색 차단 가드",
+   "expected": [
+    "src/skills/tools/search-loop-guard.ts"
+   ]
+  },
+  {
+   "id": "c08",
+   "domain": "code",
+   "category": "impl-where",
+   "query": "where is the docs search refresh file cap implemented",
+   "expected": [
+    "src/cli/docs-cli.ts",
+    "src/domains/knowledge.ts"
+   ]
+  },
+  {
+   "id": "c09",
+   "domain": "code",
+   "category": "impl-where",
+   "query": "여러 우편 한번에 분류 카드",
+   "expected": [
+    "src/tui/triage/bulk-triage-hook.ts"
+   ]
+  },
+  {
+   "id": "c10",
+   "domain": "code",
+   "category": "call-site",
+   "query": "dispatchGrep 호출하는 곳",
+   "expected": [
+    "src/boot/daemon-tools/index.ts",
+    "src/boot/daemon-tools/grep.ts",
+    "src/eval-prompt-cli.ts",
+    "src/session-runtime/index.ts",
+    "src/skills/runner.ts",
+    "src/skills/tools/persistent-grounding.ts",
+    "src/autopilot/tool-registry.ts"
+   ]
+  },
+  {
+   "id": "c11",
+   "domain": "code",
+   "category": "config-key",
+   "query": "knowledge.docsRoots",
+   "expected": [
+    "src/knowledge/docs-roots.ts",
+    "src/cli/docs-cli.ts",
+    "src/domains/knowledge.ts"
+   ]
+  },
+  {
+   "id": "c12",
+   "domain": "code",
+   "category": "config-key",
+   "query": "tools.nativeStructure.enabled",
+   "expected": [
+    "src/user-config.ts",
+    "src/skills/tools/grep.ts"
+   ]
+  },
+  {
+   "id": "c13",
+   "domain": "code",
+   "category": "nl-en",
+   "query": "daily regression pack runner",
+   "expected": [
+    "src/ux-sim/sim-world/daily-regression/pack.ts"
+   ]
+  },
+  {
+   "id": "c14",
+   "domain": "code",
+   "category": "relation",
+   "query": "DOCS-SEARCH-CONDUCTOR 칸을 구현한 코드",
+   "expected": [
+    "src/domains/knowledge.ts",
+    "src/cli/docs-cli.ts"
+   ]
+  },
+  {
+   "id": "c15",
+   "domain": "code",
+   "category": "symbol",
+   "query": "resolveKnowledgeDocsRoots",
+   "expected": [
+    "src/knowledge/docs-roots.ts"
+   ]
+  },
+  {
+   "id": "c16",
+   "domain": "code",
+   "category": "relation",
+   "query": "DR17 bulk triage 시나리오 코드",
+   "expected": [
+    "src/ux-sim/sim-world/daily-regression/dr17-bulk-triage.ts"
+   ]
+  }
+ ]
+}

@@ -12,8 +12,8 @@ const roots: string[] = [];
 const root = (prefix: string) => { const dir = mkdtempSync(join(tmpdir(), prefix)); roots.push(dir); return dir; };
 afterAll(() => { for (const dir of roots) rmSync(dir, { recursive: true, force: true }); });
 
-test('pack lists DR01–DR08, DR11, DR12, DR14, DR15 and DR16 as scenarios and DR01b/DR09/DR10 as pending (skip with reason)', () => {
-  expect(dailyRegressionScenarios.map((row) => row.id)).toEqual(['DR01', 'DR02', 'DR03', 'DR04', 'DR05', 'DR06', 'DR07', 'DR08', 'DR11', 'DR12', 'DR14', 'DR15', 'DR16']);
+test('pack lists DR01–DR08, DR11, DR12, DR14, DR15, DR16, DR17 and DR18 as scenarios and DR01b/DR09/DR10 as pending (skip with reason)', () => {
+  expect(dailyRegressionScenarios.map((row) => row.id)).toEqual(['DR01', 'DR02', 'DR03', 'DR04', 'DR05', 'DR06', 'DR07', 'DR08', 'DR11', 'DR12', 'DR14', 'DR15', 'DR16', 'DR17', 'DR18']);
   expect(dailyRegressionPending.map((row) => row.id)).toEqual(['DR01b', 'DR09', 'DR10']);
 });
 

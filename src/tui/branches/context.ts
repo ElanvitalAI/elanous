@@ -28,8 +28,8 @@ export function projectNextTuiContextArea(
 }
 
 function attachmentId(token: string): number | null {
-  const match = /^\[attached (\d+): /u.exec(token);
-  // Source: src/tui/input/at-picker.ts acceptAtFile emits a decimal ordinal in the token.
+  const match = /^\[(?:attached|image) (\d+): /u.exec(token);
+  // Source: src/tui/input/at-picker.ts acceptAtFile emits a decimal ordinal in the token («image» for pictures).
   return match ? Number.parseInt(match[1]!, 10) : null;
 }
 

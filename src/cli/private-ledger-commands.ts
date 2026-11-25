@@ -12,7 +12,7 @@ import { isIsolatedLedgerWriteRoot } from '../hq/ledger-write-target.js';
 const privateLedgerWrites: Record<string, readonly string[]> = {
   claims: ['add', 'verify', 'publish', 'link', 'retract', 'list', 'show', 'render', 'recheck'], // list/show can mark expired evidence stale
   lesson: ['add', 'recur', 'enforce', 'promote'],
-  directives: ['sync', 'search', 'list'], // search/list refresh the persistent index too
+  directives: ['sync', 'search', 'list', 'ask'], // search/list refresh the persistent index too
 };
 
 function mayWritePrivateLedger(name: string, args: readonly string[], hqDeps: HqDeps, ledgerRoot: string): boolean {
@@ -68,12 +68,14 @@ export function registerPrivateLedgerCommands(program: Command, hqDeps: HqDeps =
       });
   }
   if (existsSync(resolve(import.meta.dir, 'directives-cli.ts')) || existsSync(resolve(import.meta.dir, 'directives-cli.js'))) {
-    program.command('directives').description('대표 지시 로컬 색인·검색').allowUnknownOption().allowExcessArguments(true)
+    // helpOption(false): `--help` reaches the real command below, which prints every subcommand and period option.
+    program.command('directives').description('사람 발화 로컬 색인·검색·내보내기').helpOption(false).allowUnknownOption().allowExcessArguments(true)
+      .addHelpText('after', '\n  list             최근 발화 (--since/--until/--source/--limit/--json)\n  search <words>   발화 검색\n  ask <문장>       말로 묻기 (의미+키워드 · 한 적 있나 · 기간 내역)\n  export           기간 안 발화 전부 시간순 (--format md|jsonl)\n  sync             원천 색인 동기화\n\n각 명령의 옵션: elanous directives <명령> --help')
       .action(async (_opts: unknown, command: Command) => {
         if (!mayWritePrivateLedger('directives', command.args, hqDeps, ledgerRoot)) return;
         const privateDirectivesModule: string = './directives-cli.js';
         const { registerDirectivesCommands } = await import(privateDirectivesModule) as { registerDirectivesCommands: (program: Command, options: { stateDir: string }) => void };
-        const privateProgram = new Command();
+        const privateProgram = new Command('elanous');
         registerDirectivesCommands(privateProgram, { stateDir: ledgerRoot });
         await privateProgram.parseAsync(['directives', ...command.args], { from: 'user' });
       });

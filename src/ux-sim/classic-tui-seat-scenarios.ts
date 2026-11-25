@@ -161,7 +161,7 @@ export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promi
     cols: 100,
     ...(spec.expectedBinarySha256 ? { expectedBinarySha256: spec.expectedBinarySha256 } : {}),
     ready: spec.scenario === 'classic-first-screen-noise'
-      ? { label: 'first-run provider chooser', until: (screen: string) => screen.includes('처음 실행 LLM 설정') && screen.includes('선택:'), timeoutMs: 90_000 }
+      ? { label: 'first-run provider chooser', until: (screen: string) => screen.includes('First run: set up an LLM') && screen.includes('Choice:'), timeoutMs: 90_000 }
       : { label: 'boot', until: classicReady, timeoutMs: 90_000 },
     // Ctrl+C tears down slower than the device's default window; `/exit` is the clean path.
     quitKeys: '/exit\r',
@@ -182,7 +182,7 @@ export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promi
     env[TEST_FAKE_LLM_TOOL_CALL_ENV] = JSON.stringify({
       when: 'inline-confirm',
       name: 'Agent',
-      args: { description: 'Esc confirmation fixture', prompt: 'hold child for Esc fixture', max_turns: 1 },
+      args: { description: 'Esc confirmation fixture', prompt: 'hold child for Esc fixture', reason: 'Esc fixture', max_turns: 1 },
     });
     env.ELANOUS_TUI_UNATTENDED = '1';
     env[TEST_FAKE_LLM_DELAY_MS_ENV] = '15000';

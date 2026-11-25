@@ -4,11 +4,11 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, utimesSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CommitmentLedger } from '../dashboard/input/commitment-ledger.js';
+import { CommitmentLedger } from '../commitment/ledger.js';
 import {
   SELF_TIMER_BACKOFF_FACTOR, SELF_TIMER_EVENTS, SELF_TIMER_MAX_HORIZON_MS, SELF_TIMER_POLL_MAX_MS, SELF_TIMER_POLL_MIN_MS,
   armWaker, evaluateWaker, formatWaitCondition, listWakers, nextBackoff, parseDuration, parseWaitCondition,
-  reviewResultFileArrived, tickWakers, watchWaker, WakerBindingError, WakerHorizonError, type SelfTimerDeps, type WaitProbes,
+  reviewResultFileArrived, tickWakers, watchWaker, parentAliveProbe, WakerBindingError, WakerHorizonError, type SelfTimerDeps, type WaitProbes,
 } from './self-timer-watch.js';
 
 const roots: string[] = [];
@@ -237,5 +237,37 @@ describe('리뷰 결과 파일 저장소', () => {
     writeFileSync(fresh, JSON.stringify({ pr: 38050 }));
     utimesSync(fresh, new Date(BASE + 1000), new Date(BASE + 1000));
     expect(reviewResultFileArrived(dir, 38050, since, parse)).toBe(true);
+  });
+});
+
+describe('RAIL30 ⑥ — a blocking watch follows its parent', () => {
+  test('parent gone after the second slice → orphaned · the waker stays armed without a watcher pid', async () => {
+    const h = harness();
+    const { waker } = armWaker({ seat: 'TC', commitmentId: h.entry.id, condition: 'pr-merged:38049' }, h.deps);
+    let checks = 0;
+    const result = await watchWaker('TC', waker.id, { ...h.deps, parentAlive: () => ++checks <= 2 });
+    expect(result.outcome).toBe('orphaned');
+    expect(result.waker.status).toBe('armed');
+    expect(result.waker.watcherPid).toBeUndefined();
+    expect(h.sleeps).toEqual([30_000, 30_000]);
+    expect(h.events.map((e) => e.event)).toContain('self-timer.orphaned');
+  });
+
+  test('parent alive → slices of 30 s until the condition holds (fires as before)', async () => {
+    let n = 0;
+    const h = harness({ prMerged: async () => ++n >= 2 });
+    const { waker } = armWaker({ seat: 'TC', commitmentId: h.entry.id, condition: 'pr-merged:38049' }, h.deps);
+    const result = await watchWaker('TC', waker.id, { ...h.deps, parentAlive: () => true });
+    expect(result.outcome).toBe('fired');
+    expect(h.sleeps.every((ms) => ms <= 30_000)).toBe(true);
+  });
+
+  test('production probe: started under pid 1 = no probe · re-parented to 1 = gone', () => {
+    expect(parentAliveProbe(1, () => 1)).toBeUndefined();
+    let ppid = 7068;
+    const probe = parentAliveProbe(7068, () => ppid)!;
+    expect(probe()).toBe(true);
+    ppid = 1;
+    expect(probe()).toBe(false);
   });
 });

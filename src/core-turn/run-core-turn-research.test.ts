@@ -691,7 +691,7 @@ test('research Agent calls wait for results and narrow child tools to read-only 
       return 'Provisional answer';
     }
     await handlers.dispatchTool('Agent', {
-      description: 'check source', prompt: 'read sources only', subagent_type: 'general-purpose',
+      description: 'check source', prompt: 'read sources only', reason: 'fixture', subagent_type: 'general-purpose',
       run_in_background: true, wait_for_slot: true, max_turns: 99,
       tool_filter: { allow: ['Bash'], deny: [] },
     });
@@ -721,7 +721,7 @@ test('research Agent is not dispatched until at least three judgment axes exist'
   spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers) => {
     modelCalls += 1;
     if (modelCalls === 1) return 'Provisional answer';
-    await handlers.dispatchTool('Agent', { description: 'delegate', prompt: 'judge these sources' });
+    await handlers.dispatchTool('Agent', { description: 'delegate', prompt: 'judge these sources', reason: 'fixture' });
     return 'Final answer';
   });
   const request = 'Research recent battery policy updates using current sources.';

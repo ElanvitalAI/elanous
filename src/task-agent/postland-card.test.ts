@@ -51,7 +51,8 @@ describe('TA postland cell and card closure', () => {
       const sync = () => syncMergedPrChecklistWithFeedback(79, f.dir, undefined, {
         readPr: () => ({ ...mergedPr, title: 'feature merge', mergedAt: pr.mergedAt }),
         versions: () => ['0.2.28'], checklist: f.deps.checklist,
-        setStatus: f.deps.setStatus,
+        // sync's setStatus has setItem's 4-arg shape (no snapshot); the stub needs one, so pass the current cell.
+        setStatus: (version, id, patch, by) => f.deps.setStatus(version, id, patch, by, { title: f.item.title, status: f.item.status, evidence: f.item.evidence }),
         candidateTaskCells: () => ['CELL'], boundTaskCells: () => ['CELL'],
         closeTaskCard: (merged, cwd, options) => closeMergedTaskCard(merged, cwd, {
           ...options, statePath: f.statePath, checklist: f.deps.checklist, setStatus: f.deps.setStatus, judge: () => 'proposed', log: () => {},

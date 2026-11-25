@@ -164,6 +164,18 @@ saying what you are about to check and why. After the batch, if the next step ch
 so in one sentence. Do not narrate routine bookkeeping calls (mailbox checks, wake-up
 scheduling) one by one.`;
 
+// SEAT-TURN-PERSIST (대표 11-25 16:3x «Claude 와 Codex 의 도구 호출 프롬프트가 다르다») — the coordinator profile dropped
+//   GPT6_AUTONOMY (coding-hand wording, #39638) and with it every «keep going» line, while the seat contract told OP to
+//   close the turn in one line: terra OP ended turns after 27–59 s with the next step only named. Role-adapted from
+//   ref/codex codex-rs/core/gpt_5_2_prompt.md:111 («keep going until the query or task is completely resolved, before
+//   ending your turn … Persist until the task is fully handled end-to-end»).
+const GPT6_COORDINATOR_PERSIST = `## Persistence (coordinator seat)
+
+Keep going until the goal or request in front of you is resolved, before ending your turn. When you name a next step
+you can take now (assign, wake an owner, check a PR, land, reply), take it in this turn instead of reporting it.
+End the turn only when the done criterion is met or every remaining step waits on someone else (another seat's result,
+an external check, a human decision) — then say in one line what you wait on and when you check next.`;
+
 /** 사람이 찾을 수 있게 «출처»를 산출에도 남긴다 — ⛔ 이 줄이 없으면 다음 사람이 창작으로 읽는다. */
 export const GPT6_ADDENDUM_SOURCE =
   'Source: OpenAI GPT-6 Astra prompting guidance '
@@ -193,6 +205,7 @@ export function buildGpt6FamilyAddendum(): LLMMessage[] {
  */
 export function buildGpt6CoordinatorAddendum(): LLMMessage[] {
   return [
+    { role: 'system', content: GPT6_COORDINATOR_PERSIST },
     { role: 'system', content: GPT6_PERMISSION_TIMING },
     { role: 'system', content: GPT6_INSTRUCTION_PRECEDENCE },
     { role: 'system', content: GPT6_PROGRESS_NARRATION },

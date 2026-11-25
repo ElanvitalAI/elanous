@@ -38,7 +38,9 @@ export type ClosureEvidence =
   | { kind: 'pr'; number: number }
   | { kind: 'checklist'; cellId: string; status: 'green' | 'done' }
   | { kind: 'measured'; metric: string; value: number; unit?: string }
-  | { kind: 'commitment-done'; commitmentId: string; doneEvidence: string };
+  | { kind: 'commitment-done'; commitmentId: string; doneEvidence: string }
+  /** SEAT-TURN-FOLLOWUPS R ⓐ — a person's line with no cell/PR/metric ref: the seat's reply turn that addresses it, or «done: <line>». */
+  | { kind: 'answered'; replyTurnId?: string; done?: string };
 
 export interface WaitFor { commitmentId: string; condition: string; deadlineAt: string }
 
@@ -49,7 +51,8 @@ export interface Requirement {
   closeCondition: string;
   next: string;
   /** expired = an overdue wait escalated once and still open one interval later · superseded = a newer CEO item replaced it. */
-  status: 'open' | 'blocked' | 'closed' | 'expired' | 'superseded';
+  /** stale = BLOCKED with nothing actionable: OP self-closed it with a one-line note (REQ-BLOCK-ROUTE-TO-ASKEE (c)). */
+  status: 'open' | 'blocked' | 'closed' | 'expired' | 'superseded' | 'stale';
   /** Bumped by every structured change (next · wait · evidence). The gap fingerprint is id ⊕ revision. */
   revision: number;
   waitFor?: WaitFor;
@@ -59,8 +62,21 @@ export interface Requirement {
   escalatedAt?: string;
   expired?: { at: string; reason: string };
   supersededBy?: string;
+  /** SEAT-TURN-FOLLOWUPS R ④ — why it was superseded without a newer item (`announcement`: a directive with no evidence refs). */
+  supersededReason?: string;
+  /** SEAT-TURN-FOLLOWUPS R ② — the structured refs (cell: · pr: · metric:) that make a CEO directive evidence-bearing. */
+  refs?: string[];
+  /** SEAT-TURN-FOLLOWUPS R ⓐ — `artifact` (PR · checklist · measured) or `answered` (a person's line with no artifact ref). */
+  evidenceMode?: 'artifact' | 'answered';
+  /** SEAT-TURN-FOLLOWUPS R ③ — the one exception card raised when it blocked (decision id). */
+  exceptionCard?: string;
   /** Recipient seat of the delegated mail (from the mail store), for the escalation line. */
   peer?: string;
+  /** P0 cell owner (checklist `owner`), for the blocked route to the owner's coordinator. */
+  cellOwner?: string;
+  /** REQ-BLOCK-ROUTE-TO-ASKEE — what the blocked route already did (one re-ask · one exception line). */
+  blockRoute?: { reaskAt?: string; reaskTo?: string; reaskMsgId?: number; exceptionAt?: string; exceptionTo?: string };
+  stale?: { at: string; note: string };
   createdAt: string;
   updatedAt: string;
 }
@@ -107,7 +123,7 @@ function touch(r: Requirement, at: string): void {
   if (r.status === 'expired') { r.status = 'open'; delete r.expired; delete r.escalatedAt; }
 }
 
-const isFinal = (r: Requirement): boolean => r.status === 'closed' || r.status === 'superseded';
+const isFinal = (r: Requirement): boolean => r.status === 'closed' || r.status === 'superseded' || r.status === 'stale';
 
 // ── closure gate ──────────────────────────────────────────────────────────────────────
 
@@ -127,6 +143,11 @@ export function validateEvidence(e: unknown): { ok: true; evidence: ClosureEvide
       return typeof v.value === 'number' && Number.isFinite(v.value)
         ? { ok: true, evidence: { kind: 'measured', metric: v.metric, value: v.value, ...(typeof v.unit === 'string' && v.unit ? { unit: v.unit } : {}) } }
         : { ok: false, reason: 'measured-value-required' };
+    case 'answered': {
+      const reply = typeof v.replyTurnId === 'string' && v.replyTurnId.trim() ? v.replyTurnId.trim() : undefined;
+      const done = typeof v.done === 'string' && v.done.trim() ? v.done.trim().slice(0, 300) : undefined;
+      return reply || done ? { ok: true, evidence: { kind: 'answered', ...(reply ? { replyTurnId: reply } : {}), ...(done ? { done } : {}) } } : { ok: false, reason: 'answer-required' };
+    }
     case 'commitment-done':
       return typeof v.commitmentId === 'string' && typeof v.doneEvidence === 'string' && v.doneEvidence.trim()
         ? { ok: true, evidence: { kind: 'commitment-done', commitmentId: v.commitmentId, doneEvidence: v.doneEvidence } } : { ok: false, reason: 'commitment-evidence-required' };
@@ -140,6 +161,8 @@ export function closeRequirement(store: RequirementStore, id: string, evidence: 
   if (r.status === 'closed') return { closed: true };
   const checked = validateEvidence(evidence);
   if (!checked.ok) return { closed: false, reason: checked.reason };
+  // R ⓐ — «answered» closes only a person's line that named no artifact; artifact requirements keep artifact evidence.
+  if (checked.evidence.kind === 'answered' && r.evidenceMode !== 'answered') return { closed: false, reason: 'artifact-evidence-required' };
   // A P0 cell closes on its own cell's status, not on another cell's.
   if (r.source.kind === 'p0-cell' && checked.evidence.kind === 'checklist' && checked.evidence.cellId !== r.source.cellId) return { closed: false, reason: 'other-cell' };
   touch(r, at);
@@ -191,14 +214,64 @@ export function attachWait(store: RequirementStore, id: string, wait: WaitFor, a
 
 export interface SeedInput {
   /** User turns whose structured source is a person (`from.kind === 'human'`) in the OP session. */
-  directives?: ReadonlyArray<{ turnId: string; text: string }>;
+  directives?: ReadonlyArray<{ turnId: string; text: string; refs?: readonly string[]; kind?: string | null; announce?: boolean;
+    /** R ⓐ — the line's structured source is a person in the seat (typed · Telegram TG-OP); false = a crown-flagged relayed mail. */
+    human?: boolean }>;
   /** Current release cells already filtered to priority P0 ∧ owner OP. */
-  p0Cells?: ReadonlyArray<{ version: string; id: string; title: string; status: string }>;
+  p0Cells?: ReadonlyArray<{ version: string; id: string; title: string; status: string; owner?: string }>;
   /** OP's open follow-up commitments bound to a waker (MsgPost request/decision follow-up). */
   delegated?: ReadonlyArray<{ commitmentId: string; msgId: string; text: string; status: string; doneEvidence?: string; wait?: WaitFor; peer?: string }>;
 }
 
 const DIRECTIVE_CLOSE = 'evidence that the directive is done: a PR number, a checklist status green/done, or a measured number';
+
+/** SEAT-TURN-FOLLOWUPS R ② — refs that name something a PR / checklist / measured number can close. */
+export const DIRECTIVE_EVIDENCE_REF_PREFIXES: readonly string[] = ['cell:', 'pr:', 'metric:'];
+/** Mail kinds that are never requirements (ack closes them). */
+export const NON_REQUIREMENT_KINDS: readonly string[] = ['announce', 'info', 'notice', 'status', 'coord', 'bulletin'];
+
+const hasEvidenceRef = (refs: readonly string[] | undefined): boolean =>
+  (refs ?? []).some((ref) => DIRECTIVE_EVIDENCE_REF_PREFIXES.some((prefix) => ref.startsWith(prefix)));
+
+/**
+ * SEAT-TURN-FOLLOWUPS R — is this CEO line a requirement, and how does it close? (structured fields only)
+ *   ⓐ a person's own line in the seat (typed · TG-OP) → always; artifact evidence when it names cell/PR/metric, else «answered»
+ *   ⓑ a crown-flagged relayed mail that is an announcement or info/notice → never (ack closes it)
+ *   ⓒ a crown-flagged request with cell/PR/metric refs → artifact evidence; without refs → not a requirement
+ * Live: crown-flagged bulletins and «keep going» nudges became `ceo:<turn>` requirements nothing could close → «🚨 BLOCKED».
+ */
+export function directiveMode(d: { refs?: readonly string[]; kind?: string | null; announce?: boolean; human?: boolean }): 'artifact' | 'answered' | null {
+  const nonRequirement = d.announce === true || (d.kind ? NON_REQUIREMENT_KINDS.includes(d.kind.trim().toLowerCase()) : false);
+  if (d.human === true) return hasEvidenceRef(d.refs) ? 'artifact' : 'answered';
+  if (nonRequirement) return null;
+  return hasEvidenceRef(d.refs) ? 'artifact' : null;
+}
+/** Back-compat name: true when the line is an artifact-evidence requirement. */
+export function isEvidenceDirective(d: { refs?: readonly string[]; kind?: string | null; announce?: boolean; human?: boolean }): boolean {
+  return directiveMode(d) === 'artifact';
+}
+
+/**
+ * SEAT-TURN-FOLLOWUPS R ④ (coordinator decision 11-25) — on load, a CEO requirement stored before this build (it carries no
+ * `evidenceMode`, which every requirement seeded by this build has) with no evidence refs closes as
+ * «superseded: pre-unify migration»: those were mostly relayed bulletins/nudges and would otherwise reopen and nag.
+ * Returns the ids closed (the caller writes ONE digest line with the count).
+ */
+export function migrateUnreferencedDirectives(store: RequirementStore, at: string): string[] {
+  const closed: string[] = [];
+  for (const r of store.requirements) {
+    if (r.source.kind !== 'ceo-directive' || r.evidenceMode || (r.status !== 'open' && r.status !== 'blocked')) continue;
+    if (hasEvidenceRef(r.refs)) { r.evidenceMode = 'artifact'; continue; }
+    r.status = 'superseded';
+    r.supersededReason = 'pre-unify migration';
+    delete r.blocked;
+    r.updatedAt = at;
+    closed.push(r.id);
+  }
+  return closed;
+}
+
+const ANSWERED_CLOSE = 'answered: the seat\'s reply that addresses it (reply turn id) or «done: <one line>» (eln msg req close <id> --answered-by <turn> | --done "<line>")';
 
 function upsert(store: RequirementStore, r: Omit<Requirement, 'status' | 'revision' | 'createdAt' | 'updatedAt'>, at: string): Requirement {
   const existing = store.requirements.find((x) => x.id === r.id);
@@ -212,12 +285,17 @@ function upsert(store: RequirementStore, r: Omit<Requirement, 'status' | 'revisi
 export function seedRequirements(store: RequirementStore, input: SeedInput, at: string): void {
   for (const d of input.directives ?? []) {
     if (!d.turnId || !d.text.trim()) continue;
+    const mode = directiveMode(d);
+    if (mode === null) continue; // R ⓑⓒ — a relayed announcement / info / unreferenced crown mail is not a requirement (ack closes it)
     upsert(store, { id: `ceo:${d.turnId}`, source: { kind: 'ceo-directive', turnId: d.turnId }, title: d.text.trim().slice(0, 200),
-      closeCondition: DIRECTIVE_CLOSE, next: 'Carry out the directive with tools, then close it with evidence' }, at);
+      closeCondition: mode === 'artifact' ? DIRECTIVE_CLOSE : ANSWERED_CLOSE,
+      next: mode === 'artifact' ? 'Carry out the directive with tools, then close it with evidence' : 'Address the line in this turn, then close it as answered',
+      refs: [...(d.refs ?? [])], evidenceMode: mode }, at);
   }
   for (const c of input.p0Cells ?? []) {
     const r = upsert(store, { id: `p0:${c.version}:${c.id}`, source: { kind: 'p0-cell', version: c.version, cellId: c.id }, title: c.title.slice(0, 200),
       closeCondition: `checklist ${c.id} status green or done`, next: `Find who is moving ${c.id} (PR · pregate · owner) and drive the next missing step` }, at);
+    if (c.owner && !r.cellOwner) r.cellOwner = c.owner;
     if (r.status !== 'closed' && (c.status === 'green' || c.status === 'done')) closeRequirement(store, r.id, { kind: 'checklist', cellId: c.id, status: c.status }, at);
   }
   for (const d of input.delegated ?? []) {
@@ -376,7 +454,79 @@ export function noteContinuationOpened(store: RequirementStore, c: { requirement
 
 /** Counts by state, for `eln msg req list`. */
 export function countByState(store: RequirementStore): Record<Requirement['status'], number> {
-  const counts: Record<Requirement['status'], number> = { open: 0, blocked: 0, closed: 0, expired: 0, superseded: 0 };
+  const counts: Record<Requirement['status'], number> = { open: 0, blocked: 0, closed: 0, expired: 0, superseded: 0, stale: 0 };
   for (const r of store.requirements) counts[r.status] += 1;
   return counts;
+}
+
+// ── REQ-BLOCK-ROUTE-TO-ASKEE — a BLOCKED requirement goes to whoever is blocking it, never to the CEO by default ──────
+
+/** A re-asked seat gets this long before the exception line (same as the mail follow-up wait). */
+export const REASK_BACKOFF_MS = ESCALATION_INTERVAL_MS;
+/** The only gaps a CEO card may carry (CEO 11-25 19:2x). Declared on a CEO requirement as a `gap:<category>` ref. */
+export const CEO_ONLY_GAPS: readonly string[] = ['money', 'security', 'irreversible', 'policy'];
+/** Seats whose silence goes back to CLAUDE-OP once, not to a coordinator (the coach seat and its aliases). */
+const COACH_SEAT = /^(CLAUDE-OP|COACH)(\b|$)/i;
+
+export function ceoGap(r: Requirement): string | undefined {
+  if (r.source.kind !== 'ceo-directive') return undefined;
+  for (const ref of r.refs ?? []) {
+    const m = /^gap:([a-z]+)$/.exec(ref.trim().toLowerCase());
+    if (m && CEO_ONLY_GAPS.includes(m[1]!)) return m[1];
+  }
+  return undefined;
+}
+
+export type BlockedRoute =
+  | { kind: 'ceo-card'; gap: string }
+  | { kind: 'reask'; to: string; body: string }
+  | { kind: 'exception'; to: string; body: string }
+  | { kind: 'hold'; reason: string }
+  | { kind: 'stale'; note: string };
+
+/**
+ * Pure: what a BLOCKED requirement does next. (a) waiting on a delegated mail → one re-ask to the recipient, then (after
+ * the backoff) one exception line to the recipient's coordinator (a coach seat → CLAUDE-OP) · (b) a P0 cell → one
+ * exception line to the cell owner's coordinator · (c) nothing actionable (no recipient · the route lands on the seat
+ * itself · a CEO line without a CEO-only gap) → stale. A CEO card only for a CEO line with a CEO-only gap.
+ */
+export function routeBlocked(r: Requirement, input: { seat: string; now: Date; coordinatorOf: (seat: string) => string | undefined }): BlockedRoute {
+  const self = input.seat.toUpperCase();
+  const route = r.blockRoute ?? {};
+  const nowMs = input.now.getTime();
+  const gap = ceoGap(r);
+  if (gap) return { kind: 'ceo-card', gap };
+  const exceptionTarget = (seat: string): string | undefined => {
+    if (COACH_SEAT.test(seat)) return 'CLAUDE-OP';
+    const coord = input.coordinatorOf(seat)?.toUpperCase();
+    return coord && coord !== self ? coord : undefined;
+  };
+  if (r.source.kind === 'delegated-request') {
+    const peer = r.peer?.toUpperCase();
+    if (!peer || peer === self) return { kind: 'stale', note: `blocked on #${r.source.msgId} with no recipient seat to ask` };
+    if (!route.reaskAt) {
+      return { kind: 'reask', to: peer, body: `[OP · re-ask · ${r.id}] No reply yet to #${r.source.msgId}: ${r.title.slice(0, 160)} — reply to #${r.source.msgId} with the result, or say what blocks it.` };
+    }
+    if (nowMs - Date.parse(route.reaskAt) < REASK_BACKOFF_MS) return { kind: 'hold', reason: `re-asked ${peer} at ${route.reaskAt}` };
+    if (route.exceptionAt) return { kind: 'hold', reason: `exception sent to ${route.exceptionTo} at ${route.exceptionAt}` };
+    const to = exceptionTarget(peer);
+    if (!to) return { kind: 'stale', note: `${peer} silent after a re-ask on #${r.source.msgId} and no coordinator above it` };
+    return { kind: 'exception', to, body: `[OP · exception · ${r.id}] ${peer} has not answered #${r.source.msgId} (re-asked ${route.reaskAt}): ${r.title.slice(0, 160)}` };
+  }
+  if (r.source.kind === 'p0-cell') {
+    if (route.exceptionAt) return { kind: 'hold', reason: `exception sent to ${route.exceptionTo} at ${route.exceptionAt}` };
+    const owner = r.cellOwner?.split(/[\s/,·]+/).find((x) => x.trim() && x.toUpperCase() !== self);
+    const to = owner ? exceptionTarget(owner) : undefined;
+    if (!to) return { kind: 'stale', note: `P0 cell ${r.source.cellId} blocked and its owner has no coordinator other than ${self}` };
+    return { kind: 'exception', to, body: `[OP · exception · ${r.id}] P0 cell ${r.source.cellId} (owner ${r.cellOwner}) is stuck: ${r.title.slice(0, 160)} — close condition: ${r.closeCondition}` };
+  }
+  return { kind: 'stale', note: `CEO line ${r.source.turnId} blocked with no CEO-only gap (money · security · irreversible · policy)` };
+}
+
+/** Marks a blocked requirement stale (final): OP closed it itself with a one-line note. */
+export function markStale(r: Requirement, note: string, at: string): void {
+  r.status = 'stale';
+  r.stale = { at, note };
+  r.updatedAt = at;
+  delete r.blocked;
 }

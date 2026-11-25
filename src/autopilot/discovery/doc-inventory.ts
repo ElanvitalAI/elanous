@@ -145,8 +145,9 @@ export function indexGaps(
   return out.sort((a, b) => (b.date ?? '').localeCompare(a.date ?? '') || a.filename.localeCompare(b.filename));
 }
 
-/** docs/ 재귀 스캔 → DocEntry[]. skipDirs 로 _archive/_superseded 제외 가능. */
-export function scanDocs(docsDir: string, opts: { skipDirs?: string[] } = {}): DocEntry[] {
+/** docs/ 재귀 스캔 → DocEntry[]. skipDirs 로 _archive/_superseded 제외 가능.
+ *  readText:false 면 본문을 읽지 않는다(체크박스 0) — 색인 선정처럼 stat 만 필요한 호출용. */
+export function scanDocs(docsDir: string, opts: { skipDirs?: string[]; readText?: boolean } = {}): DocEntry[] {
   const skip = new Set(opts.skipDirs ?? ['_archive', '_superseded', 'archive', 'node_modules']);
   const out: DocEntry[] = [];
   const repoRoot = join(docsDir, '..');
@@ -162,7 +163,7 @@ export function scanDocs(docsDir: string, opts: { skipDirs?: string[] } = {}): D
         walk(full, subdir ? `${subdir}/${name}` : name);
       } else if (name.endsWith('.md')) {
         let text = '';
-        try { text = readFileSync(full, 'utf-8'); } catch { /* */ }
+        if (opts.readText !== false) { try { text = readFileSync(full, 'utf-8'); } catch { /* */ } }
         const boxes = countBoxes(text);
         out.push({
           path: relative(repoRoot, full),

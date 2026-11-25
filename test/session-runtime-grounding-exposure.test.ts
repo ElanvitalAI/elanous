@@ -56,7 +56,7 @@ describe('essential catalog exposes persistent grounding', () => {
     }).map(spec => spec.name);
 
     expect(names).toEqual([
-      'Read', 'Grep', 'Glob', 'ListDir', 'Edit', 'Write',
+      'Glob', 'Grep', 'Read', 'ListDir', 'Edit', 'Write',
       'Agent', 'AgentOutput', 'AgentReply', 'AgentStop', 'AgentList', 'SelfImplement',
       'ops_status', 'autopilot_missions', 'self_recall', 'memory_recall', 'session_manage',
       'schedule_manage', 'fact_check', 'se_build',

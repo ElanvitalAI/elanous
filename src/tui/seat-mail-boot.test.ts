@@ -12,9 +12,9 @@ test('only an identified seat missing binding warns; track alone is not a seat',
   const deps = { home: root, msgPath: join(root, 'missing.db'), env: { ELANOUS_TRACK: 'OPC' } };
   try {
     expect(createSeatMailHeaderHook(join(root, 'project'), deps)(null, null)).toBeNull();
-    expect(createSeatMailHeaderHook(join(root, 'seats', 'OPC'), deps)(null, null)).toContain('우편 감시 결속 실패: cwd/seat-state 없음');
+    expect(createSeatMailHeaderHook(join(root, 'seats', 'OPC'), deps)(null, null)).toContain('mail watch not bound: no seat-state for this folder');
     mkdirSync(join(root, 'elanous-hq', 'seat-state', 'OPC'), { recursive: true });
-    expect(createSeatMailHeaderHook(join(root, 'project'), { ...deps, env: { ...deps.env, COORD_ID: 'OPC' } })(null, null)).toBe('OPC · 우편 0');
+    expect(createSeatMailHeaderHook(join(root, 'project'), { ...deps, env: { ...deps.env, COORD_ID: 'OPC' } })(null, null)).toBe('OPC · mail 0');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -26,23 +26,23 @@ test('header reflects watcher failure and recovery without breaking on getter er
     let throws = false;
     const watcher = { getStatus() { if (throws) throw new Error('bad observer'); return status; } };
     const header = createSeatMailHeaderHook(join(root, 'seats', 'OPC'), { home: root, msgPath: join(root, 'none'), env: {} }, null, watcher);
-    expect(header(null, null)).toBe('OPC · 우편 0 · 우편 감시 starting');
+    expect(header(null, null)).toBe('OPC · mail 0 · mail watch starting');
     status = 'start-error';
-    expect(header(null, null)).toContain('우편 감시 오류: start-error');
+    expect(header(null, null)).toContain('mail watch error: start-error');
     status = 'running';
-    expect(header(null, null)).toBe('OPC · 우편 0');
+    expect(header(null, null)).toBe('OPC · mail 0');
     status = 'read-error';
-    expect(header(null, null)).toContain('우편 감시 오류: read-error');
+    expect(header(null, null)).toContain('mail watch error: read-error');
     status = 'running';
-    expect(header(null, null)).toBe('OPC · 우편 0');
+    expect(header(null, null)).toBe('OPC · mail 0');
     throws = true;
-    expect(header(null, null)).toContain('우편 감시 오류: read-error');
+    expect(header(null, null)).toContain('mail watch error: read-error');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('seat header warns on more than 100 unread while preserving the actual count', () => {
-  expect(seatMailLine({ seat: 'TC', unread: 140 })).toBe('TC · 우편 140 ⚠ 100건 초과');
-  expect(seatMailLine({ seat: 'TC', unread: 100 })).toBe('TC · 우편 100');
+  expect(seatMailLine({ seat: 'TC', unread: 140 })).toBe('TC · mail 140 ⚠ over 100');
+  expect(seatMailLine({ seat: 'TC', unread: 100 })).toBe('TC · mail 100');
 });
 
 test('자리 첫 화면 우편 스냅샷은 같은 원장을 읽고 ack cursor를 움직이지 않는다', () => {
@@ -57,7 +57,7 @@ test('자리 첫 화면 우편 스냅샷은 같은 원장을 읽고 ack cursor�
     const deps = { home, msgPath, env: {} };
     const first = readSeatMailSnapshot(join(root, 'seats', 'OPC'), deps);
     expect(first).toEqual({ seat: 'OPC', unread: 1 });
-    expect(seatMailLine(first)).toBe('OPC · 우편 1');
+    expect(seatMailLine(first)).toBe('OPC · mail 1');
     expect(store.getCursor('OPC')).toBe(0);
     expect(readSeatMailSnapshot(join(root, 'seats', 'OUTER', 'work', 'seats', 'OPC'), deps))
       .toEqual({ seat: 'OPC', unread: 1 });
@@ -95,7 +95,7 @@ test('손상된 우편 DB는 첫 화면을 막지 않고 확인 불가로 표시
   try {
     const snapshot = readSeatMailSnapshot(join(root, 'seats', 'OPC'), { home, msgPath, env: {} });
     expect(snapshot).toEqual({ seat: 'OPC', unread: null });
-    expect(seatMailLine(snapshot)).toBe('OPC · 우편 확인 불가');
+    expect(seatMailLine(snapshot)).toBe('OPC · mail unknown');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -114,27 +114,27 @@ test('single seat header hook projects observed health and real pending or idle 
   try {
     const header = createSeatMailHeaderHook(join(root, 'seats', 'OUTER', 'work', 'seats', 'OPC'),
       { home, msgPath, env: {} });
-    expect(header(null, null)).toBe('OPC · 우편 1');
-    expect(header(null, wake)).toBe('OPC · 우편 1 · 건강 관측 전 · 깨움 없음');
+    expect(header(null, null)).toBe('OPC · mail 1');
+    expect(header(null, wake)).toBe('OPC · mail 1 · health pending · no wake scheduled');
     const base = {
       sessionId: 'session', capturedAt: Date.now(), line: 'unused', source: 'checkout' as const,
       runningSha: null, installedSha: null, representativeError: null,
       creditSource: null, creditKnown: false,
     };
     const healthCases = [
-      { value: { ...base, errorCount: 0 }, text: '건강 오류 없음' },
-      { value: { ...base, errorCount: 2 }, text: '건강 오류 2' },
-      { value: { ...base, errorCount: null }, text: '건강 확인 불가' },
+      { value: { ...base, errorCount: 0 }, text: 'healthy' },
+      { value: { ...base, errorCount: 2 }, text: 'health errors 2' },
+      { value: { ...base, errorCount: null }, text: 'health unknown' },
     ];
     for (const item of healthCases) {
-      expect(header(item.value, wake)).toBe(`OPC · 우편 1 · ${item.text} · 깨움 없음`);
+      expect(header(item.value, wake)).toBe(`OPC · mail 1 · ${item.text} · no wake scheduled`);
     }
     const scheduled = wake.scheduler.schedule({ delaySeconds: 60, reason: 'check' });
     expect(scheduled.ok).toBe(true);
     for (const item of healthCases) {
       const line = header(item.value, wake) ?? '';
-      expect(line).toContain(`OPC · 우편 1 · ${item.text} · 깨움 `);
-      expect(line).not.toContain('깨움 없음');
+      expect(line).toContain(`OPC · mail 1 · ${item.text} · next wake `);
+      expect(line).not.toContain('no wake scheduled');
     }
     expect(store.getCursor('OPC')).toBe(0);
   } finally {
@@ -152,11 +152,11 @@ test('single header hook boots with absent, corrupt and read-only ledgers withou
   mkdirSync(join(home, 'elanous-hq', 'seat-state', 'OPC'), { recursive: true });
   const deps = { home, msgPath, env: {} };
   try {
-    expect(createSeatMailHeaderHook(cwd, deps)(null, null)).toBe('OPC · 우편 0');
+    expect(createSeatMailHeaderHook(cwd, deps)(null, null)).toBe('OPC · mail 0');
     expect(existsSync(msgPath)).toBe(false);
     writeFileSync(msgPath, 'corrupt ledger');
     const corruptBefore = readFileSync(msgPath);
-    expect(createSeatMailHeaderHook(cwd, deps)(null, null)).toBe('OPC · 우편 확인 불가');
+    expect(createSeatMailHeaderHook(cwd, deps)(null, null)).toBe('OPC · mail unknown');
     expect(readFileSync(msgPath)).toEqual(corruptBefore);
     rmSync(msgPath);
     const store = new MsgStore(msgPath);
@@ -165,7 +165,7 @@ test('single header hook boots with absent, corrupt and read-only ledgers withou
     chmodSync(msgPath, 0o444);
     const bytesBefore = readFileSync(msgPath);
     const filesBefore = readdirSync(root);
-    expect(createSeatMailHeaderHook(cwd, deps)(null, null)).toBe('OPC · 우편 1');
+    expect(createSeatMailHeaderHook(cwd, deps)(null, null)).toBe('OPC · mail 1');
     expect(readFileSync(msgPath)).toEqual(bytesBefore);
     expect(readdirSync(root)).toEqual(filesBefore);
   } finally { rmSync(root, { recursive: true, force: true }); }

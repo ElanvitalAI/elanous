@@ -300,8 +300,10 @@ test('synthetic clock reports each local request and shrinking pending seats eve
     progress: message => progress.push(message),
   });
   expect(progress).toEqual(['Migration requested: node-b:w/t/TC · TC', 'Migration requested: node-b:w/t/UX · UX',
-    'Remaining seats: 2 · 35s remaining', 'Remaining seats: 1 · 5s remaining']);
+    'Remaining seats: 2 · 35s remaining', 'Seat done: TC · unknown→aaaaaaaaaaaa', 'Remaining seats: 1 · 5s remaining',
+    'Stragglers at deadline: UX (still unknown)']);
   expect(result.rows.map(row => row.result)).toEqual(['updated', 'waiting']);
+  expect(result.ok).toBe(true);
 });
 
 test('synthetic remote delay reports countdown and always clears its timer on failure', async () => {
@@ -365,4 +367,61 @@ test('other runtimes are skipped without attempting migration and summarized sep
 test('installation progress uses the literal request count, never a guessed count', () => {
   expect(updateInstallProgress('already up to date (skipped)', 3)).toBe('Install: already up to date (skipped) · Migration requested for 3 seats · Progress every 30s');
   expect(updateInstallProgress('updated', undefined)).toBe('Install: updated · Migration requested for an unknown number of seats · Progress every 30s');
+});
+
+// ELS-UPDATE-ALL-REMAINING-STUCK (대표 11-25 20:4x): the TUI restarts via execve in place, so the pid never changes.
+test('exec-in-place restart (same pid, newer registration) counts as done and exits before the deadline', async () => {
+  let time = 0; const progress: string[] = [];
+  const oldRow = { id: 'tui:10', ownerPid: 10, alive: true, kind: 'tui', seat: 'TC', workdir: '/seats/TC', sessionId: 's-TC', startedAt: 1000,
+    build: { sha: 'b'.repeat(40), source: 'installed' } };
+  const result = await updateAllElsTabs({
+    sender: () => 'OP', target: () => ({ desired, installed: desired }),
+    list: async () => ({ hosts: [{ name: 'node-b', reach: 'local' }], panes: [pane('TC')] }),
+    seats: () => [time >= 3_000 ? { ...oldRow, startedAt: 5000, build: { sha: desired, source: 'installed' } } : oldRow],
+    migrate: async () => ({ status: 'success', reason: 'waiting' }),
+    sleep: async ms => { time += ms; }, now: () => time, timeoutMs: 600_000,
+    progress: message => progress.push(message),
+  });
+  expect(time).toBe(3_000);
+  expect(result.ok).toBe(true);
+  expect(result.rows.map(row => row.result)).toEqual(['updated']);
+  expect(progress).toEqual(['Migration requested: node-b:w/t/TC · TC', 'Seat done: TC · bbbbbbbbbbbb→aaaaaaaaaaaa']);
+});
+
+test('same pid with the same registration time is not a restart and stays a straggler', async () => {
+  let time = 0; const progress: string[] = [];
+  const row = { id: 'tui:10', ownerPid: 10, alive: true, kind: 'tui', seat: 'TC', workdir: '/seats/TC', sessionId: 's-TC', startedAt: 1000,
+    build: { sha: desired, source: 'installed' } };
+  const result = await updateAllElsTabs({
+    sender: () => 'OP', target: () => ({ desired, installed: desired }),
+    list: async () => ({ hosts: [{ name: 'node-b', reach: 'local' }], panes: [pane('TC')] }),
+    seats: () => [row], migrate: async () => ({ status: 'success', reason: 'waiting' }),
+    sleep: async ms => { time += ms; }, now: () => time, timeoutMs: 5_000,
+    progress: message => progress.push(message),
+  });
+  expect(result.rows.map(r => r.result)).toEqual(['waiting']);
+  expect(progress.at(-1)).toBe('Stragglers at deadline: TC (still aaaaaaaaaaaa)');
+});
+
+test('three fake seats: slow done, exited skipped, remote unreachable fails the run', async () => {
+  let time = 0; const progress: string[] = [];
+  const slow = { id: 'tui:20', ownerPid: 20, alive: true, kind: 'tui', seat: 'SLOW', workdir: '/seats/SLOW', sessionId: 's-SLOW', startedAt: 100,
+    build: { sha: 'c'.repeat(40), source: 'installed' } };
+  const result = await updateAllElsTabs({
+    sender: () => 'OP', target: () => ({ desired, installed: desired }),
+    list: async () => ({ hosts: [{ name: 'node-b', reach: 'local' }, { name: 'far', reach: 'down' }], panes: [
+      { ...pane('SLOW'), pid: 20 },
+      { ...pane('GONE'), state: 'exited' },
+      { address: 'far:w/t/R', host: 'far', reach: 'down', seat: 'REMOTE', state: 'working', cwd: '/seats/REMOTE', pid: 30, kind: 'pty' },
+    ] }),
+    seats: () => [time >= 40_000 ? { ...slow, startedAt: 900, build: { sha: desired, source: 'installed' } } : slow],
+    migrate: async () => ({ status: 'success', reason: 'waiting' }),
+    sleep: async ms => { time += ms; }, now: () => time, timeoutMs: 600_000,
+    progress: message => progress.push(message),
+  });
+  expect(time).toBe(40_000);
+  expect(result.ok).toBe(false);
+  expect(result.rows.map(r => `${r.tab}=${r.result}`)).toEqual(['far:*=failed', 'far:w/t/R=failed', 'node-b:w/t/SLOW=updated', 'node-b:w/t/GONE=skipped']);
+  expect(progress).toEqual(['Migration requested: node-b:w/t/SLOW · SLOW', 'Seat skipped: GONE · node-b:w/t/GONE (exited)',
+    'Remaining seats: 1 · 570s remaining', 'Seat done: SLOW · cccccccccccc→aaaaaaaaaaaa']);
 });

@@ -34,7 +34,7 @@ test('OpenRouter first run offers only final four from env and fake .env, then i
     const result = await runFirstRunProviderSetup({ ask: async () => answers.shift() ?? '', print: line => output.push(line) }, options);
     expect(result).toMatchObject({ provider: 'openrouter' });
     expect(saved).toEqual([{ 'cred:openrouter.api_key': 'dotenv-secret-9876' }]);
-    expect(output.join('\n')).toContain('끝 4자리 9876');
+    expect(output.join('\n')).toContain('last 4 9876');
     expect(output.join('\n')).not.toContain('dotenv-secret-9876');
     expect(output.join('\n')).not.toContain('environment-secret-1234');
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -82,7 +82,7 @@ test('OpenRouter first run offers OAuth then phone QR before hidden paste and sa
   expect(oauthCalls).toBe(1);
   expect(result).toMatchObject({ provider: 'openrouter' });
   expect(saved).toEqual([{ 'cred:openrouter.api_key': 'oauth-secret-never-print' }]);
-  expect(output.join('\n')).toContain('1 브라우저 OAuth 로그인 (권장) · 2 폰 QR/PWA 등록 · 3 숨김 붙여넣기');
+  expect(output.join('\n')).toContain('1 Browser OAuth login (recommended) · 2 Phone QR/PWA · 3 Paste (hidden)');
   expect(output.join('\n')).not.toContain('oauth-secret-never-print');
 });
 

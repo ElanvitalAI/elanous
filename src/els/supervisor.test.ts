@@ -38,6 +38,7 @@ test('renderPlist: label, argv, keep-alive and escaped values', () => {
   expect(plist).toContain('<key>Label</key><string>dev.elanous.els</string>');
   expect(plist).toContain('<string>/a b/elanous</string>');
   expect(plist).toContain('<key>KeepAlive</key><true/>');
+  expect(plist).toContain('<key>COLORTERM</key><string>truecolor</string>');
   expect(plist).toContain('/log&amp;x');
 });
 

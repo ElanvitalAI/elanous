@@ -133,7 +133,13 @@ if [ "$ASSUME_YES" -ne 1 ]; then
   fi
   case "$ANSWER" in
     y|Y|yes|YES|Yes) ASSUME_YES=1 ;;
-    *) echo "$(t 'Installation not started: consent required (use --yes to consent).' '설치를 시작하지 않았습니다: 동의가 필요합니다 (--yes로 동의).')" >&2; exit 1 ;;
+    *) echo "$(t 'Installation not started: consent required (use --yes to consent).' '설치를 시작하지 않았습니다: 동의가 필요합니다 (--yes로 동의).')" >&2
+       # DEMO-ZEROBASE-FIXES: a piped run (`curl … | bash`) has no terminal to ask in — show the exact line that consents.
+       if [ "$INTERACTIVE" -ne 1 ]; then
+         echo "$(t 'No terminal to ask for consent. To install unattended, run:' '동의를 물을 터미널이 없습니다. 무인 설치는:')" >&2
+         echo '  curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash -s -- --yes' >&2
+       fi
+       exit 1 ;;
   esac
 fi
 

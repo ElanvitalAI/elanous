@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-RELEASE-QUICKPASS-WORLD-TS",
+  "path": "src/ux-sim/release-quickpass-world.ts",
+  "boundary": "Pure in-process discrete-event simulation on virtual minutes with fake command runners; never runs release commands, touches Git, or contacts GitHub or npm. The real executor is loaded only when RELEASE_QUICKPASS_EXECUTOR names a module.",
+  "deviceIds": [
+    "release-quickpass-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

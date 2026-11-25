@@ -12,6 +12,7 @@
 import { emitTurnLife } from '../debug/turn-life.js';
 import type { SeatMailArrivalInfo } from './seat-mail-arrival.js';
 import { SEAT_MAIL_COALESCE_MS } from './seat-mail-digest.js';
+import type { FloodMeter } from './seat-mail-flood.js';
 
 export interface SeatMailOnArrivedDeps {
   busy: () => boolean;
@@ -21,7 +22,7 @@ export interface SeatMailOnArrivedDeps {
    * SEAT-TURN-MIDTURN-MAIL 어댑터 — 턴 중 도착은 이벤트함에 한 건(id = ledger msgId).
    * 접수 성립(true) 즉시 이 모듈이 원본 큐 노티스 제거를 호출한다(N03-SEED7 — 이중 배달 창 폐쇄).
    */
-  enqueueMidTurn?: (event: { kind: string; id: string; text: string; from?: string; intent?: string | null }, onDrained?: () => void) => boolean;
+  enqueueMidTurn?: (event: { kind: string; id: string; text: string; from?: string; intent?: string | null; crownDirective?: string | null; originKind?: string | null; viaLedger?: boolean }, onDrained?: () => void) => boolean;
   /** OP #106762 ⓐ — 이벤트함이 접수한 건의 대기 큐 노티스를 접수 시점에 지운다(fail-open · 지운 건수를 돌려준다). */
   removeQueuedNotice?: (match: { source: string; msgId?: number; text?: string }) => number;
   /**
@@ -30,6 +31,12 @@ export interface SeatMailOnArrivedDeps {
    * Absent = knock at once (unit seams).
    */
   schedule?: (fn: () => void, ms: number) => unknown;
+  /**
+   * SEAT-MAIL-FLOOD (Q9) — a seat's flood meter. In flood only crown · human · ✋ · alert · P0 open a turn or ride the
+   * running one; every other mail stays queued for the next turn's digest (never dropped). Absent = no flood rule.
+   */
+  flood?: FloodMeter;
+  now?: () => number;
 }
 
 export function seatMailOnArrived(deps: SeatMailOnArrivedDeps): (arrivals?: readonly SeatMailArrivalInfo[]) => void {
@@ -40,7 +47,14 @@ export function seatMailOnArrived(deps: SeatMailOnArrivedDeps): (arrivals?: read
     knockPending = true;
     deps.schedule(() => { knockPending = false; deps.injectKey(deps.queueWake); }, SEAT_MAIL_COALESCE_MS);
   };
-  return (arrivals) => {
+  return (rawArrivals) => {
+    // SEAT-MAIL-FLOOD — count the turn-opening arrivals; in flood, ordinary mail is folded to the digest (marked passive here).
+    const at = (deps.now ?? Date.now)();
+    const arrivals = rawArrivals === undefined || !deps.flood ? rawArrivals : rawArrivals.map((arrival) => {
+      if (arrival.passive === true || arrival.msgId === undefined) return arrival;
+      const verdict = deps.flood!.note(arrival, at);
+      return verdict.open ? arrival : { ...arrival, passive: true };
+    });
     if (deps.busy()) {
       // OBSERVE-TURN-EVENT-LIFECYCLE — 바쁜 턴: 원문은 이벤트함에, 큐 노티스는 접수 시점에 지운다(이 모듈은 관측만).
       const msgIds = (arrivals ?? []).flatMap((arrival) => (arrival.msgId === undefined ? [] : [arrival.msgId]));
@@ -57,7 +71,10 @@ export function seatMailOnArrived(deps: SeatMailOnArrivedDeps): (arrivals?: read
         const accepted =
           deps.enqueueMidTurn?.(
             { kind: 'seat-mail', id: String(arrival.msgId), text: arrival.text,
-              ...(arrival.sender === undefined ? {} : { from: arrival.sender }), ...(arrival.intent === undefined ? {} : { intent: arrival.intent }) },
+              ...(arrival.sender === undefined ? {} : { from: arrival.sender }), ...(arrival.intent === undefined ? {} : { intent: arrival.intent }),
+              ...(arrival.crownDirective ? { crownDirective: arrival.crownDirective } : {}), ...(arrival.origin?.kind ? { originKind: arrival.origin.kind } : {}),
+              // FED-MAIL-WORK-ORDER — every arrival with a msgId was read from the local ledger by the watcher.
+              viaLedger: true },
           ) ?? false;
         // N03-SEED7 (OP #140613) — 이벤트함이 접수한 건은 «접수 시점»에 원본 큐 노티스를 내놓는다: 배수 때까지
         // 큐에 남아 있으면 busy→idle 전환 뒤 큐 노크가 같은 msgId 로 턴을 하나 더 열어, 같은 우편이 두 모델

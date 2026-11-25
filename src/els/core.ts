@@ -60,6 +60,8 @@ export interface ElsPty {
   /** The visible screen; `ansi: true` keeps colours/attributes as SGR sequences (the attach view paints them). */
   renderScreen(options?: { readonly ansi?: boolean; readonly scrollBack?: number }): Promise<string>;
   onExit(cb: () => void): void;
+  /** DEMO-PANE-EXIT-VISIBLE: after exit — the exit code (null = signal/unknown) and a one-line reason. */
+  exitInfo?(): { readonly code: number | null; readonly reason: string };
   /** PTY 출력 구독 — 등록부 어댑터 경유 (src/els/server.ts registryPty). */
   onOutput?(cb: (data: string) => void): { dispose(): void };
   /** Holder handshake has verified the process and supplied its PID. */
@@ -130,6 +132,8 @@ export interface ElsNewInput {
   readonly ownerSeat?: string;
   /** Persistent display identity, not an authorization principal. */
   readonly seatIdentity?: string;
+  /** DEMO-FANOUT-LIVE-OP-SEAT: the verified caller pane that opened this one through the tool door — a worker child. */
+  readonly parentPane?: string;
 }
 
 // 출처: ids carry 8 random hex digits (32 bits); retrying this many times on a collision is enough for any journal
@@ -191,6 +195,11 @@ const POD_INBOX_MAX = 32;
 
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
+/** DEMO-PANE-EXIT-VISIBLE: the last ≤ 5 non-empty lines of an exited pane's final screen (each ≤ 200 chars). */
+export function paneExitTail(screen: string): string[] {
+  return screen.split('\n').map((line) => line.trimEnd()).filter((line) => line.trim().length > 0 && !/^\[screen \d+x\d+ cursor=/.test(line)).slice(-5).map((line) => line.slice(0, 200));
+}
+
 export function createElsCore(deps: ElsCoreDeps) {
   const randomId = deps.randomId ?? ((prefix: string) => `${prefix}${randomBytes(4).toString('hex')}`);
   let journal: SpaceJournal = emptyJournal();
@@ -211,7 +220,7 @@ export function createElsCore(deps: ElsCoreDeps) {
   const foregrounds = new Map<string, Foreground>();
   // SEAT-STATE-ENUM: `seat` = the last code report of the current state (cleared by a turn boundary or a v1 state word).
   const agentTurns = new Map<string, { sid: string; seq: number; state: PaneState | undefined; turnId: string | undefined; old: Set<string>;
-    seat?: ReportedSeat; waitingInput?: boolean; model?: string }>();
+    seat?: ReportedSeat; waitingInput?: boolean; model?: string; turnsDone?: number }>();
   const seatClock = createSeatStatusClock(() => now());
   // Recent PTY output is the activity signal for external agent CLIs (30 seconds).
   const AGENT_OUTPUT_ACTIVE_MS = 30_000;
@@ -507,7 +516,10 @@ export function createElsCore(deps: ElsCoreDeps) {
     discardQueue(paneId, 'pane exited');
     const pane = journal.panes.find((row) => row.id === paneId);
     if (!pane || pane.state === 'exited' || pane.ptyId !== ptyId) return false;
-    const saveError = persist(patchPane(journal, paneId, { state: 'exited', ptyId: '', exitedAt: now() }));
+    let info: { code: number | null; reason: string } | undefined;
+    try { info = pty.exitInfo?.(); } catch { info = undefined; }
+    const saveError = persist(patchPane(journal, paneId, { state: 'exited', ptyId: '', exitedAt: now(),
+      ...(info ? { exitCode: info.code, exitReason: info.reason } : {}) }));
     if (saveError) process.stderr.write(`els: exit of ${paneId} not saved yet: ${saveError}\n`);
     return true;
   };
@@ -515,8 +527,11 @@ export function createElsCore(deps: ElsCoreDeps) {
   const recordFinalScreen = (paneId: string, screen: string): void => {
     const pane = journal.panes.find((row) => row.id === paneId);
     if (!pane || pane.state !== 'exited') return;
-    const saveError = persist(patchPane(journal, paneId, { scrollback: screen }));
+    const exitTail = paneExitTail(screen);
+    const saveError = persist(patchPane(journal, paneId, { scrollback: screen, exitTail }));
     if (saveError) process.stderr.write(`els: final screen of ${paneId} not saved yet: ${saveError}\n`);
+    // DEMO-PANE-EXIT-VISIBLE: every exit leaves one line in the server log — code, reason and the last screen lines.
+    process.stderr.write(`els: pane ${paneId} (${pane.title}) exited · ${pane.exitReason ?? 'exit code unknown'}${exitTail.length ? ` · last: ${exitTail.join(' ⏎ ')}` : ' · no output'}\n`);
   };
 
   const livePty = (pane: Pane): ElsPty | undefined => {
@@ -529,6 +544,22 @@ export function createElsCore(deps: ElsCoreDeps) {
     const tab = pane ? journal.tabs.find((row) => row.id === pane.tabId) : undefined;
     const ws = tab ? journal.workspaces.find((row) => row.id === tab.workspaceId) : undefined;
     return pane && tab && ws ? { pane, tab, ws } : undefined;
+  };
+
+  /**
+   * HAND-NAME-NEUTRAL-DYNAMIC ①: a verified pane's own `meta { title }` becomes its tab's label — only for a seat pane that is
+   * the tab's one pane and only when the title starts with that seat's id (a pane names itself, never another seat).
+   * Unchanged label = no journal write.
+   */
+  const applySelfTitle = (ref: string, title: string): void => {
+    const found = resolve(ref);
+    if (!found) return;
+    const seat = (found.pane.seatIdentity ?? seatOf(found.pane.cwd) ?? '').toUpperCase();
+    const name = clean(title);
+    if (!seat || !(name === seat || name.startsWith(`${seat} · `))) return;
+    if (journal.panes.filter((row) => row.tabId === found.tab.id).length !== 1 || found.tab.label === name) return;
+    try { commit({ ...journal, tabs: journal.tabs.map((row) => row.id === found.tab.id ? { ...row, label: name } : row) }); }
+    catch { /* fail-soft: the previous label stays */ }
   };
 
   const deliver = (pane: Pane, pty: ElsPty, from: string, text: string): ElsResult => {
@@ -734,7 +765,14 @@ export function createElsCore(deps: ElsCoreDeps) {
         paneId = freshId('p', taken);
       } catch (error) { return { exitCode: 1, message: `els new: ${message(error)}` }; }
       let pty: ElsPty;
-      try { pty = deps.spawn(input.command, input.cwd, label, { ELANOUS_ELS_WS: ws.name, ELANOUS_ELS_PANE: paneId, ...((input.seatIdentity ?? input.ownerSeat) ? { ELANOUS_TRACK: (input.seatIdentity ?? input.ownerSeat)! } : {}) }, input.parent); }
+      // A worker child (parentPane) is not its owner's seat: it gets its parent's pane id, never the owner as ELANOUS_TRACK.
+      const seatEnv = input.seatIdentity ?? (input.parentPane ? undefined : input.ownerSeat);
+      // Its own mail identity (never its parent's): «<parent seat>-<pane id>», and the seat it reports to.
+      const parentRow = input.parentPane ? journal.panes.find((pane) => pane.id === input.parentPane) : undefined;
+      const parentSeat = parentRow ? parentRow.seatIdentity ?? parentRow.ownerSeat : undefined;
+      const workerEnv = input.parentPane ? { ELANOUS_ELS_PARENT_PANE: input.parentPane, ELANOUS_ELS_WORKER_ID: `${parentSeat ?? 'WORKER'}-${paneId.toUpperCase()}`,
+        ...(parentSeat ? { ELANOUS_ELS_PARENT_SEAT: parentSeat } : {}) } : {};
+      try { pty = deps.spawn(input.command, input.cwd, label, { ELANOUS_ELS_WS: ws.name, ELANOUS_ELS_PANE: paneId, ...(seatEnv ? { ELANOUS_TRACK: seatEnv } : {}), ...workerEnv }, input.parent); }
       catch (error) { return { exitCode: 1, message: `els new: failed to spawn: ${message(error)}` }; }
       let address = '';
       try {
@@ -742,6 +780,7 @@ export function createElsCore(deps: ElsCoreDeps) {
         const pane: Pane = { id: paneId, tabId, kind: 'pty', title: label, cwd: input.cwd, command: input.command,
           state: 'working', restore: 'cwd', ptyId: pty.id, scrollback: '', ...(input.ownerSeat ? { ownerSeat: input.ownerSeat } : {}),
           ...(input.seatIdentity ? { seatIdentity: input.seatIdentity } : {}),
+          ...(input.parentPane ? { parentPane: input.parentPane } : {}),
           ...(podRuntime(input.command) ? { place: { host: ws.host, runtime: 'pod' as const } } : {}) };
         address = paneAddress(ws, tab, pane);
         firstSeen.set(pane.id, now());
@@ -800,7 +839,7 @@ export function createElsCore(deps: ElsCoreDeps) {
         return { exitCode: 2, message: 'els hq coordinator: valid seat required' };
       if (journal.hqCoordinatorSeat === seat) return { exitCode: 0, message: `els hq coordinator: ${seat} (unchanged)` };
       if (journal.hqCoordinatorSeat) return { exitCode: 1, message: `els hq coordinator: already assigned to ${journal.hqCoordinatorSeat}; cannot assign ${seat}` };
-      const matches = journal.panes.filter(p => p.kind === 'pty' && (p.seatIdentity ?? seatOf(p.cwd)) === seat);
+      const matches = journal.panes.filter(p => p.kind === 'pty' && !p.parentPane && (p.seatIdentity ?? seatOf(p.cwd)) === seat);
       if (matches.length !== 1) return { exitCode: 1, message: `els hq coordinator: seat ${seat} ${matches.length ? 'is duplicated' : 'not found'}` };
       try { commit({ ...journal, hqCoordinatorSeat: seat }); }
       catch (error) { return { exitCode: 1, message: `els hq coordinator: not saved: ${message(error)}` }; }
@@ -813,7 +852,7 @@ export function createElsCore(deps: ElsCoreDeps) {
         return { exitCode: 2, message: 'els ws coordinator: workspace and valid seat required' };
       const ws = findWorkspace(journal, ref);
       if (!ws) return { exitCode: 1, message: `els ws coordinator: unknown workspace ${ref}` };
-      const matches = journal.panes.filter(pane => pane.kind === 'pty' && seatOf(pane.cwd) === seat);
+      const matches = journal.panes.filter(pane => pane.kind === 'pty' && !pane.parentPane && seatOf(pane.cwd) === seat);
       if (matches.length !== 1) return { exitCode: 1, message: `els ws coordinator: seat ${seat} ${matches.length ? 'is duplicated' : 'not found'}` };
       const tab = journal.tabs.find(row => row.id === matches[0]!.tabId);
       if (tab?.workspaceId !== ws.id) return { exitCode: 1, message: `els ws coordinator: seat ${seat} is not in ${ws.name}` };
@@ -858,7 +897,7 @@ export function createElsCore(deps: ElsCoreDeps) {
       const isSpaceCoordinatorTab = (tab: Tab): boolean => {
         const seat = journal.workspaces.find(ws => ws.id === tab.workspaceId)?.coordinatorSeat;
         if (!seat) return false;
-        const matches = journal.panes.filter(pane => pane.kind === 'pty' && seatOf(pane.cwd) === seat);
+        const matches = journal.panes.filter(pane => pane.kind === 'pty' && !pane.parentPane && seatOf(pane.cwd) === seat);
         return matches.length === 1 && matches[0]!.tabId === tab.id;
       };
       const ordered = journal.panes.map((pane, index) => ({ pane, index, tab: journal.tabs.find((row) => row.id === pane.tabId) }))
@@ -884,7 +923,8 @@ export function createElsCore(deps: ElsCoreDeps) {
           ...(sha && report?.stamp ? { stamp: report.stamp } : {}) };
         const cwd = displayCwd(pane);
         const git = gitLabels.labelFor(cwd);   // ELS-GIT-AWARENESS-HERDR: cache read only — no git on the request path
-        const seat = pane.seatIdentity ?? seatOf(cwd);
+        // A worker child sits in its parent's folder but is not that seat (DEMO-FANOUT-LIVE-OP-SEAT).
+        const seat = pane.seatIdentity ?? (pane.parentPane ? null : seatOf(cwd));
         const unreadMail = seat !== null ? badges.get(seat) ?? null : null;
         // ELS-TAB-STATE-BADGE: the badge is the contract state; a working pane with no output, `do` or first sight for the
         // stall window reads `stalled`. The server computes it (one clock), so every client — `els ls`, sidetab — shows the same.
@@ -916,10 +956,13 @@ export function createElsCore(deps: ElsCoreDeps) {
           ...(unavailableReason ? { unavailable: true } : {}) }));
         return [{ build, lastEventAtMs, badge: badge.state, badgeLabel: badge.label, stalled: badge.stalled, status, ...(elnReport?.model ? { model: elnReport.model } : {}), address: paneAddress(ws, tab, pane), workspace: ws.name, tab: tab.id, pane: pane.id, title: pane.title, kind: pane.kind,
           cwd, ...(git ? { git } : {}), command: pane.command, state: listedState, activityState, ...(unavailableReason ? { unavailableReason } : {}),
+          size: sizes.get(pane.id) ?? { cols: DEFAULT_PANE_COLS, rows: DEFAULT_PANE_ROWS },
           ptyId: live ? pane.ptyId : '', ...(live?.pid ? { pid: live.pid } : {}), restore: pane.restore, seat, unreadMail,
-          ...(ws.coordinatorSeat && seatOf(pane.cwd) === ws.coordinatorSeat && isSpaceCoordinatorTab(tab) ? { spaceCoordinator: true } : {}),
+          ...(ws.coordinatorSeat && !pane.parentPane && seatOf(pane.cwd) === ws.coordinatorSeat && isSpaceCoordinatorTab(tab) ? { spaceCoordinator: true } : {}),
           ...(live && foregrounds.has(pane.id) ? { kind: foregrounds.get(pane.id)!.kind, fgCommand: foregrounds.get(pane.id)!.command } : {}),
           ...(pane.place ? { place: pane.place } : {}),
+          ...(pane.state === 'exited' && pane.exitReason !== undefined ? { exit: { code: pane.exitCode ?? null, reason: pane.exitReason, tail: pane.exitTail ?? [] } } : {}),
+          ...(pane.parentPane ? { parentPane: pane.parentPane, turnsDone: reported?.turnsDone ?? 0 } : {}),
           ...(pane.inbox?.length ? { inbox: pane.inbox } : {}) }];
       });
       return { exitCode: 0, message: JSON.stringify({ workspaces, tabs: journal.tabs, panes, ...(journal.lastFocus ? { lastFocus: journal.lastFocus } : {}), ...(journal.hqCoordinatorSeat ? { hqCoordinatorSeat: journal.hqCoordinatorSeat } : {}), ...(journal.hqAuthorityLocation ? { hqAuthorityLocation: journal.hqAuthorityLocation } : {}) }, null, 2) };
@@ -1228,7 +1271,11 @@ export function createElsCore(deps: ElsCoreDeps) {
       const waitingInput = event.kind === 'state' ? event.state === 'waiting-input' && !event.code
         : event.kind === 'turn' || event.kind === 'release' ? false : sameSender ? prior?.waitingInput === true : false;
       const model = event.kind === 'meta' && event.model ? event.model : sameSender ? prior?.model : undefined;
-      agentTurns.set(pane, { sid: frame.sid, seq: frame.seq, state, turnId, old, ...(seat ? { seat } : {}), ...(waitingInput ? { waitingInput } : {}), ...(model ? { model } : {}) });
+      // DEMO-FANOUT-LIVE-OP-SEAT: finished turns per pane (any sender of this pane) — a worker child counts as done after its first.
+      const turnEnded = event.kind === 'turn' && event.phase !== 'start' && sameSender && prior?.turnId === event.id;
+      const turnsDone = (prior?.turnsDone ?? 0) + (turnEnded ? 1 : 0);
+      agentTurns.set(pane, { sid: frame.sid, seq: frame.seq, state, turnId, old, ...(seat ? { seat } : {}), ...(waitingInput ? { waitingInput } : {}), ...(model ? { model } : {}), ...(turnsDone > 0 ? { turnsDone } : {}) });
+      if (event.kind === 'meta' && event.title) applySelfTitle(pane, event.title);
       notifyChange();
       return { exitCode: 0, message: 'event: accepted' };
     },

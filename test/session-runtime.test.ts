@@ -432,7 +432,7 @@ describe('session-runtime dynamic native tool exposure', () => {
   // the CORE block, then surface defaults / keyword-matched additions
   // (WebSearch, OmniSearch, WebFetch). Dedup keeps Read/Grep/Glob/
   // ListDir from doubling when the surface itself names them.
-  const CORE = ['Read', 'Grep', 'Glob', 'ListDir', 'Edit', 'Write'];
+  const CORE = ['Glob', 'Grep', 'Read', 'ListDir', 'Edit', 'Write'];
 
   test('exposes WebSearch for latest/current web lookup intent', () => {
     const specs = resolveDynamicSessionNativeToolSpecs({

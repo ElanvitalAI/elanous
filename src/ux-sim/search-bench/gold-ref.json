@@ -1,0 +1,214 @@
+{
+ "schema": "search-bench.gold/1",
+ "corpus": "ref",
+ "version": 1,
+ "pinnedSha": "ffe3622823c41e0072a6ea8e7337f7c496a1ff597e6ce083d63b0465facbc6ec",
+ "repos": [
+  "codex",
+  "grok-cli",
+  "hermes-agent",
+  "yazi",
+  "bubbletea",
+  "textual",
+  "CodexBar",
+  "argo"
+ ],
+ "items": [
+  {
+   "id": "r01",
+   "domain": "code",
+   "category": "symbol",
+   "query": "ClaudeUsageFetcher",
+   "expected": [
+    "CodexBar/Sources/CodexBarCore/Providers/Claude/ClaudeUsageFetcher.swift"
+   ]
+  },
+  {
+   "id": "r02",
+   "domain": "code",
+   "category": "symbol",
+   "query": "NewProgram in bubbletea",
+   "expected": [
+    "bubbletea/tea.go"
+   ]
+  },
+  {
+   "id": "r03",
+   "domain": "code",
+   "category": "impl-where",
+   "query": "how does bubbletea run its event loop",
+   "expected": [
+    "bubbletea/tea.go"
+   ]
+  },
+  {
+   "id": "r04",
+   "domain": "code",
+   "category": "impl-where",
+   "query": "textual push_screen implementation",
+   "expected": [
+    "textual/src/textual/app.py"
+   ]
+  },
+  {
+   "id": "r05",
+   "domain": "code",
+   "category": "impl-where",
+   "query": "textual screen focus chain",
+   "expected": [
+    "textual/src/textual/screen.py"
+   ]
+  },
+  {
+   "id": "r06",
+   "domain": "code",
+   "category": "impl-where",
+   "query": "codex fuzzy file search with nucleo",
+   "expected": [
+    "codex/codex-rs/file-search/src/lib.rs"
+   ]
+  },
+  {
+   "id": "r07",
+   "domain": "code",
+   "category": "impl-where",
+   "query": "codex exec_command shell tool output token budget",
+   "expected": [
+    "codex/codex-rs/core/src/tools/handlers/shell_spec.rs"
+   ]
+  },
+  {
+   "id": "r08",
+   "domain": "code",
+   "category": "impl-where",
+   "query": "grok-cli grep tool",
+   "expected": [
+    "grok-cli/src/tools/grep.ts"
+   ]
+  },
+  {
+   "id": "r09",
+   "domain": "code",
+   "category": "symbol",
+   "query": "MAX_MATCHES grok-cli",
+   "expected": [
+    "grok-cli/src/tools/grep.ts"
+   ]
+  },
+  {
+   "id": "r10",
+   "domain": "code",
+   "category": "impl-where",
+   "query": "hermes search_files tool",
+   "expected": [
+    "hermes-agent/tools/file_tools.py"
+   ]
+  },
+  {
+   "id": "r11",
+   "domain": "code",
+   "category": "config-key",
+   "query": "yazi default keymap config",
+   "expected": [
+    "yazi/yazi-config/preset/keymap-default.toml"
+   ]
+  },
+  {
+   "id": "r12",
+   "domain": "code",
+   "category": "config-key",
+   "query": "yazi mgr default settings",
+   "expected": [
+    "yazi/yazi-config/preset/yazi-default.toml"
+   ]
+  },
+  {
+   "id": "r13",
+   "domain": "code",
+   "category": "nl-ko",
+   "query": "argo 시크릿 봉투 암호화",
+   "expected": [
+    "argo/src/secretbox.mjs"
+   ]
+  },
+  {
+   "id": "r14",
+   "domain": "code",
+   "category": "symbol",
+   "query": "ensureScheduler",
+   "expected": [
+    "argo/src/scheduler.mjs"
+   ]
+  },
+  {
+   "id": "r15",
+   "domain": "code",
+   "category": "filename",
+   "query": "shell_spec",
+   "expected": [
+    "codex/codex-rs/core/src/tools/handlers/shell_spec.rs"
+   ]
+  },
+  {
+   "id": "r16",
+   "domain": "code",
+   "category": "filename",
+   "query": "keymap-default",
+   "expected": [
+    "yazi/yazi-config/preset/keymap-default.toml"
+   ]
+  },
+  {
+   "id": "r17",
+   "domain": "docs",
+   "category": "nl-en",
+   "query": "codex prompt prefer rg over grep",
+   "expected": [
+    "codex/codex-rs/core/gpt_5_codex_prompt.md",
+    "codex/codex-rs/core/gpt_5_1_prompt.md",
+    "codex/codex-rs/core/gpt_5_2_prompt.md",
+    "codex/codex-rs/core/gpt-5.2-codex_prompt.md",
+    "codex/codex-rs/core/gpt-5.1-codex-max_prompt.md",
+    "codex/codex-rs/protocol/src/prompts/base_instructions/default.md",
+    "codex/codex-rs/models-manager/prompt.md"
+   ]
+  },
+  {
+   "id": "r18",
+   "domain": "code",
+   "category": "impl-where",
+   "query": "hermes memory tool",
+   "expected": [
+    "hermes-agent/tools/memory_tool.py"
+   ]
+  },
+  {
+   "id": "r19",
+   "domain": "docs",
+   "category": "nl-en",
+   "query": "argo AI agent company that remembers everything",
+   "expected": [
+    "argo/README.md"
+   ]
+  },
+  {
+   "id": "r20",
+   "domain": "code",
+   "category": "call-site",
+   "query": "ensureScheduler callers",
+   "expected": [
+    "argo/instrumentation-node.mjs",
+    "argo/app/api/companies/[ws]/route.js"
+   ]
+  },
+  {
+   "id": "r21",
+   "domain": "code",
+   "category": "impl-where",
+   "query": "CodexBar CLI usage command",
+   "expected": [
+    "CodexBar/Sources/CodexBarCLI/CLIUsageCommand.swift"
+   ]
+  }
+ ]
+}

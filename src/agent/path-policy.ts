@@ -12,7 +12,8 @@
 // strict/anchored 는 daemon path-guard 의 검증된 원시(resolveSafe/anchoredResolve)를 재사용(재발명0·
 // 보안 로직 단일 출처). permissive 는 native 현행과 동일(~ 확장 + relative→cwd·무제한).
 
-import { isAbsolute, resolve as resolvePath } from 'node:path';
+import { homedir } from 'node:os';
+import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { anchoredResolve, resolveSafe, SENSITIVE_GLOBS } from '../boot/daemon-tools/path-guard.js';
 
 /** 서피스 트러스트별 경로 보안 정책.
@@ -24,13 +25,24 @@ export type PathPolicy = 'permissive' | 'anchored' | 'strict';
 /** input 을 cwd 기준으로 해석하되 policy 로 보안 강도를 고른다. strict/anchored 위반 시
  *  ToolSafetyError throw. permissive 는 해석만(제한 없음). daemon 의 검증된 원시를 재사용. */
 export function resolvePathWithPolicy(input: string, cwd: string, policy: PathPolicy): string {
-  if (policy === 'strict') return resolveSafe(input, cwd);      // cwd-앵커 + deny-list
-  if (policy === 'anchored') return anchoredResolve(input, cwd); // cwd-앵커만
+  // ~ 를 먼저 펼친다 — strict/anchored 는 펼친 뒤에도 cwd-앵커·deny-list 가 그대로 막는다.
+  const expanded = expandHomePath(input);
+  if (policy === 'strict') return resolveSafe(expanded, cwd);      // cwd-앵커 + deny-list
+  if (policy === 'anchored') return anchoredResolve(expanded, cwd); // cwd-앵커만
   // permissive — native 현행과 동일: ~ 확장 후 relative→cwd, 제한 없음.
-  const expanded = input.startsWith('~')
-    ? resolvePath(input.replace(/^~/, process.env.HOME ?? ''))
-    : input;
   return isAbsolute(expanded) ? expanded : resolvePath(cwd, expanded);
+}
+
+/** 맨 앞 `~` · `~/…` 를 지금 사용자의 홈 디렉토리로 펼친다(셸과 같은 뜻).
+ *  모델이 `~/…` 를 그대로 넘기면 rg·fs 는 `<cwd>/~/…` 로 읽어 실패한다(Grep/Glob/ListDir).
+ *  `~user/…` 는 펼치지 않는다 — 다른 사용자 홈을 추측하면 엉뚱한 디렉토리(예: 홈 옆 `tmp`)를 읽는다. 원문 그대로 둔다. */
+export function expandHomePath(input: string): string {
+  if (typeof input !== 'string' || !input.startsWith('~')) return input;
+  if (input !== '~' && input[1] !== '/' && input[1] !== '\\') return input;
+  const home = process.env.HOME || homedir();
+  if (!home) return input;
+  const rest = input.slice(1);
+  return rest ? join(home, rest) : home;
 }
 
 /** Grep(strict) 이 재귀 검색에서 자격증명/키 파일을 배제할 rg exclude glob 인자 시퀀스

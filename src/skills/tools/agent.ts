@@ -46,6 +46,8 @@ import { resolveAgent } from '../../agent/loader.js';
 import { resolveAgentLayered } from '../../agent/definition-registry.js';
 import type { AgentDefinition } from '../../agent/types.js';
 import { getSessionCwd, setSessionCwd } from '../../session/working-dir.js';
+import { withSearchToolkit } from '../../agent/search-toolkit.js';
+import { runInSearchLoopScope } from './search-loop-guard.js';
 import {
   agentCacheKey, dedupeStub, logDedupHit, type SessionCache,
   DEDUP_CASCADE_HALT_THRESHOLD, CONSECUTIVE_DEDUP_BLOCK_THRESHOLD,
@@ -60,10 +62,11 @@ export const AGENT_TOOL_DEFAULT_MAX_TURNS = 20;
  *  pathological skill prompt from spawning 200-turn workers. */
 export const AGENT_TOOL_TURNS_CEILING = 50;
 
-/** Numeric ceiling on concurrent `run_in_background` Agent-tool fan-out.
+/** Numeric ceiling on concurrent `run_in_background` Agent-tool fan-out —
+ *  CAPSULE-POOL-SHORT-LANE: the seat guard's short lane (8) plus long lane (3).
  *  Enforced at exactly one point in `dispatchAgent` (see the
  *  `background-fanout-limit` block: after dedup, before `noteSeen`). */
-export const AGENT_TOOL_BACKGROUND_FANOUT_CEILING = 8;
+export const AGENT_TOOL_BACKGROUND_FANOUT_CEILING = 11;
 
 /** Clamp a caller-supplied `max_turns` onto `[1, AGENT_TOOL_TURNS_CEILING]`.
  *  Non-finite / omitted values fall back to `AGENT_TOOL_DEFAULT_MAX_TURNS`. */
@@ -256,6 +259,11 @@ export interface AgentToolArgs {
   prompt: string;
   subagent_type?: string;
   max_turns?: number;
+  /** CAPSULE-POOL-SHORT-LANE — `short`: a ≤10 min background capsule for one triaged action (cap 8 per seat, apart
+   *  from the long lane's 3). */
+  lane?: 'short' | 'long';
+  /** Short lane: the subject key (e.g. `pr:40036`, `cell:MAIL-TRIAGE-TASKQUEUE`, `msg:123`) — one live capsule per key. */
+  key?: string;
   /** ROADMAP-agent-surface-deferred-tools-2026-05-13 Wave 5 E1 —
    *  per-spawn registry isolation (Gemini CLI pattern). When set,
    *  the sub-agent sees ONLY tools whose name is in `allow` and NOT
@@ -395,6 +403,19 @@ export function buildAgentTool(): LLMToolSpec {
           type: 'boolean',
           description: w.agentWaitForSlot,
         },
+        reason: {
+          type: 'string',
+          description: 'Required. One line: why this is delegated instead of done directly by you. Shown on the spawn line. A spawn without a reason, a duplicate of work already delegated, a verification of an agent that is still running, or a 4th concurrent long-lane agent (9th short-lane) is refused — do small ledger/CLI work yourself.',
+        },
+        lane: {
+          type: 'string',
+          enum: ['short', 'long'],
+          description: 'Optional. "short" = a quick background capsule for ONE action item from mail (reply, check, small fix): brief + done criteria, stopped after 10 minutes or ~40k tokens, up to 8 at once, one per key. Default "long" (up to 3 at once).',
+        },
+        key: {
+          type: 'string',
+          description: 'Short lane only: the subject this capsule works — pr:<n>, cell:<ID>, or msg:<id>. A second short capsule for the same key is refused while the first runs.',
+        },
         name: {
           type: 'string',
           description: 'Optional UI label for this spawn (shown in agent-roster / logs). Useful when fanning out N workers with the same subagent_type — give each a distinct name so the roster can tell them apart.',
@@ -431,7 +452,7 @@ export function buildAgentTool(): LLMToolSpec {
           additionalProperties: false,
         },
       },
-      required: ['description', 'prompt'],
+      required: ['description', 'prompt', 'reason'],
     },
   };
 }
@@ -508,7 +529,8 @@ export interface DispatchAgentOpts {
   }) => void;
 }
 
-const BUILTIN_GENERAL_PURPOSE_DEFAULT_TOOLS = ['Bash', 'Read', 'Edit', 'Grep', 'WebFetch'] as const;
+// 검색 묶음(Glob·ListDir·AstGrep·DirectiveSearch·DocsSearch)까지 — src/agents/general-purpose.md 와 같은 순서.
+const BUILTIN_GENERAL_PURPOSE_DEFAULT_TOOLS = ['Bash', 'Read', 'Edit', 'Grep', 'WebFetch', 'Glob', 'ListDir', 'AstGrep', 'DirectiveSearch', 'DocsSearch'] as const;
 
 export function dispatchAgent(
   args: Record<string, unknown>,
@@ -931,6 +953,19 @@ async function dispatchAgentCore(
     debug.log('agent.spawn', 'inherited-cwd', { agent: definition.name, cwd: childCwd });
   }
 
+  // 읽기 전용 캡슐 — 자리 cwd 트리가 낡았으면(origin/main 보다 며칠 뒤) 설정된 최신 체크아웃을 기본 검색 뿌리로 쓴다.
+  //   뿌리는 단일 출처 해석기(src/knowledge/search-roots.ts · env ELANOUS_SOURCES > config knowledge.sources)에서만 온다.
+  let cwdNotice = '';
+  if (childCwd && appliedIsolation !== 'worktree' && definition.permissionMode === 'read-only') {
+    const { staleCwdFor } = await import('../../knowledge/stale-cwd.js');
+    const stale = staleCwdFor(childCwd);
+    if (stale) {
+      cwdNotice = `\n\n[cwd] ${childCwd} is ${stale.days} days behind origin/main — this read-only child searches the configured latest checkout ${stale.latestRoot} by default.`;
+      debug.log('agent.spawn', 'stale-cwd-rerooted', { cid: debugCorrelationId, agent: definition.name, from: childCwd, to: stale.latestRoot, days: stale.days });
+      childCwd = stale.latestRoot;
+    }
+  }
+
   let childDispatchTool = opts.dispatchTool;
   let childTools = opts.hostTools ?? [];
   if (childCwd && opts.buildChildToolCatalog) {
@@ -975,6 +1010,15 @@ async function dispatchAgentCore(
     }, { level: 'warn' });
   }
 
+  // 검색 묶음(src/agent/search-toolkit.ts) — 자식 카탈로그에 빠진 AstGrep·DirectiveSearch·DocsSearch 를 더한다
+  //   (TUI·MCP·CLI 어느 부모든). 도구가 하나도 없는 자식은 그대로 둔다(«도구 없음» 계약).
+  if (childTools.length > 0) {
+    const toolCwd = childCwd;
+    const toolkit = withSearchToolkit(childTools, childDispatchTool, () => toolCwd ?? getSessionCwd());
+    childTools = toolkit.tools;
+    childDispatchTool = toolkit.dispatch;
+    if (toolkit.added.length > 0) debug.log('agent.spawn', 'search-toolkit', { cid: debugCorrelationId, agent: definition.name, added: toolkit.added });
+  }
   // A first-level child may spawn one grandchild; the grandchild cannot recurse.
   if (opts.parentTaskId) childTools = stripAgentToolForOneLevelNesting(childTools);
   // Wave 5 E1 — apply per-spawn tool_filter (SUBAGENT-TOOLS-EMPTY · 0.2.36 · 대표 «서브에이전트에 제약이 생기지 않게»).
@@ -1023,7 +1067,7 @@ async function dispatchAgentCore(
     : '';
   const childPrompt = (hasNoTools
     ? `${prompt}\n\nNo tools are available; if a request requires reading files or executing commands, report that as unavailable rather than guessing.`
-    : prompt) + budgetPrompt;
+    : prompt) + budgetPrompt + cwdNotice;
 
   debug.log('agent.spawn', 'dispatch', {
     cid: debugCorrelationId,
@@ -1073,7 +1117,9 @@ async function dispatchAgentCore(
       });
     }
     if (!childDispatchTool) throw new Error(`No dispatcher for ${name}`);
-    return childDispatchTool(name, args);
+    // 넓은 검색 계수기는 캡슐마다 따로(부모와 공유하지 않는다).
+    const dispatchInChild = childDispatchTool;
+    return runInSearchLoopScope(`capsule:${spawnedTaskId ?? debugCorrelationId}`, () => dispatchInChild(name, args));
   };
   const handle = globalAgentRegistry.spawn({
     definition: spawnDefinition,

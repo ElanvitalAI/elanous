@@ -71,7 +71,7 @@ describe('CAPSULE-A2 dispatchRunShellCapsule (real legacy RunShell process)', ()
     const id = /capsule=(\S+)/.exec(started.output)?.[1] ?? '';
     expect(id).toMatch(/^shell-[0-9a-z]+-\d+$/);
     expect([started.outcome, started.exitCode]).toEqual(['started', null]);
-    expect(started.output).toBe(`RunShell outcome=started capsule=${id} — still running after 0s, so it moved to the background (same process, same timeout). Do not wait or poll for it: finish this turn. Its result arrives as a new turn event (capsule-done ${id}).`);
+    expect(started.output).toBe(`RunShell outcome=started capsule=${id} · running in background · will wake on completion — still running after 0s (same process, same timeout). If this turn has other work, continue it; otherwise end the turn with one line saying you are waiting for it — a new turn opens with its output (capsule-done ${id}) when it finishes. Do not poll or sleep for it.`);
     turn.abort();
     for (let i = 0; i < 60 && q.size === 0; i++) await new Promise((resolve) => setTimeout(resolve, 50));
     sink.dispose();

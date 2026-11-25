@@ -35,12 +35,12 @@ describe('isVisionCapableModel(openrouter)', () => {
 });
 
 describe('isLikelyVisionModel(openrouter/…)', () => {
-  test('⛔ 카탈로그에 없으면 «모른다» → false (이름 패턴으로 true 를 지어내지 않는다)', () => {
+  test('⛔ 카탈로그·내장 표 어디에도 없으면 «모른다» → false · 내장 표(VISION-CATALOG-BUILTIN 11-25)의 주력 계열은 true', () => {
     delete process.env.ELANOUS_CATALOG_DISCOVERY_SNAPSHOT;
     reloadCatalog();
     expect(isLikelyVisionModel('openrouter/moonshotai/kimi-k3')).toBe(false);
-    expect(isLikelyVisionModel('openrouter/google/gemini-3-pro')).toBe(false);
-    expect(isLikelyVisionModel('openrouter/anthropic/claude-opus-4-6')).toBe(false);
+    expect(isLikelyVisionModel('openrouter/google/gemini-3-pro')).toBe(true);
+    expect(isLikelyVisionModel('openrouter/anthropic/claude-opus-4-6')).toBe(true);
   });
 
   test('카탈로그 사실대로 — images 면 true · text-only(null) 면 false', () => {

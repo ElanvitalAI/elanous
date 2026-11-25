@@ -20,6 +20,8 @@
 //    남겼다 — 판·자리 운영·회수·스킬·서브에이전트 도구가 «어느 묶음에도 안 들어서» 기본으로 갔을 뿐이다.
 //    ⇒ 화이트리스트를 따로 두지 않고(09-25 설계 유지) 그것들을 새 묶음 넷(admin · recall · skills · subagent)으로 옮긴다.
 //    ⇒ `coding` 의 기대 집합 = Read · Grep · Glob · ListDir · Edit · Write · Bash · Plan · MarkStepDone(9개).
+//    ⊕ 검색 묶음(11-25 · src/agent/search-toolkit.ts) AstGrep(바이너리 있을 때) · DirectiveSearch · DocsSearch —
+//      어느 묶음에도 넣지 않는다(= 기본) — 캡슐이 찾기 도구를 잃지 않게.
 //    빠진 묶음은 상황 신호(골 문면)와 ToolSearch(전체 목록에서 찾는다)로 계속 닿는다.
 
 import { debug } from '../debug/log.js';
@@ -35,7 +37,7 @@ export const TOOL_EXTRA_GROUPS = {
   /** 스킬 목록·실행. */
   skills: { prefixes: [] as string[], names: ['elanous_skills_list', 'skill_exec'] },
   /** 서브에이전트 — ⚠️ 기본에서 빼도 완주율이 안 떨어지는지는 아직 안 쟀다(SMALL-MODEL-BENCH 가 잰다). 신호·ToolSearch 로 되살린다. */
-  subagent: { prefixes: [] as string[], names: ['Agent', 'AgentOutput', 'AgentReply', 'AgentStop', 'AgentList'] },
+  subagent: { prefixes: [] as string[], names: ['Agent', 'AgentOutput', 'AgentReply', 'AgentStop', 'AgentList', 'AgentSend'] },
 } as const;
 export type ToolExtraGroup = keyof typeof TOOL_EXTRA_GROUPS;
 const ALL_GROUPS = Object.keys(TOOL_EXTRA_GROUPS) as ToolExtraGroup[];

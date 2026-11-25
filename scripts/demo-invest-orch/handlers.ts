@@ -10,7 +10,9 @@
 import { execFile, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { curateStageHeadlines, tickerHeadlines } from './headline-curate.js';
+import { panelName } from '../../src/tui/widgets/scenes/invest-run.js';
 import type { InProcessHandler, InProcessHandlerContext, InProcessHandlerRegistry, InProcessHandlerResult } from '../../src/graph-runner/in-process-registry.js';
 
 export const DISCLAIMER = '리서치 시연 · 투자 권유 아님';
@@ -41,6 +43,33 @@ export interface DemoInput {
   readonly simDelayMs?: number;
   /** Live panel CLI timeout (ms). */
   readonly panelTimeoutMs?: number;
+  /** DEMO-INVEST-ELS-TARGET: the els socket the panel tabs open in (run.ts resolves it — `investElsTarget`). */
+  readonly elsSocket?: string;
+}
+
+/**
+ * DEMO-INVEST-ELS-TARGET (demo-check 11-25: a test-universe rehearsal opened 30 panel tabs in the OPS els): the els this
+ * run shows its tabs in. An explicit socket (`--els-socket`) wins; otherwise the els of the universe the run is in
+ * (ELANOUS_STATE_DIR — run.ts pins it before this is asked). An inherited ELANOUS_ELS_SOCKET never decides: a rehearsal
+ * started from inside an operational pane must not reach the operational els.
+ */
+export function investElsTarget(env: Readonly<Record<string, string | undefined>>, explicitSocket?: string): { readonly socket: string; readonly stateRoot: string } {
+  if (explicitSocket?.trim()) {
+    const socket = resolve(explicitSocket.trim());
+    return { socket, stateRoot: dirname(dirname(socket)) };
+  }
+  const root = env.ELANOUS_STATE_DIR?.trim();
+  if (!root) throw new Error('invest-orch: no universe for the els target — set ELANOUS_STATE_DIR or pass --els-socket');
+  const stateRoot = resolve(root);
+  return { socket: join(stateRoot, 'els', 'els.sock'), stateRoot };
+}
+
+/** The env of an `els new` aimed at `target`: its state root, and no els credential or socket inherited from another els. */
+export function investElsEnv(env: NodeJS.ProcessEnv, target: { readonly socket: string; readonly stateRoot: string }): NodeJS.ProcessEnv {
+  const same = env.ELANOUS_ELS_SOCKET === target.socket;
+  const out: NodeJS.ProcessEnv = { ...env, ELANOUS_STATE_DIR: target.stateRoot };
+  if (!same) for (const key of ['ELANOUS_ELS_SOCKET', 'ELANOUS_ELS_PANE_TOKEN', 'ELANOUS_ELS_OWNER_TOKEN', 'ELANOUS_ELS_PANE', 'ELANOUS_ELS_WS']) delete out[key];
+  return out;
 }
 interface PanelNodeInput { readonly role: 'panel' | 'mentor'; readonly persona?: string; readonly slot?: number; readonly runtime: Runtime; readonly model?: string; readonly provider?: string }
 
@@ -54,6 +83,8 @@ const resultOf = <T>(ctx: InProcessHandlerContext, nodeId: string): T | undefine
   return out && typeof out === 'object' ? out.result : undefined;
 };
 const fixture = <T>(name: string): T => JSON.parse(readFileSync(join(FIXTURE_DIR, `${name}.json`), 'utf8')) as T;
+/** Fixture mode: the model a runtime's default resolved to in the recorded live run (never the word «default»). */
+export const recordedDefaultModel = (runtime: Runtime): string => fixture<Partial<Record<Runtime, string>>>('panel-models')[runtime] ?? (runtime === 'claude' ? 'haiku' : 'default');
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const progress = (ctx: InProcessHandlerContext, phase: 'verify' | 'generate' | 'materialize' | 'publish', note: string) =>
   ctx.reportProgress?.({ phase, note }).catch(() => undefined);
@@ -344,16 +375,19 @@ async function runPanelCli(id: string, label: string, binding: PanelNodeInput, p
   }
   writeFileSync(script, ['#!/bin/bash', `export PATH=${shq(process.env.PATH ?? '')}`, `export HOME=${shq(homedir())}`,
     ...(process.env.ELANOUS_STATE_DIR ? [`export ELANOUS_STATE_DIR=${shq(process.env.ELANOUS_STATE_DIR)}`] : []), scrub,
-    `printf '\\033[1m▶ %s\\033[0m\\n' ${shq(`${label} · ${binding.runtime}${model ? ` · ${model}` : ''}${simulated !== undefined ? ' · 시뮬레이션' : ''}`)}`,
+    `printf '\\033[1m▶ %s\\033[0m\\n' ${shq(`${label} · ${binding.runtime}${model ? ` · ${model}` : ''}${simulated !== undefined ? ' · simulated' : ''}`)}`,
     `printf '%s\\n\\n' ${shq(prompt.split('\n')[0]!.slice(0, 120))}`, body, 'rc=${PIPESTATUS[0]}', `echo $rc > ${shq(rcFile)}`, 'printf "\\n[done rc=%s]\\n" $rc', ''].join('\n'));
   const started = Date.now();
   const timeoutMs = simulated !== undefined ? (input.simDelayMs ?? 1500) + 30_000 : input.panelTimeoutMs ?? 150_000;
   let pane = 'headless';
   if (input.els) {
     const ws = input.elsWorkspace ?? 'invest-demo';
-    const r = await run(process.env.INVEST_DEMO_ELN ?? 'eln', ['side', 'new', '--ws', ws, '--title', `${label} · ${binding.runtime}`, '--cwd', dir, '--', 'bash', script],
-      // els is the host's operational server; the run's test-universe stamp would point `eln side` at a socket that does not exist.
-      { timeoutMs: 15_000, env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'ELANOUS_STATE_DIR')) as NodeJS.ProcessEnv });
+    // DEMO-INVEST-ELS-TARGET: the tab opens in the els this run targets (its universe's, or --els-socket) — through this
+    // tree's own CLI unless INVEST_DEMO_ELN names another, never through the installed operational binary by default.
+    const target = investElsTarget(process.env, input.elsSocket);
+    const cli = process.env.INVEST_DEMO_ELN ? [process.env.INVEST_DEMO_ELN] : [process.execPath, join(REPO_ROOT, 'bin/elanous.mjs')];
+    const r = await run(cli[0]!, [...cli.slice(1), 'side', 'new', '--ws', ws, '--title', investTabTitle(id, binding.runtime), '--cwd', dir, '--', 'bash', script],
+      { timeoutMs: 15_000, env: investElsEnv(process.env, target) });
     if (r.code === 0) pane = `els:${ws}/${label}`;
   }
   let code = 1;
@@ -368,7 +402,7 @@ async function runPanelCli(id: string, label: string, binding: PanelNodeInput, p
     code = existsSync(rcFile) ? Number(readFileSync(rcFile, 'utf8').trim()) : 124;
   }
   const raw = existsSync(`${outFile}.last`) ? readFileSync(`${outFile}.last`, 'utf8') : existsSync(outFile) ? readFileSync(outFile, 'utf8') : '';
-  let text = raw, usedModel = model ?? (binding.runtime === 'claude' ? 'haiku' : 'default');
+  let text = raw, usedModel = model ?? (simulated !== undefined ? recordedDefaultModel(binding.runtime) : binding.runtime === 'claude' ? 'haiku' : 'default');
   if (simulated === undefined && binding.runtime === 'eln') {
     let j: { reply?: string; model?: string; provider?: string } | undefined;
     for (const line of raw.trim().split('\n').reverse()) { try { j = JSON.parse(line) as typeof j; break; } catch { /* not the envelope line */ } }
@@ -429,7 +463,9 @@ export function mentorConsensus(mentors: readonly PanelAnswer[]) {
 // ── decision triage («결정 분류» — Manager/Coordinator) ────────────────────────────────────────────────────────────
 export interface DecisionItem { id: string; title: string; mode: 'auto' | 'human'; criterion: string; evidence: string }
 export function triageDecisions(args: { sources: Array<{ node: string; source: string; reason?: string }>; answers: readonly PanelAnswer[]; panelOk: number; panelOf: number;
-  mentorDirections: Array<{ name: string; action?: string }>; contradicted: Array<{ mentor: string; claim: string; observed: string }>; mandateArmed: boolean; fixtures: boolean }): DecisionItem[] {
+  mentorDirections: Array<{ name: string; action?: string }>; contradicted: Array<{ mentor: string; claim: string; observed: string }>; mandateArmed: boolean; fixtures: boolean;
+  /** The run raises the human cards (--raise-decisions): publishing is then a person's call in rehearsal too. */
+  raiseDecisions?: boolean }): DecisionItem[] {
   const items: DecisionItem[] = [];
   for (const s of args.sources.filter((x) => x.source === 'missing')) {
     items.push({ id: `source-missing:${s.node}`, title: `${s.node} 결과 없음 — 이 소스 없이 진행할까?`, mode: s.node === 'market' ? 'human' : 'auto',
@@ -438,6 +474,12 @@ export function triageDecisions(args: { sources: Array<{ node: string; source: s
   for (const s of args.sources.filter((x) => x.source === 'fixture-fallback')) {
     items.push({ id: `source-substitution:${s.node}`, title: `${s.node} 라이브 실패 → 녹화 데이터로 대체할까?`, mode: s.node === 'market' ? 'human' : 'auto',
       criterion: s.node === 'market' ? '규칙: 시세(검증표의 근거)는 대체 시 사람 확인' : '규칙: 보조 소스 대체는 출처 표기(source=fixture-fallback) 영수가 있으면 자동 승인', evidence: s.reason ?? '' });
+  }
+  // DEMO-INVEST-ORCH-PIN: every panel answer is one triage item — accepted into the consensus or failed — so the count
+  // is the same on every run of the same fixture (15 answers + sources + claims + the fixed four).
+  for (const a of args.answers.filter((x) => x.status !== 'failed')) {
+    items.push({ id: `answer-accepted:${a.id}`, title: `${a.label}(${a.runtime} · ${a.model}) 응답을 합의에 넣을까?`, mode: 'auto',
+      criterion: '규칙: 파싱된 응답 + 사용 모델 기록이 있으면 자동 반영', evidence: `${a.action ?? '?'} ${a.confidence ?? '?'}/10` });
   }
   for (const a of args.answers.filter((x) => x.status === 'failed')) {
     items.push({ id: `panelist-failed:${a.id}`, title: `${a.label}(${a.runtime}) 응답 실패 — 재시도하거나 제외할까?`, mode: 'auto',
@@ -461,8 +503,9 @@ export function triageDecisions(args: { sources: Array<{ node: string; source: s
   }
   items.push({ id: 'conatus-execution', title: '합의 결과로 코나투스 주문을 낼까?', mode: 'auto',
     criterion: `규칙: 시연 그래프는 집행 노드가 없다 · mandate armed=${args.mandateArmed} → 집행 안 함`, evidence: 'execution: disabled' });
-  items.push({ id: 'publish-dashboard', title: '웹 계기판에 결과 JSON 을 공개할까?', mode: args.fixtures ? 'auto' : 'human',
-    criterion: args.fixtures ? '규칙: 녹화(dry-run) 결과는 로컬 파일만 — 공개 없음' : '규칙: 공개(publish)는 사람 결정', evidence: '' });
+  const publishByHand = !args.fixtures || args.raiseDecisions === true;
+  items.push({ id: 'publish-dashboard', title: '웹 계기판에 결과 JSON 을 공개할까?', mode: publishByHand ? 'human' : 'auto',
+    criterion: publishByHand ? '규칙: 공개(publish)는 사람 결정' : '규칙: 녹화(dry-run) 결과는 로컬 파일만 — 공개 없음', evidence: '' });
   items.push({ id: 'disclaimer', title: '리포트 첫 줄 고지 문구를 넣을까?', mode: 'auto', criterion: `규칙: «${DISCLAIMER}» 항상 첫 줄`, evidence: '' });
   return items;
 }
@@ -492,7 +535,7 @@ export function createInvestDemoHandlers(): InProcessHandlerRegistry {
     // the board-statement wording surfaces the 11-23 reinstatement and the NVDA +30% day.
     const queries = ['NVIDIA board reinstates Jensen Huang as president and CEO', 'Nvidia stock surge after Jensen Huang reinstatement', 'AI capex HBM demand hyperscaler', '코스피 외국인 엔비디아 반도체'];
     const groups = await Promise.all(queries.map((q) => crawl(q, ['--time-range', 'week', '--limit', '4']).catch(() => ({ items: [] as CrawlItem[], summary: null }))));
-    const items = groups.flatMap((g) => g.items).filter((i, n, all) => i.url && all.findIndex((j) => j.url === i.url) === n).slice(0, 12);
+    const items = curateStageHeadlines(groups.flatMap((g) => g.items).filter((i, n, all) => i.url && all.findIndex((j) => j.url === i.url) === n)).slice(0, 12);
     if (!items.length) throw new Error('event-shock: no items');
     return { source: 'live:omni-crawl', since: MENTOR_PACK_DATE, queries, items };
   });
@@ -541,7 +584,7 @@ export function createInvestDemoHandlers(): InProcessHandlerRegistry {
       prompt = promptFor('panel', { persona }, plan.question, fs.factsheet, fs.eventText, []);
       base = { tier: persona.tier_owned, weight: persona.consensus_weight, emoji: persona.emoji };
     }
-    await progress(ctx, 'generate', `runtime=${binding.runtime} model=${binding.model ?? 'default'} · ${label}`);
+    await progress(ctx, 'generate', `runtime=${binding.runtime} model=${binding.model ?? (input.fixtures ? recordedDefaultModel(binding.runtime) : 'default')} · ${label}`);
     const dir = join(plan.outDir, 'panes');
     const simulated = input.fixtures ? (fixture<Record<string, string>>('panel-answers')[ctx.nodeId] ?? '') : undefined;
     let cli = await runPanelCli(ctx.nodeId, label, binding, prompt, dir, input, simulated);
@@ -599,7 +642,7 @@ export function createInvestDemoHandlers(): InProcessHandlerRegistry {
     const items = triageDecisions({ sources, answers, panelOk: c?.panel.n ?? 0, panelOf: c?.panel.of ?? 0,
       mentorDirections: mentors.map((m) => ({ name: m.label, action: m.action })),
       contradicted: mentors.flatMap((m) => (m.verification ?? []).filter((h) => h.status === '✗').map((h) => ({ mentor: m.label, claim: h.claim, observed: h.observed }))),
-      mandateArmed: judge?.mandate.armed ?? false, fixtures: input.fixtures === true });
+      mandateArmed: judge?.mandate.armed ?? false, fixtures: input.fixtures === true, raiseDecisions: input.raiseDecisions === true });
     const human = items.filter((i) => i.mode === 'human');
     const raised: Array<{ id: string; ok: boolean; detail: string }> = [];
     if (input.raiseDecisions && !input.fixtures) {
@@ -612,7 +655,7 @@ export function createInvestDemoHandlers(): InProcessHandlerRegistry {
     }
     const summary = `결정 대기 ${items.length}건 → 기준 자동 처리 ${items.length - human.length}건 · 사람 결정 ${human.length}건`;
     await progress(ctx, 'verify', summary);
-    return ok({ summary, items, raised, cards: human.map((i) => `[결정 카드] ${i.title} · 기준: ${i.criterion}`) });
+    return ok({ summary, summaryEn: investDecisionSummaryEn(items.length, human.length), items, raised, cards: human.map((i) => `[결정 카드] ${i.title} · 기준: ${i.criterion}`) });
   };
   handlers.report = async (ctx) => {
     const plan = resultOf<{ question: string; ticker: string; mode: string; outDir: string; startedAt: string }>(ctx, 'plan')!;
@@ -634,7 +677,7 @@ export function createInvestDemoHandlers(): InProcessHandlerRegistry {
       market: market ? Object.fromEntries(Object.entries(market.series).map(([k, v]) => [k, { last: v.last, date: v.date, chg1m: v.chg1m, chg3m: v.chg3m }])) : null,
       flows: flows ? { foreign5dMillion: flows.kospi.foreign5dMillion, foreign20dMillion: flows.kospi.foreign20dMillion, inst5dMillion: flows.kospi.inst5dMillion } : null,
       framework: score ? { total: score.total, signal: score.signal, z: score.z, tiers: score.tiers, asOf: score.asOf } : null,
-      events: (event?.items ?? []).slice(0, 8).map((i) => ({ title: i.title, url: i.url })),
+      events: tickerHeadlines(plan.ticker, [resultOf<{ items: CrawlItem[] }>(ctx, 'news')?.items ?? [], event?.items ?? []]).slice(0, 8).map((i) => ({ title: i.title, url: i.url })),
       panel: panel.map((a) => ({ id: a.id, label: a.label, emoji: a.emoji, tier: a.tier, weight: a.weight, runtime: a.runtime, model: a.model, pane: a.pane, status: a.status,
         action: a.action ?? null, confidence: a.confidence ?? null, view: a.view ?? null, eventImpact: a.eventImpact ?? null, durationMs: a.durationMs })),
       mentors: mentors.map((a) => ({ id: a.id, name: a.label, gist: a.gist, runtime: a.runtime, model: a.model, status: a.status, direction: a.direction ?? null, action: a.action ?? null,
@@ -667,7 +710,23 @@ export function createInvestDemoHandlers(): InProcessHandlerRegistry {
     writeFileSync(join(plan.outDir, 'report.md'), md);
     writeFileSync(join(plan.outDir, 'dashboard.json'), `${JSON.stringify(dashboard, null, 2)}\n`);
     await progress(ctx, 'publish', `report · ${c.overall.action} · ${triage.summary}`);
-    return ok({ report: join(plan.outDir, 'report.md'), dashboard: join(plan.outDir, 'dashboard.json'), firstLine: md.split('\n')[0], consensusLine: `패널 ${c.panel.action}(${c.panel.score}) · 멘토 ${c.mentors.action}(${c.mentors.score}) · 종합 ${c.overall.action}(${c.overall.score})`, decisionSummary: triage.summary });
+    return ok({ report: join(plan.outDir, 'report.md'), dashboard: join(plan.outDir, 'dashboard.json'), firstLine: md.split('\n')[0], consensusLine: `패널 ${c.panel.action}(${c.panel.score}) · 멘토 ${c.mentors.action}(${c.mentors.score}) · 종합 ${c.overall.action}(${c.overall.score})`, decisionSummary: triage.summary,
+      summaryLines: investRunSummaryLines(c, triage.items.length, triage.items.filter((i) => i.mode === 'human').length) });
   };
   return handlers;
+}
+
+/** Product text for the els tab of one panelist — English stage name · runtime («Global macro · eln»). */
+export const investTabTitle = (nodeId: string, runtime: string): string =>
+  `${panelName(nodeId.replace(/-retry$/u, ''))} · ${runtime}${nodeId.endsWith('-retry') ? ' · retry' : ''}`;
+
+/** «25 decisions → 24 automatic · 1 for you» — the English line the run summary prints. */
+export const investDecisionSummaryEn = (total: number, human: number): string =>
+  `${total} decision${total === 1 ? '' : 's'} → ${total - human} automatic · ${human} for you`;
+
+/** The CLI run summary a demo viewer reads (the Korean report.md stays the operator's artifact). */
+export function investRunSummaryLines(c: { panel: { action: string; score: number }; mentors: { action: string; score: number }; overall: { action: string; score: number } }, total: number, human: number): string[] {
+  return ['Research demo · not investment advice · no order is placed',
+    `Panel ${c.panel.action} (${c.panel.score}) · mentors ${c.mentors.action} (${c.mentors.score}) · overall ${c.overall.action} (${c.overall.score})`,
+    investDecisionSummaryEn(total, human)];
 }

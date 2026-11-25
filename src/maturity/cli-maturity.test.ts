@@ -30,7 +30,10 @@ describe('MAT1a CLI root maturity', () => {
     for (const command of commands) expect(cliRootMaturity(command.name())).toBeDefined();
     expect(cliRootMaturity('mission')).toBe('beta');
     expect(cliRootMaturity('resource')).toBe('beta');
-    expect(names).not.toContain('autopilot');
+    // CROWN-GOAL-APPLY (#40053) brought back a root `autopilot` (goal set) — it must carry a grade or every install's bootstrap throws.
+    expect(cliRootMaturity('autopilot')).toBe('beta');
+    // #40136 added root `watch` ungraded → bare `els`/`--help` crashed on main; pin it.
+    expect(cliRootMaturity('watch')).toBe('beta');
     expect(commands.find(command => command.name() === 'ops')?.commands.map(command => command.name())).not.toContain('mission');
     expect(commands.find(command => command.name() === 'harness')?.commands.map(command => command.name())).not.toContain('mission');
     for (const name of absentPrivateLedger) expect(names).not.toContain(name);

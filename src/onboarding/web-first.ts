@@ -42,6 +42,8 @@ export interface WebFirstSetupDeps {
   print?: (line: string) => void;
   /** Interactive first-run choice; injected only for terminal tests. */
   chooseSetupMode?: (prompt: string) => Promise<string>;
+  /** DEMO-ZEROBASE-FIXES: persist a terminal choice so «Choose setup» does not come back on every run. */
+  rememberTerminalChoice?: () => void;
 }
 
 // The onboarding flow waits at most twelve seconds for a daemon before falling back to terminal setup.
@@ -142,6 +144,9 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
   if (deps.terminal) { observe('fallback', 'terminal'); return 'fallback'; }
 
   const env = deps.browserEnv ?? process.env;
+  // DEMO-ZEROBASE-FIXES: an eln tab inside els is driven by `els send`, which a line prompt refuses (no paste mode).
+  // There the chooser would be a dead end, so terminal setup goes on without asking.
+  if (env.ELANOUS_ELS_PANE) { observe('fallback', 'els-pane'); return 'fallback'; }
   const ssh = !!(env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY);
   const noDisplay = !!browserUnavailableReason(env, deps.browserPlatform ?? process.platform);
   const isHeadless = (deps.isHeadless ?? (() => isHeadlessEnv(env)))();
@@ -153,7 +158,9 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
     let answer: string;
     try { answer = (await (deps.chooseSetupMode ?? readSetupChoice)(text.setupPrompt(recommended))).trim(); }
     catch { answer = recommended; }
-    if ((answer || recommended) === '1') { observe('fallback', 'terminal-choice'); return 'fallback'; }
+    const remember = (): void => { try { deps.rememberTerminalChoice?.(); } catch { /* the choice still applies to this run */ } };
+    if ((answer || recommended) === '1') { remember(); observe('fallback', 'terminal-choice'); return 'fallback'; }
+    // Only an explicit Terminal choice is remembered: a typo must not hide web setup for good.
     if (answer !== '' && answer !== '2') { observe('fallback', 'invalid-choice'); return 'fallback'; }
   }
 

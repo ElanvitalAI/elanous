@@ -3,6 +3,7 @@
 // 우회 0: every action runs through createControl (control-allow.json · control-audit.jsonl · close human
 // confirmation). The tool's only executor is requestEls over the els socket — it never touches panes directly.
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { requestEls } from './client.js';
 import { audit, createControl, type ControlAction, type ControlTarget, type IdResolver, type StructPayload } from './control.js';
@@ -290,6 +291,67 @@ export async function runElsControl(args: unknown, deps: ElsControlDeps): Promis
   };
 }
 
+/** Actions that only look: they never need the caller's OP runtime registration. */
+const LOOK_ACTIONS: ReadonlySet<string> = new Set(['ls', 'status', 'read']);
+/** The server's tool-door answer when the caller's runtime is not (or no longer) registered (server.ts `new`). */
+const UNVERIFIED_TOOL_SEAT = 'verified tool seat required';
+
+export interface OpRuntimeRegistrationDeps {
+  readonly env?: Record<string, string | undefined>;
+  /** Run `els seat set OP` as a child of this process (the server verifies the child descends from the claimed runtime). */
+  readonly run?: (argv: readonly string[], env: Record<string, string | undefined>) => Promise<{ readonly code: number; readonly out: string }>;
+  readonly runtime?: () => { readonly pid: number; readonly start: string } | undefined;
+  readonly entry?: string;
+}
+
+let opRuntimeRegistration: Promise<boolean> | undefined;
+
+/** Test seam: forget this process's registration. */
+export function resetOpRuntimeRegistrationForTesting(): void { opRuntimeRegistration = undefined; }
+
+/**
+ * DEMO-FANOUT-LIVE-OP-SEAT (demo-check 11-25 S2 «denied … an authorized OP pane is required»): the els tool door only
+ * accepts an OP caller whose live runtime was registered with `els seat set OP` — before this, a person had to type that
+ * line inside the OP pane. An eln running in the server-minted OP pane (ELANOUS_TRACK=OP ⊕ its pane credential) now does
+ * the same registration itself, once, before its first acting ElsControl call. Nothing here grants authority: the server
+ * still checks the pane credential's OP role, the claimed runtime's live process generation and that the registering
+ * child descends from it (seat-runtime.ts). A pane without the credential, or another seat, never tries.
+ */
+export async function ensureOpRuntimeRegistered(deps: OpRuntimeRegistrationDeps = {}): Promise<boolean> {
+  const env = deps.env ?? process.env;
+  if (elsControlSeat(env)?.name !== 'OP' || !(env.ELANOUS_ELS_PANE_TOKEN ?? '').trim() || !elsControlSocketPath(env)) return false;
+  opRuntimeRegistration ??= (async () => {
+    const runtime = (deps.runtime ?? (() => {
+      const { runtimeProcessIdentity } = require('./seat-runtime.js') as typeof import('./seat-runtime.js');
+      const self = runtimeProcessIdentity(process.pid);
+      return self ? { pid: self.pid, start: self.start } : undefined;
+    }))();
+    if (!runtime) return false;
+    const entry = deps.entry ?? join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'bin', 'elanous.mjs');
+    const run = deps.run ?? runChild;
+    try {
+      const result = await run([process.execPath, entry, 'side', 'seat', 'set', 'OP'], { ...env, ELN_SEAT_RUNTIME: JSON.stringify(runtime) });
+      return result.code === 0;
+    } catch { return false; }
+  })();
+  const ok = await opRuntimeRegistration;
+  if (!ok) opRuntimeRegistration = undefined;   // a refused or failed registration is retried on the next acting call
+  return ok;
+}
+
+function runChild(argv: readonly string[], env: Record<string, string | undefined>): Promise<{ code: number; out: string }> {
+  const { spawn } = require('node:child_process') as typeof import('node:child_process');
+  return new Promise((resolve) => {
+    const child = spawn(argv[0]!, argv.slice(1), { env: env as NodeJS.ProcessEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout?.on('data', (chunk: Buffer) => { out += chunk.toString('utf8'); });
+    child.stderr?.on('data', (chunk: Buffer) => { out += chunk.toString('utf8'); });
+    const timer = setTimeout(() => { try { child.kill('SIGTERM'); } catch { /* already gone */ } }, 15_000);
+    child.on('error', () => { clearTimeout(timer); resolve({ code: 1, out }); });
+    child.on('exit', (code) => { clearTimeout(timer); resolve({ code: code ?? 1, out }); });
+  });
+}
+
 /** Daemon dispatch — gated on ELANOUS_ELS_SOCKET (no socket ⇒ the tool is not on the surface at all). */
 export async function dispatchElsControl(args: unknown): Promise<string> {
   const socketPath = elsControlSocketPath();
@@ -303,7 +365,16 @@ export async function dispatchElsControl(args: unknown): Promise<string> {
     });
   }
   const seat = elsControlSeat();
-  return JSON.stringify(await runElsControl(args, { socketPath, stateDir: dirname(socketPath), ...(seat ? { seat } : {}) }));
+  const acting = !LOOK_ACTIONS.has(str(argsRecord(args).action));
+  if (acting) await ensureOpRuntimeRegistered();
+  const deps = { socketPath, stateDir: dirname(socketPath), ...(seat ? { seat } : {}) };
+  let result = await runElsControl(args, deps);
+  // An els server restart forgets the registration this process made: register again once and retry the same call.
+  if (acting && !result.ok && result.message.includes(UNVERIFIED_TOOL_SEAT)) {
+    resetOpRuntimeRegistrationForTesting();
+    if (await ensureOpRuntimeRegistered()) result = await runElsControl(args, deps);
+  }
+  return JSON.stringify(result);
 }
 
 export function buildElsControlTool(): LLMToolSpec {
@@ -317,7 +388,7 @@ export function buildElsControlTool(): LLMToolSpec {
         action: { type: 'string', enum: [...ELS_CONTROL_ACTIONS], description: '수행 동작' },
         pane: { type: 'string', description: '대상 pane id — 유일한 대상 지정자입니다. workspace·tab·shell 은 els 저널에서 도구가 직접 조회하며 인자로 받지 않습니다 (new 는 이 pane 의 workspace 에 엽니다)' },
         title: { type: 'string', description: 'new: 새 탭 제목' },
-        text: { type: 'string', description: '명령줄/입력 텍스트 (new·do·send)' },
+        text: { type: 'string', description: 'new: the command the new tab runs (e.g. "eln" for an agent tab) · do/send: the line to type into the pane' },
         kind: { type: 'string', description: 'rename·move·close 구조 종류: workspace|tab' },
         id: { type: 'string', description: 'rename·move 구조 대상 id (pane 과 같은 workspace 안이어야 함)' },
         name: { type: 'string', description: 'rename: 새 이름' },

@@ -265,9 +265,12 @@ export async function runSetupKeys(io: SetupKeysIO, options: SetupKeysOptions): 
   return { stored, skipped };
 }
 
-export const FIRST_RUN_PROVIDER_SETUP_MENU_HEADING = '처음 실행 LLM 설정';
-export const FIRST_RUN_PROVIDER_SETUP_MENU_CHOICES = '1 Codex 구독 로그인 (권장) · 2 OpenRouter 내 키 사용 · 3 기타 API 키 입력 · Enter 건너뛰기';
+export const FIRST_RUN_PROVIDER_SETUP_MENU_HEADING = 'First run: set up an LLM';
+export const FIRST_RUN_PROVIDER_SETUP_MENU_CHOICES = '1 Codex login with a ChatGPT plan (recommended) · 2 Use my OpenRouter key · 3 Enter another API key · Enter to skip';
 export const FIRST_RUN_PROVIDER_SETUP_MENU_MAX_MISSES = 3;
+export const FIRST_RUN_PROVIDER_SETUP_MENU_PROMPT = 'Choice: ';
+export const OPENROUTER_KEY_SOURCE_PROMPT = 'Key source: ';
+export const DEFAULT_PROVIDER_PROMPT = 'Default provider number (Enter to skip): ';
 
 /** First-run entry: offer Codex login, catalog-backed OpenRouter BYOK, or the existing key setup. */
 export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRunProviderSetupOptions): Promise<FirstRunProviderSetupResult> {
@@ -277,7 +280,7 @@ export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRu
   for (;;) {
     io.print(FIRST_RUN_PROVIDER_SETUP_MENU_HEADING);
     io.print(FIRST_RUN_PROVIDER_SETUP_MENU_CHOICES);
-    const parsed = parseMenuAnswer(await io.ask('선택: '), choices);
+    const parsed = parseMenuAnswer(await io.ask(FIRST_RUN_PROVIDER_SETUP_MENU_PROMPT), choices);
     if (parsed.kind === 'cancel') return null;
     if (parsed.kind === 'miss') {
       misses += 1;
@@ -301,7 +304,7 @@ export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRu
     const updateWaitLine = () => {
       if (!headless || !io.updateLine || waitingStartedAt === undefined) return;
       waitLineStarted = true;
-      io.updateLine('Codex 로그인 대기 중… ' + elapsedSeconds() + '초 · Ctrl-C 건너뛰기');
+      io.updateLine('Waiting for Codex login… ' + elapsedSeconds() + 's · Ctrl-C to skip');
     };
     const interrupted = new Promise<'cancel'>(resolve => {
       cancelLogin = io.onInterrupt?.(() => {
@@ -315,19 +318,19 @@ export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRu
       onProgress: (event) => {
         if (event.type === 'user_code') {
           if (headless) {
-            io.print('헤드리스 Codex 로그인 · 브라우저에서 아래 주소를 열고 코드를 입력하세요');
-            io.print('주소: ' + event.loginUrl);
-            io.print('코드: ' + event.userCode);
+            io.print('Headless Codex login · open this address in a browser and enter the code');
+            io.print('Address: ' + event.loginUrl);
+            io.print('Code: ' + event.userCode);
             waitingStartedAt = Date.now();
             updateWaitLine();
             if (io.updateLine) timer = setInterval(updateWaitLine, 1_000);
           } else {
-            io.print('Codex 로그인: ' + event.loginUrl + ' · 코드 ' + event.userCode);
+            io.print('Codex login: ' + event.loginUrl + ' · code ' + event.userCode);
           }
         } else if (event.type === 'polling') {
           if (headless) updateWaitLine();
           else if (!waitingLinePrinted) {
-            io.print('Codex 로그인을 기다리는 중… · Ctrl-C 건너뛰기');
+            io.print('Waiting for Codex login… · Ctrl-C to skip');
             waitingLinePrinted = true;
           }
         } else if (event.type === 'exchanging') {
@@ -336,8 +339,8 @@ export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRu
               clearInterval(timer);
               timer = undefined;
             }
-            io.updateLine?.('Codex 로그인 확인 중… ' + elapsedSeconds() + '초');
-          } else io.print('Codex 로그인을 확인하는 중…');
+            io.updateLine?.('Checking Codex login… ' + elapsedSeconds() + 's');
+          } else io.print('Checking Codex login…');
         }
       },
     });
@@ -347,15 +350,15 @@ export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRu
         controller.abort();
         void login.catch(() => {});
         if (waitLineStarted) io.finishLine?.();
-        io.print('Codex 로그인을 건너뛰었습니다. 나중에 elanous login openai-codex로 이어갈 수 있습니다.');
+        io.print('Codex login skipped. Continue later with `elanous login openai-codex`.');
         return null;
       }
       if (waitLineStarted) io.finishLine?.();
-      io.print('Codex 로그인 완료');
+      io.print('Codex login complete');
       return 'openai-codex';
     } catch {
       if (waitLineStarted) io.finishLine?.();
-      io.print('Codex 로그인을 완료하지 못했습니다. 나중에 elanous login openai-codex로 다시 시도할 수 있습니다.');
+      io.print('Codex login did not complete. Try again later with `elanous login openai-codex`.');
       return null;
     } finally {
       if (timer !== undefined) clearInterval(timer);
@@ -373,8 +376,8 @@ export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRu
       ...scanOpenRouterKeyCandidates(options),
     ];
     for (const candidate of candidates) {
-      io.print(`OpenRouter 키 발견: ${candidate.source} · 끝 4자리 ${candidate.lastFour}`);
-      const answer = (await io.ask('이 키를 사용할까요? (y/n): ')).trim().toLowerCase();
+      io.print(`OpenRouter key found: ${candidate.source} · last 4 ${candidate.lastFour}`);
+      const answer = (await io.ask('Use this key? (y/n): ')).trim().toLowerCase();
       if (answer !== 'y' && answer !== 'yes') {
         // A rejected inherited key must not remain available to the provider
         // after the user chooses a different source or skips setup.
@@ -390,8 +393,8 @@ export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRu
       if (imported.stored.includes('OPENROUTER_API_KEY')) { ready = true; break; }
     }
     while (!ready) {
-      io.print('OpenRouter 키 공급: 1 브라우저 OAuth 로그인 (권장) · 2 폰 QR/PWA 등록 · 3 숨김 붙여넣기 · Enter 건너뛰기');
-      const answer = (await io.ask('키 공급 선택: ')).trim();
+      io.print('OpenRouter key: 1 Browser OAuth login (recommended) · 2 Phone QR/PWA · 3 Paste (hidden) · Enter to skip');
+      const answer = (await io.ask(OPENROUTER_KEY_SOURCE_PROMPT)).trim();
       if (!answer) return { kind: 'needs-llm' };
       if (answer === '2') {
         ready = await (options.registerOpenRouterByPhone ?? registerOpenRouterByPhone)(io, options);
@@ -402,14 +405,14 @@ export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRu
           if (selected?.trim()) env.OPENROUTER_API_KEY = selected.trim();
           else ready = false;
         }
-        if (!ready) io.print('폰 등록이 확인되지 않았습니다. 다시 선택하세요.');
+        if (!ready) io.print('Phone registration was not confirmed. Choose again.');
         continue;
       }
       let value: string | undefined;
       if (answer === '1') value = await (options.openRouterPkce ?? openRouterPkce)(io, { headless: openRouterHeadless(options) });
-      else if (answer === '3') value = io.askSecret ? (await io.askSecret('OPENROUTER_API_KEY (Enter=건너뜀): ')).trim() : undefined;
+      else if (answer === '3') value = io.askSecret ? (await io.askSecret('OPENROUTER_API_KEY (Enter to skip): ')).trim() : undefined;
       else continue;
-      if (!value) { io.print('OpenRouter 키를 받지 못했습니다. 다시 선택하세요.'); continue; }
+      if (!value) { io.print('No OpenRouter key received. Choose again.'); continue; }
       const imported = await importServiceKeys(new Map([['OPENROUTER_API_KEY', value]]), io, { ...options, env });
       ready = imported.stored.includes('OPENROUTER_API_KEY');
     }
@@ -429,7 +432,7 @@ export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRu
     .filter(provider => provider.available && provider.auth === 'apikey');
   const available = [...new Set(providers.map(provider => provider.provider as LLMProviderName))];
   if (!available.length) return null;
-  io.print(`기본 공급자 선택: ${available.map((provider, index) => `${index + 1} ${provider}`).join(' · ')}`);
-  const answer = (await io.ask('기본 공급자 번호 (Enter=건너뜀): ')).trim();
+  io.print(`Default provider: ${available.map((provider, index) => `${index + 1} ${provider}`).join(' · ')}`);
+  const answer = (await io.ask(DEFAULT_PROVIDER_PROMPT)).trim();
   return available[Number(answer) - 1] ?? null;
 }

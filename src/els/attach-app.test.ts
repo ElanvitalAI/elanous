@@ -16,25 +16,36 @@ test('CEO 30-second no-eyes receipt paints the els side red and clears after act
   const listed = (pendingRed: number) => JSON.stringify({ panes, ceoSide: { pendingRed } });
   const h = harness(listed(0), { cols: 120, rows: 24 });
   await h.app.start();
-  expect(h.lastScreen()).not.toContain('대표 대기 글');
+  expect(h.lastScreen()).not.toContain('CEO waiting');
   h.setListing(listed(1));
   h.tick(); await Bun.sleep(20);
-  expect(h.lastScreen()).toContain('대표 대기 글');
+  expect(h.lastScreen()).toContain('CEO waiting');
   expect(h.writes.at(-1)).toContain('\u001b[31m');
   h.setListing(listed(0));
   h.tick(); await Bun.sleep(20);
-  expect(h.lastScreen()).not.toContain('대표 대기 글');
+  expect(h.lastScreen()).not.toContain('CEO waiting');
 });
 
-test('a damaged CEO side status is visibly unknown rather than silently zero', async () => {
+test('a damaged CEO side status is visibly unknown (dim note, not a red alarm) rather than silently zero', async () => {
   const panes = [row('op', 'p1', 'OP', 'idle')];
   const h = harness(JSON.stringify({ panes, ceoSide: { error: 'unavailable' } }), { cols: 120, rows: 24 });
   await h.app.start();
-  expect(h.lastScreen()).toContain('대표 대기 글 확인 불가');
-  expect(h.writes.at(-1)).toContain('\u001b[31m');
+  expect(h.lastScreen()).toContain('CEO inbox unavailable');
+  expect(h.lastScreen()).not.toContain('🔴');
   h.setListing(JSON.stringify({ panes }));
   h.tick(); await Bun.sleep(20);
-  expect(h.lastScreen()).not.toContain('대표 대기 글');
+  expect(h.lastScreen()).not.toContain('CEO inbox unavailable');
+  expect(h.lastScreen()).not.toContain('CEO waiting');
+});
+
+test('DEMO-ONBOARD-EN-COPY: a fresh state dir (listing without a CEO side) shows no CEO banner and no Korean', async () => {
+  const h = harness(JSON.stringify({ panes: [row('w', 'p1', 'zsh', 'idle')] }), { cols: 120, rows: 24 });
+  await h.app.start();
+  const screen = h.lastScreen();
+  expect(screen).not.toContain('CEO inbox unavailable');
+  expect(screen).not.toContain('🔴');
+  expect(screen).not.toContain('대표 대기 글');
+  expect(screen).toContain('⏏ Background  ✕ Quit');
 });
 // ELS-APP-RENDER-SINGLE-FRAME: the dialog is spliced into the composed rows — read row `y` (1-based) of the one frame.
 const modalRow = (screen: string, y: number): string => plain(screen.split('\r\n')[y - 1] ?? '');
@@ -544,7 +555,7 @@ test('app: the selected pane exits with another pane left → the focus moves to
   h.setListing(listOf(row('w1', 'p1', 'one', 'exited'), row('w1', 'p2', 'two', 'idle')));
   h.attachments[0]!.handlers.onEnd(0, 'pane exited');
   expect(h.attachments.at(-1)!.pane).toBe('p2');
-  expect(h.lastScreen()).toContain('pane 종료됨');
+  expect(h.lastScreen()).toContain('pane exited');
   h.attachments.at(-1)!.handlers.onEnd(1, 'els: the els server closed the connection');
   // D1a(ELS-SERVER-RESTART-SURVIVE): a server lost after a good list no longer ends the view — the screen stays and
   // the status line says it is coming back (the dedicated D1a test below rides the whole cycle).
@@ -684,7 +695,7 @@ test('app: herdr panes join the left list under «⇄herdr …»; selecting one 
   expect(reads).toEqual(['herdr:w1/t2/p2']);
   expect(screens.at(-1)!).toContain('HERDR SCREEN of herdr:w1/t2/p2');
   expect(screens.at(-1)!).toContain('│  ⇄herdr MSHQ 주 OP    +');                             // the remote pane's tab (FU3 form)
-  expect(screens.at(-1)!).toContain('읽기 전용');
+  expect(screens.at(-1)!).toContain('read-only');
   app.key('rm -rf x\r');
   await Bun.sleep(5);
   expect(screens.at(-1)!).toContain('읽기 전용 — 입력은 els do herdr:w1/t2/p2');
@@ -879,7 +890,7 @@ const click = (x: number, y = 24): string => `\u001b[<0;${x};${y}M`;
 test('app: the bottom line shows « ⏏ 백그라운드  ✕ 종료 »; clicking ⏏ leaves els running (code 0, nothing closed) — like ctrl+b q', async () => {
   const h = harness(listOf(row('w1', 'p1', 'one', 'working')));
   await h.app.start();
-  expect(h.lastScreen().split('\r\n').at(-1)).toContain(' ⏏ 백그라운드  ✕ 종료 ');
+  expect(h.lastScreen().split('\r\n').at(-1)).toContain(' ⏏ Background  ✕ Quit ');
   h.app.key(click(65));
   expect(await h.app.done).toEqual({ code: 0, message: '' });
   expect(h.requests.filter((r) => r.op === 'close' || r.op === 'close-workspace')).toEqual([]);
@@ -897,7 +908,7 @@ test('app: ✕ with something running asks «⚠ N개 실행 중 — 종료?»; 
   const h = harness(listOf(row('w1', 'p1', 'one', 'working'), row('w1', 'p2', 'two', 'idle')));
   await h.app.start();
   h.app.key(click(76));
-  expect(h.lastScreen()).toContain('⚠ 1개 실행 중 — 종료? · y 확인 · 다른 키 취소');
+  expect(h.lastScreen()).toContain('⚠ 1 running — quit? · y confirm · any other key cancels');
   h.app.key('n');
   await Bun.sleep(10);
   expect(h.requests.filter((r) => r.op === 'close-workspace')).toEqual([]);
@@ -1059,7 +1070,7 @@ test('app: wheel over the pane and ctrl+b [ / ] ask the server to scroll the att
   h.app.key('\u0002]');
   expect(h.attachments[0]!.scrolls).toEqual([3, -3, 20, -20]);     // a page is the terminal height (24) - 4
   h.attachments[0]!.handlers.onFrame({ pane: 'p1', seq: 1, cols: 51, rows: 23, back: 7, screen: '[screen 51x23 scrolled-back=7]\nold' });
-  expect(h.lastScreen()).toContain('스크롤백 7줄 위');
+  expect(h.lastScreen()).toContain('scrollback 7 lines up');
   h.attachments[0]!.handlers.onFrame({ pane: 'p1', seq: 2, cols: 51, rows: 23, back: 0, screen: '[screen 51x23 cursor=(row 0, col 0, visible true)]\nlive' });
   expect(h.lastScreen()).not.toContain('스크롤백');
 });

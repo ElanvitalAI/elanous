@@ -60,7 +60,7 @@ describe('essential dashboard catalog', () => {
       'TerminalModalList', 'TerminalModalObserve', 'TerminalModalFocus', 'TerminalModalDetach', 'TerminalModalKill',
     ].map(name => ({ name, description: name, parameters: { type: 'object' } }));
     const expected = [
-      'Read', 'Grep', 'Glob', 'ListDir', 'Edit', 'Write',
+      'Glob', 'Grep', 'Read', 'ListDir', 'Edit', 'Write',
       'Agent', 'AgentOutput', 'AgentReply', 'AgentStop', 'AgentList',
       // ⭐ 고정 목록(`ESSENTIAL_NATIVE_RULE_IDS`)에 들어온 순서 그대로 적는다.
       //    RunDevHarness is explicit-only; the isolated empty config above asserts its default absence.

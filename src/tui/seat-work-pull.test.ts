@@ -1,22 +1,19 @@
 import { describe, expect, test } from 'bun:test';
 
 // ── SEAT-WORK-PULL 배선층 (OP #139787) — RED 먼저: 모듈이 없으면 이 시험은 실패한다. ──
-// 계약: 자리가 IDLE(≠busy)이고 맡은 일이 없으면 pullNextCellFor 로 다음 칸을 당겨
+// 계약: 자리가 IDLE(≠busy)이고 맡은 일이 없으면 eln work next(workNext) 로 다음 칸을 당겨
 //       칸 본문(turnOpensWith)을 큐 노티스(source 'work-pull')로 넣고 queueWake 를 inject
 //       해 턴을 연다. 큐가 비었으면 노티스·inject 없이 «일감 0» 근거 줄만 돌려준다.
 
 import { createSeatWorkPull, mountSeatWorkPull } from './seat-work-pull.js';
-import type { WorkCell, WorkPullResult } from '../seat-loop/work-pull.js';
+import type { KnockPullResult as WorkPullResult } from './seat-work-pull.js';
 
 function fakeDeps(pull: WorkPullResult, opts: { busy?: boolean } = {}) {
   const calls: { notices: Array<{ text: string; source: string }>; injects: number } = { notices: [], injects: 0 };
   const deps = {
     seat: 'SEAT-A',
     busy: () => opts.busy ?? false,
-    readChecklist: (): WorkCell[] => [
-      { id: 'cell-1', title: '칸1', status: 'yellow', owner: null, priority: 'P0' },
-    ],
-    pull: (_seat: string, _cells: WorkCell[]) => pull,
+    pull: (_seat: string) => pull,
     enqueueNotice: (text: string, source: string) => { calls.notices.push({ text, source }); },
     injectKey: () => { calls.injects += 1; },
     queueWake: { marker: 'queue-wake' },
@@ -27,7 +24,7 @@ function fakeDeps(pull: WorkPullResult, opts: { busy?: boolean } = {}) {
 describe('SEAT-WORK-PULL 배선 — idle 자리가 일을 당겨 턴을 연다', () => {
   test('busy 자리는 당기지 않는다 — notice·inject 0회', () => {
     const { deps, calls } = fakeDeps(
-      { kind: 'claimed', claim: { db: ':memory:', cellId: 'cell-1', seat: 'SEAT-A', token: 't' }, cell: { id: 'cell-1', title: '칸1', status: 'yellow', owner: null, priority: 'P0' }, turnOpensWith: '[work-pull] 칸1' },
+      { kind: 'claimed', cell: { id: 'cell-1' }, turnOpensWith: '[work-pull] 칸1' },
       { busy: true },
     );
     const pull = createSeatWorkPull(deps as never);
@@ -39,7 +36,7 @@ describe('SEAT-WORK-PULL 배선 — idle 자리가 일을 당겨 턴을 연다',
 
   test('idle + claimed → 칸 본문을 source work-pull 노티스로 넣고 queueWake 1회 inject', () => {
     const { deps, calls } = fakeDeps(
-      { kind: 'claimed', claim: { db: ':memory:', cellId: 'cell-1', seat: 'SEAT-A', token: 't' }, cell: { id: 'cell-1', title: '칸1', status: 'yellow', owner: null, priority: 'P0' }, turnOpensWith: '[work-pull] 칸1 본문' },
+      { kind: 'claimed', cell: { id: 'cell-1' }, turnOpensWith: '[work-pull] 칸1 본문' },
     );
     const pull = createSeatWorkPull(deps as never);
     const out = pull();

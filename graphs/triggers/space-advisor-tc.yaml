@@ -1,0 +1,40 @@
+graph_id: space-advisor-tc
+version: 1
+loop:
+  title: Space advisor (TC-ADV)
+  root: 조율자
+  managed_by: trigger-registry
+  description: >-
+    SPACE-ADVISOR (CEO 11-25 23:0x · docs/conductor/FEDERATION-STEWARDS.md §5c). Every 2 min one advise run for TC:
+    learn TC's new ✋ decisions as precedents → writer-check steward resolver (#40173) → advisor (precedent resolve with
+    owner ⊕ deadline · or ONE recommendation card to TC · 10-min silence → routine applies / judgment escalates to OP) →
+    30-min digest. Shadow = decide only (no mail); live after one goal-verified tick.
+  owner: TC
+  trigger:
+    cron: '*/2 * * * *'
+  goal:
+    kind: ledger-line
+    path: '{stateRoot}/loops/space-advisor-tc.jsonl'
+    contains: '"goal":"met","window":"{window}"'
+  failure:
+    goal_deadline_min: 2
+    max_attempts: 1
+    backoff_sec: [30]
+  legacy:
+    kind: marker
+    path: '{seatState}/OP/tools/.graph-cutover/space-advisor-tc'
+  cutover_after: 1
+entry_node: tick
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: tick
+    kind: agent
+    recipe: 'cmd:space-advisor-tick'
+    max_visits: 1
+    input:
+      space: TC
+      advisor: TC-ADV
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }

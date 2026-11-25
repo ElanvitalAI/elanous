@@ -26,6 +26,7 @@ import { a5Wordings } from '../turn-capsule/a5-wording.js';
 
 import { debug } from '../debug/log.js';
 import { globalAgentRegistry } from './registry.js';
+import { noteAgentResultConsumed } from '../skills/tools/agent-spawn-guard.js';
 import type { AgentRegistry } from './registry.js';
 import type { AgentTask, AgentState } from './types.js';
 
@@ -211,6 +212,7 @@ export async function dispatchAgentOutput(
       return { dispose: () => clearTimeout(handle) };
     });
   const record = (result: AgentOutputResult): AgentOutputResult => {
+    if (result.state !== undefined && isTerminal(result.state)) noteAgentResultConsumed(result.taskId);
     debug.log('agent.output', 'retrieve', {
       taskId: result.taskId,
       retrievalStatus: result.retrievalStatus,

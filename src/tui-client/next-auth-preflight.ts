@@ -5,7 +5,7 @@ import type { UserConfig } from '../user-config/schema.js';
 type Reason = 'missing-file' | 'expired' | 'other';
 const HOST = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
-export type NextTuiAuthFailureKind = 'codex-auth-missing' | 'codex-auth-failed' | 'glm-auth-missing';
+export type NextTuiAuthFailureKind = 'codex-auth-missing' | 'codex-auth-failed' | 'glm-auth-missing' | 'llm-unset';
 /** Public, fixed text per kind — never provider error text or credential values. */
 export const NEXT_TUI_AUTH_FAILURE_TEXT: Readonly<Record<NextTuiAuthFailureKind, string>> = {
   'codex-auth-missing': 'Codex 인증이 준비되지 않았습니다. 주인 호스트에서 접근 미러를 갱신하세요.',
@@ -13,6 +13,8 @@ export const NEXT_TUI_AUTH_FAILURE_TEXT: Readonly<Record<NextTuiAuthFailureKind,
   // Same text as ZAI_CREDENTIAL_MISSING_REASON (src/llm/zai-coding-plan.ts) — kept literal so the TUI core
   // import graph does not load the Z.ai provider module; the focused test pins the two equal.
   'glm-auth-missing': 'GLM 자격 없음: ZAI Coding Plan 키(~/.cache/zai_api_key 또는 ZAI_API_KEY)를 찾지 못했습니다',
+  // DEMO-ONBOARD-EN-COPY — a new machine with no provider must name the next step, not end in a bare failure.
+  'llm-unset': 'No LLM is set up yet. Run `elanous login openai-codex` (ChatGPT plan) or add an API key with `elanous setup keys`, then resend.',
 };
 /** Only these preflights may create a public auth failure. */
 export class NextTuiAuthError extends Error {
@@ -20,6 +22,16 @@ export class NextTuiAuthError extends Error {
     super(NEXT_TUI_AUTH_FAILURE_TEXT[kind]);
     this.name = 'NextTuiAuthError';
   }
+}
+
+/** DEMO-ONBOARD-EN-COPY — provider `auto` with no usable route (no login, no key, no local server) used to end the
+ * first chat in a 0s generic failure. Judge with the same route selector the runtime uses (presence only) and name
+ * the next step before the child starts. A judge that throws never blocks the turn. */
+export function preflightNextTuiLlmRoute(provider: string | undefined, usable: () => boolean): void {
+  if (provider !== 'auto') return;
+  let ok = true;
+  try { ok = usable(); } catch { ok = true; }
+  if (!ok) throw new NextTuiAuthError('llm-unset');
 }
 
 /** TUI-GLM-PROVIDER-USES-ZAI-CODING-PLAN — a glm turn with no Z.ai Coding Plan key used to end in 0s

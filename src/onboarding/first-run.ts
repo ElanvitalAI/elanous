@@ -63,10 +63,13 @@ export function parseMenuAnswer(answer: string, choices: readonly LLMProviderNam
  * first-run device asserts against it, so a wording change cannot drift apart.
  */
 export function formatProviderMenu(choices: readonly LLMProviderName[]): string {
-  return choices.map((name, i) => `${i + 1} ${CHOICE_LABEL[name] ?? name}`).join(', ');
+  // DEMO-ENGLISH-FIRST-RUN: one choice per row — a narrow terminal never wraps the menu into a raw one-liner.
+  return choices.map((name, i) => `  ${i + 1}  ${CHOICE_LABEL[name] ?? name}`).join('\n');
 }
 
 export const FIRST_RUN_PROVIDER_MENU_PROMPT = 'Choose LLM';
+/** Printed when provider setup is skipped and the first screen opens without an LLM (DEMO-ONBOARD-EN-COPY). */
+export const FIRST_RUN_NO_LLM_LINE = 'Opening without an LLM; chat will not answer yet. Set one up: `elanous login openai-codex` or `elanous setup keys`.';
 
 export async function promptProviderMenu(
   ask: (prompt: string) => Promise<string>,
@@ -75,7 +78,7 @@ export async function promptProviderMenu(
   const choices = orderProviderChoices(detected);
   const menu = formatProviderMenu(choices);
   for (;;) {
-    const parsed = parseMenuAnswer(await ask(`${FIRST_RUN_PROVIDER_MENU_PROMPT} (${menu}; Enter to cancel): `), choices);
+    const parsed = parseMenuAnswer(await ask(`${FIRST_RUN_PROVIDER_MENU_PROMPT}\n${menu}\nType a number, or press Enter to cancel: `), choices);
     if (parsed.kind === 'chosen') return parsed.provider;
     if (parsed.kind === 'cancel') return null;
   }
@@ -190,7 +193,7 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
         solarDemoPreset = setupResult.solar;
       }
       if (!provider) {
-        print('LLM 없이 첫 화면을 엽니다. LLM 기능은 사용할 수 없습니다. 다시 설정: `elanous setup keys` 또는 `elanous login openai-codex`.');
+        print(FIRST_RUN_NO_LLM_LINE);
         // Skipping provider setup keeps this invocation reachable, but it must
         // not persist `ready`: a later bare launch still needs web-first setup.
         observe('ready', inputs);

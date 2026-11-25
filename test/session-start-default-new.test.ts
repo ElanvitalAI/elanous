@@ -19,7 +19,10 @@ import { resumeInProcessDashboardSession } from '../src/dashboard/index.js';
 import type { ChatMessage } from '../src/chat/index.js';
 import * as llmModule from '../src/llm.js';
 import { debug } from '../src/debug/log.js';
-import { getActiveSessionId, historyFromSession, loadSession, setActiveSessionId } from '../src/session/index.js';
+import {
+  getActiveSessionId, historyFromSession, loadSession, PENDING_ATTACH_TTL_MS, setActiveSessionId, setPendingAttachSessionId,
+  takePendingAttachSessionId,
+} from '../src/session/index.js';
 import { ptyAvailable, startPty, unregisterPty } from '../src/pty-shell/registry.js';
 
 const root = new URL('../', import.meta.url).pathname;
@@ -147,43 +150,73 @@ describe('TUI-H8-FOLLOW ② — id 없는 --resume 뒤 프롬프트 첫 낱말�
 
 describe('대시보드 TUI 루트 이어하기 우선순위(r1 must-fix)', () => {
   const latest = () => 'latest-1';
-  test('이름 있는 TUI는 session resume으로 지정된 활성 세션을 복원한다', () => {
+  test('이름 있는 TUI는 살아 있는 자리 TUI 의 전역 active 표지에 붙지 않는다(11-25 be2bc47e)', () => {
+    // 명시 붙기 표지 없음 = 새 세션. active 표지(살아 있는 OP TUI 가 쓰는 값)는 아예 묻지 않는다.
     expect(resolveRootResumeSessionId({
       namedDashboard: true,
-      activeSessionId: () => 'session-with-history',
+      pendingAttachSessionId: () => null,
+      sessionExists: () => true,
+      continueLatest: false,
+      readEnvId: () => 'live-op-session',
+      latest: () => 'live-op-session',
+    })).toEqual({ source: 'none' });
+  });
+  test('명시 붙기 표지는 one-shot 이고 10분이 지나면 무시된다', () => {
+    const priorState = process.env.ELANOUS_STATE_DIR;
+    const state = mkdtempSync(join(tmpdir(), 'named-attach-ttl-'));
+    process.env.ELANOUS_STATE_DIR = state;
+    try {
+      setActiveSessionId('live-op-session');
+      expect(takePendingAttachSessionId()).toBeNull();
+      setPendingAttachSessionId('picked-1', 1_000);
+      expect(takePendingAttachSessionId(1_000 + PENDING_ATTACH_TTL_MS - 1)).toBe('picked-1');
+      expect(takePendingAttachSessionId(1_000 + PENDING_ATTACH_TTL_MS - 1)).toBeNull();
+      setPendingAttachSessionId('picked-2', 1_000);
+      expect(takePendingAttachSessionId(1_000 + PENDING_ATTACH_TTL_MS + 1)).toBeNull();
+      expect(getActiveSessionId()).toBe('live-op-session');
+    } finally {
+      if (priorState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = priorState;
+      rmSync(state, { recursive: true, force: true });
+    }
+  });
+  test('이름 있는 TUI는 session resume 의 명시 붙기 표지로만 세션을 복원한다', () => {
+    expect(resolveRootResumeSessionId({
+      namedDashboard: true,
+      pendingAttachSessionId: () => 'session-with-history',
       continueLatest: false,
       readEnvId: () => null,
       latest,
-    })).toEqual({ sessionId: 'session-with-history', source: 'named-active' });
+    })).toEqual({ sessionId: 'session-with-history', source: 'named-attach' });
   });
   test('이름 있는 TUI에서는 session resume의 활성 표지가 옛 env override보다 우선한다', () => {
     expect(resolveRootResumeSessionId({
       namedDashboard: true,
-      activeSessionId: () => 'session-selected-by-resume',
+      pendingAttachSessionId: () => 'session-selected-by-resume',
       sessionExists: () => true,
       continueLatest: false,
       readEnvId: () => 'stale-env-override',
       latest,
-    })).toEqual({ sessionId: 'session-selected-by-resume', source: 'named-active' });
+    })).toEqual({ sessionId: 'session-selected-by-resume', source: 'named-attach' });
   });
   test('활성 표식이 낡았거나 읽을 수 없으면 이름 있는 TUI도 새 세션으로 간다', () => {
     expect(resolveRootResumeSessionId({
       namedDashboard: true,
-      activeSessionId: () => '  ',
+      pendingAttachSessionId: () => '  ',
       continueLatest: false,
       readEnvId: () => null,
       latest,
     })).toEqual({ source: 'none' });
     expect(resolveRootResumeSessionId({
       namedDashboard: true,
-      activeSessionId: () => { throw new Error('marker unavailable'); },
+      pendingAttachSessionId: () => { throw new Error('marker unavailable'); },
       continueLatest: false,
       readEnvId: () => null,
       latest,
     })).toEqual({ source: 'none' });
     expect(resolveRootResumeSessionId({
       namedDashboard: true,
-      activeSessionId: () => 'missing-session',
+      pendingAttachSessionId: () => 'missing-session',
       sessionExists: () => false,
       continueLatest: false,
       readEnvId: () => null,
@@ -195,14 +228,14 @@ describe('대시보드 TUI 루트 이어하기 우선순위(r1 must-fix)', () =>
     const readEnvId = () => { envReads += 1; return 'unrelated-env-session'; };
     expect(resolveRootResumeSessionId({
       namedDashboard: true,
-      activeSessionId: () => null,
+      pendingAttachSessionId: () => null,
       continueLatest: false,
       readEnvId,
       latest,
     })).toEqual({ source: 'none' });
     expect(resolveRootResumeSessionId({
       namedDashboard: true,
-      activeSessionId: () => 'deleted-session',
+      pendingAttachSessionId: () => 'deleted-session',
       sessionExists: () => false,
       continueLatest: false,
       readEnvId,
@@ -218,7 +251,7 @@ describe('대시보드 TUI 루트 이어하기 우선순위(r1 must-fix)', () =>
     try {
       const sessionModulePath = join(root, 'src/session/index.ts');
       const writer = `
-        const { appendMessage, createSession, setActiveSessionId } = await import(${JSON.stringify(sessionModulePath)});
+        const { appendMessage, createSession, setActiveSessionId, setPendingAttachSessionId } = await import(${JSON.stringify(sessionModulePath)});
         const root = process.env.TEST_SESSION_ROOT;
         const session = createSession({ source: 'tui', title: 'restart transcript' }, root);
         for (let i = 0; i < 13; i += 1) {
@@ -228,6 +261,7 @@ describe('대시보드 TUI 루트 이어하기 우선순위(r1 must-fix)', () =>
           }, root);
         }
         setActiveSessionId(session.id);
+        setPendingAttachSessionId(session.id);
         process.exit(0);
       `;
       // The writer exits immediately after the final synchronous append (no TUI
@@ -243,13 +277,13 @@ describe('대시보드 TUI 루트 이어하기 우선순위(r1 must-fix)', () =>
 
       const restart = resolveRootResumeSessionId({
         namedDashboard: true,
-        activeSessionId: getActiveSessionId,
+        pendingAttachSessionId: () => takePendingAttachSessionId(),
         sessionExists: (id) => loadSession(id, sessions) !== null,
         continueLatest: false,
         readEnvId: () => null,
         latest,
       });
-      expect(restart).toEqual({ sessionId, source: 'named-active' });
+      expect(restart).toEqual({ sessionId, source: 'named-attach' });
 
       const chatHistory: ChatMessage[] = [{ role: 'system', content: 'dashboard prompt' }];
       const resumed = resumeInProcessDashboardSession(restart.sessionId!, {

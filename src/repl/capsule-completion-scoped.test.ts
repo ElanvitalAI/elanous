@@ -65,7 +65,7 @@ describe('① completions are scoped to the starting session', () => {
     try {
       for (const sessionId of ['sess-A', 'sess-B']) {
         const tools = buildReplTools({ nextTui: true, sessionId });
-        await tools.dispatch('Agent', { description: 'scoped probe', prompt: 'noop', run_in_background: true }).catch(() => undefined);
+        await tools.dispatch('Agent', { description: 'scoped probe', prompt: 'noop', reason: 'fixture', run_in_background: true }).catch(() => undefined);
       }
     } finally {
       spy.mockRestore();

@@ -418,7 +418,7 @@ describe('first run', () => {
         setupWhenNoProvider: async () => null, print: line => lines.push(line),
       });
       expect(result).toEqual({ outcome: 'ready', inputs: 1 });
-      expect(lines.join('\n')).toContain('LLM 기능은 사용할 수 없습니다');
+      expect(lines.join('\n')).toContain('chat will not answer yet');
       expect(lines.join('\n')).toContain('elanous setup keys');
       const saved = buildUserConfig(f.path);
       expect(saved.onboarding.ready).toBeUndefined();
@@ -694,7 +694,7 @@ describe('first run', () => {
     expect(prompts).toHaveLength(3);
     expect(new Set(prompts).size).toBe(1); // the menu never changes between re-asks
     expect(prompts[0]).toContain('Enter to cancel');
-    expect(prompts[0]).toContain('1 Grok');
+    expect(prompts[0]).toContain('  1  Grok');
     await expect(promptProviderMenu(async () => '', ['grok'])).resolves.toBeNull();
   });
 
@@ -768,8 +768,8 @@ describe('first run', () => {
       expect(child.stdout).toContain('[elanous] provider: openai-codex');
       expect(child.stdout).toContain('웹 셋업을 위해 데몬을 시작합니다.');
       expect(child.stdout).toMatch(/웹 셋업을 사용할 수 없습니다 \((?:daemon-start-failed|daemon-health-timeout)\)\. 터미널 설정으로 전환합니다\./);
-      expect(child.stdout).toContain('오류 보고 안내:');
-      expect(child.stdout.indexOf('오류 보고 안내:')).toBeLessThan(child.stdout.indexOf('\x1b[?1049h'));
+      expect(child.stdout).toContain('Error reports:');
+      expect(child.stdout.indexOf('Error reports:')).toBeLessThan(child.stdout.indexOf('\x1b[?1049h'));
       expect(child.stdout.indexOf('웹 셋업을 위해 데몬을 시작합니다.')).toBeLessThan(child.stdout.indexOf('\x1b[?1049h'));
       expect(child.stdout.indexOf('\x1b[?1049h')).toBeGreaterThan(child.stdout.indexOf('[elanous] provider: openai-codex'));
       expect(child.stdout + child.stderr).not.toContain('eln setup llm');
@@ -812,7 +812,7 @@ describe('first run', () => {
       let timedOut = false;
       child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
         stdout += chunk;
-        if (!choseCodex && stdout.includes('Choose LLM (')) {
+        if (!choseCodex && stdout.includes('Type a number, or press Enter to cancel')) {
           choseCodex = true;
           setTimeout(() => child.stdin.write('1\n'), 300);
         }
@@ -943,7 +943,7 @@ describe('first run', () => {
       expect(elapsed).toBeLessThan(20000);
       expect(run.stdout).not.toContain('웹 셋업을 위해 데몬을 시작합니다.');
       // No TTY → no dashboard → nobody saw a notice: it is neither printed nor recorded as shown.
-      expect(run.stdout).not.toContain('오류 보고 안내:');
+      expect(run.stdout).not.toContain('Error reports:');
       expect(buildUserConfig(join(configDir, 'config.json')).errorReports?.noticeShown).toBeUndefined();
     } finally { f.cleanup(); }
   }, 70000);

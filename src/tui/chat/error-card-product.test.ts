@@ -11,7 +11,7 @@ test('trusted failed turn is a distinct card in the actual public history render
   const visible = nextTuiPublicHistory(messages);
   expect(visible[1]?.replyFailure).toBe(true);
   const screen = logViewLines(visible, 80).join('\n');
-  expect(screen).toContain('✘ 요청을 처리하지 못했습니다.');
+  expect(screen).toContain('✘ Could not process the request.');
   expect(screen).toContain('↑ recall input → Enter resend · check /provider · /resume to continue');
   expect(screen).not.toContain('  요청을 처리하지 못했습니다.');
   expect(screen).not.toContain('provider secret detail');
@@ -28,7 +28,7 @@ test('known auth failure keeps its public recovery context in the card', () => {
   const visible = nextTuiPublicHistory([user, { role: 'assistant', content: 'raw auth server body',
     ts: '2026-11-15T00:00:01Z', replyFailure: true, replyFinal: false, replyFailureKind: 'codex-auth-missing' }]);
   const screen = logViewLines(visible, 80).join('\n');
-  expect(screen).toContain('✘ Codex 인증이 준비되지 않았습니다.');
+  expect(screen).toContain('✘ Codex authentication is not ready.');
   expect(screen).toContain('Check /provider · renew auth → ↑ recall input → Enter resend');
   expect(screen).not.toContain('raw auth server body');
 });

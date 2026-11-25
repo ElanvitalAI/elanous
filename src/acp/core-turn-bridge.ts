@@ -59,6 +59,7 @@ import { resolveSessionSurfaceProfile } from '../session-runtime/index.js';
 import { classifyTuiChatIntent, type TuiChatRoute } from '../core-turn/short-question.js';
 import { HARNESS_ROLE_ENV } from '../harness/harness-space.js';
 import { RESEARCH_TOOL_ALLOWLIST, RESEARCH_TURN_MAX_TOOL_TURNS } from '../core-turn/research-policy.js';
+import { decideTurnBudget, seatFromEnv } from './turn-budget.js';
 import { isResearchAgentIntent } from '../tool-hints/signals.js';
 import { createReasoningThoughtBuffer } from './reasoning-thought-buffer.js';
 import { scanTurnSignalsAsync, type TurnObservation } from '../lessons/lesson-turn-signals.js';
@@ -357,7 +358,12 @@ export function bridgeCoreTurnToAcp(
         // CHAT-GOAL-LOOP-DEFAULT-OFF — the legacy (daemon ACP) default is a single core turn; only the harness executor
         //   (structural explicit-goal signal) keeps the goal loop.
         : { route: '코딩·구현' as const, reason: harness ? 'harness' : 'legacy', goalLoop: harness };
-      const tools = !route.goalLoop && route.route !== '코딩·구현' && route.route !== '읽기·분석'
+      // SEAT-TURN-FULL-BUDGET (대표 11-25 16:2x «regex 가 문제를 키운다 · 기본값이 너무 작다») — a federation seat's turn
+      //   (structured: the resolved seat · or the seat env the seat launcher sets) never takes a sentence-shaped route:
+      //   no quick-route allowlist, no fact-question budget or instruction — full tools and the seat safety cap below.
+      const seatTurn = seat !== null || seatFromEnv(process.env) !== null;
+      const quickRoute = !route.goalLoop && route.route !== '코딩·구현' && route.route !== '읽기·분석';
+      const tools = quickRoute && !seatTurn && route.route !== '코딩·구현' && route.route !== '읽기·분석'
         ? toolsForTuiRoute(availableTools, route.route) // bridgeCoreTurnToAcp applies route allowlists here.
         : availableTools;
       if (deps.tuiRouting) {
@@ -395,24 +401,25 @@ export function bridgeCoreTurnToAcp(
       const factShaped = isFactQuestion(turnCtx.userText);
       // A quick research/turn lookup still keeps the fact budget. Only the
       // multi-source research/agent route needs enough rounds to compare axes.
-      const factQuestion = factShaped && !armGoalLoop && surfaceProfile.id !== 'research/agent';
+      const goalLoopResearchBudget = armGoalLoop && isResearchAgentIntent(turnCtx.userText);
+      const explicitMaxToolTurns = deps.resolveMaxToolTurns?.({ sessionId: turnCtx.sessionId });
+      const budget = decideTurnBudget({ factShaped, seatTurn, armGoalLoop, researchAgent: surfaceProfile.id === 'research/agent',
+        goalLoopResearch: goalLoopResearchBudget, quickRoute, ...(explicitMaxToolTurns !== undefined ? { explicitMaxToolTurns } : {}),
+        factMaxToolTurns: getUserConfig().chat.factQuestion.maxToolTurns, researchMaxToolTurns: RESEARCH_TURN_MAX_TOOL_TURNS });
+      const factQuestion = budget.factQuestion;
+      if (factShaped && seatTurn) {
+        try { debug.log('chat.turn', 'fact-budget-skipped', { reason: 'seat-turn', seat: seat ?? seatFromEnv(process.env) }); }
+        catch { /* observation cannot interrupt a turn */ }
+      }
       if (factShaped && armGoalLoop) {
         try { debug.log('chat.turn', 'fact-budget-skipped', { reason: 'goal-loop-armed', route: route.route }); }
         catch { /* observation cannot interrupt a turn */ }
       }
-      const explicitMaxToolTurns = deps.resolveMaxToolTurns?.({ sessionId: turnCtx.sessionId });
       // CHAT-TOOLS-ENTRY-VIA-CORE-TURN (JUD-B ACP clause · R-SIG): a single core turn no longer gets its research tool
       // budget from the `isResearchAgentIntent` sentence regex. runCoreTurn applies RESEARCH_TURN_MAX_TOOL_TURNS itself
-      // once its research route enters (run-core-turn.ts `maxToolTurns`) — the structured route on a web-tool pool, the
-      // same decision the CLI and the Next TUI reach; the legacy verdict survives there only for the no-web-tool
-      // route. A goal-loop turn is an excluded path (#38246 exclusions) and keeps its pre-existing budget verdict.
-      const goalLoopResearchBudget = armGoalLoop && isResearchAgentIntent(turnCtx.userText);
-      const resolvedMaxToolTurns = explicitMaxToolTurns ?? (factQuestion
-        ? getUserConfig().chat.factQuestion.maxToolTurns
-        : goalLoopResearchBudget ? RESEARCH_TURN_MAX_TOOL_TURNS : undefined);
-      const maxToolTurns = goalLoopResearchBudget && resolvedMaxToolTurns !== undefined
-        ? Math.min(resolvedMaxToolTurns, RESEARCH_TURN_MAX_TOOL_TURNS)
-        : resolvedMaxToolTurns;
+      // once its research route enters (run-core-turn.ts `maxToolTurns`). A goal-loop turn is an excluded path (#38246
+      // exclusions) and keeps its pre-existing budget verdict. SEAT-TURN-FULL-BUDGET: the verdict is turn-budget.ts.
+      const maxToolTurns = budget.maxToolTurns;
       const withFactInstruction = (seed: LLMMessage[]): LLMMessage[] => factQuestion
         ? [{ role: 'system', content: FACT_QUESTION_INSTRUCTION }, ...seed]
         : seed;

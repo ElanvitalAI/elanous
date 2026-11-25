@@ -1,12 +1,15 @@
 // DOCS-SEARCH-INDEX-EMPTY — 「문서 색인이 0」 결함의 회귀 시험.
 // 정적 import 만 쓴다(TEST-INTERFERENCE-RATCHET · 본문 안 동적 import 금지).
 import { describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { resolveKnowledgeDocsRoots } from './docs-roots.js';
 import { docsIndexCount, hybridQueryKnowledge, ingestDocsCorpus, ingestDocsDir, openKnowledgeDb, type EmbedFn } from '../domains/knowledge.js';
+import { configuredDocsRoots, docsIndexNotice, docsSearchFallback, formatFallbackHits } from '../cli/docs-cli.js';
+import { fallbackDocsSearch, isLowConfidence } from './docs-search-fallback.js';
+import { configuredLatestRepoRoots, normalizeConfiguredDocsRoot } from './docs-roots.js';
 
 /** 결정론 임베딩 — 네트워크 없이 질의↔청크 의미 유사를 흉내 내는 토큰 뭉치 벡터. */
 const fakeEmbed: EmbedFn = async (text) => {
@@ -131,5 +134,172 @@ describe('DOCS-SEARCH-INDEX-EMPTY — 문서 색인 뿌리', () => {
     } finally {
       db.close();
     }
+  });
+});
+
+/** DOCS-SEARCH-CONDUCTOR 픽스처 — 접두가 taxonomy 밖인 conductor 정본 1장 ⊕ 그 이름·낱말을 본문에 흘리는 잡음 문서들. */
+function conductorFixture(): { root: string; docs: string; target: string; opts: Parameters<typeof ingestDocsCorpus>[1] } {
+  const root = mkdtempSync(join(tmpdir(), 'docs-search-conductor-'));
+  const docs = join(root, 'repo', 'docs');
+  mkdirSync(join(docs, 'conductor'), { recursive: true });
+  const target = join(docs, 'conductor', 'WIDGET-THROTTLE-PLAN.md');
+  writeFileSync(target, [
+    '# 위젯 부하 줄이기 — 한 줄기 설계',
+    '',
+    '## 배경',
+    '',
+    '- 요청 큐가 밀리면 렌더 스레드가 막힌다.',
+    '',
+  ].join('\n'));
+  for (let i = 1; i <= 6; i++) {
+    writeFileSync(join(docs, `PLAN-noise-${i}-2026-11-0${i}.md`), [
+      `# PLAN noise ${i}`,
+      '',
+      `- WIDGET-THROTTLE-PLAN 을 언급만 한다 · 위젯 부하 줄이기 이야기 ${i} · 위젯 위젯 부하 부하.`,
+      '',
+    ].join('\n'));
+  }
+  return {
+    root,
+    docs,
+    target,
+    opts: {
+      docsRoots: [docs],
+      env: { ELANOUS_STATE_DIR: join(root, 'state') },
+      embed: fakeEmbed,
+    },
+  };
+}
+
+describe('DOCS-SEARCH-CONDUCTOR — 정본 설계 문서 색인·이름 검색', () => {
+  test('④ 접두 taxonomy 밖 conductor 문서도 색인되고 파일명 질의는 그 문서가 1위', async () => {
+    const fx = conductorFixture();
+    const db = openKnowledgeDb(join(fx.root, 'knowledge.db'));
+    try {
+      await ingestDocsCorpus(db, fx.opts);
+      const matches = await hybridQueryKnowledge(db, 'WIDGET-THROTTLE-PLAN', { kind: 'docs', k: 8, embed: fakeEmbed });
+      expect(matches[0]!.source_ref).toBe(fx.target);
+    } finally {
+      db.close();
+    }
+  });
+
+  test('⑤ 한국어 제목 질의는 그 문서가 상위 3 안', async () => {
+    const fx = conductorFixture();
+    const db = openKnowledgeDb(join(fx.root, 'knowledge.db'));
+    try {
+      await ingestDocsCorpus(db, fx.opts);
+      const matches = await hybridQueryKnowledge(db, '위젯 부하 줄이기', { kind: 'docs', k: 8, embed: fakeEmbed });
+      expect(matches.slice(0, 3).map((m) => m.source_ref)).toContain(fx.target);
+    } finally {
+      db.close();
+    }
+  });
+
+  test('⑥ 새 파일을 더하면 다음 갱신 뒤 이름으로 잡힌다', async () => {
+    const fx = conductorFixture();
+    const db = openKnowledgeDb(join(fx.root, 'knowledge.db'));
+    try {
+      await ingestDocsCorpus(db, fx.opts);
+      const added = join(fx.docs, 'conductor', 'LANTERN-RELAY.md');
+      writeFileSync(added, '# 랜턴 중계 정본\n\n- 새로 생긴 설계.\n');
+      const before = await hybridQueryKnowledge(db, 'LANTERN-RELAY', { kind: 'docs', k: 8, embed: fakeEmbed });
+      expect(before.map((m) => m.source_ref)).not.toContain(added);
+      const second = await ingestDocsCorpus(db, fx.opts);
+      expect(second.files).toBe(1);
+      const after = await hybridQueryKnowledge(db, 'LANTERN-RELAY', { kind: 'docs', k: 8, embed: fakeEmbed });
+      expect(after[0]!.source_ref).toBe(added);
+    } finally {
+      db.close();
+    }
+  });
+
+  test('⑦ 상한을 넘친 변경은 pending 으로 남고 안내 한 줄이 나온다', async () => {
+    const fx = conductorFixture();
+    const db = openKnowledgeDb(join(fx.root, 'knowledge.db'));
+    try {
+      const first = await ingestDocsCorpus(db, { ...fx.opts, maxFiles: 2 });
+      expect(first.files).toBe(2);
+      expect(first.pending).toBe(5);
+      expect(docsIndexNotice(first)).toContain('index stale — 5 changed doc(s) not indexed yet');
+      const rest = await ingestDocsCorpus(db, fx.opts);
+      expect(rest.pending).toBe(0);
+      expect(docsIndexNotice(rest)).toBeNull();
+      expect(docsIndexNotice({ ...rest, rootPaths: [join(fx.root, 'nowhere')] }))
+        .toBe('docs search: no docs/conductor in the index roots — run from a repo worktree or set knowledge.docsRoots');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+/** 11-25 — 설정에 «저장소 뿌리»(latest)를 적은 경우: 임시 config ⊕ 임시 저장소. */
+function repoRootFixture(): { root: string; repo: string; target: string; configPath: string } {
+  const root = mkdtempSync(join(tmpdir(), 'docs-search-repo-root-'));
+  const repo = join(root, 'latest');
+  mkdirSync(join(repo, 'docs', 'conductor'), { recursive: true });
+  mkdirSync(join(repo, '.git'), { recursive: true });
+  const target = join(repo, 'docs', 'conductor', 'JUDGE-LOAD-REDUCTION.md');
+  writeFileSync(target, ['# JUDGE-LOAD-REDUCTION', '', '- 판정국 부하를 줄이는 설계.', ''].join('\n'));
+  const configPath = join(root, 'config.json');
+  writeFileSync(configPath, JSON.stringify({ knowledge: { docsRoots: [repo] } }));
+  return { root, repo, target, configPath };
+}
+
+describe('DOCS-SEARCH-ROOTS — 설정 뿌리가 저장소 뿌리여도 이긴다(11-25)', () => {
+  test('⑦ 임시 config 의 저장소 뿌리 → docs 로 정규화 · conductor 판정 통과 · JUDGE-LOAD-REDUCTION 색인', async () => {
+    const fx = repoRootFixture();
+    const raw = JSON.parse(readFileSync(fx.configPath, 'utf8'));
+    const configured = configuredDocsRoots(raw);
+    expect(configured).toEqual([fx.repo]);
+    expect(normalizeConfiguredDocsRoot(fx.repo)).toBe(join(fx.repo, 'docs'));
+    const resolved = resolveKnowledgeDocsRoots({ docsRoots: configured });
+    expect(resolved.source).toBe('config');
+    expect(resolved.roots.map((r) => r.path)).toEqual([join(fx.repo, 'docs')]);
+    const db = openKnowledgeDb(join(fx.root, 'knowledge.db'));
+    try {
+      const refresh = await ingestDocsCorpus(db, { docsRoots: configured!, embed: fakeEmbed });
+      expect(docsIndexNotice(refresh)).toBeNull();
+      const matches = await hybridQueryKnowledge(db, 'JUDGE-LOAD-REDUCTION', { kind: 'docs', k: 5, embed: fakeEmbed });
+      expect(matches[0]!.source_ref).toBe(fx.target);
+    } finally {
+      db.close();
+    }
+  });
+
+  test('⑧ docs 디렉터리를 직접 적은 설정은 그대로 · 설정 없음은 undefined · latest 저장소 뿌리 추출', () => {
+    const fx = repoRootFixture();
+    expect(normalizeConfiguredDocsRoot(join(fx.repo, 'docs'))).toBe(join(fx.repo, 'docs'));
+    expect(configuredDocsRoots({})).toBeUndefined();
+    expect(configuredDocsRoots({ knowledge: { docsRoots: [] } })).toEqual([]);
+    expect(configuredLatestRepoRoots([fx.repo])).toEqual([fx.repo]);
+    expect(configuredLatestRepoRoots([join(fx.repo, 'docs')])).toEqual([fx.repo]);
+  });
+
+  test('⑨ 폴백 — 색인 0건·의미만이면 이름 ⊕ 본문으로 찾고 «(fallback)» 표시', () => {
+    const fx = repoRootFixture();
+    writeFileSync(join(fx.repo, 'docs', 'conductor', 'OTHER.md'), '# other\n\n- judge-load-reduction 언급\n');
+    expect(isLowConfidence([])).toBe(true);
+    expect(isLowConfidence([{ matchedBy: 'vector' }])).toBe(true);
+    expect(isLowConfidence([{ matchedBy: 'vector' }, { matchedBy: 'fts' }])).toBe(false);
+    const hits = fallbackDocsSearch('judge-load-reduction', [join(fx.repo, 'docs')]);
+    expect(hits[0]!.path).toBe(fx.target);
+    expect(hits[0]!.nameHits).toBe(1);
+    expect(hits.map((h) => h.path)).toContain(join(fx.repo, 'docs', 'conductor', 'OTHER.md'));
+    expect(formatFallbackHits(hits)[0]).toStartWith('(fallback) name');
+    expect(fallbackDocsSearch('zzz-no-such-token', [join(fx.repo, 'docs')])).toEqual([]);
+  });
+
+  test('⑩ 진짜 빗나감(색인 0 ⊕ 폴백 0)만 docs.search-miss 로 남는다', () => {
+    const fx = repoRootFixture();
+    const roots = [join(fx.repo, 'docs')];
+    const logged: unknown[][] = [];
+    const log = (...a: unknown[]) => { logged.push(a); };
+    expect(docsSearchFallback('zzz-no-such-token', [], roots, 8, log)).toEqual([]);
+    expect(logged).toEqual([['docs', 'search-miss', { query: 'zzz-no-such-token', roots, hits: 0 }]]);
+    logged.length = 0;
+    expect(docsSearchFallback('judge-load-reduction', [], roots, 8, log).length).toBeGreaterThan(0);
+    expect(docsSearchFallback('anything', [{ matchedBy: 'fts' }], roots, 8, log)).toEqual([]);
+    expect(logged).toEqual([]);
   });
 });

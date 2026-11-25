@@ -140,3 +140,42 @@ describe('ELN-SEAT-IDLE-QUEUE-STALL watchdog', () => {
     expect(at(8_200).kind).toBe('woke');
   });
 });
+
+describe('11-25 OP deaf — the stall watchdog dispatches held mail, not just a knock', () => {
+  test('idle with held mail: at 5000 ms the held mail is released first, then the wake key goes', () => {
+    const order: string[] = [];
+    const events: Array<[string, Record<string, unknown>]> = [];
+    let now = 0;
+    const dog = createQueueIdleWatchdog({
+      now: () => now,
+      idle: () => true,
+      queued: () => 19,
+      releaseHeld: () => { order.push('release'); return true; },
+      wake: () => { order.push('wake'); return true; },
+      log: (event, data) => { events.push([event, data]); },
+      stallMs: 5_000,
+    });
+    dog.tick();
+    now = 4_999; dog.tick();
+    expect(order).toEqual([]);
+    now = 5_000; dog.tick();
+    expect(order).toEqual(['release', 'wake']);
+    expect(events).toEqual([
+      ['idle-stall-release-held', { queued: 19, idleMs: 5_000 }],
+      ['idle-stall-wake', { queued: 19, idleMs: 5_000, stallMs: 5_000 }],
+    ]);
+  });
+
+  test('nothing held: releaseHeld answers false and only the wake is logged', () => {
+    const events: string[] = [];
+    let now = 0;
+    const dog = createQueueIdleWatchdog({
+      now: () => now, idle: () => true, queued: () => 1,
+      releaseHeld: () => false, wake: () => true,
+      log: (event) => { events.push(event); }, stallMs: 5_000,
+    });
+    dog.tick();
+    now = 5_000; dog.tick();
+    expect(events).toEqual(['idle-stall-wake']);
+  });
+});

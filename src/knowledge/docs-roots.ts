@@ -90,6 +90,34 @@ export function defaultSeatStateRoot(env: NodeJS.ProcessEnv = process.env): stri
   return isolated ? join(isolated, 'seat-state') : join(homedir(), 'elanous-hq', 'seat-state');
 }
 
+/**
+ * 설정 뿌리 정규화 — 사람은 `knowledge.docsRoots` 에 «저장소 뿌리»(예: `~/elanous-hq/latest`)를 적는다.
+ * 순회기(`ingestDocsDir`)와 `docs/conductor` 판정은 «docs 디렉터리»를 기대하므로, 뿌리 바로 밑에
+ * `conductor` 가 없고 `docs/` 가 있으면 `<root>/docs` 로 바꾼다. docs 디렉터리·파일 뿌리는 그대로다.
+ * (11-25 실측: 저장소 뿌리를 적었더니 매 검색이 «no docs/conductor in the index roots» 를 냈다.)
+ */
+export function normalizeConfiguredDocsRoot(path: string, exists: (path: string) => boolean = existsSync): string {
+  const expanded = path === '~' ? homedir() : path.startsWith('~/') ? join(homedir(), path.slice(2)) : path;
+  const root = resolve(expanded);
+  if (exists(join(root, 'conductor'))) return root;
+  const docs = join(root, 'docs');
+  if (exists(docs)) return docs;
+  return root;
+}
+
+/** 설정 뿌리를 «저장소 뿌리»로 — 낡은 cwd 트리 대신 같이 찾을 최신 체크아웃(Grep/Glob 힌트용). */
+export function configuredLatestRepoRoots(docsRoots: readonly unknown[] | undefined, exists: (path: string) => boolean = existsSync): string[] {
+  if (!Array.isArray(docsRoots)) return [];
+  const out: string[] = [];
+  for (const raw of docsRoots) {
+    if (typeof raw !== 'string' || !raw.trim()) continue;
+    const docs = normalizeConfiguredDocsRoot(raw.trim(), exists);
+    const repo = docs.endsWith('/docs') ? dirname(docs) : docs;
+    if (exists(join(repo, '.git')) && !out.includes(repo)) out.push(repo);
+  }
+  return out;
+}
+
 /** 수집 뿌리 목록과 각 뿌리의 출처. 없으면 빈 목록 ⊕ source `none`. */
 export function resolveKnowledgeDocsRoots(opts: ResolveKnowledgeDocsRootsOpts = {}): KnowledgeDocsRootsResult {
   // 배열이 있으면(빈 배열·공백만) 설정이 있는 것이다. 자동 감지로 넘어가지 않는다.
@@ -98,7 +126,8 @@ export function resolveKnowledgeDocsRoots(opts: ResolveKnowledgeDocsRootsOpts = 
       .map((p) => (typeof p === 'string' ? p.trim() : ''))
       .filter((p) => p.length > 0);
     if (configured.length === 0) return { roots: [], source: 'none' };
-    const roots = dedupe(configured.map((path) => ({ path, source: 'config' as const })));
+    const exists = opts.exists ?? existsSync;
+    const roots = dedupe(configured.map((path) => ({ path: normalizeConfiguredDocsRoot(path, exists), source: 'config' as const })));
     return { roots, source: 'config' };
   }
 

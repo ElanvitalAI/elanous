@@ -118,7 +118,7 @@ export function readSeatMailSnapshot(
 }
 
 export function seatMailLine(snapshot: SeatMailSnapshot | null): string | null {
-  return snapshot ? `${snapshot.seat} · 우편 ${snapshot.unread ?? '확인 불가'}${snapshot.unread !== null && snapshot.unread > 100 ? ' ⚠ 100건 초과' : ''}` : null;
+  return snapshot ? `${snapshot.seat} · mail ${snapshot.unread ?? 'unknown'}${snapshot.unread !== null && snapshot.unread > 100 ? ' ⚠ over 100' : ''}` : null;
 }
 
 // ── ELN-SEAT-INBOX-TURN-BOUNDARY — 턴 경계 우편 자동 수신 ───────────────────────────
@@ -254,14 +254,14 @@ export function createSeatMailHeaderHook(
 ): (health: NextTuiSelfHealthSnapshot | null, wakeup: Pick<NextTuiWakeup, 'headline'> | null) => string | null {
   const snapshot = readSeatMailSnapshot(cwd, deps);
   const mail = seatMailLine(snapshot) ?? (resolveSeatId(cwd, { env: deps.env })
-    ? '⚠ 우편 감시 결속 실패: cwd/seat-state 없음' : null);
+    ? '⚠ mail watch not bound: no seat-state for this folder' : null);
   return (health, wakeup) => {
     let watchLine: string | null = null;
     if (mail && watcher) {
       let status: SeatMailWatchStatus;
       try { status = watcher.getStatus(); } catch { status = 'read-error'; }
-      if (status === 'read-error' || status === 'start-error') watchLine = `⚠ 우편 감시 오류: ${status}`;
-      else if (status === 'starting' || status === 'stopped') watchLine = `우편 감시 ${status}`;
+      if (status === 'read-error' || status === 'start-error') watchLine = `⚠ mail watch error: ${status}`;
+      else if (status === 'starting' || status === 'stopped') watchLine = `mail watch ${status}`;
     }
     const mailWithWatch = watchLine ? `${mail} · ${watchLine}` : mail;
     const line = mailWithWatch && wakeup ? `${mailWithWatch} · ${wakeup.headline(health)}` : mailWithWatch;

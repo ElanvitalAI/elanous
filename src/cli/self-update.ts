@@ -50,6 +50,8 @@ export interface SelfUpdateOptions {
 
 export interface SelfUpdateDeps {
   cliRoot?: string;
+  /** 설치 성공 직후 문서 색인 따라잡기 킥(분리 자식 · 기다리지 않음). 기본 = `<prefix>/bin/elanous docs index`. */
+  kickDocsIndex?: (prefix: string) => void | Promise<void>;
   git?: (cwd: string, args: string[]) => { status: number | null; stdout: string; stderr: string };
   decide?: (opts: { to: string; cwd: string; out: { log: (s: string) => void; error: (s: string) => void } }) => Promise<RestartNeededResult>;
   run?: (command: string, args: string[], cwd: string, options?: { timeout?: number }) => { status: number | null; stderr: string; stdout?: string };
@@ -252,6 +254,22 @@ export interface InstallRecord {
   commit?: string;
   channel?: string;
   previous?: string;
+}
+
+/** 설치가 끝났으면 문서 색인 따라잡기를 분리 자식으로 «시작»한다 — 시작(spawn)까지만 기다리고 색인은 기다리지 않는다.
+ *  실패해도 갱신 결과는 바뀌지 않는다(검색 시 증분이 잇는다). */
+async function kickDocsIndexAfterInstall(result: SelfUpdateResult, prefix: string, kick?: (prefix: string) => void | Promise<void>): Promise<void> {
+  if (result.exitCode !== 0 || !result.installedVersion) return;
+  try {
+    if (kick) await kick(prefix);
+    else await (await import('../knowledge/docs-index-refresh.js')).kickDocsIndexRefresh(prefix);
+  } catch { /* 색인 킥 실패가 갱신을 막지 않는다 — 검색 시 증분이 잇는다 */ }
+}
+
+/** 갱신 함수가 끝나기 전에 걸어 둔 색인 킥(spawn 시작)을 기다린다 — CLI 가 process.exit 하기 전에 자식이 떠 있게. */
+async function settleDocsIndexKicks<T>(kicks: Promise<void>[], result: T): Promise<T> {
+  await Promise.allSettled(kicks);
+  return result;
 }
 
 export function defaultInstallRoot(): string {
@@ -747,6 +765,8 @@ export interface ReleaseUpdateOptions {
 
 export interface ReleaseUpdateDeps {
   packageRoot?: string;
+  /** 설치 성공 직후 문서 색인 따라잡기 킥 — SelfUpdateDeps.kickDocsIndex 와 같다. */
+  kickDocsIndex?: (prefix: string) => void | Promise<void>;
   exists?: (path: string) => boolean;
   fetchInstaller?: (url: string) => Promise<string>;
   /** Bounded latest-release retry delay; injectable so retry behavior stays deterministic in tests. */
@@ -797,11 +817,18 @@ function installedBuild(metadata: unknown): string {
 
 /** A release update never packs the checkout: the downloaded installer verifies its own release tarball. */
 export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps: ReleaseUpdateDeps = {}): Promise<SelfUpdateResult> {
+  const kicks: Promise<void>[] = [];
+  return settleDocsIndexKicks(kicks, await runReleaseUpdateCore(options, deps, kicks));
+}
+
+async function runReleaseUpdateCore(options: ReleaseUpdateOptions, deps: ReleaseUpdateDeps, kicks: Promise<void>[]): Promise<SelfUpdateResult> {
   const out = deps.out ?? console;
   let selection: Pick<SelfUpdateResult, 'releaseBase' | 'releaseBaseSource'> = {};
+  let installPrefix: string | null = null;
   const finish = (result: SelfUpdateResult): SelfUpdateResult => {
     result = { ...result, ...selection };
     if (options.alert && result.exitCode !== 0) (deps.alert ?? defaultAlert)(`⛔ elanous self-update 실패(exit ${result.exitCode}): ${result.reason}`);
+    if (installPrefix) kicks.push(kickDocsIndexAfterInstall(result, installPrefix, deps.kickDocsIndex));
     if (options.json) out.log(JSON.stringify(result));
     else out.log(`release-update: installed=${result.installedVersion ?? 'none'} restarted=${result.restarted} reason=${result.reason}`);
     return result;
@@ -816,6 +843,7 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
     : basename(holder) === 'current' && exists(join(parent, 'install.json')) ? parent
     : exists(join(holder, 'install.json')) ? holder : null;
   if (!prefix) return fail(2, `설치 prefix 확인 실패 (install.json 없음): ${packageRoot}`);
+  installPrefix = prefix;
   const version = options.version?.trim();
   if (options.version !== undefined && (!version || !/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/.test(version))) {
     return fail(2, `잘못된 릴리스 버전: ${options.version}`);
@@ -1194,6 +1222,11 @@ export async function runUpdateForInstallation(
 }
 
 export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfUpdateDeps = {}): Promise<SelfUpdateResult> {
+  const kicks: Promise<void>[] = [];
+  return settleDocsIndexKicks(kicks, await runSelfUpdateCore(options, deps, kicks));
+}
+
+async function runSelfUpdateCore(options: SelfUpdateOptions, deps: SelfUpdateDeps, kicks: Promise<void>[]): Promise<SelfUpdateResult> {
   const out = deps.out ?? console;
   const git = deps.git ?? ((cwd, args) => execute('git', args, cwd));
   const run = deps.run ?? execute;
@@ -1221,6 +1254,7 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
       });
     } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
     if (options.alert && result.exitCode !== 0 && !alerted) alertOnce(`⛔ elanous self-update 실패(exit ${result.exitCode}): ${result.reason}`);
+    if (!options.rollback) kicks.push(kickDocsIndexAfterInstall(result, deps.installRoot ?? defaultInstallRoot(), deps.kickDocsIndex));
     if (result.exitCode === 0) {
       const notice = formatUpdateNotice(result);
       if (notice) (deps.notice ?? defaultNotice)(notice);

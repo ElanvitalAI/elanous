@@ -140,9 +140,9 @@ test('msg post: an eln-mail-watch wake starts the 60s checker once; any other wa
     wake: async (address, msgId) => ({ wake: 'herdr', source: 'seat-registry', address, msgId, result: result as never }),
     spawnMailFallback: input => { spawned.push(input); },
   });
-  await program.parseAsync(['msg', 'post', '--from', 'OP', '--to', 'HAND-X', '--body', 'b1'], { from: 'user' });
+  await program.parseAsync(['msg', 'post', '--from', 'OP', '--to', 'HAND-X', '--body', 'b1', '--kind', 'info'], { from: 'user' });
   result = 'injected';
-  await program.parseAsync(['msg', 'post', '--from', 'OP', '--to', 'HAND-X', '--body', 'b2'], { from: 'user' });
+  await program.parseAsync(['msg', 'post', '--from', 'OP', '--to', 'HAND-X', '--body', 'b2', '--kind', 'info'], { from: 'user' });
   expect(spawned).toEqual([{ messageId: 1, recipient: 'HAND-X', from: 'OP' }]);
 });
 

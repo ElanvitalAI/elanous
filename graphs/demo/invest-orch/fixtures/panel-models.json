@@ -1,0 +1,6 @@
+{
+  "_comment": "Recorded: the model each runtime's default resolved to in the live run of 2026-11-24 (invest-orch-1124/dashboard.json). Fixture mode shows these names instead of «default».",
+  "eln": "grok/grok-4.7",
+  "codex": "gpt-6.2-sol",
+  "claude": "haiku"
+}

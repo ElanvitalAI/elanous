@@ -111,11 +111,34 @@ function scqaField(value: string, name: string): string {
   if (Array.from(original).length > 240 || sentences.length > 2) throw new Error(`SCQA ${name} exceeds 2 sentences or 240 characters`);
   return safe(original);
 }
+// REQ-BLOCK-ROUTE-TO-ASKEE (CEO 11-25 19:2x «is this something that should come to me?») — the requirement loop
+// (`requirements:<seat>`) may put a card in front of the CEO only when the requirement came from a CEO line (`origin:ceo`)
+// and the gap is CEO-only (money · security · secret · irreversible · a declared `gap:policy`), with filled Q/A and a
+// recommendation. The sweep of the other automated raisers is a follow-up (listed in the PR).
+const CEO_ONLY_CATEGORIES: readonly DecisionCategory[] = ['money', 'security', 'secret', 'irreversible'];
+
+/** Null = may raise · else the refusal reason. */
+export function automatedCeoCardRefusal(input: Pick<RaiseInput, 'category' | 'scqa' | 'recommendation' | 'raisedBy' | 'refs'>): string | null {
+  const agent = input.raisedBy?.agent ?? '';
+  if (!agent.startsWith('requirements:')) return null;
+  const refs = input.refs ?? [];
+  if (!refs.includes('origin:ceo')) return `${agent}: a requirement raises a CEO card only when it came from a CEO line`;
+  const policyGap = input.category === 'scope' && refs.includes('gap:policy');
+  if (!CEO_ONLY_CATEGORIES.includes(input.category) && !policyGap) return `${agent}: a CEO card needs a CEO-only category (money · security · secret · irreversible · gap:policy), got ${input.category}`;
+  if ('skipped' in input.recommendation) return `${agent}: a CEO card needs a recommendation`;
+  if (!input.scqa.q?.trim() || !input.scqa.a?.trim()) return `${agent}: a CEO card needs filled S/C/Q/A`;
+  return null;
+}
+
 function validate(input: RaiseInput, historical = false): RaiseInput {
   const title = safe(single(input.title, 'title'));
   if (!CATEGORIES.includes(input.category)) throw new Error('invalid category');
   if (!input.raisedBy?.agent) throw new Error('raisedBy.agent is required');
   if (input.raisedBy.track && !isDecisionTrack(input.raisedBy.track)) throw new Error('invalid track');
+  if (!historical) {
+    const refusal = automatedCeoCardRefusal(input);
+    if (refusal) { debug.log('decisions', 'ceo-card-refused', { agent: input.raisedBy.agent, category: input.category, reason: refusal }); throw new Error(`CEO card refused — ${refusal}`); }
+  }
   const s = scqaField(input.scqa.s, 's');
   const c = scqaField(input.scqa.c, 'c');
   const q = input.scqa.q?.trim() ? scqaField(input.scqa.q, 'q') : undefined;

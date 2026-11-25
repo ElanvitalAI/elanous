@@ -27,7 +27,7 @@ export type NextTuiQueueDelivery = 'steer' | 'queue';
 export type NextTuiQueueItemStatus = 'queued' | 'delivered' | 'cancelled' | 'superseded';
 export type NextTuiQueueBoundary = 'tool-result' | 'idle';
 /**
- * 대표 addendum C: a queue item is either something the person typed (`user`) or a completion notice
+ * CEO addendum C: a queue item is either something the person typed (`user`) or a completion notice
  * (`notice`: sidetab result · harness child finished · seat mail arrived). Producers of notices are
  * ELN-CHILD-NOTICE-INTO-QUEUE; this file only owns their place in the order.
  */
@@ -70,6 +70,7 @@ export interface NextTuiQueueItem {
   readonly mailClass?: 'P0' | 'P1' | 'P2';
   /** QUEUE-P1-3MIN: the mail's structured intent (request · decision · info · alert) — a decision joins at once. */
   readonly mailIntent?: string;
+  readonly mailKind?: string;
   /** QUEUE-FINISH-FIRST: the ledger `replyTo` of a seat mail — a reply to a mail the current work waits on joins it. */
   readonly replyTo?: number;
   /** SEAT-MAIL-COALESCE-NOTICE: an info seat mail — waits like a passive result, listed in the next digest. */
@@ -79,6 +80,9 @@ export interface NextTuiQueueItem {
   /** NOTICE-FOLD-1LINE: a `seat-mail` notice's sender and where the mail's own body sits — in `text` (`bodyAt`) and
    *  in its `digest` line (`digestBodyAt`) — so the chat folds each mail of a digest to its own line. */
   readonly mail?: NextTuiQueueMailSpan;
+  /** BULK-TRIAGE: a seat mail's structured ledger fields for the bulk triage card (set by the producer, never parsed). */
+  readonly triage?: NextTuiQueueTriageMeta;
+  readonly foldedMail?: readonly NextTuiQueueFoldedMail[];
   /**
    * When a notice existed, if the producer knows. Absent means unknown.
    * The zero-miss receipt must not treat unknown as a zero wait.
@@ -156,7 +160,31 @@ export interface NextTuiQueueNoticeEntry {
   readonly digest?: string;
   readonly mailClass?: 'P0' | 'P1' | 'P2';
   readonly mailIntent?: string;
+  readonly mailKind?: string;
   readonly replyTo?: number;
+  readonly triage?: NextTuiQueueTriageMeta;
+  /** BULK-TRIAGE — on the overflow guide: the structured fields of each mail folded past the cap. */
+  readonly foldedMail?: readonly NextTuiQueueFoldedMail[];
+}
+
+/** BULK-TRIAGE — one mail folded into the overflow guide past the notice cap (kept for the triage card). */
+export interface NextTuiQueueFoldedMail {
+  readonly msgId?: number;
+  readonly replyTo?: number;
+  readonly triage?: NextTuiQueueTriageMeta;
+}
+
+/** BULK-TRIAGE — the ledger fields one seat mail brings to the triage card (body clipped to 300 chars). */
+export interface NextTuiQueueTriageMeta {
+  readonly from: string;
+  readonly to?: string;
+  readonly kind?: string;
+  readonly intent?: string;
+  readonly crownDirective?: string;
+  readonly originKind?: string;
+  readonly deadline?: string;
+  readonly priority?: number;
+  readonly body: string;
 }
 
 /** NOTICE-FOLD-1LINE — a seat mail's sender and body offsets (set by the producer that built the text; never parsed). */

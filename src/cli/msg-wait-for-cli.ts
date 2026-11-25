@@ -25,6 +25,21 @@ export interface MsgWaitForCliDeps {
   cwd?: () => string;
 }
 
+/** The production preempt probe: the first ✋ mail to `seat` after the wait started (null when the ledger cannot be read). */
+export async function handPreemptProbe(seat: string): Promise<(() => string | null) | null> {
+  try {
+    const { defaultMsgStorePath, openMsgStoreReadOnly } = await import('../msg/msg-store.js');
+    const { handArrivedAfter, handPreemptLine } = await import('../msg/hand-raise-ladder.js');
+    const first = openMsgStoreReadOnly(defaultMsgStorePath());
+    let afterId: number;
+    try { afterId = first.latestId(); } finally { first.close(); }
+    return () => {
+      const store = openMsgStoreReadOnly(defaultMsgStorePath());
+      try { const hand = handArrivedAfter(store, seat, afterId); return hand ? handPreemptLine(hand) : null; } finally { store.close(); }
+    };
+  } catch { return null; }
+}
+
 export function registerMsgWaitForCommands(msg: Command, deps: MsgWaitForCliDeps = {}): void {
   const out = deps.out ?? console;
   const setExitCode = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
@@ -45,27 +60,44 @@ export function registerMsgWaitForCommands(msg: Command, deps: MsgWaitForCliDeps
   };
 
   msg.command('wait-for <condition>')
-    .description('Arm a self wake bound to a commitment ledger entry: time:<dur> · pr-merged:<N> · review:<N> · mail-reply:<M> · file:<path>')
+    .description('Arm a self wake bound to a commitment ledger entry: time:<dur> · pr-merged:<N> · review:<N> · mail-reply:<M> · file:<path> · pregate-receipt:<PR>[@head] · cell-status:<id>=green|owner=<seat> · seat-idle:<seat> · file-exists:<path> · mail-from:<seat>')
     .requiredOption('--notify <seat>', 'seat whose mailbox receives the fired/expired notice')
     .requiredOption('--commitment <id>', 'commitment ledger entry this waker is bound to (required)')
-    .option('--within <dur>', 'horizon (30s · 10m · 2h); default and ceiling = max horizon')
+    .option('--within <dur>', 'horizon (30s · 10m · 2h); default 10m for mail-reply (then one reminder to the counterpart, 5 more min, then cancelled with a result) · other conditions default to the max horizon · ceiling = max horizon')
     .option('--arm-only', 'register and exit; a later wait-tick evaluates it')
+    .option('--auto-close', 'COND-WATCH: when the condition holds, close the commitment done with the evidence line (one wake)')
     .option('--json')
-    .action(run('wait-for', async (condition: string, opts: { notify: string; commitment: string; within?: string; armOnly?: boolean; json?: boolean }) => {
-      const { armWaker, parseDuration, watchWaker } = await loadTimer();
+    .action(run('wait-for', async (condition: string, opts: { notify: string; commitment: string; within?: string; armOnly?: boolean; autoClose?: boolean; json?: boolean }) => {
+      const { armWaker, parentAliveProbe, parseDuration, watchWaker } = await loadTimer();
       const armed = armWaker({
         seat: opts.notify, commitmentId: opts.commitment, condition,
         ...(opts.within === undefined ? {} : { withinMs: parseDuration(opts.within) }),
         cwd: (deps.cwd ?? (() => process.cwd()))(),
+        ...(opts.autoClose ? { autoClose: true } : {}),
       }, timer);
       if (opts.armOnly) {
         emit({ ...armed, outcome: armed.merged ? 'merged' : 'armed' }, opts.json, () =>
           out.log(`${armed.merged ? '합침' : '걸림'} ${armed.waker.id} · ${armed.waker.condition} · 약속 ${armed.waker.commitmentId} · 지평 ${armed.waker.deadlineAt}`));
         return;
       }
-      const result = await watchWaker(armed.waker.seat, armed.waker.id, timer);
+      // HAND-RAISE-LADDER — a ✋ to the waiting seat ends the wait early («✋ arrived: …»); the waker stays armed.
+      // Injected timer deps (tests) bring their own probe; production reads the mail ledger.
+      const preempt = timer.preempt ?? (deps.timer ? null : await handPreemptProbe(armed.waker.seat));
+      // RAIL30 ⑥ — a blocking watch follows its parent (the seat TUI's shell): parent gone → end, waker stays armed.
+      const parentAlive = timer.parentAlive ?? (deps.timer ? undefined : parentAliveProbe());
+      const result = await watchWaker(armed.waker.seat, armed.waker.id, { ...timer, ...(preempt ? { preempt } : {}), ...(parentAlive ? { parentAlive } : {}) });
+      if (result.outcome === 'orphaned') {
+        emit({ outcome: 'orphaned', merged: armed.merged, waker: result.waker }, opts.json, () =>
+          out.log(`orphaned ${result.waker.id} · parent process gone — the waker stays armed (wait-tick evaluates it) · 약속 ${result.waker.commitmentId}`));
+        return;
+      }
+      if (result.outcome === 'preempted') {
+        emit({ outcome: 'preempted', merged: armed.merged, waker: result.waker, line: result.line }, opts.json, () => out.log(result.line));
+        return;
+      }
       emit({ outcome: result.outcome, merged: armed.merged, waker: result.waker }, opts.json, () =>
-        out.log(`${result.outcome} ${result.waker.id} · ${result.waker.condition} · 약속 ${result.waker.commitmentId}`));
+        out.log(`${result.outcome} ${result.waker.id} · ${result.waker.condition} · 약속 ${result.waker.commitmentId}`
+          + (result.outcome === 'cancelled' && result.waker.cancelReason ? ` · ${result.waker.cancelReason}` : '')));
       if (result.outcome === 'expired') setExitCode(WAIT_FOR_EXIT_EXPIRED);
     }));
 
@@ -75,6 +107,20 @@ export function registerMsgWaitForCommands(msg: Command, deps: MsgWaitForCliDeps
     .action(run('wait-tick', async (opts: { seat?: string; json?: boolean }) => {
       const { tickWakers } = await loadTimer();
       const ticks = await tickWakers(opts.seat, timer);
+      // MSG-WAIT-CONTRACT — the same tick advances the ledger reply waits (msg ask · MsgAsk): reminder, then cancel.
+      if (!deps.timer) {
+        try {
+          const { defaultMsgStorePath, openMsgStore } = await import('../msg/msg-store.js');
+          const { sweepWaitContracts } = await import('../msg/msg-wait-contract.js');
+          const { loadFederationLadder } = await import('../msg/hand-raise-ladder.js');
+          const ladder = loadFederationLadder();
+          const store = openMsgStore(defaultMsgStorePath());
+          try {
+            for (const a of sweepWaitContracts(store, { now: Date.now(), ...(opts.seat ? { involving: opts.seat } : {}), parentOf: ladder.parentOf }))
+              if (!opts.json) out.log(`${a.state} msg-wait #${a.messageId} · ${a.asker} → ${a.counterpart}`);
+          } finally { store.close(); }
+        } catch (error) { out.error(`msg wait-tick: reply-wait sweep failed: ${error instanceof Error ? error.message : String(error)}`); }
+      }
       emit(ticks, opts.json, () => {
         if (!ticks.length) out.log('No armed wakers.');
         for (const t of ticks) out.log(`${t.outcome} ${t.waker.seat}/${t.waker.id} · ${t.waker.condition}`);

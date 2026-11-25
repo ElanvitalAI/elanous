@@ -21,7 +21,7 @@ async function drive(mode: 'codex' | 'openrouter' | 'interrupt'): Promise<string
       let output = '';
       let next = 0;
       const replies = mode === 'codex'
-        ? [{ marker: '선택: ', value: '1' }]
+        ? [{ marker: 'Choice: ', value: '1' }]
         : mode === 'interrupt'
           ? [
             { marker: 'SECRET_FOR_INTERRUPT: ', value: 'interrupt-secret-never-output' },
@@ -29,9 +29,9 @@ async function drive(mode: 'codex' | 'openrouter' | 'interrupt'): Promise<string
             { marker: 'INTERRUPT_CALLBACK', value: 'done' },
           ]
           : [
-          { marker: '선택: ', value: '2' },
-          { marker: '키 공급 선택: ', value: '3' },
-          { marker: 'OPENROUTER_API_KEY (Enter=건너뜀): ', value: 'pty-sentinel-never-output' },
+          { marker: 'Choice: ', value: '2' },
+          { marker: 'Key source: ', value: '3' },
+          { marker: 'OPENROUTER_API_KEY (Enter to skip): ', value: 'pty-sentinel-never-output' },
           { marker: 'OpenRouter 모델 (', value: '\x1b[A5' },
         ];
       child.stdout.on('data', (chunk: Buffer) => {
@@ -64,12 +64,12 @@ async function drive(mode: 'codex' | 'openrouter' | 'interrupt'): Promise<string
       '  expect "INTERRUPT_CALLBACK"',
       '  send "done\\r"',
       '  expect "INTERRUPT_RESULT true"',
-      '} elseif {$env(PTY_MODE) eq "codex"} { expect "선택: "; send "1\\r" } else {',
-      '  expect "선택: "',
+      '} elseif {$env(PTY_MODE) eq "codex"} { expect "Choice: "; send "1\\r" } else {',
+      '  expect "Choice: "',
       '  send "2\\r"',
-      '  expect "키 공급 선택: "',
+      '  expect "Key source: "',
       '  send "3\\r"',
-      '  expect "OPENROUTER_API_KEY (Enter=건너뜀): "',
+      '  expect "OPENROUTER_API_KEY (Enter to skip): "',
       '  send "pty-sentinel-never-output\\r"',
       '  expect "OpenRouter 모델 ("',
       '  send "\\033\\[A5\\r"',

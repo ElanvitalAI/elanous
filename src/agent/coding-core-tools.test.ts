@@ -10,6 +10,7 @@ import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildCliAgentTools, program, setCliAgentDispatchForTesting } from '../index.js';
+import { setAstGrepProbeForTesting } from './search-toolkit.js';
 import { dispatchAgent } from '../skills/tools/agent.js';
 import { debug } from '../debug/log.js';
 import type { AgentDefinition } from './types.js';
@@ -42,7 +43,7 @@ function fakeProvider(turns: LLMStreamEvent[][]): LLMProvider {
 describe('coding-core-tools — Phase 2 골든룰(native 이름배열 diff=0)', () => {
   test('buildCodingCoreNativeSpecs 이름배열 = 종전 CLI·continuation native 블록', () => {
     const names = buildCodingCoreNativeSpecs().map((s) => s.name);
-    // coding/chat 조립기 통일로 의도적으로 포함된 하위 에이전트 다섯 도구도 이 기준선이 소유한다.
+    // coding/chat 조립기 통일로 의도적으로 포함된 하위 에이전트 여섯 도구(AGENT-STEER AgentSend 포함)도 이 기준선이 소유한다.
     expect(names).toEqual([
       'Read',
       'Grep',
@@ -50,10 +51,13 @@ describe('coding-core-tools — Phase 2 골든룰(native 이름배열 diff=0)', 
       'ListDir',
       'Edit',
       'Write',
+      // DocsSearch — 자리 표면(coding/turn) 즉시 칸(5497ec9 재측정 · 캡슐에만 있던 것을 본 턴에도).
+      'DocsSearch',
       'Agent',
       'AgentOutput',
       'AgentReply',
       'AgentStop',
+      'AgentSend',
       'AgentList',
     ]);
   });
@@ -243,11 +247,16 @@ describe('tool profile invariants on the real CLI tool list', () => {
 
   // CHILD-TOOL-PROFILE-TRIM — 10-10 실측 27개(스키마 26,742자) → 코딩 도구만 남는다.
   // 2026-11-18 FIRECRAWL #38324가 코딩 프로필에 firecrawl 을 더했다(9→10).
-  test('coding on the real CLI list (Plan on) leaves exactly the ten coding tools', async () => {
+  // (app_build · app_build_plan = #38924 공용 앱 도구 — main 에서 이미 이 목록을 깨고 있었다.)
+  // 2026-11-25 검색 묶음(src/agent/search-toolkit.ts)이 AstGrep·DirectiveSearch·DocsSearch 를 더했다(10→13 · AstGrep 은 바이너리 있을 때).
+  test('coding on the real CLI list (Plan on) leaves exactly the coding tools plus the search toolkit', async () => {
     const { applyToolProfile, parseToolProfile } = await import('./tool-profile.js');
-    const all = buildCliAgentTools(undefined, { sessionId: 'trim-probe', emitFeedback: () => {} }, process.cwd()).specs;
+    setAstGrepProbeForTesting(() => true);
+    let all;
+    try { all = buildCliAgentTools(undefined, { sessionId: 'trim-probe', emitFeedback: () => {} }, process.cwd()).specs; }
+    finally { setAstGrepProbeForTesting(null); }
     const coding = applyToolProfile(all, parseToolProfile('coding'));
-    expect(coding.tools!.map((t) => t.name).sort()).toEqual(['Bash', 'Edit', 'Glob', 'Grep', 'ListDir', 'MarkStepDone', 'Plan', 'Read', 'Write', 'firecrawl']);
+    expect(coding.tools!.map((t) => t.name).sort()).toEqual(['AstGrep', 'Bash', 'DirectiveSearch', 'DocsSearch', 'Edit', 'Glob', 'Grep', 'ListDir', 'MarkStepDone', 'Plan', 'Read', 'Write', 'app_build', 'app_build_plan', 'firecrawl']);
     expect([...coding.tools!.map((t) => t.name), ...coding.removed].sort()).toEqual(all.map((s) => s.name).sort());
   });
 });

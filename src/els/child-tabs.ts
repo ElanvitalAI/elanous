@@ -7,7 +7,11 @@
 //   - success: one result line goes to the parent (returned and passed to `notifyParent`), the tab closes after
 //     `closeDelayMs` (10 s) unless pinned; failure: the tab stays marked ✕ until `dismiss`,
 //   - only long-lived children get a tab: one still alive after `tabAfterMs` (60 s); shorter ones live in the parent
-//     line summary only. A background shell never gets a tab (parent suffix «⌁n» + expandable list) unless pinned,
+//     line summary only. A graph run is the exception (DEMO-GRAPH-TAB-POLISH): its tab opens at start, sized
+//     GRAPH_TAB_SIZE until a viewer resizes it; a graph run that carries a scene (its end card) stays open after it
+//     ends until it is dismissed or closed (a plain graph run closes after success like any child),
+//   - a graph run may carry a scene (`scene`, e.g. the invest research widgets): the tab then draws that scene fitted to
+//     the pane instead of the node widget; a resize redraws it (`redraw`). A background shell never gets a tab (parent suffix «⌁n» + expandable list) unless pinned,
 //   - at most `maxPerWs` (4) auto tabs per parent workspace and `maxTabs` (8) overall; the rest share ONE
 //     «⎇ +n» bundle tab per workspace,
 //   - `tree()` / `summary()` give the left list (ELS1) the same rows and the «⎇3 ●2 ✕1» suffix: state is kept here once.
@@ -17,8 +21,14 @@ import { projectGraphLoopViews, type GraphViewEvent } from '../graph-view/model.
 import { renderGraphDashboard, type DashboardColorMode } from '../graph-view/dashboard.js';
 import { renderGraphView } from '../graph-view/render.js';
 import { agoText, childSummary, KIND_GLYPH, STATUS, type ChildKind, type StatusWord } from './status-vocab.js';
+import { renderInvestResearchFrame, type InvestResearchModel } from '../tui/widgets/scenes/invest-research.js';
 
 export type ChildSource = ChildKind | 'graph-node';
+
+/** A scene a graph run's tab draws instead of its node widget. */
+export type ChildScene = { readonly kind: 'invest-research'; readonly model: InvestResearchModel };
+/** The size a graph tab opens at (the full dashboard needs ≥ 110×24); an attached viewer's resize replaces it. */
+export const GRAPH_TAB_SIZE = { cols: 120, rows: 36 } as const;
 
 export interface ChildStart {
   readonly id: string;
@@ -31,7 +41,7 @@ export interface ChildStart {
 }
 
 export interface ChildTabsDeps {
-  readonly core: Pick<ElsCore, 'openVirtual' | 'patchVirtual' | 'closeVirtual'>;
+  readonly core: Pick<ElsCore, 'openVirtual' | 'patchVirtual' | 'closeVirtual'> & Partial<Pick<ElsCore, 'resize'>>;
   readonly notifyParent?: (ws: string, line: string) => void;
   readonly maxTabs?: number;
   readonly maxPerWs?: number;
@@ -66,6 +76,7 @@ interface Child extends Omit<ChildStart, 'parent'> {
   endedAt?: number;
   drawn?: string;
   model?: string;
+  scene?: ChildScene;
 }
 
 export interface ChildRow {
@@ -122,6 +133,10 @@ export function createChildTabs(deps: ChildTabsDeps) {
     const nodes = [...children.values()].filter((row) => row.parent === child.id && isNode(row));
     const lines = [...child.lines, ...nodes.map((node) => nodeLine(node, 1))].join('\n');
     if (child.source !== 'graph') return lines;
+    if (child.scene) {
+      const size = (child.tab !== undefined ? deps.paneSize?.(child.tab) : undefined) ?? GRAPH_TAB_SIZE;
+      return renderInvestResearchFrame(child.scene.model, size.cols, size.rows).join('\n');
+    }
     const widget = graphWidget(child, nodes);
     return widget.length > 8 ? widget.join('\n') : `${widget.join('\n')}\n\n${lines}`;
   };
@@ -191,11 +206,11 @@ export function createChildTabs(deps: ChildTabsDeps) {
     if (child.tab !== undefined) deps.core.closeVirtual(child.tab);
   };
   const scheduleClose = (child: Child): void => {
-    if (child.pinned || child.status !== 'done' || isNode(child)) return;
+    if (child.pinned || child.status !== 'done' || isNode(child) || child.scene) return;
     if (child.timer) clearTimer(child.timer);
     child.timer = setTimer(() => {
       child.timer = undefined;
-      if (child.pinned || children.get(child.id) !== child) return;
+      if (child.pinned || child.scene || children.get(child.id) !== child) return;
       if (child.view === 'bundle') sweepBundle(child.ws); else remove(child);
     }, closeDelayMs);
   };
@@ -214,6 +229,7 @@ export function createChildTabs(deps: ChildTabsDeps) {
       }
       child.tab = (JSON.parse(opened.message) as { pane: string }).pane;
       child.view = 'tab';
+      if (child.source === 'graph') deps.core.resize?.(child.tab, GRAPH_TAB_SIZE.cols, GRAPH_TAB_SIZE.rows);
       if (child.source === 'graph' && child.status !== 'done' && child.status !== 'failed' && tickMs > 0)
         child.ticker = setTick(() => { child.tick++; if (children.get(child.id) !== child || child.status === 'done' || child.status === 'failed') { stopTick(child); return; } draw(child); }, tickMs);
       draw(child);
@@ -243,6 +259,7 @@ export function createChildTabs(deps: ChildTabsDeps) {
       if (isNode(child)) { draw(parent!); return out('ok'); }
       if (child.source === 'shell') return out('ok'); // no tab unless pinned
       child.view = 'pending';
+      if (child.source === 'graph') { promote(child); return out('ok'); } // a graph run is watched from its first node
       child.promo = setTimer(() => { child.promo = undefined; promote(child); }, tabAfterMs);
       return out('ok');
     },
@@ -292,6 +309,24 @@ export function createChildTabs(deps: ChildTabsDeps) {
       try { deps.notifyParent?.(child.ws, line); } catch { /* the parent line is best effort */ }
       if (ok) scheduleClose(child);
       return out(line);
+    },
+
+    /** Replace the scene a graph run's tab draws (kept after the run ends: the end card). */
+    scene(id: string, scene: ChildScene) {
+      const child = children.get(id);
+      if (!child) return refuse(`unknown child ${id}`);
+      if (child.source !== 'graph') return refuse(`${id} is not a graph run`);
+      if (scene?.kind !== 'invest-research' || !scene.model || typeof scene.model !== 'object') return refuse('unknown scene');
+      child.scene = scene;
+      if (child.timer) { clearTimer(child.timer); child.timer = undefined; } // a run with an end card stays until dismissed
+      touch(child);
+      draw(child);
+      return out('ok');
+    },
+
+    /** The pane was resized: draw its child tab again at the new size (a finished tab has no ticker). */
+    redraw(pane: string) {
+      for (const child of children.values()) if (child.tab === pane) { child.drawn = undefined; draw(child); }
     },
 
     pin(id: string) {

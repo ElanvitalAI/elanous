@@ -2,6 +2,7 @@
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { parseDocument, isMap, isSeq, isScalar } from 'yaml';
+import { parseSpaceLead, type SpaceLeadDecl } from '../seat/space-lead.js';
 
 export interface SeatConfig {
   readonly id: string; readonly role?: string; readonly description?: string;
@@ -9,18 +10,21 @@ export interface SeatConfig {
   readonly host: string; readonly cwd: string; readonly title: string;
   readonly tags: string[]; readonly capabilities: string[]; readonly languages: string[];
   readonly max_parallel: number; readonly remote: { readonly allowed: boolean; readonly hosts?: string[] };
+  /** SPACE-ADVISOR — the coordinator this seat serves (role `advisor` requires it · must be a space coordinator). */
+  readonly parent?: string;
 }
 export interface WorkspaceConfig {
   readonly version: 1; readonly root: string;
   readonly hq?: { readonly coordinator: string; readonly authorityLocation?: string };
   readonly hosts: Record<string, { ssh: string }>;
   readonly seats: Record<string, SeatConfig>;
-  readonly spaces: Record<string, { coordinator: string; seats: string[]; description?: string }>;
+  /** `lead` (SPACE-LEAD-HUMAN) — who leads the space: a tab (`llm`, the default) or a person (`human`). */
+  readonly spaces: Record<string, { coordinator: string; seats: string[]; description?: string; lead?: SpaceLeadDecl }>;
 }
 type Row = Record<string, unknown>;
 const record = (x: unknown): x is Row => !!x && typeof x === 'object' && !Array.isArray(x);
 const runtime = ['eln', 'codex', 'claude', 'grok', 'shell'];
-const seatKeys = ['role','description','runtime','provider','model','profile','host','cwd','title','tags','capabilities','languages','max_parallel','remote'];
+const seatKeys = ['role','description','runtime','provider','model','profile','host','cwd','title','tags','capabilities','languages','max_parallel','remote','parent'];
 const roleKeys = ['description','runtime','provider','model','profile','capabilities','languages','max_parallel','remote'];
 const secretKey = /^(token|password|secret|api_key)$/i;
 const secretValue = /(?:sk-[a-zA-Z0-9_-]{12,}|ghp_[a-zA-Z0-9]+|xox[baprs]-[a-zA-Z0-9-]+|-----BEGIN|(?:^|\s)[A-Za-z0-9+/]{40,}={0,2}(?:$|\s))/;
@@ -67,7 +71,7 @@ export function parseWorkspaceConfig(text: string, path: string, home = process.
   if (!record(raw)) return { errors: [...errors, `error: ${path}: expected object`], warnings };
   const keys = (obj: Row, allowed: string[], ctx: string) => Object.keys(obj).forEach(k => { if (!allowed.includes(k)) bad(k, `unknown key "${k}" in ${ctx}`, obj); });
   scope = raw;
-  keys(raw, ['version','root','hosts','roles','seats','spaces','hq','grids'], 'workspace');
+  keys(raw, ['version','root','hosts','roles','seats','spaces','hq','grids','org'], 'workspace');
   for (const k of ['hq', 'grids']) if (raw[k] !== undefined && !record(raw[k])) bad(k, `${k} must be an object`);
   if (raw.version !== 1) bad('version', `unsupported version ${JSON.stringify(raw.version)} (this els reads 1)`);
   const maps: Record<string, Row> = {};
@@ -109,12 +113,14 @@ export function parseWorkspaceConfig(text: string, path: string, home = process.
     if (!hostExists(host)) bad('host', `seat ${id} names unknown host ${host}`);
     if (host !== 'local' && remote.allowed !== true) bad('host', `seat ${id} has host ${host} but remote.allowed is false`);
     if (host !== 'local' && Array.isArray(remote.hosts) && !remote.hosts.includes(host)) bad('host', `seat ${id} host ${host} is not allowed by remote.hosts`);
-    seats[id] = { id, ...(role ? { role } : {}), ...(typeof s.description === 'string' ? { description: s.description } : {}), runtime: typeof s.runtime === 'string' ? s.runtime : 'eln', ...(typeof s.provider === 'string' ? { provider: s.provider } : {}), ...(typeof s.model === 'string' ? { model: s.model } : {}), ...(typeof s.profile === 'string' ? { profile: s.profile } : {}), host, cwd: typeof s.cwd === 'string' ? (isAbsolute(s.cwd) ? s.cwd : resolve(root, s.cwd)) : join(root, 'seats', id), title: typeof s.title === 'string' ? s.title : id, tags: Array.isArray(s.tags) ? s.tags as string[] : [], capabilities: Array.isArray(s.capabilities) ? s.capabilities as string[] : [], languages: Array.isArray(s.languages) ? s.languages as string[] : [], max_parallel: typeof s.max_parallel === 'number' ? s.max_parallel : 1, remote: { allowed: remote.allowed === true, ...(Array.isArray(remote.hosts) ? { hosts: remote.hosts as string[] } : {}) } };
+    if (s.parent !== undefined && (typeof s.parent !== 'string' || !s.parent.trim())) bad('parent', `seats.${id}.parent must be a nonempty string`);
+    seats[id] = { id, ...(typeof s.parent === 'string' && s.parent.trim() ? { parent: s.parent.trim() } : {}), ...(role ? { role } : {}), ...(typeof s.description === 'string' ? { description: s.description } : {}), runtime: typeof s.runtime === 'string' ? s.runtime : 'eln', ...(typeof s.provider === 'string' ? { provider: s.provider } : {}), ...(typeof s.model === 'string' ? { model: s.model } : {}), ...(typeof s.profile === 'string' ? { profile: s.profile } : {}), host, cwd: typeof s.cwd === 'string' ? (isAbsolute(s.cwd) ? s.cwd : resolve(root, s.cwd)) : join(root, 'seats', id), title: typeof s.title === 'string' ? s.title : id, tags: Array.isArray(s.tags) ? s.tags as string[] : [], capabilities: Array.isArray(s.capabilities) ? s.capabilities as string[] : [], languages: Array.isArray(s.languages) ? s.languages as string[] : [], max_parallel: typeof s.max_parallel === 'number' ? s.max_parallel : 1, remote: { allowed: remote.allowed === true, ...(Array.isArray(remote.hosts) ? { hosts: remote.hosts as string[] } : {}) } };
   }
   const spaces: WorkspaceConfig['spaces'] = {}; const placed = new Map<string, string>();
   for (const [name, value] of Object.entries(maps.spaces!)) {
     if (!name.trim() || !record(value)) { bad(name, `invalid space ${name}`); continue; }
-    scope = value; keys(value, ['coordinator','seats','description'], `spaces.${name}`);
+    scope = value; keys(value, ['coordinator','seats','description','lead','kind'], `spaces.${name}`);
+    if (value.kind !== undefined && (typeof value.kind !== 'string' || !['direct', 'federation', 'kingdom'].includes(value.kind))) bad('kind', `spaces.${name}.kind must be direct, federation or kingdom`);
     if (record(value.coordinator)) {
       const selector = value.coordinator;
       keys(selector, ['role', 'tag'], `spaces.${name}.coordinator`);
@@ -130,7 +136,9 @@ export function parseWorkspaceConfig(text: string, path: string, home = process.
     if (value.seats !== undefined && (!Array.isArray(value.seats) || !value.seats.every(x => typeof x === 'string'))) { bad('seats', `spaces.${name}.seats must be an array of seat ids`); continue; }
     const members = [value.coordinator, ...((value.seats ?? []) as string[]).filter(x => x !== value.coordinator)];
     for (const id of members) { if (!Object.hasOwn(seats,id)) bad('seats', `space ${name} references unknown seat ${id}`); else if (placed.has(id)) bad('seats', `seat ${id} is in two spaces: ${placed.get(id)} and ${name}`); else placed.set(id, name); }
-    spaces[name] = { coordinator: value.coordinator, seats: members, ...(typeof value.description === 'string' ? { description: value.description } : {}) };
+    let lead: SpaceLeadDecl | undefined;
+    if (value.lead !== undefined) { const parsed = parseSpaceLead(value.lead, `spaces.${name}`); if (parsed.error) bad('lead', parsed.error); else lead = parsed.lead; }
+    spaces[name] = { coordinator: value.coordinator, seats: members, ...(typeof value.description === 'string' ? { description: value.description } : {}), ...(lead ? { lead } : {}) };
   }
   let hq: WorkspaceConfig['hq'];
   if (record(raw.hq)) {
@@ -154,6 +162,12 @@ export function parseWorkspaceConfig(text: string, path: string, home = process.
     }
     if (value.authorityLocation !== undefined && (typeof value.authorityLocation !== 'string' || !value.authorityLocation.trim() || value.authorityLocation.includes('\0'))) bad('authorityLocation', 'hq.authorityLocation must be a nonempty string');
     else if (hq && typeof value.authorityLocation === 'string') hq = { ...hq, authorityLocation: value.authorityLocation };
+  }
+  // SPACE-ADVISOR — an advisor serves exactly one space coordinator (its ladder parent).
+  const coordinatorIds = new Set(Object.values(spaces).map((sp) => sp.coordinator));
+  for (const seat of Object.values(seats)) {
+    if (seat.role === 'advisor' && !seat.parent) { scope = seat as unknown as Row; bad('parent', `seats.${seat.id}.parent is required for role advisor`); }
+    else if (seat.parent && !coordinatorIds.has(seat.parent)) { scope = seat as unknown as Row; bad('parent', `seats.${seat.id}.parent must name a space coordinator`); }
   }
   for (const id of Object.keys(seats)) if (!placed.has(id)) warnings.push(`warning: seat ${id} is defined but not placed in any space`);
   return { ...(errors.length ? {} : { config: { version: 1 as const, root, hosts, seats, spaces, ...(hq ? { hq } : {}) } }), errors, warnings };

@@ -171,7 +171,9 @@ describe('runReleaseUpdate — release installer', () => {
   test('uses install.json prefix and latest installer, passing script on stdin without changing PATH', async () => {
     const f = setup();
     try {
-      const result = await runReleaseUpdate({}, f.deps);
+      const kicked: string[] = [];
+      const result = await runReleaseUpdate({}, { ...f.deps, kickDocsIndex: async (prefix) => { await new Promise((r) => setTimeout(r, 20)); kicked.push(prefix); } });
+      expect(kicked).toEqual([f.prefix]);
       expect(f.urls).toEqual(['https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh']);
       expect(f.calls).toEqual([{ command: 'bash', args: ['-s', '--', '--yes', '--no-modify-path', '--prefix', f.prefix], cwd: f.prefix, input: 'echo verified installer', env: { ELANOUS_VERSION: '', ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: 'https://github.com/ElanvitalAI/elanous/releases' } }]);
       expect(result).toMatchObject({ exitCode: 0, installedVersion: '0.2.0', restarted: false });
@@ -1543,6 +1545,24 @@ describe('self-update --dev and --rollback (temp install root only)', () => {
       writeFileSync(join(root, 'install.json'), JSON.stringify({ version: '0.2.16-dev.0', versionDir: `versions/${name}`, source: checkout, installedAt: '2026-10-06T00:00:00.000Z', commit: sha12 }));
       return { status: 0, stderr: '' };
     },
+  });
+
+  test('a successful install kicks the docs index catch-up once (non-blocking); a failed install does not', async () => {
+    const root = devRoot();
+    const failedRoot = devRoot();
+    const kicked: string[] = [];
+    try {
+      // The kick's spawn start is awaited before the update returns (the CLI exits right after).
+      const ok = await runSelfUpdate({ dev: true, from: checkout }, { ...devDeps(root), kickDocsIndex: async (prefix) => { await new Promise((r) => setTimeout(r, 20)); kicked.push(prefix); } });
+      expect(ok.exitCode).toBe(0);
+      expect(kicked).toEqual([root]);
+      const failed = await runSelfUpdate({ dev: true, from: checkout }, { ...devDeps(failedRoot, { empty: true, failAfterRelink: true }), kickDocsIndex: (prefix) => { kicked.push(prefix); } });
+      expect(failed.exitCode).not.toBe(0);
+      expect(kicked).toEqual([root]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(failedRoot, { recursive: true, force: true });
+    }
   });
 
   test('--dev installs versions/<ver>-dev.<sha12>, moves current, and keeps channel=dev plus previous', async () => {

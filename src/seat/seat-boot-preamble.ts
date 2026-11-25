@@ -16,6 +16,8 @@ import { basename, join } from 'node:path';
 import type { LLMMessage } from '../llm.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { buildSeatRoleCardBlock } from './seat-role-card.js';
+import { SEAT_FIRST_ANSWER_LINE, SEAT_NO_CAUSE_CONTINUE } from './seat-turn-prose.js';
+export { SEAT_FIRST_ANSWER_LINE, SEAT_ZERO_WORK_CONTINUE } from './seat-turn-prose.js';
 import { collectSeatBootSections, renderSeatBootCard } from '../cli/seat-cli.js';
 import { defaultMsgStorePath } from '../msg/msg-store.js';
 import { buildCommonMemoryIndexBlock, buildSeatMemoryIndexBlock, seatMemoryDir, seatMemoryIndexFiles } from '../seat-memory/seat-memory.js';
@@ -33,6 +35,9 @@ const SEAT_IN_PATH = /(?:^|\/)seats\/([A-Za-z][A-Za-z0-9_-]{0,63})(?:\/|$)/;
 
 /** cwd 의 `/seats/<자리>` → `COORD_ID` 순으로 자리를 판정한다. 못 하면 null. */
 export function detectSeat(cwd: string, env: NodeJS.ProcessEnv = process.env): SeatDetection | null {
+  // DEMO-FANOUT-LIVE-OP-SEAT: a pane els opened as another pane's worker child (ElsControl new) shares its parent's folder
+  // but is not that seat — no seat boot, no seat loop, no seat mail identity.
+  if (env.ELANOUS_ELS_PARENT_PANE?.trim()) return null;
   const fromCwd = SEAT_IN_PATH.exec(cwd)?.[1]?.toUpperCase();
   if (fromCwd && SEAT_ID.test(fromCwd)) return { seat: fromCwd, source: 'cwd' };
   const coord = env.COORD_ID?.trim().toUpperCase();
@@ -134,7 +139,8 @@ export const SEAT_INTENT_ESCALATION_FLOW =
   '확인 → 원인 발견 → 조사 → 처방 확정 → 구현 골 넘기기 를 «이 턴 안에서» 잇는다. 확인·조사 지시도 원인을 찾으면 여기서 멈추지 않는다.\n' +
   '- 원인과 처방이 섰으면 «다음 턴에»·«보고 뒤에»·«재점검 예약» 으로 미루지 말고 바로 구현 골로 넘긴다 — TUI 에서는 SelfImplement 도구(자리 규칙이 손 발사를 정했으면 `eln tasks hand`). 넘긴 뒤 보고는 한 줄.\n' +
   '- 자리에서 기능·수정·여러 파일 구현을 Edit/Write 로 직접 하지 않는다 — 한 줄 설정·문서·오타만 예외.\n' +
-  '- 원인이 없으면 «원인 없음 · 근거(무엇을 봤나)» 한 줄로 끝낸다. 넘기지 못하면(권한·선행 조건) 막힌 이유와 필요한 판단 하나를 적는다.';
+  SEAT_NO_CAUSE_CONTINUE;
+
 
 /** 🧠 직전 인계 회상 한 줄(TUI-SEAT-MEMORY-RECALL · COMPARE ④ · 대표 «메모리»).
  *  S: 10-22 prod 자리 세션 셋(UX GLM · UX Luna · OPT Luna)이 memory_recall·self_recall 을 한 번도 안 불렀다 — 기억 도구가
@@ -428,7 +434,7 @@ function buildCardMessages(cwd: string, deps: SeatBootDeps): CardEntry {
     (detection.seat === 'OP' ? 'OP 첫 턴: PR 목록은 과거 스냅샷이다. 진행 중 PR을 말하기 전에 현재 GitHub 정본을 다시 확인하고, 조회 실패면 확인 불가로 말하라.\n' : '') +
     `## 자리 부트 카드 — 너는 이 작업 디렉터리의 ${detection.seat} 자리에서 일한다\n` +
     `(판정: ${detection.source === 'cwd' ? `cwd 의 /seats/${detection.seat}` : 'COORD_ID'} · 세션 시작 스냅샷 ${at} · 이후 바뀐 값은 다시 조회하라)\n` +
-    `사람이 다른 일을 먼저 시키지 않았다면, 첫 답에서 자리 이름·'자리 역할' 절의 역할·안 읽은 우편 수를 각각 명시하고 처리할 일을 제안하라. 역할이 미관측이면 추측하지 말고 미관측이라고 말하라.\n` +
+    `${SEAT_FIRST_ANSWER_LINE}\n` +
     (recall ? `${recall}\n` : '') +
     `${memoryImport}\n` +
     (opHandoff ? `${opHandoff}\n` : '') +

@@ -349,7 +349,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
         return;
       }
       if (!isStdinTty() && !opts.yes) {
-        (out.error ?? out.log)('대화형 온보딩은 stdin TTY가 있는 자리에서만 실행할 수 있다. 무인 설정은 `elanous setup --non-interactive`를 사용하라.');
+        (out.error ?? out.log)('Interactive setup needs a terminal (stdin TTY). Unattended: `elanous setup --yes` to apply, or `elanous setup --non-interactive` to report only.');
         setExitCode(1);
         return;
       }
@@ -357,7 +357,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
       if (isFirstRun) {
         let approved = opts.yes;
         if (!approved) {
-          try { approved = (await prompt('첫 설정을 적용할까요? [y/N] '))?.trim().toLowerCase() === 'y'; }
+          try { approved = (await prompt('Apply first-time setup? [y/N] '))?.trim().toLowerCase() === 'y'; }
           catch {
             out.log('First setup unchanged because consent could not be read.');
             setExitCode(1);
@@ -387,11 +387,13 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
             await doctorProgram.parseAsync([...args], { from: 'user' });
             return exitCode;
           });
+          // DEMO-ZEROBASE-FIXES: doctor --fix runs quietly and can take tens of seconds — say so, or it looks frozen.
+          out.log('Applying recommended setup (permissions, PATH, services)… this can take up to a minute.');
           const fixCode = await runDoctorFix(['doctor', '--fix', '--yes']);
           if (fixCode === 0 && isStdinTty() && !opts.yes) {
             const result = await configureFirecrawlKey({ promptSecret: askSecret, print: out.log, setSecret: deps.setCredentialSlotAsync ?? setCredentialSlotAsync });
             if (result === 'failed') { setExitCode(1); return; }
-          } else out.log('Firecrawl 선택 키 설정: elanous setup firecrawl');
+          } else out.log('Optional Firecrawl key: elanous setup firecrawl');
           out.log(`First setup ${fixCode === 0 ? 'complete' : 'incomplete'}; provider/GitHub authentication and OS security approvals remain manual.`);
           setExitCode(fixCode);
         } catch {
@@ -480,7 +482,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
     .description('Set an optional Firecrawl key in the secret store; Enter skips')
     .action(async () => {
       if (!isStdinTty()) {
-        (out.error ?? out.log)('Firecrawl 키 설정은 TTY에서 elanous setup firecrawl 로 실행하세요.');
+        (out.error ?? out.log)('Run `elanous setup firecrawl` in a terminal (TTY) to set the Firecrawl key.');
         setExitCode(1); return;
       }
       const result = await configureFirecrawlKey({ promptSecret: askSecret, print: out.log, setSecret: deps.setCredentialSlotAsync ?? setCredentialSlotAsync });

@@ -1,0 +1,49 @@
+graph_id: release-traffic
+version: 1
+loop:
+  title: Release traffic control (node-b reserve · aws1 absorb · restore)
+  root: 자원국
+  managed_by: trigger-registry
+  description: >-
+    SCHEDULER-TO-GRAPH-RUNNER · CEO 11-25 23:5x. Replaces the hand rules (traffic-control-t-minus-1h · traffic-*.sh ·
+    release-phase-autotraffic.sh). Compound condition — times resolve from the release graph's own clock, never a fixed
+    wall clock: reserve when (now ≥ cutAt − 2h OR rehearsalAt − 15m) AND the rehearsal is scheduled/started/passed/failed;
+    re-converge when the absorb lease (aws1) or the publish state changes; restore when publish is confirmed OR the
+    publishAt + 2h timeout passes. The node converges pregate slots (node-b → 1, aws1 → 5, back to baseline/5 after publish ·
+    update-all once), adopts hand-set values, never overwrites a value changed by hand since its write (card instead),
+    writes an audit row + undo per change, single-flight. Owner = REL steward (orgDuty release-supervision when it lands).
+  owner: REL
+  trigger:
+    condition:
+      when:
+        any:
+          - all:
+              - { any: [ { time: { after: 'release.cutAt - 2h' } }, { time: { after: 'release.rehearsalAt - 15m' } } ] }
+              - { fact: release.rehearsal, in: [scheduled, started, passed, failed] }
+          - { fact: release.published, equals: true }
+          - { fact: release.aborted, equals: true }
+          - { time: { after: 'release.abortedAt + 30m' } }
+          - { time: { after: 'release.publishAt + 30m' } }
+          - { fact: res.lease.aws1.live, equals: false }
+        timeout: { after: 'release.publishAt + 2h', then: abort-restore }
+      cooldown_min: 0
+  goal:
+    kind: ledger-line
+    path: '{stateRoot}/loops/release-traffic.jsonl'
+    contains: '"window":"{window}"'
+  failure:
+    goal_deadline_min: 40
+    max_attempts: 3
+    backoff_sec: [60, 180]
+  legacy:
+    kind: marker
+    path: '{seatState}/OP/tools/.graph-cutover/release-traffic'
+  cutover_after: 1
+entry_node: tick
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: tick, kind: agent, recipe: 'cmd:release-traffic-tick', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }

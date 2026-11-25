@@ -1,0 +1,44 @@
+graph_id: op-bulletin
+version: 1
+loop:
+  title: OP 30-minute federal bulletin
+  root: 조율자
+  managed_by: trigger-registry
+  description: >-
+    Condition-driven federal bulletin: wake OP when landed count, idle seats, or raised hands changed since the last
+    bulletin (at most every 15 min), or after 30 min regardless. Done-when = seat-state/OPS/BULLETIN-NOW.md is
+    rewritten after the wake. Shadow until two goal-verified fires, then the legacy watchdog bulletin branch is off.
+  owner: OP
+  trigger:
+    condition:
+      predicate: { kind: state-changed, parts: [landed-count, idle-seats, hands-up-count] }
+      cooldown_min: 15
+      max_wait_min: 30
+      on_max_wait: fire
+  goal:
+    kind: file-mtime
+    path: '{seatState}/OPS/BULLETIN-NOW.md'
+  failure:
+    goal_deadline_min: 20
+    max_attempts: 2
+    backoff_sec: [180]
+  legacy:
+    kind: marker
+    path: '{seatState}/OP/tools/.graph-cutover/op-bulletin'
+  cutover_after: 2
+entry_node: wake
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: wake
+    kind: agent
+    recipe: 'cmd:trigger-wake'
+    max_visits: 1
+    input:
+      from: OP
+      to: OP
+      kind: request
+      body: '[graph 깨움 · 연방 공보] OPS-RULES §연방 공보 7칸 양식으로: 지난 30분 입력(카드·스페이스 카드·긴급·착지·초록·els 상태) 종합 → ⓪ 지난 공보 효과 → 병목 1개 → 국면 조정 → 정책·자원·스페이스별 지시. seat-state/OPS/BULLETIN-NOW.md 덮어쓰기(이전 것은 BULLETIN-LOG 에 덧붙임) + 서브 조율자 6(JUD TC UX REL RES MVP-B)에 --kind bulletin.'
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: wake, on: outcome, map: { ok: done, fail: failed, error: failed } }

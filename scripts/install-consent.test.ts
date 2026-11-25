@@ -5,6 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const installer = join(import.meta.dir, 'install.sh');
+/** A fresh install with no --yes (consent declined or no terminal to ask): one spawn site for both refusal tests. */
+const runInstallerWithoutConsent = (home: string, prefix: string, extra: Record<string, string>) =>
+  spawnSync('/bin/bash', [installer, '--prefix', prefix], {
+    encoding: 'utf8', input: '', env: { ...process.env, HOME: home, ELANOUS_INSTALL_LANG: 'en', ...extra },
+  });
 
 test('declining installation leaves the home and prefix unchanged', () => {
   const home = mkdtempSync(join(tmpdir(), 'elanous-consent-'));
@@ -12,9 +17,7 @@ test('declining installation leaves the home and prefix unchanged', () => {
     const startup = join(home, '.bashrc');
     const prefix = join(home, 'install');
     writeFileSync(startup, 'unchanged\n');
-    const result = spawnSync('/bin/bash', [installer, '--prefix', prefix], {
-      encoding: 'utf8', env: { ...process.env, HOME: home, ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_ANSWER: 'n', ELANOUS_INSTALL_LANG: 'en' },
-    });
+    const result = runInstallerWithoutConsent(home, prefix, { ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_ANSWER: 'n' });
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('consent required');
     expect(readFileSync(startup, 'utf8')).toBe('unchanged\n');
@@ -95,3 +98,18 @@ test('an unattended run over an existing installation is its own update (self-up
     rmSync(home, { recursive: true, force: true });
   }
 }, 300_000);
+
+test('DEMO-ZEROBASE-FIXES: a piped (non-interactive) fresh install refuses with the exact --yes line to run', () => {
+  const home = mkdtempSync(join(tmpdir(), 'elanous-consent-pipe-'));
+  try {
+    const prefix = join(home, 'install');
+    const result = runInstallerWithoutConsent(home, prefix, { ELANOUS_INSTALL_INTERACTIVE: '0' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Installation not started: consent required (use --yes to consent).');
+    expect(result.stderr).toContain('No terminal to ask for consent. To install unattended, run:');
+    expect(result.stderr).toContain('curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash -s -- --yes');
+    expect(existsSync(prefix)).toBe(false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

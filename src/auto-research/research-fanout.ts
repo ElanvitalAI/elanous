@@ -269,9 +269,12 @@ export interface ResearchSubagentDeps {
   dispatchAgent: typeof import('../skills/tools/agent.js').dispatchAgent;
   buildOmniSearchTool: typeof import('../skills/tools/omni-search.js').buildOmniSearchTool;
   dispatchResearchOmniSearch: typeof import('../skills/tools/omni-search.js').dispatchResearchOmniSearch;
+  /** Read-only search toolkit (Read · Grep · Glob · ListDir · AstGrep · DirectiveSearch · DocsSearch). Omitted = the real one. */
+  buildReadOnlySearchCatalog?: typeof import('../agent/search-toolkit.js').buildReadOnlySearchCatalog;
 }
 
-/** Production worker: a read-only general sub-agent with only the research web search tool.
+/** Production worker: a read-only general sub-agent with the research web search tool plus the read-only
+ *  search toolkit (local code, docs and owner directives — src/agent/search-toolkit.ts).
  *  `deps` is a test seam; production lazily imports the real Agent/OmniSearch modules. */
 export const createResearchSubagent = (deps?: ResearchSubagentDeps): ResearchFanoutWorker => async (angle, request, signal) => {
   const { dispatchAgent, buildOmniSearchTool, dispatchResearchOmniSearch } = deps ?? await (async () => {
@@ -281,10 +284,15 @@ export const createResearchSubagent = (deps?: ResearchSubagentDeps): ResearchFan
     ]);
     return { dispatchAgent: agent.dispatchAgent, buildOmniSearchTool: omni.buildOmniSearchTool, dispatchResearchOmniSearch: omni.dispatchResearchOmniSearch };
   })();
+  const buildLocal = deps?.buildReadOnlySearchCatalog
+    ?? (await import('../agent/search-toolkit.js')).buildReadOnlySearchCatalog;
+  let local: ReturnType<typeof buildLocal> | undefined;
+  try { local = buildLocal(process.cwd()); } catch { local = undefined; /* fail-soft — web research still runs */ }
+  const localNames = new Set((local?.specs ?? []).map((t) => t.name));
   const prompt = [
     `Research this question from the angle “${angle.label}”: ${request}`,
     angle.instruction,
-    'Use OmniSearch for web research. Return a concise synthesis with a precise date, denominator/time window and state when relevant.',
+    'Use OmniSearch for web research; read-only local search tools (Read, Grep, Glob, ListDir, DocsSearch, DirectiveSearch, AstGrep when present) cover this repo, its docs and what the owner said. Return a concise synthesis with a precise date, denominator/time window and state when relevant.',
     'Attach a Markdown link for every factual claim. Clearly label unresolved conflicts and uncertainty. Never invent a source or date.',
   ].join('\n\n');
   const searchSources = new Map<string, ResearchFanoutSource>();
@@ -301,8 +309,9 @@ export const createResearchSubagent = (deps?: ResearchSubagentDeps): ResearchFan
     // background receipt (#38772), and must not be detached by the 10 s sync cap.
     awaitResult: true,
     ...(parentSessionId ? { parentSessionId } : {}),
-    hostTools: [buildOmniSearchTool()],
+    hostTools: [buildOmniSearchTool(), ...(local?.specs ?? [])],
     dispatchTool: async (name, args) => {
+      if (local && localNames.has(name)) return local.dispatch(name, args);
       if (name !== 'OmniSearch') throw new Error(`research agent tool is not permitted: ${name}`);
       const search = await dispatchResearchOmniSearch(args, {
         signal,
@@ -317,7 +326,7 @@ export const createResearchSubagent = (deps?: ResearchSubagentDeps): ResearchFan
       role: angle.label,
       goal: angle.instruction,
       systemPrompt: 'You are a careful research analyst. Use web search, cite original URLs, preserve dates and uncertainty.',
-      tools: ['OmniSearch'],
+      tools: ['OmniSearch', ...localNames],
       permissionMode: 'read-only',
       maxTurns: 5,
     }),

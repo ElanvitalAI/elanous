@@ -10,10 +10,19 @@
  * so a later item must still be woken. The leaf import failing is the same
  * as a refusal: no turn, and the rest of the queue still wakes.
  */
+/** Consecutive not-injected notices after which one turn is forced (no silent stall · 11-25 OP deaf). */
+export const NOT_INJECTED_FORCE_AFTER = 3;
+
 export function noticeOneDispatch(input: {
   readonly injected: boolean;
   readonly remaining: number;
-}): { readonly startTurn: boolean; readonly wakeQueue: boolean } {
+  /** Why the ledger refused: `full` is bookkeeping, not a reason to lose the turn — it starts anyway. */
+  readonly refusal?: 'duplicate' | 'full';
+  /** Not-injected results in a row, this one included. */
+  readonly streak?: number;
+}): { readonly startTurn: boolean; readonly wakeQueue: boolean; readonly forced?: 'ledger-full' | 'not-injected-streak' } {
   if (input.injected) return { startTurn: true, wakeQueue: false };
+  if (input.refusal === 'full') return { startTurn: true, wakeQueue: false, forced: 'ledger-full' };
+  if ((input.streak ?? 0) >= NOT_INJECTED_FORCE_AFTER) return { startTurn: true, wakeQueue: false, forced: 'not-injected-streak' };
   return { startTurn: false, wakeQueue: input.remaining > 0 };
 }

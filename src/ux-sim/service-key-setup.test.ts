@@ -176,7 +176,7 @@ test('first-run API-key choice never calls the actual OAuth module entrypoint', 
       'oauthSpy.mockClear();',
       "const { runFirstRunProviderSetup } = await import('./src/cli/setup-keys.ts');",
       "const env: Record<string, string | undefined> = {};",
-      "const result = await runFirstRunProviderSetup({ ask: async prompt => prompt === '선택: ' ? '3' : '1', askSecret: async prompt => prompt.includes('EXA_API_KEY') ? 'synthetic-exa-key' : '', print: () => {} }, {",
+      "const result = await runFirstRunProviderSetup({ ask: async prompt => prompt === 'Choice: ' ? '3' : '1', askSecret: async prompt => prompt.includes('EXA_API_KEY') ? 'synthetic-exa-key' : '', print: () => {} }, {",
       "  config: { llm: { provider: 'openai' } }, env, cacheDir: process.env.HOME + '/cache',",
       '  loginWithCodex: oauth.loginWithCodex, verifier: async input => { verifierCalls += 1; if (input.provider !== \'exa\' || input.apiKey !== \'synthetic-exa-key\') throw new Error(\'unexpected verifier input\'); return { success: true, verification: \'verified\' }; },',
       '});',
@@ -305,7 +305,7 @@ test('synthetic canary inputs never reach the key verifier or emitted output', a
     const firstRunCacheDir = mkdtempSync(join(tmpdir(), 'ux-service-key-first-run-'));
     isolatedRoots.push(firstRunCacheDir);
     await runFirstRunProviderSetup({
-      ask: async prompt => prompt === '선택: ' ? '3' : '',
+      ask: async prompt => prompt === 'Choice: ' ? '3' : '',
       askSecret: async prompt => prompt.includes('EXA_API_KEY') ? firstRunSecret : '',
       print: message => printed.push(message),
     }, {
@@ -434,13 +434,13 @@ test('headless Codex device login cancellation during a delayed token exchange n
       }).finally(() => { loginSettled = true; });
     }, io, { headless: true });
 
-    for (let turn = 0; turn < 20 && !printed.some(line => line.startsWith('코드: ')); turn++) await Promise.resolve();
-    expect(printed.some(line => line.startsWith('코드: '))).toBe(true);
-    expect(updates[0]).toContain('0초');
-    expect(updates[0]).toContain('Ctrl-C 취소');
+    for (let turn = 0; turn < 20 && !printed.some(line => line.startsWith('Code: ')); turn++) await Promise.resolve();
+    expect(printed.some(line => line.startsWith('Code: '))).toBe(true);
+    expect(updates[0]).toContain('0s');
+    expect(updates[0]).toContain('Ctrl-C to cancel');
     clock.tick(1_100);
     await oauth.exchangeStarted;
-    expect(updates.some(line => line.includes('Codex 로그인 확인 중'))).toBe(true);
+    expect(updates.some(line => line.includes('Checking Codex login'))).toBe(true);
 
     interrupt?.();
     expect(signal?.aborted).toBe(true);
@@ -476,7 +476,7 @@ test('headless Codex cancellation during a delayed device approval never starts 
   expect(await resultPromise).toEqual({ kind: 'cancelled' });
   expect(oauth.requests().map(request => request.endpoint)).toEqual(['device-code', 'device-poll']);
   expect(loadTokens('openai-codex')).toBeNull();
-  expect(printed.filter(line => line.includes('대기 중'))).toHaveLength(1);
+  expect(printed.filter(line => line.includes('Waiting for Codex login'))).toHaveLength(1);
 });
 
 test('headless device-flow failures are not formatted as offline or browser-launch failures', async () => {
@@ -504,12 +504,12 @@ test('non-TTY headless login prints elapsed updates every ten seconds without po
       print: line => printed.push(line),
       onInterrupt: handler => { interrupt = handler; return () => { interrupt = undefined; }; },
     }, { headless: true });
-    for (let turn = 0; turn < 20 && !printed.some(line => line.includes('0초')); turn++) await Promise.resolve();
+    for (let turn = 0; turn < 20 && !printed.some(line => line.includes(' 0s ')); turn++) await Promise.resolve();
     clock.tick(10_000);
-    for (let turn = 0; turn < 20 && !printed.some(line => line.includes('10초')); turn++) await Promise.resolve();
-    expect(printed.some(line => line.includes('0초'))).toBe(true);
-    expect(printed.some(line => line.includes('10초'))).toBe(true);
-    expect(printed.filter(line => line.includes('대기 중'))).toHaveLength(2);
+    for (let turn = 0; turn < 20 && !printed.some(line => line.includes(' 10s ')); turn++) await Promise.resolve();
+    expect(printed.some(line => line.includes(' 0s '))).toBe(true);
+    expect(printed.some(line => line.includes(' 10s '))).toBe(true);
+    expect(printed.filter(line => line.includes('Waiting for Codex login'))).toHaveLength(2);
     expect(printed.every(line => !/\.{2,}/.test(line))).toBe(true);
     interrupt?.();
     expect(await resultPromise).toEqual({ kind: 'cancelled' });

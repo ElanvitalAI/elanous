@@ -24,7 +24,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
-import { DEFAULT_REFERENCE_ROOTS, denyNonPublicReference } from '../agent/ref-grounding.js';   // ★ F3 — 로컬 canonical ref 루트
+import { referenceRoots, denyNonPublicReference } from '../agent/ref-grounding.js';   // ★ F3 — 로컬 canonical ref 루트
 import { debug } from '../debug/log.js';
 
 const CACHE_ROOT_DEFAULT = join(homedir(), '.cache', 'elanous-refs');
@@ -143,7 +143,7 @@ export function dispatchRefConsult(
   let repoPath = cachePath;
   let source: 'cache' | 'local-ref' = 'cache';
   if (!existsSync(join(cachePath, '.git'))) {
-    const roots = args.referenceRoots ?? DEFAULT_REFERENCE_ROOTS;
+    const roots = args.referenceRoots ?? referenceRoots();
     const localHit = roots
       .flatMap((root) => [
         join(root, args.repo),

@@ -62,8 +62,9 @@ export function scheduleFindings(results: CheckResult[], now: Date): ScheduleFin
 }
 
 export function daemonScheduleEntries(rows: readonly ScheduleRow[], now: Date): CheckEntry[] {
+  const owner = (require('../org/org-map.js') as typeof import('../org/org-map.js')).orgDuty('trigger-owner');
   return rows.filter(row => row.enabled && row.cron && (row.run_via === 'elanous' || row.run_via === 'trigger'))
-    .map(row => ({ id: row.id, owner: 'OP', enabled: true, registered: true, dueAt: dueBefore(row.cron!, now) ?? undefined,
+    .map(row => ({ id: row.id, owner, enabled: true, registered: true, dueAt: dueBefore(row.cron!, now) ?? undefined,
       ...(row.last_seen ? { observedSince: row.last_seen } : {}),
       ...(row.last_run ? { lastRunAt: row.last_run } : {}),
       ...(row.last_status ? { lastStatus: row.last_status, recentStatuses: [row.last_status] } : {}),

@@ -3488,6 +3488,10 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
         await registerStandaloneLogSink('pr-land');
       } catch { /* fail-open */ }
       const code = await runPrLand(opts, { ...deps, onMergedSupersede: supersedeMerged });
+      // fed-state: a successful `pr land` is one land fact (fail-open · dry runs excluded).
+      if (code === 0 && !(opts as { dryRun?: boolean }).dryRun) {
+        try { (await import('../fed-state/ledger.js')).recordFact({ type: 'land', ...(opts.pr ? { ref: String(opts.pr) } : {}), seat: process.env.ELANOUS_TRACK?.toUpperCase(), source: 'pr-land' }); } catch { /* fail-open */ }
+      }
       if (code !== 0) (deps.setExitCode ?? ((exitCode: number) => { process.exitCode = exitCode; }))(code);
     });
   pr.command('granularity')

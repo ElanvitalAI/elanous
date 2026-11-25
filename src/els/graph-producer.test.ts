@@ -1,7 +1,8 @@
 // ELS-GRAPH-LIVE-VIEW real flow: a real graph run (runGraph, in-process handler that reports node-progress) → the
 // runner's process-wide listeners → wireElsGraphProducer → els child requests → the child tree the sidetab reads.
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { elsJournalPath } from './journal.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { onGraphNodeLifecycle, onGraphNodeProgress, onGraphRunIdleWake, runGraph } from '../graph-runner/runner.js';
@@ -85,6 +86,32 @@ test('real els server: a running graph shows its node chain and progress note wi
     ['done', '  ✅ build · ok'],
     ['done', '  ✅ done · ok'],
   ]);
+});
+
+test('real els server renders truecolor graph tab from socket child events', async () => {
+  const oldColor = process.env.COLORTERM;
+  const oldTerm = process.env.TERM;
+  process.env.COLORTERM = 'truecolor';
+  delete process.env.TERM;
+  try {
+    const stateRoot = tempDir('els-color-server-');
+    const started = await startElsServer({ stateRoot, spawn: () => { throw new Error('no PTY'); },
+      childTabs: { tabAfterMs: 1, paneSize: () => ({ cols: 120, rows: 40 }) } });
+    if ('exitCode' in started) throw new Error(started.message);
+    cleanups.push(() => started.close());
+    const socket = elsSocketPath(stateRoot);
+    expect((await requestEls(socket, { op: 'seat-set', seat: 'OP' })).exitCode).toBe(0);
+    expect((await requestEls(socket, { op: 'child', action: 'start', id: 'graph-color', ws: 'OP', source: 'graph', label: 'run' })).exitCode).toBe(0);
+    expect((await requestEls(socket, { op: 'child', action: 'pin', id: 'graph-color' })).exitCode).toBe(0);
+    expect((await requestEls(socket, { op: 'child', action: 'start', id: 'graph-node-color', ws: 'OP', source: 'graph-node', parent: 'graph-color', label: 'node' })).exitCode).toBe(0);
+    const journal = JSON.parse(readFileSync(elsJournalPath(stateRoot), 'utf8')) as { panes: Array<{ title: string; scrollback: string }> };
+    const graphPane = journal.panes.find((pane) => pane.title.includes('graph'));
+    expect(graphPane).toBeDefined();
+    expect(graphPane!.scrollback).toMatch(/\x1b\[(?:38|48);2;\d+;\d+;\d+m/);
+  } finally {
+    if (oldColor === undefined) delete process.env.COLORTERM; else process.env.COLORTERM = oldColor;
+    if (oldTerm === undefined) delete process.env.TERM; else process.env.TERM = oldTerm;
+  }
 });
 
 test('liveness of a running node follows the clock: ● within 5 min, ◐ to 25 min, ✕ past it; the run tab text carries the chain', async () => {

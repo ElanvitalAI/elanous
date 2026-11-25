@@ -48,7 +48,7 @@ ${args}
   <key>StandardOutPath</key><string>${xml(logPath)}</string>
   <key>StandardErrorPath</key><string>${xml(logPath)}</string>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>${xml(pathEnv)}</string></dict>
+  <dict><key>PATH</key><string>${xml(pathEnv)}</string><key>COLORTERM</key><string>truecolor</string></dict>
 </dict>
 </plist>
 `;

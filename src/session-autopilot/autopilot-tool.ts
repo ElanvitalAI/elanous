@@ -17,20 +17,30 @@ export const AUTOPILOT_ON_VERBS = ['시작', '켜', 'on'] as const;
 export const AUTOPILOT_OFF_VERBS = ['끝', '꺼', '해제', '종료', 'off'] as const;
 
 /** The one system-prompt line (stable prefix · present when the tool is in the profile). */
-export const AUTOPILOT_PROMPT_LINE = `자율주행 모드: 사람의 말이 ${AUTOPILOT_WORDS.map((w) => `«${w}»`).join('·')} 모드를 켜거나(${AUTOPILOT_ON_VERBS.join('·')}) 끄는(${AUTOPILOT_OFF_VERBS.join('·')}) 뜻이면 — 낱말과 켜기/끄기 동사가 있으면 확인 없이 — 바로 ${AUTOPILOT_TOOL_NAME}({on:true, goal?} | {on:false})를 부른다. «다시 자율주행»=on:true · «계속 내가 운전»=on:true,hold:true. 사람이 목표(단기 발행 일정·중기 데모 같은 마일스톤·장기 월/분기)를 정하거나 고치거나 지우면 ${AUTOPILOT_GOAL_SET_TOOL_NAME}/${AUTOPILOT_GOAL_REMOVE_TOOL_NAME} 을 부른다 — 목표를 스스로 만들지 않는다.`;
+export const AUTOPILOT_PROMPT_LINE = `자율주행 모드: 사람의 말이 ${AUTOPILOT_WORDS.map((w) => `«${w}»`).join('·')} 모드를 켜거나(${AUTOPILOT_ON_VERBS.join('·')}) 끄는(${AUTOPILOT_OFF_VERBS.join('·')}) 뜻이면 — 낱말과 켜기/끄기 동사가 있으면 확인 없이 — 바로 ${AUTOPILOT_TOOL_NAME}({on:true, goal?} | {on:false})를 부른다. «다시 자율주행»=on:true · «이제부터 내가 운전하겠다»=on:true,hold:true. 새 요청·다른 방향·긴급 지시는 자율주행을 멈추지 않는다 — 켜진 채로 처리하고, 새 방향이면 {on:true, goal}로 목표만 바꾼다. 사람이 목표(단기 발행 일정·중기 데모 같은 마일스톤·장기 월/분기)를 정하거나 고치거나 지우면 ${AUTOPILOT_GOAL_SET_TOOL_NAME}/${AUTOPILOT_GOAL_REMOVE_TOOL_NAME} 을 부른다 — 목표를 스스로 만들지 않는다.`;
 
 export function buildAutopilotTools(): LLMToolSpec[] {
   return [
     {
       name: AUTOPILOT_TOOL_NAME,
-      description: `Turn this session's autopilot (자율주행) mode on or off. Call it whenever the person's message is about the mode — words ${AUTOPILOT_WORDS.join(', ')} with an on verb (${AUTOPILOT_ON_VERBS.join(', ')}) or an off verb (${AUTOPILOT_OFF_VERBS.join(', ')}), e.g. «자율주행 시작», «오토파일럿 켜줘», «autopilot on», «자율주행 꺼», «오토파일럿 끝». No confirmation when the word and the verb are present; ask only if genuinely ambiguous. «다시 자율주행» = on:true (resume) · «계속 내가 운전» = on:true + hold:true. While ON, record each in-policy decision you make yourself with decided:{kind, criterion}.`,
+      description: `Turn this session's autopilot (자율주행) mode on or off. Call it whenever the person's message is about the mode — words ${AUTOPILOT_WORDS.join(', ')} with an on verb (${AUTOPILOT_ON_VERBS.join(', ')}) or an off verb (${AUTOPILOT_OFF_VERBS.join(', ')}), e.g. «자율주행 시작», «오토파일럿 켜줘», «autopilot on», «자율주행 꺼», «오토파일럿 끝». No confirmation when the word and the verb are present; ask only if genuinely ambiguous. «다시 자율주행» = on:true (resume) · «이제부터 내가 운전하겠다» = on:true + hold:true. A new, different-direction or urgent request never pauses or stops autopilot — handle it while staying ON; only the person's new direction replaces the goal via on:true + goal (ordinary mail / requests are never a goal — an autonomous turn's goal is refused). When the open first-class goal (crown / person directive) is done, call goal_done:true. While ON, record each in-policy decision you make yourself with decided:{kind, criterion}.`,
       parameters: {
         type: 'object',
         properties: {
           on: { type: 'boolean', description: 'true = start / resume · false = stop' },
-          goal: { type: 'string', description: 'what to drive toward (optional)' },
+          goal: { type: 'string', description: 'what to drive toward — only for a person\'s request whose done-state needs work beyond this turn (deliverable · plan · multi-step decision · deadline/target); a question answerable now, a status ask, an ack or a one-step command is NOT a goal' },
+          done_criterion: { type: 'string', description: 'required with goal — one judgment line that says when the goal is done' },
+          kind: { type: 'string', enum: ['task', 'autopilot'], description: 'task (default) = a multi-step deliverable — shown as a pin above the input, NOT the autopilot goal; needs done_criterion + deadline; at most 3 pins. autopilot = only the seat\'s standing/version goal or a crown P0 direction — replaces the 🚗 AUTO goal' },
+          deadline: { type: 'string', description: 'required with any goal — «HH:MM» or ISO time it is due (one nudge at the deadline, expired 30 min after). Without goal = extend the open goal\'s deadline' },
+          priority: { type: 'string', enum: ['P0', 'P1', 'P2'], description: 'with a task goal — default P1; beyond 3 pins the lowest priority (oldest) is evicted' },
+          expected_turns: { type: 'number', description: 'required with goal (or expected_minutes) — your size estimate; a goal must be ≥ 3 turns or > 15 minutes of work, otherwise just do it in this turn' },
+          expected_minutes: { type: 'number', description: 'alternative size estimate in minutes (> 15)' },
+          done_check: { type: 'string', description: 'optional machine check that clears the goal by itself: file:<path> (exists) · file-updated:<path> (changed after the goal was set) · pr:<n> (merged) · mail:<SEAT> (a mail from that seat arrived) · checklist:<version>:<status>>=<n> · checklist:<version>:<id>=<status>' },
+          outcome: { type: 'string', enum: ['done', 'partial', 'dropped'], description: 'with goal_done — done (default) · partial (closing with a partial result) · dropped (needs reason)' },
+          reason: { type: 'string', description: 'with goal_done outcome:"dropped" (required) or "partial" — one line' },
           until: { type: 'string', description: '«HH:MM» or ISO time to turn itself off (optional)' },
           hold: { type: 'boolean', description: 'with on:true — the person keeps driving: stay paused until resumed' },
+          goal_done: { type: 'boolean', description: 'true = a goal is done — with kind:"task" (+ goal text) it unpins that task pin; otherwise it closes the open first-class goal (crown / person directive) and the standing goal returns' },
           decided: { type: 'object', properties: { kind: { type: 'string' }, criterion: { type: 'string' } }, required: ['kind', 'criterion'], description: 'log one autonomous decision (no state change)' },
         },
         additionalProperties: false,
@@ -74,8 +84,18 @@ export async function dispatchAutopilotTool(name: string, args: Record<string, u
     const req: AutopilotSetRequest = {
       ...(typeof args.on === 'boolean' ? { on: args.on } : {}),
       ...(typeof args.goal === 'string' ? { goal: args.goal } : {}),
+      ...(typeof args.done_criterion === 'string' ? { doneCriterion: args.done_criterion } : {}),
       ...(typeof args.until === 'string' ? { until: args.until } : {}),
+      ...(args.kind === 'task' || args.kind === 'autopilot' ? { kind: args.kind } : {}),
+      ...(typeof args.deadline === 'string' ? { deadline: args.deadline } : {}),
+      ...(typeof args.priority === 'string' || typeof args.priority === 'number' ? { priority: args.priority } : {}),
       ...(args.hold === true ? { hold: true } : {}),
+      ...(args.goal_done === true ? { goalDone: true } : {}),
+      ...(typeof args.expected_turns === 'number' ? { expectedTurns: args.expected_turns } : {}),
+      ...(typeof args.expected_minutes === 'number' ? { expectedMinutes: args.expected_minutes } : {}),
+      ...(args.done_check !== undefined ? { doneCheck: args.done_check } : {}),
+      ...(args.outcome === 'done' || args.outcome === 'partial' || args.outcome === 'dropped' ? { outcome: args.outcome } : {}),
+      ...(typeof args.reason === 'string' ? { reason: args.reason } : {}),
       ...(args.decided && typeof args.decided === 'object' ? { decided: args.decided as { kind: string; criterion: string } } : {}),
     };
     const result = pilot.set(req, 'tool');

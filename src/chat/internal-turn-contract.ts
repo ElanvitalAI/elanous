@@ -22,6 +22,11 @@ export interface StartTurnIfIdleOptions {
   from?: MessageSource;
   /** Explicit references from the producer, not inferred from turn text or routing metadata. */
   workReferences?: readonly WorkReference[];
+  /**
+   * SEAT-TURN-FOLLOWUPS H4 — this turn is bounded by its owner's own limit (the goal drive: 3 per 30 min), so the gate's
+   * run cap neither refuses it nor counts it (the min-interval rest still applies).
+   */
+  ownLimit?: boolean;
 }
 
 export type StartTurnIfIdleResult =

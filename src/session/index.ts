@@ -355,10 +355,13 @@ export interface SerializedMessage {
   steerJoined?: boolean;
   /** Persisted only for a completed assistant turn; partial/draft text stays private in basic history. */
   replyFinal?: boolean;
+  /** SEAT-REPLY-DELTA-ONLY: the full answer a mail/notice turn wrote before it was folded to its one-line delta
+   *  (`content` holds the folded line the screen and the next turn see). */
+  replyDeltaFull?: string;
   /** A fixed public failure marker persisted after a failed turn; partial reply text stays private. */
   replyFailure?: boolean;
   /** Trusted Next TUI preflight kind; arbitrary provider error text never sets this. */
-  replyFailureKind?: 'codex-auth-missing' | 'codex-auth-failed' | 'glm-auth-missing';
+  replyFailureKind?: 'codex-auth-missing' | 'codex-auth-failed' | 'glm-auth-missing' | 'llm-unset';
   /** Per-turn stable identifier. Auto-populated by `appendMessage` when the
    *  caller omits it (SAM S0 seed · M1.2 narrow). The wire format stays a
    *  bare 26-char ULID; external inputs should pass through `asTurnUri()`
@@ -1741,6 +1744,32 @@ export function getActiveSessionId(): string | null {
 export function setActiveSessionId(id: string): void {
   mkdirSync(dirname(activeFile()), { recursive: true });
   writeFileSync(activeFile(), id, 'utf-8');
+}
+
+// ── 명시 붙기(one-shot) — `session resume <id>` 가 남기고 `--name` TUI 가 한 번 소비한다 ──
+//   ⛔ 전역 `active` 표지는 살아 있는 자리 TUI 가 자기 세션으로 계속 덮어쓴다 — 그것을 `--name` 이
+//   읽으면 새 탭이 «살아 있는 OP 세션»에 붙는다(11-25 실측 be2bc47e). 그래서 이름 있는 TUI 는
+//   이 별도 표지(사람이 방금 고른 것)만 보고, 쓰면 지운다.
+function pendingAttachFile(): string { return join(stateRoot(), 'active-attach.json'); }
+
+/** 명시 붙기 표지의 유효 시간 — 지나면 새 세션으로 간다. */
+export const PENDING_ATTACH_TTL_MS = 10 * 60_000;
+
+export function setPendingAttachSessionId(id: string, now: number = Date.now()): void {
+  mkdirSync(dirname(pendingAttachFile()), { recursive: true });
+  writeFileSync(pendingAttachFile(), JSON.stringify({ id, at: now }), 'utf-8');
+}
+
+/** 읽고 지운다(one-shot). 없거나 낡았거나 깨졌으면 null. */
+export function takePendingAttachSessionId(now: number = Date.now(), ttlMs: number = PENDING_ATTACH_TTL_MS): string | null {
+  const p = pendingAttachFile();
+  if (!existsSync(p)) return null;
+  let parsed: { id?: unknown; at?: unknown } | null = null;
+  try { parsed = JSON.parse(readFileSync(p, 'utf-8')) as { id?: unknown; at?: unknown }; } catch { parsed = null; }
+  try { unlinkSync(p); } catch { /* 이미 소비됨 */ }
+  if (!parsed || typeof parsed.id !== 'string' || !parsed.id.trim() || typeof parsed.at !== 'number') return null;
+  if (now - parsed.at > ttlMs || parsed.at > now + 60_000) return null;
+  return parsed.id.trim();
 }
 
 export function clearActiveSessionId(): void {

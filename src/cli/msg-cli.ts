@@ -1,9 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import { goalSetterRefusal, goalSetterVerdict } from '../session-autopilot/crown-goal-apply.js';
 import type { Command } from 'commander';
 import { Database } from 'bun:sqlite';
 import { formatMessage, registerMsgListCommand } from './msg-list-cli.js';
 import { readUnreadCount } from '../msg/msg-store.js';
 import { registerMsgWaitForCommands } from './msg-wait-for-cli.js';
+import { registerMsgHandCommands } from './msg-hand-cli.js';
+import { registerMsgClearCommand, registerMsgResetCommand } from './msg-clear-cli.js';
 import { registerMsgRequirementCommands } from './msg-requirement-cli.js';
 import { registerMsgReceiptsCommands } from './msg-receipts-cli.js';
 import { existsSync, mkdirSync } from 'node:fs';
@@ -18,12 +21,18 @@ import { SEAT_AGENT_RUNTIMES, type SeatAgentRuntime } from '../loops/seat-regist
 import { MAIL_FALLBACK_MS, runMailFallback, spawnMailFallback } from '../msg/msg-mail-fallback.js';
 import { clearPostOffice, discoverPostOfficeUrl, ensurePostOffice, writePostOffice } from '../msg/msg-post-office.js';
 import { triageMailbox, type TriageRow } from '../msg/inbox-triage.js';
+import { divertedRootForStore, gatePost, storeGateDeps } from '../msg/post-gate.js';
+import { loadFederationLadder } from '../msg/hand-raise-ladder.js';
+import { parseExpiresDuration, postExpiry } from '../msg/directive-expiry.js';
+import { COALESCE_WINDOW_MS, coalesceEligible, OUTBOUND_WINDOW_MS } from '../msg/outbound-coalesce.js';
+import { senderAboveOnLadder } from '../tui/seat-mail-turn-policy.js';
 import { acquireLockSync } from '../storage/file-lock.js';
 import { GitHubMsgMirrorTransport } from '../msg/msg-mirror-github.js';
 import { configuredMirrorTarget, runMsgMirrorTick, type MirrorTarget, type MsgMirrorStateStore, type MsgMirrorTransport } from '../msg/msg-mirror-runner.js';
 import { JsonMsgMirrorStateStore } from '../msg/msg-mirror-state.js';
 import { startMsgSseServer } from '../msg/msg-sse-server.js';
 import { debug } from '../debug/log.js';
+import { ANNOUNCE_KIND, announceRefs, newAnnounceId, normalizeAnnounceId, normalizeAnnounceScope, parseApplyField, recordAnnounceApply } from '../msg/announce.js';
 import { ackDigestInputs, recordAckDigest, type AckDigestInput, type AckDigestPorts } from '../msg/msg-ack-digest.js';
 
 /** OP 승인 #106323(2026-11-19) — TTY 가 아닌데도 닫히지 않는 파이프 stdin(테스트·데몬이 fd 0 을 붙잡은 경우)에
@@ -63,6 +72,10 @@ const directiveDbPath = (): string => join(elanousStateRoot(), 'directives', 'di
 const AGENT_REPLY_ROLES = { COORDINATOR: 'coordinator', GUARDIAN: 'guardian' } as const;
 
 export interface MsgCliDeps {
+  /** MAIL-ANTI-FLOOD F·G side ledgers (default: next to the mail ledger · `<msg dir>/diverted`). */
+  divertedRoot?: string;
+  /** COND-WATCH `--watch` arming seam (default: armMessageFollowUp — commitment ⊕ waker ⊕ detached watcher). */
+  followUp?: typeof import('../msg/msg-follow-up.js').armMessageFollowUp;
   /** 60s eln-mail safety net launcher (default: detached `eln msg mail-fallback` in the live universe only). */
   spawnMailFallback?: (input: { messageId: number; recipient: string; from: string }) => void;
   /** `mail-fallback` sleep seam. */
@@ -129,6 +142,18 @@ export interface MsgCliDeps {
 
 type CommonOptions = { json?: boolean };
 type RecipientOptions = CommonOptions & { to?: string; after?: string; limit?: string; thread?: string };
+
+/**
+ * MSG-WAIT-CONTRACT ① — the envelope threaded onto the recipient's newest unanswered question/decision (or a mail the
+ * recipient waits on). The waker store is read only when there is a candidate (lazy: msg post stays light).
+ */
+function threadedEnvelope<E extends MessageEnvelope>(store: MsgStore, envelope: E, optOut: boolean): E {
+  if (optOut) return envelope;
+  const contract = require('../msg/msg-wait-contract.js') as typeof import('../msg/msg-wait-contract.js');
+  return contract.withAutoReplyTo(store, envelope, {
+    waitedOn: (seatId) => contract.wakerWaitedOn((s) => (require('../msg/self-timer-watch.js') as typeof import('../msg/self-timer-watch.js')).listWakers(s))(seatId),
+  });
+}
 
 function seat(raw: string | undefined, flag: string): string {
   if (raw === undefined) throw new Error(`${flag} is required`);
@@ -529,7 +554,8 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .option('--from <seat>').option('--to <seat>').option('--kind <kind>').option('--body <text>')
     .option('--body-file <path>', 'read the message body from a UTF-8 file; use - for stdin')
     .option('--reject-undeclared', 'reject a recipient that has no routable seat or pane instead of storing it with a warning')
-    .option('--reply-to <id>', 'point this reply at a question message ID')
+    .option('--reply-to <id>', 'point this reply at a question message ID (default: the newest unanswered question/decision from the recipient)')
+    .option('--no-reply-to', 'do not thread this post onto the recipient\'s unanswered question')
     .option('--agent-reply <address>', 'let this address\'s agent body (COORDINATOR · GUARDIAN) answer the saved message once')
     .option('--origin-key <key>', 'deduplicate a channel mirror by coord:<commentId>:<recipient>')
     .option('--intent <kind>', 'message intent: request | decision | info | alert')
@@ -537,11 +563,27 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .option('--deadline <due>', 'deadline: ISO-8601 · local HH:MM (next occurrence) · +<n>m|h from now')
     .option('--done <condition>', 'completion condition (A217 request contract · required with --intent request)')
     .option('--needs-ack', 'mark the message as acknowledgement-required')
+    .option('--needs-reply', 'MAIL-ANTI-FLOOD E: you wait for an answer (default: question · decision)')
+    .option('--no-needs-reply', 'MAIL-ANTI-FLOOD E: no answer expected — the receiver reads it in its digest')
     .option('--crown-directive <id>', 'crown directive ID this message executes')
+    .option('--urgency <level>', 'OP-PULSE: CEO urgency of this crown directive — normal | urgent | all-in (stored as ref urgency:<level>; urgent → 4h burst proposal · all-in → max burst)')
+    .option('--goal <text>', 'set the receiving seat\'s autopilot goal (structured field · OP / CLAUDE-OP or with --crown-directive)')
     .option('--priority <level>', 'priority: urgent(2) | p0(1) | normal(0)')
+    .option('--expires <dur>', 'DIRECTIVE-EXPIRY: lapse after <dur> (30m · 2h · 1d); default by kind — info/notice/status 30m · coord/request 2h · directive 2h')
+    .option('--standing', 'DIRECTIVE-EXPIRY: a standing directive (lapses after 24h)')
+    .option('--no-expiry', 'DIRECTIVE-EXPIRY: never lapses')
+    .option('--no-coalesce', 'OUTBOUND-COALESCE: store a separate row even when an unread mail to the same receiver could take these lines')
+    .option('--retracts <msgId>', 'DIRECTIVE-EXPIRY: this mail withdraws an earlier one (closed now · dropped from the next turn)')
     .option('--no-dedupe', 'store even when the same from/to/body was posted within the dedupe window (default 30 min)')
+    .option('--announce [id]', 'post as a federation announce (kind announce · ref announce:<id>); without an id one is generated')
+    .option('--announce-scope <scope>', 'announce scope: federation | coordinators (default federation)')
+    .option('--apply <line>', 'on a reply to an announce (--reply-to): the «적용:» line — what this seat will do differently')
+    .option('--watch <condition>', 'the OUTCOME you await instead of a reply (pr-merged:<N> · pregate-receipt:<PR>[@head] · cell-status:<id>=green|owner=<seat> · seat-idle:<seat> · file-exists:<path> · mail-from:<seat>) — the commitment closes itself with evidence when it holds; the recipient reads «no reply needed»')
     .option('--json')
-    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; bodyFile?: string; replyTo?: string; originKey?: string; agentReply?: string; rejectUndeclared?: boolean; intent?: string; ref?: string[]; deadline?: string; done?: string; needsAck?: boolean; crownDirective?: string; priority?: string; dedupe?: boolean }) => run(async () => {
+    .action((body: string | undefined, opts: CommonOptions & { watch?: string; from?: string; to?: string; kind?: string; body?: string; bodyFile?: string; replyTo?: string | false; originKey?: string; agentReply?: string; rejectUndeclared?: boolean; intent?: string; ref?: string[]; deadline?: string; done?: string; needsAck?: boolean; needsReply?: boolean; crownDirective?: string; urgency?: string; goal?: string; priority?: string; dedupe?: boolean; announce?: string | boolean; announceScope?: string; apply?: string; expires?: string; standing?: boolean; expiry?: boolean; retracts?: string; coalesce?: boolean }) => run(async () => {
+      // MSG-WAIT-CONTRACT — `--no-reply-to` arrives as replyTo === false (commander negation).
+      const noReplyTo = opts.replyTo === false;
+      const replyToOpt = typeof opts.replyTo === 'string' ? opts.replyTo : undefined;
       const warn = (line: string) => out.error(line);
       // MSG-FILTERS-RELAX: the seat actually running this CLI. `--from` defaults to it; a different `--from` is stored
       // with the caller in origin.seat instead of being refused.
@@ -582,34 +624,87 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         || [positionalBody, opts.body, opts.bodyFile].filter(value => value !== undefined).length > 1)
         throw new Error('provide body once (argument, --body, or --body-file)');
       if (opts.bodyFile === '') throw new Error('--body-file requires a path or - for stdin');
-      const text = opts.bodyFile === undefined
+      // COND-WATCH — parse before storing: a bad condition never leaves a stored message behind.
+      const watchModule = opts.watch === undefined ? null : await import('../commitment/condition-watch.js');
+      const watch = watchModule === null ? null : watchModule.parseWatch(opts.watch!, (deps.cwd ?? (() => process.cwd()))());
+      const rawText = opts.bodyFile === undefined
         ? opts.body ?? positionalBody ?? await readStdin()
         : opts.bodyFile === '-' ? await readStdin() : await readFile(opts.bodyFile, 'utf8');
+      const text = watchModule !== null && watch !== null ? watchModule.withWatchFooter(rawText, watch) : rawText;
       for (const warning of postBodyWarnings(text))
         out.error(`msg post 경고: ${warning} — 본문을 확인하고 다음 보고는 --body-file 또는 stdin 사용`);
       checkCrownDirective(opts.crownDirective, warn);
+      // CROWN-GOAL-APPLY — the goal is a structured field; only a goal setter (or a crown-directive mail) may carry one.
+      if (opts.goal !== undefined && !opts.goal.trim()) throw new Error('--goal needs a nonempty goal line');
+      if (opts.goal !== undefined) {
+        const verdict = goalSetterVerdict({ sender: from, seat: opts.to === undefined ? null : canonicalMessageAddress(opts.to), crownDirective: opts.crownDirective ?? null,
+          ladder: () => (require('../msg/hand-raise-ladder.js') as typeof import('../msg/hand-raise-ladder.js')).loadFederationLadder() });
+        if (!verdict.ok) throw new Error(`--goal: ${goalSetterRefusal(verdict)}`);
+      }
       const priority = cliPriorityLevel(opts.priority, '--priority', warn);
+      // ANNOUNCE-UPTAKE — an announce is kind=announce ⊕ refs announce:<id> · announce-scope:<scope> (default off).
+      const apply = parseApplyField(opts.apply);
+      if (apply !== null && replyToOpt === undefined) throw new Error('--apply needs --reply-to <announce message id>');
+      if (opts.announceScope !== undefined && opts.announce === undefined) throw new Error('--announce-scope needs --announce');
+      if (opts.announce !== undefined && opts.kind !== undefined && opts.kind.trim().toLowerCase() !== ANNOUNCE_KIND)
+        throw new Error('--announce sets kind announce; drop --kind');
+      const announce = opts.announce === undefined ? null : {
+        id: typeof opts.announce === 'string' ? normalizeAnnounceId(opts.announce) : newAnnounceId(text, (deps.now ?? (() => new Date()))()),
+        scope: normalizeAnnounceScope(opts.announceScope) };
+      const urgency = opts.urgency === undefined ? null : (await import('../loops/op-pulse-urgency.js')).parseUrgency(opts.urgency);
+      if (urgency !== null && !opts.crownDirective) throw new Error('--urgency needs --crown-directive (urgency is a field of a CEO line)');
+      const refs = [...(opts.ref ?? []), ...(announce === null ? [] : announceRefs(announce.id, announce.scope)), ...(urgency === null ? [] : [`urgency:${urgency}`])];
+      // DIRECTIVE-EXPIRY (Q5) — expiry by kind ⊕ structured directive fields; flags override. `--retracts` → supersedes.
+      const retracts = opts.retracts === undefined ? undefined : integer(opts.retracts, '--retracts', 0, 1, Number.MAX_SAFE_INTEGER);
+      const expiry = postExpiry({ kind: announce !== null ? ANNOUNCE_KIND : opts.kind ?? null, crownDirective: opts.crownDirective ?? null, goal: opts.goal ?? null,
+        senderAbove: (() => { try { return senderAboveOnLadder(loadFederationLadder(), from, to) === true; } catch { return false; } })(),
+        ...(opts.expires === undefined ? {} : { expires: opts.expires }), ...(opts.standing ? { standing: true } : {}),
+        ...(opts.expiry === false ? { expiry: false } : {}), now: (deps.now ?? (() => new Date()))() });
       const envelope = { from, to, body: text, ...origin,
-        ...(opts.kind === undefined ? {} : { kind: opts.kind }),
-        ...(opts.replyTo === undefined ? {} : { replyTo: integer(opts.replyTo, '--reply-to', 0, 1, Number.MAX_SAFE_INTEGER) }),
+        ...(expiry.expiresAt === undefined ? {} : { expiresAt: expiry.expiresAt }),
+        ...(retracts === undefined ? {} : { supersedes: retracts }),
+        ...(announce !== null ? { kind: ANNOUNCE_KIND } : opts.kind === undefined ? {} : { kind: opts.kind }),
+        ...(replyToOpt === undefined ? {} : { replyTo: integer(replyToOpt, '--reply-to', 0, 1, Number.MAX_SAFE_INTEGER) }),
         ...(priority === undefined ? {} : { priority }),
         ...(opts.intent === undefined ? {} : { intent: opts.intent as MessageEnvelope['intent'] }),
-        ...(opts.ref === undefined || opts.ref.length === 0 ? {} : { refs: opts.ref }),
+        ...(refs.length === 0 ? {} : { refs }),
         ...(deadlineAt === undefined ? {} : { deadlineAt }),
         ...(opts.done === undefined ? {} : { doneWhen: opts.done }),
         ...(opts.needsAck ? { needsAck: true } : {}),
-        ...(opts.crownDirective === undefined ? {} : { crownDirective: opts.crownDirective }) };
+        ...(opts.crownDirective === undefined ? {} : { crownDirective: opts.crownDirective }),
+        ...(opts.goal === undefined ? {} : { goal: opts.goal }) };
       // #38516 r2 MF3: a per-attempt token goes into this INSERT, so recovery after an ambiguous write can name THIS
       // attempt's commit — an older identical row (`--no-dedupe`, or outside the window) never stands in for a send that
       // was not stored. MF4: the `--origin-key` path is idempotent by its provenance key instead (explicit contract:
       // the key names one logical message, so the stored row under it is this message whichever attempt wrote it;
       // the body-hash window does not apply there).
+      // MAIL-ANTI-FLOOD E·F·G — kind ⊕ needsReply (a kind-less post is stored as passive info ⊕ one warning line) · self-mail → scheduled wake ·
+      // coach injection → coach note · a saturated receiver folds non-urgent posts into its digest. A keyed channel
+      // mirror (`--origin-key`) is a programmatic relay: legacy shape, never diverted.
+      let gate: ReturnType<typeof gatePost> | null = null;
+      let coalescedInto: number | null = null;
       const attemptToken = randomUUID();
-      let posted: Message;
+      let stored: Message | null;
       try {
-        posted = withStore(store => opts.originKey === undefined
-          ? store.post(envelope, { dedupe: opts.dedupe !== false, attemptToken })
-          : store.appendWithProvenance(envelope, opts.originKey));
+        stored = withStore(store => {
+          if (opts.originKey !== undefined) return store.appendWithProvenance(envelope, opts.originKey);
+          // G — an order from above on the ladder is never folded (same ladder relation the receiver's router reads).
+          let senderAbove: boolean | undefined;
+          try { senderAbove = senderAboveOnLadder(loadFederationLadder(), envelope.from, envelope.to); } catch { senderAbove = undefined; }
+          // OUTBOUND-COALESCE (H6) — an ordinary order from above joins the sender's still-unread mail to the same receiver (≤10 min).
+          if (opts.coalesce !== false && opts.originKey === undefined && coalesceEligible({ senderAbove: senderAbove === true, kind: envelope.kind ?? null, intent: envelope.intent ?? null, priority: envelope.priority ?? null,
+            crownDirective: envelope.crownDirective ?? null, goal: envelope.goal ?? null, supersedes: envelope.supersedes ?? null, to: envelope.to, ...(replyToOpt === undefined ? {} : { replyTo: 1 }),
+            ...(opts.needsReply === undefined ? {} : { needsReply: opts.needsReply }) })) {
+            const joined = store.coalesceInto(envelope.from, envelope.to, envelope.body, COALESCE_WINDOW_MS, (deps.now ?? (() => new Date()))());
+            if (joined !== null) { coalescedInto = joined.id; return joined; }
+          }
+          gate = gatePost({ envelope, entrance: 'cli', ...(opts.needsReply === undefined ? {} : { needsReply: opts.needsReply }), ...(senderAbove === undefined ? {} : { senderAbove }) },
+            storeGateDeps(store, deps.divertedRoot ?? divertedRootForStore(store.storePath)));
+          if (gate.action !== 'post') return null;
+          Object.assign(envelope, { kind: gate.envelope.kind, needsAck: gate.envelope.needsAck });
+          // MSG-WAIT-CONTRACT ① — thread onto the recipient's newest unanswered question/decision (or a mail it waits on).
+          return store.post(threadedEnvelope(store, envelope, noReplyTo || to === 'TA'), { dedupe: opts.dedupe !== false, attemptToken });
+        });
       } catch (error) {
         // Only an ambiguous STORAGE error (lock / busy / I-O around COMMIT) can hide a commit. A validation refusal
         // (bad origin key, recipient mismatch, unknown group) stored nothing by definition — report it as is.
@@ -624,11 +719,65 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         if (landed === null) throw error;
         debug.log('msg.post', 'recovered-after-error', { msgId: landed.id, from, to, by: opts.originKey === undefined ? 'attempt' : 'origin-key',
           error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
-        posted = landed;
+        stored = landed;
+      }
+      const decided = gate as ReturnType<typeof gatePost> | null;
+      if (decided?.action === 'refuse') throw new Error(decided.error);
+      if (decided?.action === 'divert') {
+        emit({ diverted: decided.ledger, to, kind: decided.shape.kind, needsReply: decided.shape.needsReply, line: decided.line }, opts.json, () => out.log(`msg post: ${decided.line}`));
+        return;
+      }
+      if (decided?.action === 'post' && decided.warning) out.error(decided.warning);
+      if (stored === null) throw new Error('msg post: nothing stored');
+      const posted: Message = stored;
+      // OUTBOUND-COALESCE (H6) — the sender's outbound rate (metric · soft budget read by its own inbox snapshot).
+      try { debug.log('msg.outbound', 'rate', { seat: from, per30m: withStore(store => store.countSentSince(from, new Date(Date.now() - OUTBOUND_WINDOW_MS))) }); } catch { /* metric only */ }
+      if (coalescedInto !== null) {
+        debug.log('msg.post', 'coalesced', { into: coalescedInto, from, to });
+        emit({ ...posted, coalesced: true }, opts.json, () => out.log(`msg post: coalesced into #${coalescedInto} (${to} has not read it yet · one wake)`));
+        return;
+      }
+      if (retracts !== undefined) {
+        // DIRECTIVE-EXPIRY — after the retraction mail is stored: the original's expiry becomes now (a refusal is a warning; the mail stays).
+        try {
+          const closed = withStore(store => store.retract(retracts, from, (deps.now ?? (() => new Date()))()));
+          debug.log('msg.post', 'retracted', { msgId: posted.id, retracts, closed: closed !== null });
+          if (!opts.json) out.log(closed === null ? `retracts #${retracts}: already lapsed` : `retracted #${retracts}`);
+        } catch (error) { out.error(`msg post: #${posted.id} stored; retracting #${retracts} failed: ${error instanceof Error ? error.message : String(error)}`); }
       }
       // The human line names the stored id without echoing the body: a caller that scans the output for an error word
       // must not find it inside its own message (11-18: a report quoting «database is locked» was re-sent 13 times).
-      emit(posted, opts.json, () => out.log(postedLine(posted)));
+      emit(posted, opts.json, () => out.log(`${postedLine(posted)}${announce === null ? '' : ` · announce ${announce.id} (${announce.scope})`}`));
+      // COND-WATCH — arm the outcome watch (after the commit; a failure is a warning with the stored id, never a resend).
+      if (watch !== null) {
+        try {
+          const { armMessageFollowUp } = await import('../msg/msg-follow-up.js');
+          const { formatWaitCondition } = await import('../msg/self-timer-watch.js');
+          const armed = await (deps.followUp ?? armMessageFollowUp)(posted, undefined, undefined, formatWaitCondition(watch));
+          if (!opts.json) out.log(`watch ${armed.condition} · commitment ${armed.commitmentId}${armed.merged ? ' (merged)' : ''}`);
+        } catch (error) { out.error(`msg post: #${posted.id} stored; arming the watch failed: ${error instanceof Error ? error.message : String(error)} (do not resend; arm it with eln msg wait-for)`); }
+      } else {
+        try {
+          const { suggestWatch } = await import('../commitment/condition-watch.js');
+          const hint = suggestWatch({ kind: opts.kind, refs });
+          if (hint) out.error(`msg post: tip — you await an outcome, not a reply: add --watch ${hint}`);
+        } catch { /* a hint is optional */ }
+      }
+      // LEADER-HAND-CONTRACT ① — a free-text HOLD reply to a ✋ is sent but does not close it; say so (and count it).
+      if (posted.replyTo !== undefined) {
+        try {
+          const { holdReplyWarning } = await import('../msg/hand-raise-ladder.js');
+          const warning = withStore(store => holdReplyWarning(store, { from, replyTo: posted.replyTo, body: posted.body, refs: posted.refs ?? [], now: Date.now() }));
+          if (warning) { out.error(`msg post: ${warning}`); debug.log('needhuman', 'hold-reply-warned', { msgId: posted.id, replyTo: posted.replyTo, from }); }
+        } catch { /* a warning is optional */ }
+      }
+      // ANNOUNCE-UPTAKE — the reply's apply field lands as the seat's «applied» event. Fail-open: the reply is stored.
+      if (apply !== null && posted.replyTo !== undefined) {
+        try {
+          const applied = withStore(store => recordAnnounceApply(store.db, { seat: from, messageId: posted.replyTo!, line: apply, viaMessageId: posted.id }));
+          if (applied === null) out.error(`msg post: --apply ignored — #${posted.replyTo} is not an announce`);
+        } catch (error) { out.error(`msg post: #${posted.id} stored; recording the apply line failed: ${error instanceof Error ? error.message : String(error)}`); }
+      }
       // #38516 r2 MF2: TA handling runs after the commit and is separated from it — a TA failure is a warning with the
       // stored id, never exit 2 (exit 2 = «not stored», which makes callers resend). A retry with the same --origin-key
       // stays safe: it finds the stored request and re-drives the pending delivery (provenance + linked reply).
@@ -790,6 +939,11 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
   // ELN-SELF-TIMER-WATCH(I3) — 원장 항목에 묶인 셀프 깨우개: wait-for · wait-tick · wait-list.
   registerMsgWaitForCommands(msg, { out, setExitCode });
   registerMsgRequirementCommands(msg, { out, setExitCode });
+  // HAND-RAISE-LADDER — every ✋ ends in one outcome: hand <msgId> resolve|reject|escalate · sweep · board · list.
+  registerMsgHandCommands(msg, { openStore: open, out, setExitCode, ...(deps.now === undefined ? {} : { now: deps.now }) });
+  // MSG-CLEAR (CEO 11-25) — bulk-ack by filters (receipt · undo) ⊕ reset = delete by seat/space/federation (snapshot · restore).
+  registerMsgClearCommand(msg, { openStore: open, out, setExitCode, ...(deps.now === undefined ? {} : { now: deps.now }) });
+  registerMsgResetCommand(msg, { openStore: open, out, setExitCode, ...(deps.now === undefined ? {} : { now: deps.now }) });
   // SEAT-INBOX B1-C — 영수증 읽기·구독(receipts --follow = 우체국 SSE) ⊕ 명시 영수증(receipt).
   registerMsgReceiptsCommands(msg, { openStore: open, out, setExitCode, ...(deps.now === undefined ? {} : { now: deps.now }),
     ...(deps.signal === undefined ? {} : { signal: deps.signal, handleSignals: false }),
@@ -822,9 +976,14 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
 
   msg.command('ack [id]').description('Acknowledge selected messages; --through acknowledges every message up to and including that ID')
     .option('--to <seat>').option('--id <id>', 'acknowledge exactly one message').option('--ids <ids>', 'acknowledge selected comma-separated IDs').option('--through <id>', 'WARNING: acknowledge ALL messages through this ID, including earlier unread messages')
-    .option('--receipted', 'acknowledge every message that already has an accepted, rejected, done or expired receipt (idempotent)').option('--json')
-    .action((positional: string | undefined, opts: CommonOptions & { to?: string; id?: string; ids?: string; through?: string; receipted?: boolean }) => run(async () => {
+    .option('--receipted', 'acknowledge every message that already has an accepted, rejected, done or expired receipt (idempotent)')
+    .option('--apply <line>', 'with a positional ID / --id / --ids naming an announce: the «적용:» line — what this seat will do differently')
+    .option('--json')
+    .action((positional: string | undefined, opts: CommonOptions & { to?: string; id?: string; ids?: string; through?: string; receipted?: boolean; apply?: string }) => run(async () => {
       const to = messageRecipient(opts.to, '--to');
+      const apply = parseApplyField(opts.apply);
+      if (apply !== null && opts.id === undefined && opts.ids === undefined && positional === undefined)
+        throw new Error('--apply needs the announce message ID (positional, --id or --ids)');
       // MSG-FILTERS-RELAX: a bulk ack (2+ mails) leaves a compact digest — printed and saved as one seat memory entry.
       const digestOf = async (inputs: AckDigestInput[]) => recordAckDigest(to, inputs, {
         ...(deps.saveAckDigest ? { save: deps.saveAckDigest } : {}), ...(deps.now ? { now: deps.now } : {}), warn: line => out.error(line) });
@@ -853,6 +1012,11 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
           // §8 — 손 ack 는 영수증 seen 으로 남는다(accepted 이상은 만들지 않는다). 영수증 실패는 ack 를 바꾸지 않는다.
           for (const id of ids) recordHandSeen(store, to, id);
           inputs = ackDigestInputs(store, to, ids);
+          // ANNOUNCE-UPTAKE — the ack's apply field: the «applied» event for each acked announce (others are reported).
+          if (apply !== null) {
+            const notAnnounce = ids.filter(id => recordAnnounceApply(store.db, { seat: to, messageId: id, line: apply }) === null);
+            if (notAnnounce.length > 0) out.error(`msg ack: --apply ignored for #${notAnnounce.join(' #')} (not an announce)`);
+          }
         });
         const recorded = await digestOf(inputs);
         emit(ids.length === 1 ? { recipient: to, id: ids[0], status: 'acked' } : { recipient: to, ids, status: 'acked', ...digestJson(recorded) }, opts.json, () => out.log(`${to} acknowledged #${ids.join(' #')}`));
@@ -883,6 +1047,21 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         if (registry.status === 'ready' && registry.registry.seats.some(entry => entry.address === to)) count = readUnreadCount(to);
       } catch { /* An unavailable declaration or ledger is unknown, not zero. */ }
       out.log(JSON.stringify({ status: count === null ? 'unknown' : 'ok', count }));
+    })());
+
+  // MSG-NOISE (Q9 · EEMUA 191 daily bad-actor review) — the top sender × kind pairs by volume for the daily rationalisation.
+  msg.command('noise').description('Top 5 sender × kind by message count in a window (daily noise review)')
+    .option('--since <dur>', 'window: 30m · 6h · 24h · 7d (default 24h)', '24h').option('--top <n>', 'rows (default 5)', '5').option('--json')
+    .action((opts: CommonOptions & { since: string; top: string }) => run(() => {
+      const ms = parseExpiresDuration(opts.since);
+      const since = new Date((deps.now ?? (() => new Date()))().getTime() - ms);
+      const top = integer(opts.top, '--top', 5, 1, 100);
+      const rows = withStore(store => store.noiseTop(since, top));
+      emit({ since: since.toISOString(), rows }, opts.json, () => {
+        out.log(`msg noise since ${since.toISOString()} (${opts.since}) — top ${top} sender × kind`);
+        if (rows.length === 0) out.log('  (no messages)');
+        for (const r of rows) out.log(`  ${String(r.count).padStart(5)}  ${r.sender} · ${r.kind}`);
+      });
     })());
 
   msg.command('unread').description('Show recipients with unacknowledged messages')
@@ -1031,14 +1210,23 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       } finally { store.close(); }
     })());
 
-  msg.command('ask <recipient> <question>').description('Post a question and wait for its first reply')
-    .option('--from <seat>', 'asking seat (required)').option('--wait <seconds>', 'seconds to wait for a reply (default 60)', '60')
+  msg.command('ask <recipient> <question>').description('Post a question and wait for its first reply (any later mail from the recipient counts)')
+    .option('--from <seat>', 'asking seat (required)')
+    .option('--within <dur>', 'reply horizon (default 10m): then one reminder to the recipient, 5 more min, then the wait is cancelled with a result')
+    .option('--wait <seconds>', 'short probe wait in seconds (no reminder · no cancel ladder below 10m); overrides --within')
     .option('--agent-reply <address>', 'let this address\'s agent body (COORDINATOR · GUARDIAN) answer before waiting')
     .option('--json')
-    .action((recipient: string, question: string, opts: CommonOptions & { from?: string; wait?: string; agentReply?: string }) => run(async () => {
+    .action((recipient: string, question: string, opts: CommonOptions & { from?: string; wait?: string; within?: string; agentReply?: string }) => run(async () => {
       const from = seat(opts.from, '--from');
       const to = canonicalSeatId(recipient);
-      const waitSeconds = integer(opts.wait, '--wait', 60, 0, 86400);
+      const contract = await import('../msg/msg-wait-contract.js');
+      // MSG-WAIT-CONTRACT ② — default horizon 10m (ceiling stays 86400s). A wait of 10m or more runs the ladder.
+      const windowMs = opts.wait !== undefined ? integer(opts.wait, '--wait', 60, 0, 86400) * 1000
+        : opts.within !== undefined ? (await import('../msg/self-timer-watch.js')).parseDuration(opts.within) : contract.MSG_WAIT_DEFAULT_WITHIN_MS;
+      if (!(windowMs >= 0) || windowMs > 86400_000) throw new Error('--within must be between 0 and 24h');
+      const waitSeconds = Math.round(windowMs / 1000);
+      const ladderOn = windowMs >= contract.MSG_WAIT_DEFAULT_WITHIN_MS;
+      const nowMs = () => (deps.now ?? (() => new Date()))().getTime();
       const agentAddress = agentReplyAddress(opts.agentReply);
       if (agentAddress !== null) requireAgentTarget(agentAddress, to);
       const interrupt = deps.signal === undefined ? new AbortController() : undefined;
@@ -1050,18 +1238,39 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       }
       let store: MsgStore | undefined;
       try {
-        const asked = withStore(ledger => ledger.post({ from, to, body: question }));
+        const askedAt = nowMs();
+        const asked = withStore(ledger => ledger.post({ from, to, body: question, kind: 'question',
+          ...(ladderOn ? { refs: [contract.waitUntilRef(askedAt + windowMs)] } : {}) }));
         emit(asked, opts.json, () => out.log(`#${asked.id}`));
         // msg ask uses the same saved-message handler before waiting for its linked reply.
         await handleTaMessage(asked);
         // 사람 없는 live 대화: 답할 몸이 있으면 «기다리기 전»에 답을 원장에 남긴다 — 같은 대기 루프가 그 답을 집는다.
         if (agentAddress !== null) await autoReply(agentAddress, asked, opts.json);
-        const deadline = Date.now() + waitSeconds * 1000;
         let reply: Message | undefined;
         store = open();
+        // HAND-RAISE-LADDER — a ✋ to the asking seat ends the wait early: a coordinator is never deaf while it waits.
+        const { handArrivedAfter, handPreemptLine, loadFederationLadder } = await import('../msg/hand-raise-ladder.js');
+        const parentOf = ladderOn ? (() => { try { return loadFederationLadder().parentOf; } catch { return undefined; } })() : undefined;
+        const hardStop = askedAt + windowMs + (ladderOn ? contract.MSG_WAIT_RETRY_GRACE_MS : 0);
         do {
+          // MSG-WAIT-CONTRACT — a linked reply, or ANY later mail from the recipient (sender match, logged).
+          // Any linked reply first (the agent-reply body answers under its own address), as before.
           reply = store.listReplies(asked.id, 1)[0];
-          if (reply !== undefined || signal.aborted || Date.now() >= deadline) break;
+          if (reply === undefined && ladderOn) {
+            const step = contract.advanceWait(store, { messageId: asked.id, asker: from, counterpart: to, startedAtMs: askedAt, withinMs: windowMs, now: nowMs(), logMatch: true, ...(parentOf ? { parentOf } : {}) });
+            if (step.state === 'answered') reply = step.match.reply;
+            else if (step.state === 'retried') out.error(`msg ask: no reply to #${asked.id} in ${Math.round(windowMs / 60_000)}m — reminder #${step.mailId} sent to ${to}; waiting ${contract.MSG_WAIT_RETRY_GRACE_MS / 60_000} more min`);
+            else if (step.state === 'cancelled') {
+              emit({ cancelled: true, question: asked.id, result: step.cancel.result, notice: step.cancel.noticeId, coordinator: step.cancel.coordinator }, opts.json,
+                () => out.log(`#${asked.id} wait cancelled: ${step.cancel.result}`));
+              return;
+            }
+          } else if (reply === undefined) reply = contract.replyMatchLogged(store, { id: asked.id, from, to })?.reply;
+          if (reply === undefined) {
+            const hand = handArrivedAfter(store, from, asked.id);
+            if (hand) { emit({ preempted: true, question: asked.id, hand: hand.id, line: handPreemptLine(hand) }, opts.json, () => out.log(handPreemptLine(hand))); return; }
+          }
+          if (reply !== undefined || signal.aborted || nowMs() >= hardStop) break;
           await sleep(1000);
         } while (true);
         if (reply === undefined && signal.aborted) throw new Error(`ask interrupted after posting #${asked.id}`);

@@ -316,18 +316,18 @@ test('FATAL-REPORT-AUTO: a failed crash send retries after connectivity recovers
 
 test('first-run notice line names identity fields only when identity reporting is on', async () => {
   const { errorReportNoticeLine } = await import('./report.js');
-  expect(errorReportNoticeLine(undefined)).toContain('익명 진단을');
-  expect(errorReportNoticeLine({ identity: false, email: 'a@b.c' })).toContain('익명 진단을');
-  expect(errorReportNoticeLine({ identity: true, email: 'a@b.c' })).toContain('설정된 신원(이메일)을');
-  expect(errorReportNoticeLine({ identity: true, email: 'a@b.c', telegramUser: 'u' })).toContain('설정된 신원(이메일·텔레그램 사용자)을');
+  expect(errorReportNoticeLine(undefined)).toContain('an anonymous diagnostic');
+  expect(errorReportNoticeLine({ identity: false, email: 'a@b.c' })).toContain('an anonymous diagnostic');
+  expect(errorReportNoticeLine({ identity: true, email: 'a@b.c' })).toContain('configured identity (email)');
+  expect(errorReportNoticeLine({ identity: true, email: 'a@b.c', telegramUser: 'u' })).toContain('configured identity (email · Telegram user)');
   // identity on but no field set: the report carries none, so the notice says anonymous.
-  expect(errorReportNoticeLine({ identity: true })).toContain('익명 진단을');
+  expect(errorReportNoticeLine({ identity: true })).toContain('an anonymous diagnostic');
   for (const settings of [{ identity: true }, { identity: true, email: 'a@b.c' }, { identity: false, email: 'a@b.c', telegramUser: 'u' }, { identity: true, email: 'a@b.c', telegramUser: 'u' }]) {
     const report = buildErrorReport({ code: 'c', message: 'm', surface: 'cli' }, { installId: 'i', settings: { enabled: true, ...settings }, nexus: { alive: false }, at: new Date(0).toISOString() }) as unknown as Record<string, unknown>;
     const line = errorReportNoticeLine(settings);
     const sentFields = ['email', 'telegramUser'].filter((field) => JSON.stringify(report).includes(`"${field}"`));
-    expect(line.includes('익명 진단을')).toBe(sentFields.length === 0);
-    if ('email' in settings) expect(line.includes('이메일')).toBe(sentFields.includes('email'));
-    if ('telegramUser' in settings) expect(line.includes('텔레그램 사용자')).toBe(sentFields.includes('telegramUser'));
+    expect(line.includes('an anonymous diagnostic')).toBe(sentFields.length === 0);
+    if ('email' in settings) expect(line.includes('email')).toBe(sentFields.includes('email'));
+    if ('telegramUser' in settings) expect(line.includes('Telegram user')).toBe(sentFields.includes('telegramUser'));
   }
 });

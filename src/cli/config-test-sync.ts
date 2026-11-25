@@ -44,6 +44,31 @@ export const TEST_SYNC_AUX_FILES: readonly string[] = [
   'policy/llm.yaml',
 ];
 
+/** VISION-CATALOG-BUILTIN (대표 11-25) — 모델 «사실» 캐시(자격 0 · 공개 메타데이터). config 처럼 시험 우주로 옮긴다.
+ *  🩸 종전엔 옮기지 않아 `--test` 우주에서 OpenRouter opus-5.5 가 text-only 로 읽혔다(이미지가 자리표시로 바뀜).
+ *  config 와 달리 «캐시»라 매 기동 때 맞춘다: 시험 쪽이 없거나 운영 쪽이 더 새로우면 복사한다. */
+export const TEST_SYNC_MODEL_FACT_CACHES: readonly string[] = [
+  'discovery-snapshot.json',
+  'openrouter-vision-cache.json',
+];
+
+/** 모델 사실 캐시를 시험 우주로 맞춘다. 반환 = 복사한 파일 이름. 실패는 조용히 건너뛴다(캐시일 뿐 — 없으면 «모른다»). */
+export function syncTestModelFactCaches(testDir: string, srcDir: string = prodConfigDir()): string[] {
+  const copied: string[] = [];
+  for (const f of TEST_SYNC_MODEL_FACT_CACHES) {
+    const from = join(srcDir, f);
+    const to = join(testDir, f);
+    try {
+      if (!existsSync(from)) continue;
+      if (existsSync(to) && statSync(to).mtimeMs >= statSync(from).mtimeMs) continue;
+      mkdirSync(dirname(to), { recursive: true });
+      copyFileSync(from, to);
+      copied.push(f);
+    } catch { /* 캐시 복사 실패 = 시험 우주는 내장 표·조회로 간다 */ }
+  }
+  return copied;
+}
+
 /** 의도적 제외 (복사 금지 — 이유 명시. 목록 변경 시 반드시 사유와 함께). */
 export const TEST_SYNC_EXCLUDED: ReadonlyArray<{ file: string; reason: string }> = [
   { file: 'auth.json', reason: '운영 OAuth 자격은 시험 우주에 복사하지 않는다' },

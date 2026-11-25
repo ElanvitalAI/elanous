@@ -40,19 +40,39 @@ interface WakeupTurnGate {
 
 export const SCHEDULE_WAKEUP_TOOL_NAME = 'ScheduleWakeup';
 export const WAKEUP_MIN_DELAY_MS = 60_000;
-export const WAKEUP_MAX_ENTRIES = 5;
+/** 대기 깨움 슬롯 — SEAT-QUEUE-CAPACITY(CEO 11-25): 5 → 20 · 조율 자리는 20+ 약속을 동시에 쥔다. */
+export const WAKEUP_MAX_ENTRIES = 20;
 export const WAKEUP_REPEAT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const WAKEUP_RETRY_DELAY_MS = 60_000;
 /** 바쁨(NotIdle)·사람 입력 중(HumanTyping)으로 못 연 깨움을 «버리지 않고» 미루는 상한 — 첫 예정 시각부터.
  *  TUI-WAKEUP-DEFER-NOT-DROP(10-22 OPT w7: 02:38·02:39 NotIdle → dropped · codex 는 idle 때 골을 이어가고 바쁘면 미룬다).
  *  상한을 넘겨도 여전히 버리지 않는다(OP #88346): «턴 끝 배출» 대기 큐 + 마운트 배출 · fired 사건에 delaySec. */
+/** RAIL30 ④ — a one-shot wake overdue by more than this at restore is dropped (one digest line), not replayed. */
+export const WAKEUP_RESTORE_DROP_AFTER_MS = 2 * 60 * 60_000;
 export const WAKEUP_DEFER_MAX_MS = 30 * 60_000;
+/** WAKE-FOLD-IDEMPOTENT (OP 11-25 19:43 · retro #40133): a one-shot refused NotIdle this long past due is no longer
+ *  re-scheduled — it (with every other one-shot this late) is delivered once as a notice on the next turn's inbox. */
+export const WAKEUP_BUSY_DELIVER_MS = 10 * 60_000;
+/**
+ * SEAT-TURN-FOLLOWUPS H3 — a refused wake backs off (5 s · 10 s · 20 s · 40 s · 60 s cap per entry) instead of retrying hot:
+ * OP measured 149 wake retry refusals in 9 min. Reset when the wake fires.
+ */
+export const WAKE_REFUSAL_BACKOFF_BASE_MS = 5_000;
+/** SEAT-TURN-FOLLOWUPS H3 — two wakes with the same cause (reason) inside this window open one turn (the 30-min check opened twice). */
+export const WAKE_SAME_CAUSE_WINDOW_MS = 10 * 60_000;
+export function wakeRefusalBackoffMs(refusals: number): number {
+  return Math.min(WAKEUP_RETRY_DELAY_MS, WAKE_REFUSAL_BACKOFF_BASE_MS * 2 ** Math.max(0, refusals - 1));
+}
+const wakeCauseKey = (reason: string): string => reason.trim().replace(/\s+/gu, ' ').toLowerCase();
 /** 미룸 대상인 거부 이유 — 곧 풀리는 «지금 바쁨» 뿐이다(Disabled·Cap·Superseded 는 미뤄도 안 풀린다). */
 const WAKEUP_DEFERRABLE_REASONS: ReadonlySet<string> = new Set(['NotIdle', 'HumanTyping']);
 /** 일회성 지연의 상한 — 반복 TTL 과 같은 7일(그보다 먼 일은 cron `schedule_manage` 몫). */
 export const WAKEUP_MAX_DELAY_MS = WAKEUP_REPEAT_TTL_MS;
-/** 한 턴 안 schedule·cancel 호출 합계 상한 — 넘으면 «다음 턴에» 로 거부(예약·취소 고리 차단). */
-export const WAKEUP_MAX_CALLS_PER_TURN = 6;
+/** 한 턴 안 schedule·cancel 호출 합계 상한 — 넘으면 «다음 턴에» 로 거부(예약·취소 고리 차단).
+ *  SEAT-QUEUE-CAPACITY(CEO 11-25): 6 → 12 — 슬롯 20 을 몇 턴에 채울 수 있게 · 고리 차단은 그대로(13번째부터 거부). */
+export const WAKEUP_MAX_CALLS_PER_TURN = 12;
+/** 상한 거부 때 함께 돌려주는 «가장 오래된 예약» 수 — 모델이 바로 cancel 할 id 목록. */
+export const WAKEUP_REFUSAL_OLDEST = 5;
 /** 반복 간격이 틀렸을 때의 거부 문구 — 일회성으로 가는 길을 같이 준다(«하지 마라»만 주면 재시도 고리가 돈다). */
 export const WAKEUP_REPEAT_INVALID_ERROR =
   'repeatMinutes 는 반복 간격(분 · 1 이상)이다 — 한 번만 깨우려면 repeatMinutes 를 빼거나 0 으로 두고 delaySeconds 또는 at 만 줘라';
@@ -84,6 +104,17 @@ export interface WakeupEntry {
   /** 이 예약이 마지막으로 연 내부 턴 id(직전 회차 진행 판정용). */
   lastTurnId?: string;
   fireCount: number;
+  /** WAKE-FOLD-IDEMPOTENT — present only on a fold bundle: every original wake it carries, reason in full. A bundle is
+   *  never folded again (later stale wakes are merged into it). */
+  bundle?: WakeupBundleItem[];
+}
+
+export interface WakeupBundleItem { id: string; dueAt: number; reason: string }
+
+function isBundleItem(value: unknown): value is WakeupBundleItem {
+  if (!value || typeof value !== 'object') return false;
+  const b = value as Partial<WakeupBundleItem>;
+  return typeof b.id === 'string' && typeof b.reason === 'string' && typeof b.dueAt === 'number' && Number.isFinite(b.dueAt);
 }
 
 /** 재기동 복원(OP O2)용 영속 인터페이스 — 실물은 이 TUI 세션의 JSON 파일 1개.
@@ -120,7 +151,8 @@ function isWakeupEntry(value: unknown): value is WakeupEntry {
     && (e.repeatMs === undefined || (typeof e.repeatMs === 'number' && Number.isFinite(e.repeatMs) && e.repeatMs >= WAKEUP_MIN_DELAY_MS))
     && (e.fireCount === undefined || (typeof e.fireCount === 'number' && Number.isFinite(e.fireCount) && e.fireCount >= 0))
     && (e.retried === undefined || typeof e.retried === 'boolean')
-    && (e.expiresAt === undefined || (typeof e.expiresAt === 'number' && Number.isFinite(e.expiresAt)));
+    && (e.expiresAt === undefined || (typeof e.expiresAt === 'number' && Number.isFinite(e.expiresAt)))
+    && (e.bundle === undefined || (Array.isArray(e.bundle) && e.bundle.every(isBundleItem)));
 }
 
 class WakeupFileUnreadable extends Error {
@@ -224,6 +256,11 @@ export interface WakeupSchedulerDeps {
   maxCallsPerTurn?: number;
   /** 세션 파일 영속. 없으면 메모리만(재기동 복원 없음). */
   persist?: WakeupPersistence;
+  /** RAIL30 ④ — restore drops one-shots overdue by more than this (default {@link WAKEUP_RESTORE_DROP_AFTER_MS} · sims pass Infinity for the old rule). */
+  restoreDropAfterMs?: number;
+  /** WAKE-FOLD-IDEMPOTENT ③ — append a notice to the next turn's inbox (a queued notice rides the next turn even while
+   *  the seat is busy). true = accepted. Absent = the old path (keep re-trying through the door). */
+  deliverQueued?: (text: string, meta: { ids: string[]; count: number }) => boolean;
 }
 
 export type ScheduleWakeupRequest = {
@@ -238,8 +275,10 @@ export type ScheduleWakeupRequest = {
 };
 
 export type ScheduleWakeupResult =
-  | { ok: true; entry: WakeupEntry }
-  | { ok: false; error: string };
+  /** merged = 같은 reason 의 기존 예약 id(새로 만들지 않고 시각만 옮겼다) · folded = 상한 회수로 접은 늦은 예약 묶음. */
+  | { ok: true; entry: WakeupEntry; merged?: string; folded?: { id: string; count: number } }
+  /** code 'cap' = 예약 상한 — oldest = 가장 오래된 예약(먼저 cancel 할 후보). */
+  | { ok: false; error: string; code?: 'cap'; oldest?: WakeupEntry[] };
 
 export type CancelWakeupResult = { ok: true } | { ok: false; error: string; capped?: boolean };
 
@@ -300,6 +339,20 @@ import { emitTurnLife } from '../../debug/turn-life.js';
 export function formatWakeupPrompt(entry: Pick<WakeupEntry, 'id' | 'reason' | 'repeatMs'>): string {
   const repeat = entry.repeatMs ? ` · 반복 ${Math.round(entry.repeatMs / 60_000)}분` : '';
   return `[예약 깨움 ${entry.id}${repeat}] ${entry.reason} — 스스로 예약한 점검 시각이다. 남은 일을 이어서 처리하라.`;
+}
+
+/** Every original wake an entry carries — a bundle's items, else the entry itself. */
+function wakeItems(e: Pick<WakeupEntry, 'id' | 'dueAt' | 'reason' | 'bundle'>): WakeupBundleItem[] {
+  return e.bundle ? e.bundle.map(b => ({ ...b })) : [{ id: e.id, dueAt: e.dueAt, reason: e.reason }];
+}
+
+/** One delivery text for several past-due wakes — every reason in full, never truncated. */
+export function formatWakeupDigest(items: readonly WakeupBundleItem[], via: 'turn' | 'turn-inbox'): string {
+  const head = via === 'turn-inbox'
+    ? `[예약 깨움 묶음 · ${items.length}건 · 바쁜 턴 동안 시각이 지나 다음 턴에 배달]`
+    : `[예약 깨움 묶음 · ${items.length}건 · 시각 지난 예약을 한 번에 배달]`;
+  return `${head} 스스로 예약한 점검들이다 — 이미 처리한 것은 건너뛰고 남은 것만 이어라:\n`
+    + items.map(i => `- ${i.id}@${formatWakeupClock(i.dueAt)} ${i.reason}`).join('\n');
 }
 
 export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupScheduler {
@@ -450,6 +503,9 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
 	    }, 0);
 	  };
 
+	  /** H3 — consecutive refusals per wake id · when a cause last opened a turn (and by which id). */
+	  const refusalsById = new Map<string, number>();
+	  const lastFiredByCause = new Map<string, { id: string; at: number }>();
 	  const fireBody = (id: string, entry: WakeupEntry): void => {
     const t = now();
     if (entry.expiresAt !== undefined && t > entry.expiresAt) {
@@ -462,6 +518,14 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
       advance(entry, t);
       return;
     }
+    // SEAT-TURN-FOLLOWUPS H3 — another wake with the same cause just opened a turn: this one rides it (no second turn).
+    const sameCause = lastFiredByCause.get(wakeCauseKey(entry.reason));
+    if (sameCause && sameCause.id !== id && t - sameCause.at < WAKE_SAME_CAUSE_WINDOW_MS) {
+      log('tui.wakeup', 'skipped', { id, reason: 'same-cause', firedBy: sameCause.id, agoSec: Math.round((t - sameCause.at) / 1000) });
+      refusalsById.delete(id);
+      advance(entry, t);
+      return;
+    }
     // OBSERVE-TURN-EVENT-LIFECYCLE — 예약 시각 도래(busy 여부·거부 사유는 문이 판정한다).
     try { turnLifeLog('turn-life:event-arrived', { source: 'scheduled', wakeupId: id, arrivedAt: t }); } catch { /* observability is fail-open */ }
     // R1(C4) — 원천 어댑터: 도래를 버스 항목으로도 낸다(source 'wakeup' · dedupeKey wakeup:<id>:<fireCount>).
@@ -469,13 +533,20 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     // duplicate 는 정상이다(같은 회차를 마운트 배출·버스가 다시 낼 때) — 무시한다.
     publish({ id: `wakeup-${id}-${entry.fireCount}`, source: 'wakeup', dedupeKey: `wakeup:${id}:${entry.fireCount}`,
       arrivedAt: t, deliverBy: entry.dueAt + (entry.repeatMs ?? WAKEUP_DEFER_MAX_MS), text: formatWakeupPrompt(entry) });
+    // WAKE-FOLD-IDEMPOTENT ① — a past-due one-shot opening at an idle boundary carries every other past-due one-shot
+    // with it: one turn, every reason in full (never 29 turns, never a re-scheduled bundle).
+    const companions = entry.repeatMs ? [] : overdueOneShots(t, 0).filter(e => e.id !== id);
+    const deliveredItems = entry.repeatMs ? [] : [entry, ...companions].flatMap(wakeItems);
+    const prompt = companions.length > 0 || entry.bundle ? formatWakeupDigest(deliveredItems, 'turn') : formatWakeupPrompt(entry);
     let result: StartTurnIfIdleResult;
     try {
-      result = deps.startTurnIfIdle(formatWakeupPrompt(entry), { origin: 'scheduled', reason: entry.reason });
+      result = deps.startTurnIfIdle(prompt, { origin: 'scheduled', reason: entry.reason });
     } catch (error) {
       result = { opened: false, reason: 'NotIdle', detail: `threw:${String(error)}` };
     }
     if (result.opened) {
+      refusalsById.delete(id);
+      lastFiredByCause.set(wakeCauseKey(entry.reason), { id, at: t });
       entry.lastTurnId = result.turnId;
       entry.fireCount += 1;
       queuedForTurnEnd.delete(id); // 두 번 배출 없음 — 발화됐으니 대기 큐에서 뺀다
@@ -483,6 +554,11 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
         id, turnId: result.turnId, reason: entry.reason, retried: entry.retried, repeat: !!entry.repeatMs,
         delaySec: Math.max(0, Math.round((t - entry.dueAt) / 1000)), // 늦게 깬 시간(지연 초) — 첫 예정부터 실제 발화까지(OP #88346)
       });
+      // A lone one-shot keeps its `fired` line as the delivery record; a digest adds one `delivered` line with its count.
+      if (!entry.repeatMs && deliveredItems.length > 1) {
+        for (const c of companions) removeQuiet(c.id);
+        log('tui.wakeup', 'delivered', { via: 'turn', turnId: result.turnId, count: deliveredItems.length, entries: 1 + companions.length, ids: deliveredItems.map(i => i.id) });
+      }
       advance(entry, t);
       return;
     }
@@ -493,12 +569,18 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     const pacedAt = !result.opened && result.reason === 'Cap' && result.retryAt !== undefined ? result.retryAt : null;
     const deferrable = WAKEUP_DEFERRABLE_REASONS.has(result.reason) || pacedAt !== null;
     if (deferrable) {
+      // WAKE-FOLD-IDEMPOTENT ③ — busy for WAKEUP_BUSY_DELIVER_MS past due: stop re-scheduling; hand this one-shot (and
+      // every other one-shot as late) to the next turn's inbox as one notice. A refused hand-off keeps the old path.
+      if (!entry.repeatMs && deps.deliverQueued && t - entry.dueAt >= WAKEUP_BUSY_DELIVER_MS && deliverToInbox(t)) return;
       // 바쁨·사람 입력 중 — 버리지 않는다(ELN-SEAT-WAKEUP-SCHEDULE-FAIL · OP #88346): 이 발화를 «턴 끝 배출»
       // 대기 큐에 싣는다(Map — 같은 예약 id 두 번은 하나로). 배출 시점 = wrapPort 의 입력칸 마운트(턴 끝 ·
       // idle) — agent-wake 의 idle 감시와 같은 길. 소실 0.
       const announced = queuedForTurnEnd.get(id) ?? false;
       queuedForTurnEnd.set(id, announced);
-      const delay = pacedAt !== null ? Math.max(0, pacedAt - t) : WAKEUP_RETRY_DELAY_MS;
+      const refusals = (refusalsById.get(id) ?? 0) + 1;
+      refusalsById.set(id, refusals);
+      // H3 — never a hot retry: a paced «retryAt» is honoured but floored by this entry's refusal back-off.
+      const delay = pacedAt !== null ? Math.max(pacedAt - t, wakeRefusalBackoffMs(refusals)) : WAKEUP_RETRY_DELAY_MS;
       const nextTry = t + delay;
       // 상한 시각의 시도까지는 한다(<=) · 반복은 다음 회차 시각과 겹치면 그 회차에 넘긴다(<).
       const withinDeferCap = nextTry <= entry.dueAt + WAKEUP_DEFER_MAX_MS;
@@ -518,6 +600,14 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
         log('tui.wakeup', 'queued', { id, reason: result.reason, next: 'turn-end' });
         deps.notify?.(`⏰ 예약 깨움 대기(${id}): ${entry.reason} — ${result.reason} · 턴이 끝나면 즉시 깨운다`);
         queuedForTurnEnd.set(id, true); // «대기» 고지는 구간마다 한 번(발화·취소·회차 진행 때 큐가 비워진다)
+      }
+      // WAKE-CAP-RECLAIM (OP 11-25 12:0x): next TUI 는 wrapPort(마운트 배출)를 잇지 않는다 — 바쁜 자리에선 늦은 일회성이
+      // 30분 흐린 재청마다 또 NotIdle 로 거부돼 몇 시간씩 쌓였다(OP 32건 · 최장 5.4시간 · fireCount 0). 버스 소비자는
+      // `:late` 항목만 연다 — 소진 경로뿐 아니라 이 미룸 상한 경로의 일회성도 `:late` 로 내 idle 경계에서 배출되게 한다
+      // (같은 dedupeKey 는 버스가 접는다 · 반복은 advance 가 다음 회차로 넘긴다).
+      if (!entry.repeatMs) {
+        publish({ id: `wakeup-${id}-${entry.fireCount}-late`, source: 'wakeup', dedupeKey: `wakeup:${id}:${entry.fireCount}:late`,
+          arrivedAt: t, deliverBy: entry.dueAt + WAKEUP_DEFER_MAX_MS, text: formatWakeupPrompt(entry) });
       }
       const safetyDelay = pacedAt !== null ? Math.max(WAKEUP_DEFER_MAX_MS, pacedAt - t) : WAKEUP_DEFER_MAX_MS;
       timers.set(id, setTimer(() => fire(id), safetyDelay));
@@ -552,6 +642,74 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     timers.set(id, setTimer(() => fire(id), WAKEUP_DEFER_MAX_MS));
   };
 
+  /** WAKE-CAP-RECLAIM (OP 11-25 12:0x) — 미룸 창(첫 예정 + 30분)까지 지난 일회성 = «묵은 늦은 예약». 오래된 순.
+   *  WAKE-FOLD-IDEMPOTENT ① — a bundle is never stale-folded again (that re-wrap ate OP's wakes every 30 s at 19:43). */
+  const staleOverdue = (t: number): WakeupEntry[] =>
+    [...entries.values()].filter(e => !e.repeatMs && !e.bundle && e.dueAt + WAKEUP_DEFER_MAX_MS <= t).sort((a, b) => a.dueAt - b.dueAt);
+
+  /** One-shots (bundles included) at least `lateMs` past due, oldest first. */
+  const overdueOneShots = (t: number, lateMs: number): WakeupEntry[] =>
+    [...entries.values()].filter(e => !e.repeatMs && e.dueAt + lateMs <= t).sort((a, b) => a.dueAt - b.dueAt);
+
+  /** Remove one entry without saving (the caller saves once). */
+  const removeQuiet = (id: string): void => {
+    const handle = timers.get(id);
+    if (handle !== undefined) clearTimer(handle);
+    timers.delete(id);
+    entries.delete(id);
+    queuedForTurnEnd.delete(id);
+    refusalsById.delete(id);
+  };
+
+  /** WAKE-FOLD-IDEMPOTENT ③ — once any one-shot is WAKEUP_BUSY_DELIVER_MS late, every past-due one-shot goes to the next turn's inbox as ONE notice
+   *  (each original reason in full). Removed only once the inbox accepted it; false = nothing delivered. */
+  const deliverToInbox = (t: number): boolean => {
+    if (!deps.deliverQueued) return false;
+    // Triggered by the oldest wake reaching the busy limit; carries every past-due one-shot so they arrive as one notice.
+    if (overdueOneShots(t, WAKEUP_BUSY_DELIVER_MS).length === 0) return false;
+    const due = overdueOneShots(t, 0);
+    const items = due.flatMap(wakeItems).sort((a, b) => a.dueAt - b.dueAt);
+    let accepted = false;
+    try { accepted = deps.deliverQueued(formatWakeupDigest(items, 'turn-inbox'), { ids: items.map(i => i.id), count: items.length }); }
+    catch (error) { log('tui.wakeup', 'deliver-failed', { error: String(error), count: items.length }); return false; }
+    if (!accepted) { log('tui.wakeup', 'deliver-failed', { error: 'inbox-refused', count: items.length }); return false; }
+    for (const e of due) removeQuiet(e.id);
+    persistBestEffort();
+    log('tui.wakeup', 'delivered', { via: 'turn-inbox', count: items.length, entries: due.length, ids: items.map(i => i.id), oldestLateSec: Math.max(0, Math.round((t - items[0]!.dueAt) / 1000)) });
+    deps.notify?.(`⏰ 늦은 예약 ${items.length}건을 다음 턴 받은편지함에 한 묶음으로 넣었다(바쁜 턴 ${Math.round(WAKEUP_BUSY_DELIVER_MS / 60_000)}분 초과)`);
+    return true;
+  };
+
+  /** 묵은 늦은 예약을 «늦은 예약 N건 묶음» 일회성 하나로 접는다 — 소실 0(각 id·시각·reason 을 전부 싣는다 · 자르지 않는다) ⊕ 슬롯 회수.
+   *  WAKE-FOLD-IDEMPOTENT ①: 묶음이 이미 있으면 새 묶음으로 감싸지 않고 그 묶음에 합친다(멱등 · 묶음 id 그대로). 접을 게 없으면 null.
+   *  저장은 호출자 몫. */
+  const foldStale = (t: number, why: 'restore' | 'cap'): { id: string; count: number } | null => {
+    const stale = staleOverdue(t);
+    const existing = [...entries.values()].find(e => e.bundle);
+    if (stale.length === 0 || (!existing && stale.length < 2)) return null;
+    for (const e of stale) removeQuiet(e.id);
+    const label = why === 'restore' ? '재기동 복원' : '상한 회수';
+    const seen = new Set<string>();
+    const items = [...(existing?.bundle ?? []), ...stale.flatMap(wakeItems)]
+      .filter(i => (seen.has(i.id) ? false : (seen.add(i.id), true)))
+      .sort((a, b) => a.dueAt - b.dueAt);
+    const reason = `늦은 예약 ${items.length}건 묶음(${label}) — 이미 처리한 것은 건너뛰고 남은 것만 이어라: `
+      + items.map(i => `${i.id}@${formatWakeupClock(i.dueAt)} ${i.reason}`).join(' · ');
+    if (existing) {
+      existing.bundle = items;
+      existing.reason = reason;
+      log('tui.wakeup', 'folded', { id: existing.id, why, into: 'existing', added: stale.length, count: items.length, ids: stale.map(e => e.id) });
+      return { id: existing.id, count: items.length };
+    }
+    // The bundle is due now (not at the oldest item's time) so it is delivered at the next boundary, never «stale» itself.
+    const folded: WakeupEntry = { id: `w${++seq}`, reason, dueAt: t, retried: false, fireCount: 0, bundle: items };
+    entries.set(folded.id, folded);
+    arm(folded);
+    log('tui.wakeup', 'folded', { id: folded.id, why, count: stale.length, ids: stale.map(e => e.id), oldestLateSec: Math.max(0, Math.round((t - stale[0]!.dueAt) / 1000)) });
+    deps.notify?.(`⏰ 늦은 예약 ${stale.length}건을 한 깨움(${folded.id})으로 묶었다 — ${label}`);
+    return { id: folded.id, count: stale.length };
+  };
+
   // 재기동 복원(OP O2): persist 가 있으면 이전 예약을 되살린다. 만료(expiresAt 경과)와
   // 기한이 지난 일회성은 폐기+log. 반복만 advance 의 coalescing 으로 다음 회차에 재무장한다.
   // 루프 안의 advance 는 저장하지 않는다 — 아직 안 읽은 뒤 항목이 파일에서 빠지지 않게, 전체를 메모리에
@@ -575,6 +733,19 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
       entries.set(entry.id, entry);
     }
     const t = now();
+    // RAIL30 ④ (11-25 JUD 16:5x 가 00:01·05:23 깨움을 재생) — 2 h 넘게 지난 일회성은 재기동에서 되살리지 않는다.
+    // 그 사이 세상이 바뀌었다: 한 줄 «dropped n stale wakes» 만 남기고 버린다(반복 예약은 advance 가 다음 회차로 잇는다).
+    if (!writeRefused) {
+      const dropped = [...entries.values()].filter(e => !e.repeatMs && e.dueAt + (deps.restoreDropAfterMs ?? WAKEUP_RESTORE_DROP_AFTER_MS) <= t);
+      for (const e of dropped) entries.delete(e.id);
+      if (dropped.length > 0) {
+        discarded += dropped.length;
+        log('tui.wakeup', 'restore-dropped-stale', { count: dropped.length, ids: dropped.map(e => e.id), oldestLateSec: Math.round((t - Math.min(...dropped.map(e => e.dueAt))) / 1000) });
+        deps.notify?.(`⏰ dropped ${dropped.length} stale wakes (overdue > 2 h at restart): ${dropped.slice(0, 3).map(e => `${e.id}@${formatWakeupClock(e.dueAt)}`).join(' · ')}${dropped.length > 3 ? ' · …' : ''}`);
+      }
+    }
+    // WAKE-CAP-RECLAIM: 죽은 TUI(강제 종료된 옛 프로세스)의 묵은 늦은 예약은 이 프로세스가 이어받되 한 깨움으로 접는다.
+    const foldedOnRestore = writeRefused ? null : foldStale(t, 'restore');
     for (const entry of [...entries.values()]) {
       if (entry.expiresAt !== undefined && t > entry.expiresAt) {
         log('tui.wakeup', 'restored-expired', { id: entry.id });
@@ -594,7 +765,7 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
       restored++;
       if (entry.repeatMs && entry.dueAt <= t) advance(entry, t, false); else arm(entry);
     }
-    if (discarded > 0) persistBestEffort();
+    if (discarded > 0 || foldedOnRestore) persistBestEffort();
     if (restored > 0) log('tui.wakeup', 'restored', { count: restored, owner: process.pid });
   };
   restoreFromPersist();
@@ -658,7 +829,6 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
       }
       if (!reason) return reject('reason 이 비었다 — 깨어나서 무엇을 할지 한 줄로 적어라');
       if (writeRefused) return reject(writeRefused);
-      if (entries.size >= maxEntries) return reject(`예약 상한 ${maxEntries}개 — list 로 보고 cancel 뒤 다시`);
       let repeatMs: number | undefined;
       // ⭐ 0 = 일회성(생략과 같다) — 모델이 «한 번만»을 0 으로 부른다(라이브 실측). 음수·NaN·1 미만 소수는 거부.
       if (req.repeatMinutes !== undefined && req.repeatMinutes !== 0) {
@@ -687,6 +857,56 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
       }
       if (dueAt - t < WAKEUP_MIN_DELAY_MS) return reject(`최소 ${WAKEUP_MIN_DELAY_MS / 1000}초 뒤부터 예약할 수 있다`);
       if (dueAt - t > WAKEUP_MAX_DELAY_MS) return reject('7일보다 먼 예약은 schedule_manage(cron) 몫');
+      // WAKE-CAP-RECLAIM (c): 같은 reason ⊕ 같은 반복 꼴의 예약이 이미 있으면 새로 만들지 않고 그 예약을 새 시각으로 옮긴다
+      // (같은 «10분 뒤 추적» 을 매 턴 다시 걸어 슬롯이 차던 꼴).
+      const same = [...entries.values()].find(e => e.reason === reason && (e.repeatMs ?? 0) === (repeatMs ?? 0));
+      if (same) {
+        const before = { ...same };
+        same.dueAt = dueAt;
+        same.retried = false;
+        if (repeatMs !== undefined) same.expiresAt = t + WAKEUP_REPEAT_TTL_MS;
+        queuedForTurnEnd.delete(same.id);
+        arm(same);
+        try { persistSave(); }
+        catch (error) {
+          Object.assign(same, before);
+          arm(same);
+          log('tui.wakeup', 'persist-save-failed', { error: String(error), action: 'merge', id: same.id });
+          return reject(`예약을 저장하지 못해 예약하지 않았다: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        log('tui.wakeup', 'merged', { id: same.id, dueAt, inMs: dueAt - t, previousDueAt: before.dueAt });
+        deps.notify?.(`⏰ 예약 깨움 ${formatWakeupClock(dueAt)}: ${reason} (같은 예약 ${same.id} 시각만 옮김)`);
+        return { ok: true, entry: { ...same }, merged: same.id };
+      }
+      // OP 11-25 07:49 — 바쁜 자리는 시각이 지난 일회성(«늦은 깨움» 배출 대기 · 소실 0 계약)이 쌓여 상한을 막았다
+      // (20칸 중 늦은 대기 12). 상한은 «앞으로 올» 예약(미래 일회성 + 반복)만 센다. 늦은 대기는 따로 세고,
+      // 전체는 상한 2배를 넘지 않는다(무한 적재 방지).
+      // WAKE-CAP-RECLAIM (OP 11-25 12:0x · 전체 40 = 늦은 대기 32 + 앞으로 올 8): 막히면 먼저 묵은 늦은 예약을 한 깨움으로
+      // 접어 슬롯을 회수한다(e). 그래도 막히면 거부 ⊕ 가장 오래된 예약 목록(d).
+      const counts = () => {
+        const overdue = [...entries.values()].filter(e => !e.repeatMs && e.dueAt <= t);
+        // WAKE-FOLD-IDEMPOTENT ② — past-due wakes never count toward the cap (they are delivered, not scheduled).
+        return { overdue, upcoming: entries.size - overdue.length, full: entries.size - overdue.length >= maxEntries };
+      };
+      // Housekeeping instead of a total cap: wakes ≥ 10 min late go to the next turn's inbox; stale ones that remain
+      // (no inbox wired) fold into the single bundle once they pile up to the cap.
+      deliverToInbox(t);
+      let c = counts();
+      let folded: { id: string; count: number } | null = null;
+      if (c.full || c.overdue.length >= maxEntries) {
+        folded = foldStale(t, 'cap');
+        if (folded) { persistBestEffort(); c = counts(); }
+      }
+      if (c.full) {
+        const { overdue, upcoming } = c;
+        const late = overdue.length > 0
+          ? ` · 그중 시각 지난 대기 ${overdue.length}개(${overdue.slice(0, 5).map(e => e.id).join(',')}${overdue.length > 5 ? ',…' : ''}) — 이미 처리했으면 cancel`
+          : '';
+        const error = `예약 상한 ${maxEntries}개(앞으로 올 예약 ${upcoming} · 전체 ${entries.size})${late} — list 로 보고 cancel 뒤 다시`;
+        log('tui.wakeup', 'rejected', { id: null, reason: 'cap', error });
+        const oldest = [...entries.values()].sort((a, b) => a.dueAt - b.dueAt).slice(0, WAKEUP_REFUSAL_OLDEST).map(e => ({ ...e }));
+        return { ok: false, error, code: 'cap', oldest };
+      }
       const entry: WakeupEntry = {
         id: `w${++seq}`,
         reason,
@@ -712,7 +932,7 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
       });
       const repeat = repeatMs ? ` · ${Math.round(repeatMs / 60_000)}분마다(7일)` : ' (한 번)';
       deps.notify?.(`⏰ 예약 깨움 ${formatWakeupClock(dueAt)}${repeat}: ${reason}`);
-      return { ok: true, entry: { ...entry } };
+      return { ok: true, entry: { ...entry }, ...(folded ? { folded } : {}) };
     },
 	    list() {
 	      return [...entries.values()].sort((a, b) => a.dueAt - b.dueAt).map(e => ({ ...e }));
@@ -766,7 +986,7 @@ export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMTool
       'Wake THIS TUI later with an internal turn: when you would write «다음 점검 HH:MM» and end the turn, call this instead so the check actually happens. '
       + 'action=schedule (default) needs reason plus one of at ("HH:MM" local, past → tomorrow) / delaySeconds (≥60) / repeatMinutes (≥1; repeats expire after 7 days). Never provide both at and delaySeconds; the scheduler validates the timing choice. '
       + 'ONE-SHOT (wake once): give only delaySeconds or at and OMIT repeatMinutes (0 also means one-shot). Set repeatMinutes only when you really want it to repeat. '
-      + `action=list shows pending wakeups; action=cancel needs id. Limits: ≥60s ahead, ≤7 days, at most 5 pending, at most ${WAKEUP_MAX_CALLS_PER_TURN} schedule/cancel calls per turn. `
+      + `action=list shows pending wakeups; action=cancel needs id. Limits: ≥60s ahead, ≤7 days, at most ${WAKEUP_MAX_ENTRIES} upcoming (past-due one-shots do not count: they are delivered together in one notice — at the next idle turn, or on the next turn's inbox after 10 busy minutes), an identical reason re-times the existing wakeup instead of adding a duplicate, a refusal returns success:false with the oldest wakeups to cancel, at most ${WAKEUP_MAX_CALLS_PER_TURN} schedule/cancel calls per turn. `
       + 'If the TUI is busy or the human is typing at that time it retries once a minute (up to 30 minutes), then stays queued and wakes exactly once the moment the current turn ends — a scheduled wakeup is never silently lost. '
       + durable
       + 'Not the same as schedule_manage — that is an OS cron job that runs a command outside this TUI and never opens a turn here.',
@@ -800,7 +1020,22 @@ export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMTool
         ...(typeof args.repeatMinutes === 'number' ? { repeatMinutes: args.repeatMinutes } : {}),
       };
       const result = scheduler.schedule(request, canonicalToolArgs(args));
-      return result.ok ? { scheduled: describeEntry(result.entry), saved: scheduler.persists() } : { error: result.error };
+      if (result.ok) {
+        return {
+          scheduled: describeEntry(result.entry), saved: scheduler.persists(),
+          ...(result.merged ? { merged: result.merged, note: `an identical wakeup (${result.merged}) already existed — moved it to the new time instead of adding a duplicate` } : {}),
+          ...(result.folded ? { folded: result.folded } : {}),
+        };
+      }
+      // WAKE-CAP-RECLAIM (d): 상한 거부는 «명시적 거부» — success:false ⊕ 이유 ⊕ 먼저 cancel 할 가장 오래된 예약.
+      if (result.code === 'cap') {
+        return {
+          success: false, refused: 'wake-cap', error: result.error,
+          oldest: (result.oldest ?? []).map(describeEntry),
+          hint: 'NOT scheduled. Cancel the oldest wakeups listed (action:cancel id) that are already handled, then schedule again.',
+        };
+      }
+      return { error: result.error };
     },
   };
 }

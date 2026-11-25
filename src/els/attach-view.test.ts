@@ -21,8 +21,8 @@ test('drawView drops the emulator header line of a live pane and keeps any other
 });
 
 test('statusLine names the pane, an optional note, and how to leave', () => {
-  expect(statusLine('w1/t1/p1')).toBe(' w1/t1/p1 · ctrl+b q 분리 ');
-  expect(statusLine('p1', 'x')).toBe(' p1 · x · ctrl+b q 분리 ');
+  expect(statusLine('w1/t1/p1')).toBe(' w1/t1/p1 · ctrl+b q detach ');
+  expect(statusLine('p1', 'x')).toBe(' p1 · x · ctrl+b q detach ');
 });
 
 test('key decoder joins a multi-byte character split across stdin chunks (Korean, emoji) instead of replacing it', () => {

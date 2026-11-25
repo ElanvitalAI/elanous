@@ -1,4 +1,4 @@
-// DAILY-REGRESSION pack (대표 11-24 12:5x «features must always be tested enough in the simulation world and the test
+// DAILY-REGRESSION pack (CEO 11-24 12:5x «features must always be tested enough in the simulation world and the test
 // world»): today's behaviour fixes replayed end to end with synthetic events, one scenario per fix. Each scenario owns a
 // fresh universe (temp dirs only — never a real HQ path, host name or seat ledger) and drives the real code path:
 // the real next-TUI process in a PTY (DR01–DR03), the real CLI process (DR04), the real stores and loops (DR05–DR07),
@@ -37,6 +37,8 @@ import { runSeatTui, settledUntil } from './seat-tui.js';
 import { dr15 } from './dr15-invest-demo.js';
 import { dr14 } from './dr14-els-wheel.js';
 import { dr16 } from './dr16-autopilot.js';
+import { dr17 } from './dr17-bulk-triage.js';
+import { dr18 } from './dr18-docsearch.js';
 
 export interface DailyRegressionContext {
   /** Fresh directory owned by this scenario run. */
@@ -96,7 +98,7 @@ const dr01: DailyRegressionScenario = {
     const c = checks();
     // (a) frame level — the 7-mail digest of the 11-24 11:44 incident through the real view + render + vanish detector.
     const mail = (n: number) => `[from JUD-${n} · action]\nmsg:14098${n} · review request for PR #3991${n}\n`
-      + `${'Please re-run the focused tests on node-b and post the receipt path with the head sha. '.repeat(4)}`;
+      + `${'Please re-run the focused tests on the remote host and post the receipt path with the head sha. '.repeat(4)}`;
     const digest = `[seat-mail digest] 7 mails — 7 need action · 0 info (every mail below needs a reply)\n\n${[1, 2, 3, 4, 5, 6, 7].map(mail).join('\n\n')}`;
     const answered: SerializedMessage[] = [
       { role: 'user', content: 'Please check the JUD tabs and close the idle ones.', ts: '2026-11-24T02:42:42.543Z' },
@@ -590,7 +592,7 @@ const dr12: DailyRegressionScenario = {
   },
 };
 
-export const dailyRegressionScenarios: readonly DailyRegressionScenario[] = [dr01, dr02, dr03, dr04, dr05, dr06, dr07, dr08, dr11, dr12, dr14, dr15, dr16];
+export const dailyRegressionScenarios: readonly DailyRegressionScenario[] = [dr01, dr02, dr03, dr04, dr05, dr06, dr07, dr08, dr11, dr12, dr14, dr15, dr16, dr17, dr18];
 
 /** Behaviours whose PR is not on main yet. When one lands, its scenario replaces the row here (same id). */
 export const dailyRegressionPending: readonly DailyRegressionPending[] = [

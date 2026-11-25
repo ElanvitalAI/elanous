@@ -98,7 +98,7 @@ describe('ELN-WAIT-NOT-POLL — wait, don\'t poll (goal loop)', () => {
 
   test('②\' 살아 있는 백그라운드 자식 peek(AgentOutput not_ready)만 남은 iteration — waiting 자동 종료', async () => {
     const r = await drive([
-      [{ type: 'tool_call', id: 'a1', name: 'Agent', args: { prompt: '조사' } }],
+      [{ type: 'tool_call', id: 'a1', name: 'Agent', args: { prompt: '조사', reason: 'fixture' } }],
       [{ type: 'text', delta: '자식을 띄웠습니다.' }],
       [{ type: 'tool_call', id: 'p1', name: 'AgentOutput', args: { taskId: 't1', block: false } }],
       [{ type: 'text', delta: '아직 실행 중입니다 — 완료 노크를 기다립니다.' }],

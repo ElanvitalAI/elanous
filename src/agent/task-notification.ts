@@ -200,6 +200,11 @@ export class TaskNotificationQueue {
     return this.queue.some((n) => n.taskId === taskId);
   }
 
+  /** AGENT-STEER — a resumed task finishes a second time; let that completion through once more. */
+  rearm(taskId: string): void {
+    this.seen.delete(taskId);
+  }
+
   /** Forget everything — tests use this for isolation. Listeners are
    *  preserved: clear() empties queue + seen, not the wake wiring. */
   clear(): void {
@@ -318,7 +323,8 @@ export function wireTaskNotifications(
       });
     }
   });
-  return () => sub.dispose();
+  const resumed = registry.onTaskResume?.((task) => queue.rearm(task.id));
+  return () => { sub.dispose(); resumed?.dispose(); };
 }
 
 // Module-load side effect: wire the global pair. Idempotent because

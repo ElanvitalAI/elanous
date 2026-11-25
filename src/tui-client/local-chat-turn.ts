@@ -1,7 +1,8 @@
+import { NEXT_TUI_AGENT_SEND_TYPE } from '../agent/agent-steer.js';
 import { createRunShellApprovalIssuer, isRunShellApprovalCall, runShellApprovalCard, RUNSHELL_APPROVAL_RESULT, RUNSHELL_PUBLIC_KEY_ENV } from './next-runshell-approval.js';
 import type { ApprovalOutcome } from '../graph-runner/approval-outcome.js';
 import type { MessageSource } from '../session/index.js';
-import { safeAgentSummary, safeToolActivityTarget } from '../tui/chat/tool-activity.js';
+import { safeAgentSpend, safeAgentSummary, safeToolActivityTarget } from '../tui/chat/tool-activity.js';
 import { parsePlanWire, type PlanWire } from '../code-edit/plan-wire.js';
 import { isGraphProgressObservation, type GraphProgressObservation } from '../graph-runner/graph-progress-observation.js';
 /** Keep one REPL child per session so background tasks and their completion queue survive turns. */
@@ -138,7 +139,7 @@ export function isMeasuredTurnUsage(value: unknown): value is MeasuredTurnUsage 
     });
 }
 export type LocalChatToolActivity =
-  | { phase: 'start' | 'finish'; id: string; name: string; target?: string; summary?: string }
+  | { phase: 'start' | 'finish'; id: string; name: string; target?: string; summary?: string; spend?: string; failed?: boolean }
   | { phase: 'snapshot'; calls: Array<{ id: string; name: string; target?: string }> };
 export type LocalChatPushNowResult = { requestId: string; outcome: 'ready' | 'interrupted' | 'deferred'; activeTools: string[] };
 interface WaitingTurn {
@@ -425,8 +426,10 @@ class LocalChatSession {
         } else if ((result.phase === 'start' || result.phase === 'finish')
           && typeof result.id === 'string' && typeof result.name === 'string') {
           const summary = result.phase === 'finish' && result.name === 'Agent' ? safeAgentSummary((result as { summary?: unknown }).summary) : undefined;
+          const spend = result.phase === 'finish' && result.name === 'Agent' ? safeAgentSpend((result as { spend?: unknown }).spend) : undefined;
           try { waiting.onToolActivity?.({ phase: result.phase, id: result.id, name: result.name,
-            target: safeToolActivityTarget(result.name, result.target), ...(summary ? { summary } : {}) }); }
+            target: safeToolActivityTarget(result.name, result.target), ...(summary ? { summary } : {}), ...(spend ? { spend } : {}),
+            ...(result.phase === 'finish' && (result as { failed?: unknown }).failed === true ? { failed: true } : {}) }); }
           catch { /* observer cannot break a turn */ }
         }
         return;
@@ -614,9 +617,12 @@ class LocalChatSession {
     catch { return false; }
   }
   /** A200 — hand input typed during this turn to the child; it joins the next model request. */
-  requestSteer(steerId: string, text: string, urgent = false, seatMail?: { msgId: number; from: string; intent?: string | null }): boolean {
+  requestSteer(steerId: string, text: string, urgent = false, seatMail?: { msgId: number; from: string; intent?: string | null; crownDirective?: string | null; originKind?: string | null; viaLedger?: boolean },
+    attachments: readonly { path: string; token?: string }[] = []): boolean {
     if (this.closed || !this.waiting) return false;
-    try { this.child.send({ type: 'elanous.next-tui.steer', turnId: this.waiting.turnId, steerId, text, urgent, ...(seatMail ? { seatMail } : {}) }); return true; }
+    // IMAGE-IN-STEER-FU — attachment paths travel with the steer; the child reads the bytes into image parts.
+    try { this.child.send({ type: 'elanous.next-tui.steer', turnId: this.waiting.turnId, steerId, text, urgent, ...(seatMail ? { seatMail } : {}),
+      ...(attachments.length > 0 ? { attachments: attachments.map((a) => ({ path: a.path, ...(a.token ? { token: a.token } : {}) })) } : {}) }); return true; }
     catch { return false; }
   }
   retractSteer(steerIds: readonly string[]): boolean {
@@ -642,6 +648,12 @@ class LocalChatSession {
     this.pendingHarnessAskUserIds.clear();
     emitTurnLife('turn-life:turn-cancel-sent', { sessionId: this.sessionId, turnId: this.waiting.turnId, approvalsWithdrawn });
     return true;
+  }
+
+  requestAgentSend(to: string, body: string): boolean {
+    if (this.closed) return false;
+    try { this.child.send({ type: NEXT_TUI_AGENT_SEND_TYPE, sessionId: this.sessionId, to, body }); return true; }
+    catch { return false; }
   }
 
   requestTaskStop(taskId: string): boolean {
@@ -748,8 +760,9 @@ export function commitLocalChatPushNow(sessionId: string, requestId: string): bo
   return sessions.get(sessionId)?.commitPushNow(requestId) ?? false;
 }
 export function requestLocalChatSteer(sessionId: string, steerId: string, text: string, urgent = false,
-  seatMail?: { msgId: number; from: string; intent?: string | null }): boolean {
-  return sessions.get(sessionId)?.requestSteer(steerId, text, urgent, seatMail) ?? false;
+  seatMail?: { msgId: number; from: string; intent?: string | null; crownDirective?: string | null; originKind?: string | null; viaLedger?: boolean },
+  attachments: readonly { path: string; token?: string }[] = []): boolean {
+  return sessions.get(sessionId)?.requestSteer(steerId, text, urgent, seatMail, attachments) ?? false;
 }
 export function retractLocalChatSteer(sessionId: string, steerIds: readonly string[]): boolean {
   return sessions.get(sessionId)?.retractSteer(steerIds) ?? false;
@@ -761,12 +774,55 @@ export function localChatChildOwner(sessionId: string): { pid: number; startedAt
   const pid = session?.child.pid;
   return session && typeof pid === 'number' && pid > 0 ? { pid, startedAt: session.spawnedAt } : null;
 }
+/** AGENT-STEER — the person's `/agent <name> <text>` to this session's REPL child. */
+export function requestLocalChatAgentSend(sessionId: string, to: string, body: string): boolean {
+  return sessions.get(sessionId)?.requestAgentSend(to, body) ?? false;
+}
 export function requestLocalChatTaskStop(sessionId: string, taskId: string): boolean {
   return sessions.get(sessionId)?.requestTaskStop(taskId) ?? false;
 }
 
-/** Run one turn while retaining the child for the next turn. */
+/** Run one turn while retaining the child for the next turn.
+ *
+ * DEMO-ONBOARD-EN-COPY — a failed turn under provider `auto` with no usable route at all (no login, no key, no local
+ * server) is reported as `llm-unset`, so the first chat on a new machine names the next step instead of a bare
+ * failure. Only the failure is re-labelled: a successful turn never consults the selector, and a judge that throws
+ * keeps the original error. */
 export async function runLocalChatTurn(
+  ...args: Parameters<typeof runLocalChatTurnOnce>
+): ReturnType<typeof runLocalChatTurnOnce> {
+  try { return await runLocalChatTurnOnce(...args); }
+  catch (error) {
+    const [sessionId, , signal] = args;
+    throw await classifyLocalTurnFailure(error, signal, async () => {
+      const cfg = (await import('../user-config.js')).getUserConfig();
+      const provider = getSessionProvider(sessionId)?.provider ?? cfg.llm.provider;
+      const { decideProviderForConfig } = await import('../llm.js');
+      return { provider, hasRoute: () => decideProviderForConfig(cfg).provider !== 'auto' };
+    });
+  }
+}
+
+/** The error a failed local turn reports: `llm-unset` only when `auto` has no route at all; otherwise — and whenever
+ *  judging itself fails (config read, import, selector) — the original error, unchanged. */
+export async function classifyLocalTurnFailure(
+  error: unknown,
+  signal: AbortSignal,
+  judge: () => Promise<{ provider: string | undefined; hasRoute: () => boolean }>,
+): Promise<unknown> {
+  if (signal.aborted || (error instanceof Error && error.name === 'NextTuiAuthError')) return error;
+  try {
+    const { provider, hasRoute } = await judge();
+    if (provider !== 'auto' || hasRoute()) return error;
+    const { NextTuiAuthError } = await import('./next-auth-preflight.js');
+    const relabelled = new NextTuiAuthError('llm-unset');
+    // The card is chosen by kind; the original text stays the message, so logs and callers keep the child's own reason.
+    if (error instanceof Error && error.message) relabelled.message = error.message;
+    return relabelled;
+  } catch { return error; }
+}
+
+async function runLocalChatTurnOnce(
   sessionId: string,
   text: string,
   signal: AbortSignal,

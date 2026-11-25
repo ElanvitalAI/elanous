@@ -63,8 +63,8 @@ test('③ herdr spaces fold into one «herdr» bundle below my spaces; it opens 
   ] }));
   const rows = [...herdr, ...local];
   const trim = (lines: readonly string[]) => lines.map((line) => line.replace(/\u001b\[[0-9;]*m/g, '').trimEnd());
-  expect(trim(buildSpaceList(rows, 'p1', 30, 4))).toEqual([' spaces', ' ○ UX', ' ⊞ HERDR · 2', ' new · menu']);
-  expect(trim(buildSpaceList(rows, 'herdr:w2/t0/p0', 30, 6))).toEqual([' spaces', ' ○ UX', ' ⊟ HERDR · 2', '   ● ⇄HERDR OP', '   ○ ⇄HERDR TC', ' new · menu']);
+  expect(trim(buildSpaceList(rows, 'p1', 30, 4))).toEqual([' spaces', ' ○ UX', ' ▸ HERDR · 2', ' new · menu']);
+  expect(trim(buildSpaceList(rows, 'herdr:w2/t0/p0', 30, 6))).toEqual([' spaces', ' ○ UX', ' ▾ HERDR · 2', '   ● ⇄HERDR OP', '   ○ ⇄HERDR TC', ' new · menu']);
 });
 
 test('④ (OP #101592 · #101606) focus marker: the tab row is padded UPPERCASE «emoji NAME» like herdr (focused blue, others gray, ELS-TAB-STYLE-HERDR), the selected space is reverse video, and the block moves with the focus', () => {

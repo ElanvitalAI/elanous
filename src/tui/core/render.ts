@@ -3,8 +3,8 @@ import type { SerializedMessage } from '../../session/index.js';
 import type { MessageBlock } from '../../conv-substrate/message-block.js';
 import { dimContinueBanner } from '../chat/continue-banner.js';
 import { parseToolResultEnvelope } from '../../chat/tool-render/result-text.js';
-import { fitLogLine, logViewLines, logViewLinesWithInsertions, toolFoldBlockRanges, wrapLogLines } from '../chat/log-view.js';
-import { isToolActivityLine } from '../chat/tool-activity.js';
+import { fitLogLine, logViewLinesWithInsertions, logViewRowHeights, toolFoldBlockRanges, wrapLogLines } from '../chat/log-view.js';
+import { isCapabilityDiscoveryTool, isToolActivityLine } from '../chat/tool-activity.js';
 import { isWorkingRow } from '../chat/working-row.js';
 import { messageBlockDetailLines, nextMessageBlockDetailLevel, type TuiDetailLevel } from '../chat/message-block-view.js';
 
@@ -29,6 +29,14 @@ export function hasDisplayableCompletedToolBlock(
 
 function isHiddenInternalTool(name: string | undefined): boolean {
   return HIDDEN_INTERNAL_TOOL_NAMES.has(name ?? '');
+}
+
+const rowToolErrors = new WeakMap<SerializedMessage, boolean>();
+/** hasToolError parses the saved result envelope — once per row object (TUI-LONG-PASTE-SPIN). */
+function rowHasToolError(message: SerializedMessage): boolean {
+  let error = rowToolErrors.get(message);
+  if (error === undefined) rowToolErrors.set(message, error = hasToolError(message.toolResult));
+  return error;
 }
 
 function hasToolError(result: unknown): boolean {
@@ -170,16 +178,32 @@ function prepareHistory(input: NextTuiLogFrameInput): PreparedHistory {
   const detailedTools = new Set((input.messageBlocks ?? []).flatMap(({ block }) =>
     block.body.kind === 'tool-call' && block.detail?.rawRef && block.id === block.detail.rawRef.blockId
       ? [`${block.detail.rawRef.runId}\u0000${block.body.toolCallId}`] : []));
-  const historyMessages = input.messages.map((message) => {
+  // TOOL-SEARCH-FOLD — a successful capability lookup has no row of its own. It belongs to the next real tool
+  // call: folded, it is hidden; when the user expands that call, the lookup shows (expanded) just above it.
+  const expandedTools = new Set(input.expandedToolIndexes ?? []);
+  const discoveryShown = new Set<number>();
+  // One reverse pass finds the next real tool for every discovery row. Searching from the
+  // beginning for each row made an all-discovery transcript quadratic, even in degraded mode.
+  let nextRealTool = -1;
+  for (let index = input.messages.length - 1; index >= 0; index -= 1) {
+    const message = input.messages[index]!;
+    if (message.role !== 'tool') continue;
+    if (!isCapabilityDiscoveryTool(message.toolName)) { nextRealTool = index; continue; }
+    if (nextRealTool >= 0 && expandedTools.has(nextRealTool)) { discoveryShown.add(index); expandedTools.add(index); }
+  }
+  const historyMessages = input.messages.map((message, index) => {
     if (message.role !== 'tool') return message;
+    if (isCapabilityDiscoveryTool(message.toolName) && !discoveryShown.has(index) && !rowHasToolError(message)) {
+      return { ...message, role: 'system', content: '' } as SerializedMessage;
+    }
     if (message.surfaceRunId && message.toolCallId
       && detailedTools.has(`${message.surfaceRunId}\u0000${message.toolCallId}`)) {
       return { ...message, role: 'system', content: '' } as SerializedMessage;
     }
-    if (isHiddenInternalTool(message.toolName) && hasToolError(message.toolResult)) {
-      return { ...message, toolResult: normalizeStructuredToolError(message.toolResult) };
+    if (isHiddenInternalTool(message.toolName) && rowHasToolError(message)) {
+      return derivedRow(message, 'tool-error', () => ({ ...message, toolResult: normalizeStructuredToolError(message.toolResult) }));
     }
-    if ((isHiddenInternalTool(message.toolName) && !hasToolError(message.toolResult))
+    if ((isHiddenInternalTool(message.toolName) && !rowHasToolError(message))
       || (message.toolName === 'Agent' && !hasAgentResult(message.toolResult))) {
       // Keep the saved index stable for MessageBlock anchors and fold state; system rows are not transcript rows.
       return { ...message, role: 'system', content: '' } as SerializedMessage;
@@ -187,8 +211,7 @@ function prepareHistory(input: NextTuiLogFrameInput): PreparedHistory {
     // Agent traces intentionally collapse to lifecycle status in log-view; use a result label so
     // substantive output remains available without editing the shared renderer.
     if (message.toolName !== 'Agent') return message;
-    const toolResult = serializableAgentResult(message.toolResult);
-    return { ...message, toolName: 'Agent result', toolResult };
+    return derivedRow(message, 'agent-result', () => ({ ...message, toolName: 'Agent result', toolResult: serializableAgentResult(message.toolResult) }));
   });
   const visibleMessageBlocks = (input.messageBlocks ?? []).filter(({ block }) =>
     block.body.kind !== 'tool-call' || !lifecycleToolCalls.has(block.body.title));
@@ -196,8 +219,23 @@ function prepareHistory(input: NextTuiLogFrameInput): PreparedHistory {
   // real block ID, so the existing mouse/key toggle and raw-reference lifecycle work.
   // Only group once every member has a matching persisted result: nothing is lost
   // while calls are running or when a result has not yet reached the transcript.
+  // TOOL-SEARCH-FOLD — a capability lookup block rides on the next real tool-call block: hidden while that block is
+  // folded, drawn at its detail level just above it once expanded. A failed lookup keeps its own row.
+  const discoveryBlocks = new Map<string, typeof visibleMessageBlocks[number]>();
+  const blockDiscovery = new Map<string, Array<typeof visibleMessageBlocks[number]>>();
+  let pendingDiscovery: Array<typeof visibleMessageBlocks[number]> = [];
+  for (const item of visibleMessageBlocks) {
+    if (item.block.body.kind !== 'tool-call') continue;
+    if (isCapabilityDiscoveryTool(item.block.body.title) && item.block.body.status !== '실패') {
+      discoveryBlocks.set(item.block.id, item);
+      pendingDiscovery.push(item);
+      continue;
+    }
+    if (pendingDiscovery.length > 0) { blockDiscovery.set(item.block.id, pendingDiscovery); pendingDiscovery = []; }
+  }
   const byRun = new Map<string, typeof visibleMessageBlocks>();
   for (const item of visibleMessageBlocks) {
+    if (discoveryBlocks.has(item.block.id)) continue;
     const ref = item.block.detail?.rawRef;
     if (item.block.body.kind !== 'tool-call' || !ref || ref.blockId !== item.block.id) continue;
     const group = byRun.get(ref.runId) ?? [];
@@ -217,15 +255,21 @@ function prepareHistory(input: NextTuiLogFrameInput): PreparedHistory {
   }
   const blockRanges: Array<{ kind: 'message'; id: string; start: number; end: number; anchor: number }> = [];
   let priorBlockLines = 0;
+  // TUI-LONG-PASTE-SPIN — one height pass (row memo) instead of re-rendering the whole prefix per block (O(blocks × rows)).
+  const historyLinesThrough = historyPrefixLines(historyMessages, input.columns, expandedTools);
   for (const { block, level, rawText, afterMessageIndex } of visibleMessageBlocks) {
-    if (block.body.kind === 'assistant' || block.body.kind === 'user' || hidden.has(block.id)) continue;
+    if (block.body.kind === 'assistant' || block.body.kind === 'user' || hidden.has(block.id) || discoveryBlocks.has(block.id)) continue;
     const anchor = Math.min(input.messages.length - 1, Math.max(0, afterMessageIndex ?? input.messages.length - 1));
     const rows = insertions.get(anchor) ?? [];
     const group = grouped.get(block.id);
     const displayBlock = group && block.detail ? { ...block, detail: { ...block.detail,
       summary: `${block.detail.summary ?? block.body.kind} · ${group.length} tools` } } : block;
-    const rendered = messageBlockDetailLines(displayBlock, level, input.columns, rawText);
-    const prefixLines = (anchor >= 0 ? logViewLines(historyMessages.slice(0, anchor + 1), input.columns, input.expandedToolIndexes).length : 0)
+    const riders = (level ?? 0) > 0 ? blockDiscovery.get(block.id) ?? [] : [];
+    const rendered = [
+      ...riders.flatMap((rider) => messageBlockDetailLines(rider.block, level, input.columns, rider.rawText)),
+      ...messageBlockDetailLines(displayBlock, level, input.columns, rawText),
+    ];
+    const prefixLines = (anchor >= 0 ? historyLinesThrough(anchor) : 0)
       + inlineRowsAt(input, anchor + 1, anchor);
     if (rendered.length > 0) blockRanges.push({ kind: 'message', id: block.id,
       start: prefixLines + priorBlockLines, end: prefixLines + priorBlockLines + rendered.length - 1, anchor });
@@ -245,16 +289,42 @@ function prepareHistory(input: NextTuiLogFrameInput): PreparedHistory {
   }
   const foldTargets: Array<{ kind: 'message'; id: string; start: number; end: number } | { kind: 'tool'; index: number; part?: number; start: number; end: number }> = [
     ...blockRanges.map(({ kind, id, start, end }) => ({ kind, id, start, end })),
-    ...toolFoldBlockRanges(historyMessages, input.columns, input.expandedToolIndexes).map((range) => {
+    ...toolFoldBlockRanges(historyMessages, input.columns, expandedTools).filter((range) => !discoveryShown.has(range.index)).map((range) => {
       const offset = blockRanges.filter((block) => block.anchor < range.index).reduce((sum, block) => sum + block.end - block.start + 1, 0)
         + inlineRowsAt(input, range.index);
       return { kind: 'tool' as const, index: range.index, ...(range.part === undefined ? {} : { part: range.part }), start: range.start + offset, end: range.end + offset };
     }),
   ];
   foldTargets.sort((left, right) => left.end - right.end);
-  const lines = logViewLinesWithInsertions(historyMessages, input.columns, input.expandedToolIndexes, insertions);
+  const lines = logViewLinesWithInsertions(historyMessages, input.columns, expandedTools, insertions);
   // An empty transcript is normal on a new session; do not render the shared history placeholder in Next TUI.
   return { foldTargets, lines: lines.length === 1 && lines[0] === "No chat history" ? [] : lines };
+}
+
+// TUI-LONG-PASTE-SPIN — a display copy of a saved row is made once per row object, so the log-view row memo (keyed by
+// row object) still hits on the next frame instead of re-wrapping the copy.
+const derivedRows = new WeakMap<SerializedMessage, { readonly kind: string; readonly row: SerializedMessage }>();
+function derivedRow(source: SerializedMessage, kind: string, make: () => SerializedMessage): SerializedMessage {
+  const hit = derivedRows.get(source);
+  if (hit && hit.kind === kind) return hit.row;
+  const row = make();
+  derivedRows.set(source, { kind, row });
+  return row;
+}
+
+/** Lines logViewLines(messages.slice(0, anchor + 1)) would return, for any anchor, from one pass of row heights
+ *  (an empty prefix renders the one «No chat history» placeholder row, as logViewLines does). */
+function historyPrefixLines(messages: readonly SerializedMessage[], columns: number, expanded?: ReadonlySet<number>): (anchor: number) => number {
+  let prefix: number[] | null = null;
+  return (anchor) => {
+    if (!prefix) {
+      prefix = [];
+      let sum = 0;
+      for (const height of logViewRowHeights(messages, columns, expanded)) prefix.push(sum += height);
+    }
+    const lines = prefix[Math.min(anchor, prefix.length - 1)] ?? 0;
+    return lines === 0 ? 1 : lines;
+  };
 }
 
 /** A transcript marker row: the turn end in blue, a finished capsule dim, a failed capsule in the warning color. */
@@ -555,13 +625,16 @@ export function visibleMessageBlockDetailTarget(
   if (window.rows <= 0) return undefined;
   const ranges: Array<{ block: MessageBlock; start: number; end: number }> = [];
   let insertedLines = 0;
+  const linesThrough = historyPrefixLines(messages, columns, expandedToolIndexes);
   for (const { block, afterMessageIndex } of blocks) {
     if (block.body.kind === 'assistant' || block.body.kind === 'user') continue;
+    // TOOL-SEARCH-FOLD — a capability lookup is never its own Enter target; it opens with the next real call.
+    if (block.body.kind === 'tool-call' && isCapabilityDiscoveryTool(block.body.title) && block.body.status !== '실패') continue;
     const level = levels.get(block.id) ?? 0;
     const rendered = messageBlockDetailLines(block, level, columns, window.rawTexts?.get(block.id));
     if (rendered.length === 0 || messages.length === 0) continue;
     const anchor = Math.min(messages.length - 1, Math.max(0, afterMessageIndex ?? messages.length - 1));
-    const baseLines = logViewLines(messages.slice(0, anchor + 1), columns, expandedToolIndexes).length;
+    const baseLines = linesThrough(anchor);
     const start = baseLines + insertedLines;
     ranges.push({ block, start, end: start + rendered.length - 1 });
     insertedLines += rendered.length;

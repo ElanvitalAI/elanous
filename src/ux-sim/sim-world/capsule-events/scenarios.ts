@@ -15,7 +15,7 @@ const c1Scene: SimWorldScenario = {
   async run(ctx) {
     const root = ctx.universeRoot;
     const capture = join(root, 'requests.jsonl');
-    const args = { description: 'c1 worker', prompt: 'slow-child task', run_in_background: true, max_turns: 1 };
+    const args = { description: 'c1 worker', prompt: 'slow-child task', reason: 'c1 fixture', run_in_background: true, max_turns: 1 };
     writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
     const delivered = () => existsSync(capture) ? readFileSync(capture, 'utf8').split('\n').filter(Boolean)
       .map(line => JSON.parse(line)).filter(row => JSON.stringify(row.messages).includes('<task id=')) : [];

@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-SEARCH-BENCH-CLI-TS",
+  "path": "src/ux-sim/search-bench/cli.ts",
+  "boundary": "The search bench materializes a pinned corpus into a temp git repo with an ignored decoy dir and drives the product Glob, Grep and Read dispatchers, the docs-search index stages and RunShell-folded engines over it",
+  "deviceIds": ["search-bench"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

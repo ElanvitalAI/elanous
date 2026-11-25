@@ -360,7 +360,7 @@ describe('ingestDocsDir — docs/ 자동 벡터화(P3)', () => {
   test('디렉터리 없으면 0(fail-soft)', async () => {
     const kdb = openKnowledgeDb(':memory:');
     const r = await ingestDocsDir(kdb, { dir: '/nonexistent-docs-xyz', embed: mockEmbed });
-    expect(r).toEqual({ files: 0, chunks: 0, skipped: 0, unchanged: 0, refreshed: 0 });
+    expect(r).toEqual({ files: 0, chunks: 0, skipped: 0, unchanged: 0, refreshed: 0, pending: 0, attempted: 0 });
     kdb.close();
   });
 });

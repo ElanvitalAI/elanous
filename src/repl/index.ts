@@ -6,7 +6,7 @@ import { judgeStop } from '../agent/stop-door.js';
 import { sessionProviderAppliesToTurn } from './session-provider-turn.js';
 import { buildInstalledPackQueryTool, dispatchInstalledPackQuery } from '../boot/installed-pack-query.js';
 import { emitTurnLife } from '../debug/turn-life.js';
-import { safeAgentSummary, toolActivityTarget } from '../tui/chat/tool-activity.js';
+import { agentSpendLabel, safeAgentSummary, toolActivityTarget, toolResultFailed } from '../tui/chat/tool-activity.js';
 import { getPlanState } from '../code-edit/plan-tool.js';
 import { planWireFromState } from '../code-edit/plan-wire.js';
 import type { LLMToolSpec } from '../llm/tool-spec.js';
@@ -57,17 +57,20 @@ import {
 import { getUserConfig, reloadUserConfig, saveUserConfig, jumpToRotationEntry } from '../user-config.js';
 import type { UserConfig } from '../user-config/types.js';
 import { setAmbientSessionId, debug } from '../debug/log.js';
+import { NEXT_TUI_AGENT_SEND_TYPE } from '../agent/agent-steer.js';
 import { buildInstalledSkillCatalogMessage, type InstalledSkillSummary } from '../skills/skill-catalog-preamble.js';
 import { resolveModelContextWindow } from '../models/context-window.js';
 import { decideSigintAction } from './sigint.js';
 import { decideSessionStart, observeSessionStart } from '../session/session-start.js';
 import { buildReplayTurnsFromSession } from './replay.js';
 import type { ContentBlock } from '../llm.js';
+import { prepareRequestImage } from '../image/request-image-normalize.js';
 import { inspectActiveProvider } from '../provider-summary.js';
 import { parse as parseYaml } from 'yaml';
 import type { PendingTaskNotification } from '../agent/task-notification.js';
 import { dispatchReplMessageTool, isReplMessageTool } from './ops-msg-bridge.js';
 import { buildActiveDirectivesSystemMessages, buildSeatBootSystemMessages, buildSeatMemoryIndexSystemMessages, detectSeatTui, resolveSeatMemoryContext, resolveSessionMemoryStore, type SeatBootDeps } from '../seat/seat-boot-preamble.js';
+import { SEAT_HAND_PULL_LINE, SEAT_ZERO_WORK_CONTINUE } from '../seat/seat-turn-prose.js';
 import { seatRole, type SeatRole } from '../seat/seat-role.js';
 import { coordinatorReasoningConfig } from '../seat/coordinator-reasoning.js';
 import { lookupSeatOwners, type SeatOwnerReaders } from '../core-turn/seat-owner-lookup.js';
@@ -119,7 +122,7 @@ type ReplShellActivity =
   | { phase: 'finish'; id: string; name: 'Bash' | 'RunShell' }
   | { phase: 'snapshot'; calls: Array<{ id: string; name: 'Bash' | 'RunShell'; startedAtMonotonicMs: number }> };
 type ReplToolActivity =
-  | { phase: 'start' | 'finish'; id: string; name: string; target?: string; summary?: string }
+  | { phase: 'start' | 'finish'; id: string; name: string; target?: string; summary?: string; spend?: string; failed?: boolean }
   | { phase: 'snapshot'; calls: Array<{ id: string; name: string; target?: string }> };
 
 const shellSnapshotRouter = createShellSnapshotRouter();
@@ -156,6 +159,7 @@ export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: 
       return Number(leftDone) - Number(rightDone) || (leftDone && rightDone ? (left.finishedAt ?? 0) - (right.finishedAt ?? 0) : 0);
     }).map((task) => ({
       id: task.id, label: task.label ?? task.definition.name, state: task.state,
+      ...(task.corrections ? { corrections: task.corrections } : {}),
     }));
     const nestedAgents = completedNestedAgents(tasks, ownedRootTaskIds);
     const frame = JSON.stringify({ sessionId, promised: unregisteredPromises.size > 0, running, pending: globalTaskNotificationQueue.size + bufferedCount(), tasks: roster, nestedAgents });
@@ -197,6 +201,19 @@ export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: 
     emit();
   };
   process.on('message', onTaskStop);
+  // AGENT-STEER — the person's `/agent <name> <text>`: the same channel as the AgentSend seat tool.
+  const onAgentSend = (message: unknown): void => {
+    if (!message || typeof message !== 'object') return;
+    const request = message as { type?: unknown; sessionId?: unknown; to?: unknown; body?: unknown };
+    if (request.type !== NEXT_TUI_AGENT_SEND_TYPE || request.sessionId !== sessionId
+      || typeof request.to !== 'string' || typeof request.body !== 'string') return;
+    const { sendToAgent } = require('../agent/agent-steer.js') as typeof import('../agent/agent-steer.js');
+    const outcome = sendToAgent(globalAgentRegistry, { to: request.to, body: request.body, from: 'human', ownerSessionId: sessionId });
+    if (outcome.ok) backgroundTaskIds.add(outcome.taskId);
+    else debug.log('agent.steer', 'unknown-target', { from: 'human', to: request.to, known: outcome.known.length }, { level: 'warn' });
+    emit();
+  };
+  process.on('message', onAgentSend);
   const timer = setInterval(emit, 250);
   timer.unref();
   emit();
@@ -219,11 +236,12 @@ export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: 
       emit();
     },
     emit,
-    dispose() { clearInterval(timer); done.dispose(); capsuleDone.dispose(); queueCapsules.dispose(); shellCapsules?.dispose(); stopShellWatch(); process.off('message', onTaskStop); },
+    dispose() { clearInterval(timer); done.dispose(); capsuleDone.dispose(); queueCapsules.dispose(); shellCapsules?.dispose(); stopShellWatch(); process.off('message', onTaskStop); process.off('message', onAgentSend); },
   };
 }
 
-type CapsuleRegistry = Pick<import('../agent/registry.js').AgentRegistry, 'onTaskDone' | 'onTaskStart' | 'onToolCall' | 'get'>;
+type CapsuleRegistry = Pick<import('../agent/registry.js').AgentRegistry, 'onTaskDone' | 'onTaskStart' | 'onToolCall' | 'get'>
+  & Partial<Pick<import('../agent/registry.js').AgentRegistry, 'onTaskResume'>>;
 
 /** CAPSULE-B1 — one `capsule-done` frame per background root task of this session (start: one progress line).
  *  `background` is flipped back to foreground on completion (task-notification), so membership is also read from
@@ -261,7 +279,9 @@ export function watchCapsuleDone(
     write(encodeCapsuleFrame({ type: 'capsule-progress', capsuleId: task.id, kind: 'agent', sessionId, at: call.ts,
       line: `${task.label ?? task.definition.name} · #${call.callIdx} ${call.tool}` }));
   });
-  return { dispose() { started.dispose(); finished.dispose(); toolCalls.dispose(); } };
+  // AGENT-STEER — a resumed capsule finishes again: its new completion is a new frame.
+  const resumed = registry.onTaskResume?.((task) => { emitted.delete(task.id); });
+  return { dispose() { started.dispose(); finished.dispose(); toolCalls.dispose(); resumed?.dispose(); } };
 }
 
 /** REPL public entry — wires whichever input source the caller chose
@@ -397,7 +417,8 @@ export async function resolveSeatMemoryAudience(
 }
 
 // OP's coding tools remain searchable; only their full schemas leave the session prefix.
-const COORDINATOR_DEFERRED_TOOLS = new Set(['Edit', 'Write', 'Grep', 'Glob', 'ListDir', 'AgentList', 'AgentOutput', 'AgentStop', 'memory_delete', 'memory_search', 'update_plan']);
+// Grep/Glob/ListDir/Read stay immediate on every seat surface (SEAT_IMMEDIATE_SEARCH_TOOLS in tier-flip).
+const COORDINATOR_DEFERRED_TOOLS = new Set(['Edit', 'Write', 'AgentList', 'AgentOutput', 'AgentStop', 'memory_delete', 'memory_search', 'update_plan']);
 const COORDINATOR_MAIL_PAGE_SIZE = 10;
 const COORDINATOR_PANE_LINES = 20;
 
@@ -526,6 +547,24 @@ export function buildReplTools(options: {
   const ledger = require('../skills/tools/ops-ledger.js') as typeof import('../skills/tools/ops-ledger.js');
   const ask = require('../skills/tools/msg-ask.js') as typeof import('../skills/tools/msg-ask.js');
   specs.push(ledger.buildMsgListTool(), ledger.buildMsgPostTool(), ask.buildMsgAskTool(), ledger.buildMsgAckTool());
+  // COMMITMENT-CLOSE — waker notices name this tool; tool search must find it here (#160639 · #160695).
+  {
+    const commitments = require('../commitment/close.js') as typeof import('../commitment/close.js');
+    specs.push(commitments.buildCommitmentCloseTool());
+    dispatchByName.set(commitments.COMMITMENT_CLOSE_TOOL_NAME, async args => commitments.dispatchCommitmentClose(args as Record<string, unknown>).output);
+  }
+  // HAND-RAISE-LADDER — every ✋ ends in one outcome (resolve · reject · escalate); the auto-escalation notice names this tool.
+  {
+    const hands = require('../skills/tools/hand-raise-tool.js') as typeof import('../skills/tools/hand-raise-tool.js');
+    specs.push(hands.buildHandRaiseTool());
+    dispatchByName.set(hands.HAND_RAISE_TOOL_NAME, async args => hands.dispatchHandRaise(args as Record<string, unknown>).output);
+  }
+  // OP-HANDLES-L2b — the one-step assignment door; coordinators reach for it instead of «assign via mail + check writers».
+  {
+    const assign = require('../skills/tools/seat-assign-tool.js') as typeof import('../skills/tools/seat-assign-tool.js');
+    specs.push(assign.buildSeatAssignTool());
+    dispatchByName.set(assign.SEAT_ASSIGN_TOOL_NAME, async args => (await assign.dispatchSeatAssign(args as Record<string, unknown>)).output);
+  }
   // SESSION-AUTOPILOT — the structured switch (autopilot_set) and the person's goal stack, in every session.
   {
     const autopilot = require('../session-autopilot/autopilot-tool.js') as typeof import('../session-autopilot/autopilot-tool.js');
@@ -613,7 +652,9 @@ export function buildReplTools(options: {
             && step[3] === '--previous-green' && /^(?:0|[1-9][0-9]{0,3})$/.test(step[4]!)
             && step[5] === '--expect-version' && /^[0-9]+\.[0-9]+\.[0-9]+(?:-dev\.[0-9]+)?$/.test(step[6]!)
             && step[7] === '--json';
-          return { allowed: !requiresApproval && (exactOp || exactCost || exactInbox), priorHumanApproval: false };
+          // RUNSHELL-SEARCH-PARITY — read-only search steps (rg · git grep · ast-grep · eln docs search) need no approver.
+          const search = runShellMod.searchCommandPolicy(step) === 'read-local';
+          return { allowed: !requiresApproval && (exactOp || exactCost || exactInbox || search), priorHumanApproval: false };
         }
         if (runShellMod.scriptCommandPolicy(step) !== 'read-local')
           return { allowed: true, priorHumanApproval: false };
@@ -818,6 +859,14 @@ function buildAgentSystemPrompt(
       ...(modelFamily !== undefined ? { modelFamily } : {}),
       enabledTools: [...enabledToolNames],
       ...(role !== undefined ? { seatRole: role } : {}),
+      // SEAT-TURN-FOLLOWUPS Q10 — space leads and kingdom seats get the leader card (federation.yaml ⊕ coord-tracks).
+      ...(() => {
+        try {
+          const detection = detectSeatTui(cwd);
+          const lead = detection ? (require('../seat/seat-leadership.js') as typeof import('../seat/seat-leadership.js')).liveSeatLeadership(detection.seat, cwd) : null;
+          return lead ? { seatLeader: lead } : {};
+        } catch { return {}; }
+      })(),
       // ELN-PROMPT-CACHE-PIN — built once per session; the els block travels in the turn's volatile context.
       sessionPinned: true,
     });
@@ -945,18 +994,32 @@ function buildReplVolatileContext(ctx: ReplSystemPromptContext): string[] {
       const seat = seatContext.seat;
       ownerCheck = '## 조사 전 주인 확인\n일반 조사·구현을 시작하기 전에 현재 일의 구조화된 칸·PR·우편 참조와 최신 주인 정본을 확인하라. '
         + `참조가 없거나 주인 조회가 unknown이면 멈추거나 사람을 부르지 말고 내 일을 직접 찾는다: \`eln release checklist status --version <현재 판> --owner ${seat} --json\` 의 내 노랑 칸과 \`eln msg list --to ${seat}\` 의 미읽음 우편을 읽고 맨 위 일로 바로 진행하라. `
-        + '내 칸·우편이 모두 0건이면 «일감 0»이라고 한 줄로 알리고 기다린다(막힘 아님). 다른 자리가 주인으로 확인된 일이면 주인에게 조율하고 중복 조사를 시작하지 마라. 이 지침은 인가 판정이 아니다.';
+        + `${SEAT_ZERO_WORK_CONTINUE} ` + '다른 자리가 주인으로 확인된 일이면 주인에게 조율하고 중복 조사를 시작하지 마라. 이 지침은 인가 판정이 아니다.';
+      // HAND-PULL-FIRST — a hand seat pulls `eln work next` when its cell is done (never waits for an assignment).
+      try { if (seatRole(seat) === 'hand') ownerCheck += ` ${SEAT_HAND_PULL_LINE}`; } catch { /* role unknown: no hand line */ }
       ownerCheck += '\n' + buildTurnOwnerResult(seatContext.seat, ctx.workReferences, ctx.ownerReaders);
     }
   } catch { /* seat detection unavailable: do not invent an identity */ }
   if (ownerCheck) out.push(ownerCheck);
+  // COACH-CONTEXT-AUTO-INJECT — the WORLD block (facts + coach delta) for opted-in seats (default OP) on every turn.
+  try {
+    const seatContext = resolveSeatMemoryContext(ctx.cwd, ctx.seatBootDeps ?? {});
+    if (seatContext) {
+      const world = (require('../op-world/op-world.js') as typeof import('../op-world/op-world.js')).worldBlockForSeatTurn(seatContext.seat);
+      if (world) out.push(world);
+    }
+  } catch { /* the WORLD block only drops out */ }
   // SESSION-AUTOPILOT — while ON, the decision-autonomy paragraph + the person's goals ride the turn's volatile tail.
   try {
     const ap = require('../session-autopilot/autopilot.js') as typeof import('../session-autopilot/autopilot.js');
     const goalsMod = require('../session-autopilot/goals.js') as typeof import('../session-autopilot/goals.js');
     const file = ap.autopilotStateFile(ctx.cwd);
-    const paragraph = ap.autopilotPolicyParagraph(ap.readAutopilotState(file), goalsMod.readGoals(goalsMod.autopilotGoalsFile(file)) ?? []);
+    const apState = ap.readAutopilotState(file);
+    const paragraph = ap.autopilotPolicyParagraph(apState, goalsMod.readGoals(goalsMod.autopilotGoalsFile(file)) ?? []);
     if (paragraph) out.push(paragraph);
+    // AUTOPILOT-DYNAMIC-GOAL-FEED — the effective goal rides FIRST as one fixed-id block (same goal = same bytes · replaced, never stacked).
+    const feed = require('../session-autopilot/dynamic-goal.js') as typeof import('../session-autopilot/dynamic-goal.js');
+    return feed.withGoalFeed(out, apState?.on ? feed.goalFeedBlock(apState.derived) : null);
   } catch { /* the paragraph only drops out */ }
   return out;
 }
@@ -1079,6 +1142,30 @@ function buildSeatBootCardText(ctx: {
   }
 }
 
+/** IMAGE-REQUEST-BUDGET — normalize image attachments (2048 px · JPEG/WebP re-encode) and add the resize notice the
+ *  model reads (upstream codex image_resize_notice). A dropped image becomes a text block naming its path. */
+async function prepareAttachmentBlocks(
+  attachments: readonly PendingAttachment[],
+  onDropped: (note: string) => void,
+): Promise<ContentBlock[]> {
+  const imageCount = attachments.filter((a) => a.block.type === 'image').length;
+  const blocks: ContentBlock[] = [];
+  const notices: string[] = [];
+  let index = 0;
+  for (const attachment of attachments) {
+    if (attachment.block.type !== 'image') { blocks.push(attachment.block); continue; }
+    index += 1;
+    const prepared = await prepareRequestImage(Buffer.from(attachment.block.base64, 'base64'), attachment.path, {
+      mediaType: attachment.block.mediaType, index, total: imageCount, where: 'user message',
+    });
+    blocks.push(prepared.block);
+    if (prepared.notice) notices.push(prepared.notice);
+    if (prepared.droppedNote) onDropped(prepared.droppedNote);
+  }
+  for (const notice of notices) blocks.push({ type: 'text', text: notice });
+  return blocks;
+}
+
 function loadAttachment(rawPath: string, baseDir: string): PendingAttachment | null {
   const resolved = isAbsolute(rawPath) ? rawPath : resolvePath(baseDir, rawPath);
   if (!existsSync(resolved)) {
@@ -1152,7 +1239,14 @@ async function runOneTurn(
       provider: cfg.llm.provider, model: cfg.llm.model ?? null, durationMs: Date.now() - startedAt, logPath: null };
   }
   const replyChunks: string[] = [];
-  const userImages = pendingAttachments.length > 0 ? pendingAttachments.map(a => a.block) : [];
+  // IMAGE-REQUEST-BUDGET — every attached image is downscaled/re-encoded before it joins the request; one that still
+  // cannot fit is sent as its path with a visible note, never failing the turn.
+  const userImages = pendingAttachments.length > 0
+    ? await prepareAttachmentBlocks(pendingAttachments, (note) => {
+      if (jsonOutput) onJsonStatus?.(note);
+      else ui.info(note);
+    })
+    : [];
   if (!jsonOutput) {
     process.stdout.write('  ');
   }
@@ -1222,7 +1316,7 @@ async function runOneTurn(
     : undefined;
   const stopSteerListener = steerInbox && steerTurnId
     ? steerRouter.listen(steerTurnId, (request) => {
-      if (request.kind === 'steer') steerInbox.push(request.steerId, request.text, request.urgent === true, request.seatMail);
+      if (request.kind === 'steer') steerInbox.push(request.steerId, request.text, request.urgent === true, request.seatMail, request.attachments ?? [], process.cwd());
       else steerInbox.retract(request.steerIds);
     })
     : undefined;
@@ -1299,7 +1393,9 @@ async function runOneTurn(
       if (jsonOutput && onJsonToolActivity) {
         activeToolCalls.delete(call.id);
         const agentSummary = call.name === 'Agent' ? safeAgentSummary(call.result) : undefined;
-        onJsonToolActivity({ phase: 'finish', id: call.id, name: call.name, ...(agentSummary ? { summary: agentSummary } : {}) });
+        const agentSpend = call.name === 'Agent' ? agentSpendLabel(call.result) : undefined;
+        onJsonToolActivity({ phase: 'finish', id: call.id, name: call.name, ...(agentSummary ? { summary: agentSummary } : {}), ...(agentSpend ? { spend: agentSpend } : {}),
+          ...(toolResultFailed(call.result) ? { failed: true } : {}) });
       }
       if (call.name === 'Agent') onJsonAgent?.({ phase: 'finish', id: call.id, status: agentResultStatus(call.result) });
       if (jsonOutput && onJsonShellActivity && (call.name === 'Bash' || call.name === 'RunShell')) {
@@ -1736,7 +1832,15 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       const turnPrompt = systemPromptForTurn(turn.workReferences);
       // ELN-PROMPT-CACHE-PIN — the self-health line changes per turn: volatile context, not the instructions.
       const turnSystemPrompt = turnPrompt.stable;
-      const turnVolatileContext = selfHealth ? [...turnPrompt.volatile, selfHealth.line] : turnPrompt.volatile;
+      const turnVolatileBase = selfHealth ? [...turnPrompt.volatile, selfHealth.line] : turnPrompt.volatile;
+      // SIGNAL-INBOX-SNAPSHOT (Q6) — a seat turn (incl. every goal-drive continuation) carries one «Inbox (unhandled)» block.
+      const inboxSnapshot = (() => {
+        try {
+          const seat = (require('../seat/seat-boot-preamble.js') as typeof import('../seat/seat-boot-preamble.js')).detectSeat(process.cwd())?.seat ?? null;
+          return (require('../msg/inbox-snapshot-turn.js') as typeof import('../msg/inbox-snapshot-turn.js')).seatInboxSnapshotText(seat);
+        } catch { return null; }
+      })();
+      const turnVolatileContext = inboxSnapshot ? [...turnVolatileBase, inboxSnapshot] : turnVolatileBase;
       let result: Awaited<ReturnType<typeof runOneTurn>>;
       const turnAbort = new AbortController();
       const pushNowReady = new Set<string>();

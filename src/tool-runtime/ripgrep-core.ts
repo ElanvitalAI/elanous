@@ -41,6 +41,8 @@ export interface RgSpawnOpts {
 export interface RgListFilesOpts extends RgSpawnOpts {
   /** rg --glob 패턴들(gitignore-스타일·경로 필터). 없으면 전체 파일. */
   globs?: readonly string[];
+  /** rg --iglob 패턴들 — globs 와 같되 대소문자 무시(Glob 툴 기본 · search-bench 절제 −0.22). */
+  iglobs?: readonly string[];
 }
 
 /** rg 저수준 실행 — 인자 조립·에러 분류. 내부 공용. */
@@ -81,6 +83,7 @@ export function rgListFiles(opts: RgListFilesOpts): RgResult {
   const args = ['--files'];
   appendIgnoreArgs(args, opts.noIgnore);
   for (const g of opts.globs ?? []) { args.push('--glob', g); }
+  for (const g of opts.iglobs ?? []) { args.push('--iglob', g); }
   return runRg(args, opts);
 }
 

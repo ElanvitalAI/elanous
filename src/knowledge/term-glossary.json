@@ -1,0 +1,16 @@
+{
+ "schema": "elanous.term-glossary/1",
+ "note": "Generic ko<->en term pairs for search query expansion (operations / repo vocabulary). Product Grep (files_with_matches) and DocsSearch expand query words with it; search-bench strategies with expand=true use the same file. Not derived from any gold set.",
+ "pairs": [
+  ["판정", "judge"], ["판정국", "judge"], ["부하", "load"], ["로드", "load"], ["줄이기", "reduction"], ["감소", "reduction"],
+  ["발행", "release"], ["발행", "ship"], ["승인", "approval"], ["카드", "card"], ["피처", "feature"], ["기능", "feature"],
+  ["가속", "acceleration"], ["착지", "land"], ["착지", "landing"], ["줄", "queue"], ["그래프", "graph"], ["검색", "search"],
+  ["문서", "doc"], ["자리", "seat"], ["우편", "mail"], ["분류", "triage"], ["한번에", "bulk"], ["반복", "repeat"],
+  ["반복", "loop"], ["차단", "block"], ["가드", "guard"], ["자격", "credential"], ["금고", "vault"], ["임대", "lease"],
+  ["정적", "static"], ["키", "key"], ["시간대", "time"], ["조회", "window"], ["창", "window"], ["예약", "schedule"],
+  ["예약", "scheduler"], ["트리거", "trigger"], ["레시피", "recipe"], ["기억", "memory"], ["색인", "index"],
+  ["설정", "config"], ["구현", "implement"], ["호출", "call"], ["시나리오", "scenario"], ["회귀", "regression"],
+  ["매일", "daily"], ["시크릿", "secret"], ["암호화", "encrypt"], ["봉투", "envelope"], ["치유", "heal"], ["카드", "card"],
+  ["원격", "remote"], ["붙기", "attach"], ["어디서든", "anywhere"], ["흡수", "absorb"], ["칸", "cell"], ["예산", "budget"]
+ ]
+}

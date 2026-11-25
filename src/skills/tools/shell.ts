@@ -39,7 +39,7 @@ import { debug, redactSecretText, redactSecrets } from '../../debug/log.js';
 import { getSessionCwd } from '../../session/working-dir.js';
 import { clampShellTimeoutMs } from '../../tool-runtime/shell-watchdog.js';
 import { getUserConfig } from '../../user-config/reader.js';
-import type { CapsulePolicy, CapsuleStatus } from '../../turn-capsule/contract.js';
+import { knownLongShellRunner, type CapsulePolicy, type CapsuleStatus } from '../../turn-capsule/contract.js';
 import { runShellCapsule, shellCapsulePolicy, type ShellCapsuleDeps } from '../../turn-capsule/shell-capsule.js';
 import { triageShellIsolation } from '../../shell-runner/isolation-triage.js';
 import { prepareRunnerRunShell } from '../../shell-runner/prepare-runshell.js';
@@ -47,7 +47,9 @@ import { resolve } from 'node:path';
 import { scriptCommandPolicy, runShellScript } from './run-shell-script.js';
 import { dispatchSignedRecipe } from './run-shell-recipe-dispatch.js';
 import { defaultCheckScript } from './run-shell-default-checks.js';
+import { finishRunShellSearch, planRunShellSearch, searchCommandPolicy, parseRunShellSearch, type RunShellSearchPlan } from './run-shell-search.js';
 export { scriptCommandPolicy } from './run-shell-script.js';
+export { searchCommandPolicy, runShellSearchStrategy } from './run-shell-search.js';
 import { SCHEDULE_WAKEUP_TOOL_NAME } from './schedule-wakeup.js';
 import {
   globalTaskNotificationQueue,
@@ -58,6 +60,22 @@ import {
   startShellLineWatch,
   type ShellLineWatchSpec,
 } from './shell-line-watch.js';
+
+/** RunShell entry variants: exactly one entry key, plus the listed companions.
+ *  Kept out of the JSON schema (Claude rejects top-level combinators) and
+ *  enforced by assertRunShellEntry before dispatch. */
+export const RUN_SHELL_ENTRY_VARIANTS: ReadonlyArray<readonly string[]> = [
+  ['command'], ['script'], ['recipeId'], ['check', 'checkSeat', 'checkVersion'],
+];
+
+export function assertRunShellEntry(rawArgs: Record<string, unknown>): void {
+  const present = RUN_SHELL_ENTRY_VARIANTS.filter((variant) => rawArgs[variant[0]!] !== undefined);
+  if (present.length !== 1) {
+    throw new Error('RunShell requires exactly one of command, script, recipeId or check');
+  }
+  const missing = present[0]!.filter((key) => rawArgs[key] === undefined);
+  if (missing.length) throw new Error(`RunShell ${present[0]![0]} requires ${missing.join(', ')}`);
+}
 
 /** LLMToolSpec — the shape surfaced to the model. Kept narrow so
  *  accidental misuse is hard: no env override, no cwd outside the
@@ -137,6 +155,10 @@ export function buildRunShellTool(): LLMToolSpec {
           type: 'string',
           description: 'Free-form label shown in shell logs and status.',
         },
+        run_in_background: {
+          type: 'boolean',
+          description: 'true = start in the background now (for a command you know runs for minutes). The turn gets a capsule id at once; continue other work or end the turn — a new turn opens with the output when it finishes. Known long runners (bun run test:deterministic, pregate, els update-all, rail scripts) start in the background on their own.',
+        },
         watchPattern: {
           type: 'string',
           description:
@@ -149,7 +171,9 @@ export function buildRunShellTool(): LLMToolSpec {
             "Requires mode='bg'. Enqueue one <task-notification> once this many complete output lines have been seen.",
         },
       },
-      oneOf: [{ required: ['command'] }, { required: ['script'] }, { required: ['recipeId'] }, { required: ['check', 'checkSeat', 'checkVersion'] }],
+      // No top-level oneOf/anyOf/allOf: Claude (Anthropic and OpenRouter) rejects
+      // composed tool input schemas. The entry variants are enforced at runtime by
+      // assertRunShellEntry instead (RUN_SHELL_ENTRY_VARIANTS).
       additionalProperties: false,
     },
   };
@@ -218,6 +242,33 @@ function asMode(raw: unknown): 'inline' | 'bg' | undefined {
   if (raw === undefined) return undefined;
   if (raw === 'inline' || raw === 'bg') return raw;
   throw new Error(`invalid mode value: ${JSON.stringify(raw)}`);
+}
+
+/** RUNSHELL-SEARCH-PARITY — the search argv behind the hardened script git-read prefix (exact form only). */
+const SCRIPT_GIT_READ_PREFIX_LENGTH = 12;
+export function runShellSearchView(command: readonly string[], scriptGitRead: boolean): readonly string[] {
+  return scriptGitRead && command[0] === 'git' ? ['git', ...command.slice(SCRIPT_GIT_READ_PREFIX_LENGTH)] : command;
+}
+
+function rejectedSearchResult(reason: string): RunShellDispatchResult {
+  return {
+    output: `RunShell refused a search flag: ${reason}. Search argv is read-only (rg · git grep · ast-grep run|scan · eln docs search).`,
+    exitCode: null, outcome: 'denied', elapsedMs: 0, stdout: '', stderr: reason, truncated: false,
+    approvalKey: 'rejected:search-flag', sandboxed: false, sandboxTool: 'none',
+  };
+}
+
+/** Apply the search plan to a finished RunShell result: hints · citations · miss log · byte summary. */
+function withSearchParity(result: RunShellDispatchResult, plan: RunShellSearchPlan | null, cwd: string): RunShellDispatchResult {
+  if (!plan || result.outcome === 'started') return result;
+  const done = finishRunShellSearch(plan, result, resolve(cwd));
+  return {
+    ...result,
+    stdout: done.stdout,
+    output: `${result.output} search=${plan.parsed.tool} hits=${done.hits}${plan.addedRoots.length ? ` roots+${plan.addedRoots.length}` : ''}`,
+    searchRawBytes: done.rawBytes,
+    search: { tool: plan.parsed.tool, hits: done.hits, rawBytes: done.rawBytes, returnedBytes: done.returnedBytes, addedRoots: plan.addedRoots.length },
+  };
 }
 
 function rejectedCdResult(): RunShellDispatchResult {
@@ -744,6 +795,7 @@ export async function dispatchRunShell(
      * 모델 경계 마스킹은 외측 script 결과 반환 시 단일 출구(script 결과 반환 직후)에서 1회. */
     rawInternal?: boolean; tolerateCheckInboxFailure?: boolean } = {},
 ): Promise<RunShellDispatchResult> {
+  assertRunShellEntry(rawArgs);
   if (rawArgs.recipeId !== undefined) {
     if (typeof rawArgs.recipeId !== 'string' || Object.keys(rawArgs).some(key => !['recipeId', 'timeoutMs'].includes(key)))
       throw new Error('RunShell recipe accepts only recipeId and timeoutMs');
@@ -826,6 +878,17 @@ export async function dispatchRunShell(
   const cwdSource = cwd === undefined ? 'session' : 'argument';
   const boundaryReject = harnessCommandWriteReject(command, effectiveCwd, 'run-shell');
   if (boundaryReject) throw new Error(boundaryReject);
+  // RUNSHELL-SEARCH-PARITY — read-only search argv: refuse rewrite/exec flags, add configured roots when
+  // the cwd is stale or the filter is markdown, then cite result paths (repo:<id>/… · ref:<id>/…).
+  const searchView = runShellSearchView(command, opts.scriptGitRead === true);
+  if (searchCommandPolicy(searchView) === 'deny') {
+    const reason = parseRunShellSearch(searchView)?.refused ?? 'refused';
+    logShellDispatch('search.refused', { reason }, argsTrace);
+    return rejectedSearchResult(reason);
+  }
+  let searchPlan: RunShellSearchPlan | null = null;
+  try { searchPlan = planRunShellSearch(searchView, resolve(effectiveCwd)); } catch { searchPlan = null; }
+  const spawnCommand = searchPlan?.addedRoots.length ? [...command, ...searchPlan.argv.slice(searchView.length)] : command;
 
   // Explicit inline/bg uses the file-backed runner when its deps are installed;
   // omitted mode and uninitialized hosts keep the legacy argv path.
@@ -848,7 +911,7 @@ export async function dispatchRunShell(
   if (mode && deps) {
     let prepared: Awaited<ReturnType<typeof prepareRunnerRunShell>>;
     try {
-      prepared = await prepareRunnerRunShell({ command, cwd: effectiveCwd, sessionId: opts.sessionId,
+      prepared = await prepareRunnerRunShell({ command: spawnCommand, cwd: effectiveCwd, sessionId: opts.sessionId,
         signal: opts.signal, sandbox, network, approval });
     } catch { prepared = null; }
     if (!prepared) {
@@ -857,7 +920,7 @@ export async function dispatchRunShell(
         truncated: false, approvalKey: 'runner:denied', sandboxed: false, sandboxTool: 'none' };
     }
     if (!prepared.grant) {
-      const gated = await gateShellCommand({ command, cwd, approval, network, signal: opts.signal }, opts.priorHumanApproval);
+      const gated = await gateShellCommand({ command: spawnCommand, cwd, approval, network, signal: opts.signal }, opts.priorHumanApproval);
       if (gated) return {
         output: formatSummary(gated), exitCode: gated.exitCode, outcome: gated.outcome,
         elapsedMs: gated.elapsedMs, stdout: gated.stdout, stderr: gated.stderr,
@@ -865,13 +928,14 @@ export async function dispatchRunShell(
         sandboxed: gated.sandboxed, sandboxTool: gated.sandboxTool,
       };
     }
-    const result = await dispatchViaRunner({
+    const runnerResult = await dispatchViaRunner({
       command: prepared.command, cwd: resolve(effectiveCwd), timeoutMs, mode, description,
       grant: prepared.grant, sandboxed: prepared.sandboxed, sandboxTool: prepared.sandboxTool,
       ...(watch ? { watch } : {}), signal: opts.signal, ownerSessionId: opts.sessionId,
       deps, rawInternal: opts.rawInternal === true,
       ...(opts.onSpawn ? { onSpawn: opts.onSpawn } : {}),
     });
+    const result = withSearchParity(runnerResult, searchPlan, effectiveCwd);
     logShellDispatch(`runner.${result.outcome}`, { cwd: effectiveCwd, cwdSource }, argsTrace);
     // RSEM-RAW-RECEIPT — 내부 script-step 재귀는 원문 반환(외측 단일 출구에서 1회 마스킹).
     if (opts.rawInternal) return result;
@@ -879,7 +943,7 @@ export async function dispatchRunShell(
   }
 
   const result = await runShell({
-    command,
+    command: spawnCommand,
     cwd,
     timeoutMs,
     ...(opts.scriptGitRead ? { env: { GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' } } : {}),
@@ -896,7 +960,7 @@ export async function dispatchRunShell(
   const summary = result.watchdog ? `${result.watchdog.text}\n${formatSummary(result)}` : formatSummary(result);
   // RUNSHELL-OUTPUT-EGRESS-MASK — 모델로 나가는 결과 텍스트의 단일 출구(legacy 경로).
   // RSEM-RAW-RECEIPT — 내부 script-step 재귀 호출은 원문을 그대로 돌려준다(외측에서 1회 마스킹).
-  if (opts.rawInternal) return withLongSleepWarning({
+  if (opts.rawInternal) return withLongSleepWarning(withSearchParity({
     ...(result.watchdog ? { watchdog: result.watchdog } : {}),
     output: summary,
     exitCode: result.exitCode,
@@ -908,8 +972,8 @@ export async function dispatchRunShell(
     approvalKey: result.approvalKey,
     sandboxed: result.sandboxed,
     sandboxTool: result.sandboxTool,
-  }, longSleep, bgAvailable, resumeHint);
-  return maskRunShellEgress(withLongSleepWarning({
+  }, searchPlan, effectiveCwd), longSleep, bgAvailable, resumeHint);
+  return maskRunShellEgress(withLongSleepWarning(withSearchParity({
     ...(result.watchdog ? { watchdog: result.watchdog } : {}),
     output: summary,
     exitCode: result.exitCode,
@@ -921,7 +985,7 @@ export async function dispatchRunShell(
     approvalKey: result.approvalKey,
     sandboxed: result.sandboxed,
     sandboxTool: result.sandboxTool,
-  }, longSleep, bgAvailable, resumeHint));
+  }, searchPlan, effectiveCwd), longSleep, bgAvailable, resumeHint));
 }
 
 /** RUNSHELL-OUTPUT-EGRESS-MASK (ROSTER-0333-60 · #39491과 같은 출구 원칙) — RunShell 결과의
@@ -1168,9 +1232,10 @@ export function runShellCapsuleNoticeText(result: RunShellDispatchResult): strin
 /** CAPSULE-A2 — what the turn reads when its RunShell call moved to the background (model contract · A5 owns wording). */
 export function runShellCapsuleStartedResult(capsuleId: string, syncCapMs: number): RunShellDispatchResult {
   return {
-    output: `RunShell outcome=started capsule=${capsuleId} — still running after ${Math.round(syncCapMs / 1000)}s, so it moved `
-      + 'to the background (same process, same timeout). Do not wait or poll for it: finish this turn. Its result arrives '
-      + `as a new turn event (capsule-done ${capsuleId}).`,
+    output: `RunShell outcome=started capsule=${capsuleId} · running in background · will wake on completion — still running `
+      + `after ${Math.round(syncCapMs / 1000)}s (same process, same timeout). If this turn has other work, continue it; `
+      + 'otherwise end the turn with one line saying you are waiting for it — a new turn opens with its output '
+      + `(capsule-done ${capsuleId}) when it finishes. Do not poll or sleep for it.`,
     exitCode: null, outcome: 'started', elapsedMs: syncCapMs, stdout: '', stderr: '', truncated: false,
     approvalKey: `capsule:${capsuleId}`, sandboxed: false, sandboxTool: 'none',
   };
@@ -1184,12 +1249,17 @@ export function dispatchRunShellCapsule(
     scriptApproval?: (command: string[], signal?: AbortSignal) => Promise<{ allowed: boolean; priorHumanApproval: boolean }> } = {},
   deps: Omit<ShellCapsuleDeps, 'policy'> & { readonly policy?: CapsulePolicy } = {},
 ): Promise<RunShellDispatchResult> {
+  // RUNSHELL-BG-ENDS-TURN ② — `run_in_background` is a capsule request, not a dispatcher argument.
+  const { run_in_background: wantsBackground, ...shellArgs } = rawArgs;
+  rawArgs = shellArgs;
   if (rawArgs.mode === 'bg') return dispatchRunShell(rawArgs, opts);
   const policy = deps.policy ?? shellCapsulePolicy(deps.correlation);
   const { signal, ...rest } = opts;
   const command = Array.isArray(rawArgs.command) ? rawArgs.command.filter((part) => typeof part === 'string').join(' ') : '';
   return runShellCapsule<RunShellDispatchResult>({
     tool: 'RunShell', command, clockFromSpawn: true,
+    ...(wantsBackground === true || (Array.isArray(rawArgs.command) && knownLongShellRunner(
+      rawArgs.command.filter((part): part is string => typeof part === 'string')) !== null) ? { requestedBackground: true } : {}),
     ...(signal ? { turnSignal: signal } : {}),
     start: (own, spawned) => dispatchRunShell(rawArgs, { ...rest, ...(own ? { signal: own } : {}), onSpawn: spawned }),
     describe: (result) => ({ status: runShellCapsuleStatus(result), output: runShellCapsuleNoticeText(result) }),

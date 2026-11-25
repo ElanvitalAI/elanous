@@ -42,7 +42,7 @@ describe('MCP Agent spawn and retrieval', () => {
 
       const launched = await handleMcpRequest({
         jsonrpc: '2.0', id: 3, method: 'tools/call',
-        params: { name: 'agent', arguments: { description: 'MCP worker', prompt: 'Answer this' } },
+        params: { name: 'agent', arguments: { description: 'MCP worker', prompt: 'Answer this', reason: 'background worker' } },
       }, ctx);
       expect(launched.error).toBeUndefined();
       const handle = (launched.result as { structuredContent: { taskId: string; background: boolean } }).structuredContent;
@@ -93,7 +93,7 @@ describe('MCP Agent spawn and retrieval', () => {
       const listed = await handleMcpRequest({ jsonrpc: '2.0', id: 7, method: 'tools/list' });
       const agentSchema = (listed.result as { tools: Array<{ name: string; inputSchema: { properties: Record<string, unknown> } }> })
         .tools.find(t => t.name === 'Agent')?.inputSchema;
-      const clientArgs = { description: 'Cwd worker', prompt: 'Respond', cwd };
+      const clientArgs = { description: 'Cwd worker', prompt: 'Respond', reason: 'pinned cwd worker', cwd };
       expect(agentSchema?.properties).toHaveProperty('cwd');
       for (const surface of ['skill', 'tui'] as const) {
         const hostList = await handleMcpRequest({ jsonrpc: '2.0', id: 8, method: 'tools/list' }, { surface });
@@ -129,7 +129,7 @@ describe('MCP Agent spawn and retrieval', () => {
     }));
     try {
       expect(buildAgentTool().parameters.properties).not.toHaveProperty('cwd');
-      const result = await agentRuntime.run({ description: 'Runtime worker', prompt: 'Respond', run_in_background: true }, runtimeContext);
+      const result = await agentRuntime.run({ description: 'Runtime worker', prompt: 'Respond from runtime context', reason: 'runtime forwarding', run_in_background: true }, runtimeContext);
       expect('taskId' in result && result.taskId).toBe('runtime-cwd-id');
       expect(spawn.mock.calls[0]?.[0].cwd).toBe(cwd);
       expect(spawn.mock.calls[0]?.[0].tools?.map(s => s.name).sort())
@@ -153,7 +153,7 @@ describe('MCP Agent spawn and retrieval', () => {
       const result = await handleMcpRequest({
         jsonrpc: '2.0', id: 5, method: 'tools/call',
         params: { name: 'Agent', arguments: {
-          description: 'Synchronous worker', prompt: 'Respond', run_in_background: false,
+          description: 'Synchronous worker', prompt: 'Respond synchronously', reason: 'synchronous path', run_in_background: false,
         } },
       });
       expect(result.error).toBeUndefined();

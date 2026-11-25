@@ -15,7 +15,7 @@ export type CodexDeviceLoginWaitResult =
 
 export function formatCodexDeviceLoginFailure(error: unknown): string {
   const detail = error instanceof Error ? error.message : String(error);
-  return `Codex 로그인 실패: ${detail}`;
+  return `Codex login failed: ${detail}`;
 }
 
 /** Run device-code login with one stable wait line and cooperative Ctrl-C cancellation. */
@@ -36,7 +36,7 @@ export async function runCodexDeviceLoginWait(
   const elapsedSeconds = () => Math.floor((Date.now() - (startedAt ?? Date.now())) / 1000);
   const updateWaitLine = () => {
     if (!options.headless || startedAt === undefined || controller.signal.aborted) return;
-    const line = `Codex 로그인 대기 중… ${elapsedSeconds()}초 · Ctrl-C 취소`;
+    const line = `Waiting for Codex login… ${elapsedSeconds()}s · Ctrl-C to cancel`;
     if (io.updateLine) {
       lineStarted = true;
       io.updateLine(line);
@@ -58,25 +58,25 @@ export async function runCodexDeviceLoginWait(
       if (controller.signal.aborted) return;
       if (event.type === 'user_code') {
         io.print(options.introMessage ?? (options.headless
-          ? '헤드리스 Codex 로그인 · 브라우저에서 아래 주소를 열고 코드를 입력하세요'
-          : 'Codex 로그인: 브라우저에서 아래 주소를 열고 코드를 입력하세요'));
-        io.print(`주소: ${event.loginUrl ?? 'https://auth.openai.com/codex/device'}`);
-        io.print(`코드: ${event.userCode ?? '(없음)'}`);
+          ? 'Headless Codex login · open this address in a browser and enter the code'
+          : 'Codex login: open this address in a browser and enter the code'));
+        io.print(`Address: ${event.loginUrl ?? 'https://auth.openai.com/codex/device'}`);
+        io.print(`Code: ${event.userCode ?? '(none)'}`);
         startedAt = Date.now();
         updateWaitLine();
         if (options.headless) timer = setInterval(updateWaitLine, 1_000);
       } else if (event.type === 'polling') {
         if (options.headless) updateWaitLine();
         else if (!waitingLinePrinted) {
-          io.print('Codex 로그인을 기다리는 중… · Ctrl-C 취소');
+          io.print('Waiting for Codex login… · Ctrl-C to cancel');
           waitingLinePrinted = true;
         }
       } else if (event.type === 'exchanging') {
         if (timer !== undefined) { clearInterval(timer); timer = undefined; }
         if (options.headless) {
-          io.updateLine?.(`Codex 로그인 확인 중… ${elapsedSeconds()}초`);
+          io.updateLine?.(`Checking Codex login… ${elapsedSeconds()}s`);
           lineStarted ||= io.updateLine !== undefined;
-        } else io.print('Codex 로그인을 확인하는 중…');
+        } else io.print('Checking Codex login…');
       }
     },
   })).then(

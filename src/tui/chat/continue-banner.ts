@@ -16,6 +16,7 @@ export const CONTINUE_REASON = {
 const RESUME_BY_ORIGIN: Readonly<Partial<Record<InternalTurnOrigin | string, string>>> = {
   scheduled: 'Resuming (scheduled check)',
   retro: 'Resuming (scheduled retro)',
+  pulse: 'Resuming (OP pulse)',
   'msg-wake': 'Resuming (new message)',
   'child-complete': 'Resuming (delegated work finished)',
   autowake: 'Resuming (remaining work)',

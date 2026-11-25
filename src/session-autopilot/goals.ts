@@ -30,10 +30,10 @@ export const GOAL_NEAR_MS: Record<AutopilotGoalLevel, number> = { short: 0, mid:
 
 /** OP first-start seed (read-only import of standing facts · source=seed so the person can delete them). */
 export const OP_GOAL_SEED: ReadonlyArray<Omit<AutopilotGoal, 'id' | 'owner' | 'status' | 'source'>> = [
-  { level: 'mid', title: '11-26 20:00 AI&B 데모', due: '2026-11-26T20:00:00+09:00' },
-  { level: 'mid', title: '12월 무료 회원 오픈', due: '2026-12-01T00:00:00+09:00' },
-  { level: 'long', title: '2027 Q1 유료 준비', due: '2027-03-31T23:59:00+09:00' },
-  { level: 'long', title: '4월 유료 시작', due: '2027-04-01T00:00:00+09:00' },
+  { level: 'mid', title: '11-26 20:00 AI&B demo', due: '2026-11-26T20:00:00+09:00' },
+  { level: 'mid', title: 'Free membership opens December', due: '2026-12-01T00:00:00+09:00' },
+  { level: 'long', title: '2027 Q1 paid launch prep', due: '2027-03-31T23:59:00+09:00' },
+  { level: 'long', title: 'Paid launch in April', due: '2027-04-01T00:00:00+09:00' },
 ];
 
 export const autopilotGoalsFile = (stateFile: string): string => join(dirname(stateFile), 'goals.json');
@@ -113,9 +113,9 @@ export const activeGoals = (goals: readonly AutopilotGoal[]): AutopilotGoal[] =>
 /** «D-2» · «D-0 5h» · «지남» — time to due. */
 export function timeToDue(due: string | undefined, now: number): string {
   const at = Date.parse(due ?? '');
-  if (!Number.isFinite(at)) return '기한 없음';
+  if (!Number.isFinite(at)) return 'no due date';
   const ms = at - now;
-  if (ms < 0) return '지남';
+  if (ms < 0) return 'overdue';
   const days = Math.floor(ms / 86_400_000);
   return days > 0 ? `D-${days}` : `D-0 ${Math.max(1, Math.round(ms / 3_600_000))}h`;
 }

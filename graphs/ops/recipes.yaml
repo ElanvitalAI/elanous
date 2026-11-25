@@ -45,3 +45,7 @@ host-reservation-watch-shadow:
 resource-heartbeat-collect:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/resource-ledger/host-readiness-collector.ts"'
   timeout_ms: 120000 # Five-minute collection interval; bounded SSH probes per registered host.
+# RES-POLICY-GUARDIAN: one patrol tick; outcome partial = a sensor was unmeasured (the tick still completed).
+res-patrol:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" res patrol --json'
+  timeout_ms: 240000 # Five-minute cadence; cloud inventory and the 30-minute credential read are the slow parts.

@@ -1,6 +1,7 @@
 // Serialization owns the canonical typed-to-sparse on-disk projection.
 import type { UserConfig, AcpConfig, VwEntryConfig, VwKnownName } from './types.js';
 import type { ModelTierUserConfig } from '../model-tier/types.js';
+import { CHAT_DEFAULTS } from './chat.js';
 
 export interface UserConfigSerializerDependencies {
   parseProjectRubricAxes(id: string, axes: unknown): Array<{ key: string; weight: number }>;
@@ -123,6 +124,7 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
     ...(cfg.starter ? { starter: cfg.starter } : {}),
     ...(cfg.watch ? { watch: cfg.watch } : {}),
     ...(cfg.guardian ? { guardian: cfg.guardian } : {}),
+    ...(cfg.res ? { res: cfg.res } : {}),
     ...(cfg.loops ? { loops: {
       ...rawLoops,
       owners: cfg.loops.owners ?? {}, defaultOwner: cfg.loops.defaultOwner ?? 'OP',
@@ -318,6 +320,11 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
     shell: cfg.shell,
     errorReports: cfg.errorReports ? stripUndef({ ...cfg.errorReports }) : undefined,
     chat: stripUndef({
+      // ★ 2026-11-25 ELN-CONFIG-SET-DROPS: chat.factQuestion was typed and parsed but missing from this whitelist, so
+      //   `config set chat.factQuestion.maxToolTurns 60` saved, re-read 6 («직렬화 드롭»).
+      //   Sparse: written only when it differs from the default.
+      factQuestion: cfg.chat.factQuestion.maxToolTurns !== CHAT_DEFAULTS.factQuestion.maxToolTurns
+        ? { maxToolTurns: cfg.chat.factQuestion.maxToolTurns } : undefined,
       fastPath: cfg.chat.fastPath,
       conciseness: stripUndef({
         enabled: cfg.chat.conciseness.enabled,

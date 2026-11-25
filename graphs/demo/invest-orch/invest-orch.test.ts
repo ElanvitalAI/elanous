@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseGraphTemplateYaml } from '../../../src/self-implement/graph-yaml.js';
 import { parentRunSources } from '../../../scripts/demo-invest-orch/parent-run-sources.js';
+import { graphBindings, parsePanelNote } from '../../../scripts/demo-invest-orch/scene-feed.js';
 
 const root = mkdtempSync(join(tmpdir(), 'invest-orch-'));
 const saved = { state: process.env.ELANOUS_STATE_DIR, skills: process.env.INVEST_DEMO_SKILLS_DIR };
@@ -134,4 +135,43 @@ test('els tab sources: branch child runs are re-addressed to the parent run; chi
   fire.end!({ graphId: 'invest-orch-demo', runId: 'P', status: 'done' } as never);
   expect(seen).toEqual(['life P plan start', 'life P panel-hbm-ai start', 'prog P panel-hbm-ai runtime=codex model=gpt-6.2-sol · HOLD 6/10',
     'life P panel-hbm-ai end', 'life X cut start', 'end P done']);
+});
+
+// DEMO-INVEST-ORCH-PIN: the same fixture with --raise-decisions gives the stage count 25 → 24 auto · 1 human every run,
+// and no panel row says «default» (fixture mode shows the recorded live model names).
+test('pinned rehearsal: 3 fixture runs with raiseDecisions → 25 · 24 auto · 1 human (publish), identical ids, real model names', async () => {
+  const runs: Array<{ summary: string; ids: string[]; human: string[]; models: string[] }> = [];
+  for (let i = 0; i < 3; i++) {
+    const outDir = join(root, `pin-${i}`);
+    const state = await runGraph(graphPath, { input: { fixtures: true, raiseDecisions: true, simDelayMs: 10, outDir }, quiet: true,
+      deps: { root: join(root, 'universe'), inProcessHandlers: h.createInvestDemoHandlers() } });
+    expect(state.status).toBe('done');
+    const d = JSON.parse(readFileSync(join(outDir, 'dashboard.json'), 'utf8'));
+    runs.push({ summary: d.decisionSummary, ids: d.decisions.map((x: { id: string }) => x.id),
+      human: d.decisions.filter((x: { mode: string }) => x.mode === 'human').map((x: { id: string }) => x.id),
+      models: [...d.panel, ...d.mentors].map((a: { model: string }) => a.model) });
+  }
+  expect(runs[0]!.summary).toBe('결정 대기 25건 → 기준 자동 처리 24건 · 사람 결정 1건');
+  expect(runs[0]!.human).toEqual(['publish-dashboard']);
+  expect(runs[0]!.ids.filter((id) => id.startsWith('answer-accepted:')).length).toBe(15);
+  expect(runs[1]).toEqual(runs[0]!);
+  expect(runs[2]).toEqual(runs[0]!);
+  expect(runs[0]!.models.includes('default')).toBe(false);
+  expect(new Set(runs[0]!.models)).toEqual(new Set(['z-ai/glm-4.6', 'deepseek/deepseek-chat-v3.1', 'qwen/qwen3-235b-a22b-2507', 'moonshotai/kimi-k2', 'grok/grok-4.7', 'gpt-6.2-sol', 'haiku']));
+}, 120_000);
+
+test('without raiseDecisions a rehearsal publishes nothing by hand: 25 → 25 auto · 0 human', () => {
+  const ok = (id: string) => ({ id, role: 'panel' as const, label: id, runtime: 'eln' as const, model: 'm', account: 'a', pane: 'p', status: 'ok' as const, durationMs: 1, source: 'fixture', action: 'HOLD' as const, confidence: 5 });
+  const base = { sources: [], answers: [ok('a'), { ...ok('b'), status: 'failed' as const }], panelOk: 1, panelOf: 1, mentorDirections: [], contradicted: [], mandateArmed: false, fixtures: true };
+  expect(h.triageDecisions(base).map((i) => [i.id, i.mode])).toEqual([['answer-accepted:a', 'auto'], ['panelist-failed:b', 'auto'], ['panel-quorum', 'auto'],
+    ['conatus-execution', 'auto'], ['publish-dashboard', 'auto'], ['disclaimer', 'auto']]);
+  expect(h.triageDecisions({ ...base, raiseDecisions: true }).find((i) => i.id === 'publish-dashboard')!.mode).toBe('human');
+});
+
+test('scene feed reads the panelist note: runtime · model · verdict (and «failed» as no answer)', () => {
+  expect(parsePanelNote('runtime=codex model=gpt-6.2-sol · BUY 7/10 · 메모리 · view')).toEqual({ runtime: 'codex', model: 'gpt-6.2-sol', verdict: 'BUY 7/10' });
+  expect(parsePanelNote('runtime=eln model=z-ai/glm-4.6 · failed · 라벨')).toEqual({ runtime: 'eln', model: 'z-ai/glm-4.6', verdict: 'no answer' });
+  expect(parsePanelNote('plan · fixtures')).toEqual({});
+  const b = graphBindings(graphPath);
+  expect([b.get('panel-hbm-ai'), b.get('panel-korean-flow'), b.get('plan')]).toEqual([{ runtime: 'codex' }, { runtime: 'eln', model: 'moonshotai/kimi-k2' }, {}]);
 });

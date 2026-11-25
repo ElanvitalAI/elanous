@@ -18,6 +18,17 @@ import { debug } from '../debug/log.js';
 /** 로컬 참조 루트(기본 ~/source/ref). 다른 환경엔 없으면 무동작(graceful). */
 export const DEFAULT_REFERENCE_ROOTS = [join(homedir(), 'source', 'ref')];
 
+/** ref 출처 — 단일 해석기(env ELANOUS_SOURCES·ELANOUS_REF_ROOTS > config knowledge.sources type "ref")가 이긴다.
+ *  아무것도 설정되지 않았을 때만 옛 기본(DEFAULT_REFERENCE_ROOTS)으로 오늘처럼 동작한다. */
+export function referenceRoots(): string[] {
+  try {
+    const { resolveSearchRoots } = require('../knowledge/search-roots.js') as typeof import('../knowledge/search-roots.js');
+    const configured = resolveSearchRoots().refRoots;
+    if (configured.length > 0) return configured;
+  } catch { /* fail-soft — 옛 기본 */ }
+  return DEFAULT_REFERENCE_ROOTS;
+}
+
 // 대표 2026-10-14 — 비공개 소스(Claude Code 사본) 통로 차단. Claude Code 는 공개 계약(code.claude.com)만 본다.
 // ref 루트 아래 디렉터리가 실존해도 이 이름이면 그라운딩·조회 대상에서 뺀다(대소문자·`_`/`-` 변형 포함).
 const NON_PUBLIC_REFERENCE_PATTERN = /^claude[-_]?code[-_]?(?:fork|src|source|leak|leaked)$/i;
@@ -96,7 +107,7 @@ function referenceMetadata(root: string, token: string): LocalReferenceMetadata 
 
 /** 테스트 코어 — 골 토큰 ∩ (roots 아래 실존 디렉터리) 를 그라운딩 노트로.
  *  토큰 길이 ≥4(흔한 단어 노이즈 감소)·최대 8개·중복 제거. 무매치 → 빈 문자열. */
-export function localRefGroundingDigest(taskText: string, roots: string[] = DEFAULT_REFERENCE_ROOTS): string {
+export function localRefGroundingDigest(taskText: string, roots: string[] = referenceRoots()): string {
   if (!taskText || !taskText.trim()) return '';
   const tokens = new Set<string>();
   for (const m of taskText.toLowerCase().matchAll(/[a-z0-9][a-z0-9_-]{3,}/g)) tokens.add(m[0]);
@@ -132,6 +143,6 @@ export function localRefGroundingDigest(taskText: string, roots: string[] = DEFA
 }
 
 /** ambient wrapper — fail-soft·매 턴 fresh. roots 기본 = ~/source/ref. */
-export function localRefGroundingAmbient(taskText: string, roots: string[] = DEFAULT_REFERENCE_ROOTS): string {
+export function localRefGroundingAmbient(taskText: string, roots: string[] = referenceRoots()): string {
   try { return localRefGroundingDigest(taskText, roots); } catch { return ''; }
 }

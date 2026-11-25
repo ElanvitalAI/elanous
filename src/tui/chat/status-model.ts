@@ -18,7 +18,9 @@ export function resolveNextTuiSelection(
   const model = selected?.model || override
     || (selected && selected.provider !== config.llm.provider ? PROVIDER_DEFAULT_MODEL[selected.provider] : undefined)
     || (config.llm.model === 'auto' ? session?.model : undefined)
-    || config.llm.model || session?.model || 'unset';
+    || config.llm.model || session?.model
+    // DEMO-ENGLISH-FIRST-RUN: first run saves the provider with an empty model — show that provider's default, not «unset».
+    || PROVIDER_DEFAULT_MODEL[provider as keyof typeof PROVIDER_DEFAULT_MODEL] || 'unset';
   return { provider, model };
 }
 

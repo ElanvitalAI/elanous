@@ -42,3 +42,26 @@ describe('serializeUserConfig: chat.autoCompact.workingBudgetTokens round-trip (
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
+
+describe('serializeUserConfig: chat.factQuestion.maxToolTurns round-trip (11-25 «저장 후 값 미반영»)', () => {
+  test('a set value survives save and re-read; the default is not written', () => {
+    const root = mkdtempSync(join(tmpdir(), 'eln-fact-budget-rt-'));
+    try {
+      const path = join(root, 'config.json');
+      writeFileSync(path, JSON.stringify({ chat: { factQuestion: { maxToolTurns: 60 } } })); // 출처: #40092 ops «config set … 60» repro
+      const cfg = buildUserConfig(path);
+      expect(cfg.chat.factQuestion.maxToolTurns).toBe(60);
+      cfg.guardian = { mode: 'live' };
+      saveUserConfig(cfg, path);
+      const onDisk = JSON.parse(readFileSync(path, 'utf8')) as { chat?: { factQuestion?: { maxToolTurns?: unknown } } };
+      expect(onDisk.chat?.factQuestion?.maxToolTurns).toBe(60);
+      expect(buildUserConfig(path).chat.factQuestion.maxToolTurns).toBe(60);
+      writeFileSync(path, JSON.stringify({}));
+      const plain = buildUserConfig(path);
+      plain.guardian = { mode: 'live' };
+      saveUserConfig(plain, path);
+      const minimal = JSON.parse(readFileSync(path, 'utf8')) as { chat?: { factQuestion?: unknown } };
+      expect(minimal.chat?.factQuestion).toBeUndefined();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});

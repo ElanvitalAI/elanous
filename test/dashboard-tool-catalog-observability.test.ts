@@ -137,7 +137,7 @@ describe('dashboard tool catalog observability', () => {
 
     // TUI-DIET-D1-TAIL — the legacy coding/turn catalog is gone; this pins the essential catalog the TUI assembles.
     expect(names).toEqual([
-      'Read', 'Grep', 'Glob', 'ListDir', 'Edit', 'Write',
+      'Glob', 'Grep', 'Read', 'ListDir', 'Edit', 'Write',
       'Agent', 'AgentOutput', 'AgentReply', 'AgentStop', 'AgentList', 'SelfImplement',
       'Bash', 'RunShell',
       'MsgList', 'MsgPost', 'MsgAsk', 'MsgAck',

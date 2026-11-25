@@ -55,9 +55,10 @@ describe('ops-ledger msg tools (우편)', () => {
   test('post → list → ack → list 왕복 · 커서 전진 · 300ms 이내', async () => {
     const posted = await dispatchMsgPost({ from: 'OP', to: 'TC', body: '릴리스 컷 18시 KST' }, msgDeps);
     expect(posted.ok).toBe(true);
-    expect(posted.message.id).toBeGreaterThan(0);
-    expect(posted.message.from).toBe('OP');
-    expect(posted.message.to).toBe('TC');
+    // 출처: #40082 — ledger ids start at 1 (MAIL-ANTI-FLOOD made `message` optional; the bound itself is unchanged).
+    expect(posted.message!.id).toBeGreaterThan(0);
+    expect(posted.message!.from).toBe('OP');
+    expect(posted.message!.to).toBe('TC');
 
     const startedAt = Date.now();
     const listed = await dispatchMsgList({ to: 'TC' }, msgDeps);
@@ -67,19 +68,19 @@ describe('ops-ledger msg tools (우편)', () => {
     expect(listed.after).toBe(0);
     expect(listed.messages[0]!.body).toBe('릴리스 컷 18시 KST');
 
-    const acknowledged = await dispatchMsgAck({ to: 'TC', id: posted.message.id }, msgDeps);
+    const acknowledged = await dispatchMsgAck({ to: 'TC', id: posted.message!.id }, msgDeps);
     expect(acknowledged.ok).toBe(true);
-    expect(acknowledged.cursor).toBe(posted.message.id);
+    expect(acknowledged.cursor).toBe(posted.message!.id);
 
     const afterAck = await dispatchMsgList({ to: 'TC' }, msgDeps);
     expect(afterAck.count).toBe(0);
-    expect(afterAck.after).toBe(posted.message.id);
+    expect(afterAck.after).toBe(posted.message!.id);
   });
 
   test('좌석 정규화 · ALL 발신 거부 · 인자 검증', async () => {
     const posted = await dispatchMsgPost({ from: 'coo', to: 'cto', body: '별칭 좌석' }, msgDeps);
-    expect(posted.message.from).toBe('OP');
-    expect(posted.message.to).toBe('TC');
+    expect(posted.message!.from).toBe('OP');
+    expect(posted.message!.to).toBe('TC');
 
     await expect(dispatchMsgPost({ from: 'ALL', to: 'OP', body: 'broad' }, msgDeps)).rejects.toThrow('ALL cannot send messages');
     await expect(dispatchMsgPost({ from: 'OP', to: 'TC' }, msgDeps)).rejects.toThrow("'body' must be a nonempty string");
@@ -90,8 +91,8 @@ describe('ops-ledger msg tools (우편)', () => {
 
   test('MSG-FILTERS-RELAX: MsgAck clears a batch in one call — ids (per id) · receipted · a foreign id is reported, not thrown', async () => {
     const ids: number[] = [];
-    for (const body of ['하나', '둘', '셋', '넷', '다섯', '여섯']) ids.push((await dispatchMsgPost({ from: 'OP', to: 'TC', body }, msgDeps)).message.id);
-    const foreign = (await dispatchMsgPost({ from: 'OP', to: 'UX', body: 'UX 몫' }, msgDeps)).message.id;
+    for (const body of ['하나', '둘', '셋', '넷', '다섯', '여섯']) ids.push((await dispatchMsgPost({ from: 'OP', to: 'TC', body, kind: 'info' }, msgDeps)).message!.id);
+    const foreign = (await dispatchMsgPost({ from: 'OP', to: 'UX', body: 'UX 몫', kind: 'info' }, msgDeps)).message!.id;
     const store = msgDeps.openStore!();
     try {
       // a legacy decided mail: terminal receipt but no ack row (the backfill case `receipted` covers).
@@ -110,12 +111,13 @@ describe('ops-ledger msg tools (우편)', () => {
     await expect(dispatchMsgAck({ to: 'TC' }, msgDeps)).rejects.toThrow("MsgAck needs 'ids', 'id' or 'receipted: true'");
   });
 
-  test('MSG-FILTERS-RELAX: MsgPost stores an unknown kind; MsgList reads another seat and a sub-seat mailbox', async () => {
-    const posted = await dispatchMsgPost({ from: 'OP', to: 'MK/graphics', body: '배너 시안', kind: 'Design.Review 2' }, msgDeps);
-    expect(posted.message.kind).toBe('design.review 2');
+  test('MAIL-ANTI-FLOOD E: MsgPost refuses a kind outside the closed set, stores a legacy alias as written; MsgList reads another seat and a sub-seat mailbox', async () => {
+    await expect(dispatchMsgPost({ from: 'OP', to: 'MK/graphics', body: '배너 시안', kind: 'Design.Review 2' }, msgDeps)).rejects.toThrow('msg post refused (unknown --kind "design.review 2")');
+    const posted = await dispatchMsgPost({ from: 'OP', to: 'MK/graphics', body: '배너 시안', kind: 'Review' }, msgDeps);
+    expect(posted.message!.kind).toBe('review');
     const sub = await dispatchMsgList({ to: 'mk/graphics' }, msgDeps);
     expect(sub.recipient).toBe('MK/graphics');
-    expect(sub.messages.map(message => [message.from, message.body, message.kind])).toEqual([['OP', '배너 시안', 'design.review 2']]);
+    expect(sub.messages.map(message => [message.from, message.body, message.kind])).toEqual([['OP', '배너 시안', 'review']]);
     await dispatchMsgPost({ from: 'TC', to: 'UX', body: '다른 자리 우편' }, msgDeps);
     const other = await dispatchMsgList({ to: 'UX' }, msgDeps);
     expect(other.messages.map(message => message.body)).toEqual(['다른 자리 우편']);
@@ -161,7 +163,7 @@ describe('ops-ledger msg tools (우편)', () => {
       expect(store.list('TC')).toHaveLength(1);
       // MSG-FILTERS-RELAX: an out-of-range wait is clamped (-5 → 0 s), the question is posted, never refused.
       const clamped = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '음수 대기', waitSeconds: -5 }, msgDeps);
-      expect(clamped.output).toBe(`MsgAsk #${clamped.question.id} posted; no linked reply within 0s`);
+      expect(clamped.output).toBe(`MsgAsk #${clamped.question.id} posted; no linked reply within 0s — the reply wait continues on the ledger: one reminder at 10m, cancelled at 15m (you get a notice)`);
       expect(store.list('TC')).toHaveLength(2);
     } finally { store.close(); }
   });
@@ -328,7 +330,7 @@ describe('ops-ledger msg tools — 채워 넣은 인자', () => {
       expect(all.after).toBe(0);
       const paged = await dispatchMsgList({ to: 'OP', after: 1 }, msgDeps);
       expect(paged.messages.map(message => message.body)).toEqual(['m2', 'm3']);
-      expect(all.messages[0]!.kind ?? null).toBeNull();
+      expect(all.messages[0]!.kind ?? null).toBe('info'); // MAIL-ANTI-FLOOD E: an empty kind is auto-tagged
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -582,9 +584,9 @@ describe('ops-ledger 배선 — 카탈로그 ↔ 런타임 ↔ 등록부', () =>
     _resetToolRuntimeRegistryForTest();
   });
 
-  test('10개 런타임이 카탈로그 항목과 1:1 이고 MsgInbox만 MCP 전용이다', () => {
-    expect(ALL_OPS_LEDGER_RUNTIMES).toHaveLength(10);
-    expect(tuiOpsLedgerRuntimes).toHaveLength(9);
+  test('13개 런타임이 카탈로그 항목과 1:1 이고 MsgInbox만 MCP 전용이다', () => {
+    expect(ALL_OPS_LEDGER_RUNTIMES).toHaveLength(13);
+    expect(tuiOpsLedgerRuntimes).toHaveLength(12);
     for (const runtime of ALL_OPS_LEDGER_RUNTIMES) {
       const entry = findNativeTool(runtime.id);
       expect(entry).toBeDefined();
@@ -698,8 +700,9 @@ describe('ops-ledger 한 턴 시나리오 — OP 가 우편 5통을 읽고 판�
         ['MsgPost', { from: 'OP', to: 'TC', body: '5통 확인' }],
         ['MsgAck', { to: 'OP', id: 5 }],
       ];
-      // MsgAsk's linked reply path is exercised in its own focused test above.
-      expect(calls.map(([name]) => name).sort()).toEqual(tuiOpsLedgerRuntimes.filter(runtime => runtime.id !== 'msg_ask').map(runtime => runtime.spec.name).sort());
+      // MsgAsk's linked reply path is exercised in its own focused test above; CommitmentClose in src/commitment/close.test.ts;
+      // HandRaise in src/msg/hand-raise-ladder.test.ts.
+      expect(calls.map(([name]) => name).sort()).toEqual(tuiOpsLedgerRuntimes.filter(runtime => runtime.id !== 'msg_ask' && runtime.id !== 'commitment_close' && runtime.id !== 'hand_raise' && runtime.id !== 'seat_assign').map(runtime => runtime.spec.name).sort());
       const results: Record<string, Record<string, unknown>> = {};
       const wallMs: Record<string, number> = {};
       for (const [name, args] of calls) {
@@ -751,7 +754,7 @@ describe('#122460 ①② (CX-16 postland 실측) — the agent MsgAck tool moves
       setElanousConfigDir(dir);
       registerAllDefaultToolRuntimes();
       const ids: number[] = [];
-      for (const body of ['하나', '둘', '셋']) ids.push((await dispatchMsgPost({ from: 'RES-INFRA', to: 'HAND-ELN-ELS-API', body, intent: 'request' }, { followUp: async (message) => ({ commitmentId: 'c-test', wakerId: 'w-test', condition: `mail-reply:${message.id}`, merged: false }) })).message.id);
+      for (const body of ['하나', '둘', '셋']) ids.push((await dispatchMsgPost({ from: 'RES-INFRA', to: 'HAND-ELN-ELS-API', body, intent: 'request' }, { followUp: async (message) => ({ commitmentId: 'c-test', wakerId: 'w-test', condition: `mail-reply:${message.id}`, merged: false }) })).message!.id);
       const result = await dispatchToolByName('MsgAck', { to: 'HAND-ELN-ELS-API', id: ids[1] }, { surface: 'tui' }) as Record<string, unknown>;
       expect(result).toMatchObject({ ok: true, cursor: ids[1] });
       const store = new MsgStore(join(dir, 'msg', 'messages.db'));

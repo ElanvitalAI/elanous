@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
-import { CommitmentLedger } from '../dashboard/input/commitment-ledger.js';
+import { CommitmentLedger } from '../commitment/ledger.js';
 import type { SelfTimerDeps } from '../msg/self-timer-watch.js';
 import { registerMsgWaitForCommands, WAIT_FOR_EXIT_EXPIRED, WAIT_FOR_EXIT_REJECTED } from './msg-wait-for-cli.js';
 

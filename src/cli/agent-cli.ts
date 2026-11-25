@@ -875,6 +875,15 @@ export function buildCliAgentTools(
   const bashSpec = bashMod.buildBashTool();
   specs.push(bashSpec);
   dispatchByName.set('Bash', async (args) => bashMod.dispatchBash(args, { cwd: dispatchWorkingDirectory() }));
+  // 검색 묶음(src/agent/search-toolkit.ts) — AstGrep(바이너리 있을 때) · DirectiveSearch · DocsSearch.
+  //   어느 추가 묶음(tool-profile)에도 없으므로 `coding` 프로필이 지우지 않는다 — 캡슐도 같은 목록을 받는다.
+  const searchExtras = (require('../agent/search-toolkit.js') as typeof import('../agent/search-toolkit.js'))
+    .buildSearchToolkitExtras(dispatchWorkingDirectory);
+  for (const s of searchExtras.specs) {
+    // DocsSearch 는 코딩 코어(coding/turn)에도 있다 — 이름이 겹치면 스펙을 두 번 싣지 않는다.
+    if (!specs.some((existing) => existing.name === s.name)) specs.push(s);
+    dispatchByName.set(s.name, async (args) => searchExtras.dispatch(s.name, args));
+  }
   // L2 코어 앱 도구(schedule_manage·memory_recall·… — 도메인 무관·전 서피스 공용). 단일
   // 출처(core-tools.ts)에서 상속. CLI 채팅도 자기 예약·기억을 조회/관리.
   // ★ turn 조립기 통일 Phase 0(2026-07-22) — L2 core + L3 finance(gated) 공통 조립을 buildSharedAppTools

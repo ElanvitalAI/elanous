@@ -71,7 +71,7 @@ function releaseNodeFailure(event: GraphEvent): MacrophageScrap | undefined {
     : /\bts\d{3,5}\b|typescript|type(?:check| checking| error)/.test(search) ? 'type-error'
       : /config(?:uration)?\b.{0,40}(?:missing|unset|not configured|required)|(?:missing|unset|not configured|required).{0,40}config(?:uration)?\b/.test(search)
         ? 'configuration-missing' : 'unknown';
-  return { id: `release-failure:${nodeId}:${failureSignature}`, kind: 'release-node-failure', owner: 'OP',
+  return { id: `release-failure:${nodeId}:${failureSignature}`, kind: 'release-node-failure', owner: (require('../org/org-map.js') as typeof import('../org/org-map.js')).orgDuty('steward-cards'),
     evidence: { nodeId, failureSignature, failureDetail: detail.slice(0, 400) } };
 }
 

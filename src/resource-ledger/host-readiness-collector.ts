@@ -23,6 +23,8 @@ const REMOTE_PROBE_SCRIPT = [
   "printf '__MEMSIZE__\n'; sysctl -n hw.memsize 2>&1",
   "printf '__DF_ROOT__\n'; df -P / 2>&1",
   "printf '__DF_TMP__\n'; df -P /tmp 2>&1",
+  // RES patrol leak watch: bun process count and summed RSS (KiB) — `ps -A -o rss=,comm=` works on Linux procps and macOS.
+  "printf '__BUN__\n'; ps -A -o rss=,comm= 2>/dev/null | awk '$2 ~ /(^|\\/)bun$/ {n++; r+=$1} END {print n+0, r+0}'",
   ...METRIC_TOOLS.map(([key, command]) => `printf '__TOOL_${key}__\n'; command -v ${command} 2>/dev/null || true`),
 ].join('; ');
 
@@ -90,6 +92,13 @@ function diskAvailableGb(text: string): number | undefined {
     : undefined;
 }
 
+/** `<count> <rssKiB>` from the BUN probe section; anything else is unmeasured. */
+export function parseBunUsage(text: string): { processes: number; rssMb: number } | undefined {
+  const match = /^(\d+)\s+(\d+)$/.exec(text.trim());
+  if (!match) return undefined;
+  return { processes: Number(match[1]), rssMb: Math.round(Number(match[2]) / 1024) };
+}
+
 async function measure(host: string, run: HostReadinessCommandRunner): Promise<Omit<HostReadinessHeartbeat, 'host' | 'at' | 'maintenance' | 'gateProtected'>> {
   const probe = await run('sh', ['-c', REMOTE_PROBE_SCRIPT], host);
   if (probe.status !== 0) return { sshAvailable: false, tools: Object.fromEntries(METRIC_TOOLS.map(([key]) => [key, false])) };
@@ -102,11 +111,13 @@ async function measure(host: string, run: HostReadinessCommandRunner): Promise<O
   const rootDiskFreeGb = diskAvailableGb(section(probe.stdout, 'DF_ROOT'));
   const tmpDiskFreeGb = diskAvailableGb(section(probe.stdout, 'DF_TMP'));
   const tools = Object.fromEntries(METRIC_TOOLS.map(([key]) => [key, section(probe.stdout, `TOOL_${key}`).length > 0]));
+  const bun = parseBunUsage(section(probe.stdout, 'BUN'));
   const sample = loads && Number.isFinite(cores) && cores > 0 && memoryAvailablePercent !== undefined
     && rootDiskUsedPercent !== undefined && tmpDiskUsedPercent !== undefined
     && rootDiskFreeGb !== undefined && tmpDiskFreeGb !== undefined
     ? { loadPercent: loads[0] / cores * 100, load15Percent: loads[2] / cores * 100,
-        memoryAvailablePercent, rootDiskUsedPercent, tmpDiskUsedPercent, rootDiskFreeGb, tmpDiskFreeGb }
+        memoryAvailablePercent, rootDiskUsedPercent, tmpDiskUsedPercent, rootDiskFreeGb, tmpDiskFreeGb,
+        load1: loads[0], ...(bun ? { bunProcesses: bun.processes, bunRssMb: bun.rssMb } : {}) }
     : undefined;
   return { sshAvailable: true, tools, ...(sample ? { sample } : {}) };
 }

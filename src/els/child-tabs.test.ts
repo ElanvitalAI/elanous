@@ -4,14 +4,14 @@ import { createChildTabs } from './child-tabs.js';
 import { emptyJournal, type SpaceJournal } from './space.js';
 import { childSummary } from './status-vocab.js';
 
-function rig(maxTabs?: number) {
+function rig(maxTabs?: number, paneSize?: { cols: number; rows: number }) {
   let stored: SpaceJournal = emptyJournal();
   const core = createElsCore({ load: () => stored, save: (j) => { stored = j; }, spawn: () => { throw new Error('no pty'); } });
   core.start();
   const timers: { fn: () => void; ms: number; live: boolean }[] = [];
   const lines: string[] = [];
   let clock = 0;
-  const tabs = createChildTabs({ core, ...(maxTabs ? { maxTabs } : {}), now: () => clock, notifyParent: (_ws, line) => lines.push(line),
+  const tabs = createChildTabs({ core, ...(maxTabs ? { maxTabs } : {}), ...(paneSize ? { paneSize: () => paneSize } : {}), now: () => clock, notifyParent: (_ws, line) => lines.push(line),
     setTimer: (fn, ms) => { const t = { fn, ms, live: true }; timers.push(t); return t; }, clearTimer: (h) => { (h as { live: boolean }).live = false; } });
   const fire = (ms = 10_000) => { for (const t of timers.filter((x) => x.ms === ms)) { timers.splice(timers.indexOf(t), 1); if (t.live) t.fn(); } };
   const aged = () => fire(60_000); // 60 s pass: long-lived children get their tabs
@@ -102,6 +102,26 @@ test('graph run: nodes inside the run tab, blocked node, harness under a node on
   r.tabs.end('h', true, 'fixed');
   r.tabs.end('g', true, 'built');
   expect(childSummary(['working', 'working', 'failed'])).toBe('⎇3 🟢2 🔴1');
+});
+
+test('graph dashboard uses the launchd truecolor environment, but does not invent color when absent', () => {
+  const previousColor = process.env.COLORTERM;
+  const previousTerm = process.env.TERM;
+  try {
+    delete process.env.TERM;
+    for (const color of [undefined, 'truecolor']) {
+      if (color === undefined) delete process.env.COLORTERM;
+      else process.env.COLORTERM = color;
+      const r = rig(undefined, { cols: 120, rows: 40 });
+      r.tabs.start({ id: 'g', ws: 'OP', source: 'graph', label: 'run' });
+      r.aged();
+      r.tabs.start({ id: 'n', ws: 'OP', source: 'graph-node', label: 'node', parent: 'g' });
+      expect(/\x1b\[(?:38|48);2;\d+;\d+;\d+m/.test(r.stored().panes[0]!.scrollback)).toBe(color === 'truecolor');
+    }
+  } finally {
+    if (previousColor === undefined) delete process.env.COLORTERM; else process.env.COLORTERM = previousColor;
+    if (previousTerm === undefined) delete process.env.TERM; else process.env.TERM = previousTerm;
+  }
 });
 
 test('closing a graph run keeps its running harness: it moves up and stays in the tree', () => {

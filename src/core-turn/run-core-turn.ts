@@ -20,11 +20,13 @@
 //     the lower layer. Core-turn is for the 80% path, not every
 //     observability hook.
 
+import { isExplicitToolRefusal } from './tool-refusal.js';
 import { buildLedgerCitationRule, RESEARCH_SYNTHESIS_EVIDENCE_BUDGET_CHARS } from '../auto-research/synthesis-evidence-budget.js';
 import { isAuthRejectionError, streamLLMWithTools } from '../llm.js';
 import { drainPendingInterjections } from '../session/pending-input.js';
 import { drainMidTurnEvents } from '../session/mid-turn-events.js';
 import { queueNoticeHead } from '../chat/interjection.js';
+import { coordinatorSeatSet, orchestrationSkipReason } from './orchestration-route.js';
 import type { LLMMessage, StreamWithToolsHandlers } from '../llm.js';
 import { debug, redactSecretText, withAmbientSessionScope } from '../debug/log.js';
 import { emitTurnLife } from '../debug/turn-life.js';
@@ -106,6 +108,7 @@ function classifyStopReason(
 /** P3 웜-preload 입력 — 가장 최근 user 메시지의 텍스트를 뽑는다(intent
  *  시그널 소스). content 가 string 이면 그대로, ContentBlock[] 이면 text
  *  블록들을 이어붙인다. user 메시지가 없으면 undefined. */
+
 export function extractRecentUserText(
   messages: readonly CoreTurnContext['messages'][number][],
 ): string | undefined {
@@ -136,6 +139,12 @@ export function seatResearchSkipReason(userText: string | undefined, seat: strin
   if (userText && queueNoticeHead(userText) !== null) return 'queue-notice';
   if (seat && !EXPLICIT_RESEARCH_REQUEST.test(userText ?? '')) return 'seat-session';
   return null;
+}
+
+/** The HQ coordinator seat federation.yaml declares (lazy; only a turn with an orchestration tool asks). */
+function declaredHqCoordinatorSeat(): string | undefined {
+  const { loadFederationLadder } = require('../msg/hand-raise-ladder.js') as typeof import('../msg/hand-raise-ladder.js');
+  return loadFederationLadder().hq;
 }
 
 function selectSurfaceUserText(ctx: CoreTurnContext): string | undefined {
@@ -654,7 +663,9 @@ export async function runCoreTurn(
             : { callId: '', sessionId: ctx.sessionId, signal: ctx.signal, ...(ctx.userText ? { userText: ctx.userText } : {}) },
           );
         }
-        success = true;
+        // WAKE-CAP-RECLAIM (OP 11-25 12:03:57): a tool that answers with an explicit refusal (`success:false`) did not
+        // succeed — the capsule-exit line must not say success:true for a refused ScheduleWakeup.
+        success = !isExplicitToolRefusal(result);
         return result;
       } finally {
         endToolBatchObservation?.();
@@ -756,7 +767,13 @@ export async function runCoreTurn(
   // skipped, so the web chat (and any surface with web tools) answered «만들어 배포해줘» as research. Same verdict on
   // every surface: the pin decides first, like an obvious local command.
   const forcedRoutePin = resolveTurnRoutePin(surfaceUserText, ctx.tools)?.mode === 'force';
-  const seatSkip = options.researchRouteOverride === undefined ? seatResearchSkipReason(surfaceUserText, stallSeat) : null;
+  // DEMO-FANOUT-LIVE-OP-SEAT: an orchestration request (a coordinator seat with ElsControl/Agent in the pool, or a line
+  // naming one of those tools) is handed to the ordinary tool loop — never answered by the research/grounding route.
+  const seatSkip = options.researchRouteOverride === undefined
+    ? seatResearchSkipReason(surfaceUserText, stallSeat)
+      ?? orchestrationSkipReason(surfaceUserText, stallSeat, ctx.tools.map((tool) => tool.name), coordinatorSeatSet(declaredHqCoordinatorSeat),
+        Boolean(process.env.ELANOUS_ELS_PARENT_PANE?.trim()))
+    : null;
   if (seatSkip) debug.log('research.turn', 'skipped-seat', { sessionId: ctx.sessionId, seat: stallSeat, reason: seatSkip });
   const routePrefilter = structuredRouteEligible
     ? obviousLocalCommand(surfaceUserText) ?? (forcedRoutePin ? 'route-pin-forced' as const : undefined)
@@ -1227,7 +1244,9 @@ export async function runCoreTurn(
       ...(ctx.terminalPriorAnswerVisible !== undefined ? { terminalPriorAnswerVisible: ctx.terminalPriorAnswerVisible } : {}),
       ...(ctx.terminalCompletionAccepted !== undefined ? { terminalCompletionAccepted: ctx.terminalCompletionAccepted } : {}),
       ...(ctx.sessionId !== undefined ? { drainPendingUserInput: () => [...drainPendingInterjections(ctx.sessionId!), ...drainMidTurnEvents(ctx.sessionId!).map((event) => (event.kind === 'seat-mail' && Number.isSafeInteger(Number(event.id))
-        ? { kind: 'seat-mail' as const, msgId: Number(event.id), from: event.from ?? '?', intent: event.intent ?? null, text: event.text }
+        ? { kind: 'seat-mail' as const, msgId: Number(event.id), from: event.from ?? '?', intent: event.intent ?? null,
+          crownDirective: event.crownDirective ?? null, originKind: event.originKind ?? null,
+          ...(event.viaLedger === true ? { viaLedger: true } : {}), text: event.text }
         : event.text))] } : {}),
       ...(ctx.streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs: ctx.streamIdleTimeoutMs } : {}),
     });

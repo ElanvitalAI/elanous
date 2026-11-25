@@ -27,6 +27,7 @@
 // crashed wizard cannot corrupt an existing file. Mode 0600 when the
 // telegram bot token is present.
 
+import { parseStewardSpaceConfig } from './steward/space/config.js';
 import type {
   SkillRouterConfig, LLMProviderName, LLMConfig, SkillSetName, UserConfig, SkillSource,
   DefaultSkillDirsOptions, SkillsConfig, ObsidianConfig, TelegramReportChannel, TelegramTestChannel, TelegramChannel,
@@ -2060,6 +2061,30 @@ function parseGuardianConfig(raw: unknown): UserConfig['guardian'] {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** RES-POLICY-GUARDIAN — keep only well-typed fields; a bad field falls back to the code default (never a crash). */
+function parseResConfig(raw: unknown): UserConfig['res'] {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    warnUserConfigDrop('res', '섹션이 객체가 아니다 — 버림(기본 정책)');
+    return undefined;
+  }
+  const v = raw as Record<string, unknown>;
+  const out: { -readonly [K in keyof NonNullable<UserConfig['res']>]: NonNullable<UserConfig['res']>[K] } = {};
+  if (v.mode === 'shadow' || v.mode === 'live') out.mode = v.mode;
+  else if (v.mode !== undefined) warnUserConfigDrop('res.mode', 'shadow 또는 live 가 아니다 — 버림(shadow)');
+  if (typeof v.dormant === 'boolean') out.dormant = v.dormant;
+  else if (v.dormant !== undefined) warnUserConfigDrop('res.dormant', 'boolean 이 아니다 — 버림');
+  for (const key of ['vmStartCommand', 'vmStopCommand'] as const) {
+    if (typeof v[key] === 'string' && (v[key] as string).trim()) out[key] = v[key] as string;
+    else if (v[key] !== undefined) warnUserConfigDrop(`res.${key}`, '문자열이 아니다 — 버림');
+  }
+  if (v.policy !== undefined) {
+    if (v.policy && typeof v.policy === 'object' && !Array.isArray(v.policy)) out.policy = v.policy as NonNullable<UserConfig['res']>['policy'];
+    else warnUserConfigDrop('res.policy', '객체가 아니다 — 버림(기본 정책)');
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /** Parse optional ops fields independently; invalid settings cannot silently select a cron cwd. */
 function parseOpsConfig(raw: unknown): UserConfig['ops'] | undefined {
   if (raw === undefined) return undefined;
@@ -2811,6 +2836,8 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   const rawNotifications = rawGlobalObj?.notifications ?? rawObj.notifications;
   const autopilotConfig = parseAutopilotConfig(rawObj.autopilot);
   const stewardLoops = parseStewardLoopsConfig(rawObj.loops);
+  // STEWARD-SPACE (행정관) — `loops.stewardSpace` was dropped here before (every scope read `off`).
+  const stewardSpace = parseStewardSpaceConfig((rawObj.loops as { stewardSpace?: unknown } | undefined)?.stewardSpace);
   const orgRaw = rawObj.org && typeof rawObj.org === 'object' && !Array.isArray(rawObj.org) ? rawObj.org as Record<string, unknown> : {};
   const budgetRaw = orgRaw.budget && typeof orgRaw.budget === 'object' && !Array.isArray(orgRaw.budget) ? orgRaw.budget as Record<string, unknown> : {};
   const seatBudgets: NonNullable<NonNullable<UserConfig['org']>['budget']> = Object.create(null);
@@ -3516,9 +3543,11 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       ? (rawObj.coo as { linearProject: string }).linearProject.trim() : '외부 행정·큰 일 (COO)' },
     decisions: parseDecisionsConfig(rawObj.decisions),
     loops: { ...(stewardLoops ?? {}), ...parseLoopOwners(rawObj.loops), orchestrator: parseOrchestratorLoopConfig((rawObj.loops as { orchestrator?: unknown } | undefined)?.orchestrator), seat: parseSeatLoopsConfig(rawObj.loops),
-      persona: { enabled: (rawObj.loops as { persona?: { enabled?: unknown } } | undefined)?.persona?.enabled === true } },
+      persona: { enabled: (rawObj.loops as { persona?: { enabled?: unknown } } | undefined)?.persona?.enabled === true },
+      ...(stewardSpace ? { stewardSpace } : {}) },
     events: parseEventsConfig(rawObj.events),
     guardian: parseGuardianConfig(rawObj.guardian),
+    res: parseResConfig(rawObj.res),
     taskAgent: parseTaskAgentConfig(rawObj.taskAgent),
     // M1-1: sparse — undefined when the user hasn't set anything, so
     // resolvers fall through to zero-config defaults.

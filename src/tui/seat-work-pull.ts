@@ -3,38 +3,48 @@
 // 턴을 연다. 칸 본문은 큐 노티스(source 'work-pull')로, 턴 개시는 idle 문(queueWake) inject 로.
 // «일감 0» 은 큐 조회 결과 근거 줄로만 — 노티스·inject 없이 상태 카드행으로 돌아간다.
 //
-// 큐 소스·claim 원자성은 유닛층(src/seat-loop/work-pull.ts — GREEN 커밋)이 책임진다:
-// pullNextCellFor(seat, cells, {db, now, spaceOfSeat}) — 정렬(owner=자리 → 주인 없음 · 같은 스페이스
-// 순 → 우선순위) 후 INSERT … ON CONFLICT DO NOTHING 원자 claim. 이 모듈은 그 결과를
-// TUI 큐·idle 문에 잇는 배선일 뿐이고, 감시 지점(entry.ts idle 문 옆)에서 만들어 idle 마다 부른다.
+// KNOCK-USES-WORK-NEXT (OP 11-25 20:4x): 당기기는 `eln work next` 와 같은 함수 하나다 — workNext(seat,
+// liveWorkNextDeps(seat)). 옛 유닛층(seat-loop/work-pull.ts · «내 칸·주인 없음» 만 보던 별도 큐 조회)은 지웠다:
+// 리더 보유 칸·타 스페이스 P0 풀·판정 자리 분리·막힘 칸 재제안이 노크에도 그대로 적용된다.
+// 이 모듈은 그 결과를 TUI 큐·idle 문에 잇는 배선일 뿐이고, 감시 지점(entry.ts idle 문 옆)에서 만들어 idle 마다 부른다.
 
 import { checklistDevVersion, listChecklist } from '../release-loop/checklist.js';
-import { pullNextCellFor, workClaimDbPath, type WorkCell, type WorkPullResult } from '../seat-loop/work-pull.js';
-import { wireWorkPullKnock } from './work-pull-knock.js';
+import { workNext, type WorkNextDeps, type WorkNextResult } from '../steward/space/work-next.js';
+import { liveWorkNextDeps } from '../steward/space/work-next-cli.js';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { wireWorkPullKnock, type PullGateVerdict } from './work-pull-knock.js';
+
+/** 판 칸의 얇은 모양 — goal-drive(handCellState)·ledgerFingerprint 가 읽는다. */
+export interface WorkCell { id: string; title: string; status: string; owner: string | null; priority: string }
+
+/** 노크 pull 결과 — claimed(턴을 여는 칸 본문) | no-work(work-next 근거 줄). */
+export type KnockPullResult =
+  | { kind: 'claimed'; wip?: true; cell: { id: string }; turnOpensWith: string }
+  | { kind: 'no-work'; evidence: string };
 
 export interface SeatWorkPullDeps {
-  /** 당기는 자리 — 큐 정렬(owner=자리)의 키. */
+  /** 당기는 자리. */
   seat: string;
   /** 자리가 바쁜지 — busy 면 당기지 않는다(SEAT-OPERATING-CONTRACT: 진행 중 턴은 스스로 지킨다). */
   busy: () => boolean;
-  /** 큐 소스(주입용) — 없으면 현재 판 checklist 에서 읽는다. */
-  readChecklist?: () => WorkCell[];
-  /** pull 구현(주입용) — 없으면 유닛층 pullNextCellFor 원본. */
-  pull?: (seat: string, cells: WorkCell[]) => WorkPullResult;
+  /** pull 구현(주입용) — 없으면 workNext(seat, workNextDeps(seat)). */
+  pull?: (seat: string) => KnockPullResult;
+  /** work-next deps 공급(시험 우주 주입) — 없으면 `eln work next` 와 같은 liveWorkNextDeps. */
+  workNextDeps?: (seat: string) => WorkNextDeps;
+  /** WIP-CONTINUE 15 분 기록(시험 주입) — 없으면 상태 루트 파일. */
+  wipStore?: WipKnockStore;
+  now?: () => number;
   /** 큐 노티스 삽입 — entry.ts 의 queue.enqueueNotice. */
   enqueueNotice: (text: string, source: 'work-pull') => unknown;
   /** idle 문 두드리기 — entry.ts 의 injectKey. */
   injectKey: (key: unknown) => void;
   /** idle 문 키 — entry.ts 의 queueWake 센티널(객체 정체성으로 문을 식별). */
   queueWake: unknown;
-  /** claim DB 격리(stateRoot — 시험 우주가 준다). 없으면 기본 인스턴스 루트. */
-  stateRoot?: string;
-  /** 자리의 스페이스 소속 — «같은 스페이스 순» 정렬 키(선택). */
-  spaceOfSeat?: string | null;
-  now?: () => number;
 }
 
-/** 현재 판 → WorkCell 매핑(owner 없음=null · priority 없음=P2 · 판 읽기 실패 시 빈 큐 = fail-open «일감 0»). */
+/** 현재 판 → WorkCell 매핑(owner 없음=null · priority 없음=P2 · 판 읽기 실패 시 빈 배열). */
 export function checklistCells(): WorkCell[] {
   try {
     return listChecklist(checklistDevVersion()).items.map((item) => ({
@@ -49,25 +59,65 @@ export function checklistCells(): WorkCell[] {
   }
 }
 
+/** WIP-CONTINUE — one internal «continue your cell» turn per cell per 15 min (persisted across restarts). */
+export const WIP_CONTINUE_EVERY_MS = 15 * 60_000;
+
+/** Persisted «last wip-continue knock» per seat·cell — `<state>/steward/wip-continue-knocks.json`. */
+export interface WipKnockStore { readonly last: (key: string) => number | undefined; readonly mark: (key: string, at: number) => void }
+
+export function fileWipKnockStore(path = join(effectiveInstanceRoot(), 'steward', 'wip-continue-knocks.json')): WipKnockStore {
+  const read = (): Record<string, number> => { try { return JSON.parse(readFileSync(path, 'utf8')) as Record<string, number>; } catch { return {}; } };
+  return {
+    last: (key) => { const v = read()[key]; return typeof v === 'number' ? v : undefined; },
+    mark: (key, at) => {
+      const rows = read(); rows[key] = at;
+      for (const k of Object.keys(rows)) if (at - rows[k]! > 24 * 3_600_000) delete rows[k];
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(`${path}.tmp`, JSON.stringify(rows)); renameSync(`${path}.tmp`, path);
+    },
+  };
+}
+
+export const wipContinueTurn = (cellId: string, line: string): string =>
+  `[SEAT-WORK-PULL · wip-continue] continue your cell ${cellId}: take the next step toward its done-when. `
+  + `If it is already done on main (PR merged / evidence exists) close it green with that evidence. `
+  + `If it is blocked → \`eln work block ${cellId} --on <seat> --reason <why>\` then \`eln work next\`. (${line})`;
+
+/**
+ * work-next 결과 → 노크 결과. code 0 = 새 claim · code 4 = 내 ACTIVE 칸(WIP 1) — idle 이면 «계속» 턴 하나,
+ * 같은 자리·칸은 15 분에 한 번(영속) · code 3 = «일감 0» ⊕ work-next 근거 분해.
+ */
+export function knockResultOf(r: WorkNextResult, seat: string, wip: { store: WipKnockStore; now: number }): KnockPullResult {
+  if (r.code === 0) {
+    const lend = r.lentTo ? ` · pool.lend → ${r.lentTo}` : '';
+    return { kind: 'claimed', cell: { id: r.cell.id }, turnOpensWith: `[SEAT-WORK-PULL · eln work next] ${r.line}${lend}` };
+  }
+  if (r.code === 4) {
+    const key = `${seat.toUpperCase()}:${r.cell.id}`;
+    let last: number | undefined;
+    try { last = wip.store.last(key); } catch { last = undefined; }
+    if (last !== undefined && wip.now - last < WIP_CONTINUE_EVERY_MS) return { kind: 'no-work', evidence: `${r.line} (wip-continue knocked ${Math.round((wip.now - last) / 60_000)} min ago)` };
+    try { wip.store.mark(key, wip.now); } catch { /* an unwritable store only risks one extra knock */ }
+    return { kind: 'claimed', wip: true, cell: { id: r.cell.id }, turnOpensWith: wipContinueTurn(r.cell.id, r.line) };
+  }
+  return { kind: 'no-work', evidence: r.breakdown ? `${r.line} — ${r.breakdown}` : r.line };
+}
+
 /**
  * 배선 팩토리 — 반환된 함수를 자리 idle 감시 지점에서 부른다.
  * busy → null(당기지 않음). claimed → 칸 본문 노티스 + queueWake inject 1회. no-work → 근거 줄.
  */
-export function createSeatWorkPull(deps: SeatWorkPullDeps): () => { claimed: string } | { noWork: string } | null {
+export function createSeatWorkPull(deps: SeatWorkPullDeps): () => { claimed: string; wip?: true } | { noWork: string } | null {
+  const pull = deps.pull ?? ((seat: string) => knockResultOf(workNext(seat, (deps.workNextDeps ?? liveWorkNextDeps)(seat)), seat,
+    { store: deps.wipStore ?? fileWipKnockStore(), now: (deps.now ?? Date.now)() }));
   return () => {
     if (deps.busy()) return null;
-    const cells = deps.readChecklist ? deps.readChecklist() : checklistCells();
-    const pull = deps.pull ?? ((seat: string, cs: WorkCell[]) =>
-      pullNextCellFor(seat, cs, {
-        db: workClaimDbPath(deps.stateRoot === undefined ? {} : { stateRoot: deps.stateRoot }),
-        now: deps.now === undefined ? Date.now() : deps.now(),
-        spaceOfSeat: deps.spaceOfSeat ?? null,
-      }));
-    const result = pull(deps.seat, cells);
+    let result: KnockPullResult;
+    try { result = pull(deps.seat); } catch (error) { return { noWork: `일감 조회 실패 — ${error instanceof Error ? error.message : String(error)}` }; }
     if (result.kind === 'claimed') {
       deps.enqueueNotice(result.turnOpensWith, 'work-pull');
       deps.injectKey(deps.queueWake);
-      return { claimed: result.cell.id };
+      return result.wip ? { claimed: result.cell.id, wip: true } : { claimed: result.cell.id };
     }
     return { noWork: result.evidence };
   };
@@ -80,12 +130,14 @@ export interface SeatWorkPullMountDeps {
   readonly busy: () => boolean;
   /** SEAT-NOTICE-BOOT-RACE — 자리 사람의 첫 턴 전엔 pull 조차 부르지 않는다(노크층 게이트와 같은 규칙). */
   readonly personTurnStarted: () => boolean;
+  /** PULL-KNOCK-HAND-GATE — 있으면 이 판정이 문을 연다(사람 턴 ∨ 턴 끝남 ∨ 손 자리 90 s 정착). entry.ts 가 boot-wake 와 같은 판정을 준다. */
+  readonly gate?: () => PullGateVerdict;
   /** 큐 노티스 삽입 — entry.ts 가 queue.enqueueNotice(text, 'work-pull', …) 로 닫는다(source 는 여기 고정). */
   readonly enqueueNotice: (text: string) => unknown;
   readonly injectKey: (key: unknown) => void;
   readonly queueWake: unknown;
   /** 시험 주입 — 유닛층 pull·판 읽기·claim DB 격리 교체. */
-  readonly pullDeps?: Partial<Pick<SeatWorkPullDeps, 'readChecklist' | 'pull' | 'stateRoot' | 'spaceOfSeat'>>;
+  readonly pullDeps?: Partial<Pick<SeatWorkPullDeps, 'pull' | 'workNextDeps' | 'wipStore' | 'now'>>;
   readonly intervalMs?: number;
   readonly schedule?: (fire: () => void, intervalMs: number) => () => void;
   readonly log?: (event: string, data?: Record<string, unknown>) => void;
@@ -109,6 +161,7 @@ export function mountSeatWorkPull(deps: SeatWorkPullMountDeps): (() => void) | n
   return wireWorkPullKnock({
     pull,
     personTurnStarted: deps.personTurnStarted,
+    ...(deps.gate === undefined ? {} : { gate: deps.gate }),
     intervalMs: deps.intervalMs,
     schedule: deps.schedule,
     log: deps.log,

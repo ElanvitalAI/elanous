@@ -2,10 +2,25 @@
 import { spawn } from 'node:child_process';
 import { ENV_EVENT_PANE, ENV_EVENT_SOCKET, ENV_EVENT_WS } from '../agent-events/protocol.js';
 import { requestEls } from '../els/client.js';
-import { defaultMsgStorePath, openMsgStore } from '../msg/msg-store.js';
+import { canonicalMessageAddress, defaultMsgStorePath, openMsgStore, type MsgStore } from '../msg/msg-store.js';
 import { resolveSeatRetroSeat } from '../seat/seat-retro-seat.js';
 import { debug } from '../debug/log.js';
-import type { NeedsHumanDeps } from './needs-human-push.js';
+import type { NeedsHumanDeps, NeedsHumanHandledBy } from './needs-human-push.js';
+
+/**
+ * Did `rung` handle the needs-human mail #msgId from `seat`? Read from the shared ledger at the 5-min check (the rung acts in its own
+ * process): its TUI turn took the mail in (a seen/done/accepted receipt) · it mailed the blocked seat after the mail (id order) · the
+ * mail row is acked. null = none of these.
+ */
+export function needsHumanHandledOn(store: MsgStore, input: { msgId: number; rung: string; seat: string }): NeedsHumanHandledBy | null {
+  const rung = canonicalMessageAddress(input.rung); const seat = canonicalMessageAddress(input.seat);
+  const table = (name: string): boolean => store.db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== null;
+  if (table('msg_receipts') && store.db.query(`SELECT 1 FROM msg_receipts WHERE message_id = ? AND recipient = ?
+    AND state IN ('seen', 'accepted', 'done') LIMIT 1`).get(input.msgId, rung) !== null) return 'turn-ack';
+  if (store.db.query('SELECT 1 FROM msg_messages WHERE id > ? AND sender = ? AND recipient = ? LIMIT 1').get(input.msgId, rung, seat) !== null) return 'reply';
+  const status = store.messageStatus(rung, input.msgId);
+  return status === 'acked' || status === 'done' ? 'ack' : null;
+}
 
 export function createNeedsHumanDeps(input: { cwd: string; resumeWith: (text: string) => void; env?: NodeJS.ProcessEnv }): NeedsHumanDeps {
   const env = input.env ?? process.env;
@@ -28,6 +43,14 @@ export function createNeedsHumanDeps(input: { cwd: string; resumeWith: (text: st
     postMail: (envelope) => {
       const store = openMsgStore(defaultMsgStorePath());
       try { return store.post(envelope, { dedupe: true }).id; } finally { store.close(); }
+    },
+    handledBy: (q) => {
+      const store = openMsgStore(defaultMsgStorePath());
+      try { return needsHumanHandledOn(store, q); } finally { store.close(); }
+    },
+    ackFor: (rung, msgId) => {
+      const store = openMsgStore(defaultMsgStorePath());
+      try { if (store.messageStatus(rung, msgId) === 'delivered') store.ackMessage(rung, msgId, 'acked'); } finally { store.close(); }
     },
     raiseDecision: (card) => {
       const args = ['decisions', 'raise', '--title', card.title, '--category', 'scope', '--s', card.summary, '--c', `blockId ${card.blockId}`,

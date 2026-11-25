@@ -1,3 +1,4 @@
+import { recordFact as recordFedFact } from '../fed-state/ledger.js';
 import { Database } from 'bun:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
@@ -9,6 +10,8 @@ import { currentReceiptState, hasReceiptTable, latestReceiptIdOn, receiptsCheckN
 import { recordReceiptClock } from '../hq/msg-receipt-clock-sink.js';
 import { appendLedgerEvent } from './ledger-events.js';
 import { ALL_SEAT_BELL, ringSeatBell } from './seat-bell.js';
+import { isLive, mayRetract } from './directive-expiry.js';
+import { appendedBody } from './outbound-coalesce.js';
 
 /** ELS-ORCH-TASK-ENVELOPE §1 — one result artifact reference (WU §4-3 `attachments[{path, sha}]` shape). */
 export interface TaskResultArtifact { path: string; sha: string; }
@@ -42,6 +45,8 @@ export interface MessageEnvelope {
   correlationId?: string;
   /** ELS-ORCH-TASK-ENVELOPE §1: the finishing result this reply carries (done/failed · artifacts · summary). */
   result?: TaskResultEnvelope;
+  /** CROWN-GOAL-APPLY: the autopilot goal this mail sets on the receiving seat (structured — the body is never parsed for it). */
+  goal?: string;
 }
 
 /**
@@ -263,8 +268,11 @@ export function validateMessageEnvelope(input: unknown): MessageEnvelope {
   const correlationId = record.correlationId === undefined || record.correlationId === null ? undefined : String(record.correlationId).trim() || undefined;
   if (correlationId !== undefined && /\s/.test(correlationId)) throw new Error('correlationId must not contain whitespace');
   const result = validateTaskResult(record.result);
+  // CROWN-GOAL-APPLY — one goal line; blank is the same as absent.
+  const goal = typeof record.goal === 'string' && record.goal.trim() ? record.goal.replace(/\s+/g, ' ').trim() : undefined;
+  if (record.goal !== undefined && record.goal !== null && typeof record.goal !== 'string') throw new Error('goal must be a string');
   // MSG-FILTERS-RELAX: an unknown field is ignored (and logged), never a refused message.
-  const unknownFields = Object.keys(record).filter(key => !['from', 'to', 'body', 'kind', 'replyTo', 'expiresAt', 'priority', 'supersedes', 'provenance', 'intent', 'refs', 'deadlineAt', 'doneWhen', 'needsAck', 'crownDirective', 'correlationId', 'result', 'origin'].includes(key));
+  const unknownFields = Object.keys(record).filter(key => !['from', 'to', 'body', 'kind', 'replyTo', 'expiresAt', 'priority', 'supersedes', 'provenance', 'intent', 'refs', 'deadlineAt', 'doneWhen', 'needsAck', 'crownDirective', 'correlationId', 'result', 'origin', 'goal'].includes(key));
   if (unknownFields.length > 0) {
     try { debug.log('msg', 'msg.envelope.unknown-fields-ignored', { fields: unknownFields }, { level: 'warn' }); } catch { /* observability is fail-open */ }
   }
@@ -284,6 +292,7 @@ export function validateMessageEnvelope(input: unknown): MessageEnvelope {
     ...(crownDirective === undefined ? {} : { crownDirective }),
     ...(correlationId === undefined ? {} : { correlationId }),
     ...(result === undefined ? {} : { result: Object.freeze({ ...result }) }),
+    ...(goal === undefined ? {} : { goal }),
     ...(record.origin === undefined ? {} : { origin: normalizeMessageOrigin(record.origin as Record<string, unknown>, from) }),
   };
 }
@@ -454,6 +463,7 @@ interface MessageRow {
   origin_delegated?: number | null;
   correlation_id?: string | null;
   result_json?: string | null;
+  goal_text?: string | null;
 }
 
 function fromRow(row: MessageRow): Message {
@@ -476,6 +486,7 @@ function fromRow(row: MessageRow): Message {
     ...(row.correlation_id == null ? {} : { correlationId: row.correlation_id }),
     ...(parseStoredResult(row.result_json) ? { result: parseStoredResult(row.result_json)! } : {}),
     ...(row.crown_directive == null ? {} : { crownDirective: row.crown_directive }),
+    ...(row.goal_text == null ? {} : { goal: row.goal_text }),
     ...(parseStoredProvenance(row.provenance_json) ? { provenance: parseStoredProvenance(row.provenance_json)! } : {}),
     ...(origin ? { origin } : {}),
     schemaVersion: row.schema_version ?? 1,
@@ -530,6 +541,10 @@ function parseStoredProvenance(json: string | null | undefined): Provenance | un
 }
 
 /** SQLite owns both append order and per-recipient acknowledgement progress. */
+/** HAND-FLOOD-CAP — automated ✋ escalation rows per recipient per window (overflow folds into the newest row). */
+export const HAND_ESCALATION_MAIL_CAP = 3;
+export const HAND_ESCALATION_MAIL_WINDOW_MS = 10 * 60_000;
+
 export class MsgStore {
   readonly db: Database;
   private readonly dbPath: string;
@@ -639,6 +654,9 @@ export class MsgStore {
     // v2/origin columns are projected inside the same transaction by v2Select.
     return this.db.transaction(() => read(this.hasReplyTo, this.hasGroupMemberships, this.hasProvenance, this.hasFromKind)).deferred();
   }
+
+  /** MAIL-ANTI-FLOOD — the ledger file (its folder holds the diverted side ledgers). */
+  get storePath(): string { return this.dbPath; }
 
   constructor(path: string = defaultMsgStorePath(), options: { readOnly?: boolean; now?: () => Date; dedupeWindowMs?: number; busyTimeoutMs?: number; archivePath?: string } = {}) {
     this.clock = options.now ?? (() => new Date());
@@ -752,6 +770,8 @@ export class MsgStore {
       // ELS-ORCH-TASK-ENVELOPE §1 — correlation + result columns (additive; old binaries ignore them).
       if (!columns.has('correlation_id')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN correlation_id TEXT');
       if (!columns.has('result_json')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN result_json TEXT');
+      // CROWN-GOAL-APPLY — the structured autopilot goal a mail sets (additive; old binaries ignore it).
+      if (!columns.has('goal_text')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN goal_text TEXT');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_reply_to ON msg_messages(reply_to, id)');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_dedupe ON msg_messages(sender, recipient, created_at)');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_post_attempt ON msg_messages(post_attempt)');
@@ -770,7 +790,7 @@ export class MsgStore {
     const columns = new Set((this.db.query('PRAGMA table_info(msg_messages)').all() as { name: string }[]).map(row => row.name));
     const wanted = ['reply_to', 'expires_at', 'priority', 'supersedes', 'provenance_json', 'from_kind', 'crown_directive', 'intent',
       'refs_json', 'body_ref_json', 'deadline_at', 'needs_ack', 'schema_version', 'origin_seat', 'origin_delegated', 'done_when', 'body_sha256',
-      'post_attempt', 'repeat_count', 'last_repeat_at', 'correlation_id', 'result_json'];
+      'post_attempt', 'repeat_count', 'last_repeat_at', 'correlation_id', 'result_json', 'goal_text'];
     if (wanted.some(name => !columns.has(name))) return true;
     const indexes = new Set((this.db.query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'msg_messages'").all() as { name: string }[])
       .map(row => row.name));
@@ -816,6 +836,25 @@ export class MsgStore {
     return { ...existing, deduped: true as const, repeatCount, lastRepeatAt: at, repeatReason };
   }
 
+  /**
+   * HAND-FLOOD-CAP (11-25 22:5x · 140+ rows to OP in 30 min): automated ✋ escalation mail (`hand-escalation:*` forwards and
+   * `hand-told:*` notices) is capped at the post layer — at most HAND_ESCALATION_MAIL_CAP rows per recipient per 10 min.
+   * Overflow is folded into the newest such row (repeat_count +1) instead of a new row. Beacon cards are not tagged, so exempt.
+   */
+  private foldHandEscalation(msg: MessageEnvelope): Message | null {
+    const tag = (msg.refs ?? []).find((r) => r.startsWith('hand-escalation:') || r.startsWith('hand-told:'));
+    if (!tag) return null;
+    const since = new Date(Date.now() - HAND_ESCALATION_MAIL_WINDOW_MS).toISOString();
+    const rows = this.db.query(`SELECT id FROM msg_messages WHERE recipient = ? AND created_at >= ?
+      AND (refs_json LIKE '%"hand-escalation:%' OR refs_json LIKE '%"hand-told:%') ORDER BY id DESC`)
+      .all(canonicalMessageAddress(msg.to), since) as { id: number }[];
+    if (rows.length < HAND_ESCALATION_MAIL_CAP) return null;
+    const newest = this.getMessage(rows[0]!.id);
+    if (!newest) return null;
+    try { debug.log('msg.hand-escalation-capped', 'folded', { recipient: msg.to, into: newest.id, cap: HAND_ESCALATION_MAIL_CAP }); } catch { /* fail-open */ }
+    return this.recordRepeat(newest, HAND_ESCALATION_MAIL_WINDOW_MS);
+  }
+
   append(input: MessageEnvelope): Message { return this.post(input); }
 
   /** Append once for a coordination comment, task failure, or decided notification. */
@@ -839,6 +878,11 @@ export class MsgStore {
       if (existing) return fromRow(existing);
       if (msg.to.startsWith('group:') && !this.db.query('SELECT 1 FROM msg_groups WHERE address = ?').get(msg.to)) {
         throw new Error(`group not found: ${msg.to}`);
+      }
+      const folded = this.foldHandEscalation(msg);
+      if (folded) {
+        this.db.query('INSERT INTO msg_provenance(provenance_key, message_id) VALUES (?, ?)').run(provenanceKey, folded.id);
+        return folded;
       }
       const message = this.insertMessage(msg);
       this.db.query('INSERT INTO msg_provenance(provenance_key, message_id) VALUES (?, ?)')
@@ -879,6 +923,8 @@ export class MsgStore {
     const result = this.db.query(`INSERT INTO msg_messages(sender, recipient, body, kind, reply_to, created_at, expires_at, priority, supersedes, provenance_json, from_kind, intent, refs_json, deadline_at, needs_ack, crown_directive, schema_version, body_ref_json, origin_seat, origin_delegated, done_when, body_sha256, post_attempt, correlation_id, result_json)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(msg.from, msg.to, msg.body, msg.kind ?? null, msg.replyTo ?? null, createdAt, msg.expiresAt ?? null, msg.priority ?? null, msg.supersedes ?? null, msg.provenance ? JSON.stringify(msg.provenance) : null, fromKind, intent, msg.refs ? JSON.stringify(msg.refs) : null, msg.deadlineAt ?? null, needsAck ? 1 : 0, msg.crownDirective ?? null, 2, null, origin?.seat ?? null, origin?.delegatedByCrown === undefined ? null : (origin.delegatedByCrown ? 1 : 0), msg.doneWhen ?? null, messageBodySha256(msg.body), attemptToken ?? null, correlationId ?? null, msg.result ? JSON.stringify(msg.result) : null);
     const id = Number(result.lastInsertRowid);
+    // CROWN-GOAL-APPLY — the structured goal rides its own column (same transaction as the INSERT above).
+    if (msg.goal !== undefined && columnPresent(this.db, 'goal_text')) this.db.query('UPDATE msg_messages SET goal_text = ? WHERE id = ?').run(msg.goal, id);
     this.queueBell(msg.to, id);
     // SEAT-INBOX B1-C §4a — posted = 원장 커밋. 수신자 칸은 주소 그대로(ALL · group 포함).
     recordReceiptOn(this.db, { messageId: id, recipient: msg.to, state: 'posted', source: 'ledger' }, () => new Date(createdAt),
@@ -886,9 +932,84 @@ export class MsgStore {
     // ELS-SERVER-EVENT-HUB-NO-DB-POLL — the sidecar line waits with the posted receipts: emitted only past the
     // outermost commit, dropped with a rollback (withPostedEvents drains this queue after the commit).
     this.pendingPostedEvents.push(() => this.emitLedgerEvent('post'));
+    // fed-state mail flow counter — after commit, fail-open.
+    this.pendingPostedEvents.push(() => { recordFedFact({ type: 'mail', state: 'post', from: msg.from, to: msg.to, kind: msg.kind ?? intent, ref: String(id), source: 'msg-store' }); });
     // ELS-ORCH-TASK-ENVELOPE §1 — the returned message reflects the stored row: a reply's
     // inherited correlationId (an explicit one already lives in msg) and the result envelope.
     return { id, ...msg, ...(correlationId !== undefined ? { correlationId } : {}), intent, needsAck, ...(origin ? { origin } : {}), schemaVersion: 2, createdAt };
+  }
+
+  /**
+   * DIRECTIVE-EXPIRY (Q5) — close an earlier mail: its expiry becomes now (never later than it already was), so every
+   * unread read (held list · MsgList · digest) drops it. Only its sender or OP / CLAUDE-OP may retract.
+   * Returns the closed id, or null when it had already lapsed.
+   */
+  retract(messageId: number, by: string, now: Date = new Date()): { retracted: number; previousExpiresAt: string | null } | null {
+    const original = this.getMessage(messageId);
+    if (original === null) throw new Error(`retracted message not found: #${messageId}`);
+    const retractor = canonicalMessageAddress(by);
+    if (!mayRetract(retractor, original.from)) throw new Error(`${retractor} may not retract #${messageId} (sender ${original.from}; only the sender or OP / CLAUDE-OP)`);
+    if (!hasEnvelopeMetadata(this.db)) throw new Error('message ledger has no expiry column');
+    if (!isLive(original, now.getTime())) return null;
+    this.db.query('UPDATE msg_messages SET expires_at = ? WHERE id = ?').run(now.toISOString(), messageId);
+    return { retracted: messageId, previousExpiresAt: original.expiresAt ?? null };
+  }
+
+  /**
+   * OUTBOUND-COALESCE (H6) — append `body` to the newest mail `from` → `to` inside the window that the receiver has not
+   * read, acked or taken into a turn (no delivered-or-later receipt) and that itself was foldable (no crown · goal ·
+   * retraction · alert · P0). Returns the updated mail, or null when there is none (the caller posts a new row).
+   */
+  coalesceInto(from: string, to: string, body: string, windowMs: number, now: Date = new Date()): Message | null {
+    const sender = canonicalMessageAddress(from);
+    const recipient = canonicalMessageAddress(to);
+    if (recipient === 'ALL' || recipient.startsWith('group:')) return null;
+    return this.db.transaction((): Message | null => {
+      const since = new Date(now.getTime() - windowMs).toISOString();
+      const receipts = hasReceiptTable(this.db) ? "AND NOT EXISTS (SELECT 1 FROM msg_receipts r WHERE r.message_id = m.id AND r.recipient = m.recipient AND r.state <> 'posted')" : '';
+      const acks = hasMessageAckTable(this.db) ? 'AND NOT EXISTS (SELECT 1 FROM msg_message_acks a WHERE a.message_id = m.id AND a.recipient = m.recipient)' : '';
+      const crown = columnPresent(this.db, 'crown_directive') ? 'AND m.crown_directive IS NULL' : '';
+      const goal = columnPresent(this.db, 'goal_text') ? 'AND m.goal_text IS NULL' : '';
+      const meta = hasEnvelopeMetadata(this.db) ? "AND m.supersedes IS NULL AND COALESCE(m.priority, 0) < 1 AND (m.expires_at IS NULL OR julianday(m.expires_at) > julianday('now'))" : '';
+      const row = this.db.query(`SELECT m.id FROM msg_messages m WHERE m.sender = ? AND m.recipient = ? AND m.created_at >= ?
+          AND m.id > COALESCE((SELECT last_id FROM msg_cursors WHERE recipient = m.recipient), 0)
+          AND m.kind IN ('info', 'notice', 'status', 'coord') AND m.reply_to IS NULL
+          ${crown} ${goal} ${meta} ${acks} ${receipts} ORDER BY m.id DESC LIMIT 1`).get(sender, recipient, since) as { id: number } | null;
+      if (row === null) return null;
+      const current = this.getMessage(row.id);
+      if (current === null) return null;
+      const merged = appendedBody(current.body, body, now);
+      this.db.query('UPDATE msg_messages SET body = ? WHERE id = ?').run(merged, row.id);
+      if (columnPresent(this.db, 'body_sha256')) this.db.query('UPDATE msg_messages SET body_sha256 = ? WHERE id = ?').run(messageBodySha256(merged), row.id);
+      return this.getMessage(row.id);
+    }).immediate();
+  }
+
+  /** MSG-NOISE (Q9) — the top sender × kind pairs by row count since `since` (kind-less rows read as «-»). */
+  noiseTop(since: Date, limit: number = 5): Array<{ sender: string; kind: string; count: number }> {
+    return this.db.query(`SELECT sender, COALESCE(NULLIF(kind, ''), '-') AS kind, COUNT(*) AS count FROM msg_messages
+      WHERE created_at >= ? GROUP BY sender, COALESCE(NULLIF(kind, ''), '-') ORDER BY count DESC, sender ASC, kind ASC LIMIT ?`)
+      .all(since.toISOString(), limit) as Array<{ sender: string; kind: string; count: number }>;
+  }
+
+  /** OUTBOUND-COALESCE (H6) — rows `from` stored since `since` (the outbound metric · soft budget). */
+  countSentSince(from: string, since: Date): number {
+    return (this.db.query('SELECT COUNT(*) AS count FROM msg_messages WHERE sender = ? AND created_at >= ?')
+      .get(canonicalMessageAddress(from), since.toISOString()) as { count: number }).count;
+  }
+
+  /**
+   * DIRECTIVE-EXPIRY (Q5) — mail to `recipient` (direct) whose expiry fell inside (since, now] and that the seat never
+   * acked: the turn-start snapshot names each lapsed directive once and counts the rest.
+   */
+  listLapsed(recipient: string, since: Date, now: Date = new Date(), limit: number = 200): Message[] {
+    const to = canonicalMessageAddress(recipient);
+    if (!hasEnvelopeMetadata(this.db)) return [];
+    const ack = hasMessageAckTable(this.db) ? 'AND NOT EXISTS (SELECT 1 FROM msg_message_acks a WHERE a.message_id = m.id AND a.recipient = ?)' : '';
+    const ids = this.db.query(`SELECT m.id FROM msg_messages m WHERE m.recipient = ? AND m.expires_at IS NOT NULL
+        AND julianday(m.expires_at) > julianday(?) AND julianday(m.expires_at) <= julianday(?) ${ack} ORDER BY m.id DESC LIMIT ?`)
+      .all(to, since.toISOString(), now.toISOString(), ...(ack ? [to] : []), limit) as Array<{ id: number }>;
+    return ids.map(row => this.getMessage(row.id)).filter((m): m is Message => m !== null);
   }
 
   /**
@@ -1535,6 +1656,7 @@ export class MsgStore {
     if (!result.changes) throw new Error(`message not found for ${to}: #${messageId}`);
     this.queueBell(to, messageId);
     if (!this.db.inTransaction) this.emitLedgerEvent('ack');
+    recordFedFact({ type: 'mail', state: 'ack', seat: to, ref: String(messageId), source: 'msg-store' });
     return true;
   }
 
@@ -1782,7 +1904,7 @@ export function readUnreadSource(recipient: string, path: string = defaultMsgSto
 }
 
 const V2_CORE_COLUMNS = ['intent', 'refs_json', 'deadline_at', 'needs_ack', 'crown_directive', 'schema_version', 'body_ref_json', 'correlation_id', 'result_json'] as const;
-const V2_ORIGIN_COLUMNS = ['origin_seat', 'origin_delegated', 'done_when'] as const;
+const V2_ORIGIN_COLUMNS = ['origin_seat', 'origin_delegated', 'done_when', 'goal_text'] as const;
 
 function columnPresent(db: Database, name: string): boolean {
   return (db.query("SELECT COUNT(*) AS count FROM pragma_table_info('msg_messages') WHERE name = ?")

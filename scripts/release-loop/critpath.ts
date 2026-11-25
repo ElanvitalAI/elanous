@@ -2,6 +2,8 @@
 // prepare → (docs-node skipped · web notes ship via a docs PR + deploy-pages after merge) → approval wait.
 // A local ledger human marker is unverified until a separate trust root exists, so this command cannot
 // enter publish or npm from that marker. Explicit manual release publish is a separate command.
+// RELEASE-AUTO-PUBLISH: only when the owner opts in (`release.autoPublish: "on-green"`) and every green condition holds for
+// this exact cut + notes (autoPublishBlockers) does critpath record an AUTO decision (release-auto) and continue; off = unchanged.
 // Every step lands in an append-only ledger
 // (<instance>/release/<v>/critpath.json) so a rerun skips what is already done and the run is its own evidence.
 import { createHash } from 'node:crypto';
@@ -9,21 +11,28 @@ import { verifyHumanApprovalProof, type DecisionTrustRoot, type HumanProof } fro
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { publicWaiverReason } from './known-issues-node.js';
+import { debug } from '../../src/debug/log.js';
 
 export type CritpathStep = 'prepare' | 'approval' | 'publish' | 'npm' | 'verify';
 export type CritpathOutcome = 'ok' | 'skipped' | 'dry-run' | 'waiting-approval' | 'staged' | 'fail';
 export interface CritpathLedgerEntry { step: CritpathStep; cmd: string; outcome: CritpathOutcome; at: string; sha?: string; detail?: string }
-export interface CritpathLedger { version: string; binding?: ApprovalBinding; waiveReason?: string; entries: CritpathLedgerEntry[] }
+/** A dry run that reached its end green for exactly this cut + notes (prepare · install e2e · publish preview · npm --dry-run). */
+export interface DryRunPass { cutSha: string; notesSha256: string; tgzSha1: string; at: string }
+export interface CritpathLedger { version: string; binding?: ApprovalBinding; waiveReason?: string; dryRunPass?: DryRunPass; entries: CritpathLedgerEntry[] }
 
 /** What a human approves: exactly this version, cut commit and notes body. Anything else needs a new card. */
 export interface ApprovalBinding { version: string; cutSha: string; notesSha256: string }
-export type ApprovalState = { state: 'approved'; id: string } | { state: 'pending'; id: string } | { state: 'unverified'; id: string } | { state: 'declined'; id: string } | { state: 'none' };
+export type ApprovalState = { state: 'approved'; id: string } | { state: 'auto'; id: string } | { state: 'pending'; id: string } | { state: 'unverified'; id: string } | { state: 'declined'; id: string } | { state: 'none' };
 /** The slice of a decision-ledger entry the approval check reads (src/decisions/decision-ledger.ts DecisionEntry). */
-export interface ApprovalRecord { id: string; refs?: string[]; status: string; choice?: string; decidedBy?: { kind: string }; proof?: HumanProof }
+export interface ApprovalRecord { id: string; refs?: string[]; status: string; choice?: string; decidedBy?: { kind: string; agent?: string }; proof?: HumanProof }
 
 export const APPROVE_OPTION = 'a';
 /** Distinct from failure (1): the run is healthy and waits for a human publish decision. 75 = EX_TEMPFAIL (sysexits.h). */
 export const CRITPATH_WAITING_EXIT = 75;
+/** RELEASE-AUTO-PUBLISH — the only agent whose AUTO decision on the publish card counts, and only while the owner opted in. */
+export const AUTO_PUBLISH_AGENT = 'release-auto';
+/** A green dry run older than this does not authorize an automatic publish. */
+export const AUTO_PUBLISH_DRY_RUN_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 export function approvalRef(b: ApprovalBinding): string {
   return `release-critpath/${b.version}/${b.cutSha}/${b.notesSha256}`;
@@ -39,6 +48,9 @@ export function approvalState(records: readonly ApprovalRecord[], b: ApprovalBin
   // until a trust-root signature over this exact binding proves it out of band.
   if (entry.status === 'decided' && entry.choice === APPROVE_OPTION && entry.decidedBy?.kind === 'human')
     return verifyHumanApprovalProof(ref, entry.proof, trustRoots) ? { state: 'approved', id: entry.id } : { state: 'unverified', id: entry.id };
+  // An AUTO record is not approval by itself: runCritpath re-checks the owner switch and every green condition on each run.
+  if (entry.status === 'decided' && entry.choice === APPROVE_OPTION && entry.decidedBy?.kind === 'auto' && entry.decidedBy.agent === AUTO_PUBLISH_AGENT)
+    return { state: 'auto', id: entry.id };
   return { state: 'declined', id: entry.id };
 }
 
@@ -61,8 +73,41 @@ export interface CritpathDeps {
   /** Trust-root public keys for out-of-band human approval proofs; absent = every human marker stays unverified. */
   trustRoots?: () => readonly DecisionTrustRoot[];
   requestApproval(b: ApprovalBinding, waiveReason?: string): { id: string };
+  /** RELEASE-AUTO-PUBLISH — owner opt-in seam (`release.autoPublish: "on-green"`). Absent or mode 'off' = the card waits for a human. */
+  autoPublish?: AutoPublishDeps;
   now?: () => Date;
   log?: (line: string) => void;
+}
+
+export interface AutoPublishDeps {
+  mode(): 'off' | 'on-green';
+  /** 🔴 (critical) checklist items for the version. */
+  redCount(version: string): number | Promise<number>;
+  /** Open HOLD decisions for the version (ids). */
+  openHolds(version: string): string[] | Promise<string[]>;
+  /** Record the publish choice on the card as an AUTO decision (actor release-auto). */
+  decide(cardId: string, reason: string): void;
+  /** After-the-fact report to the owner (OP mail · CEO channel). Failure never blocks the release. */
+  notify(body: string): void;
+}
+
+/** Why an automatic publish is not allowed now; empty = every green condition holds for this exact cut + notes. */
+export function autoPublishBlockers(input: { version: string; binding: ApprovalBinding; preparedCommit: string; branchHead: string | Error; dryRunPass?: DryRunPass; now: Date; redCount: number | Error; openHolds: string[] | Error }): string[] {
+  const reasons: string[] = [];
+  const dry = input.dryRunPass;
+  if (!dry) reasons.push('no green dry run recorded');
+  else if (dry.cutSha !== input.binding.cutSha || dry.notesSha256 !== input.binding.notesSha256) reasons.push(`dry run was for another cut/notes (cut ${dry.cutSha.slice(0, 12)} · notes ${dry.notesSha256.slice(0, 12)})`);
+  else {
+    const age = input.now.getTime() - Date.parse(dry.at);
+    if (!(age >= 0 && age <= AUTO_PUBLISH_DRY_RUN_MAX_AGE_MS)) reasons.push(`dry run stale (${dry.at} · max 6h)`);
+  }
+  if (input.branchHead instanceof Error) reasons.push(`branch-read-failed: ${input.branchHead.message.slice(0, 120)}`);
+  else if (input.branchHead !== input.preparedCommit) reasons.push(`cut branch head moved: release/${input.version} ${input.branchHead.slice(0, 12)} ≠ prepared ${input.preparedCommit.slice(0, 12)}`);
+  if (input.redCount instanceof Error) reasons.push(`checklist unreadable: ${input.redCount.message.slice(0, 120)}`);
+  else if (input.redCount > 0) reasons.push(`checklist 🔴 ${input.redCount}`);
+  if (input.openHolds instanceof Error) reasons.push(`decisions unreadable: ${input.openHolds.message.slice(0, 120)}`);
+  else if (input.openHolds.length) reasons.push(`open HOLD decision ${input.openHolds.join(', ')}`);
+  return reasons;
 }
 
 export interface CritpathOptions {
@@ -135,13 +180,24 @@ export async function runCritpath(o: CritpathOptions, deps: CritpathDeps): Promi
     writeLedger(o.ledgerPath, ledger);
     log(`${outcome === 'fail' ? '✗' : outcome === 'waiting-approval' ? '⏸' : '✓'} ${step} · ${outcome}${detail ? ` · ${detail}` : ''}`);
   };
+  const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/[\r\n]+/g, ' ').slice(0, 500);
+  // RELEASE-AUTO-PUBLISH — set once an AUTO decision approved this run: the owner then always hears the result (done or the stop step).
+  let autoReport: string | undefined;
+  const report = (r: CritpathResult): CritpathResult => {
+    if (!autoReport || !deps.autoPublish) return r;
+    const body = r.status === 'done'
+      ? `auto-published v${o.version} · cut ${(ledger.binding?.cutSha ?? '').slice(0, 12)} · checks ${autoReport}`
+      : `auto-publish v${o.version} approved on green but stopped at ${r.step ?? '?'} · ${r.resume ?? ''} · checks ${autoReport}`;
+    try { deps.autoPublish.notify(body); }
+    catch (e) { debug.log('release.auto-publish', 'notify-failed', { version: o.version, reason: message(e) }); log(`· release.auto-publish notify failed: ${message(e)}`); }
+    return r;
+  };
   const fail = (step: CritpathStep, cmd: string, detail: string, sha?: string): CritpathResult => {
     record(step, cmd, 'fail', sha, detail);
     const resume = `fix the cause, then rerun from ${step} (done steps are skipped): ${rerun}`;
     log(`⛔ stopped at ${step}\n   command: ${cmd}\n   resume:  ${resume}`);
-    return { status: 'failed', exitCode: 1, step, cmd, resume, ledger: o.ledgerPath };
+    return report({ status: 'failed', exitCode: 1, step, cmd, resume, ledger: o.ledgerPath });
   };
-  const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/[\r\n]+/g, ' ').slice(0, 500);
 
   // ① prepare — the cut is a commit, never a branch name: --branch resolves to the commit origin/release/<v> points to
   // now, so a branch that moved after prepare (recover/append) is never published from the old prepare or old approval.
@@ -149,9 +205,23 @@ export async function runCritpath(o: CritpathOptions, deps: CritpathDeps): Promi
   if (o.branch) {
     const resolveCmd = `git fetch origin ${o.branch} && git rev-parse ${source}`;
     let resolved: string;
+    let readError: string | undefined;
     try { resolved = deps.resolveBranch(o.branch).trim().toLowerCase(); }
-    catch (e) { return fail('prepare', resolveCmd, message(e)); }
-    if (!/^[0-9a-f]{40}$/.test(resolved)) return fail('prepare', resolveCmd, `${source} did not resolve to a 40-hex commit: ${resolved.slice(0, 80)}`);
+    catch (e) { resolved = ''; readError = message(e); }
+    if (!readError && !/^[0-9a-f]{40}$/.test(resolved)) readError = `${source} did not resolve to a 40-hex commit: ${resolved.slice(0, 80)}`;
+    if (readError) {
+      // RELEASE-AUTO-PUBLISH (Terra #40028): with the owner switch on, an unreadable cut branch is a red check — the
+      // release waits (rc 75) with the skip reason instead of failing; switch off keeps the failure exactly as before.
+      if (!o.dryRun && deps.autoPublish?.mode() === 'on-green') {
+        const reason = `branch-read-failed: ${readError}`;
+        debug.log('release.auto-publish', 'skipped', { version: o.version, reason });
+        log(`· release.auto-publish skipped {${reason}}`);
+        const resume = `cut branch ${o.branch} unreadable; the publish waits — fix the branch read, then rerun: ${rerun}`;
+        log(`⏸ waiting for publish approval\n   ${resume}`);
+        return { status: 'waiting-approval', exitCode: CRITPATH_WAITING_EXIT, step: 'approval', cmd: resolveCmd, resume, ledger: o.ledgerPath };
+      }
+      return fail('prepare', resolveCmd, readError);
+    }
     cut = resolved;
   }
   const moved = (preparedCommit: string) => fail('prepare', prepareCmd,
@@ -200,6 +270,10 @@ export async function runCritpath(o: CritpathOptions, deps: CritpathDeps): Promi
       if (!dry.ok) return fail('npm', `${npmCmd} --dry-run`, dry.detail);
       record('npm', `${npmCmd} --dry-run`, 'dry-run', prepared.tgzSha1);
     }
+    if (prepared.e2eOk && prepared.checksumsOk) {
+      ledger.dryRunPass = { cutSha: binding.cutSha, notesSha256: binding.notesSha256, tgzSha1: prepared.tgzSha1, at: now().toISOString() };
+      writeLedger(o.ledgerPath, ledger);
+    }
     const approval = approvalState(deps.approvalRecords(), binding, deps.trustRoots?.());
     const remaining = [rerun, verifyCmd, 'bun website/scripts/deploy-pages.ts --remote <host> --yes   # after the docs PR merges'];
     log(`· approval ${approval.state} for v${o.version} cut ${binding.cutSha} notes sha256 ${binding.notesSha256}`);
@@ -212,16 +286,47 @@ export async function runCritpath(o: CritpathOptions, deps: CritpathDeps): Promi
     const approvalCmd = `approval record ${approvalRef(binding)}`;
     const approval = approvalState(deps.approvalRecords(), binding, deps.trustRoots?.());
     if (approval.state === 'declined') return fail('approval', approvalCmd, `publish card ${approval.id} was not approved — a changed cut or notes raises a new card`);
-    if (approval.state !== 'approved') {
-      const card = approval.state === 'pending' || approval.state === 'unverified' ? { id: approval.id } : deps.requestApproval(binding, waiveReason);
+    // RELEASE-AUTO-PUBLISH (대표 11-25 «오토파일럿이면 큰 문제 없을 때 이 절차도 생략») — owner opt-in only; any red check keeps the human wait.
+    let autoCard: string | undefined;
+    if (approval.state !== 'approved' && approval.state !== 'unverified' && deps.autoPublish?.mode() === 'on-green') {
+      const ap = deps.autoPublish;
+      const attempt = async <T>(f: () => T | Promise<T>): Promise<T | Error> => { try { return await f(); } catch (e) { return e instanceof Error ? e : new Error(String(e)); } };
+      // --branch resolved the head this run; --cut-commit still asks where release/<v> points now (a moved branch is not auto-published).
+      const branchHead = o.branch ? cut : await attempt(() => deps.resolveBranch(`release/${o.version}`).trim().toLowerCase());
+      const blockers = autoPublishBlockers({ version: o.version, binding, preparedCommit: prepared.sourceCommit, branchHead, dryRunPass: ledger.dryRunPass, now: now(),
+        redCount: await attempt(() => ap.redCount(o.version)), openHolds: await attempt(() => ap.openHolds(o.version)) });
+      if (blockers.length) {
+        const reason = blockers.join('; ');
+        debug.log('release.auto-publish', 'skipped', { version: o.version, cut: binding.cutSha, reason });
+        log(`· release.auto-publish skipped {${reason}}`);
+      } else {
+        const checks = `dry-run ✓ ${ledger.dryRunPass!.at} (prepare · install · publish preview · npm --dry-run) · checklist 🔴 0 · cut head = prepared ${binding.cutSha.slice(0, 12)} · no open HOLD`;
+        const card = approval.state === 'auto' ? { id: approval.id } : approval.state === 'pending' ? { id: approval.id } : deps.requestApproval(binding, waiveReason);
+        if (approval.state !== 'auto') {
+          try { ap.decide(card.id, `auto-publish on green (release.autoPublish on-green): ${checks}`); }
+          catch (e) {
+            debug.log('release.auto-publish', 'skipped', { version: o.version, cut: binding.cutSha, reason: `decide failed: ${message(e)}` });
+            log(`· release.auto-publish skipped {decide failed: ${message(e)}}`);
+          }
+        }
+        const after = approval.state === 'auto' ? approval : approvalState(deps.approvalRecords(), binding, deps.trustRoots?.());
+        if (after.state === 'auto' && after.id === card.id) {
+          autoCard = card.id;
+          autoReport = checks;
+          debug.log('release.auto-publish', 'decided', { version: o.version, cut: binding.cutSha, card: card.id });
+        }
+      }
+    }
+    if (autoCard) record('approval', approvalCmd, 'ok', binding.cutSha, `card ${autoCard} · AUTO ${AUTO_PUBLISH_AGENT}`);
+    else if (approval.state !== 'approved') {
+      const card = approval.state === 'pending' || approval.state === 'unverified' || approval.state === 'auto' ? { id: approval.id } : deps.requestApproval(binding, waiveReason);
       record('approval', approvalCmd, 'waiting-approval', binding.cutSha, `card ${card.id}${approval.state === 'unverified' ? ' · human proof unverified' : ''}`);
       const resume = approval.state === 'unverified'
         ? `decision ${card.id} claims human approval but has no trusted out-of-band proof; automatic critpath publication remains disabled`
         : `card ${card.id} awaits a trusted out-of-band approval; automatic critpath publication remains disabled`;
       log(`⏸ waiting for publish approval\n   version ${o.version} · cut ${binding.cutSha} · notes sha256 ${binding.notesSha256}${waiveReason ? `\n   waiver: ${waiveReason}` : ''}\n   ${resume}`);
       return { status: 'waiting-approval', exitCode: CRITPATH_WAITING_EXIT, step: 'approval', cmd: approvalCmd, resume, approval: approval.state === 'unverified' ? approval : { state: 'pending', id: card.id }, ledger: o.ledgerPath };
-    }
-    record('approval', approvalCmd, 'ok', binding.cutSha, `card ${approval.id}`);
+    } else record('approval', approvalCmd, 'ok', binding.cutSha, `card ${approval.id}`);
   }
 
   // ③ publish (public repo push + GitHub release) — an existing release is treated as done, never recreated.
@@ -259,5 +364,5 @@ export async function runCritpath(o: CritpathOptions, deps: CritpathDeps): Promi
     record('verify', verifyCmd, 'ok', prepared.publicCommit, verified.summary);
   }
   log(`✅ critpath v${o.version} done — ledger ${o.ledgerPath}`);
-  return { status: 'done', exitCode: 0, ledger: o.ledgerPath };
+  return report({ status: 'done', exitCode: 0, ledger: o.ledgerPath });
 }

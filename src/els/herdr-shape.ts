@@ -37,7 +37,10 @@ export function herdrTabs(listed: Listed, workspace?: string): object {
 
 /** `els new` answer ({address, pane, ptyId, cwd}) in herdr's creation shape (`.result.pane.pane_id`). */
 export function herdrCreated(created: { address: string; pane: string; ptyId: string; cwd: string }): object {
-  const [ws = '', tab = ''] = created.address.split('/');
+  const parsed = parseAddress(created.address);
+  const [legacyWs = '', legacyTab = ''] = created.address.split('/');
+  const ws = parsed?.ws ?? legacyWs;
+  const tab = parsed?.tab ?? legacyTab;
   return { result: { workspace: { workspace_id: ws }, tab: { tab_id: tab, workspace_id: ws }, root_pane: { pane_id: created.pane, tab_id: tab, workspace_id: ws, cwd: created.cwd },
     pane: { pane_id: created.pane, tab_id: tab, workspace_id: ws, cwd: created.cwd } } };
 }

@@ -34,7 +34,7 @@ export const NOTICE_FOLD_MARK = '📩';
 export function machineGlyph(source: string | undefined): string {
   switch (source) {
     case 'seat-mail': case 'seat-mail-guide': case 'ceo-ingress': case 'msg-wake': return '📩';
-    case 'wakeup': case 'scheduled': case 'retro': return '⏰';
+    case 'wakeup': case 'scheduled': case 'retro': case 'pulse': return '⏰';
     case 'capsule-done': case 'harness-child': case 'graph-node': case 'graph-end': case 'sidetab': case 'child-complete': return '🤖';
     case 'goal-continue': case 'autowake': case 'self-pull': return '↻';
     default: return '⚠';

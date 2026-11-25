@@ -1,0 +1,30 @@
+{
+  "id": "release-quickpass-world",
+  "name": "Release quick-pass world (golden path replay + historical blockers)",
+  "implementation": [
+    "src/ux-sim/release-quickpass-world.ts"
+  ],
+  "tests": [
+    "src/ux-sim/release-quickpass-world.test.ts"
+  ],
+  "target": "The release graph's quick path walks the manual quick pass that published 0.3.33–0.3.35: advisory failures warn, raise a card, and the run continues; only build or publish non-zero, security-4, or an explicit NO-GO stop; no progress for 15 minutes wakes REL; mark and resume work from any step; the DAG runs in parallel without publish ever starting before its real deps.",
+  "inputs": [
+    "golden step DAG from seat-state/REL/QUICKPASS-GOLDEN.md",
+    "seeded fake command runners on virtual minutes",
+    "13 historical blocker faults, one at a time and all at once, plus 5 must-stop controls",
+    "optional real executor via RELEASE_QUICKPASS_EXECUTOR"
+  ],
+  "observations": [
+    "per-step pass/warn/stop/skipped/marked with virtual start and end",
+    "cards and REL wakes",
+    "manual-serial vs DAG wall minutes",
+    "race check: slow failed branch does not move publish or change unrelated steps"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/release-quickpass-world.test.ts",
+    "bun src/ux-sim/release-quickpass-world.ts <TABLE.md>"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

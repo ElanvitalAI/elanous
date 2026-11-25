@@ -33,7 +33,7 @@ test('doctor report shows read-only backend tier advice with estimated threshold
   const backendTier = recommendBackendTier({ memory: { totalBytes: 8 * 1024 ** 3, availableBytes: 4 * 1024 ** 3 }, engines: ['Colima'] });
   const output = renderDoctorReport({ ok: true, credentials: [], externalCommands: [], backendTier });
   expect(output).toContain('Backend tier: T1');
-  expect(output).toContain('추정 문턱');
+  expect(output).toContain('estimated thresholds');
 });
 
 test('runDoctor carries measured host tier and installed-engine advice into text and JSON report data', () => {

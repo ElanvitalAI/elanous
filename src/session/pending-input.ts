@@ -15,10 +15,12 @@
 
 import { randomUUID } from 'node:crypto';
 import { debug } from '../debug/log.js';
-import type { PendingInterjection } from '../chat/interjection.js';
+import type { InterjectionImage, PendingInterjection } from '../chat/interjection.js';
 
 /** Provenance of a pending item that is seat mail (untrusted data), not operator input. */
-export interface PendingSeatMailSource { readonly msgId: number; readonly from: string; readonly intent?: string | null }
+export interface PendingSeatMailSource { readonly msgId: number; readonly from: string; readonly intent?: string | null;
+  /** FED-MAIL-WORK-ORDER — structured trust inputs (crown relay id · origin kind). */
+  readonly crownDirective?: string | null; readonly originKind?: string | null; readonly viaLedger?: boolean }
 
 /** 레지스트리 항목 — ⭐ id 는 «원본 큐»가 배수·되꺼내기·턴 종료 승격을 짝지을 때 쓴다(10-14 중복 수리). */
 export interface PendingUserInputItem {
@@ -26,6 +28,8 @@ export interface PendingUserInputItem {
   text: string;
   /** Present only for seat mail — rendered as an untrusted-data block, never as a <user_query>. */
   seatMail?: PendingSeatMailSource;
+  /** IMAGE-IN-STEER-FU — operator images typed with this line (real bytes · drained as image parts). */
+  images?: readonly InterjectionImage[];
 }
 
 export type PendingUserInputDrained = (drained: readonly string[], items: readonly PendingUserInputItem[]) => void;
@@ -51,16 +55,18 @@ export function enqueuePendingUserInput(
   text: string,
   onDrained?: PendingUserInputDrained,
   seatMail?: PendingSeatMailSource,
+  images?: readonly InterjectionImage[],
 ): string | null {
   const trimmed = text.trim();
-  if (!sessionId || trimmed.length === 0) return null;
+  const withImages = !seatMail && images !== undefined && images.length > 0;
+  if (!sessionId || (trimmed.length === 0 && !withImages)) return null;
   const bucket = buckets.get(sessionId) ?? { items: [] };
   nextPendingId += 1;
   const id = `pending-${pendingIdPrefix}-${nextPendingId}`;
-  bucket.items.push({ id, text: trimmed, ...(seatMail ? { seatMail } : {}) });
+  bucket.items.push({ id, text: trimmed, ...(seatMail ? { seatMail } : {}), ...(withImages ? { images: [...images!] } : {}) });
   if (onDrained) bucket.onDrained = onDrained;
   buckets.set(sessionId, bucket);
-  debug.log('llm.interjection', 'enqueued', { sessionId, id, queued: bucket.items.length });
+  debug.log('llm.interjection', 'enqueued', { sessionId, id, queued: bucket.items.length, images: withImages ? images!.length : 0 });
   return id;
 }
 
@@ -75,7 +81,10 @@ export function drainPendingInterjections(sessionId: string): PendingInterjectio
   bucket.items = [];
   const drained = items.map(item => item.text);
   const interjections: PendingInterjection[] = items.map((item) => (item.seatMail
-    ? { kind: 'seat-mail', msgId: item.seatMail.msgId, from: item.seatMail.from, intent: item.seatMail.intent ?? null, text: item.text }
+    ? { kind: 'seat-mail', msgId: item.seatMail.msgId, from: item.seatMail.from, intent: item.seatMail.intent ?? null,
+      crownDirective: item.seatMail.crownDirective ?? null, originKind: item.seatMail.originKind ?? null,
+      ...(item.seatMail.viaLedger === true ? { viaLedger: true } : {}), text: item.text }
+    : item.images && item.images.length > 0 ? { kind: 'operator', text: item.text, images: item.images }
     : item.text));
   // ⭐ 주입 횟수의 정본 관측 — 이 id 들이 지금 루프 경계로 넘어간다(RFC v2 P1 ⓑ · 내용은 남기지 않는다).
   debug.log('llm.interjection', 'drained', { sessionId, ids: items.map(item => item.id) });

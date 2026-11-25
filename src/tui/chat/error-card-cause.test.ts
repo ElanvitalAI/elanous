@@ -25,5 +25,5 @@ test('the public failure message keeps its prefix, adds the cause class, and hid
   expect(message).not.toContain('sk-SECRET');
   expect(turnReplyFailureMessage('t1', true, undefined, 'odd')).toBe('요청을 처리하지 못했습니다.');
   expect(turnReplyFailureMessage('t1', false, undefined, 'x')).toBeNull();
-  expect(nextTuiErrorCard(message)[0]).toContain('✘ 요청을 처리하지 못했습니다. (');
+  expect(nextTuiErrorCard(message)[0]).toContain('✘ Could not process the request. (');
 });

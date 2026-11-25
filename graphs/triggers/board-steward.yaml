@@ -1,0 +1,36 @@
+graph_id: board-steward
+version: 1
+loop:
+  title: Board Steward (steward:BOARD)
+  root: 조율자
+  managed_by: trigger-registry
+  description: >-
+    BOARD-STEWARD (CEO 11-25 23:1x · OP-direct · no LLM). Owns ONE federation board across spaces (space = tag).
+    (1) op-pulse phase → federation-wide priority-order (the ledger `eln work next` reads) · leader writes are flagged
+    and overwritten. (2) pre-cut/release-window → cut list <root>/steward/board/cut-list-<v>.json for the release graph
+    L-0 (green ship · yellow waive/defer · critical hold) · L-8 publish → next board (carry-over ⊕ new) ⊕ pulse phase
+    reset. (3) health: ready vs idle hands per space (≥2×) · blocked · WIP-1 returns. (4) one digest row per tick ·
+    OP card only on breach (≤3/10 min). Shadow = files under the shadow dir only.
+  owner: OP
+  trigger:
+    cron: '*/10 * * * *'
+  goal:
+    kind: ledger-line
+    path: '{stateRoot}/loops/board-steward.jsonl'
+    contains: '"goal":"met","window":"{window}"'
+  failure:
+    goal_deadline_min: 8
+    max_attempts: 2
+    backoff_sec: [60]
+  legacy:
+    kind: marker
+    path: '{seatState}/OP/tools/.graph-cutover/board-steward'
+  cutover_after: 1
+entry_node: tick
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: tick, kind: agent, recipe: 'cmd:board-steward-tick', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }

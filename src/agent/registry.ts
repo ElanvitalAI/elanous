@@ -108,6 +108,10 @@ export class AgentRegistry {
   private taskDoneListeners = new Set<(task: AgentTask) => void>();
   /** Listeners for a task starting to run (spawn's runner or runManaged). */
   private taskStartListeners = new Set<(task: AgentTask) => void>();
+  /** AGENT-STEER — the spawn options of each spawned task, kept so a finished task can resume with the same
+   *  tools / dispatcher / provider. Dropped with the task (prune / clear). */
+  private spawnOpts = new Map<string, AgentSpawnOpts>();
+  private taskResumeListeners = new Set<(task: AgentTask) => void>();
 
   /** Create a task, start its run, and return handle. The generator is
    *  lazy — the run doesn't progress until the caller starts iterating
@@ -153,6 +157,7 @@ export class AgentRegistry {
       controller: queued?.controller ?? new AbortController(),
     };
     this.tasks.set(task.id, task);
+    this.spawnOpts.set(task.id, opts);
     // PFC-S1 P2: hand the runner a terminal-state callback so the
     // task-notification queue (and future roster panes) observe
     // completion without runner importing this file (would cycle).
@@ -208,6 +213,44 @@ export class AgentRegistry {
       task.finishedAt = Date.now();
       this.notifyTaskDone(task);
     }
+  }
+
+  /** AGENT-STEER — true when `id` finished and was started by `spawn` (its options are known). */
+  canResume(id: string): boolean {
+    const task = this.tasks.get(id);
+    return task !== undefined && this.spawnOpts.has(id)
+      && (task.state === 'done' || task.state === 'error' || task.state === 'aborted');
+  }
+
+  /** AGENT-STEER — resume a finished task: its full prior messages plus `text` as a new user message, same tools.
+   *  The resumed run is routed as background so its completion reaches the parent as a task notification. */
+  resume(id: string, text: string): SpawnHandle {
+    const task = this.tasks.get(id);
+    const opts = this.spawnOpts.get(id);
+    if (!task || !opts || !this.canResume(id)) throw new Error(`agent task cannot resume: ${id}`);
+    task.messages.push({ role: 'user', content: text });
+    task.controller = new AbortController();
+    task.state = 'pending';
+    delete task.result;
+    delete task.error;
+    delete task.finishedAt;
+    task.background = true;
+    for (const listener of this.taskResumeListeners) {
+      try { listener(task); } catch { /* observer isolation */ }
+    }
+    const events = runAgent(task, {
+      ...opts,
+      resume: true,
+      onTerminal: (t) => this.notifyTaskDone(t),
+      onStart: (t) => this.notifyTaskStart(t),
+    });
+    return { task, events };
+  }
+
+  /** Subscribe to resumes (completion ledgers re-arm their once-per-task dedupe). */
+  onTaskResume(listener: (task: AgentTask) => void): { dispose(): void } {
+    this.taskResumeListeners.add(listener);
+    return { dispose: () => { this.taskResumeListeners.delete(listener); } };
   }
 
   get(id: string): AgentTask | undefined {
@@ -364,6 +407,7 @@ export class AgentRegistry {
       if (!task.finishedAt) continue;
       if (now - task.finishedAt > olderThanMs) {
         this.tasks.delete(id);
+        this.spawnOpts.delete(id);
         removed++;
       }
     }
@@ -373,6 +417,8 @@ export class AgentRegistry {
   /** Forget every task unconditionally. Tests use this for isolation. */
   clear(): void {
     this.tasks.clear();
+    this.spawnOpts.clear();
+    this.taskResumeListeners.clear();
     this.toolCallListeners.clear();
     this.taskDoneListeners.clear();
   }

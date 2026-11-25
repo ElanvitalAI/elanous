@@ -27,7 +27,7 @@ test('first-run OpenRouter BYOK selects one Solar profile from catalog and store
   const key = 'onboarding-fixture-key-never-print';
   const solar = OPENROUTER_ONBOARDING_CHOICES.findIndex((model) => model.id === 'solar-demo') + 1;
   const io: SetupKeysIO = {
-    ask: async (prompt) => prompt.startsWith('선택:') ? '2' : prompt.startsWith('키 공급 선택:') ? '3' : String(solar),
+    ask: async (prompt) => prompt.startsWith('Choice:') ? '2' : prompt.startsWith('Key source:') ? '3' : String(solar),
     askSecret: async () => key,
     print: (line) => output.push(line),
   };
@@ -203,7 +203,7 @@ test('first-run no-provider flow reaches ready through the production Codex OAut
     expect(paths.map(path => new URL(path).pathname)).toEqual([
       '/api/accounts/deviceauth/usercode', '/api/accounts/deviceauth/token', '/oauth/token',
     ]);
-    expect(output.join('\n')).toContain('Codex 로그인 완료');
+    expect(output.join('\n')).toContain('Codex login complete');
     expect(output.join('\n')).not.toContain('sentinel-access-token');
     expect(output.join('\n')).not.toContain('sentinel-refresh-token');
   } finally {
@@ -219,8 +219,8 @@ test('first-run menu offers a direct OpenRouter path and saves the chosen catalo
   const lines: string[] = [];
   const env: NodeJS.ProcessEnv = {};
   const qwen = OPENROUTER_ONBOARDING_CHOICES.findIndex((model) => model.id === 'qwen/qwen3.8-flash') + 1;
-  const io: SetupKeysIO = { ask: async (prompt) => prompt.startsWith('선택:') ? '2'
-    : prompt.startsWith('이 키를 사용할까요?') ? 'y' : String(qwen), print: line => lines.push(line) };
+  const io: SetupKeysIO = { ask: async (prompt) => prompt.startsWith('Choice:') ? '2'
+    : prompt.startsWith('Use this key?') ? 'y' : String(qwen), print: line => lines.push(line) };
   try {
     const result = await runFirstRun({
       path, config: buildUserConfig(path), isTTY: true,
@@ -246,8 +246,8 @@ test('first-run API-key setup selects the detected provider and keeps the key ou
   let selectingProvider = false;
   const io: SetupKeysIO = {
     ask: async prompt => {
-      if (prompt.startsWith('선택:')) return '3';
-      if (prompt.startsWith('기본 공급자 번호')) { selectingProvider = true; return '1'; }
+      if (prompt.startsWith('Choice:')) return '3';
+      if (prompt.startsWith('Default provider number')) { selectingProvider = true; return '1'; }
       return '';
     },
     askSecret: async prompt => prompt.includes('XAI_API_KEY') ? 'api-key-sentinel' : '',
@@ -301,7 +301,7 @@ test('first-run setup menu re-asks parser misses, then asks for setup without re
     expect(result).toEqual({ outcome: 'needs-llm', inputs: 1 });
     expect(output.filter(line => line === FIRST_RUN_PROVIDER_SETUP_MENU_HEADING)).toHaveLength(FIRST_RUN_PROVIDER_SETUP_MENU_MAX_MISSES);
     expect(output.some(line => line.includes('eln setup llm'))).toBe(true);
-    expect(output).not.toContain('LLM 없이 첫 화면을 엽니다. LLM 기능은 사용할 수 없습니다. 다시 설정: `elanous setup keys` 또는 `elanous login openai-codex`.');
+    expect(output).not.toContain('Opening without an LLM; chat will not answer yet. Set one up: `elanous login openai-codex` or `elanous setup keys`.');
     expect(config.onboarding.ready).toBeUndefined();
 
     const skipPath = join(root, 'skip.json');
@@ -394,22 +394,22 @@ test('production first-run shows fake-clock headless progress and aborts the rea
       clock.tick(1_100);
       for (let turn = 0; turn < 8 && updates.length === 0; turn++) await Promise.resolve();
       expect(updates.length).toBeGreaterThan(0);
-      expect(updates[0]).toContain('0초');
+      expect(updates[0]).toContain('0s');
       expect(updates[0]).toContain('Ctrl-C');
       expect(printed.filter(line => line.includes('ABCD-1234'))).toHaveLength(1);
       clock.tick(1_000);
       for (let turn = 0; turn < 8 && !pollStarted; turn++) await Promise.resolve();
       expect(pollStarted).toBe(true);
-      expect(updates.at(-1)).toContain('1초');
+      expect(updates.at(-1)).toContain('1s');
       interrupt?.();
       const result = await resultPromise;
       expect(result.outcome).toBe('ready');
       expect(signal?.aborted).toBe(true);
       expect(pollAborted).toBe(true);
       expect(buildUserConfig(configPath).onboarding.ready).toBeUndefined();
-      expect(printed.some(line => line.includes('Codex 로그인을 건너뛰었습니다'))).toBe(true);
+      expect(printed.some(line => line.includes('Codex login skipped'))).toBe(true);
       expect(printed.some(line => line.includes('elanous login openai-codex'))).toBe(true);
-      expect(printed.some(line => line.includes('완료하지 못했습니다'))).toBe(false);
+      expect(printed.some(line => line.includes('did not complete'))).toBe(false);
       expect(clock.pendingTimers()).toBe(0);
     });
   } finally {
@@ -455,14 +455,14 @@ test('headless setup stops refreshing elapsed wait when token exchange begins', 
         },
       });
       for (let turn = 0; turn < 8 && updates.length < 2; turn++) await Promise.resolve();
-      expect(updates[0]).toContain('0초');
+      expect(updates[0]).toContain('0s');
       expect(updates[0]).toContain('Ctrl-C');
       clock.tick(1_000);
-      expect(updates.at(-1)).toContain('1초');
+      expect(updates.at(-1)).toContain('1s');
       const beforeExchange = updates.length;
       reportProgress?.({ type: 'exchanging' });
       expect(updates.length).toBe(beforeExchange + 1);
-      expect(updates.at(-1)).toContain('로그인 확인 중');
+      expect(updates.at(-1)).toContain('Checking Codex login');
       const afterExchange = updates.length;
       clock.tick(2_000);
       expect(updates).toHaveLength(afterExchange);

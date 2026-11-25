@@ -128,6 +128,11 @@ export function registerHostsCommands(program: Command, deps: HostsCliDeps = {})
     .action(async (host: string) => {
       const write = deps.write ?? console.log;
       if (!startableHosts.has(host)) { write(`start refused · unknown VM ${host}`); process.exitCode = 1; return; }
+      // GUARDIAN-FINDINGS-VISIBLE: the operator's start is the actual decision — pair it with the guardian's «would».
+      if (!deps.startVm) {
+        const { autoRecordDecision } = await import('../res-policy/auto-record.js');
+        await autoRecordDecision('vm-start', host, 'allow', 'hosts-cli', { ref: 'hosts start' });
+      }
       try { await (deps.startVm ?? startCloudVm)(host); }
       catch (error) { write(`start failed · ${host} · ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; return; }
       try {

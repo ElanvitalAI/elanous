@@ -27,6 +27,13 @@
  *    Release of P2 (one digest turn): work not in progress (5 min coalescing between mail turns) · 3 continuations ran
  *    while holding (no progress) · P2 waited 20 min (starvation) · the continuation did not start.
  *
+ * OP-INBOX-PULSE-BATCH (대표 11-26 «OP keeps getting interrupted, folds work again and again» · ~165 mails/h) — the OP
+ * seat only ({@link createQueueFinishFirst} `opBatch`): P0 stays immediate (person · crown · origin human · intent alert ·
+ * mail kind `release-stop`, all structured fields); every other mail (request · decision · report · info · coord ·
+ * steward/✋ digests · leader replies · coach mail · graph-node stalls) is held and released as ONE batch right after
+ * the next op-pulse turn opens ({@link QueueFinishFirst.notePulse}, the pulse inbox's origin-'pulse' turn) or at
+ * {@link OP_BATCH_MAX_HOLD_MS} (pulse missing). Nothing is dropped.
+ *
  * Three faces: observe = `tui.queue held` / `released` / `peeked` + the «✉ N held» chip; judge = {@link decideIdleQueue}
  * (pure); repair = the release rules above (no mail is ever dropped — held mail stays queued and is peeked).
  */
@@ -44,8 +51,21 @@ export const QUEUE_P1_JOIN_AFTER_MS = 60_000;
 export { P1_PAUSE_NOTE } from '../chat/interjection.js';
 /** QUEUE-P1-3MIN: the continuation that resumes the paused work after the P1 turn. */
 export const RESUME_PAUSED_WORK_PROMPT = 'Resume the paused work from your one-line checkpoint (the requirement is still open) and carry it to its result.';
+/** OP-INBOX-PULSE-BATCH: the OP batch is released after the next pulse turn, or at the latest this long after arrival. */
+export const OP_BATCH_MAX_HOLD_MS = 30 * 60_000;
+/** OP-INBOX-PULSE-BATCH: the structured mail kind (`--kind release-stop`) that stops a release — always immediate. */
+export const RELEASE_STOP_MAIL_KIND = 'release-stop';
 /** P2 waits at most this long while work is in progress. */
 export const QUEUE_HOLD_P2_MAX_MS = 20 * 60_000;
+/**
+ * SEAT-TURN-FOLLOWUPS (66-run terra experiment: the #40092 idle flush doubled cost, arm E $0.36–0.53 vs $0.15–0.29 per run) —
+ * an idle seat flushes held mail at most once per this window, and only when something held is not plain info.
+ */
+export const IDLE_FLUSH_MIN_GAP_MS = 10 * 60_000;
+/** Mail intents that are worth an idle flush (anything else is info and waits for the digest / the 20-min starvation). */
+const FLUSH_WORTHY_INTENTS: ReadonlySet<string> = new Set(['request', 'decision', 'question', 'result', 'alert']);
+const flushWorthy = (item: QueueClassItem, cls: QueueHoldClass): boolean =>
+  cls === 'P1' || item.passive !== true || FLUSH_WORTHY_INTENTS.has((item.mailIntent ?? '').toLowerCase());
 /** Continuations run while holding before the held mail is released anyway (no progress). */
 export const QUEUE_HOLD_CONTINUATION_CAP = 3;
 /** A continuation that was opened but did not start within this window releases the held mail. */
@@ -91,6 +111,8 @@ export interface QueueClassItem {
   readonly digest?: string;
   readonly mailClass?: SeatMailClass;
   readonly mailIntent?: string;
+  /** The ledger `kind` of a seat mail (structured; `release-stop` is P0 in the OP batch). */
+  readonly mailKind?: string;
   readonly replyTo?: number;
 }
 
@@ -119,6 +141,19 @@ export function classifyQueueItem(item: QueueClassItem, waits: WorkWaits = NO_WA
     }
     default: return 'P1';
   }
+}
+
+/**
+ * OP-INBOX-PULSE-BATCH — the OP seat's class: P0 stays P0 (plus mail kind `release-stop`); everything else that would
+ * open a turn by itself (P1 mail · graph-node stall · related reply) becomes P2 and waits for the pulse batch.
+ * Own capsule/child results and non-mail sources keep their class.
+ */
+export function classifyOpBatchItem(item: QueueClassItem, waits: WorkWaits = NO_WAITS): QueueHoldClass {
+  if (item.source === 'seat-mail' && (item.mailKind ?? '').toLowerCase() === RELEASE_STOP_MAIL_KIND) return 'P0';
+  const base = classifyQueueItem(item, waits);
+  if (base === 'P0') return 'P0';
+  if (item.source === 'seat-mail' || item.source === 'graph-node') return 'P2';
+  return base;
 }
 
 export const isHoldable = (c: QueueHoldClass): boolean => c === 'P1' || c === 'P2';
@@ -163,11 +198,11 @@ export type IdleQueueDecision =
   /** Work is in progress: open the continuation first; the listed items stay queued. */
   | { readonly kind: 'continue'; readonly heldIds: readonly string[] }
   /** Keep holding: the continuation was opened and has not started yet, or the mail-turn gap is still open. */
-  | { readonly kind: 'hold'; readonly heldIds: readonly string[]; readonly reason: 'continuation-starting' | 'coalescing' }
+  | { readonly kind: 'hold'; readonly heldIds: readonly string[]; readonly reason: 'continuation-starting' | 'coalescing' | 'flush-limit' | 'info-only' | 'pulse-batch' }
   /** QUEUE-P1-3MIN: these P1 items go now (P2 stays held); `paused` = the open work pauses and resumes after. */
   | { readonly kind: 'deliver-p1'; readonly ids: readonly string[]; readonly paused: boolean; readonly heldIds: readonly string[] }
   /** Held mail goes now — one digest turn, P1 first. */
-  | { readonly kind: 'release'; readonly reason: 'work-done' | 'no-progress' | 'starvation' | 'continuation-not-started' };
+  | { readonly kind: 'release'; readonly reason: 'work-done' | 'no-progress' | 'starvation' | 'continuation-not-started' | 'idle-stall' | 'pulse' };
 
 export interface IdleQueueInput {
   readonly items: readonly QueueClassItem[];
@@ -181,6 +216,12 @@ export interface IdleQueueInput {
   readonly continuationTried: boolean;
   /** When the last mail-triggered (notice) turn was dispatched; null = none yet. */
   readonly lastMailTurnAt?: number | null;
+  /** PASSIVE-HOLD-WHILE-BUSY — a seat holds mail only while busy: idle with no open work = release now (no coalescing gap). */
+  readonly holdOnlyWhileBusy?: boolean;
+  /** OP-INBOX-PULSE-BATCH: this is the OP seat — hold everything but P0 until the pulse (or 30 min). */
+  readonly opBatch?: boolean;
+  /** OP-INBOX-PULSE-BATCH: a pulse turn opened since the last release — the batch goes now. */
+  readonly pulseDue?: boolean;
   readonly now: number;
 }
 
@@ -198,6 +239,7 @@ export interface IdleQueueInput {
  *   9. else → continue (open the continuation first; held mail waits and is peeked).
  */
 export function decideIdleQueue(input: IdleQueueInput): IdleQueueDecision {
+  if (input.opBatch) return decideOpBatch(input);
   const classed = input.items.map((item) => ({ item, cls: classifyQueueItem(item, input.waits) }));
   const held = classed.filter((c) => isHoldable(c.cls));
   if (held.length === 0) return { kind: 'pass' };
@@ -215,7 +257,12 @@ export function decideIdleQueue(input: IdleQueueInput): IdleQueueDecision {
   const p0 = classed.some((c) => c.cls === 'P0');
   if (!input.workInProgress) {
     const last = input.lastMailTurnAt ?? null;
-    if (last !== null && input.now - last < QUEUE_MAIL_TURN_MIN_GAP_MS) return p0 ? { kind: 'pass-unheld', heldIds } : { kind: 'hold', heldIds, reason: 'coalescing' };
+    if (input.holdOnlyWhileBusy) {
+      // Idle flush: rate-limited and only for something that is not plain info (starvation above still releases at 20 min).
+      if (!p0 && !held.some(({ item, cls }) => flushWorthy(item, cls))) return { kind: 'hold', heldIds, reason: 'info-only' };
+      if (!p0 && last !== null && input.now - last < IDLE_FLUSH_MIN_GAP_MS) return { kind: 'hold', heldIds, reason: 'flush-limit' };
+    }
+    if (!input.holdOnlyWhileBusy && last !== null && input.now - last < QUEUE_MAIL_TURN_MIN_GAP_MS) return p0 ? { kind: 'pass-unheld', heldIds } : { kind: 'hold', heldIds, reason: 'coalescing' };
     return { kind: 'release', reason: 'work-done' };
   }
   if (p0) return { kind: 'pass-unheld', heldIds };
@@ -228,10 +275,39 @@ export function decideIdleQueue(input: IdleQueueInput): IdleQueueDecision {
   return { kind: 'continue', heldIds };
 }
 
+/**
+ * OP-INBOX-PULSE-BATCH 판정식 — pure. nothing held → pass · pulse opened → release(pulse) · some held mail waited ≥ 30 min →
+ * release(starvation) · a P0 queued → pass-unheld · open work, continuation not tried → continue (peek) · else hold.
+ */
+function decideOpBatch(input: IdleQueueInput): IdleQueueDecision {
+  const classed = input.items.map((item) => ({ item, cls: classifyOpBatchItem(item, input.waits) }));
+  const held = classed.filter((c) => isHoldable(c.cls));
+  if (held.length === 0) return { kind: 'pass' };
+  const heldIds = held.map((c) => c.item.id);
+  if (input.pulseDue) return { kind: 'release', reason: 'pulse' };
+  if (held.some(({ item }) => { const at = arrivedAt(item); return at !== undefined && input.now - at >= OP_BATCH_MAX_HOLD_MS; })) {
+    return { kind: 'release', reason: 'starvation' };
+  }
+  if (classed.some((c) => c.cls === 'P0')) return { kind: 'pass-unheld', heldIds };
+  if (input.workInProgress && input.awaitingStartSince === null && !input.continuationTried) return { kind: 'continue', heldIds };
+  return { kind: 'hold', heldIds, reason: 'pulse-batch' };
+}
+
+/**
+ * IDLE-WITH-QUEUE (대표 11-25 16:0x «Queue 20 · 📩 14 held» with the pane idle) — the «typeahead» the internal-turn gate
+ * yields to is a PERSON's queued line only. Counting every queued item (seat-mail notices held by this leaf included)
+ * refused every self wake / goal continuation as HumanTyping while the held mail waited for that continuation: a deadlock
+ * that only a person's keystroke broke. Notices never count — the idle door dispatches them.
+ */
+export function personQueuedCount(items: readonly Pick<QueueClassItem, 'kind'>[]): number {
+  return items.filter((item) => item.kind === 'user').length;
+}
+
 /** Delivery order of a released digest: P1 before P2, arrival order kept inside a class. */
-export function orderReleased<T extends QueueClassItem>(items: readonly T[], waits: WorkWaits = NO_WAITS): T[] {
+export function orderReleased<T extends QueueClassItem>(items: readonly T[], waits: WorkWaits = NO_WAITS, opBatch = false): T[] {
+  const classOf = opBatch ? classifyOpBatchItem : classifyQueueItem;
   const rank = (c: QueueHoldClass): number => (c === 'P0' ? 0 : c === 'related' ? 1 : c === 'P1' ? 2 : 3);
-  return items.map((item, index) => ({ item, index, r: rank(classifyQueueItem(item, waits)) }))
+  return items.map((item, index) => ({ item, index, r: rank(classOf(item, waits)) }))
     .sort((a, b) => a.r - b.r || a.index - b.index)
     .map((x) => x.item);
 }
@@ -281,7 +357,10 @@ export interface QueueFinishFirstLog {
  * The per-TUI state around {@link decideIdleQueue}: work-in-progress from the last turn end, continuation accounting,
  * the waits of the current work, and once-per-item `held` logs.
  */
-export function createQueueFinishFirst(deps: { now?: () => number; log?: QueueFinishFirstLog } = {}) {
+export function createQueueFinishFirst(deps: { now?: () => number; log?: QueueFinishFirstLog; holdOnlyWhileBusy?: boolean; opBatch?: boolean } = {}) {
+  const opBatch = deps.opBatch === true;
+  const classOf = (item: QueueClassItem, w: WorkWaits): QueueHoldClass => (opBatch ? classifyOpBatchItem(item, w) : classifyQueueItem(item, w));
+  let pulseDue = false;
   const now = deps.now ?? Date.now;
   const log = deps.log ?? (() => {});
   let workInProgress = false;
@@ -298,8 +377,11 @@ export function createQueueFinishFirst(deps: { now?: () => number; log?: QueueFi
   /** QUEUE-P1-3MIN: the open work a P1 paused — resumed by one continuation after the P1 turn. */
   let paused: { at: number } | null = null;
   let resumeDue = false;
+  /** 11-25 OP deaf: the idle-stall watchdog saw the seat idle with held mail — the next decide releases it. */
+  let forcedRelease = false;
   const input = (items: readonly QueueClassItem[]): IdleQueueInput =>
-    ({ items, waits, workInProgress, continuationsWhileHolding, awaitingStartSince, continuationTried, lastMailTurnAt, now: now() });
+    ({ items, waits, workInProgress, continuationsWhileHolding, awaitingStartSince, continuationTried, lastMailTurnAt,
+      ...(deps.holdOnlyWhileBusy ? { holdOnlyWhileBusy: true } : {}), ...(opBatch ? { opBatch: true, pulseDue } : {}), now: now() });
 
   const markHeld = (items: readonly QueueClassItem[], ids: readonly string[], reason: string): void => {
     heldNow = ids.length;
@@ -311,7 +393,7 @@ export function createQueueFinishFirst(deps: { now?: () => number; log?: QueueFi
       const item = byId.get(id);
       if (!item) continue;
       const at = arrivedAt(item);
-      log('tui.queue', 'held', { class: classifyQueueItem(item, waits), waitedMs: at === undefined ? null : Math.max(0, now() - at),
+      log('tui.queue', 'held', { class: classOf(item, waits), waitedMs: at === undefined ? null : Math.max(0, now() - at),
         reason, itemId: id, ...(item.msgId === undefined ? {} : { msgId: item.msgId }) });
     }
   };
@@ -339,7 +421,9 @@ export function createQueueFinishFirst(deps: { now?: () => number; log?: QueueFi
     /** A person's own turn: the work is theirs now; accounting restarts. */
     noteHumanTurn(): void { continuationsWhileHolding = 0; },
     decide(items: readonly QueueClassItem[]): IdleQueueDecision {
-      const decision = decideIdleQueue(input(items));
+      const forced = forcedRelease && items.some((item) => isHoldable(classOf(item, waits)));
+      forcedRelease = false;
+      const decision: IdleQueueDecision = forced ? { kind: 'release', reason: 'idle-stall' } : decideIdleQueue(input(items));
       if (decision.kind === 'deliver-p1') {
         const byId = new Map(items.map((item) => [item.id, item]));
         for (const id of decision.ids) {
@@ -351,10 +435,11 @@ export function createQueueFinishFirst(deps: { now?: () => number; log?: QueueFi
         }
         if (decision.paused) paused ??= { at: now() };
         markHeld(items, decision.heldIds, 'work-in-progress');
-      } else if (decision.kind === 'hold') markHeld(items, decision.heldIds, decision.reason === 'coalescing' ? 'coalescing' : 'work-in-progress');
+      } else if (decision.kind === 'hold') markHeld(items, decision.heldIds, decision.reason === 'continuation-starting' ? 'work-in-progress' : decision.reason === 'pulse-batch' ? 'pulse-batch' : 'coalescing');
       else if (decision.kind === 'continue' || decision.kind === 'pass-unheld') markHeld(items, decision.heldIds, workInProgress ? 'work-in-progress' : 'coalescing');
       else if (decision.kind === 'release') {
-        const count = heldNow || items.filter((item) => isHoldable(classifyQueueItem(item, waits))).length;
+        const count = heldNow || items.filter((item) => isHoldable(classOf(item, waits))).length;
+        pulseDue = false;
         log('tui.queue', 'released', { reason: decision.reason, count, continuations: continuationsWhileHolding });
         heldNow = 0;
         heldActionable = 0;
@@ -366,12 +451,30 @@ export function createQueueFinishFirst(deps: { now?: () => number; log?: QueueFi
       } else { heldNow = 0; heldActionable = 0; }
       return decision;
     },
+    /**
+     * 11-25 OP deaf — the seat sat idle past the stall window with mail held: the next {@link decide} releases every
+     * held item as one digest turn (reason `idle-stall`). Returns false when nothing is held (no-op).
+     */
+    forceRelease(): boolean {
+      // OP-INBOX-PULSE-BATCH: an idle OP is not a stall — the batch waits for the pulse (30-min cap still releases).
+      if (heldNow === 0 || opBatch) return false;
+      forcedRelease = true;
+      log('tui.queue', 'idle-stall-release', { held: heldNow });
+      return true;
+    },
     /** Is mail held right now (mid-turn steer gate)? */
-    holding(): boolean { return workInProgress; },
+    holding(): boolean { return workInProgress || opBatch; },
+    /** OP-INBOX-PULSE-BATCH: the op-pulse turn opened — the next idle boundary releases the held batch as one turn. */
+    notePulse(): void {
+      if (!opBatch) return;
+      pulseDue = true;
+      log('tui.queue', 'pulse-batch-due', { held: heldNow });
+    },
+    opBatch(): boolean { return opBatch; },
     heldCount(): number { return heldNow; },
     heldActionableCount(): number { return heldActionable; },
     waits(): WorkWaits { return waits; },
-    classify(item: QueueClassItem): QueueHoldClass { return classifyQueueItem(item, waits); },
+    classify(item: QueueClassItem): QueueHoldClass { return classOf(item, waits); },
     /** A mail-triggered (notice) turn was dispatched — the coalescing gap starts. */
     noteMailTurn(): void { lastMailTurnAt = now(); },
     /** The idle timer asks: would the door do something other than keep holding (release · starvation · gap closed)? */
@@ -381,9 +484,9 @@ export function createQueueFinishFirst(deps: { now?: () => number; log?: QueueFi
     },
     /** Extras for a continuation prompt: related full bodies + held peek. */
     continuationExtras(items: readonly QueueClassItem[]): { suffix: string; relatedIds: string[]; peeked: number; heldIds: string[] } {
-      const related = items.filter((item) => item.kind === 'notice' && classifyQueueItem(item, waits) === 'related');
-      const held = items.filter((item) => isHoldable(classifyQueueItem(item, waits)));
-      const blocks = [relatedJoinBlock(related), heldPeekBlock(orderReleased(held, waits), peekedIds)].filter((b): b is string => b !== null);
+      const related = items.filter((item) => item.kind === 'notice' && classOf(item, waits) === 'related');
+      const held = items.filter((item) => isHoldable(classOf(item, waits)));
+      const blocks = [relatedJoinBlock(related), heldPeekBlock(orderReleased(held, waits, opBatch), peekedIds)].filter((b): b is string => b !== null);
       return { suffix: blocks.length ? `\n\n${blocks.join('\n\n')}` : '', relatedIds: related.map((item) => item.id), peeked: held.length,
         heldIds: held.map((item) => item.id) };
     },

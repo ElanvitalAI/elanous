@@ -7,7 +7,8 @@ import type { MouseReport } from './attach-mouse.js';
 
 export type KeyAction =
   | 'detach' | 'next' | 'previous' | 'next-workspace' | 'toggle-sidebar' | 'new' | 'new-workspace'
-  | 'new-chat' | 'rename-tab' | 'close' | 'close-workspace' | 'help' | 'goto' | 'scroll-up' | 'scroll-down' | 'move-tab' | 'toggle-agents-order';
+  | 'new-chat' | 'rename-tab' | 'close' | 'close-workspace' | 'help' | 'goto' | 'scroll-up' | 'scroll-down' | 'move-tab' | 'toggle-agents-order'
+  | 'expand-all' | 'collapse-all' | 'toggle-active' | 'toggle-group' | 'list-page-up' | 'list-page-down' | 'list-home' | 'list-end' | 'tabs-left' | 'tabs-right';
 
 export type KeyEvent =
   | { readonly kind: 'input'; readonly bytes: string }
@@ -26,7 +27,17 @@ const ESCAPE = '\u001b';
 const AFTER_PREFIX: Readonly<Record<string, KeyAction>> = {
   ',': 'rename-tab', q: 'detach', j: 'next', l: 'next', n: 'next', k: 'previous', h: 'previous', p: 'previous', w: 'next-workspace',
   b: 'toggle-sidebar', s: 'toggle-sidebar', g: 'toggle-agents-order', c: 'new', a: 'new-chat', N: 'new-workspace', x: 'close', D: 'close-workspace', m: 'move-tab', '?': 'help', '[': 'scroll-up', ']': 'scroll-down',
+  // ELS-GROUP-FOLD-CONTROL: + / - expand / collapse every agent group · space or enter folds the selected pane's group.
+  // ELS-ACTIVE-ONLY-FILTER: A flips «Active only» (lowercase a is already «new elanous chat»).
+  '+': 'expand-all', '-': 'collapse-all', ' ': 'toggle-group', '\r': 'toggle-group', A: 'toggle-active',
 };
+
+// ELS-SCROLL-MOUSE: after the prefix, PgUp/PgDn/Home/End page the side list and ←/→ scroll the tab row (the keys alone
+// stay the pane's — a shell or an editor needs them).
+const AFTER_PREFIX_KEYS: readonly (readonly [string, KeyAction])[] = [
+  ['\u001b[5~', 'list-page-up'], ['\u001b[6~', 'list-page-down'], ['\u001b[H', 'list-home'], ['\u001b[1~', 'list-home'], ['\u001bOH', 'list-home'],
+  ['\u001b[F', 'list-end'], ['\u001b[4~', 'list-end'], ['\u001bOF', 'list-end'], ['\u001b[D', 'tabs-left'], ['\u001bOD', 'tabs-left'], ['\u001b[C', 'tabs-right'], ['\u001bOC', 'tabs-right'],
+];
 
 const PASTE_BEGIN = '\u001b[200~';
 const PASTE_END = '\u001b[201~';
@@ -52,7 +63,14 @@ export function createKeyRouter(options: { pasteTimeoutMs?: number } = {}): { re
         const flush = (): void => { if (typed) { emit({ kind: 'input', bytes: typed }); typed = ''; } };
         for (const segment of split.segments) {
           if (segment.kind !== 'text') { flush(); emit(mouseEvent(segment.report)); continue; }
-          for (const char of segment.text) {
+          const chars = [...segment.text];
+          for (let index = 0; index < chars.length; index++) {
+            const char = chars[index]!;
+            if (armed && char === ESCAPE) {
+              const rest = chars.slice(index, index + 4).join('');
+              const key = AFTER_PREFIX_KEYS.find(([seq]) => rest.startsWith(seq));
+              if (key) { armed = false; emit({ kind: 'action', action: key[1] }); index += [...key[0]].length - 1; continue; }
+            }
             if (!armed) {
               if (char === PREFIX && !(typeof literalPrefix === 'function' ? literalPrefix() : literalPrefix)) { flush(); armed = true; } else typed += char;
               continue;

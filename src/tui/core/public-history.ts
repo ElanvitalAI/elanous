@@ -13,13 +13,7 @@ export type OmitLastTurnAnswer = boolean | { readonly since: number };
 export function nextTuiPublicHistory(messages: readonly SerializedMessage[], omitLastTurnAnswer: OmitLastTurnAnswer = false): SerializedMessage[] {
   const visible = messages.map((message) => message.role === 'tool' || message.role === 'assistant' || (message.role === 'user' && message.interruptionMarker === true)
     ? { role: 'system' as const, content: '', ts: message.ts }
-    // A200 · ELN-QUEUE-SUPERSEDE — interrupted-on-purpose and «대체 후보» lines are model context; the bubble shows the person's words.
-    : message.role === 'user' && message.steerJoined === true
-      // TUI-ANSWER-VANISH-ON-TOOLCALL ③ — a steer reads as the person's message, marked where it joined.
-      ? { ...message, content: `${stripQueueModelContext(message.content)}\n${STEER_JOINED_MARK}` }
-      : message.role === 'user' && stripQueueModelContext(message.content) !== message.content
-        ? { ...message, content: publicUserText(message.content) }
-        : message);
+    : message.role === 'user' ? publicUserRow(message) : message);
   let candidate = -1;
   let turn = 0;
   const commit = (legacyLastAnswer = false): void => {
@@ -35,8 +29,7 @@ export function nextTuiPublicHistory(messages: readonly SerializedMessage[], omi
       : streamReplyFinal(turnId, message.content);
     const publicAnswer = message.replyFinal === undefined && legacyLastAnswer
       ? `이전 버전 기록 · 완료 여부 확인 안 됨\n\n${answer}` : answer;
-    if (answer) visible[candidate] = { role: 'assistant', content: publicAnswer, ts: message.ts,
-      ...(message.replyFailure === true ? { replyFailure: true, replyFailureKind: message.replyFailureKind } : {}) };
+    if (answer) visible[candidate] = publicAnswerRow(message, publicAnswer);
     candidate = -1;
   };
   for (const [index, message] of messages.entries()) {
@@ -61,6 +54,34 @@ export function nextTuiPublicHistory(messages: readonly SerializedMessage[], omi
     : omitLastTurnAnswer;
   if (!ownTurnAnswer) commit(true);
   return visible;
+}
+
+// TUI-LONG-PASTE-SPIN — the public copy of a saved row is made once per row object (and per answer text): the
+// transcript's row memo is keyed by row object, so a fresh copy every recompute re-wrapped the whole transcript, and
+// the notice/context strip below ran over every saved user row on every recompute (13% of a stalled frame).
+const publicUserRows = new WeakMap<SerializedMessage, SerializedMessage>();
+function publicUserRow(message: SerializedMessage): SerializedMessage {
+  const hit = publicUserRows.get(message);
+  if (hit) return hit;
+  // A200 · ELN-QUEUE-SUPERSEDE — interrupted-on-purpose and «대체 후보» lines are model context; the bubble shows the person's words.
+  const row = message.steerJoined === true
+    // TUI-ANSWER-VANISH-ON-TOOLCALL ③ — a steer reads as the person's message, marked where it joined.
+    ? { ...message, content: `${stripQueueModelContext(message.content)}\n${STEER_JOINED_MARK}` }
+    : stripQueueModelContext(message.content) !== message.content
+      ? { ...message, content: publicUserText(message.content) }
+      : message;
+  publicUserRows.set(message, row);
+  return row;
+}
+
+const publicAnswerRows = new WeakMap<SerializedMessage, SerializedMessage>();
+function publicAnswerRow(message: SerializedMessage, content: string): SerializedMessage {
+  const hit = publicAnswerRows.get(message);
+  if (hit && hit.content === content) return hit;
+  const row: SerializedMessage = { role: 'assistant', content, ts: message.ts,
+    ...(message.replyFailure === true ? { replyFailure: true, replyFailureKind: message.replyFailureKind } : {}) };
+  publicAnswerRows.set(message, row);
+  return row;
 }
 
 /** The person-facing text of a saved user row: model-only heads removed. A queue notice row keeps its saved text — the

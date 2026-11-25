@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
 import { debug } from '../debug/log.js';
 import { recallMemoryContext } from '../agent-substrate/execution/memory-context.js';
-import { DEFAULT_REFERENCE_ROOTS, localRefGroundingDigest } from '../agent/ref-grounding.js';
+import { referenceRoots, localRefGroundingDigest } from '../agent/ref-grounding.js';
 import { groundMissionInCodebase, isImplementationGoal, type CodebaseGrounding } from '../autopilot/mission-codebase-gate.js';
 import { searchWeb, type WebSearchResult } from '../web-search/index.js';
 
@@ -150,7 +150,7 @@ export async function groundGoalAuthoringContext(
 ): Promise<GoalAuthoringGroundingResult> {
   const recall = deps.recallMemory ?? recallMemoryContext;
   const localReferences = deps.localReferences ?? localRefGroundingDigest;
-  const roots = deps.referenceRoots ?? DEFAULT_REFERENCE_ROOTS;
+  const roots = deps.referenceRoots ?? referenceRoots();
   const observe = deps.observe ?? debug.log.bind(debug);
   let memory = '';
   await observeGroundingSegment(observe, 'memory-recall', async () => {

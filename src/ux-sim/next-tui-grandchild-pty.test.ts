@@ -18,8 +18,8 @@ test('next TUI PTY shows a completed child and its grandchild', async () => {
         ELANOUS_TEST_FAKE_LLM_CAPTURE: join(root, 'requests.jsonl'),
         ELANOUS_TEST_FAKE_LLM_RESPONSE: '[fake-llm] B4 finished',
         ELANOUS_TEST_FAKE_LLM_TOOL_CALL: JSON.stringify([
-          { when: 'B4 parent', name: 'Agent', args: { description: 'B4 child', prompt: 'B4 child prompt' } },
-          { when: 'B4 child prompt', name: 'Agent', args: { description: 'B4 grandchild', prompt: 'B4 grandchild prompt' } },
+          { when: 'B4 parent', name: 'Agent', args: { description: 'B4 child', prompt: 'B4 child prompt', reason: 'B4 fixture' } },
+          { when: 'B4 child prompt', name: 'Agent', args: { description: 'B4 grandchild', prompt: 'B4 grandchild prompt', reason: 'B4 fixture' } },
         ]),
       },
       ready: { label: 'boot', until: 'Ctrl+Q 종료' },

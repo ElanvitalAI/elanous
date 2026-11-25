@@ -556,7 +556,13 @@ test('ANTHROPIC_MODEL defaults to the anthropic ladder best model (latest Opus),
 
 async function runGpt6ToolCall(
   call: { name: string; args: Record<string, unknown> },
-  options: { model?: string; maxTurns?: number; callsPerStream?: number; researchTurn?: boolean; flags?: Partial<Record<Gpt6CodexGuardId, boolean>> } = {},
+  options: {
+    model?: string; maxTurns?: number; callsPerStream?: number; researchTurn?: boolean; flags?: Partial<Record<Gpt6CodexGuardId, boolean>>;
+    /** 라운드마다 다른 호출(n번째 라운드 = sequence[n-1]) — 주면 call·callsPerStream 대신 쓴다. */
+    sequence?: Array<{ name: string; args: Record<string, unknown> }>;
+    /** true 를 돌려주면 그 dispatch 가 실패(throw)한다. */
+    failDispatch?: (name: string, args: Record<string, unknown>) => boolean;
+  } = {},
 ): Promise<{ result: string; toolResults: string[]; dispatches: number }> {
   let turn = 0;
   let dispatches = 0;
@@ -567,7 +573,13 @@ async function runGpt6ToolCall(
     available: () => true,
     async *chat() { yield 'unused'; },
     async *streamChat() {
-      if (turn < (options.callsPerStream ?? 1)) {
+      if (options.sequence && turn < options.sequence.length) {
+        const next = options.sequence[turn]!;
+        turn++;
+        yield { type: 'tool_call', id: `call-${turn}`, name: next.name, args: next.args };
+        return;
+      }
+      if (!options.sequence && turn < (options.callsPerStream ?? 1)) {
         turn++;
         const args = call.name === 'Grep' && (options.callsPerStream ?? 1) > 1 && typeof call.args.pattern === 'string'
           ? { ...call.args, pattern: `${call.args.pattern}-${turn}` }
@@ -588,12 +600,17 @@ async function runGpt6ToolCall(
       {
         onText() {},
         onToolResult: ({ result }) => toolResults.push(String(result)),
-        dispatchTool: async () => { dispatches++; return 'executed'; },
+        dispatchTool: async (name: string, args: Record<string, unknown>) => {
+          dispatches++;
+          if (options.failDispatch?.(name, args)) throw new Error(`${name}: ${String(args.pattern ?? "")} — No such file or directory`);
+          return 'executed';
+        },
       },
       {
         provider,
         model: options.model ?? 'gpt-6-sol',
-        tools: [{ name: call.name, description: 'test tool', parameters: { type: 'object', properties: {} } }],
+        tools: [...new Set([call.name, ...(options.sequence ?? []).map((c) => c.name)])]
+          .map((name) => ({ name, description: 'test tool', parameters: { type: 'object', properties: {} } })),
         maxTurns: options.maxTurns ?? 3,
         researchTurn: options.researchTurn,
         slowToolTickMs: 60_000,
@@ -655,6 +672,32 @@ test('GPT-6 exploration budget retains existing rejection through streamLLMWithT
   expect(enabled.dispatches).toBe(2);
   expect(enabled.toolResults.some((result) => result.includes('EXPLORATION BUDGET EXHAUSTED'))).toBe(true);
   expect(getGpt6CodexGuardStats()['exploration-budget']).toEqual({ wouldBlock: 1, blocked: 1 });
+});
+
+test('exploration budget counts only successful search rounds — failed/errored rounds do not burn it', async () => {
+  const flags = { 'exploration-budget': true, 'search-only-streak': false } as const;
+  const grep = (i: number) => ({ name: 'Grep', args: { pattern: `missing-${i}`, path: `~/nowhere-${i}`, output_mode: 'content' } });
+  const failing = await runGpt6ToolCall(grep(0), {
+    maxTurns: 10, flags, sequence: [grep(1), grep(2), grep(3), grep(4), grep(5)], failDispatch: () => true,
+  });
+  expect(failing.dispatches).toBe(5);
+  expect(failing.toolResults.some((result) => result.includes('EXPLORATION BUDGET EXHAUSTED'))).toBe(false);
+});
+
+test('exploration budget never blocks a Read and resets on it', async () => {
+  const flags = { 'exploration-budget': true, 'search-only-streak': false } as const;
+  const grep = (i: number) => ({ name: 'Grep', args: { pattern: `found-${i}`, path: 'src', output_mode: 'content' } });
+  const read = (file: string) => ({ name: 'Read', args: { file_path: join(process.cwd(), file) } });
+  // 검색 두 라운드 뒤 Read 두 라운드(검색이 돌려준 경로) → 다시 검색 두 라운드 · 아무것도 막히지 않는다.
+  const run = await runGpt6ToolCall(grep(0), {
+    maxTurns: 12, flags,
+    sequence: [grep(1), grep(2), read('src/llm.ts'), read('src/config.ts'), grep(3), grep(4)],
+  });
+  expect(run.toolResults.some((result) => result.includes('EXPLORATION BUDGET EXHAUSTED'))).toBe(false);
+  expect(run.dispatches).toBe(6);
+  // 대조: 같은 수의 연속 검색 라운드는 여전히 예산에 걸린다.
+  const searches = await runGpt6ToolCall(grep(0), { maxTurns: 12, flags, sequence: [grep(1), grep(2), grep(3), grep(4), grep(5), grep(6)] });
+  expect(searches.toolResults.some((result) => result.includes('EXPLORATION BUDGET EXHAUSTED'))).toBe(true);
 });
 
 test('research turn completes multiple discovery rounds without the early GPT-6 exploration block', async () => {

@@ -94,7 +94,7 @@ const m4: SimWorldScenario = {
     // The seat's rule on a failed post is «retry»; a success is posted once.
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const before = exits.length;
-      await program.parseAsync(['msg', 'post', '--from', 'JUD', '--to', 'OP', '--body', body], { from: 'user' });
+      await program.parseAsync(['msg', 'post', '--from', 'JUD', '--to', 'OP', '--body', body, '--kind', 'report'], { from: 'user' });
       if (exits.length === before) break;
     }
     const rows = u.withStore((store) => store.db.query('SELECT id FROM msg_messages WHERE body = ?').all(body) as Array<{ id: number }>);

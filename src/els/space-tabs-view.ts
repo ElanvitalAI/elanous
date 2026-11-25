@@ -11,6 +11,7 @@
 import { clipCells, fitCells, UNREACHABLE_MARK, wordOfState, type PaneRow } from './attach-view.js';
 import { STATUS, type StatusWord } from './status-vocab.js';
 import { seatMarks, type SeatMarkInput } from './seat-marks.js';
+import { agentEntry, remoteMark } from './agent-entry.js';
 
 export interface SpaceTabRow extends PaneRow {
   readonly command?: readonly string[];
@@ -22,6 +23,11 @@ export interface SpaceTabRow extends PaneRow {
   readonly place?: { readonly host?: string; readonly runtime: 'process' | 'pod' };
   /** ELS-AGENTS-HIDE-SHELL: the server says the pane runs a bare shell now (kind «shell», or a shell command with no agent in front). */
   readonly bareShell?: boolean;
+  /** DEMO-PANE-EXIT-VISIBLE: why an exited pane ended (server ls `exit`): «exit 3» and the last screen line. */
+  readonly exit?: { readonly reason: string; readonly last?: string };
+  /** ELS-PANE-LABEL-MODEL-FIRST: the model the pane's eln reported (agent-event meta) and the server's last real event time. */
+  readonly model?: string;
+  readonly lastEventAtMs?: number;
 }
 
 const STALL_MARK = '⏸';
@@ -37,11 +43,20 @@ export function withCommands(rows: readonly PaneRow[], listJson: string): SpaceT
   const stalled = new Set<string>();
   const places = new Map<string, { host?: string; runtime: 'process' | 'pod' }>();
   const bareShells = new Set<string>();
+  const exits = new Map<string, { reason: string; last?: string }>();
+  const facts = new Map<string, { model?: string; lastEventAtMs?: number }>();
   if (Array.isArray(panes)) {
     for (const raw of panes) {
       const row = raw as { pane?: unknown; command?: unknown; kind?: unknown; fgCommand?: unknown; stalled?: unknown; place?: unknown };
       if (!raw || typeof row.pane !== 'string') continue;
       if (row.stalled === true) stalled.add(row.pane);
+      const exit = (raw as { exit?: { reason?: unknown; tail?: unknown } }).exit;
+      if (exit && typeof exit.reason === 'string') {
+        const tail = Array.isArray(exit.tail) ? exit.tail.filter((line): line is string => typeof line === 'string') : [];
+        exits.set(row.pane, { reason: exit.reason, ...(tail.length ? { last: tail[tail.length - 1]! } : {}) });
+      }
+      const extra = raw as { model?: unknown; lastEventAtMs?: unknown };
+      facts.set(row.pane, { ...(typeof extra.model === 'string' && extra.model ? { model: extra.model } : {}), ...(typeof extra.lastEventAtMs === 'number' && Number.isFinite(extra.lastEventAtMs) ? { lastEventAtMs: extra.lastEventAtMs } : {}) });
       // ELS-POD-TAB: the server's place rides the same lane as command/stalled — validated, then passed through.
       const place = row.place as { host?: unknown; runtime?: unknown } | undefined;
       const runtime = place?.runtime === 'pod' ? 'pod' as const : place?.runtime === 'process' ? 'process' as const : undefined;
@@ -58,7 +73,7 @@ export function withCommands(rows: readonly PaneRow[], listJson: string): SpaceT
       }
     }
   }
-  return rows.map((row) => ({ ...row, ...(bareShells.has(row.pane) ? { bareShell: true } : {}), ...(commands.has(row.pane) ? { command: commands.get(row.pane)! } : {}), ...(agents.has(row.pane) ? { agent: agents.get(row.pane)! } : {}), ...(stalled.has(row.pane) ? { stalled: true } : {}), ...(places.has(row.pane) ? { place: places.get(row.pane)! } : {}) }));
+  return rows.map((row) => ({ ...row, ...facts.get(row.pane), ...(bareShells.has(row.pane) ? { bareShell: true } : {}), ...(commands.has(row.pane) ? { command: commands.get(row.pane)! } : {}), ...(agents.has(row.pane) ? { agent: agents.get(row.pane)! } : {}), ...(stalled.has(row.pane) ? { stalled: true } : {}), ...(places.has(row.pane) ? { place: places.get(row.pane)! } : {}), ...(exits.has(row.pane) ? { exit: exits.get(row.pane)! } : {}) }));
 }
 
 const AGENT_KINDS = new Set(['eln', 'codex', 'claude', 'grok']);
@@ -91,7 +106,7 @@ export function agentPanelRows<T extends { readonly row: SpaceTabRow }>(entries:
   for (const entry of entries) {
     if (!isBareShell(entry.row)) { out.push({ entry, exited: false }); continue; }
     const seat = entry.row.seat;
-    if (!seat || liveSeats.has(`|${seat}`) || exitedShown.has(seat)) continue;
+    if (!seat || [...liveSeats].some((key) => key.endsWith(`|${seat}`)) || exitedShown.has(seat)) continue;   // ELS-SIDE-REMOTE-GROUP: live on any host = no dead twin
     exitedShown.add(seat);
     out.push({ entry, exited: true });
   }
@@ -115,7 +130,7 @@ export function paneEmoji(row: SpaceTabRow): string {
 }
 
 const markInput = (row: SpaceTabRow): SeatMarkInput =>
-  ({ word: wordOfState(row.state), ...(row.seatState ? { seatState: row.seatState } : {}), ...(row.seatReason ? { seatReason: row.seatReason } : {}), ...(row.unread ? { unread: row.unread } : {}) });
+  ({ word: wordOfState(row.state), ...(row.seatState ? { seatState: row.seatState } : {}), ...(row.seatReason ? { seatReason: row.seatReason } : {}), ...(row.seatSource ? { seatSource: row.seatSource } : {}), ...(row.unread ? { unread: row.unread } : {}) });
 /** SIDETAB-TWO-MARKS: slot 1 (activity) glued to slot 2 (attention): «⚪✋», «🟢✉3», «⚪⏳», «🟢». */
 const twoMarks = (row: SpaceTabRow): string => { const marks = seatMarks(markInput(row)); return `${marks.activity}${marks.attention}`; };
 /** The group header count of seats waiting on a person: « ✋2» (empty when none). */
@@ -167,7 +182,55 @@ export interface SpaceListLayout {
   readonly emptySpaces: readonly { readonly y: number; readonly ws: string }[];
   readonly newBox?: SidebarBox;
   readonly menuBox?: SidebarBox;
+  /** ELS-SCROLL-MOUSE: present when the list overflows — the first shown item, the item count, the rows the items get,
+   *  the scrollbar's column (1-based, the list's last cell) and the screen row of the first item row. */
+  readonly scroll?: ListScroll;
+  /** ELS-SIDE-SPLIT-SCROLL: present when the spaces exceed their region — that region's own small scroll (same fields). */
+  readonly spacesScroll?: ListScroll;
+  /** ELS-SIDE-SPLIT-SCROLL: the screen row the agents region starts at (split list only). */
+  readonly agentsTop?: number;
+  /** ELS-GROUP-FOLD-CONTROL: each «▾/▸ SPACE · n» agent-group head on screen (click toggles it) and whether it is folded now. */
+  readonly groupHeads?: readonly { readonly y: number; readonly ws: string; readonly folded: boolean }[];
+  /** ELS-GROUP-FOLD-CONTROL: the head line's «▾ all» (expand every group) and «▸ all» (collapse every group) words (columns zero-based, end exclusive). */
+  readonly foldAll?: { readonly y: number; readonly expand: SidebarBox; readonly collapse: SidebarBox };
+  /** ELS-ACTIVE-ONLY-FILTER: the agents head's «◉ Active · n» / «○ All · m» word (a click flips the filter). */
+  readonly activeBox?: SidebarBox;
 }
+/** ELS-GROUP-FOLD-CONTROL: the person's own fold choice per agent group (wsId → true folded · false open). Auto-fold never overrides it. */
+export type GroupFolds = ReadonlyMap<string, boolean>;
+export const FOLD_ALL_WORDS = '▾ all ▸ all';
+/** ELS-ACTIVE-ONLY-FILTER: a seat that is working, or needs a person (✋ · blocked · failed). Idle, done, offline and exited seats are not. */
+export function isActiveSeat(row: SpaceTabRow): boolean {
+  if (row.exit || row.stale) return false;
+  if (seatMarks(markInput(row)).needsPerson) return true;
+  const word = wordOfState(row.state);
+  return word === 'working' || word === 'blocked' || word === 'failed';
+}
+/** ELS-SIDE-SPLIT-SCROLL: the «─» rule and the «○ All · n … grouped» head stay pinned between the two regions. */
+export const PINNED_AGENT_ROWS = 2;
+/** ELS-SIDE-SPLIT-SCROLL: the rows the spaces region and the agents region get, or undefined when the list is one region
+ *  (no agents, or fewer than 8 rows — a strip that small keeps the single list). Spaces = all of them up to 40% of the rows. */
+export function splitRooms(room: number, spaceCount: number): { readonly spaces: number; readonly agents: number } | undefined {
+  if (spaceCount < 0 || room < 8) return undefined;
+  const spaces = Math.min(spaceCount, Math.max(1, Math.floor(room * 0.4)));
+  return { spaces, agents: room - spaces - PINNED_AGENT_ROWS };
+}
+export interface ListScroll { readonly start: number; readonly total: number; readonly room: number; readonly x: number; readonly y: number }
+
+/** ELS-SCROLL-MOUSE: a thin scrollbar — track «│», thumb «┃» — for `room` rows showing [start, start+room) of `total`. */
+export const SCROLL_TRACK = '│';
+export const SCROLL_THUMB = '┃';
+export function scrollbarCells(start: number, total: number, room: number): string[] {
+  if (room <= 0) return [];
+  if (total <= room) return Array.from({ length: room }, () => ' ');
+  const size = Math.max(1, Math.round((room * room) / total));
+  const span = total - room;
+  const at = Math.min(room - size, Math.round((Math.min(span, Math.max(0, start)) * (room - size)) / span));
+  return Array.from({ length: room }, (_, row) => row >= at && row < at + size ? SCROLL_THUMB : SCROLL_TRACK);
+}
+/** The first item a click on scrollbar row `row` (0-based inside the bar) scrolls to. */
+export const scrollStartAt = (row: number, total: number, room: number): number =>
+  total <= room ? 0 : Math.max(0, Math.min(total - room, Math.round((row * (total - room)) / Math.max(1, room - 1))));
 
 /** The last `width` cells of `text`, led by «…» when it was cut (a path keeps its tail: the folder you are in). */
 function tailCells(text: string, width: number): string {
@@ -191,13 +254,42 @@ const homePath = (cwd: string, home: string | undefined): string => home && (cwd
  * workspace «● NAME» (the name UPPERCASE for display only, one status dot = the most urgent state inside it), the selected
  * space's path on one dim line under it (home as «~», cut by cells), «new · menu» pinned to the last line. No pane count.
  */
-export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: string | undefined, width: number, height: number, home?: string, ceoPendingRed = 0, emptyCoordinators: readonly { wsId: string; name: string; remote?: string; stale?: boolean }[] = [], selectedEmpty?: string, agentsOrder: 'grouped' | 'status' = 'grouped', actingSeat?: string): SpaceListLayout {
+/** DEMO-FANOUT-LIVE-OP-SEAT: a worker child has done its task once it finished a turn and is not working again. */
+export function workerDone(row: SpaceTabRow): boolean {
+  return (row.turnsDone ?? 0) > 0 && wordOfState(row.state) !== 'working';
+}
+
+/** «done/total» of the worker children a pane opened (undefined when it opened none). */
+export function workerProgress(pane: string, rows: readonly SpaceTabRow[]): { readonly done: number; readonly total: number } | undefined {
+  const children = rows.filter((row) => row.parentPane === pane);
+  return children.length ? { done: children.filter(workerDone).length, total: children.length } : undefined;
+}
+
+/** Each worker child right under its parent (journal order); a child whose parent is not listed stays where it was. */
+export function nestWorkerChildren<T extends { readonly row: SpaceTabRow }>(entries: readonly T[]): T[] {
+  const listed = new Set(entries.map((entry) => entry.row.pane));
+  const childrenOf = new Map<string, T[]>();
+  const top: T[] = [];
+  for (const entry of entries) {
+    const parent = entry.row.parentPane;
+    if (parent && parent !== entry.row.pane && listed.has(parent)) childrenOf.set(parent, [...(childrenOf.get(parent) ?? []), entry]);
+    else top.push(entry);
+  }
+  return top.flatMap((entry) => [entry, ...(childrenOf.get(entry.row.pane) ?? [])]);
+}
+
+export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: string | undefined, width: number, height: number, home?: string, ceoPendingRed = 0, emptyCoordinators: readonly { wsId: string; name: string; remote?: string; stale?: boolean }[] = [], selectedEmpty?: string, agentsOrder: 'grouped' | 'status' = 'grouped', actingSeat?: string, listTop?: number, groupFolds: GroupFolds = new Map(), activeOnly = false, spacesTop?: number): SpaceListLayout {
   const chosen = selectedEmpty ?? selectedSpace(rows, selectedPane);
-  type Item = { readonly text: string; readonly ws?: string; readonly pane?: string; readonly mode?: 'focus' | 'dim'; readonly bold?: boolean };
+  type Item = { readonly text: string; readonly ws?: string; readonly pane?: string; readonly mode?: 'focus' | 'dim'; readonly bold?: boolean; readonly group?: { readonly ws: string; readonly folded: boolean } };
   // 출처: OP #134199/#134203 — 스페이스 줄에는 동작 상태를 표시하지 않는다(조율자 ⭐ 표식과 원격 사망 ✕만).
   const isActing = (row: SpaceTabRow): boolean => !!actingSeat && !row.remote && row.seat === actingSeat;
-  const nameOf = (space: Space): string => `${space.panes.some(isActing) ? '[OP 대행] ' : ''}${space.panes.some((row) => row.stale) ? `${UNREACHABLE_MARK} ` : ''}${space.panes.some((row) => row.role === 'coordinator') ? '⭐ ' : ''}${space.name.toLocaleUpperCase()}${actingSeat && space.panes.some(row => !row.remote && row.seat === 'OP') ? ` → ${actingSeat} acting` : ''}${personCount(space.panes)}`;
+  const nameOf = (space: Space): string => `${nameHead(space)}${personCount(space.panes)}`;
+  // ELS-SCROLL-MOUSE: the agent-count badge («✋n») stays when a long name is cut — the name gives way, never the badge.
+  const nameHead = (space: Space): string => `${space.panes.some(isActing) ? '[OP 대행] ' : ''}${space.panes.some((row) => row.stale) ? `${UNREACHABLE_MARK} ` : ''}${space.panes.some((row) => row.role === 'coordinator') ? '⭐ ' : ''}${space.name.toLocaleUpperCase()}${actingSeat && space.panes.some(row => !row.remote && row.seat === 'OP') ? ` → ${actingSeat} acting` : ''}`;
+  const badgedLine = (head: string, badge: string, cells: number): string => badge && Bun.stringWidth(head + badge) > cells ? headCells(head, Math.max(1, cells - Bun.stringWidth(badge))) + badge : headCells(head + badge, cells);
   const items: Item[] = [];
+  let agentsFrom = -1;   // ELS-SIDE-SPLIT-SCROLL: index of the «─» rule — spaces above it, the pinned agents head and the agents below
+  let activeAgentsHead = -1, activeWordCells = 0;
   const pendingEmpty = emptyCoordinators.filter((space) => !rows.some((row) => row.wsId === space.wsId));
   const addEmpty = (space: typeof pendingEmpty[number]): void => {
     const baton = actingSeat && !space.remote && space.name.toLocaleUpperCase() === 'OP' ? ` → ${actingSeat} acting` : '';
@@ -206,7 +298,7 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
   for (const space of pendingEmpty.filter((space) => !space.remote)) addEmpty(space);
   const spaceLine = (space: Space, indent: string): void => {
     const selected = space.wsId === chosen;
-    items.push({ text: headCells(` ${indent}${nameOf(space)}`, width), ws: space.wsId, pane: space.panes[0]!.pane, ...(selected ? { mode: 'focus' as const } : {}) });
+    items.push({ text: badgedLine(` ${indent}${nameHead(space)}`, personCount(space.panes), width - 1), ws: space.wsId, pane: space.panes[0]!.pane, ...(selected ? { mode: 'focus' as const } : {}) });
     // 출처: OP #134227 — 포커스된 스페이스만 2줄(부제 «N agents · 가지»), 그 어떤 스페이스도 2줄을 넘지 않는다.
     const cwd = space.panes[0]!.cwd;
     const branch = cwd ? (baseName(cwd) || cwd) : space.name;
@@ -229,7 +321,7 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
   for (const space of visible) { addHostEmpty(space.panes[0]?.remote); spaceLine(space, ''); }
   addHostEmpty(herdr[0]?.panes[0]?.remote);
   if (herdr.length > 0) {
-    items.push({ text: `${herdrOpen ? ' ⊟' : ' ⊞'} HERDR · ${herdr.length}` });
+    items.push({ text: `${herdrOpen ? ' ▾' : ' ▸'} HERDR · ${herdr.length}` });
     if (herdrOpen) for (const space of herdr) spaceLine(space, '  ');
   }
   for (const space of pendingEmpty) addHostEmpty(space.remote);
@@ -242,45 +334,181 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
     : { working: 0, blocked: 1, stalled: 2, idle: 3, failed: 4, done: 5, unknown: 5 }[wordOfState(row.state)] ?? 5; // done = 스펙 순서 밖(완료·dim) — 미지 폴백(5)과 동급
   const twoLine = width >= 20;
   if (agentSpaces.length > 0) {
+    agentsFrom = items.length;
     items.push({ text: '─'.repeat(width) });
     // ELS-AGENTS-GROUPED-TOGGLE-FU (OP #134722 ②): the head word is the mode — «grouped» keeps herdr's
     // 스페이스별 묶음, «status» flattens every space's panes into one rank order(같은 계수 — OP #134223).
     const orderWord = agentsOrder === 'status' ? 'status' : 'grouped';
-    items.push({ text: ` agents${' '.repeat(Math.max(1, width - 7 - orderWord.length))}${orderWord}` });
-    const ordered: readonly { readonly space: Space; readonly row: SpaceTabRow }[] = agentsOrder === 'status'
+    const allCount = agentSpaces.reduce((sum, space) => sum + space.panes.filter((row) => !isBareShell(row)).length, 0);
+    const activeCount = agentSpaces.reduce((sum, space) => sum + space.panes.filter(isActiveSeat).length, 0);
+    const filterWord = activeOnly ? `◉ Active · ${activeCount}` : `○ All · ${allCount}`;
+    activeAgentsHead = items.length;
+    activeWordCells = Bun.stringWidth(filterWord);
+    items.push({ text: ` ${filterWord}${' '.repeat(Math.max(1, width - 1 - activeWordCells - orderWord.length))}${orderWord}` });
+    const keep = (row: SpaceTabRow): boolean => !activeOnly || isActiveSeat(row) || row.pane === selectedPane;
+    const rankedAll: readonly { readonly space: Space; readonly row: SpaceTabRow }[] = agentsOrder === 'status'
       ? agentSpaces.flatMap((space) => space.panes.map((row) => ({ space, row }))).sort((a, b) => rankOf(a.row) - rankOf(b.row))
       : agentSpaces.flatMap((space) => [...space.panes].sort((a, b) => rankOf(a) - rankOf(b)).map((row) => ({ space, row })));
-    for (const { entry: { space, row }, exited } of agentPanelRows(ordered, rows)) {
-      if (exited) {
-        items.push({ text: headCells(` ${EXITED_MARK} ${row.seat} exited`, width), pane: row.pane, ws: space.wsId, ...(row.pane === selectedPane ? { mode: 'focus' as const } : {}) });
-        if (twoLine) items.push({ text: `       shell · ${space.name}`, mode: 'dim' });
-        continue;
+    const ranked = rankedAll.filter((entry) => keep(entry.row));
+    // ELS-PANE-LABEL-MODEL-FIRST: an entry reads «<mark> <SEAT> <model>» and, dim under it, «cell · @lent space · runtime (not
+    // eln) · ⇄host · age» (agent-entry.ts). «grouped» draws a «⊟ SPACE · n» head per space; when the entries would not fit, every
+    // group but the selected pane's folds to its head («⊞») — a click on a head selects its first pane and so opens it.
+    const now = Date.now();
+    const entryItems = (list: readonly { readonly space: Space; readonly row: SpaceTabRow }[]): Item[] & { shown?: number } => {
+      const out: Item[] & { shown?: number } = [];
+      out.shown = 0;
+      const ordered = nestWorkerChildren(list);
+      // ELS-SIDE-REMOTE-GROUP (대표 11-25 21:5x): an exited pane (dead shell twin or a pane whose program ended) sits in a dim
+      // «exited» tail of its group — never with a success glyph — and a seat that is live anywhere shows no exited twin.
+      const liveSeat = new Set(rows.filter((one) => one.seat && !isBareShell(one) && one.state !== 'exited' && !one.exit).map((one) => one.seat!));
+      const placed = agentPanelRows(ordered, rows).map((one) => ({ ...one, exited: one.exited || one.entry.row.state === 'exited' || !!one.entry.row.exit }))
+;
+      const tail = placed.filter((one) => one.exited).filter((one, at, all) => !one.entry.row.seat || !liveSeat.has(one.entry.row.seat) && all.findIndex((x) => x.entry.row.seat === one.entry.row.seat) === at);
+      for (const { entry: { space, row }, exited } of [...placed.filter((one) => !one.exited), ...tail]) {
+        out.shown!++;
+        if (exited) {
+          out.push({ text: headCells(` ${EXITED_MARK} ${row.seat ?? tabName(row.title)}${row.remote ? `@${row.remote.toLowerCase()}` : ''} exited${row.exit ? ` · ${row.exit.reason}` : ''}`, width), pane: row.pane, ws: space.wsId, ...(row.pane === selectedPane ? { mode: 'focus' as const } : { mode: 'dim' as const }) });
+          // DEMO-PANE-EXIT-VISIBLE: the exited pane's last screen line, dim under it.
+          if (twoLine && row.exit?.last) out.push({ text: headCells(`       ${row.exit.last}`, width), mode: 'dim' });
+          continue;
+        }
+        const mark = row.stale ? UNREACHABLE_MARK : twoMarks(row);
+        // DEMO-FANOUT-LIVE-OP-SEAT: a worker child sits indented under its parent («↳») with ✓ once its task turn finished;
+        // the parent carries «done/total» of its children.
+        const child = !!row.parentPane && ordered.some((entry) => entry.row.pane === row.parentPane);
+        const progress = workerProgress(row.pane, rows);
+        const indent = child ? '  ↳ ' : '';
+        const entry = agentEntry({ name: `${row.seat ?? (row.agent && labelName(row) === row.agent ? space.name.toLocaleUpperCase() : labelName(row))}${row.remote ? `@${row.remote.toLowerCase()}` : ''}`, title: tabName(row.title), ...(row.agent ? { agent: row.agent } : {}), ...(row.model ? { model: row.model } : {}), ...(row.command ? { command: row.command } : {}), groupSpace: space.name, ...(row.remote ? { remote: row.remote } : {}), ...(row.lastEventAtMs ? { lastEventAtMs: row.lastEventAtMs } : {}) }, now);
+        out.push({ text: badgedLine(` ${indent}${mark} ${isActing(row) ? '[OP 대행] ' : ''}${entry.head}`, `${child && workerDone(row) ? ' ✓' : ''}${progress ? ` ${progress.done}/${progress.total}` : ''}`, width - 1), pane: row.pane, ws: space.wsId, ...(row.spaceCoordinator ? { bold: true } : {}), ...(row.pane === selectedPane ? { mode: 'focus' as const } : {}) });
+        if (twoLine && entry.detail) out.push({ text: headCells(`    ${child ? '    ' : ''}${entry.detail}`, width), mode: 'dim' });
       }
-      const mark = row.stale ? UNREACHABLE_MARK : twoMarks(row);
-      items.push({ text: headCells(` ${mark} ${isActing(row) ? '[OP 대행] ' : ''}${row.remote ? `⇄${row.remote} ` : ''}${labelName(row)}`, width), pane: row.pane, ws: space.wsId, ...(row.spaceCoordinator ? { bold: true } : {}), ...(row.pane === selectedPane ? { mode: 'focus' as const } : {}) });
-      if (twoLine) items.push({ text: `       ${row.agent ?? 'shell'} · ${space.name}`, mode: 'dim' });
+      return out;
+    };
+    if (agentsOrder === 'status') items.push(...entryItems(ranked));
+    else {
+      // ELS-SIDE-REMOTE-GROUP: a remote seat joins its SPACE's group (TC-H-REMOTE-1 → TC, by the seat's first word); with no
+      // such local space it gets a group named after that word (or its host) — a raw remote workspace id is never a heading.
+      const localByName = new Map(agentSpaces.filter((space) => !space.panes[0]?.remote).map((space) => [space.name.toLocaleUpperCase(), space]));
+      const made = new Map<string, Space>();
+      const homeOf = (entry: { readonly space: Space; readonly row: SpaceTabRow }): Space => {
+        if (!entry.row.remote) return entry.space;
+        const word = (entry.row.seat ?? '').split('-')[0]!.toLocaleUpperCase();
+        const local = word ? localByName.get(word) : undefined;
+        if (local) return local;
+        const name = word || entry.row.remote.toLocaleUpperCase();
+        const key = `remote-group:${name}`;
+        if (!made.has(key)) made.set(key, { wsId: key, name, panes: [] });
+        return made.get(key)!;
+      };
+      const homed = ranked.map((entry) => ({ ...entry, home: homeOf(entry) }));
+      const homes = [...agentSpaces.filter((space) => homed.some((entry) => entry.home === space)), ...made.values()];
+      const groups = homes.map((space) => ({ space, list: homed.filter((entry) => entry.home === space) }))
+        .map((group) => ({ ...group, items: entryItems(group.list) })).filter((group) => (group.items.shown ?? 0) > 0);
+      const opened = groups.map((group) => group.items);
+      const room = height - (height >= 3 ? 1 : 0) - (height >= 2 ? 1 : 0);
+      // ELS-GROUP-FOLD-CONTROL: the person's choice first (folded stays folded, opened is never auto-folded); then fold the
+      // biggest UNTOUCHED unselected groups, only as many as it takes to fit. Past that the scrollbar (and the wheel) takes over.
+      const folds = new Set<number>(groups.map((group, at) => groupFolds.get(group.space.wsId) === true ? at : -1).filter((at) => at >= 0));
+      // ELS-SIDE-SPLIT-SCROLL: in the split list the spaces have their own region — only the agents region's rows count.
+      const split = splitRooms(room, agentsFrom);
+      let need = (split ? items.length - agentsFrom - PINNED_AGENT_ROWS : items.length) + groups.length + opened.reduce((sum, list, at) => sum + (folds.has(at) ? 0 : list.length), 0) - (split ? split.agents : room);
+      for (const at of groups.map((_, at) => at).sort((x, y) => opened[y]!.length - opened[x]!.length)) {
+        if (need <= 0 || groups.length < 2) break;
+        if (folds.has(at) || groupFolds.has(groups[at]!.space.wsId)) continue;
+        if (groups[at]!.list.some((entry) => entry.row.pane === selectedPane)) continue;
+        folds.add(at);
+        need -= opened[at]!.length;
+      }
+      groups.forEach((group, at) => {
+        const folded = folds.has(at);
+        items.push({ text: headCells(` ${folded ? '▸' : '▾'} ${group.space.name.toLocaleUpperCase()} · ${activeOnly ? `${group.items.shown}/${rankedAll.filter((entry) => !isBareShell(entry.row) && homeOf(entry) === group.space).length}` : group.items.shown}${personCount(group.list.map((entry) => entry.row))}`, width), ws: group.space.wsId, pane: group.list[0]!.row.pane, group: { ws: group.space.wsId, folded } });
+        if (!folded) items.push(...opened[at]!);
+      });
     }
   }
   const head = height >= 3;
   const foot = height >= 2;
   const room = height - (head ? 1 : 0) - (foot ? 1 : 0);
-  const at = Math.max(0, items.findIndex((item) => item.mode === 'focus'));
-  const tail = items[at + 1]?.mode === 'dim' ? 1 : 0;      // the selected name and its path line show together
-  const start = items.length <= room ? 0 : Math.min(at, Math.max(Math.min(Math.max(0, at - Math.floor(room / 2)), items.length - room), at + tail + 1 - room));
   const lines: string[] = [];
   const spaces: { y: number; ws: string; pane: string }[] = [];
   const emptySpaces: { y: number; ws: string }[] = [];
-  if (head) lines.push(ceoPendingRed !== 0
-    ? `\u001b[31m${fitCells(ceoPendingRed < 0 ? ' 🔴 대표 대기 글 확인 불가' : ` 🔴 대표 대기 글 ${ceoPendingRed}`, width)}\u001b[39m`
-    : `\u001b[2m${fitCells(SPACE_LIST_HEAD, width)}\u001b[22m`);
-  for (const item of items.slice(start, start + room)) {
-    if (item.ws !== undefined) {
-      if (item.pane !== undefined) spaces.push({ y: lines.length + 1, ws: item.ws, pane: item.pane });
-      else emptySpaces.push({ y: lines.length + 1, ws: item.ws });
+  const groupHeads: { y: number; ws: string; folded: boolean }[] = [];
+  const hasGroups = items.some((item) => item.group);
+  const foldAt = width - FOLD_ALL_WORDS.length - 1;
+  const foldAll = head && hasGroups && foldAt >= SPACE_LIST_HEAD.length + 1
+    ? { y: 1, expand: { y: 1, from: foldAt, to: foldAt + 5 }, collapse: { y: 1, from: foldAt + 6, to: foldAt + 11 } } : undefined;
+  // DEMO-ONBOARD-EN-COPY: red only for real waiting CEO messages; an unreadable count is a dim note, not an alarm.
+  if (head) lines.push(ceoPendingRed > 0
+    ? `\u001b[31m${fitCells(` 🔴 CEO waiting: ${ceoPendingRed}`, width)}\u001b[39m`
+    : ceoPendingRed < 0
+      ? `\u001b[2m${fitCells(' CEO inbox unavailable', width)}\u001b[22m`
+      : `\u001b[2m${fitCells(foldAll ? `${SPACE_LIST_HEAD}${' '.repeat(foldAt - SPACE_LIST_HEAD.length)}${FOLD_ALL_WORDS}` : SPACE_LIST_HEAD, width)}\u001b[22m`);
+  let activeBox: SidebarBox | undefined;
+  // Paint items[from, from+count) at the next lines, `start` = the region's first shown item; a bar when it overflows.
+  const paint = (region: readonly Item[], offset: number, start: number, count: number, overflow: boolean): void => {
+    const bar = overflow ? scrollbarCells(start, region.length, count) : [];
+    const textWidth = overflow ? width - 1 : width;
+    for (let row = 0; row < count; row++) {
+      const item = region[start + row];
+      const glyph = overflow ? `\u001b[2m${bar[row] ?? ' '}\u001b[22m` : '';
+      if (!item) { lines.push(`${' '.repeat(textWidth)}${glyph}`); continue; }
+      if (offset + start + row === activeAgentsHead) activeBox = { y: lines.length + 1, from: 1, to: 1 + activeWordCells };
+      if (item.group) groupHeads.push({ y: lines.length + 1, ws: item.group.ws, folded: item.group.folded });
+      if (item.ws !== undefined) {
+        if (item.pane !== undefined) spaces.push({ y: lines.length + 1, ws: item.ws, pane: item.pane });
+        else emptySpaces.push({ y: lines.length + 1, ws: item.ws });
+      }
+      const fitted = fitCells(item.text, textWidth);
+      const text = item.bold ? `\u001b[1m${fitted}\u001b[22m` : fitted;
+      lines.push((item.mode === 'focus' ? `${FOCUS_ON}${text}${FOCUS_OFF}` : item.mode === 'dim' ? `\u001b[2m${text}\u001b[22m` : text) + glyph);
     }
-    const fitted = fitCells(item.text, width);
-    const text = item.bold ? `\u001b[1m${fitted}\u001b[22m` : fitted;
-    lines.push(item.mode === 'focus' ? `${FOCUS_ON}${text}${FOCUS_OFF}` : item.mode === 'dim' ? `\u001b[2m${text}\u001b[22m` : text);
+  };
+  // ELS-SIDE-SPLIT-SCROLL (대표 11-25 22:3x «스페이스 영역은 고정 · 에이전트 영역만 스크롤»): from a real side list the spaces
+  // are a fixed region (all of them up to 40% of the rows — past that, their own small scroll), the «─» rule and the agents
+  // head are pinned under it, and the agents are the only region the wheel, the scrollbar and ctrl+b PgUp/PgDn/Home/End move.
+  const split = splitRooms(room, agentsFrom);
+  let listScroll: ListScroll | undefined;
+  let spacesScroll: ListScroll | undefined;
+  let agentsTop: number | undefined;
+  if (split) {
+    const spaceItems = items.slice(0, agentsFrom);
+    const agentOffset = agentsFrom + PINNED_AGENT_ROWS;
+    const agentItems = items.slice(agentOffset);
+    const spaceOver = spaceItems.length > split.spaces;
+    const focusSpace = Math.max(0, spaceItems.findIndex((item) => item.mode === 'focus'));
+    const spaceTail = spaceItems[focusSpace + 1]?.mode === 'dim' ? 1 : 0;
+    const spaceStart = !spaceOver ? 0 : spacesTop !== undefined ? Math.max(0, Math.min(spaceItems.length - split.spaces, Math.floor(spacesTop)))
+      : Math.max(0, Math.min(spaceItems.length - split.spaces, focusSpace + spaceTail + 1 - split.spaces, focusSpace));
+    const spaceTop = lines.length + 1;
+    paint(spaceItems, 0, spaceStart, split.spaces, spaceOver && split.spaces >= 3);
+    if (spaceOver) spacesScroll = { start: spaceStart, total: spaceItems.length, room: split.spaces, x: width, y: spaceTop };
+    paint(items.slice(agentsFrom, agentOffset), agentsFrom, 0, PINNED_AGENT_ROWS, false);
+    const agentOver = agentItems.length > split.agents;
+    const agentFocus = agentItems.map((item) => item.mode).lastIndexOf('focus');
+    // Follow the selection with its group head in view when both fit (the head says whose agent it is).
+    const groupAt = agentFocus < 0 ? -1 : agentItems.slice(0, agentFocus + 1).map((item) => !!item.group).lastIndexOf(true);
+    const lowest = agentFocus + (agentItems[agentFocus + 1]?.mode === 'dim' ? 2 : 1) - split.agents;
+    const follow = agentFocus < 0 ? 0 : Math.max(0, Math.min(agentItems.length - split.agents, Math.max(lowest, Math.min(agentFocus - Math.floor(split.agents / 2), groupAt < 0 ? agentFocus : groupAt))));
+    const agentStart = !agentOver ? 0 : listTop !== undefined ? Math.max(0, Math.min(agentItems.length - split.agents, Math.floor(listTop))) : follow;
+    const agentTop = lines.length + 1;
+    agentsTop = agentTop;
+    paint(agentItems, agentOffset, agentStart, split.agents, agentOver);
+    if (agentOver) listScroll = { start: agentStart, total: agentItems.length, room: split.agents, x: width, y: agentTop };
+  } else {
+    const at = Math.max(0, items.findIndex((item) => item.mode === 'focus'));
+    // ELS-SCROLL-MOUSE: the selected AGENT row (below its space line) must be in view too — with 40+ agents it is far below.
+    const agentAt = items.map((item) => item.mode).lastIndexOf('focus');
+    const tail = items[at + 1]?.mode === 'dim' ? 1 : 0;      // the selected name and its path line show together
+    const scrolls = items.length > room && room > 0;
+    // (from 10 rows — a real side list; a few-row strip keeps the selected space line first, as before)
+    const keepInView = (first: number): number => room >= 10 && (agentAt < first || agentAt >= first + room) ? Math.max(0, Math.min(items.length - room, agentAt - Math.floor(room / 2))) : first;
+    const overflow = scrolls && room >= 3;   // the bar (and the person's own offset) from three rows: a bar in one or two rows is noise
+    // ELS-SCROLL-MOUSE: a scrolled list (wheel · scrollbar · ctrl+b PgUp/PgDn/Home/End) keeps its offset; otherwise the selection stays in view.
+    const start = !scrolls ? 0 : overflow && listTop !== undefined ? Math.max(0, Math.min(items.length - room, Math.floor(listTop)))
+      : keepInView(Math.min(at, Math.max(Math.min(Math.max(0, at - Math.floor(room / 2)), items.length - room), at + tail + 1 - room)));
+    paint(items, 0, start, Math.max(0, Math.min(room, items.length - start)), overflow);
+    if (overflow) listScroll = { start, total: items.length, room, x: width, y: head ? 2 : 1 };
+    while (lines.length < height - (foot ? 1 : 0)) lines.push(overflow ? `${' '.repeat(width - 1)}\u001b[2m${scrollbarCells(start, items.length, room)[lines.length - (head ? 1 : 0)] ?? ' '}\u001b[22m` : ' '.repeat(width));
   }
   while (lines.length < height - (foot ? 1 : 0)) lines.push(' '.repeat(width));
   let newBox: SidebarBox | undefined;
@@ -291,7 +519,8 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
     menuBox = { y: lines.length + 1, from: SPACE_LIST_END.indexOf('menu'), to: SPACE_LIST_END.indexOf('menu') + 4 };
     lines.push(fitCells(SPACE_LIST_END, width));
   }
-  return { lines, spaces, emptySpaces, ...(newBox ? { newBox, menuBox: menuBox! } : {}) };
+  return { lines, spaces, emptySpaces, ...(newBox ? { newBox, menuBox: menuBox! } : {}), ...(listScroll ? { scroll: listScroll } : {}), ...(spacesScroll ? { spacesScroll } : {}), ...(agentsTop !== undefined ? { agentsTop } : {}),
+    ...(hasGroups ? { groupHeads } : {}), ...(activeBox ? { activeBox } : {}), ...(foldAll && ceoPendingRed === 0 ? { foldAll } : {}) };
 }
 
 /** The folded space list: exactly `height` lines of `width` cells (see layoutSpaceList for the hit boxes). */
@@ -305,6 +534,11 @@ export interface TabRow {
   readonly tabs: readonly { readonly from: number; readonly to: number; readonly pane: string }[];
   /** ELS-NEW-TAB-NAME-WIDGET: the «+» cell (zero-based, end exclusive) — a click opens the new-tab name prompt. Absent when the row overflows («›» instead). */
   readonly plus?: { readonly from: number; readonly to: number };
+  /** ELS-SCROLL-MOUSE: the first shown tab, the tab count, and the «‹ n more» / «n more ›» cells (clicks scroll the row). */
+  readonly first?: number;
+  readonly count?: number;
+  readonly prev?: { readonly from: number; readonly to: number };
+  readonly next?: { readonly from: number; readonly to: number };
 }
 
 // ELS-FIRST-RUN-FU3 (OP #101592 · #101606): the tab row reads like herdr's — one name per tab, «+» (new tab) last.
@@ -384,7 +618,7 @@ const tabParts = (row: SpaceTabRow): { head: string; name: string; tail: string 
   const glyph = tabStatusGlyph(row);
   // ELS-POD-TAB: «[pod]» badges the tab row right after the name (the 📦 emoji stays in the dropdown — WHAT the pane
   // runs; «[pod]» is WHERE, a pod place under the host), inside the name part so a narrow row cuts it as the name gives way.
-  return { head: `${TAB_PAD}${row.spaceCoordinator ? '⭐ ' : ''}`, name: `${row.remote ? `⇄${row.remote} ` : ''}${labelName(row).toUpperCase()}${row.place?.runtime === 'pod' ? ` ${POD_BADGE}` : ''}`, tail: `${glyph ? ` ${glyph}` : ''}${TAB_PAD}` };
+  return { head: `${TAB_PAD}${row.spaceCoordinator ? '⭐ ' : ''}`, name: `${labelName(row).toUpperCase()}${row.remote ? ` ${remoteMark()}` : ''}${row.place?.runtime === 'pod' ? ` ${POD_BADGE}` : ''}`, tail: `${glyph ? ` ${glyph}` : ''}${TAB_PAD}` };
 };
 
 /** A tab drawn into `room` cells: the name gives way first; ⭐, the status glyph and the padding stay while they fit at all. */
@@ -393,8 +627,14 @@ const fitTab = ({ head, name, tail }: { head: string; name: string; tail: string
   return nameRoom >= 0 ? head + clipCells(name, nameRoom) + tail : fitCells(head + name + tail, room);
 };
 
-/** The selected workspace's panes as tabs; the focused one in reverse video. Overflow keeps the focused tab and shows ‹ / ›. */
-export function buildTabRow(rows: readonly SpaceTabRow[], selectedPane: string | undefined, width: number): TabRow {
+/** ELS-SCROLL-MOUSE: the tab row's overflow words — «‹ n more » before the first shown tab, « n more ›» after the last. */
+export const tabsBefore = (n: number): string => `‹ ${n} more `;
+export const tabsAfter = (n: number): string => ` ${n} more ›`;
+export const TAB_WORDS_FROM = 40;
+
+/** The selected workspace's panes as tabs; the focused one in reverse video. Overflow shows «‹ n more» / «n more ›»
+ *  (click or wheel scrolls); `firstTab` = a scrolled row's first tab, else the row keeps the focused tab in view. */
+export function buildTabRow(rows: readonly SpaceTabRow[], selectedPane: string | undefined, width: number, firstTab?: number): TabRow {
   const chosen = selectedSpace(rows, selectedPane);
   const panes = rows.filter((row) => row.wsId === chosen);
   if (panes.length === 0 || width < 3) return { tabs: [] };
@@ -403,33 +643,49 @@ export function buildTabRow(rows: readonly SpaceTabRow[], selectedPane: string |
   const cells = (text: string) => Bun.stringWidth(text);
   const chosenAt = Math.max(0, labels.findIndex((label) => label.pane === selectedPane));
   const total = labels.reduce((sum, label) => sum + cells(label.text) + cells(TAB_SEP), 0) + cells(NEW_TAB);
-  let first = 0;
-  if (total > width) {
-    const room = width - 2; // a leading ‹ and a trailing ›
-    while (first < chosenAt && labels.slice(first, chosenAt + 1).reduce((sum, label) => sum + cells(label.text) + cells(TAB_SEP), 0) > room) first++;
-  }
-  let line = first > 0 ? '‹' : '';
-  const tabs: { from: number; to: number; pane: string }[] = [];
-  let last = first - 1;
+  // A narrow row (under TAB_WORDS_FROM cells) keeps the bare «‹» / «›» so the focused tab is not eaten by the words.
+  const words = width >= TAB_WORDS_FROM;
+  const before = (n: number): string => words ? tabsBefore(n) : '‹';
+  const after = (n: number): string => words ? tabsAfter(n) : '›';
+  const lay = (first: number) => {
+    const line0 = first > 0 ? before(first) : '';
+    let line = line0;
+    const prev = first > 0 ? { from: 0, to: cells(line0) } : undefined;
+    const tabs: { from: number; to: number; pane: string }[] = [];
+    let last = first - 1;
+    for (let at = first; at < labels.length; at++) {
+      const piece = labels[at]!.text + TAB_SEP;
+      const reserve = at < labels.length - 1 ? cells(after(labels.length - 1 - at)) : cells(NEW_TAB);
+      if (cells(line) + cells(piece) + reserve > width) break;
+      tabs.push({ from: cells(line), to: cells(line) + cells(labels[at]!.text), pane: labels[at]!.pane });
+      line += piece;
+      last = at;
+    }
+    return { line, prev, tabs, last };
+  };
+  let first = total > width ? Math.max(0, Math.min(labels.length - 1, Math.floor(firstTab ?? 0))) : 0;
+  let laid = lay(first);
+  if (total > width && firstTab === undefined) while (first < chosenAt && !laid.tabs.some((tab) => tab.pane === labels[chosenAt]!.pane)) laid = lay(++first);
+  let { line } = laid;
+  const { tabs, prev } = laid;
+  const last = laid.last;
   let plus: { from: number; to: number } | undefined;
-  for (let at = first; at < labels.length; at++) {
-    const piece = labels[at]!.text + TAB_SEP;
-    const reserve = at < labels.length - 1 ? 1 : cells(NEW_TAB);
-    if (cells(line) + cells(piece) + reserve > width) break;
-    tabs.push({ from: cells(line), to: cells(line) + cells(labels[at]!.text), pane: labels[at]!.pane });
-    line += piece;
-    last = at;
-  }
+  let next: { from: number; to: number } | undefined;
   // 출처: #38438 review must[1] — the selected tab alone can be wider than the row: clip it instead of dropping it,
   // so a long title in a narrow row still shows the tab's visible part and keeps its click range (start column, width).
-  if (tabs.length === 0 && chosenAt < labels.length) {
+  if (tabs.length === 0 && first < labels.length) {
     const room = width - cells(line);
     if (room > 0) {
-      const text = fitTab(labels[chosenAt]!.parts, room);
-      tabs.push({ from: cells(line), to: cells(line) + Math.min(cells(text), room), pane: labels[chosenAt]!.pane });
+      const text = fitTab(labels[first]!.parts, room);
+      tabs.push({ from: cells(line), to: cells(line) + Math.min(cells(text), room), pane: labels[first]!.pane });
       line += fitCells(text, room);
     }
-  } else if (last < labels.length - 1) line += '›';
+  } else if (last < labels.length - 1) {
+    const more = after(labels.length - 1 - last);
+    const word = cells(line) + cells(more) <= width ? more : '›';
+    next = { from: width - cells(word), to: width };       // pinned to the row's right end
+    line = fitCells(line, next.from) + word;
+  }
   else { plus = { from: cells(line), to: cells(line) + cells(NEW_TAB) }; line += NEW_TAB; }
   const focused = tabs.find((tab) => tab.pane === selectedPane);
   const plain = fitCells(line, width);
@@ -439,7 +695,7 @@ export function buildTabRow(rows: readonly SpaceTabRow[], selectedPane: string |
     ...tabs.filter((tab) => exited.has(tab.pane)).flatMap((tab) => [{ at: tab.from, text: DIM_ON }, { at: tab.to, text: DIM_OFF }]),
     ...tabs.flatMap((tab) => [{ at: tab.from, text: tab === focused ? TAB_ACTIVE_ON : TAB_INACTIVE_ON }, { at: tab.to, text: TAB_OFF }]),
   ];
-  return { line: marks.length > 0 ? markCells(plain, marks) : plain, tabs, ...(plus ? { plus } : {}) };
+  return { line: marks.length > 0 ? markCells(plain, marks) : plain, tabs, ...(plus ? { plus } : {}), first, count: labels.length, ...(prev ? { prev } : {}), ...(next ? { next } : {}) };
 }
 
 /** The panes in the order the dropdown lists them (spaces in first-seen order, each space's tabs together). */

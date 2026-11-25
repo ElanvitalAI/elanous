@@ -21,6 +21,7 @@ import { preflightGateExecutionIdentity, type GatePodExecutionIdentity } from '.
 import { gateShardLedgerBatchComplete, gateShardLedgerPath, readGateShardLedger } from './gate-shard-ledger.js';
 import { gateShardsPath, readGateShards } from './gate-shards.js';
 import { createCommandCloudVmAdapter, type CloudVmAdapter } from './cloud-vm-adapter.js';
+import { shadowedCloudVm } from '../res-policy/auto-record.js';
 import { realpathProbeSummary, runRealpathProbe, type RealpathProbeReceipt } from '../../scripts/release-loop/realpath-probe.js';
 
 export type StepId = 'hard-mid' | 'rc-7h' | 'hard-5h' | 'rc-150m';
@@ -645,7 +646,8 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
           const configured = deps.cloudVmAdapter;
           const command = configured ? undefined : releaseRehearsalConfig().cloudVmCommand;
           if (!configured && !command) throw new Error('release.rehearsal.cloudVmCommand is not configured; refusing cloud rehearsal without local fallback');
-          cloudVm = configured ?? createCommandCloudVmAdapter(command!);
+          // GUARDIAN-FINDINGS-VISIBLE: the real command adapter also writes a RES shadow pair per start/stop.
+          cloudVm = configured ?? shadowedCloudVm(createCommandCloudVmAdapter(command!), 'release.rehearsal');
           await cloudVm.start('aws1');
           const status = await cloudVm.status('aws1');
           if (status.state !== 'running') throw new Error(`aws1 status is ${status.state}${status.detail ? ` (${status.detail})` : ''}`);

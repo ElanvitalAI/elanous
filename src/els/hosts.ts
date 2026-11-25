@@ -18,7 +18,18 @@ export interface FederatedHost {
     readonly home?: string; readonly stateRoot?: string; readonly cwd?: string };
   /** Person-pinned SSH transport for the view-only attach bridge. */
   readonly attach?: { readonly sshTarget: string; readonly knownHostsFile: string };
+  /** How remote tabs (new · close · attach) reach this host. Absent = `ssh` (direct tailnet reach). See HostRouteKind. */
+  readonly route?: HostRouteKind;
 }
+
+/**
+ * The remote-tab transport seam (ELS-REMOTE-TAB stage 1). `ssh` = direct tailnet reach: the host's tailnet window
+ * (`els serve --http`) for ls · read · new · close and the pinned SSH bridge (or the window) for attach. `relay`
+ * (ELS-REMOTE-TAB-RELAY) and `vm` (ELS-REMOTE-TAB-CLOUD-VM) are reserved names: a host can declare them, and the
+ * federation answers «not available in this build» until a route of that kind is plugged in.
+ */
+export type HostRouteKind = 'ssh' | 'relay' | 'vm';
+export const HOST_ROUTE_KINDS: readonly HostRouteKind[] = ['ssh', 'relay', 'vm'];
 
 function attachTransport(raw: unknown, baseUrl: string): FederatedHost['attach'] | string {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return 'attach transport is not an object';
@@ -113,9 +124,12 @@ export function loadHostRegistry(path: string): HostRegistry {
     else {
       const update = (row as { update?: unknown }).update === undefined ? undefined : updateTransport((row as { update?: unknown }).update, baseUrl);
       const attach = (row as { attach?: unknown }).attach === undefined ? undefined : attachTransport((row as { attach?: unknown }).attach, baseUrl);
+      const route = (row as { route?: unknown }).route;
       if (typeof update === 'string') rejected.push(`${name}: ${update}`);
       else if (typeof attach === 'string') rejected.push(`${name}: ${attach}`);
-      else hosts.push({ name, baseUrl, ...(update ? { update } : {}), ...(attach ? { attach } : {}) });
+      else if (route !== undefined && !HOST_ROUTE_KINDS.includes(route as HostRouteKind)) rejected.push(`${name}: route must be ssh, relay or vm`);
+      else hosts.push({ name, baseUrl, ...(update ? { update } : {}), ...(attach ? { attach } : {}),
+        ...(route !== undefined && route !== 'ssh' ? { route: route as HostRouteKind } : {}) });
     }
   });
   return { hosts, rejected };

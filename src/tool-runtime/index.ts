@@ -30,6 +30,7 @@ import { agentRuntime } from './agent-runtime.js';
 import { agentOutputRuntime } from './agent-output-runtime.js';
 import { agentReplyRuntime } from './agent-reply-runtime.js';
 import { agentStopRuntime } from './agent-stop-runtime.js';
+import { agentSendRuntime } from './agent-send-runtime.js';
 import { ALL_TEAM_TOOL_RUNTIMES } from './team-tool-runtimes.js';
 import { ALL_OPS_FLEET_RUNTIMES } from './ops-fleet-runtimes.js';
 import { ALL_OPS_LEDGER_RUNTIMES } from './ops-ledger-runtimes.js';
@@ -44,6 +45,7 @@ import { ALL_CFT_PDCA_RUNTIMES } from './cft-pdca-runtimes.js';
 import { ALL_CFT_QUICK_KILL_RUNTIMES } from './cft-quick-kill-runtimes.js';
 import { ALL_CFT_ESCALATION_LADDER_RUNTIMES } from './cft-escalation-ladder-runtimes.js';
 import { ALL_KNOWLEDGE_RUNTIMES } from './knowledge-runtimes.js';
+import { directiveSearchRuntime } from './directive-search-runtime.js';
 import { ALL_CONDUCTOR_RUNTIMES } from './conductor-runtimes.js';
 import { ALL_TOX_RUNTIMES } from '../task-orchestrator/runtimes/index.js';
 import { ACP_SESSION_RUNTIMES } from './acp-session-runtime.js';
@@ -125,6 +127,7 @@ export function registerAllDefaultToolRuntimes(opts: RegisterAllDefaultToolRunti
   registerToolRuntime(agentOutputRuntime);
   registerToolRuntime(agentReplyRuntime);
   registerToolRuntime(agentStopRuntime);
+  registerToolRuntime(agentSendRuntime);
   for (const rt of ALL_TEAM_TOOL_RUNTIMES) registerToolRuntime(rt);
   for (const rt of ALL_OPS_FLEET_RUNTIMES) registerToolRuntime(rt);
   // Ops-ledger (우편 msg · 판 release checklist) — in-process ledger tools so
@@ -141,6 +144,8 @@ export function registerAllDefaultToolRuntimes(opts: RegisterAllDefaultToolRunti
   for (const rt of ALL_CFT_QUICK_KILL_RUNTIMES) registerToolRuntime(rt);
   for (const rt of ALL_CFT_ESCALATION_LADDER_RUNTIMES) registerToolRuntime(rt);
   for (const rt of ALL_KNOWLEDGE_RUNTIMES) registerToolRuntime(rt);
+  // Owner utterances by speech («대표가 전에 뭐라고 했지») — read-only over the directives index.
+  registerToolRuntime(directiveSearchRuntime);
   for (const rt of ALL_CONDUCTOR_RUNTIMES) registerToolRuntime(rt);
   for (const rt of ALL_TOX_RUNTIMES) registerToolRuntime(rt);
   for (const rt of ACP_SESSION_RUNTIMES) registerToolRuntime(rt);

@@ -456,6 +456,10 @@ export async function startHolder(start: HolderStart): Promise<Holder> {
           }
           if (!cwdWork && !cwdUncertainAfter && holderCwd) send({ type: 'output', paneId: meta.paneId, chunk: `\x1b]7;${pathToFileURL(holderCwd).href}\x07` });
           send({ type: 'pong', paneId: meta.paneId, ptyId: handle.id, pid: handle.pid, ...(processStart ? { processStart } : {}), ...(start.generationNonce ? { generationNonce: start.generationNonce } : {}) });
+          // DEMO-PANE-EXIT-VISIBLE (demo audit 11-25): a child that ended before this client connected was broadcast to
+          // nobody — replay its exit (code + final screen) after the pong, or the server waits out the 30 s grace and
+          // records «exited» with no code and no output.
+          if (!handle.isAlive()) send({ type: 'exit', paneId: meta.paneId, exitCode: handle.exitCode, screen: await handle.renderScreen().catch(() => '') });
           return;
         }
         case 'input': handle.write(message.bytes); return;
@@ -649,6 +653,8 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
   let earlyOutputBytes = 0;
   const earlyOutputMaxBytes = 1024 * 1024;
   let lastScreen: string | undefined;
+  /** DEMO-PANE-EXIT-VISIBLE: the child's exit code from the holder's exit broadcast; undefined = the holder never said (connection lost). */
+  let exitCodeSeen: number | null | undefined;
   let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
   let socket: Socket | undefined;
   const exitCbs = new Set<() => void>();
@@ -666,6 +672,12 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
     exited = true;
     alive = false;
     if (handshakeTimer) clearTimeout(handshakeTimer);
+    // DEMO-PANE-EXIT-VISIBLE: a child that ends before the pong leaves its exit report in earlyExit — keep its code and
+    // final screen (a fast-failing script showed «exited» with no code and no output).
+    if (earlyExit) {
+      lastScreen ??= earlyExit.screen;
+      exitCodeSeen ??= typeof earlyExit.exitCode === 'number' ? earlyExit.exitCode : null;
+    }
     outbox.length = 0;
     earlyOutput.length = 0;
     earlyOutputBytes = 0;
@@ -745,6 +757,7 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
           if (detached || exited) return;
           if (earlyExit) {
             lastScreen = earlyExit.screen;
+            exitCodeSeen = typeof earlyExit.exitCode === 'number' ? earlyExit.exitCode : null;
             earlyExit = undefined;
             fireExit();
             return;
@@ -772,6 +785,7 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
         return;
       case 'exit':
         lastScreen = message.screen;
+        exitCodeSeen = typeof message.exitCode === 'number' ? message.exitCode : null;
         alive = false;
         pending.shift()?.resolve(message.screen);
         fireExit();
@@ -824,6 +838,7 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
     get pid() { return pidNow; },
     get processBinding() { return pidNow && holderPtyId && processStart && !exited && !detached ? { pid: pidNow, generation: holderPtyId, start: processStart } : undefined; },
     isAlive: () => alive,
+    exitInfo: () => exitCodeSeen === undefined ? { code: null, reason: 'holder connection lost (no exit report)' } : { code: exitCodeSeen, reason: exitCodeSeen === null ? 'killed by a signal' : `exit ${exitCodeSeen}` },
     write: (text) => {
       if (detached || exited) throw new Error('els holder: pane is not running');
       push({ op: 'input', bytes: text });

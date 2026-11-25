@@ -12,7 +12,7 @@ import { openSurfaceEventsDb, applyMemoryDecay, pruneStaleEvents, surfaceEventsD
 import { archiveColdEvents } from '../src/domains/memory-archive.js';
 import { consolidateEpisodes, promoteSessionRecaps } from '../src/domains/memory-consolidate.js';
 import { existsSync } from 'node:fs';
-import { getUserConfig } from '../src/user-config.js';
+import { resolveSearchRoots } from '../src/knowledge/search-roots.js';
 
 // 07-07 관찰 수리: homebrew/bun 주입만으론 부족(node=nvm 전용) — nvm bin 동적 주입.
 import { ensureCronNodePath } from '../src/domains/cron-path.js';
@@ -40,11 +40,8 @@ try { kpruned = pruneKnowledge(db); } catch { /* fail-soft */ }
 //   반영) + doc-lint taxonomy와 재귀 inventory를 재사용해 canonical 문서 전체를 합류한다.
 //   DOCS-SEARCH-INDEX-EMPTY: 뿌리 해석+순회+per-root debug.log 를 ingestDocsCorpus 가
 //   책임진다 — 크론과 docs search 색인 자가부트가 같은 해석을 공유한다(현행 절 후보 포함).
-const knowledgeCfg = (getUserConfig().raw.knowledge ?? {}) as { docsRoots?: unknown };
-// 배열이면 빈 배열도 설정이다. undefined 로 바꾸면 자동 감지로 넘어간다.
-const configuredRoots = Array.isArray(knowledgeCfg.docsRoots)
-  ? knowledgeCfg.docsRoots.filter((p): p is string => typeof p === 'string')
-  : undefined;
+// 단일 해석기 — env ELANOUS_DOCS_ROOTS > config knowledge.docsRoots > undefined(자동 감지).
+const configuredRoots = resolveSearchRoots().docsRoots;
 const docs = await ingestDocsCorpus(db, {
   docsRoots: configuredRoots,
   toolModuleUrl: import.meta.url,

@@ -95,7 +95,7 @@ describe('Agent-tool cap helpers', () => {
   test('turn ceiling constants match the documented defaults', () => {
     expect(AGENT_TOOL_DEFAULT_MAX_TURNS).toBe(20);
     expect(AGENT_TOOL_TURNS_CEILING).toBe(50);
-    expect(AGENT_TOOL_BACKGROUND_FANOUT_CEILING).toBe(8);
+    expect(AGENT_TOOL_BACKGROUND_FANOUT_CEILING).toBe(11);
   });
 
   test('resolveAgentToolMaxTurns defaults, honours, and clamps', () => {
@@ -278,7 +278,7 @@ describe('dispatchAgent — background fan-out ceiling on the production path', 
       for (let i = 0; i < AGENT_TOOL_BACKGROUND_FANOUT_CEILING; i++) {
         await dispatchAgent({ description: `queued setup ${i}`, prompt: `queued setup ${i}` }, opts);
       }
-      await waitFor(() => calls.count === 8, 'eight workers started');
+      await waitFor(() => calls.count === AGENT_TOOL_BACKGROUND_FANOUT_CEILING, 'eight workers started');
       const ninth = await Promise.race([
         dispatchAgent({ description: 'queued ninth', prompt: 'queued ninth' }, opts),
         new Promise<'blocked'>(resolve => setTimeout(() => resolve('blocked'), 100)),
@@ -287,11 +287,11 @@ describe('dispatchAgent — background fan-out ceiling on the production path', 
       if (ninth === 'blocked') return;
       expect(ninth.background).toBe(true);
       expect(ninth.taskId).not.toBe('background-fanout-limit');
-      expect(calls.count).toBe(8);
+      expect(calls.count).toBe(AGENT_TOOL_BACKGROUND_FANOUT_CEILING);
       expect(globalAgentRegistry.get(ninth.taskId)?.state).toBe('pending');
-      expect(countLiveBackgroundFanout(globalAgentRegistry.list())).toBe(8);
+      expect(countLiveBackgroundFanout(globalAgentRegistry.list())).toBe(AGENT_TOOL_BACKGROUND_FANOUT_CEILING);
       releases[0]!();
-      await waitFor(() => calls.count === 9, 'queued worker started');
+      await waitFor(() => calls.count === AGENT_TOOL_BACKGROUND_FANOUT_CEILING + 1, 'queued worker started');
       expect(globalAgentRegistry.get(ninth.taskId)?.state).toBe('running');
       releases[releases.length - 1]!();
       await waitFor(() => globalAgentRegistry.get(ninth.taskId)?.state === 'done', 'queued ticket completed');
@@ -311,7 +311,7 @@ describe('dispatchAgent — background fan-out ceiling on the production path', 
       for (let i = 0; i < AGENT_TOOL_BACKGROUND_FANOUT_CEILING; i++) {
         await dispatchAgent({ description: `cancel setup ${i}`, prompt: `cancel setup ${i}` }, opts);
       }
-      await waitFor(() => calls.count === 8, 'eight workers started');
+      await waitFor(() => calls.count === AGENT_TOOL_BACKGROUND_FANOUT_CEILING, 'eight workers started');
       const queued = await dispatchAgent({ description: 'cancel queued', prompt: 'cancel queued' }, opts);
       const terminal: string[] = [];
       const subscription = globalAgentRegistry.onTaskDone(task => {
@@ -322,8 +322,8 @@ describe('dispatchAgent — background fan-out ceiling on the production path', 
       expect(terminal).toEqual(['aborted']);
       expect(globalAgentRegistry.get(queued.taskId)?.state).toBe('aborted');
       releases[0]!();
-      await waitFor(() => countSessionBackgroundFanout(sessionCache) === 7, 'cancelled ticket left queue');
-      expect(calls.count).toBe(8);
+      await waitFor(() => countSessionBackgroundFanout(sessionCache) === AGENT_TOOL_BACKGROUND_FANOUT_CEILING - 1, 'cancelled ticket left queue');
+      expect(calls.count).toBe(AGENT_TOOL_BACKGROUND_FANOUT_CEILING);
       subscription.dispose();
     } finally {
       for (const release of releases) release();
@@ -368,7 +368,7 @@ describe('dispatchAgent — background fan-out ceiling on the production path', 
     const tasksBeforeNinth = globalAgentRegistry.size;
     const cacheBeforeNinth = sessionCache.size;
     const ninth = await dispatchAgent(
-      { description: 'bg worker 8', prompt: 'background work 8', run_in_background: true, wait_for_slot: false },
+      { description: 'bg worker overflow', prompt: 'background work overflow', run_in_background: true, wait_for_slot: false },
       opts,
     );
     const ninthSpawn = providerCalls.count - spawnsBeforeNinth;
@@ -391,7 +391,7 @@ describe('dispatchAgent — background fan-out ceiling on the production path', 
     // Same description + prompt as the refused call: if the refusal had written
     // the cache entry, this retry would come back as taskId 'dedup' with no spawn.
     const reentry = await dispatchAgent(
-      { description: 'bg worker 8', prompt: 'background work 8', run_in_background: true, wait_for_slot: false },
+      { description: 'bg worker overflow', prompt: 'background work overflow', run_in_background: true, wait_for_slot: false },
       opts,
     );
     await waitFor(() => providerCalls.count === AGENT_TOOL_BACKGROUND_FANOUT_CEILING + 1, 're-entry spawn reached the provider');

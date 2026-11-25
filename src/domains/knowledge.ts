@@ -172,7 +172,7 @@ function existingIds(db: Database): Set<string> {
   return new Set((db.prepare(`SELECT id FROM docs`).all() as Array<{ id: string }>).map(r => r.id));
 }
 
-async function insertDoc(db: Database, doc: Omit<KnowledgeDoc, 'embed_model'>, embed: EmbedFn): Promise<void> {
+async function insertDoc(db: Database, doc: Omit<KnowledgeDoc, 'embed_model'>, embed: EmbedFn, searchText?: string): Promise<void> {
   const { vector, model } = await embed(doc.text);
   const r = db.prepare(`INSERT OR IGNORE INTO docs(id, ts, kind, sector_tags, text, source_ref, embed_model, embedding, domain)
     VALUES (?,?,?,?,?,?,?,?,?)`)
@@ -180,8 +180,19 @@ async function insertDoc(db: Database, doc: Omit<KnowledgeDoc, 'embed_model'>, e
       new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength), doc.domain ?? 'finance');
   // P2 — FTS 동기 색인(신규 행만 · IGNORE 중복은 스킵).
   if (Number(r.changes ?? 0) > 0) {
-    db.prepare(`INSERT INTO docs_fts (id, search_text) VALUES (?, ?)`).run(doc.id, doc.text);
+    db.prepare(`INSERT INTO docs_fts (id, search_text) VALUES (?, ?)`).run(doc.id, searchText ?? doc.text);
   }
+}
+
+/** DOCS-SEARCH-CONDUCTOR — 문서 파일의 H1 제목(첫 `# ` 줄). 없으면 빈 문자열. */
+export function docTitleOf(md: string): string {
+  const m = /^#[ \t]+(.+?)[ \t]*$/m.exec(md);
+  return m ? m[1]!.trim() : '';
+}
+
+/** 청크 키워드 색인 머리 — 상위 디렉터리/파일명 ⊕ H1 제목. 모든 청크가 문서 이름·제목으로도 잡힌다. */
+function docSearchHeader(path: string, title: string): string {
+  return `${basename(dirname(path))}/${basename(path)} ${title}`.trim();
 }
 
 /** 알파 리포트 청킹 — `## ` 섹션 단위, 짧은 섹션은 앞뒤로 합쳐 ~2400자 이내. */
@@ -233,6 +244,7 @@ export async function ingestDocFile(
   const seen = existingIds(db);
   const chunks = chunkReport(md);
   const kind = opts.kind ?? 'docs';
+  const header = docSearchHeader(path, docTitleOf(md));
   let ok = 0, skipped = 0;
   for (let i = 0; i < chunks.length; i++) {
     const id = docChunkId(path, i, kind);
@@ -241,7 +253,7 @@ export async function ingestDocFile(
       await insertDoc(db, {
         id, ts, kind, sector_tags: null,
         text: chunks[i]!, source_ref: path, domain: opts.domain ?? 'elanous',
-      }, embed);
+      }, embed, `${header}\n${chunks[i]!}`);
       ok++;
     } catch { skipped++; }
   }
@@ -427,9 +439,9 @@ function deleteDocChunks(db: Database, path: string): number {
  *  경우만 재인제스트(무변경이면 재임베딩 없이 상태만 기록·대량 재처리 회피). */
 export async function ingestDocsDir(
   db: Database,
-  opts: { dir: string; domain?: string; embed?: EmbedFn; pattern?: RegExp },
-): Promise<{ files: number; chunks: number; skipped: number; unchanged: number; refreshed: number }> {
-  if (!existsSync(opts.dir)) return { files: 0, chunks: 0, skipped: 0, unchanged: 0, refreshed: 0 };
+  opts: { dir: string; domain?: string; embed?: EmbedFn; pattern?: RegExp; maxFiles?: number },
+): Promise<{ files: number; chunks: number; skipped: number; unchanged: number; refreshed: number; pending: number; attempted: number }> {
+  if (!existsSync(opts.dir)) return { files: 0, chunks: 0, skipped: 0, unchanged: 0, refreshed: 0, pending: 0, attempted: 0 };
   ensureDocsIngestState(db);
   // DOCS-SEARCH-INDEX-EMPTY — 파일 뿌리: 뿌리가 파일이면 dirname 재지향 + `^basename$` 패턴으로
   // mtime 증분·구청크 교체 기계를 그대로 재활용한다(OPS-RULES.md 한 파일이 곧 한 뿌리).
@@ -445,8 +457,8 @@ export async function ingestDocsDir(
   // DocOps 정본 두 자산(scanDocs 재귀/아카이브 제외 + KNOWN_PREFIXES taxonomy)으로 선정한다.
   const files = pattern
     ? readdirSync(dir).filter(name => pattern!.test(name)).map(name => join(dir, name)).sort()
-    : scanDocs(dir)
-      .filter(entry => KNOWN_PREFIXES.has(entry.prefix))
+    : scanDocs(dir, { readText: false })
+      .filter(entry => KNOWN_PREFIXES.has(entry.prefix) || LIVING_DOC_DIRS.has(entry.subdir.split('/')[0]!))
       .map(entry => resolve(dirname(dir), entry.path))
       .sort();
   debug.log('knowledge.ingest', 'docs-targets', {
@@ -459,7 +471,7 @@ export async function ingestDocsDir(
     `INSERT INTO docs_ingest_state (file, mtime_ms, chunk_count, ingested_at) VALUES (?, ?, ?, ?)
      ON CONFLICT(file) DO UPDATE SET mtime_ms=excluded.mtime_ms, chunk_count=excluded.chunk_count, ingested_at=excluded.ingested_at`,
   );
-  let fileCount = 0, chunks = 0, skipped = 0, unchanged = 0, refreshed = 0;
+  let fileCount = 0, chunks = 0, skipped = 0, unchanged = 0, refreshed = 0, pending = 0, attempted = 0;
   for (const file of files) {
     const full = docPathKey(file);
     let mtimeMs: number;
@@ -477,6 +489,9 @@ export async function ingestDocsDir(
         continue;
       }
     }
+    // DOCS-SEARCH-CONDUCTOR — 상한(검색 경로 자가 갱신용): 넘친 변경 파일은 다음 호출로 미룬다.
+    if (opts.maxFiles !== undefined && attempted >= opts.maxFiles) { pending++; continue; }
+    attempted++;
     // 재인제스트 전 구청크 교체 — ingestDocFile 은 기존 id 를 skip 하므로 필수.
     const deleted = deleteDocChunks(db, full);
     const wasStale = state !== null || deleted > 0;
@@ -488,11 +503,15 @@ export async function ingestDocsDir(
     if (r.chunks > 0 || r.skipped === 0) {
       upsertStmt.run(full, mtimeMs, r.chunks, new Date().toISOString());
       if (r.chunks > 0) { fileCount++; if (wasStale) refreshed++; }
-    }
+    } else pending++; // 임베딩 전체 실패 — 아직 색인 안 됨
     chunks += r.chunks; skipped += r.skipped;
   }
-  return { files: fileCount, chunks, skipped, unchanged, refreshed };
+  return { files: fileCount, chunks, skipped, unchanged, refreshed, pending, attempted };
 }
+
+/** DOCS-SEARCH-CONDUCTOR — 날짜 없는 이름의 정본 설계 문서 디렉터리(docs/ 아래 첫 단).
+ *  파일명 접두가 KNOWN_PREFIXES 밖(JUDGE-·ELS-…)이어도 색인한다. */
+export const LIVING_DOC_DIRS: ReadonlySet<string> = new Set(['conductor', 'handbook', 'roles', 'wiki']);
 
 // ── 문서 코퍼스 인제스트 (DOCS-SEARCH-INDEX-EMPTY · 2026-11-24) ────────
 //
@@ -505,6 +524,8 @@ export interface DocsCorpusOpts {
   embed?: EmbedFn;
   /** 설정 `knowledge.docsRoots`. 배열이면(빈 배열 포함) 그 값만 쓴다. */
   docsRoots?: readonly string[];
+  /** 이 호출에서 재인제스트할 변경 파일 상한(뿌리 전체 공유). 넘친 수는 `pending`. */
+  maxFiles?: number;
   /** 도구 체크아웃 판정 기준 모듈. 기본은 이 파일. */
   toolModuleUrl?: string;
   /** `toolModuleUrl` 에서 docs 까지의 상대 세그먼트. 기본 `['..','docs']`. */
@@ -522,6 +543,10 @@ export interface DocsCorpusCounts {
   files: number; chunks: number; skipped: number; unchanged: number; refreshed: number;
   /** 해석된 뿌리 수(자가부트 판정·관측용). */
   roots: number;
+  /** 바뀌었는데 아직 색인 못 한 파일 수(상한 초과 ⊕ 임베딩 실패). */
+  pending: number;
+  /** 해석된 뿌리 경로. */
+  rootPaths: string[];
 }
 
 /**
@@ -539,20 +564,27 @@ export async function ingestDocsCorpus(db: Database, opts: DocsCorpusOpts = {}):
     ...(opts.readPackageName ? { readPackageName: opts.readPackageName } : {}),
     ...(opts.gitRoot ? { gitRoot: opts.gitRoot } : {}),
   });
-  const totals: DocsCorpusCounts = { files: 0, chunks: 0, skipped: 0, unchanged: 0, refreshed: 0, roots: resolved.roots.length };
+  const totals: DocsCorpusCounts = {
+    files: 0, chunks: 0, skipped: 0, unchanged: 0, refreshed: 0, roots: resolved.roots.length,
+    pending: 0, rootPaths: resolved.roots.map(root => root.path),
+  };
   if (resolved.roots.length === 0) {
     debug.log('knowledge.ingest', 'docs-root', { source: resolved.source, roots: 0 });
     return totals;
   }
+  let attempted = 0;
   for (const root of resolved.roots) {
     try {
+      const budget = opts.maxFiles === undefined ? undefined : Math.max(0, opts.maxFiles - attempted);
       const r = await ingestDocsDir(db, {
         dir: root.path,
         ...(opts.domain !== undefined ? { domain: opts.domain } : {}),
         ...(opts.embed ? { embed: opts.embed } : {}),
+        ...(budget !== undefined ? { maxFiles: budget } : {}),
       });
       totals.files += r.files; totals.chunks += r.chunks; totals.skipped += r.skipped;
-      totals.unchanged += r.unchanged; totals.refreshed += r.refreshed;
+      totals.unchanged += r.unchanged; totals.refreshed += r.refreshed; totals.pending += r.pending;
+      attempted += r.attempted;
       debug.log('knowledge.ingest', 'docs-root', {
         path: root.path,
         source: root.source,
@@ -740,7 +772,7 @@ export async function backfillConatusReports(db: Database, opts: BackfillOptions
 
 // ── query (JS cosine 전수 스캔 — 스파이크 실측 수천 건 ~ms) ──
 
-function cosine(a: Float32Array, b: Float32Array): number {
+export function cosine(a: Float32Array, b: Float32Array): number {
   let dot = 0, na = 0, nb = 0;
   for (let i = 0; i < a.length; i++) { dot += a[i]! * b[i]!; na += a[i]! * a[i]!; nb += b[i]! * b[i]!; }
   const d = Math.sqrt(na) * Math.sqrt(nb);
@@ -825,11 +857,39 @@ export function loadKindVectors(db: Database, kind: KnowledgeDoc['kind'], domain
 
 export interface HybridMatch extends KnowledgeMatch {
   /** 어느 랭킹에 잡혔나 — 디버그/신뢰 표시용. */
-  matchedBy: 'vector' | 'keyword' | 'both';
+  matchedBy: 'vector' | 'keyword' | 'both' | 'title';
   rrf: number;
 }
 
-const RRF_K = 60;
+export const RRF_K = 60;
+
+/** DOCS-SEARCH-CONDUCTOR — 문서 이름·H1 제목 랭킹. 질의 토큰 절반 이상이 파일명 또는 제목에 있으면
+ *  후보다. 정확 일치(파일명 = 질의 · 제목 = 질의)와 전 토큰 일치는 `strong`(RRF 가중 3배). 각 문서의
+ *  첫 청크(#0) 한 행만 본다 — 문서 수만큼의 짧은 스캔. */
+function titleRanking(db: Database, query: string, opts: QueryOptions): Array<{ id: string; strong: boolean }> {
+  if (opts.kind && opts.kind !== 'docs') return [];
+  const q = query.trim().toLowerCase();
+  const tokens = [...new Set(q.split(/\s+/).filter(t => t.length > 1))];
+  if (tokens.length === 0) return [];
+  const params: unknown[] = [];
+  let domainCond = '';
+  if (opts.domain) { domainCond = "AND COALESCE(domain,'finance') = ?"; params.push(opts.domain); }
+  const rows = db.prepare(
+    `SELECT id, source_ref, substr(text, 1, 400) AS head FROM docs
+     WHERE kind = 'docs' AND substr(id, -2) = '#0' AND source_ref IS NOT NULL ${domainCond}`,
+  ).all(...(params as never[])) as Array<{ id: string; source_ref: string; head: string }>;
+  const scored: Array<{ id: string; strong: boolean; score: number; len: number }> = [];
+  for (const r of rows) {
+    const name = sourceBasename(r.source_ref).replace(/\.md$/i, '').toLowerCase();
+    const title = docTitleOf(r.head).toLowerCase();
+    const exact = name === q.replace(/\.md$/, '') || (title !== '' && title === q);
+    const hits = tokens.filter(t => name.includes(t.replace(/\.md$/, '')) || title.includes(t)).length;
+    if (!exact && hits * 2 < tokens.length) continue;
+    scored.push({ id: r.id, strong: exact || hits === tokens.length, score: exact ? tokens.length + 1 : hits, len: name.length + title.length });
+  }
+  scored.sort((a, b) => b.score - a.score || a.len - b.len);
+  return scored.slice(0, 20).map(({ id, strong }) => ({ id, strong }));
+}
 
 export async function hybridQueryKnowledge(
   db: Database,
@@ -860,16 +920,21 @@ export async function hybridQueryKnowledge(
     ).all(ftsQuery(query), ...(params as never[]), pool) as Array<{ id: string }>;
   } catch { /* MATCH 파싱 실패 등 — 벡터 단독 */ }
 
+  // ②' 문서 이름·제목 랭킹(DOCS-SEARCH-CONDUCTOR) — 정확·전 토큰 일치는 3배 가중.
+  let titles: Array<{ id: string; strong: boolean }> = [];
+  try { titles = titleRanking(db, query, opts); } catch { /* fail-soft */ }
+
   // ③ RRF 융합
-  const rrf = new Map<string, { score: number; by: Set<'vector' | 'keyword'> }>();
-  const bump = (id: string, rank: number, by: 'vector' | 'keyword') => {
-    const cur = rrf.get(id) ?? { score: 0, by: new Set<'vector' | 'keyword'>() };
-    cur.score += 1 / (RRF_K + rank + 1);
+  const rrf = new Map<string, { score: number; by: Set<'vector' | 'keyword' | 'title'> }>();
+  const bump = (id: string, rank: number, by: 'vector' | 'keyword' | 'title', weight = 1) => {
+    const cur = rrf.get(id) ?? { score: 0, by: new Set<'vector' | 'keyword' | 'title'>() };
+    cur.score += weight / (RRF_K + rank + 1);
     cur.by.add(by);
     rrf.set(id, cur);
   };
   vector.forEach((m, i) => bump(m.id, i, 'vector'));
   keyword.forEach((m, i) => bump(m.id, i, 'keyword'));
+  titles.forEach((m, i) => bump(m.id, i, 'title', m.strong ? 3 : 1));
 
   const byId = new Map(vector.map((m) => [m.id, m]));
   const top = [...rrf.entries()].sort((a, b) => b[1].score - a[1].score).slice(0, k);
@@ -883,7 +948,9 @@ export async function hybridQueryKnowledge(
       if (!r) continue;
       base = { ...r, domain: r.domain ?? 'finance', similarity: 0 } as KnowledgeMatch;
     }
-    out.push({ ...base, rrf: score, matchedBy: by.size === 2 ? 'both' : (by.has('vector') ? 'vector' : 'keyword') });
+    const matchedBy: HybridMatch['matchedBy'] = by.has('vector') && by.has('keyword') ? 'both'
+      : by.has('title') ? 'title' : (by.has('vector') ? 'vector' : 'keyword');
+    out.push({ ...base, rrf: score, matchedBy });
   }
   return out;
 }

@@ -5,6 +5,7 @@ import { checkLoops, countLoopStates, entriesFromRegistry, LOOP_STATES, notifyOw
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { verifyLoopPackage } from './package/verify.js';
 import { loopActivity } from './activity.js';
+import { registerTriggerCommands } from './trigger-cli.js';
 
 async function output(value: unknown, json: boolean): Promise<void> {
   if (json) await writeStdoutJson(JSON.stringify(value) + '\n');
@@ -116,4 +117,5 @@ export function registerLoopCommands(program: Command, checkerDeps: RegistryAdap
       }
       if (!result.ok) process.exitCode = 1;
     }));
+  registerTriggerCommands(loop);
 }

@@ -1,0 +1,35 @@
+graph_id: release-rocket
+version: 1
+loop:
+  title: Release countdown executor (rocket launch L-0…L-9 · quick-pass replay)
+  root: 발행국
+  managed_by: trigger-registry
+  description: >-
+    Every 2 minutes, tick the release graph executor over every started run (`elanous release graph run <v> …`).
+    Each step replays the manual quick-pass command REL runs; checks are advisory; hard stops are a non-zero
+    build/publish exit or an explicit NO-GO. Shadow (record «would run») unless config release.graph.mode=live and
+    release.graph.version=<v>. Done-when = release-graph/last-tick.json rewritten by the tick.
+    The registry stage does not decide execution — the per-version config does (cutover_after is set out of reach).
+  owner: OP
+  trigger:
+    cron: '*/2 * * * *'
+    stale_after_min: 5
+  goal:
+    kind: file-mtime
+    path: '{stateRoot}/release-graph/last-tick.json'
+  failure:
+    goal_deadline_min: 5
+    max_attempts: 2
+    backoff_sec: [30]
+  legacy:
+    kind: marker
+    path: '{seatState}/REL/.graph-cutover/release-rocket'
+  cutover_after: 100000
+entry_node: tick
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: tick, kind: agent, recipe: 'cmd:release-graph-tick', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }

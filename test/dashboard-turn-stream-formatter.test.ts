@@ -326,7 +326,7 @@ describe('createTurnStreamFormatter — supported renderer regression', () => {
       blockMaxLines: 4,
     };
     const supportedTools = [
-      'Bash', 'Read', 'Grep', 'Glob', 'ListDir', 'Edit', 'Write',
+      'Bash', 'Glob', 'Grep', 'Read', 'ListDir', 'Edit', 'Write',
       'Agent', 'UpdatePlan', 'Lsp', 'RunShell', 'WebSearch', 'WebFetch', 'GetDashboardState',
     ];
     const records: Array<{ category: string; data: unknown }> = [];

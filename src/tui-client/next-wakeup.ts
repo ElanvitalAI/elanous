@@ -20,6 +20,7 @@ import type { NextTuiSelfHealthSnapshot } from '../tui/chat/self-health-status.j
 
 import { createInternalTurnGate, formatInternalTurnBanner, isInternalTurnEnabledByEnv, type InternalTurnGate, type InternalTurnRequest } from '../tui/input/internal-turn.js';
 import { createNextMailWake, type NextMailWakeDeps } from './next-mail-wake.js';
+import { createPulseInboxWatcher } from '../seat/seat-pulse-inbox.js';
 import { createSeatRetroScheduler, type SeatRetroScheduler, type SeatRetroStateStore } from '../seat/seat-retro.js';
 
 import type { LLMToolDef, PluginContext } from '../plugins/core/types.js';
@@ -221,8 +222,14 @@ export interface NextTuiWakeupDeps {
   persist?: WakeupPersistence;
   /** TURN-CAPSULE-EVENTS R1(C4) — 버스 원천 어댑터(schedule-wakeup.ts:219) 포워드. 없으면 옛길(스케줄러 자체 큐) 그대로. 생산 배선은 entry.ts 몫. */
   publishEvent?: WakeupSchedulerDeps['publishEvent'];
+  /** WAKE-FOLD-IDEMPOTENT ③ — the next turn's inbox (a queued notice): past-due wakes busy-refused 10 min land here once. */
+  deliverQueued?: WakeupSchedulerDeps['deliverQueued'];
   /** Built-in self-retro (SEAT-ROLE-CARD device 2): opens an origin-'retro' turn on this same door every `intervalMin` minutes. 0 = off. */
   retro?: { readonly seat: string; readonly intervalMin: number; readonly store: SeatRetroStateStore; readonly metrics?: () => readonly string[] };
+  /** OP-PULSE: the pulse inbox this seat (OP) opens as origin-'pulse' turns on this same door. Absent = off. */
+  pulse?: { readonly inboxPath: string; readonly consumedPath: string };
+  /** OP-INBOX-PULSE-BATCH: a pulse turn opened (the held OP mail batch is due). */
+  onPulseOpened?: () => void;
 }
 
 export interface NextTuiWakeup {
@@ -278,6 +285,7 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
     ...(deps.clearTimer ? { clearTimer: deps.clearTimer } : {}),
     ...(deps.log ? { log: deps.log } : {}),
     ...(deps.publishEvent ? { publishEvent: deps.publishEvent } : {}),
+    ...(deps.deliverQueued ? { deliverQueued: deps.deliverQueued } : {}),
     ...(deps.persist && !env.ELANOUS_HARNESS_ROLE?.trim() ? { persist: deps.persist } : {}),
   });
   const tool = env.ELANOUS_HARNESS_ROLE?.trim() ? null : buildScheduleWakeupHostTool(scheduler);
@@ -316,6 +324,14 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
       ...(deps.log ? { log: (event: string, data: Record<string, unknown>) => deps.log!('tui.retro', event, data) } : {}),
     }) : null;
   retro?.start();
+  const pulse = deps.pulse && !env.ELANOUS_HARNESS_ROLE?.trim()
+    ? createPulseInboxWatcher({ inboxPath: deps.pulse.inboxPath, consumedPath: deps.pulse.consumedPath,
+      startTurnIfIdle: (text, opts) => { const r = gate.startTurnIfIdle(text, opts); if (r.opened) deps.onPulseOpened?.(); return r; },
+      setTimer: (fn, ms) => (deps.setTimer ?? ((f: () => void, m: number): WakeupTimerHandle => { const t = setTimeout(f, m); (t as { unref?: () => void }).unref?.(); return t; }))(fn, ms),
+      clearTimer: (handle) => (deps.clearTimer ?? ((h: WakeupTimerHandle): void => clearTimeout(h as ReturnType<typeof setTimeout>)))(handle as WakeupTimerHandle),
+      notify: deps.notify,
+      ...(deps.log ? { log: (event: string, data: Record<string, unknown>) => deps.log!('tui.pulse', event, data) } : {}) }) : null;
+  pulse?.start();
   const mailWake = deps.enableSeatMailWake && !env.ELANOUS_HARNESS_ROLE?.trim()
     ? createNextMailWake({ ...deps.mailWakeOptions, startTurnIfIdle: (text, opts) => gate.startTurnIfIdle(text, opts),
       intervalMs: deps.mailWakeOptions?.intervalMs ?? (acceleratedTestClock ? 1_000 : undefined) }) : null;
@@ -325,13 +341,13 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
     retro,
     tool,
     headline(health) {
-      const healthText = health === null ? '건강 관측 전'
-        : health.errorCount === null ? '건강 확인 불가'
-          : health.errorCount === 0 ? '건강 오류 없음' : `건강 오류 ${health.errorCount}`;
+      const healthText = health === null ? 'health pending'
+        : health.errorCount === null ? 'health unknown'
+          : health.errorCount === 0 ? 'healthy' : `health errors ${health.errorCount}`;
       const next = scheduler.list()[0];
       const wakeText = next
-        ? `깨움 ${new Date(next.dueAt).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', hour12: false })}`
-        : '깨움 없음';
+        ? `next wake ${new Date(next.dueAt).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', hour12: false })}`
+        : 'no wake scheduled';
       return `${healthText} · ${wakeText}`;
     },
     banner: formatInternalTurnBanner,
@@ -365,6 +381,7 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
     dispose() {
       mailWake?.dispose();
       retro?.dispose();
+      pulse?.dispose();
       scheduler.dispose();
       gate.port.detach({ yielded: true });
     },

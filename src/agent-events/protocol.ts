@@ -24,6 +24,14 @@ export type BlockReason = typeof BLOCK_REASONS[number];
 /** The states that must name one reason. */
 export const SEAT_STATES_WITH_REASON: readonly SeatState[] = ['BLOCKED', 'WAITING_APPROVAL', 'WAITING_REPLY'];
 export const isSeatState = (value: unknown): value is SeatState => SEAT_STATES.some((state) => state === value);
+/**
+ * WRITER-CHECK-RESOLVER (대표 11-25 22:4x) — the ✋ family the space steward answers itself, as a structured field (never prose):
+ * writer-handover = who owns the files / an earlier writer's work · worktree-path = which worktree / file path ·
+ * slot-isolation = a free root / slot / write scope before editing · res-approval = an RES (or guardian) approval to run.
+ */
+export const HAND_CAUSES = ['writer-handover', 'worktree-path', 'slot-isolation', 'res-approval'] as const;
+export type HandCause = typeof HAND_CAUSES[number];
+export const isHandCause = (value: unknown): value is HandCause => HAND_CAUSES.some((cause) => cause === value);
 export const isBlockReason = (value: unknown): value is BlockReason => BLOCK_REASONS.some((reason) => reason === value);
 export const seatStateNeedsReason = (state: SeatState): boolean => SEAT_STATES_WITH_REASON.includes(state);
 /** The v1 `state` word an older frame reader understands for a seat state (sent alongside the code). */

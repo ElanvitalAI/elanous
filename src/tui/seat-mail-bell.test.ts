@@ -94,7 +94,7 @@ test('post → the TUI watcher reads within 1 s with the poll timer never firing
   const u = universe();
   const w = watcherFor(u);
   w.watcher.start();
-  expect(w.intervals).toEqual([120_000]);
+  expect(w.intervals).toEqual([15_000]);
   // The start read (nothing yet) settles first.
   expect(await until(() => w.reads() >= 1, 1000)).toBe(true);
   const posted = u.store.post({ from: 'TC', to: 'OP', body: 'bell please' });
@@ -149,11 +149,11 @@ test('fs.watch fails at start → 15 s poll fallback · the poll catches the mai
     .toEqual([{ data: { count: 1, seat: 'OP', watching: false }, level: 'info' }]);
 });
 
-test('a silent watch (rings never delivered) → the 2-minute safety net catches it and logs bell-missed', async () => {
+test('a silent watch (rings never delivered) → the 15-second safety net catches it and logs bell-missed', async () => {
   const u = universe();
   const w = watcherFor(u, { watch: () => ({ close: () => {} }) });
   w.watcher.start();
-  expect(w.intervals).toEqual([120_000]);
+  expect(w.intervals).toEqual([15_000]);
   expect(await until(() => w.reads() >= 1, 1000)).toBe(true);
   const posted = u.store.post({ from: 'TC', to: 'OP', body: 'missed ring' });
   await sleep(400);
@@ -168,9 +168,9 @@ test('a watch error at runtime → falls back to the 15 s poll', () => {
   const hold: { fail?: (error: unknown) => void } = {};
   const w = watcherFor(u, { watch: (_dir, _onEvent, onError) => { hold.fail = onError; return { close: () => {} }; } });
   w.watcher.start();
-  expect(w.intervals).toEqual([120_000]);
+  expect(w.intervals).toEqual([15_000]);
   hold.fail!(new Error('watch died'));
-  expect(w.intervals).toEqual([120_000, 15_000]);
+  expect(w.intervals).toEqual([15_000, 15_000]);
   expect(w.logs.some((l) => l.event === 'bell-watch-failed')).toBe(true);
 });
 

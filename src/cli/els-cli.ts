@@ -28,7 +28,9 @@ import { parseAddress } from '../els/address.js';
 import type { FederatedHost } from '../els/hosts.js';
 import { createLineDecoder } from '../els/wire.js';
 import { guardLeave, realProcess } from '../els/attach-leave.js';
+import { sidebarWidthFor } from '../els/attach-view.js';
 import { buildBadge, changedRowsPaint, createAppFrameWriter, createPaneViewMouse, createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, fitCells, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from '../els/attach-view.js';
+import { attachRemote } from '../els/remote-attach-client.js';
 import { requestEls } from '../els/client.js';
 import { AUTO_ACTING_SEAT } from '../els/baton.js';
 import { readPipedStdin } from './piped-stdin.js';
@@ -47,6 +49,8 @@ import { desiredSha } from '../nexus/host-registry/desired-sha.js';
 import { readInstalledIdentity } from './self-update.js';
 import type { PaneState } from '../els/space.js';
 import { askHitlOnTerminal, controlledDo, controlledInput, journalControl } from '../els/control-cli.js';
+import { prepareOpUpdate, readStandingApproval, revokeStandingApproval, standingApprovalPath, writeStandingApproval } from '../els/update-all-op-approval.js';
+import { debug } from '../debug/log.js';
 import { mcpHitlAsk } from '../els/mcp-hitl.js';
 import { misplacedOptionHint, withNewDefaults } from '../els/cli-args.js';
 import { createFederation } from '../els/federation.js';
@@ -55,6 +59,7 @@ import { emptyJournal } from '../els/space.js';
 import { withHerdrHost } from '../els/herdr-host.js';
 import { importHerdr } from '../els/herdr-import.js';
 import { defaultHerdrCliRunner } from '../pty-shell/herdr-prompt.js';
+import { registerPeekWatchCommands, type PeekDeps, type PeekPaneRow } from './els-peek-cli.js';
 import { herdrCreated, herdrPanes, herdrTabs, herdrWorkspaces } from '../els/herdr-shape.js';
 import { keysToBytes } from '../els/keys.js';
 import { elsHostsPath, fetchHostJson, loadHostRegistry, registeredHostAtExecution, type HostRegistry } from '../els/hosts.js';
@@ -105,6 +110,21 @@ async function lookupLocalPane(ref: string): Promise<{ readonly workspace: strin
 function localControl(): ReturnType<typeof journalControl> {
   try { return journalControl(loadJournal(elsJournalPath())); }
   catch { return journalControl(emptyJournal()); }
+}
+
+/** `els send`: a host-qualified pane on another registered host has no local PTY (the local owner answered «unknown
+ *  pane») — route it through the federation's remote line door, the path `els do` takes. `--no-enter` has no remote door. */
+export async function routeElsSend(pane: string, text: string, enter: boolean, deps: {
+  localHost: string; from: string;
+  remoteDo: (pane: string, text: string, from: string) => Promise<ElsResult>;
+  local: (request: ElsRequest) => Promise<ElsResult>;
+}): Promise<ElsResult> {
+  const address = parseAddress(pane);
+  if (address && address.host !== '' && address.host !== deps.localHost) {
+    if (!enter) return { exitCode: 2, message: `els send --no-enter: ${pane} is on host ${address.host} — remote panes take whole lines only (els send without --no-enter, or els do)` };
+    return deps.remoteDo(pane, text, deps.from);
+  }
+  return deps.local(enter ? { op: 'send-verified', pane, text } : { op: 'send', pane, text });
 }
 
 function federation(registry: HostRegistry = loadHostRegistry(elsHostsPath(elanousStateRoot()))) {
@@ -180,6 +200,30 @@ function supervisorDeps(): SupervisorDeps {
 
 /** ELS-SKILL: every visible els command as typed (`els pane send-keys <pane> <keys...>`) with its own description —
  *  read from the real command table, so the guide cannot miss a verb. */
+/** FEDERATION HAND POOL — every federation pane (seat ⊕ status) as the status board sees it; [] when els does not answer. */
+/** The federated pane list for the hand pool — null when it could not be read (the pool then falls back to the ledgers alone). */
+/** ELS-PEEK-WATCH — the two read-only doors `els peek` / `els watch` (and `eln seat peek|watch`) use: the federated
+ *  pane list and one pane's screen. Nothing else of the els server is touched. */
+export function peekDeps(): PeekDeps {
+  const fed = federation();
+  return {
+    listPanes: async () => {
+      const answer = await fed.list();
+      if (answer.exitCode !== 0) throw new Error(answer.message);
+      return (JSON.parse(answer.message) as { panes?: PeekPaneRow[] }).panes ?? [];
+    },
+    readScreen: async (address) => { const read = await fed.read(address); return { ok: read.exitCode === 0, text: read.message }; },
+  };
+}
+
+export async function federationPanesForPool(): Promise<readonly { seat?: unknown; status?: unknown }[] | null> {
+  try {
+    const answer = await federation().list();
+    if (answer.exitCode !== 0) return null;
+    return (JSON.parse(answer.message) as { panes?: { seat?: unknown; status?: unknown }[] }).panes ?? [];
+  } catch { return null; }
+}
+
 export function skillVerbs(side: Command): SkillVerb[] {
   const visible = (command: Command): boolean => !(command as unknown as { _hidden?: boolean })._hidden && !command.name().startsWith('_');
   const usageOf = (command: Command, prefix: string): string => {
@@ -204,7 +248,7 @@ export function paneListLines(listJson: string, nowMs: number): string[] {
     const status = parsePaneSeatStatus(row.status);
     const mail = row.unreadMail?.count;
     const marks = seatMarks({ word: status ? wordOfSeatState(status.state) === 'exited' ? 'idle' : wordOfSeatState(status.state) : row.state,
-      ...(status ? { seatState: status.state, ...(status.reason ? { seatReason: status.reason } : {}) } : {}), ...(typeof mail === 'number' ? { unread: mail } : {}) });
+      ...(status ? { seatState: status.state, ...(status.reason ? { seatReason: status.reason } : {}), seatSource: status.source } : {}), ...(typeof mail === 'number' ? { unread: mail } : {}) });
     return { text: `${marks.needsPerson ? '⚪' : marks.activity}${marks.attention}`, person: marks.needsPerson };
   };
   const ordered = [...listed.panes].sort((a, b) => Number(markOf(b).person) - Number(markOf(a).person));
@@ -476,7 +520,12 @@ export function registerElsCommands(program: Command): void {
     .action(async (opts: { older?: boolean; state?: string; ws?: string }) => {
       const states = opts.state === undefined ? undefined : parseStateFilter(opts.state);
       if (states && !states.ok) { process.stderr.write(`${states.message}\n`); process.exitCode = 2; return; }
-      const answer = await federation().list();
+      const listedRaw = await federation().list();
+      // REMOTE-PANE-SIZE: each pane carries its PTY size; the viewer's own area rides along so a mismatch is obvious.
+      const terminal = viewerTerminal();
+      const answer = listedRaw.exitCode === 0 && terminal
+        ? { ...listedRaw, message: JSON.stringify({ viewer: { terminal, paneArea: viewerPaneArea(terminal) }, ...(JSON.parse(listedRaw.message) as object) }, null, 2) }
+        : listedRaw;
       if (answer.exitCode !== 0 || (!opts.older && !states && opts.ws === undefined)) { emit(answer); return; }
       const listed = JSON.parse(answer.message) as { panes: { build?: { age?: string }; workspace?: unknown; ws?: unknown; status?: unknown }[]; notice?: string;
         hqCoordinatorSeat?: unknown; workspaces?: { id?: unknown; name?: unknown; coordinatorSeat?: unknown }[] };
@@ -509,14 +558,95 @@ export function registerElsCommands(program: Command): void {
         process.stderr.write(`els status-board --ws ${opts.ws}: outside this coordinator's spaces (${scope.join(', ')})\n`); process.exitCode = 1; return;
       }
       const panes = filterPanesBySeatState(listed.panes, { ...(opts.ws !== undefined ? { ws: opts.ws } : {}), ...(scope ? { scope } : {}) });
-      process.stdout.write(opts.json ? `${JSON.stringify({ panes }, null, 2)}\n` : `${statusBoardLines(panes, Date.now()).join('\n')}\n`);
+      // HAND-RAISE-LADDER — the Federation Board line: open ✋ per level with age (fail-soft: no ledger → no line).
+      let hands: string | null = null;
+      try {
+        const ladderModule = await import('../msg/hand-raise-ladder.js');
+        const { defaultMsgStorePath, openMsgStoreReadOnly } = await import('../msg/msg-store.js');
+        const store = openMsgStoreReadOnly(defaultMsgStorePath());
+        try { hands = ladderModule.handBoardLine(ladderModule.handBoardLevels(store, { now: Date.now(), ladder: ladderModule.loadFederationLadder() })); } finally { store.close(); }
+      } catch { hands = null; }
+      // SPACE-ADVISOR — «🧭 TC-ADV 30m — resolved n · recommended n · TC-picked n · auto n · escalated n · TC ✋ open n» (fail-soft).
+      let advisor: string | null = null;
+      try { advisor = (await import('../steward/space/advisor.js')).liveAdvisorBoardLines(Date.now()); } catch { advisor = null; }
+      // FEDERATION HAND POOL — «🤝 Hand pool — idle n · working n (lent …) · close? …» (fail-soft: no ledgers → no line).
+      let handPool: string | null = null;
+      try {
+        const poolLive = await import('../seat/hand-pool-live.js');
+        const { handPoolBoardLine } = await import('../seat/hand-pool.js');
+        handPool = handPoolBoardLine(await poolLive.liveHandPool({ panes: listed.panes }), Date.now());
+      } catch { handPool = null; }
+      // RESOURCE-OPT-HOURLY — the Federation Board line of the last hourly assignment table (fail-soft: none yet → no line).
+      let resourceOpt: string | null = null;
+      try {
+        const gate = await import('../resource-opt/assignment-gate.js');
+        resourceOpt = gate.resourceOptBoardLine(gate.readResourceOptRecord(gate.resourceOptDir()));
+      } catch { resourceOpt = null; }
+      // COND-WATCH — «watches open n · satisfied/h · reply-waits n» from the waker files (fail-soft: no files → zeros).
+      let watches: string | null = null;
+      try {
+        const cw = await import('../commitment/condition-watch.js');
+        const { defaultWakersRoot } = await import('../msg/self-timer-watch.js');
+        watches = cw.watchBoardLine(cw.watchBoardCounts(cw.readAllWakers(defaultWakersRoot()), Date.now()));
+      } catch { watches = null; }
+      // GUARDIAN-FINDINGS-VISIBLE — «🛡 Guardian (shadow) — n critical · n warn: …» from the patrol state (fail-soft: no tick → no line).
+      let guardian: string | null = null;
+      try {
+        const run = await import('../res-policy/patrol-run.js');
+        const { guardianBoardLine } = await import('../res-policy/shadow-cards.js');
+        guardian = guardianBoardLine(run.readPatrolState(run.patrolStatePath()), new Date());
+      } catch { guardian = null; }
+      // WATCHER-HEARTBEAT — «👁 Watchers — n ok · DEAD …» (fail-soft: no beats → no line).
+      let watchers: string | null = null;
+      try {
+        const hb = await import('../watch/heartbeat.js');
+        const { defaultSourceHead } = await import('./watch-cli.js');
+        watchers = hb.watchersBoardLine(hb.judgeWatchers(hb.readBeats(), new Date(), defaultSourceHead()));
+      } catch { watchers = null; }
+      const boardTail = [...(watchers ? [watchers] : []), ...(hands ? [hands] : []), ...(advisor ? [advisor] : []), ...(handPool ? [handPool] : []), ...(resourceOpt ? [resourceOpt] : []), ...(watches ? [watches] : []), ...(guardian ? [guardian] : [])];
+      process.stdout.write(opts.json ? `${JSON.stringify({ panes, ...(hands ? { hands } : {}), ...(advisor ? { advisor } : {}), ...(handPool ? { handPool } : {}), ...(resourceOpt ? { resourceOpt } : {}), ...(watches ? { watches } : {}), ...(guardian ? { guardian } : {}) }, null, 2)}\n` : `${[...statusBoardLines(panes, Date.now()), ...boardTail].join('\n')}\n`);
+    });
+  // SEAT-INPLACE-UPDATE (대표 11-25): rail chains move one seat to the current install in its own pane — no `els pane close`
+  // / `els new`. The seat-control migrate door waits for the turn boundary, then the TUI execs itself (same pid · same
+  // pane · same session); the TUI's own in-place watcher carries the draft, queued lines and notices across.
+  side.command('update-seat <seat>').description('Move one seat to the current install in place (same pane, same session) at its next turn boundary')
+    .option('--in-place', 'required: in-place is the only mode (no pane close/new)')
+    .action(async (seat: string, opts: { inPlace?: boolean }) => {
+      if (!opts.inPlace) { process.stderr.write('els update-seat: pass --in-place (the pane is never closed)\n'); process.exitCode = 2; return; }
+      const result = await runSeatControl(seat.toUpperCase(), 'migrate', {
+        sender: () => detectSeatTui(process.cwd())?.seat ?? null,
+        rows: listPtyManifestRowsStrict,
+        send: (id, action, payload, options) => requestRemotePtyControl(id, action, payload, options),
+      });
+      debug.log('els', 'els.update-seat', { seat: seat.toUpperCase(), status: result.status, reason: (result as { reason?: string }).reason ?? null });
+      process.stdout.write(`${JSON.stringify(result)}\n`);
+      if (result.status !== 'success') process.exitCode = 1;
     });
   side.command('update-all').description('Catch up registered ELS hosts to desiredSha, migrate seat tabs at their turn boundary, and print one result row per tab')
     .option('--local-only', 'SSH child: only this host; do not fan out')
     .option('--json', 'emit a machine-readable result for the pinned SSH parent')
     .option('--expected-desired <sha>', 'require the SSH parent-approved exact desired commit')
-    .action(async (opts: { localOnly?: boolean; json?: boolean; expectedDesired?: string }) => {
+    .option('--grant-standing [note]', 'one-time policy: after one terminal approval, OP migrations no longer ask once the published build is installed on this host')
+    .option('--revoke-standing', 'remove the standing approval; OP migrations ask on the terminal again')
+    .action(async (opts: { localOnly?: boolean; json?: boolean; expectedDesired?: string; grantStanding?: string | boolean; revokeStanding?: boolean }) => {
       const sender = () => detectSeatTui(process.cwd())?.seat ?? null;
+      const standingPath = standingApprovalPath(elanousStateRoot());
+      if (opts.revokeStanding) {
+        revokeStandingApproval(standingPath);
+        debug.log('els', 'els.update-all standing-revoked', {});
+        process.stdout.write('Standing approval removed. OP migrations ask on the terminal again.\n');
+        return;
+      }
+      if (opts.grantStanding !== undefined) {
+        if (process.stdin.isTTY !== true) { process.stderr.write('els update-all --grant-standing: run this in a terminal; the grant needs one approval\n'); process.exitCode = 1; return; }
+        const answer = await askHitlOnTerminal(HITL_TIMEOUT_MS)('Grant standing approval: OP may migrate seats without asking once the published build is installed on this Mac. Grant? [y/N] ');
+        if (answer !== 'approve') { process.stderr.write('els update-all --grant-standing: not granted\n'); process.exitCode = 1; return; }
+        const record = { grantedBy: 'CEO' as const, grantedAt: new Date().toISOString(), ...(typeof opts.grantStanding === 'string' ? { note: opts.grantStanding } : {}) };
+        writeStandingApproval(standingPath, record);
+        debug.log('els', 'els.update-all standing-granted', record);
+        process.stdout.write(`Standing approval granted at ${record.grantedAt}.\n`);
+        return;
+      }
       const registryPath = elsHostsPath(elanousStateRoot());
       let listedRegistry: HostRegistry | undefined;
       let processTreeCache: ReadonlyMap<number, number> | undefined | null = null;
@@ -535,28 +665,27 @@ export function registerElsCommands(program: Command): void {
           prepare: async () => {
             // Reuse guarded catch-up and keep the OP HITL in this command's install→migrate path.
             // RES-INFRA operates only after an independently verified install.
+            // ELS-UPDATE-ALL-BY-OP: a CEO standing-approval record replaces the terminal prompt once the target is installed here.
             if (sender() !== 'OP') return;
             const { runCatchUp } = await import('./self-update-catch-up.js');
-            let approved = false;
             const target = approvedTarget;
-            if (!target || !/^[a-f0-9]{40}$/i.test(target)) throw new Error('Target build unavailable');
-            const confirm = async () => {
-              const answer = await federation().list();
-              if (answer.exitCode !== 0) throw new Error('Seat list unavailable');
-              const listing = JSON.parse(answer.message) as Parameters<typeof updatePreview>[0];
-              const identity = readInstalledIdentity();
-              approved = (await askHitlOnTerminal(HITL_TIMEOUT_MS)(updatePreview(listing, identity.installedVersion, identity.installedCommit, target))) === 'approve';
-              return approved;
-            };
-            const wasCurrent = readInstalledIdentity().installedCommit.toLowerCase() === target.toLowerCase();
-            const installed = await runCatchUp({ seat: 'OP', restart: false, expectedDesired: target }, {
-              approveOp: confirm,
-              out: { log: () => {}, error: () => {} },
+            installStatus = await prepareOpUpdate({
+              target,
+              installedCommit: () => readInstalledIdentity().installedCommit,
+              desired: () => desiredSha(),
+              standing: () => readStandingApproval(standingApprovalPath(elanousStateRoot())),
+              interactive: process.stdin.isTTY === true,
+              askTerminal: async () => {
+                const answer = await federation().list();
+                if (answer.exitCode !== 0) throw new Error('Seat list unavailable');
+                const listing = JSON.parse(answer.message) as Parameters<typeof updatePreview>[0];
+                const identity = readInstalledIdentity();
+                return (await askHitlOnTerminal(HITL_TIMEOUT_MS)(updatePreview(listing, identity.installedVersion, identity.installedCommit, target ?? ''))) === 'approve';
+              },
+              runCatchUp: (approveOp, out) => runCatchUp({ seat: 'OP', restart: false, expectedDesired: target }, { approveOp, out }),
+              log: (event, data) => debug.log('els', event, data),
+              stderr: line => process.stderr.write(`${line}\n`),
             });
-            if (installed.exitCode !== 0) throw new Error('Installation update failed');
-            if (!approved && !(await confirm())) throw new Error('Migration cancelled');
-            if (desiredSha()?.toLowerCase() !== target.toLowerCase()) throw new Error('Target build changed; no migration requested');
-            installStatus = wasCurrent ? 'already up to date (skipped)' : 'updated';
           },
           target: () => ({ desired: desiredSha(), installed: readInstalledIdentity().installedCommit }),
           list: async () => {
@@ -618,11 +747,21 @@ export function registerElsCommands(program: Command): void {
         process.stderr.write(`els update-all: ${error instanceof Error ? error.message : String(error)}\n`);
       }
     });
-  const createPane = async (opts: { ws?: string; cwd?: string; title?: string; raw?: boolean }, command: string[], herdrShape: boolean): Promise<void> => {
+  const createPane = async (opts: { ws?: string; cwd?: string; title?: string; raw?: boolean; host?: string }, command: string[], herdrShape: boolean): Promise<void> => {
     const hint = misplacedOptionHint({ ...opts, command });
     if (hint) { emit({ exitCode: 2, message: hint }); return; }
-    const args = withNewDefaults({ ...opts, command }, process.env, process.cwd());
-    const answer = await requestEls(elsSocketPath(), { op: 'new', ws: args.ws, cwd: args.cwd, command: args.command, ...(args.title ? { title: args.title } : {}) });
+    // `els new --host hostb[/ws] -- …` (stage 5): only the explicit flag names a remote host — the words after -- are
+    // always the command, even when the first one happens to equal a registered host name.
+    const fed = federation();
+    if (opts.host !== undefined && opts.host !== elsHostName() && !fed.newTarget(opts.host)) {
+      emit({ exitCode: 2, message: `els new: host ${opts.host} is not registered in els/hosts.json` }); return;
+    }
+    const target = opts.host !== undefined && opts.host !== elsHostName() ? fed.newTarget(opts.host) : undefined;
+    const args = withNewDefaults({ ...opts, ...(target?.ws ? { ws: target.ws } : {}), command }, process.env, process.cwd());
+    const terminal = target ? viewerTerminal() : undefined;
+    const answer = await fed.new(target, { ws: args.ws, cwd: args.cwd, command: args.command, ...(args.title ? { title: args.title } : {}),
+      ...(terminal ? { size: viewerPaneArea(terminal) } : {}) },
+      process.env.ELANOUS_TRACK || process.env.ELANOUS_SEAT || 'unknown');
     if (answer.exitCode === 0 && herdrShape) { emit({ exitCode: 0, message: JSON.stringify(herdrCreated(JSON.parse(answer.message)), null, 2) }); return; }
     emit(answer);
   };
@@ -632,11 +771,19 @@ export function registerElsCommands(program: Command): void {
     .option('--cwd <folder>', 'pane working directory (restored after restart; default: the current folder)')
     .option('--title <title>', 'tab/pane title')
     .option('--raw', 'run the words after -- exactly as given (skip the «options go before --» check)')
+    .option('--host <name>', 'open the pane on a registered host (els/hosts.json) instead of this one')
     .argument('[command...]', 'command after -- (default: $SHELL)')
-    .action((command: string[] = [], opts: { ws?: string; cwd?: string; title?: string; raw?: boolean }) => createPane(opts, command, false));
+    .action((command: string[] = [], opts: { ws?: string; cwd?: string; title?: string; raw?: boolean; host?: string }) => createPane(opts, command, false));
+  // RELEASE-BOARD: `els open release-board [<v>]` opens the board in a new pane of this workspace.
+  side.command('open <board> [version]').description('Open a board in a new pane: release-board')
+    .action((board: string, version: string | undefined) => {
+      if (board !== 'release-board') { emit({ exitCode: 2, message: `els open: unknown board «${board}» — one of: release-board` }); return; }
+      return createPane({ title: 'Release Board' }, ['elanous', 'release', 'graph', 'board', ...(version ? [version] : [])], false);
+    });
   side.command('read <pane>')
     .description('Read a pane: a local pane id, ws/tab/pane, or host:ws/tab/pane on a registered host')
     .action(async (pane: string) => emit(await federation().read(pane)));
+  registerPeekWatchCommands(side, peekDeps);
   side.command('status <pane>')
     .description('What a pane is doing, from the PTY the server owns: working/idle/exited/unknown (+ why) · input empty · last output ago · running tool')
     .option('--json', 'the PaneStatus object as JSON')
@@ -654,7 +801,12 @@ export function registerElsCommands(program: Command): void {
     // #38988 (main, newer than #90792 13:54) — the person CLI send presses Enter through the verified paste
     // path (raw text intact as a bracketed paste, turn start observed). The machine paths keep the #38608
     // must ② split: cleaned `send` types text only, raw `input` (attach, `els pane run`/`send-keys`) presses keys.
-    .action((pane: string, text: string, opts: { enter: boolean }) => ask(opts.enter ? { op: 'send-verified', pane, text } : { op: 'send', pane, text }));
+    .action(async (pane: string, text: string, opts: { enter: boolean }) => emit(await routeElsSend(pane, text, opts.enter, {
+      localHost: elsHostName(),
+      from: process.env.ELANOUS_TRACK || process.env.ELANOUS_SEAT || 'unknown',
+      remoteDo: (target, line, from) => federation().do(target, line, from),
+      local: (request) => requestEls(elsSocketPath(), request),
+    })));
   side.command('do <pane> <text>')
     .description('Type a line into a pane (local, ws/tab/pane or host:ws/tab/pane): marked «⇢ from · text», queued while the pane\'s turn is running. A local pane walks the control door first (default deny).')
     .option('--from <seat>', 'who is sending (shown to the receiver)', process.env.ELANOUS_TRACK || process.env.ELANOUS_SEAT || 'unknown')
@@ -712,7 +864,10 @@ export function registerElsCommands(program: Command): void {
     const { failed, listed } = await listJson(); if (failed) emit(failed); else printJson(herdrTabs(listed!, opts.workspace));
   });
   tab.command('close <tab>').description('Close a tab and all its panes (a person at a terminal confirms; the OP coordinator closes seat tabs without asking)')
-    .action(async (id: string) => {
+    .option('-y, --yes', 'close without the prompt: the caller has already decided (a script, a duplicate OP tab)')
+    .action(async (id: string, opts: { yes?: boolean }) => {
+      // DEMO-PANE-EXIT-VISIBLE (demo audit 11-25): a duplicate OP tab blocked `els seat OP` and the close needed a terminal.
+      if (opts.yes) { await ask({ op: 'close-tab', tab: id, confirmed: true }); return; }
       // ELS-OP-CLOSE-TAB (대표 11-24): without a terminal (an OP seat's tool, a script) nobody can answer a prompt — send the
       // close unconfirmed and let the server decide: the OP coordinator / same-UID operator may close a seat tab, a
       // hand seat still needs a person, and the OP tab itself is always refused without one.
@@ -740,12 +895,20 @@ export function registerElsCommands(program: Command): void {
   side.command('attach <pane>')
     .description('Show a local pane or registered host:ws/tab/pane live (ctrl+b q detaches)')
     .action(async (ref: string) => {
+      // The route seam first: a host on a route kind this build has no transport for (relay · vm) gets no request at all.
+      const windowTarget = federation().attachTarget(ref);
+      if (windowTarget && 'refused' in windowTarget) { process.stderr.write(`${windowTarget.refused}\n`); process.exitCode = 2; return; }
       if (!process.stdin.isTTY || !process.stdout.isTTY) {
         process.stderr.write('els attach: needs a terminal (use `els pane read` / `els pane send-text` from scripts)\n');
         process.exitCode = 2;
         return;
       }
       let remote: FederatedHost | undefined;
+      // Stage 5: a registered host without a pinned SSH attach (or a `host/pane` ref) attaches over its tailnet window.
+      if (windowTarget && !windowTarget.host.attach) {
+        process.exitCode = await runAttachView(ref, undefined, windowTarget);
+        return;
+      }
       if (ref.includes(':') && !parseAddress(ref)?.host) {
         process.stderr.write('els attach: invalid remote address\n'); process.exitCode = 2; return;
       }
@@ -779,7 +942,9 @@ export function registerElsCommands(program: Command): void {
       if ('unknown' in bytes) { emit({ exitCode: 2, message: `els pane send-keys: unknown key ${bytes.unknown} (nothing was sent)` }); return; }
       return ask({ op: 'input', pane: ref, bytes: bytes.bytes }); // #38608 must ② — keys are raw control bytes
     });
-  pane.command('close <pane>').description('Stop the pane and remove it').action((ref: string) => ask({ op: 'close', pane: ref }));
+  // Stage 5: a ref that names a remote host (`host:ws/tab/pane` or `host/pane`) is closed by the owner that has it.
+  pane.command('close <pane>').description('Stop the pane and remove it')
+    .action(async (ref: string) => { emit(await federation().close(ref, process.env.ELANOUS_TRACK || process.env.ELANOUS_SEAT || 'unknown')); });
   // ELS-HERDR-IMPORT: herdr is read once; the plan is shown and a person says yes; els panes come from the owner's `new`.
   side.command('import').description('Bring another layout into els').command('herdr')
     .description('Read this machine\'s herdr workspaces/tabs/panes (cwd), show the plan, ask, then open the missing ones in els (same workspace · tab label · cwd; existing ones skipped; herdr is not changed). Prints a receipt: created · skipped · failed')
@@ -855,7 +1020,7 @@ function ownBuildLabel(): string {
   return versionLabel(build, buildCommitTime(build)).label;
 }
 
-function runAttachView(ref: string, remote?: FederatedHost): Promise<number> {
+function runAttachView(ref: string, remote?: FederatedHost, windowTarget?: { host: FederatedHost; pane: string }): Promise<number> {
   const label = ownBuildLabel();
   return new Promise((resolve) => {
     const size = () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 });
@@ -912,7 +1077,7 @@ function runAttachView(ref: string, remote?: FederatedHost): Promise<number> {
     // screen stays, the note says so, and the view re-attaches once a second until the server answers again (every
     // attach starts with the pane's current screen, so the pane comes back as it was).
     let everFramed = false;
-    let attached: ReturnType<typeof attachEls> | ReturnType<typeof attachElsOverSsh> | undefined;
+    let attached: ReturnType<typeof attachEls> | ReturnType<typeof attachElsOverSsh> | ReturnType<typeof attachRemote> | undefined;
     let retry: ReturnType<typeof setTimeout> | undefined;
     const open = (): void => {
       const handlers: AttachHandlers = {
@@ -920,12 +1085,14 @@ function runAttachView(ref: string, remote?: FederatedHost): Promise<number> {
         // A pane that exits under the view is not a detach: say so and exit 1 (detach is the only 0).
         onEnd: (exitCode, reason) => {
           if (finished) return;
-          if (!remote && everFramed && isServerAway(reason)) { note = RECONNECT_NOTE; paint(last); retry = setTimeout(open, 1_000); retry.unref?.(); return; }
+          if (!remote && !windowTarget && everFramed && isServerAway(reason)) { note = RECONNECT_NOTE; paint(last); retry = setTimeout(open, 1_000); retry.unref?.(); return; }
           finish(1, reason === 'pane exited' ? 'els attach: the pane exited' : (exitCode === 0 ? `els attach: ${reason || 'the stream ended'}` : reason), reason === 'pane exited');
         },
         onError: (problem) => { note = problem; paint(last); },
       };
-      if (remote) {
+      if (windowTarget) {
+        attached = attachRemote(windowTarget.host, windowTarget.pane, paneSize(), handlers, `${elsHostName()}/${process.env.ELANOUS_TRACK || process.env.ELANOUS_SEAT || 'unknown'}`);
+      } else if (remote) {
         const address = parseAddress(ref)!;
         // ELS-ATTACH-FRAME-DIFF: `diff:true` rides `attachEls` only — the ssh half (attachElsOverSsh →
         // `side attach-stdio` argv) carries no such flag on its wire, so the remote keeps full frames by contract.
@@ -950,6 +1117,22 @@ function runAttachView(ref: string, remote?: FederatedHost): Promise<number> {
   });
 }
 
+/** REMOTE-PANE-SIZE (대표 11-25 «use the current terminal size exactly»): this process's real terminal (TIOCGWINSZ via
+ *  process.stdout; `tput` only when stdout is not a TTY) and the pane area the els viewer would give a pane in it —
+ *  the same chrome as attach-app paneSize (side panel + separator, tab row + status line). undefined = no terminal. */
+export function viewerTerminal(): { cols: number; rows: number } | undefined {
+  if (process.stdout.isTTY && process.stdout.columns && process.stdout.rows) return { cols: process.stdout.columns, rows: process.stdout.rows };
+  try {
+    const ask = (what: string): number => Number(spawnSync('tput', [what], { stdio: ['inherit', 'pipe', 'ignore'], encoding: 'utf8', timeout: 1_000 }).stdout.trim());
+    const cols = ask('cols'); const rows = ask('lines');
+    return process.stdin.isTTY && Number.isInteger(cols) && Number.isInteger(rows) && cols > 0 && rows > 0 ? { cols, rows } : undefined;
+  } catch { return undefined; }
+}
+export function viewerPaneArea(terminal: { cols: number; rows: number }, sidebarOpen = true): { cols: number; rows: number } {
+  const left = sidebarWidthFor(terminal.cols, sidebarOpen);
+  return { cols: Math.max(10, terminal.cols - (left ? left + 1 : 0)), rows: Math.max(3, terminal.rows - 2) };
+}
+
 /** The terminal side of bare `els`: raw keys → the app, window size → the app, the app's drawing → stdout. */
 function runAppView(sidebar: boolean | undefined, initialPane?: string): Promise<number> {
   const decodeKeys = createKeyDecoder();
@@ -957,7 +1140,8 @@ function runAppView(sidebar: boolean | undefined, initialPane?: string): Promise
   const app = createAttachApp({
     // ELS-VOICE-CONTROL-POPUP: ctrl+b : asks the cheap one-shot model (budget tier; local LM Studio fallback) — null = rules.
     voiceModel: async (prompt) => (await import('../domains/signal-dedup.js')).llmOnce(prompt),
-    remote: { list: () => hosts.list(), read: (address) => hosts.read(address) },
+    remote: { list: () => hosts.list(), read: (address) => hosts.read(address),
+      resize: (address, cols, rows) => hosts.resize(address, cols, rows, process.env.ELANOUS_TRACK || process.env.ELANOUS_SEAT || 'unknown') },
     request: (request) => requestEls(elsSocketPath(), request),
     attach: (pane, size, handlers) => attachEls(elsSocketPath(), pane, size, handlers),
     // ELS-FIRST-RUN-FU3 ② · ELS-APP-RENDER-SINGLE-FRAME: an unchanged screen writes nothing; otherwise only the changed
@@ -1003,8 +1187,9 @@ function viewMemory(): AttachAppDeps['memory'] {
   return {
     load: () => {
       try {
-        const parsed = JSON.parse(readFileSync(file, 'utf8')) as { sidebar?: unknown; lastPane?: unknown };
-        return { ...(typeof parsed.sidebar === 'boolean' ? { sidebar: parsed.sidebar } : {}), ...(typeof parsed.lastPane === 'string' ? { lastPane: parsed.lastPane } : {}) };
+        const parsed = JSON.parse(readFileSync(file, 'utf8')) as { sidebar?: unknown; lastPane?: unknown; groupFolds?: unknown; activeOnly?: unknown };
+        const folds = parsed.groupFolds && typeof parsed.groupFolds === 'object' ? Object.fromEntries(Object.entries(parsed.groupFolds as Record<string, unknown>).filter(([, v]) => typeof v === 'boolean')) as Record<string, boolean> : undefined;
+        return { ...(typeof parsed.sidebar === 'boolean' ? { sidebar: parsed.sidebar } : {}), ...(typeof parsed.lastPane === 'string' ? { lastPane: parsed.lastPane } : {}), ...(folds ? { groupFolds: folds } : {}), ...(parsed.activeOnly === true ? { activeOnly: true } : {}) };
       } catch { return {}; }
     },
     save: (state) => {

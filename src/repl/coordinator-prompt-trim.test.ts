@@ -31,9 +31,15 @@ test('coordinator defers coding schemas but ToolSearch can hydrate them; hand re
   const coord = buildReplTools({ nextTui: true, seatRole: 'coordinator' });
   const hand = buildReplTools({ nextTui: true, seatRole: 'hand' });
   const cs = splitDeferredToolSpecs(coord.specs), hs = splitDeferredToolSpecs(hand.specs);
-  for (const name of ['Edit', 'Write', 'Grep', 'Glob', 'ListDir']) {
+  for (const name of ['Edit', 'Write']) {
     expect(cs.deferred.map(s => s.name)).toContain(name);
     expect(cs.active.map(s => s.name)).not.toContain(name);
+    expect(hs.active.map(s => s.name)).toContain(name);
+  }
+  // Seat search/read tools are immediate on the coordinator surface too.
+  for (const name of ['Grep', 'Glob', 'ListDir', 'Read']) {
+    expect(cs.active.map(s => s.name)).toContain(name);
+    expect(cs.deferred.map(s => s.name)).not.toContain(name);
     expect(hs.active.map(s => s.name)).toContain(name);
   }
   expect(cs.active.map(s => s.name)).toContain('ToolSearch');
@@ -52,6 +58,13 @@ test('coordinator mailbox pages at 10 and hand keeps the ordinary limit', async 
   const second = await coord.dispatch('MsgList', { to: 'OP', after: first.messages.at(-1)!.id }) as { messages: unknown[] };
   expect(second.messages).toHaveLength(5);
   expect((await hand.dispatch('MsgList', { to: 'OP' }) as { messages: unknown[] }).messages).toHaveLength(15);
+});
+
+test('a coordinator-defer mark never hides seat search/read tools', () => {
+  const spec = (name: string) => ({ name, description: name, parameters: { type: 'object', properties: {} }, coordinatorDefer: true });
+  const split = splitDeferredToolSpecs(['Grep', 'Glob', 'ListDir', 'Read', 'Edit'].map(spec));
+  expect(split.active.map(s => s.name)).toEqual(expect.arrayContaining(['Grep', 'Glob', 'ListDir', 'Read']));
+  expect(split.deferred.map(s => s.name)).toEqual(['Edit']);
 });
 
 test('pane read keeps last 20 lines, while other actions and failures remain unchanged', () => {

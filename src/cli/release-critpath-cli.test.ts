@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Command } from 'commander';
 import { DecisionLedger, readDecisionTrustRoots, validateDecisionRaise } from '../decisions/decision-ledger.js';
 import { APPROVE_OPTION, CRITPATH_WAITING_EXIT, approvalRef, runCritpath, type ApprovalBinding, type CritpathDeps, type PreparedRelease } from '../../scripts/release-loop/critpath.js';
-import { critpathApprovalCard, defaultCritpathDeps, registerReleaseCritpathCommand } from './release-critpath-cli.js';
+import { critpathApprovalCard, defaultCritpathDeps, openHoldDecisions, registerReleaseCritpathCommand, releaseAutoPublishMode } from './release-critpath-cli.js';
 
 const binding = { version: '9.9.9', cutSha: 'a'.repeat(40), notesSha256: 'b'.repeat(64) };
 const savedExit = process.exitCode;
@@ -146,5 +146,34 @@ describe('release critpath CLI', () => {
       expect(result.approval).toEqual({ state: 'unverified', id: card.id });
       expect(calls).toEqual([]); // publish/npm/verify never run
     }
+  });
+});
+
+describe('release.autoPublish owner switch', () => {
+  const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'critpath-auto-cfg-')); dirs.push(d); return d; };
+  test('default off: no file, no key, any other value, broken JSON', () => {
+    const d = tmp();
+    expect(releaseAutoPublishMode(join(d, 'missing.json'))).toBe('off');
+    for (const body of ['{}', '{"release":{"loop":{}}}', '{"release":{"autoPublish":true}}', '{"release":{"autoPublish":"on"}}', '{not json']) {
+      writeFileSync(join(d, 'config.json'), body);
+      expect(releaseAutoPublishMode(join(d, 'config.json'))).toBe('off');
+    }
+  });
+  test('on only for the exact value "on-green"', () => {
+    const d = tmp();
+    writeFileSync(join(d, 'config.json'), '{"release":{"autoPublish":"on-green","loop":{"gateRemote":"x"}}}');
+    expect(releaseAutoPublishMode(join(d, 'config.json'))).toBe('on-green');
+  });
+  test('open HOLD decisions are the open cards titled HOLD that name the version — not the publish card, not other versions', () => {
+    const card = (id: string, title: string, status: 'open' | 'decided', refs: string[] = []) => ({ id, title, status, refs, scqa: { s: '', c: '' } });
+    const ids = openHoldDecisions([
+      card('D-1', 'HOLD v9.9.9 publish — install regression', 'open'),
+      card('D-2', 'hold release', 'open', ['release/9.9.9']),
+      card('D-3', 'HOLD v9.9.9', 'decided'),
+      card('D-4', 'HOLD v9.9.91 publish', 'open'),
+      card('D-5', 'Publish elanous v9.9.9 HOLD option', 'open', ['release-critpath/9.9.9/aaa/bbb']),
+      card('D-6', 'Ship v9.9.9 notes', 'open'),
+    ], '9.9.9');
+    expect(ids).toEqual(['D-1', 'D-2']);
   });
 });

@@ -1,0 +1,5 @@
+# RELEASE-GRAPH-EXEC: one tick of the release countdown executor (src/release-loop/release-graph-exec.ts) over every run.
+# Shadow unless config release.graph.mode=live and release.graph.version=<v>; live steps run detached, so a tick is short.
+release-graph-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" release graph tick --json'
+  timeout_ms: 180000 # Detection probes (git ls-remote · gh · npm view, 45 s caps) plus ledger writes.

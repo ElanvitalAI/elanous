@@ -45,34 +45,79 @@ export interface MouseLayout {
   readonly sidebarNew?: { readonly y: number; readonly from: number; readonly to: number }; // ELS-SIDEBAR-HERDR-CLEAN: the word «new» in the list's last line (열 0 기반)
   readonly tabs: readonly { readonly from: number; readonly to: number; readonly pane: string }[]; // 탭 중앙 오프셋(0 기반)
   readonly plus?: { readonly from: number; readonly to: number }; // ELS-NEW-TAB-NAME-WIDGET: «+» 칸(중앙 0 기반)
+  /** ELS-SCROLL-MOUSE: the side list's scrollbar (x = 1-based column, y = screen row of the first item row) when it overflows. */
+  readonly sidebarScroll?: { readonly x: number; readonly y: number; readonly room: number; readonly total: number; readonly start: number };
+  /** ELS-SIDE-SPLIT-SCROLL: the spaces region's own scroll (present only when the spaces exceed their region). */
+  readonly spacesScroll?: { readonly x: number; readonly y: number; readonly room: number; readonly total: number; readonly start: number };
+  /** ELS-SIDE-SPLIT-SCROLL: the screen row the agents region starts at — a wheel above it never moves the agents. */
+  readonly agentsTop?: number;
+  /** ELS-SCROLL-MOUSE: the tab row's «‹ n more» / «n more ›» cells (centre, zero-based). */
+  readonly tabPrev?: { readonly from: number; readonly to: number };
+  readonly tabNext?: { readonly from: number; readonly to: number };
 }
 
 export type MouseAction =
   | { readonly kind: 'select'; readonly pane: string }
   | { readonly kind: 'new-tab' } // «+» 클릭: 새 탭 이름 입력줄을 연다
   | { readonly kind: 'scroll'; readonly lines: number } // 양수 = 과거로
+  | { readonly kind: 'list-scroll'; readonly delta: number }   // ELS-SCROLL-MOUSE: side list by items (positive = down)
+  | { readonly kind: 'list-jump'; readonly start: number }     // scrollbar click: show from this item
+  | { readonly kind: 'spaces-scroll'; readonly delta: number } // ELS-SIDE-SPLIT-SCROLL: the spaces region by items
+  | { readonly kind: 'spaces-jump'; readonly start: number }
+  | { readonly kind: 'tab-scroll'; readonly delta: number }    // tab row by tabs (positive = right)
   | { readonly kind: 'passthrough'; readonly bytes: string };
 
-const WHEEL_UP = 64, WHEEL_DOWN = 65;
+const WHEEL_UP = 64, WHEEL_DOWN = 65, WHEEL_LEFT = 66, WHEEL_RIGHT = 67;
 
 /** 리포트를 화면 배치로 해석: 사이드바/탭 클릭은 선택, 휠은 스크롤백, 나머지는 pane 프로그램 통과. */
 export function interpretMouse(report: MouseReport, layout: MouseLayout): MouseAction | null {
   const { x, y } = report;
   if (report.release || y >= layout.rows || x < 1 || x > layout.cols) return null;
   const wheel = report.button & 0x40;
+  const left = layout.sidebarWidth > 0 ? layout.sidebarWidth + 1 : 0; // 사이드바 칸 + 구분선
+  const overSidebar = layout.sidebarWidth > 0 && x <= layout.sidebarWidth;
+  const overTabs = !overSidebar && y === 1 && layout.tabs.length > 0;
   if (wheel) {
+    // ELS-SCROLL-MOUSE: the wheel over the side list scrolls the list; over the tab row (or a sideways wheel) scrolls the tabs.
+    const step = report.button === WHEEL_UP || report.button === WHEEL_LEFT ? -1 : report.button === WHEEL_DOWN || report.button === WHEEL_RIGHT ? 1 : 0;
+    // ELS-SIDE-WHEEL-REGION (대표 11-25 21:4x): the region decides FIRST. A wheel over the side list (or its divider) belongs
+    // to the list — when the list fits (grouped mode folds groups until it fits) it does nothing, never the pane's scrollback.
+    // Over the tab row it belongs to the tabs — nothing when the row does not overflow.
+    if (overSidebar || (left > 0 && x === left)) {
+      if (step === 0) return null;
+      // ELS-SIDE-SPLIT-SCROLL: above the agents region (spaces · pinned head) the wheel moves the spaces when they overflow, else nothing.
+      if (layout.agentsTop !== undefined && y < layout.agentsTop) {
+        const own = layout.spacesScroll;
+        return own && y >= own.y && y < own.y + own.room ? { kind: 'spaces-scroll', delta: step } : null;
+      }
+      return layout.sidebarScroll ? { kind: 'list-scroll', delta: step * 3 } : null;
+    }
+    if (overTabs) return (layout.tabPrev || layout.tabNext) && step !== 0 ? { kind: 'tab-scroll', delta: step } : null;
+    if ((report.button === WHEEL_LEFT || report.button === WHEEL_RIGHT) && (layout.tabPrev || layout.tabNext) && step !== 0) return { kind: 'tab-scroll', delta: step };
     const lines = report.button === WHEEL_UP ? 3 : report.button === WHEEL_DOWN ? -3 : 0;
     return lines !== 0 ? { kind: 'scroll', lines } : null;
   }
-  if (layout.sidebarWidth > 0 && x <= layout.sidebarWidth) {
+  if (overSidebar) {
+    const bar = layout.sidebarScroll;
+    if (bar && x === bar.x && y >= bar.y && y < bar.y + bar.room) {
+      const row = y - bar.y;
+      const start = bar.total <= bar.room ? 0 : Math.max(0, Math.min(bar.total - bar.room, Math.round((row * (bar.total - bar.room)) / Math.max(1, bar.room - 1))));
+      return { kind: 'list-jump', start };
+    }
+    const own = layout.spacesScroll;
+    if (own && x === own.x && y >= own.y && y < own.y + own.room) {
+      const row = y - own.y;
+      return { kind: 'spaces-jump', start: Math.max(0, Math.min(own.total - own.room, Math.round((row * (own.total - own.room)) / Math.max(1, own.room - 1)))) };
+    }
     const box = layout.sidebarNew;
     if (box && y === box.y && x - 1 >= box.from && x - 1 < box.to) return { kind: 'new-tab' };
     const hit = layout.sidebar.find((item) => item.y === y);
     return hit ? { kind: 'select', pane: hit.pane } : null;
   }
-  const left = layout.sidebarWidth > 0 ? layout.sidebarWidth + 1 : 0; // 사이드바 칸 + 구분선
-  if (y === 1 && layout.tabs.length > 0) {
+  if (overTabs) {
     const col = x - left - 1; // 탭 범위는 중앙 0 기준
+    if (layout.tabPrev && col >= layout.tabPrev.from && col < layout.tabPrev.to) return { kind: 'tab-scroll', delta: -1 };
+    if (layout.tabNext && col >= layout.tabNext.from && col < layout.tabNext.to) return { kind: 'tab-scroll', delta: 1 };
     const tab = layout.tabs.find((t) => col >= t.from && col < t.to);
     if (layout.plus && col >= layout.plus.from && col < layout.plus.to) return { kind: 'new-tab' };
     return tab ? { kind: 'select', pane: tab.pane } : { kind: 'passthrough', bytes: report.bytes };

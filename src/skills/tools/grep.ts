@@ -14,8 +14,12 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 //     `content`, `count`. The LLM selects based on the task —
 //     "is this pattern anywhere?" vs "show me the matches" vs
 //     "how often does it occur?".
-//   - head_limit default 250. Prevents a broad search from
-//     dumping thousands of matches into the LLM's context window.
+//   - head_limit default 1000 (was 250 — search-bench #40045: the 250 cap
+//     cut real hits, ref recall .29; cap 1000 lifted code recall). When the
+//     cap cuts, the result says «truncated: N more …» explicitly.
+//   - files_with_matches: plain-word alternatives get ko↔en glossary
+//     variants (search-terms.ts) and identifier alternatives list their
+//     defining files first (search-structural.ts — ast-grep, else regex).
 //   - Supports -A / -B / -C (context lines), -n (line numbers),
 //     -i (case insensitive), --multiline (cross-line patterns),
 //     --glob (filename filter), --type (language filter).
@@ -38,10 +42,13 @@ import { getSessionCwd } from '../../session/working-dir.js';
 import { getUserConfig } from '../../user-config/reader.js';
 import { debug } from '../../debug/log.js';
 import { rgListFiles } from '../../tool-runtime/ripgrep-core.js';
+import { mapToLatest, staleCwdFor, staleCwdHint } from '../../knowledge/stale-cwd.js';
 import { noteBroadSearch, noteNarrowingAction } from './search-loop-guard.js';
-import { resolvePathWithPolicy, sensitiveRgExcludeArgs, type PathPolicy } from '../../agent/path-policy.js';
+import { expandHomePath, resolvePathWithPolicy, sensitiveRgExcludeArgs, type PathPolicy } from '../../agent/path-policy.js';
+import { expandGrepPattern } from './search-terms.js';
+import { findDefinitionFiles, identifierAlternatives } from './search-structural.js';
 
-const DEFAULT_HEAD_LIMIT = 250;
+const DEFAULT_HEAD_LIMIT = 1000;
 const MAX_HEAD_LIMIT = 10_000;
 const RG_TIMEOUT_MS = 30_000;
 const RG_MAX_BUFFER = 20 * 1024 * 1024;  // 20 MB — matches claude-code
@@ -76,21 +83,18 @@ export function buildGrepTool(): LLMToolSpec {
   return {
     name: 'Grep',
     description:
-      'A powerful text search tool built on ripgrep. ' +
-      'ALWAYS use Grep for text / pattern search tasks. NEVER invoke `grep` or `rg` ' +
-      'as a Bash command — this tool has the correct permissions, caps, and pagination ' +
-      'wired in. For the canonical source-exploration sequence, use Grep (find ' +
-      'candidates) → Read (inspect specific files) → Edit/Write. Glob is for filename-only ' +
-      'patterns. ' +
-      'For structural / symbol queries (e.g. "where is X defined", "who calls Y", ' +
-      '"list all methods on class Z"), use the `Lsp` tool — its goToDefinition / ' +
-      'findReferences / documentSymbol / workspaceSymbol operations are precise ' +
-      'where Grep regex would catch false positives in comments and strings. ' +
+      'Search file contents (ripgrep). Use it right after Glob, or first when you know a word or symbol in the text. Examples: ' +
+      '`Grep(pattern: "approvalCard|승인 카드")` (files mentioning a feature, ko or en) · ' +
+      '`Grep(pattern: "dispatchGrep", output_mode: "content", "-n": true)` (where a symbol is defined and used). ' +
+      'ALWAYS use Grep for text / pattern search. NEVER invoke `grep` or `rg` as a shell command — this tool has the ' +
+      'correct permissions, caps, and pagination wired in. Sequence: Glob (names) → Grep (contents) → Read (inspect) → Edit/Write. ' +
+      'In files_with_matches mode, plain words also match their ko↔en glossary terms (승인 ↔ approval), and a symbol ' +
+      '(camelCase / PascalCase / snake_case) lists the files that DEFINE it first. ' +
+      'For precise references, `Lsp` findReferences / goToDefinition beat a regex. ' +
       'Three modes via output_mode: `files_with_matches` (paths only, default), ' +
       '`content` (matching lines, with -n/-A/-B/-C context), `count` (per-file ' +
-      `occurrence count). Results are bounded by head_limit (default ${DEFAULT_HEAD_LIMIT}) ` +
-      'to protect your context window; call again with offset to paginate past it. ' +
-      'Prefer --type over --glob when searching by language.',
+      `occurrence count). Results are bounded by head_limit (default ${DEFAULT_HEAD_LIMIT}); a cut result says ` +
+      '«truncated: N more» — call again with offset to paginate. Prefer --type over --glob when searching by language.',
     parameters: {
       type: 'object',
       properties: {
@@ -104,7 +108,7 @@ export function buildGrepTool(): LLMToolSpec {
           enum: ['files_with_matches', 'content', 'count'],
           description: 'Format of the result. Default "files_with_matches".',
         },
-        head_limit: { type: 'number', description: `Max lines to return. Default ${DEFAULT_HEAD_LIMIT}.` },
+        head_limit: { type: 'number', description: `Max lines to return. Default ${DEFAULT_HEAD_LIMIT}; a cut result ends with «truncated: N more».` },
         offset: { type: 'number', description: 'Skip the first N result lines before applying head_limit.' },
         '-n': { type: 'boolean', description: 'Show line numbers (content mode).' },
         '-i': { type: 'boolean', description: 'Case-insensitive match.' },
@@ -122,13 +126,52 @@ export async function dispatchGrep(
   args: Record<string, unknown>,
   opts: { pathPolicy?: PathPolicy } = {},
 ): Promise<GrepResult> {
+  const result = await dispatchGrepCore(args, opts);
+  return withLatestTreeResults(result, args, opts);
+}
+
+/**
+ * 낡은 cwd 트리 — cwd 가 origin/main 보다 며칠 뒤처졌고 설정에 최신 체크아웃(latest)이 있으면
+ * 같은 상대 경로를 latest 에서도 찾아 붙이고 한 줄 힌트를 단다(세션당 git 한 번 · stale-cwd.ts).
+ * 실패는 조용히 원 결과를 돌려준다(보조 검색이 본 검색을 막지 않는다).
+ */
+function withLatestTreeResults(result: GrepResult, args: Record<string, unknown>, opts: { pathPolicy?: PathPolicy }): GrepResult {
+  try {
+    if ((opts.pathPolicy ?? 'permissive') !== 'permissive') return result;
+    const cwd = getSessionCwd();
+    const stale = staleCwdFor(cwd);
+    if (!stale) return result;
+    const searchPath = typeof args.path === 'string' && args.path ? expandHomePath(args.path) : '.';
+    const mapped = mapToLatest(isAbsolute(searchPath) ? searchPath : resolve(cwd, searchPath), stale);
+    if (!mapped) return result;
+    const pattern = String(args.pattern);
+    const mode = validateMode(args.output_mode) ?? 'files_with_matches';
+    const headLimit = clampInt(args.head_limit, DEFAULT_HEAD_LIMIT, 1, MAX_HEAD_LIMIT);
+    const rgArgs = buildRgArgs({ ...args, pattern, output_mode: mode });
+    rgArgs.push('--', pattern, mapped);
+    const proc = spawnSync('rg', rgArgs, { cwd: stale.latestRoot, encoding: 'utf8', timeout: RG_TIMEOUT_MS, maxBuffer: RG_MAX_BUFFER });
+    if (proc.status !== 0 && proc.status !== 1) return result;
+    const lines = (proc.stdout ?? '').split('\n').filter(Boolean);
+    const kept = lines.slice(0, headLimit);
+    const more = lines.length > kept.length ? `\n[... ${lines.length - kept.length} more in latest]` : '';
+    const section = kept.length > 0 ? `\n\n[latest: ${stale.latestRoot}]\n${kept.join('\n')}${more}` : `\n\n[latest: ${stale.latestRoot}] no matches`;
+    return { ...result, output: `[${staleCwdHint(stale)}]\n${result.output}${section}` };
+  } catch {
+    return result;
+  }
+}
+
+async function dispatchGrepCore(
+  args: Record<string, unknown>,
+  opts: { pathPolicy?: PathPolicy } = {},
+): Promise<GrepResult> {
   const pattern = typeof args.pattern === 'string' ? args.pattern : '';
   if (!pattern) throw new Error('Grep: pattern is required');
 
   const mode = validateMode(args.output_mode) ?? 'files_with_matches';
   const headLimit = clampInt(args.head_limit, DEFAULT_HEAD_LIMIT, 1, MAX_HEAD_LIMIT);
   const offset = clampInt(args.offset, 0, 0, Number.MAX_SAFE_INTEGER);
-  const searchPath = typeof args.path === 'string' && args.path ? args.path : '.';
+  const searchPath = typeof args.path === 'string' && args.path ? expandHomePath(args.path) : '.';
   // ★ Phase 4b PR3(2026-07-22) — 서피스 트러스트 정책. permissive(기본)=현행 무변경. 원격 메신저
   //   (telegram/discord)=strict: (1) 검색 루트가 cwd-탈출/자격증명 파일이면 차단(resolvePathWithPolicy),
   //   (2) 재귀 매칭에서 credential/키 파일을 rg exclude glob 으로 배제 → content mode 로도 .env/.ssh
@@ -186,10 +229,13 @@ export async function dispatchGrep(
       'fall back to Bash with `grep -r` / `find ... | xargs grep` for similar results.');
   }
 
+  // files_with_matches = discovery: plain words also match their ko↔en glossary terms (search-terms.ts).
+  //   content / count keep the literal pattern — those modes answer «show me THIS text».
+  const expansion = mode === 'files_with_matches' ? expandGrepPattern(pattern) : { pattern, added: [] as string[], from: [] as string[] };
   const rgArgs = buildRgArgs({ ...args, pattern, output_mode: mode });
   // strict — 자격증명/키 파일을 rg 가 아예 읽지 않도록 exclude glob 주입(재귀 매칭 차단).
   if (policy === 'strict') rgArgs.push(...sensitiveRgExcludeArgs());
-  rgArgs.push('--', pattern, searchPath);
+  rgArgs.push('--', expansion.pattern, searchPath);
 
   const started = Date.now();
   const proc = spawnSync('rg', rgArgs, {
@@ -215,7 +261,36 @@ export async function dispatchGrep(
   }
 
   const raw = proc.stdout ?? '';
-  const allLines = raw.split('\n').filter(Boolean);
+  let allLines = raw.split('\n').filter(Boolean);
+  const notes: string[] = [];
+  if (expansion.added.length > 0) {
+    notes.push(`[expanded: ${expansion.from.join(', ')} → ${expansion.added.join(', ')}]`);
+    // Files matching the words as written come first; glossary-only hits follow. Without this a common English
+    // variant («load») floods the list and pushes the few files that say «부하» past head_limit (bench nl-ko .50 → .33).
+    const literalArgs = buildRgArgs({ ...args, pattern, output_mode: mode });
+    if (policy === 'strict') literalArgs.push(...sensitiveRgExcludeArgs());
+    literalArgs.push('--', pattern, searchPath);
+    const literal = spawnSync('rg', literalArgs, { cwd: getSessionCwd(), encoding: 'utf8', timeout: RG_TIMEOUT_MS, maxBuffer: RG_MAX_BUFFER });
+    if (literal.status === 0) {
+      const asWritten = new Set((literal.stdout ?? '').split('\n').filter(Boolean));
+      allLines = [...allLines.filter((l) => asWritten.has(l)), ...allLines.filter((l) => !asWritten.has(l))];
+    }
+  }
+  // Identifier pattern → files that DEFINE the symbol come first (only reorders rg's own hits — never adds a path).
+  let definers: string[] = [];
+  const ids = mode === 'files_with_matches' && allLines.length > 1 ? identifierAlternatives(pattern) : [];
+  if (ids.length > 0) {
+    const cwd = getSessionCwd();
+    const lookup = findDefinitionFiles(ids, searchPath, cwd, policy === 'strict' ? sensitiveRgExcludeArgs() : []);
+    const defined = new Set(lookup.files);
+    const isDef = (line: string) => defined.has(isAbsolute(line) ? line : resolve(cwd, line));
+    const first = allLines.filter(isDef);
+    if (first.length > 0) {
+      allLines = [...first, ...allLines.filter((l) => !isDef(l))];
+      definers = first;
+    }
+    notes.push(`[definitions first: ${first.length} file${first.length === 1 ? '' : 's'} define ${ids.join(', ')} · via ${lookup.via}${lookup.fallbackReason ? ` (${lookup.fallbackReason})` : ''}]`);
+  }
   const sliceStart = Math.min(allLines.length, offset);
   const sliceEnd = Math.min(allLines.length, sliceStart + headLimit);
   const kept = allLines.slice(sliceStart, sliceEnd);
@@ -226,10 +301,10 @@ export async function dispatchGrep(
     const numFiles = kept.length;
     const ranked = rankCandidatePathsForPattern(kept, pattern);
     const discovered = discoverFocusedPathCandidates(searchPath, args, pattern);
-    const suggested = rankCandidatePathsForPattern(
-      [...new Set([...discovered, ...ranked])],
-      pattern,
-    ).slice(0, 5);
+    const suggested = [...new Set([
+      ...definers.slice(0, 5),
+      ...rankCandidatePathsForPattern([...new Set([...discovered, ...ranked])], pattern),
+    ])].slice(0, 5);
     const header = numFiles === 0
       ? `No files matched`
       : `Found ${numFiles}${truncated ? '+' : ''} file${numFiles === 1 ? '' : 's'}`;
@@ -238,10 +313,11 @@ export async function dispatchGrep(
       : '';
     const body = kept.join('\n');
     const footer = truncated
-      ? `\n\n[... ${allLines.length - sliceEnd} more results — offset:${sliceEnd} to paginate ...]`
+      ? `\n\n[truncated: ${allLines.length - sliceEnd} more matching files — offset:${sliceEnd} to paginate, or narrow with path/glob/type]`
       : '\n\n[Next step: pick 1-5 candidate files from this list and use Read or Lsp. Do not issue another broad files_with_matches search unless you are changing scope materially.]';
+    const noteBlock = notes.length > 0 ? `\n${notes.join('\n')}` : '';
     return {
-      output: `${header}${suggestionBlock}${body ? '\n' + body : ''}${footer}`,
+      output: `${header}${noteBlock}${suggestionBlock}${body ? '\n' + body : ''}${footer}`,
       mode, numFiles, numMatches: numFiles, truncated,
     };
   }
@@ -258,7 +334,7 @@ export async function dispatchGrep(
       }
     }
     const footer = truncated
-      ? `\n\n[... ${allLines.length - sliceEnd} more files — offset:${sliceEnd} to paginate ...]`
+      ? `\n\n[truncated: ${allLines.length - sliceEnd} more files — offset:${sliceEnd} to paginate]`
       : '';
     return {
       output: `${kept.join('\n')}\n\nFound ${totalMatches} match${totalMatches === 1 ? '' : 'es'} across ${files.size} file${files.size === 1 ? '' : 's'}${truncated ? ' (partial)' : ''}${footer}`,
@@ -274,7 +350,7 @@ export async function dispatchGrep(
     if (idx > 0) files.add(line.slice(0, idx));
   }
   const footer = truncated
-    ? `\n\n[... ${allLines.length - sliceEnd} more lines — offset:${sliceEnd} to paginate ...]`
+    ? `\n\n[truncated: ${allLines.length - sliceEnd} more matches — offset:${sliceEnd} to paginate, or narrow with path/glob/type]`
     : '';
   return {
     output: numMatches === 0

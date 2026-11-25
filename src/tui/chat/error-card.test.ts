@@ -18,4 +18,14 @@ test('empty failure detail still leaves the recovery actions visible', () => {
 test('known authentication failure directs connection repair before retry', () => {
   expect(nextTuiErrorCard('Codex 인증이 준비되지 않았습니다.', 'codex-auth-missing')[1])
     .toBe('  Check /provider · renew auth → ↑ recall input → Enter resend');
+  expect(nextTuiErrorCard('Codex 인증이 준비되지 않았습니다.', 'codex-auth-missing')[0])
+    .toBe('✘ Codex authentication is not ready.');
+});
+
+
+test('public turn failure card renders old and new failure detail in English', () => {
+  expect(nextTuiErrorCard('요청을 처리하지 못했습니다.')[0]).toBe('✘ Could not process the request.');
+  expect(nextTuiErrorCard('요청을 처리하지 못했습니다. (Rate limit exceeded)')[0])
+    .toBe('✘ Could not process the request. (Rate limit exceeded)');
+  expect(nextTuiErrorCard('unrelated failure')[0]).toBe('✘ unrelated failure');
 });

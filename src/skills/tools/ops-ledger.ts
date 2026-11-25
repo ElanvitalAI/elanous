@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { LLMToolSpec } from '../../llm/tool-spec.js';
+import { parseApplyField, recordAnnounceApply } from '../../msg/announce.js';
 // ── Ops-ledger native tools — 우편(msg) · 판(release checklist) ──
 //
 // OP TUI turns previously drove `elanous msg list/post/ack` and
@@ -50,6 +51,12 @@ import { join } from 'node:path';
 import { ackDigestInputs, recordAckDigest, type AckDigestInput, type AckDigestPorts } from '../../msg/msg-ack-digest.js';
 import { canonicalMessageAddress, canonicalSeatId, openMsgStore, validateMessageEnvelope, type Message, type MsgStore } from '../../msg/msg-store.js';
 import { armMessageFollowUp } from '../../msg/msg-follow-up.js';
+import { parseWatch, suggestWatch, withWatchFooter } from '../../commitment/condition-watch.js';
+import { formatWaitCondition } from '../../msg/self-timer-watch.js';
+import { divertedRootForStore, gatePost, storeGateDeps } from '../../msg/post-gate.js';
+import { MSG_POST_KINDS } from '../../msg/post-discipline.js';
+import { loadFederationLadder } from '../../msg/hand-raise-ladder.js';
+import { senderAboveOnLadder } from '../../tui/seat-mail-turn-policy.js';
 import {
   addItem,
   devVersion,
@@ -204,6 +211,8 @@ export async function observeLedgerCall<T extends Record<string, unknown>>(
 export interface MsgLedgerDeps {
   /** Message-ledger opener; overridden by tests with a temp path. */
   openStore?: () => MsgStore;
+  /** MAIL-ANTI-FLOOD F·G side ledgers (default: next to the mail ledger). */
+  divertedRoot?: string;
   followUp?: typeof armMessageFollowUp;
   /** MSG-FILTERS-RELAX bulk-ack digest saver (default: the `eln memory add` store). */
   saveAckDigest?: AckDigestPorts['save'];
@@ -282,18 +291,23 @@ export function buildMsgPostTool(): LLMToolSpec {
     name: 'MsgPost',
     description:
       'Post a durable seat-addressed message — the same SQLite ledger as `elanous msg post`, in-process (no CLI startup). ' +
-      'The recipient sees it on their next MsgList/watch. ALL may receive but never send; `kind` tags the message; `replyTo` points a reply at a question message ID.',
+      'The recipient sees it on their next MsgList/watch. ALL may receive but never send; `kind` tags the message; `replyTo` points a reply at a question message ID — '
+      + 'when omitted it is set to the recipient\'s newest unanswered question/decision to you (noReplyTo: true opts out).',
     parameters: {
       type: 'object',
       properties: {
         from: { type: 'string', description: 'Sender seat (ALL cannot send).' },
         to: { type: 'string', description: 'Recipient seat: OP · MK · TC · UX · ALL or another canonical seat id.' },
         body: { type: 'string', description: 'Message body (nonempty).' },
-        kind: { type: 'string', description: 'Optional tag (any text; stored lowercased).' },
-        replyTo: { type: 'integer', description: 'Question message ID this reply points at.' },
+        kind: { type: 'string', enum: [...MSG_POST_KINDS], description: 'What this mail is (MAIL-ANTI-FLOOD E · closed set). Omitted → tagged from replyTo/refs/sender role: info unless the structure says otherwise.' },
+        needsReply: { type: 'boolean', description: 'true only when you wait for an answer (default true for question · decision). false → the receiver reads it in its digest, no turn.' },
+        replyTo: { type: 'integer', description: 'Question message ID this reply points at (default: the recipient\'s newest unanswered question/decision to you).' },
+        noReplyTo: { type: 'boolean', description: 'Do not thread this post onto the recipient\'s unanswered question.' },
         intent: { type: 'string', enum: ['request', 'decision', 'info', 'alert'], description: 'Request and decision messages automatically receive a 30-minute follow-up.' },
         waitForPr: { type: 'integer', description: 'Optional PR number to watch for merge instead of waiting for a reply.' },
+        watch: { type: 'string', description: 'The OUTCOME you await instead of a reply: pr-merged:<N> · pregate-receipt:<PR>[@head] · cell-status:<id>=green|owner=<seat> · seat-idle:<seat> · file-exists:<path> · mail-from:<seat>. The commitment closes itself with evidence when it holds; the recipient is told no reply is needed.' },
         doneWhen: { type: 'string', description: 'Optional completion condition for the request.' },
+        apply: { type: 'string', description: 'Reply to a federation announce (with replyTo): one «적용:» line — what this seat will do differently.' },
       },
       required: ['from', 'to', 'body'],
       additionalProperties: false,
@@ -304,11 +318,23 @@ export function buildMsgPostTool(): LLMToolSpec {
 export interface MsgPostResult extends Record<string, unknown> {
   output: string;
   ok: true;
-  message: Message;
-  followUp?: { commitmentId: string; wakerId: string; condition: string; merged: boolean } | { error: string };
+  /** The stored row — absent when MAIL-ANTI-FLOOD diverted the post (self-wake · coach-note · folded). */
+  message?: Message;
+  diverted?: 'self-wake' | 'coach-note' | 'folded' | 'retro-turn';
+  followUp?: { commitmentId: string; wakerId: string; condition: string; merged: boolean; watch?: boolean } | { error: string };
+  /** COND-WATCH — a watch the structured fields suggest when none was given (the reply-wait stays armed). */
+  suggestedWatch?: string;
+}
+
+/** E auto-tag input — the sender sits above the recipient on the federation ladder (unknown ladder → omitted). */
+function senderAboveOf(from: string, to: string): { senderAbove?: boolean } {
+  try { const above = senderAboveOnLadder(loadFederationLadder(), from, to); return above === undefined ? {} : { senderAbove: above }; }
+  catch { return {}; }
 }
 
 export async function dispatchMsgPost(rawArgs: Record<string, unknown>, deps: MsgLedgerDeps = {}): Promise<MsgPostResult> {
+  const apply = parseApplyField(rawArgs.apply);
+  if (apply !== null && (rawArgs.replyTo === undefined || rawArgs.replyTo === null || rawArgs.replyTo === 0)) throw new Error("'apply' needs 'replyTo' (the announce message ID)");
   const envelope = validateMessageEnvelope({
     from: requiredString(rawArgs.from, 'from'),
     to: requiredString(rawArgs.to, 'to'),
@@ -322,13 +348,34 @@ export async function dispatchMsgPost(rawArgs: Record<string, unknown>, deps: Ms
   const waitForPr = rawArgs.waitForPr === undefined || rawArgs.waitForPr === null || rawArgs.waitForPr === 0
     ? undefined : integerArg(rawArgs.waitForPr, 'waitForPr', 1, Number.MAX_SAFE_INTEGER);
   if (waitForPr !== undefined && envelope.intent !== 'request' && envelope.intent !== 'decision') throw new Error('waitForPr requires request or decision intent');
+  // COND-WATCH — parse before storing: a bad condition never leaves a stored message behind.
+  const watchRaw = filledString(rawArgs.watch, 'watch');
+  const watch = watchRaw === undefined ? undefined : parseWatch(watchRaw);
+  if (watch !== undefined) envelope.body = withWatchFooter(envelope.body, watch);
   // #38516 r2 MF3: recovery names THIS attempt's commit by its token — never an older identical row.
   const attemptToken = randomUUID();
   const store = deps.openStore?.() ?? openMsgStore();
   let posted: Message;
+  let applyNote = '';
   try {
+    // MSG-WAIT-CONTRACT ① — thread onto the recipient's newest unanswered question/decision (or a mail it waits on).
+    const contract = require('../../msg/msg-wait-contract.js') as typeof import('../../msg/msg-wait-contract.js');
+    const threaded = contract.withAutoReplyTo(store, envelope, {
+      optOut: rawArgs.noReplyTo === true || envelope.to === 'TA',
+      waitedOn: (seat) => contract.wakerWaitedOn((s) => (require('../../msg/self-timer-watch.js') as typeof import('../../msg/self-timer-watch.js')).listWakers(s))(seat),
+    });
+    // MAIL-ANTI-FLOOD E·F·G — tag kind ⊕ needsReply from structure, divert self-mail / coach injections, fold into a
+    // saturated receiver's digest. A diverted post writes no row.
+    const needsReply = typeof rawArgs.needsReply === 'boolean' ? rawArgs.needsReply : undefined;
+    const gate = gatePost({ envelope: threaded, entrance: 'tool', ...(needsReply === undefined ? {} : { needsReply }), ...senderAboveOf(threaded.from, threaded.to) },
+      storeGateDeps(store, deps.divertedRoot ?? divertedRootForStore(store.storePath)));
+    if (gate.action === 'refuse') throw new Error(gate.error);
+    if (gate.action === 'divert') return { output: `MsgPost ${threaded.from} → ${threaded.to} · ${gate.line}`, ok: true, diverted: gate.ledger };
+    threaded.kind = gate.envelope.kind;
+    envelope.kind = gate.envelope.kind;
+    if (gate.envelope.needsAck !== undefined) threaded.needsAck = gate.envelope.needsAck;
     // ELN-MSG-POST-IDEMPOTENT: the sender idempotency key — a retried identical post returns the stored message.
-    try { posted = store.post(envelope, { dedupe: true, attemptToken }); }
+    try { posted = store.post(threaded, { dedupe: true, attemptToken }); }
     catch (error) {
       // Ambiguous write (lock/I-O around COMMIT): read by the key before calling it a failure. A validation refusal
       // stored nothing — rethrow it unread.
@@ -337,19 +384,26 @@ export async function dispatchMsgPost(rawArgs: Record<string, unknown>, deps: Ms
       if (landed === null) throw error;
       posted = landed;
     }
+    // ANNOUNCE-UPTAKE — the reply's apply field is the seat's «applied» event (fail-open: the reply is stored).
+    if (apply !== null && posted.replyTo !== undefined) {
+      try { if (recordAnnounceApply(store.db, { seat: posted.from, messageId: posted.replyTo, line: apply, viaMessageId: posted.id }) === null) applyNote = ` · apply ignored: #${posted.replyTo} is not an announce`; }
+      catch (error) { applyNote = ` · apply not recorded: ${error instanceof Error ? error.message : String(error)}`; }
+    }
   } finally {
     try { store.close(); } catch { /* the write already committed or already failed; closing never changes that */ }
   }
   let followUp: MsgPostResult['followUp'];
-  if (envelope.intent === 'request' || envelope.intent === 'decision') {
-    try { followUp = await (deps.followUp ?? armMessageFollowUp)(posted, waitForPr); }
+  if (watch !== undefined || envelope.intent === 'request' || envelope.intent === 'decision') {
+    try { followUp = await (deps.followUp ?? armMessageFollowUp)(posted, waitForPr, undefined, watch === undefined ? undefined : formatWaitCondition(watch)); }
     catch (error) { followUp = { error: error instanceof Error ? error.message : String(error) }; }
   }
+  const suggestedWatch = watch === undefined ? suggestWatch({ kind: envelope.kind, waitForPr }) ?? undefined : undefined;
   return {
-    output: `MsgPost #${posted.id} ${posted.from} → ${posted.to}${posted.deduped ? ' · deduped: already stored, no new row' : ''}${followUp ? 'error' in followUp ? ' · follow-up failed; retry or schedule manually' : ` · follow-up ${followUp.condition}` : ''}`,
+    output: `MsgPost #${posted.id} ${posted.from} → ${posted.to}${posted.deduped ? ' · deduped: already stored, no new row' : ''}${followUp ? 'error' in followUp ? ' · follow-up failed; retry or schedule manually' : ` · ${followUp.watch ? 'watch' : 'follow-up'} ${followUp.condition}` : ''}${suggestedWatch ? ` · suggest watch ${suggestedWatch} (outcome instead of a reply)` : ''}${applyNote}`,
     ok: true,
     message: posted,
     ...(followUp ? { followUp } : {}),
+    ...(suggestedWatch ? { suggestedWatch } : {}),
   };
 }
 
@@ -370,6 +424,7 @@ export function buildMsgAckTool(): LLMToolSpec {
         ids: { type: 'array', items: { type: 'integer' }, description: 'Acknowledge exactly these message IDs (per id).' },
         id: { type: 'integer', description: 'Acknowledge every message through this ID (cursor).' },
         receipted: { type: 'boolean', description: 'true = also acknowledge every message that already has a terminal receipt.' },
+        apply: { type: 'string', description: 'With `ids` naming a federation announce: one «적용:» line — what this seat will do differently. A bare ack is not uptake.' },
       },
       required: ['to'],
       additionalProperties: false,
@@ -399,6 +454,8 @@ export async function dispatchMsgAck(rawArgs: Record<string, unknown>, deps: Msg
   const through = rawArgs.id === undefined || rawArgs.id === null ? undefined : integerArg(rawArgs.id, 'id', 0, Number.MAX_SAFE_INTEGER);
   const receipted = rawArgs.receipted === true;
   if (ids.length === 0 && through === undefined && !receipted) throw new Error("MsgAck needs 'ids', 'id' or 'receipted: true'");
+  const apply = parseApplyField(rawArgs.apply);
+  if (apply !== null && ids.length === 0) throw new Error("'apply' needs 'ids' naming the announce message");
   const store = deps.openStore?.() ?? openMsgStore();
   let digestInputs: AckDigestInput[] = [];
   let result: MsgAckResult;
@@ -415,10 +472,13 @@ export async function dispatchMsgAck(rawArgs: Record<string, unknown>, deps: Msg
     }
     const cursor = through === undefined ? store.getCursor(to) : store.ackThroughSeen(to, through, 'tool-ack');
     if (receipted) for (const id of store.ackReceipted(to)) if (!acked.includes(id)) acked.push(id);
+    // ANNOUNCE-UPTAKE — the ack's apply field: one «applied» event per acked announce.
+    const applied = apply === null ? [] : acked.filter(id => { try { return recordAnnounceApply(store.db, { seat: to, messageId: id, line: apply }) !== null; } catch { return false; } });
     const parts = [
       ...(through === undefined ? [] : [`through #${cursor}`]),
       ...(acked.length === 0 ? [] : [`${acked.length} by id (#${acked.join(' #')})`]),
       ...(missing.length === 0 ? [] : [`not ${to}'s mail: #${missing.join(' #')}`]),
+      ...(apply === null ? [] : [applied.length === 0 ? 'apply ignored: no acked announce' : `applied #${applied.join(' #')}`]),
     ];
     digestInputs = ackDigestInputs(store, to, [...new Set([...passing, ...acked])].sort((a, b) => a - b));
     result = {

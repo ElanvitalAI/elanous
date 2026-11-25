@@ -125,7 +125,7 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
       writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
       const next = name === 'next';
       const calls: Array<{ name: string; args: Record<string, unknown> }> = [1, 2, 3].map((index) => ({
-        name: 'Agent', args: { description: `child ${index}`, prompt: `고정 child 지시 ${index}` },
+        name: 'Agent', args: { description: `child ${index}`, prompt: `고정 child 지시 ${index}`, reason: 'fixture' },
       }));
       if (next) calls.push({ name: 'AgentOutput', args: { taskId: '$previousToolResult.taskId', block: false } });
       const sequence = JSON.stringify({ when: '세 자식', calls });
@@ -144,7 +144,7 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
             || screen.includes('웹 화면을 여는 중…') || screen.trimStart().startsWith('elanous')) && screen.includes('❯') },
         steps: [{ label: 'three-child request', text: ask,
           until: (screen) => screen.includes(parentReply) && (next
-            ? /✓ Agent\(child 3\)|캡슐 완료: agent child 3/.test(screen) && nextTuiTurnSettled(screen) // N03 r25 실측(#38802) — #38650 캡슐 완료 통지 턴이 뷰포트를 밀어 올리고 자식 접힘은 «캡슐 완료: agent child N» 한 줄로 남는다(옛 ✓ 카드와 듀얼 승인)
+            ? /✓ (?:Agent\(child 3\)|🤖 child 3 —)|캡슐 완료: agent child 3/u.test(screen) && nextTuiTurnSettled(screen) // N03 r25 실측(#38802) — #38650 캡슐 완료 통지 턴이 뷰포트를 밀어 올리고 자식 접힘은 «캡슐 완료: agent child N» 한 줄로 남는다(옛 ✓ 카드와 듀얼 승인)
             : (screen.includes('✔ done') || /Worked for [^\n]*done/.test(screen))) }],
       });
     }
@@ -166,7 +166,7 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
       const nextTools = toolNames(nextMessages);
       expect(classic.exitCode).toBe(0);
       expect(next.exitCode).toBe(0);
-      expect(nextScreen.match(/✓ Agent\(child \d\)|캡슐 완료: agent child \d/g)?.length).toBe(3); // N03 r25 실측(#38802) — 세 자식 각각 접힌 한 줄(옛 «✓ Agent(child N)» 카드 · 현 «캡슐 완료: agent child N» 통지줄 듀얼 승인 · 통지 턴은 카드 수를 더하지 않는다)
+      expect(nextScreen.match(/✓ (?:Agent\(child \d\)|🤖 child \d —)|캡슐 완료: agent child \d/gu)?.length).toBe(3); // N03 r25 실측(#38802) — 세 자식 각각 접힌 한 줄(옛 «✓ Agent(child N)» 카드 · 현 «캡슐 완료: agent child N» 통지줄 듀얼 승인 · 통지 턴은 카드 수를 더하지 않는다)
       expect(nextScreen).not.toMatch(/▶ Agent\(child \d\)|running \d+s/); // #38778 — background 기본화 뒤 접힌 카드는 '(running in background …' 요약만 (펼쳐진 원문 없음)
       expect(nextScreen).not.toMatch(/◐ sub-agents|✗ sub-agents/); // 활성·실패 취합 카드는 화면에 남지 않는다
       expect(classicTools).toContain('Agent');

@@ -37,13 +37,16 @@ import { buildRunDevHarnessTool, isDevHarnessModelSurfaceEnabled } from '../skil
 import { buildReadTool, dispatchRead } from '../skills/tools/read.js';
 import { buildGrepTool, dispatchGrep } from '../skills/tools/grep.js';
 import { buildGlobTool, dispatchGlob } from '../skills/tools/glob.js';
+import { buildDocsSearchTool } from '../skills/tools/docs-search.js';
 import { buildListDirTool, dispatchListDir } from '../skills/tools/list-dir.js';
 import { buildEditTool, dispatchEdit } from '../skills/tools/edit.js';
 import { buildWriteTool, dispatchWrite } from '../skills/tools/write.js';
 import { buildAgentTool, dispatchAgent } from '../skills/tools/agent.js';
+import { guardedAgentSpawn } from '../skills/tools/agent-spawn-guard.js';
 import { buildAgentListTool, dispatchAgentList } from '../agent/agent-list-tool.js';
 import { buildAgentOutputTool, dispatchAgentOutput } from '../agent/agent-output-tool.js';
 import { buildAgentStopTool, dispatchAgentStop } from '../agent/agent-stop-tool.js';
+import { buildAgentSendTool, dispatchAgentSend } from '../agent/agent-send-tool.js';
 import { buildAgentReplyTool, dispatchAgentReply } from '../skills/tools/agent-reply.js';
 import { dispatchAutonomousTool, isAutonomousTool } from '../agent/autonomous-tools.js';
 import type { PathPolicy } from '../agent/path-policy.js';
@@ -513,6 +516,16 @@ const SESSION_NATIVE_TOOL_RULES: SessionNativeToolRule[] = [
     dispatch: async (args) => await dispatchListDir(args),
   },
   {
+    id: 'docs-search',
+    description: 'Search the project design docs (and configured reference sources) by topic.',
+    build: () => buildDocsSearchTool(),
+    match: () => false,
+    dispatch: async (args) => {
+      const { dispatchDocsSearch } = await import('../skills/tools/docs-search.js');
+      return await dispatchDocsSearch(args);
+    },
+  },
+  {
     id: 'code-edit',
     description: 'Edit an existing file via exact-string replacement.',
     build: () => buildEditTool(),
@@ -531,14 +544,14 @@ const SESSION_NATIVE_TOOL_RULES: SessionNativeToolRule[] = [
     description: 'Delegate focused work to a sub-agent in its own context window.',
     build: () => buildAgentTool(),
     match: () => false,
-    dispatch: async (args, signal, opts) => await dispatchAgent(args, {
+    dispatch: async (args, signal, opts) => await guardedAgentSpawn(args, () => dispatchAgent(args, {
       parentSessionId: opts?.sessionId,
       signal,
       hostTools: opts?.agentHostTools,
       dispatchTool: opts?.agentDispatchTool,
       buildChildToolCatalog: opts?.buildChildToolCatalog,
       inheritGeneralPurposeToolCatalog: opts?.inheritGeneralPurposeToolCatalog,
-    }),
+    }), undefined, undefined, opts?.sessionId ?? ''),
     preferRuntime: true,
   },
   {
@@ -563,6 +576,14 @@ const SESSION_NATIVE_TOOL_RULES: SessionNativeToolRule[] = [
     build: () => buildAgentStopTool(),
     match: () => false,
     dispatch: async (args, _signal, opts) => await dispatchAgentStop(args, { requester: opts?.sessionId }),
+    preferRuntime: true,
+  },
+  {
+    id: 'agent-send',
+    description: 'Send a correction to a running sub-agent or resume a finished one with its context.',
+    build: () => buildAgentSendTool(),
+    match: () => false,
+    dispatch: async (args, _signal, opts) => dispatchAgentSend(args, opts?.sessionId ? { requester: opts.sessionId } : {}),
     preferRuntime: true,
   },
   {
@@ -718,8 +739,8 @@ const SESSION_RUNTIME_TOOL_FAMILY_RULES: SessionRuntimeToolFamilyRule[] = [
   },
   {
     id: 'ops-ledger',
-    description: 'In-process seat messages and release checklist operations.',
-    names: ['msg_list', 'msg_post', 'msg_ask', 'msg_ack', 'checklist_list', 'checklist_add', 'checklist_set', 'checklist_edit', 'checklist_move'],
+    description: 'In-process seat messages, release checklist operations and commitment close.',
+    names: ['msg_list', 'msg_post', 'msg_ask', 'msg_ack', 'checklist_list', 'checklist_add', 'checklist_set', 'checklist_edit', 'checklist_move', 'commitment_close', 'hand_raise', 'seat_assign'],
     match: () => false,
   },
   {
@@ -775,6 +796,12 @@ const SESSION_RUNTIME_TOOL_FAMILY_RULES: SessionRuntimeToolFamilyRule[] = [
   },
 ];
 
+/** Read-only search/read families every seat surface ships immediately — native first, index last:
+ *  Glob, Grep, Read, ListDir, DocsSearch (search-bench #40045 C7: native search first, the docs index breaks ties;
+ *  a docs-first exposure made the model open with DocsSearch and lost code recall).
+ *  Seats run on ops/control/research surfaces too; without these a lookup had to shell out. */
+export const SEAT_SEARCH_NATIVE_FAMILY_IDS: readonly string[] = ['code-glob', 'code-grep', 'code-read', 'code-list-dir', 'docs-search'];
+
 const RUNTIME_TOOL_FAMILY_RULE_MAP = new Map<string, SessionRuntimeToolFamilyRule>(
   SESSION_RUNTIME_TOOL_FAMILY_RULES.map(rule => [rule.id, rule] as const),
 );
@@ -801,16 +828,18 @@ const SESSION_SURFACE_PROFILES: Record<SessionSurfaceId, Omit<SessionSurfaceProf
     // parity): edit→test→commit→PR→reboot all need a shell.
     defaultRuntimeFamilyIds: ['bash', 'run-shell', 'pty-shell', 'run-tests', 'elanous_skills_list', 'skill_exec', 'code-grounding'],
     defaultNativeFamilyIds: [
-      'code-read',
-      'code-grep',
       'code-glob',
+      'code-grep',
+      'code-read',
       'code-list-dir',
+      'docs-search',
       'code-edit',
       'code-write',
       'agent',
       'agent-output',
       'agent-reply',
       'agent-stop',
+      'agent-send',
       'agent-list',
     ],
   },
@@ -824,9 +853,9 @@ const SESSION_SURFACE_PROFILES: Record<SessionSurfaceId, Omit<SessionSurfaceProf
     // Shell execution — a goal-owning coding agent must run what it builds.
     defaultRuntimeFamilyIds: ['bash', 'run-shell', 'pty-shell', 'run-tests', 'elanous_skills_list', 'skill_exec', 'code-grounding'],
     defaultNativeFamilyIds: [
-      'code-read',
-      'code-grep',
       'code-glob',
+      'code-grep',
+      'code-read',
       'code-list-dir',
       'code-edit',
       'code-write',
@@ -834,6 +863,7 @@ const SESSION_SURFACE_PROFILES: Record<SessionSurfaceId, Omit<SessionSurfaceProf
       'agent-output',
       'agent-reply',
       'agent-stop',
+      'agent-send',
       'agent-list',
     ],
   },
@@ -851,7 +881,7 @@ const SESSION_SURFACE_PROFILES: Record<SessionSurfaceId, Omit<SessionSurfaceProf
     // "open the latest debug file and analyze" but only web-search was
     // exposed, forcing the LLM to refuse. code-edit/code-write stay
     // out — research surface should not mutate the workspace.
-    defaultNativeFamilyIds: ['code-read', 'code-grep', 'code-glob', 'code-list-dir', 'web-search'],
+    defaultNativeFamilyIds: ['code-glob', 'code-grep', 'code-read', 'code-list-dir', 'web-search'],
   },
   'research/agent': {
     id: 'research/agent',
@@ -861,7 +891,7 @@ const SESSION_SURFACE_PROFILES: Record<SessionSurfaceId, Omit<SessionSurfaceProf
     baselineContexts: ['external-world-guidance'],
     defaultHostFamilyIds: ['self-ops'],
     defaultRuntimeFamilyIds: [],
-    defaultNativeFamilyIds: ['web-search', 'deep-research', 'web-fetch'],
+    defaultNativeFamilyIds: [...SEAT_SEARCH_NATIVE_FAMILY_IDS, 'web-search', 'deep-research', 'web-fetch'],
   },
   'control/agent': {
     id: 'control/agent',
@@ -871,7 +901,7 @@ const SESSION_SURFACE_PROFILES: Record<SessionSurfaceId, Omit<SessionSurfaceProf
     baselineContexts: ['git', 'operator-state'],
     defaultHostFamilyIds: ['ui-inspect', 'self-ops'],
     defaultRuntimeFamilyIds: [],
-    defaultNativeFamilyIds: [],
+    defaultNativeFamilyIds: SEAT_SEARCH_NATIVE_FAMILY_IDS,
   },
   'ops-ui/agent': {
     id: 'ops-ui/agent',
@@ -881,7 +911,7 @@ const SESSION_SURFACE_PROFILES: Record<SessionSurfaceId, Omit<SessionSurfaceProf
     baselineContexts: ['git', 'ops-state'],
     defaultHostFamilyIds: ['ui-inspect', 'self-ops'],
     defaultRuntimeFamilyIds: [],
-    defaultNativeFamilyIds: [],
+    defaultNativeFamilyIds: SEAT_SEARCH_NATIVE_FAMILY_IDS,
   },
   'ops-fleet/agent': {
     id: 'ops-fleet/agent',
@@ -891,7 +921,7 @@ const SESSION_SURFACE_PROFILES: Record<SessionSurfaceId, Omit<SessionSurfaceProf
     baselineContexts: ['git', 'ops-state'],
     defaultHostFamilyIds: ['self-ops'],
     defaultRuntimeFamilyIds: ['fleet-core'],
-    defaultNativeFamilyIds: [],
+    defaultNativeFamilyIds: SEAT_SEARCH_NATIVE_FAMILY_IDS,
   },
 };
 
@@ -1761,7 +1791,7 @@ export function buildSessionSurfaceManualSections(
 const ESSENTIAL_NATIVE_RULE_IDS = [
   'code-read', 'code-grep', 'code-glob', 'code-list-dir', 'code-edit', 'code-write',
   // Keep dev-harness in the assembly candidate set so the catalog policy below is the single model-exposure authority.
-  'agent', 'agent-output', 'agent-reply', 'agent-stop', 'agent-list', 'self-implement', 'self-orchestrate', 'dev-harness',
+  'agent', 'agent-output', 'agent-reply', 'agent-stop', 'agent-send', 'agent-list', 'self-implement', 'self-orchestrate', 'dev-harness',
 ] as const;
 const ESSENTIAL_HOST_FAMILY_IDS = ['self-ops', 'release-read'] as const;
 // Keep this TUI essential addition out of the shared control/agent self-ops family.
@@ -2017,13 +2047,13 @@ export function buildSessionRuntimeToolSpecs(opts: {
  *  mode." Their family IDs are merged ahead of the surface defaults
  *  so they always land in the catalog (subject to availability).
  *
- *  Ordering matches the historical coding/turn surface order so the
- *  catalog's first slot stays predictable when surfaces share the
- *  same six entries. */
+ *  Ordering = search order a seat should follow (search-bench #40045):
+ *  Glob → Grep → Read first, then ListDir / Edit / Write. The catalog's
+ *  first slot stays predictable when surfaces share the same six entries. */
 const CORE_NATIVE_FAMILY_IDS: readonly string[] = [
-  'code-read',
-  'code-grep',
   'code-glob',
+  'code-grep',
+  'code-read',
   'code-list-dir',
   'code-edit',
   'code-write',

@@ -69,7 +69,7 @@ export async function runSubagentToolsDevice(spec: SubagentToolsSpec): Promise<S
       [TEST_FAKE_LLM_RESPONSE_ENV]: '[fake-llm] 맡겼습니다',
       // zero-refused 는 «사람이 좁히기를 켠» 경우의 0-거부 안전망을 잰다(기본은 allow 무시라 0 이 안 생긴다).
       ...(spec.scenario === 'zero-refused' ? { ELANOUS_SUBAGENT_HONOR_ALLOW: '1' } : {}),
-      [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: '서브에이전트로', name: 'Agent', args: { description: '도구 확인', prompt: '파일 하나 읽어라', tool_filter: toolFilter } }),
+      [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: '서브에이전트로', name: 'Agent', args: { description: '도구 확인', prompt: '파일 하나 읽어라', reason: '도구 목록 확인', tool_filter: toolFilter } }),
     },
     // 11-23 실측 next TUI 크롬: 부팅 = 제목 줄 «elanous» ⊕ «Ctrl+Q quit» · 턴 끝 = 푸터 «● Turn done».
     ready: {

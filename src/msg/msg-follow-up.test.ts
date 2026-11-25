@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CommitmentLedger } from '../dashboard/input/commitment-ledger.js';
+import { CommitmentLedger } from '../commitment/ledger.js';
 import { dispatchMsgPost } from '../skills/tools/ops-ledger.js';
 import { armMessageFollowUp, FOLLOW_UP_MS } from './msg-follow-up.js';
 import { MsgStore } from './msg-store.js';
@@ -25,10 +25,10 @@ test('request arms one 30-minute reply watcher, dedupes, and wakes sender on exp
     followUp: (message: Parameters<typeof armMessageFollowUp>[0], pr: number | undefined) => armMessageFollowUp(message, pr, { ledger, timer, launch: async () => { launched++; } }) };
   const args = { from: 'TC', to: 'CX-5', body: 'Please investigate', intent: 'request' };
   const first = await dispatchMsgPost(args, deps);
-  expect(first.message.intent).toBe('request');
-  expect(first.followUp).toMatchObject({ condition: `mail-reply:${first.message.id}`, merged: false });
+  expect(first.message!.intent).toBe('request');
+  expect(first.followUp).toMatchObject({ condition: `mail-reply:${first.message!.id}`, merged: false });
   const second = await dispatchMsgPost(args, deps);
-  expect(second.message.id).toBe(first.message.id);
+  expect(second.message!.id).toBe(first.message!.id);
   expect(second.followUp).toMatchObject({ merged: true });
   expect(launched).toBe(1);
   const [waker] = listWakers('TC', timer);
@@ -37,7 +37,7 @@ test('request arms one 30-minute reply watcher, dedupes, and wakes sender on exp
   expect((await evaluateWaker('TC', waker!.id, timer)).outcome).toBe('expired');
   expect(notices).toHaveLength(1);
   expect(notices[0]).toContain('TC:');
-  expect(notices[0]).toContain(`mail-reply:${first.message.id}`);
+  expect(notices[0]).toContain(`mail-reply:${first.message!.id}`);
 });
 
 test('decision can watch a PR and launch failure leaves a visible, retryable post', async () => {
@@ -53,7 +53,7 @@ test('decision can watch a PR and launch failure leaves a visible, retryable pos
   expect(first.followUp).toEqual({ error: 'launch failed' });
   expect(first.output).toContain('follow-up failed');
   const retry = await dispatchMsgPost(args, deps);
-  expect(retry.message.id).toBe(first.message.id);
+  expect(retry.message!.id).toBe(first.message!.id);
   expect(retry.followUp).toMatchObject({ condition: 'pr-merged:39789', merged: true });
   expect(attempts).toBe(2);
 });

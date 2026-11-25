@@ -46,7 +46,7 @@ test('seat sub-agent (general-purpose) sees MsgPost, RunShell, ElsControl and po
   try {
     const tools = buildReplTools({ nextTui: true });
     await tools.dispatch('Agent', {
-      description: 'seat child', prompt: 'post one note', subagent_type: 'general-purpose',
+      description: 'seat child', prompt: 'post one note', reason: 'seat tool catalog probe', subagent_type: 'general-purpose',
       run_in_background: false, isolation: 'cwd',
     });
     expect(childToolNames).toContain('MsgPost');

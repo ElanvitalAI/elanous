@@ -1,0 +1,39 @@
+{
+  "id": "search-bench",
+  "name": "SEARCH-BENCH search methodology device (docs/code search · Track I index × Track N native tools × external agents · RunShell engines)",
+  "audience": "internal",
+  "implementation": [
+    "src/ux-sim/search-bench/cli.ts",
+    "src/ux-sim/search-bench/corpus.ts",
+    "src/ux-sim/search-bench/kit.ts",
+    "src/ux-sim/search-bench/runner.ts",
+    "src/ux-sim/search-bench/registry.ts",
+    "src/ux-sim/search-bench/plan.ts",
+    "src/ux-sim/search-bench/adapters.ts",
+    "src/ux-sim/search-bench/docs-index.ts",
+    "src/ux-sim/search-bench/relation-graph.ts",
+    "src/ux-sim/search-bench/agent-arm.ts",
+    "src/ux-sim/sim-world/daily-regression/dr18-docsearch.ts"
+  ],
+  "tests": [
+    "src/ux-sim/search-bench/search-bench.test.ts"
+  ],
+  "target": "a pinned corpus (git sha of docs+src, or sampled reference repos) is searched by pluggable strategies through the product Glob/Grep/Read, the docs-search index stages and RunShell engines; recall@1/@5, MRR, tool calls and model-visible bytes are scored per domain and category",
+  "inputs": [
+    "gold-elanous.json and gold-ref.json gold sets",
+    "strategy files under src/ux-sim/search-bench/strategies/",
+    "optional agent transcript (search-bench.transcript/1) or the off-by-default OpenRouter LLM arm"
+  ],
+  "observations": [
+    "per-strategy recall@1/@5, MRR, calls, bytes after folding, decoy hits in the top 5",
+    "dated scorecards in <test-state>/search-bench/runs/ compared run to run"
+  ],
+  "entryCommands": [
+    "eln --test=<isolated-state> sim search-bench --corpus elanous --sha origin/main",
+    "eln --test=<isolated-state> sim search-bench --history",
+    "bun test src/ux-sim/search-bench/search-bench.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

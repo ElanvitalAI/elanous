@@ -57,8 +57,8 @@ test('mixed sources fill the cap — real mail stays pending: no receipts until 
   const world = seatMailWorld(20);
   try {
     const { queue, watcher } = world.makeWatcher();
-    // 타 출처 알림 20건이 큐 상한을 채운다(감시자 room 계산이 seat-mail만 세면 우편을 다 집어들어 가이드로 접힌다).
-    for (let i = 1; i <= 20; i += 1) queue.enqueueNotice(`other ${i}`, 'event-watch');
+    // 타 출처 알림 100건이 큐 상한(100 · SEAT-QUEUE-CAPACITY CEO 11-25 · 옛 20)을 채운다(감시자 room 계산이 seat-mail만 세면 우편을 다 집어들어 가이드로 접힌다).
+    for (let i = 1; i <= 100; i += 1) queue.enqueueNotice(`other ${i}`, 'event-watch');
     watcher.poll();
     queue.drainNotices();
     watcher.noteTurnFinished(true, 'responded');
@@ -84,8 +84,8 @@ test('mixed sources fill the cap — real mail stays pending: no receipts until 
   }
 });
 
-test('50 mail — over-cap stays pending, re-offered on every next poll: all 50 delivered+seen, restart 0 (OP #129667 ②③④)', () => {
-  const world = seatMailWorld(50);
+test('250 mail — over-cap stays pending, re-offered on every next poll: all 250 delivered+seen, restart 0 (OP #129667 ②③④ · cap 100)', () => {
+  const world = seatMailWorld(250);
   try {
     const { queue, watcher } = world.makeWatcher();
     const delivered: number[] = [];
@@ -103,16 +103,16 @@ test('50 mail — over-cap stays pending, re-offered on every next poll: all 50 
       watcher.noteTurnFinished(true, 'responded');
       turns += 1;
       if (cycle === 0) {
-        // OP #130050 — 상한 밖 21~50는 이번 턴에 큐로 못 들어가 pending(우편 유실 0) — 다음 poll 이 재제공한다.
-        expect(world.unread().length).toBe(30);
+        // OP #130050 — 상한(100) 밖 101~250은 이번 턴에 큐로 못 들어가 pending(우편 유실 0) — 다음 poll 이 재제공한다.
+        expect(world.unread().length).toBe(150);
       }
     }
-    // 완수선 직접 단얨(칸 원문 SEAT-NOTICE-BUNDLE-DRAIN): 알림 50통 주입 시뮬의 턴 수는 3 이하(20+20+10).
+    // 완수선 직접 단얨(칸 원문 SEAT-NOTICE-BUNDLE-DRAIN): 상한 100 에서 250통 주입 시뮬의 턴 수는 3 이하(100+100+50).
     expect(turns).toBeLessThanOrEqual(3);
-    // 50통 전부 실제 큐 항목으로 지나갔고(가이드 msgId 하이재크 없음), 중복 배달 0.
+    // 250통 전부 실제 큐 항목으로 지나갔고(가이드 msgId 하이재크 없음), 중복 배달 0.
     expect(new Set(delivered).size).toBe(delivered.length);
-    expect([...delivered].sort((a, b) => a - b)).toEqual(Array.from({ length: 50 }, (_, i) => i + 1));
-    // 50통 전부 확인(seen) — 재시작 재제공 0.
+    expect([...delivered].sort((a, b) => a - b)).toEqual(Array.from({ length: 250 }, (_, i) => i + 1));
+    // 250통 전부 확인(seen) — 재시작 재제공 0.
     expect(world.unread()).toEqual([]);
     const restart = world.makeWatcher();
     expect(['baseline', 'quiet']).toContain(restart.watcher.poll().kind);

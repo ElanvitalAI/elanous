@@ -59,7 +59,7 @@ describe('ELN-PLAN-WIRE-SEAT wiring', () => {
     expect(noticeTexts(queue)).toHaveLength(status.active);
     expect(queue.items.every(item => item.source === 'seat-mail')).toBe(true);
     expect(seatPlanLine(status)).toBe(`계획 ${status.active}/${status.open}`);
-    expect(appendSeatPlan('OPC · 우편 2', status)).toBe(`OPC · 우편 2 · 계획 ${status.active}/${status.open}`);
+    expect(appendSeatPlan('OPC · mail 2', status)).toBe(`OPC · mail 2 · 계획 ${status.active}/${status.open}`);
   });
 
   test('invariants 7-8: receiving or an interrupt mail never stops or closes the active item', () => {

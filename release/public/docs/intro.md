@@ -11,8 +11,10 @@ Underneath, it watches itself, understands what it sees, and heals itself — an
 
 In practice, `elanous` takes a change described in one sentence, writes a goal document, implements it in an isolated git worktree, gates it with tests, reviews it unattended and merges it. You are called only when the system cannot converge.
 
+The command below uses `--yes` to consent to installation and automatic doctor repairs, including when run without a terminal.
+
 ```bash
-curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash -s -- --yes
 elanous harness say "add a --json flag to the status command"
 ```
 

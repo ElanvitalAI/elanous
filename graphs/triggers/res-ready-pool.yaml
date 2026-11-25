@@ -1,0 +1,55 @@
+graph_id: res-ready-pool
+version: 1
+loop:
+  title: RES ready pool
+  root: 자원국
+  managed_by: trigger-registry
+  description: >-
+    RES-READY-POOL-RESERVATION §1. Fires when a burst host (aws1 · aws2 · gcp1 · gcp2 · gcp3) was never verified or its
+    ready state is older than 7 days (hosts under a live lease are skipped). One host per run under an internal 90-minute
+    lease: start (cloud-vm.sh · cost ledger) → sanitize (stale tmp/worktrees · disk/mem floor) → rail catch-up with the
+    graph-issued permit → codex auth mirror → one real light pregate → mark ready (ready.json + BOARD.md row) → stop.
+    Any failure marks the host failed and stops it. `image: true` on the mark node requests a golden image (TODO actuator).
+  owner: RES
+  trigger:
+    condition:
+      predicate: { kind: res, check: ready-stale, max_age_days: 7 }
+      cooldown_min: 30
+  goal:
+    kind: ledger-line
+    path: '{stateRoot}/loops/res-ready-pool.jsonl'
+    contains: '"window":"{window}"'
+  failure:
+    goal_deadline_min: 120
+    max_attempts: 1
+    backoff_sec: []
+  legacy:
+    kind: marker
+    path: '{seatState}/OP/tools/.graph-cutover/res-ready-pool'
+  cutover_after: 1
+entry_node: pick
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: pick, kind: agent, recipe: 'cmd:res-ready-pick', max_visits: 1 }
+  - { node_id: start, kind: agent, recipe: 'cmd:res-step-start', max_visits: 1 }
+  - { node_id: sanitize, kind: agent, recipe: 'cmd:res-step-sanitize', max_visits: 1 }
+  - { node_id: catchup, kind: agent, recipe: 'cmd:res-step-catchup', max_visits: 1 }
+  - { node_id: auth, kind: agent, recipe: 'cmd:res-step-auth', max_visits: 1 }
+  - { node_id: smoke, kind: agent, recipe: 'cmd:res-step-smoke', max_visits: 1 }
+  - { node_id: ready, kind: agent, recipe: 'cmd:res-ready-mark', max_visits: 1, input: { image: false } }
+  - { node_id: stop, kind: agent, recipe: 'cmd:res-run-stop', max_visits: 1 }
+  - { node_id: fail, kind: agent, recipe: 'cmd:res-run-fail', max_visits: 1 }
+  - { node_id: mark, kind: agent, recipe: 'cmd:res-window-done', max_visits: 1, input: { ledger: '{stateRoot}/loops/res-ready-pool.jsonl' } }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: pick, on: outcome, map: { picked: start, none: mark, shadow: mark, fail: failed, error: failed } }
+  - { from: start, on: outcome, map: { ok: sanitize, fail: fail, error: fail } }
+  - { from: sanitize, on: outcome, map: { ok: catchup, fail: fail, error: fail } }
+  - { from: catchup, on: outcome, map: { ok: auth, fail: fail, error: fail } }
+  - { from: auth, on: outcome, map: { ok: smoke, fail: fail, error: fail } }
+  - { from: smoke, on: outcome, map: { ok: ready, fail: fail, error: fail } }
+  - { from: ready, on: outcome, map: { ok: stop, fail: fail, error: fail } }
+  - { from: stop, on: outcome, map: { ok: mark, fail: failed, error: failed } }
+  - { from: fail, on: outcome, map: { ok: failed, fail: failed, error: failed } }
+  - { from: mark, on: outcome, map: { ok: done, fail: failed, error: failed } }

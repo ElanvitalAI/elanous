@@ -457,3 +457,61 @@ describe('the real entry chain: one chain, import failure recovered, verdict fol
     ]);
   });
 });
+
+describe('11-25 OP deaf — a not-injected notice never stalls silently', () => {
+  const runOnce = (refusal: 'duplicate' | 'full' | undefined, remaining: number) => {
+    const calls: string[] = [];
+    dispatchExternalEventOne({
+      opened: {
+        id: 'deaf-1', text: 'mail body', source: 'seat-mail', receivedAt: 1, injected: false,
+        ...(refusal === undefined ? {} : { refusal }),
+        finish: (): Promise<never> => Promise.reject(new Error('not finished in this test')),
+      },
+      dispatch: noticeOneDispatch({ injected: false, remaining }),
+      remaining,
+      injectKey: () => { calls.push('injectKey'); },
+      keepOpen: () => { calls.push('keepOpen'); },
+      startChatTurn: (text, status) => { calls.push(`start:${text}|${status}`); },
+      log: (event, fields) => { calls.push(`log:${event}:${JSON.stringify(fields)}`); },
+    });
+    return calls;
+  };
+
+  test('a full ledger still starts the turn (forced ledger-full)', () => {
+    resetExternalEventOneWire();
+    expect(runOnce('full', 0)).toEqual([
+      'log:queue-notice-forced-turn:{"source":"seat-mail","reason":"ledger-full","streak":1,"remaining":0}',
+      'keepOpen',
+      'log:queue-dispatched-notice:{"source":"seat-mail","remaining":0}',
+      'start:mail body|[notice · seat-mail] auto-submitted',
+    ]);
+  });
+
+  test('not injected wakes the next item; the third in a row forces the turn, then the streak restarts', () => {
+    resetExternalEventOneWire();
+    expect(runOnce('duplicate', 4)).toEqual([
+      'log:queue-notice-not-injected:{"source":"seat-mail","remaining":4,"streak":1,"refusal":"duplicate"}',
+      'injectKey',
+    ]);
+    expect(runOnce('duplicate', 3)).toEqual([
+      'log:queue-notice-not-injected:{"source":"seat-mail","remaining":3,"streak":2,"refusal":"duplicate"}',
+      'injectKey',
+    ]);
+    expect(runOnce('duplicate', 2)).toEqual([
+      'log:queue-notice-forced-turn:{"source":"seat-mail","reason":"not-injected-streak","streak":3,"remaining":2}',
+      'keepOpen',
+      'log:queue-dispatched-notice:{"source":"seat-mail","remaining":2}',
+      'start:mail body|[notice · seat-mail] auto-submitted',
+    ]);
+    expect(runOnce('duplicate', 1)).toEqual([
+      'log:queue-notice-not-injected:{"source":"seat-mail","remaining":1,"streak":1,"refusal":"duplicate"}',
+      'injectKey',
+    ]);
+  });
+
+  test('the verdict itself: full → start, streak 3 → start, streak 2 → wake only', () => {
+    expect(noticeOneDispatch({ injected: false, remaining: 0, refusal: 'full' })).toEqual({ startTurn: true, wakeQueue: false, forced: 'ledger-full' });
+    expect(noticeOneDispatch({ injected: false, remaining: 5, streak: 3 })).toEqual({ startTurn: true, wakeQueue: false, forced: 'not-injected-streak' });
+    expect(noticeOneDispatch({ injected: false, remaining: 5, streak: 2 })).toEqual({ startTurn: false, wakeQueue: true });
+  });
+});

@@ -1,0 +1,20 @@
+{
+  "id": "SIM-RELEASE-QUICKPASS-WORLD",
+  "name": "Release quick path replays the manual golden path through historical blockers",
+  "kind": "release-quickpass",
+  "device": "release-quickpass-world",
+  "implementation": [
+    "src/ux-sim/release-quickpass-world.ts"
+  ],
+  "tests": [
+    "src/ux-sim/release-quickpass-world.test.ts"
+  ],
+  "trigger": "Replay the golden quick-pass DAG with seeded fake runners, inject each historical blocker alone and all together, the must-stop controls, a stalled update-all, resume from every step, and a slow failing parallel branch.",
+  "observe": [
+    "advisory blockers end as warn plus a card and the release publishes",
+    "build/publish/npm non-zero, security-4, and NO-GO stop the run and nothing new starts after them",
+    "update-all without progress wakes REL at start + 15 minutes",
+    "resume from any step reruns only its descendants and publishes at most once"
+  ],
+  "expected": "All 13 historical blockers continue and publish, all 5 controls stop, the DAG is faster than manual serial, and publish never starts before prepare, go and notes-public."
+}

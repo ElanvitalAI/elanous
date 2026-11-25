@@ -22,6 +22,8 @@ import { resolveModelAlias } from '../intelligence-map/model-alias.js';
 import type {
   AgentDefinition, AgentEvent, AgentSpawnOpts, AgentTask,
 } from './types.js';
+import { AGENT_STEER_SYSTEM_NOTE, drainAgentSteer, hasAgentSteer } from './agent-steer.js';
+import { buildInterjectionMessage } from '../chat/interjection.js';
 
 // ── AsyncEventQueue: push-to-iterator bridge ──
 
@@ -233,9 +235,8 @@ export function buildAgentMessages(
     );
     effectivePrefix = noticeLines.join('\n');
   }
-  const system = effectivePrefix
-    ? `${effectivePrefix}\n\n${def.systemPrompt}`
-    : def.systemPrompt;
+  // AGENT-STEER — the child knows corrections may arrive mid-run and that the latest one wins.
+  const system = `${effectivePrefix ? `${effectivePrefix}\n\n${def.systemPrompt}` : def.systemPrompt}\n\n${AGENT_STEER_SYSTEM_NOTE}`;
 
   // P3 (2026-05-03) — Universal preamble plumbing for the sub-agent
   // surface. Without this, codex sub-agents executed with ZERO project
@@ -424,6 +425,12 @@ async function runEncapsulated(task: AgentTask, runOnce: () => Promise<string>, 
   return text;
 }
 
+function drainSteerLogged(task: AgentTask, at: 'mid-run' | 'after-step'): string[] {
+  const items = drainAgentSteer(task.id);
+  if (items.length > 0) debug.log('agent.steer', 'delivered', { to: task.id, at, count: items.length }, { level: 'info' });
+  return items;
+}
+
 // ── runAgent ──
 
 /** Stream an agent's execution as a sequence of AgentEvent frames.
@@ -444,6 +451,8 @@ export async function* runAgent(
     onTerminal?: (task: AgentTask) => void;
     /** Called once when the task flips to running (registry.spawn injects `notifyTaskStart`). */
     onStart?: (task: AgentTask) => void;
+    /** AGENT-STEER — continue `task.messages` as they are (registry.resume appended the new user message). */
+    resume?: boolean;
   },
 ): AsyncGenerator<AgentEvent, void, unknown> {
   const queue = new AsyncEventQueue<AgentEvent>();
@@ -481,7 +490,7 @@ export async function* runAgent(
   // Build history on the task so callers can inspect it after the run.
   // PFC-S1 P5: pass task.cwd so the slim-context notice (when
   // omitInheritedContext) can name the child's working directory.
-  task.messages = buildAgentMessages(
+  if (!opts.resume) task.messages = buildAgentMessages(
     task.definition,
     task.prompt,
     opts.systemPromptPrefix,
@@ -542,6 +551,8 @@ export async function* runAgent(
     },
     {
       model: modelResolution.model,
+      // AGENT-STEER — parent corrections join right before the child's next model request.
+      drainPendingUserInput: () => drainSteerLogged(task, 'mid-run'),
       tools,
       signal: task.controller.signal,
       provider: opts.provider,
@@ -552,7 +563,18 @@ export async function* runAgent(
       requestSizeGuard: createRequestSizeGuard({ compactOptions: () => ({ sessionId: task.id, ...(modelResolution.model ? { activeModelId: modelResolution.model } : {}) }) }),
     },
   );
-  const runPromise = runEncapsulated(task, runOnce, stepBuffer);
+  // AGENT-STEER — a correction that arrived during the child's last request (no further request to drain it)
+  // becomes one more step instead of being lost: the old answer is superseded by the latest instruction.
+  const runPromise = (async () => {
+    let text = await runEncapsulated(task, runOnce, stepBuffer);
+    while (!task.controller.signal.aborted && hasAgentSteer(task.id)) {
+      const message = buildInterjectionMessage(drainSteerLogged(task, 'after-step'), 'mid-turn');
+      if (!message) break;
+      task.messages.push({ role: 'user', content: message });
+      text = await runEncapsulated(task, runOnce, stepBuffer);
+    }
+    return text;
+  })();
 
   runPromise.then(
     (text) => {

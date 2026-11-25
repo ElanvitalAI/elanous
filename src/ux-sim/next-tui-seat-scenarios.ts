@@ -259,13 +259,14 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
           args: {
             description: 'Next TUI child tool inheritance check',
             prompt: '파일 하나 읽어라',
+            reason: 'child tool inheritance check',
             tool_filter: { allow: ['read_file', 'shell', 'grep_search'] },
           },
         }),
       },
       steps: [
         { label: 'agent dispatch', text: '서브에이전트로 확인해줘', until: (screen) => screen.includes(reply)
-          && (screen.includes('✓ sub-agents · done 1') || /✓ Agent\(/.test(screen)) && isSettledNextTuiScreen(screen) && screen.includes('❯ '), timeoutMs: 90_000 },
+          && (screen.includes('✓ sub-agents · done 1') || /✓ (?:Agent\(|🤖 )/u.test(screen)) && isSettledNextTuiScreen(screen) && screen.includes('❯ '), timeoutMs: 90_000 },
       ],
     });
     const captured = readFileSync(capture).subarray(captureOffset).toString('utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as {

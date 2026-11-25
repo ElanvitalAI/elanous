@@ -37,7 +37,7 @@ test('while ON the decision-autonomy paragraph and the goals ride the volatile c
   const text = on.volatile.join('\n');
   expect(text).toContain('## 🚗 자율주행 켜짐 · 목표: 0.3.35 개발');
   expect(text).toContain('사람에게는 돈·보안 사고·되돌릴 수 없는 행동·방향 결정만 결정 카드(decisions raise)로 올린다.');
-  expect(text).toContain('- [mid] AI&B 데모 · 기한 없음');
+  expect(text).toContain('- [mid] AI&B 데모 · no due date');
   expect(on.stable ?? '').not.toContain('자율주행 켜짐');
   writeFileSync(file, JSON.stringify({ v: 1, on: false, turns: [] }));
   const off = buildReplSystemPromptParts({ cfg, enabledToolNames: undefined, cwd: '/workspace/user', seatBootDeps: { home, env: {} } });

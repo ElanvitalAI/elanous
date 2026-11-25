@@ -321,6 +321,79 @@ export function registerSeatBootCommands(command: Command, options: { home?: () 
       if (agent !== undefined) sections.push(...collectSeatLadderSections(seat, agent as SeatAgent, { home, repoRoot: options.repoRoot?.() ?? fileURLToPath(new URL('../../', import.meta.url)), now: options.now?.() ?? new Date() }));
       console.log(renderSeatBootCard(seat as SeatRole, sections, facts, contextUpdated));
     });
+  // AUTOPILOT-GOAL-CLEARING — another seat marks a seat's goal done: one structured mail (`goal-done:<ref>` ref + body
+  // token). The receiving seat's autopilot clears the matching goal (`by:"mail"`). <goalRef> = goal id · `current` ·
+  // a ≥4-char piece of the goal text.
+  command.command('goal-done <seat> <goalRef>').description("Mark another seat's autopilot goal / pin done (posts a goal-done mail)")
+    .requiredOption('--reason <text>', 'one line: what finished it (file · PR · mail)')
+    .option('--from <seat>', 'sending seat (default: this directory\'s seat)')
+    .action(async (rawSeat: string, goalRef: string, flags: { reason: string; from?: string }) => {
+      const { resolveSeatId } = await import('../tui/seat-mail-boot.js');
+      const from = (flags.from ?? resolveSeatId(process.cwd()) ?? '').trim().toUpperCase();
+      if (!from) { console.error('seat goal-done: no sending seat — pass --from <seat>'); process.exitCode = 2; return; }
+      const { goalDoneMail } = await import('../session-autopilot/goal-clearing.js');
+      const { MsgStore } = await import('../msg/msg-store.js');
+      const store = new MsgStore(options.msgPath?.() ?? defaultMsgStorePath());
+      try {
+        const posted = store.post(goalDoneMail({ from, to: rawSeat.trim().toUpperCase(), goalRef: goalRef.trim(), reason: flags.reason }));
+        console.log(`goal-done mail #${posted.id} → ${posted.to}: ${posted.body}`);
+      } finally { store.close(); }
+    });
+  // OP-HANDLES-L2b (TRACE-OP-RESOURCE-OPTIMIZATION-1125): one-step assignment — owner ⊕ structured mail ⊕ idle wake,
+  // with the writer check built in (refuses only when another seat's live PR holds the cell's paths).
+  // FEDERATION HAND POOL (대표 11-25 [B]) — the derived pool view: hands, home scope, idle | working(scope, cell), close candidates.
+  command.command('pool').description('The federation hand pool: each hand\'s home scope and state (idle | working(scope, cell)) · idle > N h = close candidate · judge hands excluded')
+    .option('--json', 'print the pool as JSON')
+    .action(async (flags: { json?: boolean }) => {
+      const { liveHandPool } = await import('../seat/hand-pool-live.js');
+      const { handPoolBoardLine, handPoolLines } = await import('../seat/hand-pool.js');
+      const pool = await liveHandPool();
+      const now = Date.now();
+      if (flags.json) console.log(JSON.stringify(pool));
+      else for (const line of [...handPoolLines(pool, now), handPoolBoardLine(pool, now)]) console.log(line);
+    });
+  // SPACE-LEAD-HUMAN (대표 11-25 [A②]) — which spaces a person leads (config federation.humanLead · default off).
+  command.command('lead').description('Space leads: which spaces a person leads (✋ go to their Telegram/PWA card · 60 min escalation) · switch: eln config set federation.humanLead.enabled true')
+    .option('--json', 'print as JSON')
+    .action(async (flags: { json?: boolean }) => {
+      const { liveHumanLeads } = await import('../seat/space-lead-live.js');
+      const leads = [...liveHumanLeads().values()];
+      if (flags.json) { console.log(JSON.stringify(leads)); return; }
+      if (!leads.length) { console.log('human lead mode: off (every space lead is a tab) — turn on: eln config set federation.humanLead.enabled true'); return; }
+      for (const lead of leads) console.log(`${lead.coordinator}: human lead ${lead.who} · escalates after ${Math.round(lead.escalateAfterMs / 60_000)}m · channel = decision cards (Telegram / PWA)`);
+    });
+  command.command('assign <seat> <cellId>').description('Assign a checklist cell to a hand seat (or POOL = borrow the longest-idle hand): owner + assignment mail (+30m due) + idle wake · built-in writer check')
+    .option('--why <line>', 'one line: why this seat, why now')
+    .option('--from <seat>', 'assigning coordinator seat (default: ELANOUS_TRACK, then this directory\'s seat)')
+    .option('--version <v>', 'release checklist version (default: the dev version)')
+    .option('--json', 'print the result as JSON')
+    .option('--p0', 'P0/demo push past a live scope 행정관 (otherwise hands pull with `eln work next`)')
+    .option('--steward', 'internal: the scope 행정관 itself (it already holds the shared wake claim)')
+    .action(async (rawSeat: string, cellId: string, flags: { why?: string; from?: string; version?: string; json?: boolean; p0?: boolean; steward?: boolean }) => {
+      const { resolveSeatId } = await import('../tui/seat-mail-boot.js');
+      const actor = (flags.from ?? process.env.ELANOUS_TRACK ?? resolveSeatId(process.cwd()) ?? '').trim().toUpperCase();
+      const { seatAssign } = await import('../seat/seat-assign.js');
+      const { liveSeatAssignDeps } = await import('../seat/seat-assign-live.js');
+      const result = await seatAssign({ seat: rawSeat, cellId, actor, ...(flags.why ? { why: flags.why } : {}), ...(flags.version ? { version: flags.version } : {}),
+        ...(flags.p0 ? { p0: true } : {}), ...(flags.steward ? { steward: true } : {}) }, liveSeatAssignDeps());
+      if (flags.json) console.log(JSON.stringify(result));
+      else if (result.ok) for (const line of result.lines) console.log(line);
+      else console.error(result.reason);
+      if (!result.ok) process.exitCode = result.code === 'live-writer' || result.code === 'pool-empty' ? 1 : 2;
+    });
+  command.command('wake-claim <seat>').description('Shared wake ledger: claim the 20-min wake window for a seat (any waker — steward · assign · idle-nudge · coach) · exit 5 = already woken · exit 6 = 2 wakes unanswered (raise ✋ instead)')
+    .requiredOption('--by <who>', 'the waker (seat or script name)')
+    .option('--cell <id>', 'the cell the wake is about')
+    .action(async (seat: string, flags: { by: string; cell?: string }) => {
+      const { claimSeatWake, defaultWakeLedgerPath } = await import('../seat/wake-ledger.js');
+      const { lastTurnAt } = await import('../msg/diverted-mail.js');
+      let last: number | null = null;
+      try { last = lastTurnAt(seat); } catch { last = null; }
+      const claim = claimSeatWake(defaultWakeLedgerPath(), { seat, by: flags.by, ...(flags.cell ? { cell: flags.cell } : {}), atMs: Date.now(), ...(last === null ? {} : { lastActivityMs: last }) });
+      console.log(claim.ok ? `wake claimed: ${seat.toUpperCase()} by ${flags.by}` : claim.line);
+      // RAIL30 ⑤ — exit 6 = the seat ignored 2 wakes for this cause: raise one ✋ (first refusal only), do not wake.
+      process.exitCode = claim.ok ? 0 : claim.unanswered ? 6 : 5;
+    });
   command.command('close <seat>').description('닫기 전 몫 목록을 보이고, 받는 자리가 없으면 거부한다')
     .option('--handoff-to <seat>', '몫을 받을 등록된 자리')
     .option('--force', '받는 자리 없이 닫기. 사유 필수')

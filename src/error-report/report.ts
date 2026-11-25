@@ -102,10 +102,10 @@ export function buildErrorReport(input: ErrorReportInput, ctx: { installId: stri
 
 /** First-run notice: says what is actually sent — identity fields go along only when errorReports.identity is on. */
 export function errorReportNoticeLine(config: { identity?: boolean; email?: string; telegramUser?: string } | undefined): string {
-  const fields = [config?.email ? '이메일' : '', config?.telegramUser ? '텔레그램 사용자' : ''].filter(Boolean).join('·');
+  const fields = [config?.email ? 'email' : '', config?.telegramUser ? 'Telegram user' : ''].filter(Boolean).join(' · ');
   // Mirrors buildErrorReport: a field goes along only when identity is on AND the field is set.
-  const who = config?.identity === true && fields ? `진단과 함께 설정된 신원(${fields})을` : '익명 진단을';
-  return `오류 보고 안내: 오류 발생 시 ${who} 운영팀에 전송합니다. 끄려면 \`elanous config set errorReports.enabled false\`.`;
+  const who = config?.identity === true && fields ? `a diagnostic with your configured identity (${fields})` : 'an anonymous diagnostic';
+  return `Error reports: when an error happens, ${who} is sent to the elanous team. Turn off: \`elanous config set errorReports.enabled false\`.`;
 }
 
 function defaultSettings(): ErrorReportSettings {

@@ -31,6 +31,15 @@ export interface SeatMemoryToolContext {
   jevDeps?: MemoryJevDeps;
   mode?: MemoryWriteGateMode;
   now?: () => Date;
+  /** ANNOUNCE-UPTAKE — records the «memory» event for an announce (explicit id or same-turn window). Default: the msg ledger. */
+  recordAnnounceMemory?: (input: { seat: string; file: string; announceId?: string }) => Promise<string[]> | string[];
+}
+
+/** Default announce-memory port: the seat-mail ledger (loaded lazily so the seat tools never pull sqlite at boot). */
+async function recordAnnounceMemoryInLedger(input: { seat: string; file: string; announceId?: string }): Promise<string[]> {
+  const [{ openMsgStore }, { recordAnnounceMemory }] = await Promise.all([import('../msg/msg-store.js'), import('../msg/announce.js')]);
+  const store = openMsgStore();
+  try { return recordAnnounceMemory(store.db, input); } finally { store.close(); }
 }
 
 export const SEAT_MEMORY_TOOL_NAMES = ['memory_save', 'memory_delete', 'memory_search'] as const;
@@ -54,6 +63,7 @@ export const SEAT_MEMORY_SAVE_SPEC: LLMToolSpec = {
       kind: { type: 'string', enum: [...MEMORY_KINDS], description: '교정 · 확인된 방법 · 사실 · 약속' },
       scope: { type: 'string', enum: [...MEMORY_SCOPES], description: 'seat(이 자리) · role(같은 역할) · project · global' },
       reason: { type: 'string', description: '(선택) 왜 남기나 한 줄 — 없으면 description 을 쓴다.' },
+      announce_id: { type: 'string', description: '(선택) 연방 공지(announce)를 받아 행동을 바꾼 기억이면 그 announce_id.' },
     },
     required: ['name', 'description', 'type', 'body', 'kind', 'scope'],
   },
@@ -115,6 +125,12 @@ async function dispatchSeatMemorySave(args: Record<string, unknown>, ctx: SeatMe
     ...(ctx.mode ? { mode: ctx.mode } : {}), ...(ctx.now ? { now: ctx.now() } : {}),
   });
   if (!r.ok) return { saved: false, error: r.error, ...(r.code ? { code: r.code } : {}) };
+  // ANNOUNCE-UPTAKE — a saved memory counts for the named announce and any announce in this turn's window. Fail-open.
+  {
+    const announceId = text(args.announce_id) || undefined;
+    try { await (ctx.recordAnnounceMemory ?? recordAnnounceMemoryInLedger)({ seat: ctx.seat, file: r.file, ...(announceId ? { announceId } : {}) }); }
+    catch { /* uptake observation never fails a memory write */ }
+  }
   if (r.action === 'deduped') return { saved: true, action: r.action, name: r.name, file: r.file, count: r.count, seat: ctx.seat };
   if (r.action === 'superseded') return { saved: true, action: r.action, name: r.name, file: r.file, count: r.count, supersedes: r.supersedes, seat: ctx.seat };
   return { saved: true, action: r.action, name: r.name, file: r.file, seat: ctx.seat };

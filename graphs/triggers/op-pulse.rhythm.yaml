@@ -1,0 +1,86 @@
+# OP-PULSE rhythm table — phase → rhythm (cadence · targets · levers · beat). Read by graphs/triggers/op-pulse.yaml
+# (src/loops/op-pulse.ts parseRhythm · op-pulse-burst.ts parseBurstConfig). Missing fields fall back to code defaults.
+#
+# Human-readable source (each row's `source` cites it):
+#   내부 문서 `FEATURE-SHIP-ACCELERATION` §10 «국면별 리듬» · §11 «버스트 모드»  (targets from §1a: 착지 20/h · 초록 10/h)
+#   내부 문서 `JUDGE-LOAD-REDUCTION` «국면별 리듬 — 판정 쪽» · «버스트 모드 — 판정 차선» (판정 대기 중앙값 ≤ 30분 · §지표)
+# OP may PROPOSE edits to this table in a pulse turn as a cell/PR — never edit it live.
+
+detection:
+  pre_cut_hours: 4             # FEATURE-SHIP-ACCELERATION §10 — T−4h hard rehearsal → cut
+  release_after_publish_min: 30
+  post_release_hours: 2        # migration / host refresh after publish
+  night: { from: 1, to: 6 }    # local hours, low traffic
+  freezes:
+    - { from: '2026-11-26T05:00:00Z', to: '2026-11-26T11:00:00Z', label: 'AI&B demo 11-26 14:00–20:00 KST' }
+
+phases:
+  - phase: build
+    cadence_min: 60
+    targets: { landed_per_h: 20, green_per_h: 10, judge_wait_median_min: 30, idle_with_work_max: 3, ready_per_hand: 2 }
+    levers: [reprioritize, lend-hands, judge-relief, vm-ask, burst-propose]
+    new_work: true
+    beat: '<리더> — 다음 1시간 <스페이스> 착지 N · 초록 M · 병목 <하나> → 조치 <손잡이> · 기한 <HH:MM>'
+    source: 'docs/conductor/FEATURE-SHIP-ACCELERATION.md#10-국면별-리듬'
+  - phase: pre-cut
+    cadence_min: 30
+    targets: { landed_per_h: 20, green_per_h: 10, judge_wait_median_min: 20, idle_with_work_max: 2, ready_per_hand: 1 }
+    levers: [reprioritize, lend-hands, judge-relief, burst-propose]
+    new_work: true
+    beat: '<리더> — 컷 <HH:MM> 까지 로스터 칸 <목록> 착지·초록 · 새 칸 열지 않음 · 막히면 엣지 FU 로 떼고 핵심만'
+    source: 'docs/conductor/FEATURE-SHIP-ACCELERATION.md#10-국면별-리듬'
+  - phase: release-window
+    cadence_min: 15
+    targets: { landed_per_h: null, green_per_h: null, judge_wait_median_min: null, idle_with_work_max: null, ready_per_hand: null }
+    levers: [status-only]
+    new_work: false
+    beat: '<리더> — 발행 창(컷→공개+30분): 새 일 0 · 발행 결함만 · 현황 한 줄'
+    source: 'docs/conductor/FEATURE-SHIP-ACCELERATION.md#10-국면별-리듬'
+  - phase: post-release
+    cadence_min: 30
+    targets: { landed_per_h: 10, green_per_h: 5, judge_wait_median_min: 30, idle_with_work_max: 3, ready_per_hand: 2 }
+    levers: [reprioritize, lend-hands, judge-relief]
+    new_work: true
+    beat: '<리더> — 발행 뒤 이주: 호스트 갱신·회귀 먼저 · 다음 판 로스터 첫 칸 당기기 · 기한 <HH:MM>'
+    source: 'docs/conductor/FEATURE-SHIP-ACCELERATION.md#10-국면별-리듬'
+  - phase: demo-freeze
+    cadence_min: 30
+    targets: { landed_per_h: null, green_per_h: null, judge_wait_median_min: 30, idle_with_work_max: null, ready_per_hand: null }
+    levers: [defect-only, judge-relief]
+    new_work: false
+    beat: '<리더> — 데모 동결: 데모 결함 수리만 · 새 기능 칸 금지 · 수리 PR 은 판정 우선 줄'
+    source: 'docs/conductor/JUDGE-LOAD-REDUCTION.md#국면별-리듬--판정-쪽'
+  - phase: night
+    cadence_min: 90
+    targets: { landed_per_h: 8, green_per_h: 4, judge_wait_median_min: 45, idle_with_work_max: 4, ready_per_hand: 1 }
+    levers: [reprioritize, lend-hands]
+    new_work: true
+    beat: '<리더> — 야간: 긴 시험·묶음 착지·draft 수확 · 아침 <HH:MM> 까지 N'
+    source: 'docs/conductor/FEATURE-SHIP-ACCELERATION.md#10-국면별-리듬'
+  - phase: burst
+    cadence_min: 15
+    targets: { landed_per_h: 30, green_per_h: 15, judge_wait_median_min: 20, idle_with_work_max: 1, ready_per_hand: 2 }
+    levers: [reprioritize, lend-hands, judge-relief, vm-ask]
+    new_work: true
+    beat: '<리더> — 버스트 <id>(<계기>) <until> 까지: <스페이스> 손 +k · 칸 <목록> · 15분마다 재예측 · 끝나면 탭 반납'
+    source: 'docs/conductor/FEATURE-SHIP-ACCELERATION.md#11-버스트-모드'
+
+# Burst — pressure → per-lane scale (FEATURE-SHIP-ACCELERATION §11 · JUDGE-LOAD-REDUCTION «버스트 모드 — 판정 차선»).
+# Rules: LOCAL FIRST (local tabs → local slots → LAN node-b/minim5/node-c → paid cloud last) · FRONT-TO-BACK one step per
+# cooldown, back-pressure aware · ANTICIPATE by lead time. up_at/down_at = pressure ratio (1 = on target), hysteresis.
+burst:
+  cloud_budget_usd: 0          # burst.cloudBudget — 0 = every VM step is a CEO card
+  lanes:
+    #        min max step cooldown up   down  $/unit·h   actuator (wired = an existing command; TODO otherwise)
+    hands:   { min: 0, max: 8, step: 2, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 1.5 }  # els new --ws <space> (wired) · close: els close <pane>
+    ta:      { min: 0, max: 6, step: 2, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 2 }    # eln harness ask 내부 문서 `<ASK>` (wired · burst scope only)
+    remote:  { min: 0, max: 6, step: 2, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 1.5 }  # els new on node-b/minim5/node-c (TODO: remote placement per RES caps)
+    review:  { min: 0, max: 4, step: 1, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 1 }    # eln self review <PR> --model gpt-6.1-terra (wired · one per PR)
+    pregate: { min: 0, max: 4, step: 1, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 0 }    # TODO: burst-only slot override within proven caps (minim5 4 · node-b 5 · node-c 2 · mbp 2)
+    judge:   { min: 0, max: 3, step: 1, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 1 }    # TODO: borrow judge hands (JUD coordinator beat)
+    land:    { min: 0, max: 3, step: 1, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 0 }    # TODO: train width / land slots
+    vm:      { min: 0, max: 2, step: 1, cooldown_min: 30, up_at: 2, down_at: 1, cost_per_unit_hour_usd: 3 }          # eln hosts start <host> (wired · start only) · stop: TODO (no `hosts stop` yet → exit lists the VM)
+  presets:
+    - { name: 2h, hours: 2, rate_gain: 1.5, budget_usd: 30, lanes: { hands: 2, ta: 2, remote: 2, review: 1, pregate: 1 } }
+    - { name: 4h, hours: 4, rate_gain: 2, budget_usd: 80, lanes: { hands: 4, ta: 4, remote: 4, review: 2, pregate: 2, judge: 1, land: 1 } }
+    - { name: 8h, hours: 8, rate_gain: 2.5, budget_usd: 200, lanes: { hands: 8, ta: 6, remote: 6, review: 4, pregate: 4, judge: 2, land: 2 } }

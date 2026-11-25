@@ -22,6 +22,8 @@ export interface UpdateSeatRow {
   readonly kind: string;
   readonly sessionId: string;
   readonly workdir?: string;
+  /** Registration time. An in-place execve restart keeps the pid but re-registers with a newer startedAt. */
+  readonly startedAt?: number;
   readonly build?: { readonly sha: string; readonly source: string };
 }
 
@@ -147,7 +149,7 @@ export async function updateAllElsTabs(deps: UpdateAllDeps): Promise<{ ok: boole
   const rows: UpdateResultRow[] = [];
   const verifiedElnRows = new Set<number>();
   let requested = 0; let requestedKnown = true;
-  const pending = new Map<string, { oldPid: number; sessionId: string; cwd: string; rowIndexes: number[] }>();
+  const pending = new Map<string, { oldPid: number; oldStartedAt?: number; oldBuild: string; sessionId: string; cwd: string; rowIndexes: number[] }>();
   const seen = new Map<string, { expected: SeatControlExpected; request: { status: string; reason?: string } }>();
   for (const pane of listing.panes) {
     if (!pane || typeof pane.address !== 'string' || typeof pane.host !== 'string' || typeof pane.reach !== 'string' || typeof pane.state !== 'string' || typeof pane.cwd !== 'string')
@@ -240,14 +242,17 @@ export async function updateAllElsTabs(deps: UpdateAllDeps): Promise<{ ok: boole
     rows.push({ tab: pane.address, seat, result: 'waiting', detail: 'turn boundary or restart pending' });
     const item = pending.get(seat);
     if (item) item.rowIndexes.push(index);
-    else pending.set(seat, { oldPid: old.ownerPid, sessionId: old.sessionId, cwd: pane.cwd, rowIndexes: [index] });
+    else pending.set(seat, { oldPid: old.ownerPid, oldStartedAt: old.startedAt, oldBuild: old.build?.sha ?? 'unknown', sessionId: old.sessionId, cwd: pane.cwd, rowIndexes: [index] });
   };
   // OP and its acting seat are never down together: OP waits until the acting seat's own migration is verified.
   const deferredOp: UpdatePane[] = [];
   for (const pane of listing.panes) {
     if (deps.baton && pane.seat === 'OP' && pane.reach === 'local' && pane.state !== 'exited'
       && !['codex', 'claude', 'grok', 'shell'].includes(pane.kind ?? '')) { deferredOp.push(pane); continue; }
+    const before = rows.length;
     await requestPane(pane);
+    for (const row of rows.slice(before)) if (row.result === 'failed' || row.result === 'skipped')
+      deps.progress?.(`Seat ${row.result === 'failed' ? 'fail' : 'skipped'}: ${safe(row.seat || '-')} · ${safe(row.tab)} (${safe(row.detail)})`);
   }
   const skipOp = async (why: string): Promise<void> => {
     for (const pane of deferredOp.splice(0)) rows.push({ tab: pane.address, seat: 'OP', result: 'waiting', detail: `OP not restarted this wave: ${why}` });
@@ -287,7 +292,11 @@ export async function updateAllElsTabs(deps: UpdateAllDeps): Promise<{ ok: boole
       const candidates = current.filter(row => row.kind === 'tui' && row.alive && row.seat === seat && row.workdir === wait.cwd);
       if (candidates.length !== 1) continue;
       const next = candidates[0]!;
-      if (next.ownerPid === wait.oldPid || next.sessionId !== wait.sessionId || next.build?.source !== 'installed'
+      // ELS-UPDATE-ALL-REMAINING-STUCK: exec-in-place restarts keep the pid (src/tui/exec-in-place.ts), so a
+      // same-pid row counts as restarted when it re-registered later than the row the request was made against.
+      const restarted = next.ownerPid !== wait.oldPid
+        || (wait.oldStartedAt !== undefined && next.startedAt !== undefined && next.startedAt > wait.oldStartedAt);
+      if (!restarted || next.sessionId !== wait.sessionId || next.build?.source !== 'installed'
         || next.build.sha.toLowerCase() !== desired.toLowerCase()) continue;
       let detail = desired.slice(0, 12);
       if (seat === 'OP' && deps.baton) {
@@ -296,6 +305,7 @@ export async function updateAllElsTabs(deps: UpdateAllDeps): Promise<{ ok: boole
         detail += back ? ' · baton returned' : ' · baton return pending';
       }
       for (const index of wait.rowIndexes) rows[index] = { ...rows[index]!, result: 'updated', detail };
+      deps.progress?.(`Seat done: ${safe(seat)} · ${safe(wait.oldBuild.slice(0, 12))}→${desired.slice(0, 12)}`);
       pending.delete(seat);
     }
     if (deferredOp.length) await startOp(current);
@@ -305,6 +315,7 @@ export async function updateAllElsTabs(deps: UpdateAllDeps): Promise<{ ok: boole
       nextProgress = now + 30_000;
     }
   }
+  if (pending.size) deps.progress?.(`Stragglers at deadline: ${[...pending].map(([seat, wait]) => `${safe(seat)} (still ${safe(wait.oldBuild.slice(0, 12))})`).join(', ')}`);
   for (const wait of pending.values()) for (const index of wait.rowIndexes)
     rows[index] = { ...rows[index]!, result: 'waiting', detail: 'deadline; turn or restart unverified' };
   if (deferredOp.length) await skipOp('acting-unhealthy (deadline before the acting seat was verified)');
@@ -319,7 +330,8 @@ export async function updateAllElsTabs(deps: UpdateAllDeps): Promise<{ ok: boole
       rows[index] = { ...rows[index]!, result: 'failed', detail: 'desired or installed build changed during migration' };
   }
   return { ok: !targetChanged && (rows.some(row => row.result === 'updated') || (!!deps.localOnly && rows.every(row => row.result === 'skipped')))
-    && rows.every(row => row.result === 'updated' || row.result === 'skipped')
+    // A straggler still waiting at the deadline is listed, not a failure; only a failed seat makes the run fail.
+    && rows.every(row => row.result !== 'failed')
     && rows.every(row => !row.tab.endsWith(':*') || row.result === 'updated'), rows, ...(requestedKnown ? { requested } : {}),
     ...(targetChanged ? { reason: 'desired-build-changed' } : rows.length === 0 ? { reason: 'no-tabs' } : {}) };
 }

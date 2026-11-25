@@ -832,13 +832,14 @@ describe('LLM 도구', () => {
     const duplicateA = await host.dispatchTool('ScheduleWakeup', malformed);
     expect(duplicateA).toMatchObject({ ok: true, result: { error: expect.stringContaining('같은 충돌 인자의 재시도는 억제했다') } });
 
-    for (const at of [11, 12]) {
+    // 턴 상한 12 — 앞의 4회(first·corrected·firstB·duplicateA)에 다른 충돌 8회를 더해 예산을 채운다.
+    for (const at of [11, 12, 13, 15, 16, 17, 18, 19]) {
       const conflict = await host.dispatchTool('ScheduleWakeup', { at, delaySeconds: 60, reason: '다른 충돌' });
       expect(conflict).toMatchObject({ ok: true, result: { error: expect.stringContaining('at 과 delaySeconds 는 둘 중 하나만') } });
     }
     const capped = await host.dispatchTool('ScheduleWakeup', { at: 14, delaySeconds: 60, reason: '상한 확인' });
-    expect(capped).toMatchObject({ ok: true, result: { error: expect.stringContaining(`${WAKEUP_MAX_CALLS_PER_TURN}회 상한`) } });
-    expect(logs.filter((row) => row.event === 'rejected')).toHaveLength(4);
+    expect(capped).toMatchObject({ ok: true, result: { error: expect.stringContaining('12회 상한') } });
+    expect(logs.filter((row) => row.event === 'rejected')).toHaveLength(10);
     expect(logs.filter((row) => row.event === 'loop-capped')).toHaveLength(1);
 
     turn = 'human-2';
@@ -848,7 +849,7 @@ describe('LLM 도구', () => {
     expect(nextTurnError).not.toContain('재시도는 억제했다');
     const afterTurn = await host.dispatchTool('ScheduleWakeup', { delaySeconds: 60, reason: '다음 턴 예약' });
     expect(afterTurn).toMatchObject({ ok: true, result: { scheduled: { id: 'w2' } } });
-    expect(logs.filter((row) => row.event === 'rejected')).toHaveLength(5);
+    expect(logs.filter((row) => row.event === 'rejected')).toHaveLength(11);
     scheduler.dispose();
   });
 
@@ -875,7 +876,13 @@ describe('LLM 도구', () => {
       mock.on({ userMessage: prompt, toolCallId: 'wakeup-conflict-duplicate-a-again' }, {
         toolCalls: [{ id: 'wakeup-conflict-3', name: 'ScheduleWakeup', arguments: JSON.stringify({ at: 11, delaySeconds: 60, reason: '다른 충돌 3' }) }],
       });
-      mock.on({ userMessage: prompt, toolCallId: 'wakeup-conflict-3' }, {
+      // 턴 상한 12 — 다른 충돌 6회(4..9)를 더 끼워 13번째 호출이 상한에 걸리게 한다.
+      for (let n = 4; n <= 9; n += 1) {
+        mock.on({ userMessage: prompt, toolCallId: `wakeup-conflict-${n - 1}` }, {
+          toolCalls: [{ id: `wakeup-conflict-${n}`, name: 'ScheduleWakeup', arguments: JSON.stringify({ at: 10 + n, delaySeconds: 60, reason: `다른 충돌 ${n}` }) }],
+        });
+      }
+      mock.on({ userMessage: prompt, toolCallId: 'wakeup-conflict-9' }, {
         toolCalls: [{ id: 'wakeup-loop-capped', name: 'ScheduleWakeup', arguments: JSON.stringify({ at: 13, delaySeconds: 60, reason: '상한 호출' }) }],
       });
       mock.on({ userMessage: prompt, toolCallId: 'wakeup-loop-capped' }, { content: '교정된 예약이 한 번 등록됐고 추가 충돌은 턴 상한에서 멈췄습니다.' });
@@ -958,9 +965,13 @@ describe('LLM 도구', () => {
       expect(String(typedConflict?.data.error)).toContain('"delaySeconds":60');
       expect(decoded.filter((row) => row.event === 'scheduled' && row.data.reason === conflict.reason)).toHaveLength(1);
       expect(decoded.filter((row) => row.event === 'loop-capped')).toHaveLength(1);
-      expect(wakeupEvents.map((row) => row.event)).toEqual(['rejected', 'scheduled', 'rejected', 'rejected', 'loop-capped']);
+      expect(wakeupEvents.map((row) => row.event)).toEqual([
+        'rejected', 'scheduled', 'rejected', 'rejected',
+        'rejected', 'rejected', 'rejected', 'rejected', 'rejected', 'rejected',
+        'loop-capped',
+      ]);
       expect(JSON.stringify(mockSession.mock.getRequests())).toContain('at 을 빼고 delaySeconds 사용');
-      expect(mockSession.mock.getRequests().length).toBeGreaterThanOrEqual(8);
+      expect(mockSession.mock.getRequests().length).toBeGreaterThanOrEqual(14);
       process.stdout.write(`[tui.wakeup raw logs]\n${raw}`);
     } catch (error) {
       throw new Error(`${error instanceof Error ? error.message : String(error)}\nTUI screen:\n${await pty?.renderScreen()}\nAIMock requests=${JSON.stringify(mockSession.mock.getRequests())}`);
@@ -1008,5 +1019,79 @@ describe('ELN-SEAT-TURN-PACING — a minimum-interval refusal defers the wakeup 
     expect(r.calls).toHaveLength(2);
     expect(r.events()).toEqual(['scheduled:heartbeat', 'rejected:Cap', 'fired:heartbeat']);
     expect(r.lines.some(line => line.includes('놓침'))).toBe(false);
+  });
+});
+
+describe('SEAT-QUEUE-CAPACITY (CEO 11-25) — a bursty coordinator gets 20 wake slots and 12 calls per turn', () => {
+  test('20 pending wakeups are all kept; the 21st is refused with the cap 20', () => {
+    expect(WAKEUP_MAX_ENTRIES).toBe(20);
+    const r = rig();
+    for (let i = 0; i < 20; i++) expect(r.s.schedule({ delaySeconds: 120 + i, reason: `slot${i}` }).ok).toBe(true);
+    expect(r.s.list()).toHaveLength(20);
+    expect(r.s.list().map((entry) => entry.reason)).toEqual(Array.from({ length: 20 }, (_, i) => `slot${i}`));
+    const over = r.s.schedule({ delaySeconds: 600, reason: 'slot20' });
+    expect(over.ok).toBe(false);
+    expect(over.ok ? '' : over.error).toContain('상한 20');
+    expect(r.s.list()).toHaveLength(20);
+  });
+
+  test('12 schedule calls in one turn all pass; the 13th is turn-capped', () => {
+    expect(WAKEUP_MAX_CALLS_PER_TURN).toBe(12);
+    const clock = fakeClock();
+    const s = createWakeupScheduler({
+      startTurnIfIdle: () => ({ opened: true, turnId: 'auto-1' }),
+      now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+      log: () => {},
+      currentTurnId: () => 'human-1',
+    });
+    for (let i = 0; i < 12; i++) expect(s.schedule({ delaySeconds: 120 + i, reason: `call${i}` }).ok).toBe(true);
+    expect(s.list()).toHaveLength(12);
+    const capped = s.schedule({ delaySeconds: 600, reason: 'call12' });
+    expect(capped.ok).toBe(false);
+    expect(capped.ok ? '' : capped.error).toContain('다음 턴에');
+    expect(s.list()).toHaveLength(12);
+    s.dispose();
+  });
+});
+
+describe('WAKEUP-CAP-OVERDUE (OP 11-25 07:49) — past-due one-shots waiting for delivery do not block new wakeups', () => {
+  test('20 one-shots go past due while every turn is busy; a new wakeup is still accepted', () => {
+    const r = rig({ results: Array.from({ length: 200 }, () => ({ opened: false, reason: 'NotIdle' as const, detail: 'turn-running' })) });
+    for (let i = 0; i < 20; i++) expect(r.s.schedule({ delaySeconds: 60 + i, reason: `late${i}` }).ok).toBe(true);
+    r.clock.advance(120_000);
+    expect(r.s.list()).toHaveLength(20);
+    const fresh = r.s.schedule({ delaySeconds: 900, reason: 'follow-up 08:10' });
+    expect(fresh.ok).toBe(true);
+    expect(r.s.list()).toHaveLength(21);
+    expect(r.s.list().map(e => e.reason)).toContain('late0');
+    r.s.dispose();
+  });
+
+  test('20 upcoming wakeups still refuse the 21st, and the refusal names the past-due ids', () => {
+    const r = rig({ results: Array.from({ length: 200 }, () => ({ opened: false, reason: 'NotIdle' as const, detail: 'turn-running' })) });
+    for (let i = 0; i < 2; i++) expect(r.s.schedule({ delaySeconds: 60, reason: `old${i}` }).ok).toBe(true);
+    r.clock.advance(61_000);
+    for (let i = 0; i < 20; i++) expect(r.s.schedule({ delaySeconds: 600 + i, reason: `up${i}` }).ok).toBe(true);
+    const over = r.s.schedule({ delaySeconds: 900, reason: 'over' });
+    expect(over.ok).toBe(false);
+    const msg = over.ok ? '' : over.error;
+    expect(msg).toContain('예약 상한 20개');
+    expect(msg).toContain('앞으로 올 예약 20');
+    expect(msg).toContain('전체 22');
+    expect(msg).toContain('시각 지난 대기 2개(w1,w2)');
+    r.s.dispose();
+  });
+
+  test('past-due wakes never count toward the cap: 40 past due + a new one is accepted (WAKE-FOLD-IDEMPOTENT ②)', () => {
+    const r = rig({ results: Array.from({ length: 2000 }, () => ({ opened: false, reason: 'NotIdle' as const, detail: 'turn-running' })) });
+    for (let i = 0; i < 20; i++) expect(r.s.schedule({ delaySeconds: 60, reason: `a${i}` }).ok).toBe(true);
+    r.clock.advance(61_000);
+    for (let i = 0; i < 20; i++) expect(r.s.schedule({ delaySeconds: 60, reason: `b${i}` }).ok).toBe(true);
+    r.clock.advance(61_000);
+    expect(r.s.list()).toHaveLength(40);
+    const next = r.s.schedule({ delaySeconds: 300, reason: 'next' });
+    expect(next.ok).toBe(true);
+    expect(r.s.list()).toHaveLength(41);
+    r.s.dispose();
   });
 });

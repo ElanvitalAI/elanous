@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import type { UserConfig } from '../user-config/types.js';
 import type { CloudVmAdapter } from '../release-loop/cloud-vm-adapter.js';
 import { createCommandCloudVmAdapter } from '../release-loop/cloud-vm-adapter.js';
+import { shadowedCloudVm } from '../res-policy/auto-record.js';
 import { NODE_REGISTRY, type PodPoolMember, type PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
 import { ResourceLedger } from '../control-plane/ledger.js';
 import { debug } from '../debug/log.js';
@@ -98,9 +99,10 @@ export function installCloudBurstAuto(input: {
       .sort((a, b) => b.observedAt - a.observedAt)[0];
     const requestId = typeof existing?.attrs.requestId === 'string' ? existing.attrs.requestId : `pod-${config.host}-${Math.trunc(now)}`;
     observedRequestId = requestId;
-    const vm = input.cloudVm ?? createCommandCloudVmAdapter(input.cloudVmCommand!, undefined, {
+    // GUARDIAN-FINDINGS-VISIBLE: the real command adapter also writes a RES shadow pair per start/stop.
+    const vm = input.cloudVm ?? shadowedCloudVm(createCommandCloudVmAdapter(input.cloudVmCommand!, undefined, {
       reason: 'budgeted Pod federation capacity burst', source: 'fleet.cloudBurst',
-    });
+    }), 'fleet.cloud-burst');
     const member = reservedCloudBurstMember(config);
     const burstInput: CloudBurstAutoInput = { requestId, owner: config.owner, host: config.host, purpose: config.purpose,
       now, queueDepth: pressure.queueDepth, blockedCount: pressure.blockedCount, threshold: config.threshold,

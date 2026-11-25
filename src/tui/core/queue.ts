@@ -15,7 +15,7 @@ import {
   type NextTuiQueueNoticeSource,
   type NextTuiQueueMode,
   nextTuiQueueMode,
-  type NextTuiQueueItem, type NextTuiQueueMailSpan,
+  type NextTuiQueueItem, type NextTuiQueueMailSpan, type NextTuiQueueTriageMeta, type NextTuiQueueFoldedMail,
   type NextTuiPassiveResultSnapshot,
   type NextTuiQueueOp,
   NextTuiQueueConflictError,
@@ -36,6 +36,12 @@ const passiveResultSource = (source?: NextTuiQueueNoticeSource): boolean =>
  * and the idle door drains them all as one notice bundle (one turn). While a turn runs the idle door stays shut.
  */
 export const PASSIVE_RESULT_IDLE_WAKE_MS = 120_000;
+/**
+ * SEAT-REPLY-DELTA-ONLY ② ⊕ SEAT-MAIL-PASSIVE-DEFAULT — passive seat mail (P2) on an idle seat waits at most this long for
+ * its siblings: every passive mail that arrived inside the window rides ONE digest turn (or the next action turn, whichever
+ * comes first). 10 min (SIM-STEWARD-AB-1125): passive is now the default for status · notice · reply · routine request mail.
+ */
+export const INFO_MAIL_IDLE_BATCH_MS = 10 * 60_000;
 
 
 const defaultQueueLog: NextTuiQueueLog = (event, data) => debug.log('queue', event, data);
@@ -57,9 +63,12 @@ interface MutableItem {
   urgent?: boolean;
   mailClass?: 'P0' | 'P1' | 'P2';
   mailIntent?: string;
+  mailKind?: string;
   replyTo?: number;
   passive?: boolean;
   digest?: string; mail?: NextTuiQueueMailSpan;
+  triage?: NextTuiQueueTriageMeta;
+  foldedMail?: readonly NextTuiQueueFoldedMail[];
   occurredAt?: number;
   capsuleCount?: number;
   capsuleFailed?: number;
@@ -75,7 +84,7 @@ function snapshot(item: MutableItem): NextTuiQueueItem {
 
 /**
  * Consumption order at one boundary:
- *   1. kind — every `user` item before any `notice` (대표 addendum C);
+ *   1. kind — every `user` item before any `notice` (CEO addendum C);
  *   2. inside one kind — `steer` before `queue` (§6 invariant 1);
  *   3. inside one kind and delivery — ascending seq.
  */
@@ -100,6 +109,10 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
   /** SEAT-NOTICE-BUNDLE-DRAIN — the ONE guide item for cap-dropped notices, and how many were dropped since it (re)appeared. */
   let overflowNoticeId: string | null = null;
   let droppedNotices = 0;
+  /** 11-25 OP deaf: mail past the cap is FOLDED into the overflow digest (one line each), never dropped. */
+  let foldedMail: string[] = [];
+  /** BULK-TRIAGE — the structured fields of each folded mail (same order as foldedMail) for the triage card. */
+  let foldedTriage: NextTuiQueueFoldedMail[] = [];
   let interrupted = false;
   let interruptReason: NextTuiQueueInterruptReason = 'interrupt';
   let resumeReason: NextTuiQueueInterruptReason | undefined;
@@ -108,7 +121,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
 
   /** Waiting items in seq order (display / recall order); render reads `count` every frame, so it is kept, not scanned. */
   let waiting: MutableItem[] = [];
-  let capsulePending: { item: MutableItem; completions: Map<string, { text: string; failed: boolean }> } | null = null;
+  let capsulePending: { item: MutableItem; completions: Map<string, { text: string; failed: boolean }>; wake?: boolean } | null = null;
   /**
    * ELN-CAPSULE-RESULT-NO-REPEAT-REPORT (OP 0.3.34 P1-4) — capsule results already absorbed into their original
    * work item (mid-turn drain · carried-with-turn · delivered summary row). Closed cells never re-report: a replay
@@ -131,8 +144,15 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
   const ordered = (): MutableItem[] => [...waiting].sort(deliveryOrder);
   /** Passive rows join the automatic door once the oldest one has waited {@link PASSIVE_RESULT_IDLE_WAKE_MS}. */
   // SEAT-MAIL-COALESCE-NOTICE — an info seat mail (`passive`) waits like a passive result: no turn of its own.
-  const passiveItem = (item: MutableItem): boolean => passiveResultSource(item.source) || item.passive === true;
-  const passiveRipe = (): boolean => waiting.some((item) => passiveItem(item) && Date.now() - item.enqueuedAt >= PASSIVE_RESULT_IDLE_WAKE_MS);
+  // RUNSHELL-BG-ENDS-TURN — a promised-wake capsule (A2 shell detach) makes its summary row actionable at once.
+  const passiveItem = (item: MutableItem): boolean => (passiveResultSource(item.source) && !(capsulePending?.item === item && capsulePending.wake === true)) || item.passive === true;
+  const passiveWakeMs = (item: MutableItem): number => (passiveResultSource(item.source) ? PASSIVE_RESULT_IDLE_WAKE_MS : INFO_MAIL_IDLE_BATCH_MS);
+  /**
+   * PASSIVE-HOLD-WHILE-BUSY (대표 11-25 16:1x «Turn done · 📩 28 held · Queue 28» idle) — on a seat, passive mail is held
+   * only while a turn runs: once the seat is idle every waiting passive row is ripe (one digest turn at the next door).
+   */
+  let seatIdle = false;
+  const passiveRipe = (): boolean => waiting.some((item) => passiveItem(item) && (seatIdle || Date.now() - item.enqueuedAt >= passiveWakeMs(item)));
   const actionable = (): MutableItem[] => (passiveRipe() ? ordered() : ordered().filter((item) => !passiveItem(item)));
   const leave = (item: MutableItem): void => {
     waiting = waiting.filter((other) => other !== item);
@@ -177,12 +197,22 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
       const waitingNotices = waiting.filter((item) => item.status === 'queued' && item.kind === 'notice' && item.id !== overflowNoticeId);
       if (waitingNotices.length >= NEXT_TUI_NOTICE_CAP) {
         droppedNotices += 1;
+        // A real mail (seat-mail) keeps its content in the digest; a folded guide line only counts.
+        const fold = fields.source === 'seat-mail' ? [fields.text] : [];
+        const foldMeta: NextTuiQueueFoldedMail[] = fields.source === 'seat-mail' ? [{ ...(fields.msgId === undefined ? {} : { msgId: fields.msgId }),
+          ...(fields.replyTo === undefined ? {} : { replyTo: fields.replyTo }), ...(fields.triage ? { triage: fields.triage } : {}) }] : [];
         const overflow = overflowNoticeId === null ? undefined : byId.get(overflowNoticeId);
         if (overflow && overflow.status === 'queued') {
-          overflow.text = noticeOverflowGuideLine(droppedNotices);
-          log('notice-cap-overflow', { dropped: droppedNotices, kept: waitingNotices.length });
+          foldedMail.push(...fold);
+          foldedTriage.push(...foldMeta);
+          overflow.text = noticeOverflowDigest(droppedNotices, foldedMail);
+          overflow.foldedMail = [...foldedTriage];
+          log('notice-cap-overflow', { dropped: droppedNotices, kept: waitingNotices.length, folded: foldedMail.length });
+          log('notice-cap-folded', { folded: foldedMail.length, guide: overflow.id });
           return snapshot(overflow);
         }
+        foldedMail = fold;
+        foldedTriage = foldMeta;
         const seq = ++lastSeq;
         // OP #129667 ①(JUD-B #129661 원장 probe) — 가이드는 접힌 알림을 대표하는 한 줄일 뿐이다:
         // 우편의 msgId(원장 영수 키 · #38804 eventId 사슬)를 물려받지 않는다. 하이재크되면
@@ -191,7 +221,8 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
           kind: fields.kind,
           mode: fields.mode,
           delivery: fields.delivery,
-          text: noticeOverflowGuideLine(droppedNotices),
+          text: noticeOverflowDigest(droppedNotices, foldedMail),
+          foldedMail: [...foldedTriage],
           // OP #130302/#130531 합의 — 안내는 «seat-mail-guide» 별도 종류(msgId 없음 · poll당 1줄):
           // seat-mail 건수 셈에서 빺 — r1/r2 시험의 «안내=seat-mail» 단언은 이 종류 기준으로 갱신되었다(r4).
           source: 'seat-mail-guide',
@@ -205,7 +236,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
         overflowNoticeId = item.id;
         byId.set(item.id, item);
         waiting = [...waiting, item];
-        log('notice-cap-overflow', { dropped: droppedNotices, kept: waitingNotices.length, guide: item.id });
+        log('notice-cap-overflow', { dropped: droppedNotices, kept: waitingNotices.length, guide: item.id, folded: foldedMail.length });
         return snapshot(item);
       }
     }
@@ -263,7 +294,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
   };
 
   /**
-   * ELN-QUEUE-SUPERSEDE (§6 invariant 5, lowered by 대표): a new user item naming the same target as exactly one
+   * ELN-QUEUE-SUPERSEDE (§6 invariant 5, lowered by CEO): a new user item naming the same target as exactly one
    * waiting user item, with a correction word, is recorded as a replacement candidate — a hint, nothing else.
    * No status changes here (invariants 7·10); `delivered`/`cancelled`/`superseded` items are never candidates.
    */
@@ -276,6 +307,8 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
 
   return {
     get count(): number { return queued().length; },
+    /** PASSIVE-HOLD-WHILE-BUSY — a seat TUI reports idle/busy; idle makes every waiting passive row actionable. */
+    setSeatIdle(idle: boolean): void { seatIdle = idle; },
     /** Result-only notices are visible and open an automatic turn only after {@link PASSIVE_RESULT_IDLE_WAKE_MS}. */
     get autoDispatchCount(): number { return actionable().length; },
     get pendingTexts(): readonly string[] { return queued().map((item) => item.text); },
@@ -324,7 +357,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
      * A completion notice. It always waits behind user utterances and never steers the running turn:
      * seat mail that lands during a turn stays `queue` until the idle door opens the next turn.
      */
-    enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string; mailClass?: 'P0' | 'P1' | 'P2'; mailIntent?: string; replyTo?: number; mail?: NextTuiQueueMailSpan } = {}): NextTuiQueueItem {
+    enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string; mailClass?: 'P0' | 'P1' | 'P2'; mailIntent?: string; mailKind?: string; replyTo?: number; mail?: NextTuiQueueMailSpan; triage?: NextTuiQueueTriageMeta } = {}): NextTuiQueueItem {
       return accept({
         kind: 'notice',
         mode: 'chat',
@@ -335,13 +368,15 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
         ...(meta.urgent ? { urgent: true } : {}),
         ...(meta.mailClass === undefined ? {} : { mailClass: meta.mailClass }),
         ...(meta.mailIntent === undefined ? {} : { mailIntent: meta.mailIntent }),
+        ...(meta.mailKind === undefined ? {} : { mailKind: meta.mailKind }),
         ...(meta.replyTo === undefined ? {} : { replyTo: meta.replyTo }),
         ...(meta.passive ? { passive: true } : {}), ...(meta.digest === undefined ? {} : { digest: meta.digest }), ...(meta.mail ? { mail: meta.mail } : {}),
+        ...(meta.triage ? { triage: meta.triage } : {}),
         ...(meta.occurredAt === undefined ? {} : { occurredAt: meta.occurredAt }),
       });
     },
     /** Keep at most one queued capsule notice; the child notification drain owns the individual result bodies. */
-    enqueueCapsuleDoneNotice(text: string, capsuleId: string, status: string, occurredAt?: number): NextTuiQueueItem | null {
+    enqueueCapsuleDoneNotice(text: string, capsuleId: string, status: string, occurredAt?: number, wake?: boolean): NextTuiQueueItem | null {
       // ELN-CAPSULE-RESULT-NO-REPEAT-REPORT — a capsule result already absorbed into its original work item is a
       // closed cell: a replay (re-publish · reconnect) of the same capsule-done is not a new report.
       if (consumedCapsuleIds.has(capsuleId)) return null;
@@ -352,10 +387,15 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
         capsulePending = { item, completions: new Map() };
       }
       capsulePending.completions.set(capsuleId, { text, failed: status !== 'ok' });
+      // RUNSHELL-BG-ENDS-TURN (Terra MF1) — a promised wake merging into a passive row still needs its one knock.
+      const newlyWoken = wake === true && capsulePending.wake !== true;
+      if (wake === true) capsulePending.wake = true;
       refreshCapsuleSummary(capsulePending);
-      // Only the first completion needs a wake. Later arrivals update the same pending row.
-      return capsulePending.completions.size === 1 ? snapshot(capsulePending.item) : null;
+      // Only the first completion (or the first promised wake) needs a knock. Later arrivals update the same row.
+      return capsulePending.completions.size === 1 || newlyWoken ? snapshot(capsulePending.item) : null;
     },
+    /** AUTOPILOT-TASK-GOAL-PIN — the capsule's result was carried into a turn (or closed) — the pinned agent row may collapse. */
+    capsuleConsumed(capsuleId: string): boolean { return consumedCapsuleIds.has(capsuleId); },
     /** Mid-turn result delivery removes only that capsule from its pending summary. */
     removeCapsuleDoneNotice(capsuleId: string): boolean {
       const pending = capsulePending;
@@ -584,7 +624,10 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
           ...(item.passive ? { passive: true } : {}), ...(item.digest === undefined ? {} : { digest: item.digest }),
           ...(item.mailClass === undefined ? {} : { mailClass: item.mailClass }),
           ...(item.mailIntent === undefined ? {} : { mailIntent: item.mailIntent }),
+          ...(item.mailKind === undefined ? {} : { mailKind: item.mailKind }),
           ...(item.replyTo === undefined ? {} : { replyTo: item.replyTo }),
+          ...(item.triage ? { triage: item.triage } : {}),
+          ...(item.foldedMail?.length ? { foldedMail: item.foldedMail } : {}),
         })),
         remaining: queued().length,
       };
@@ -607,10 +650,19 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
   };
 }
 
-/** SEAT-NOTICE-BUNDLE-DRAIN — the ONE guide line for notices dropped at the cap (원장 안내 한 줄). */
-export const NEXT_TUI_NOTICE_CAP = 20;
+/** SEAT-NOTICE-BUNDLE-DRAIN — the ONE guide line for notices dropped at the cap (원장 안내 한 줄).
+ *  SEAT-QUEUE-CAPACITY (CEO 11-25): 20 → 100 — waiting notices drain as one bundle, so a burst of 20+ mails must not fold. */
+export const NEXT_TUI_NOTICE_CAP = 100;
 export function noticeOverflowGuideLine(dropped: number): string {
   return `[notice-overflow] 알림 상한 ${NEXT_TUI_NOTICE_CAP}을 넘어 ${dropped}건이 접혔습니다 — 원장에서 확인: eln msg list`;
+}
+/** 11-25 OP deaf — the guide line plus one line per folded mail (≤ 300 chars each): overflow folds, it never drops. */
+export function noticeOverflowDigest(dropped: number, folded: readonly string[]): string {
+  const lines = folded.map((text) => {
+    const flat = text.replace(/\s+/gu, ' ').trim();
+    return `- ${flat.length <= 300 ? flat : `${flat.slice(0, 300)}…`}`;
+  });
+  return [noticeOverflowGuideLine(dropped), ...lines].join('\n');
 }
 
 /** Status-line count of what waits for the running turn — empty when nothing waits. */

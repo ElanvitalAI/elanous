@@ -28,6 +28,38 @@ function isCompactionRewrite(shown: SerializedMessage, stored: SerializedMessage
   return stored.content.length < shown.content.length;
 }
 
+/** TUI-LONG-PASTE-SPIN (OP froze again 11-25 12:12 · `compact-display-kept {at:"message-block"}` every ~170 ms): every
+ *  store reload returns fresh row objects, so a merge handed the renderer a brand-new transcript each time and every
+ *  frame re-wrapped all 4.6k rows. A reloaded row that is the same as the row on screen keeps the on-screen object:
+ *  a reload of an unchanged store changes nothing, and only changed or new rows are drawn again. */
+function sameRow(shown: SerializedMessage, stored: SerializedMessage): boolean {
+  if (shown === stored) return true;
+  const a = shown as unknown as Record<string, unknown>;
+  const b = stored as unknown as Record<string, unknown>;
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  for (const key of keys) {
+    const left = a[key];
+    const right = b[key];
+    if (left === right) continue;
+    // Small structured fields (from · usage · attachments) compare by value; the big strings above compare by ===.
+    if (typeof left !== 'object' || typeof right !== 'object' || left === null || right === null) return false;
+    if (JSON.stringify(left) !== JSON.stringify(right)) return false;
+  }
+  return true;
+}
+
+/** `reloaded` with every row that equals a displayed row (same id · same fields) replaced by the displayed object. */
+export function reuseDisplayedRows(displayed: readonly SerializedMessage[], reloaded: readonly SerializedMessage[]): SerializedMessage[] {
+  if (displayed.length === 0) return [...reloaded];
+  const shown = new Map<string, SerializedMessage>();
+  for (const row of displayed) shown.set(transcriptRowId(row), row);
+  return reloaded.map((row) => {
+    const prior = shown.get(transcriptRowId(row));
+    return prior && sameRow(prior, row) ? prior : row;
+  });
+}
+
 /** Merge a reloaded (possibly compacted) store into the rows already on screen.
  *  - A displayed row still in the store takes the store's version, unless the store shortened its text
  *    (a compaction stub) — then the text the person read stays.
@@ -46,7 +78,7 @@ export function mergeDisplayAfterCompact(
     shownIds.add(rowId);
     const next = stored.get(rowId);
     if (!next) { keptMissing += 1; return row; }
-    return isCompactionRewrite(row, next) ? row : next;
+    return isCompactionRewrite(row, next) || sameRow(row, next) ? row : next;
   });
   const compactionPoint = rows.length - 1;
   for (const row of reloaded) {
@@ -56,17 +88,41 @@ export function mergeDisplayAfterCompact(
   return { rows, keptMissing, compactionPoint };
 }
 
+/** TUI-KEEP-TRANSCRIPT-ON-TURN-START-COMPACT — the turn-start compaction runs inside the turn child (session/chat.ts)
+ *  and rewrites the store without telling the TUI (no onCompact). The rewrite is still visible in the store itself: a
+ *  context summary row the screen has not seen. Returns that row's id, or null when the store holds no new summary.
+ *  `known` is the summary id this display already handled (a merged display never contains the summary row). */
+export function newStoreSummaryId(
+  displayed: readonly SerializedMessage[],
+  reloaded: readonly SerializedMessage[],
+  known?: string,
+): string | null {
+  let latest: SerializedMessage | undefined;
+  for (let index = reloaded.length - 1; index >= 0 && !latest; index -= 1)
+    if (isContextSummaryRow(reloaded[index]!)) latest = reloaded[index];
+  if (!latest) return null;
+  const latestId = transcriptRowId(latest);
+  if (latestId === known) return null;
+  return displayed.some((row) => isContextSummaryRow(row) && transcriptRowId(row) === latestId) ? null : latestId;
+}
+
 /** The rows to show after a store reload. Only a reload of the session on screen that was compacted while shown keeps
- *  the displayed rows; a session switch (or a never-compacted session) shows the store as it is. */
+ *  the displayed rows; a session switch (or a never-compacted session) shows the store as it is. A same-session store
+ *  that carries a summary the screen has not seen was compacted while shown (by the turn child) — it merges too and
+ *  reports the summary id in `compactedBy`. Display only: the store and the reloaded rows are never written. */
 export function displayRowsAfterReload(input: {
   readonly sameSession: boolean;
   readonly compacted: boolean;
   readonly displayed: readonly SerializedMessage[];
   readonly reloaded: readonly SerializedMessage[];
-}): CompactDisplayMerge {
-  if (!input.sameSession || !input.compacted)
-    return { rows: [...input.reloaded], keptMissing: 0, compactionPoint: input.reloaded.length - 1 };
-  return mergeDisplayAfterCompact(input.displayed, input.reloaded);
+  readonly knownSummaryId?: string;
+}): CompactDisplayMerge & { readonly compactedBy?: string } {
+  const compactedBy = input.sameSession && input.displayed.length > 0
+    ? newStoreSummaryId(input.displayed, input.reloaded, input.knownSummaryId) : null;
+  if (!input.sameSession || (!input.compacted && !compactedBy))
+    return { rows: input.sameSession ? reuseDisplayedRows(input.displayed, input.reloaded) : [...input.reloaded], keptMissing: 0, compactionPoint: input.reloaded.length - 1 };
+  const merged = mergeDisplayAfterCompact(input.displayed, input.reloaded);
+  return compactedBy ? { ...merged, compactedBy } : merged;
 }
 
 /** «Compacted 120→30 messages» → «── context compacted 120→30 ──» (any other status: no counts). */

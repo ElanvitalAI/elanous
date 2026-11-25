@@ -7,8 +7,30 @@ import { join, resolve } from 'node:path';
 import type { Command } from 'commander';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { APPROVE_OPTION, approvalRef, type ApprovalBinding, type CritpathDeps, type PreparedRelease } from '../../scripts/release-loop/critpath.js';
-import type { RaiseInput } from '../decisions/decision-ledger.js';
+import { APPROVE_OPTION, AUTO_PUBLISH_AGENT, approvalRef, type ApprovalBinding, type AutoPublishDeps, type CritpathDeps, type PreparedRelease } from '../../scripts/release-loop/critpath.js';
+import type { DecisionEntry, RaiseInput } from '../decisions/decision-ledger.js';
+import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
+import { userConfigPath } from '../user-config.js';
+
+/** RELEASE-AUTO-PUBLISH — the owner's opt-in: `release.autoPublish: "on-green"` in the config (same file as release.loop).
+ * Anything else, a missing file or an unreadable file is 'off': the publish card waits for a human as before. */
+export function releaseAutoPublishMode(configPath = getElanousConfigDirOverride() ? join(effectiveInstanceRoot(), 'config.json') : userConfigPath()): 'off' | 'on-green' {
+  try {
+    if (!existsSync(configPath)) return 'off';
+    const raw = JSON.parse(readFileSync(configPath, 'utf8')) as { release?: { autoPublish?: unknown } };
+    return raw.release?.autoPublish === 'on-green' ? 'on-green' : 'off';
+  } catch { return 'off'; }
+}
+
+/** Open decisions that hold this version's publication: title says HOLD and the card names the version (the publish card itself excluded). */
+export function openHoldDecisions(entries: readonly Pick<DecisionEntry, 'id' | 'title' | 'status' | 'refs' | 'scqa'>[], version: string): string[] {
+  const escaped = version.replace(/[.]/g, '\\.');
+  const names = new RegExp(`(^|[^0-9A-Za-z.])v?${escaped}(?![0-9A-Za-z]|\\.[0-9])`);
+  return entries.filter((e) => e.status === 'open'
+    && /\bhold\b/i.test(e.title)
+    && !(e.refs ?? []).some((r) => r.startsWith('release-critpath/'))
+    && names.test([e.title, e.scqa?.s ?? '', ...(e.refs ?? [])].join(' '))).map((e) => e.id);
+}
 
 function sha1File(path: string): string {
   return createHash('sha1').update(readFileSync(path)).digest('hex');
@@ -104,13 +126,33 @@ export async function defaultCritpathDeps(log: (line: string) => void): Promise<
       const entry = new DecisionLedger().raiseOnce(critpathApprovalCard(b, waiveReason), ref);
       return { id: entry.id };
     },
+    autoPublish: await defaultAutoPublishDeps(),
     log,
+  };
+}
+
+/** The real checks and side effects behind `release.autoPublish: "on-green"` (scripts/release-loop/critpath.ts autoPublishBlockers). */
+export async function defaultAutoPublishDeps(): Promise<AutoPublishDeps> {
+  const { DecisionLedger } = await import('../decisions/decision-ledger.js');
+  const { listChecklist, summarizeChecklist } = await import('../release-loop/checklist.js');
+  const { readRemoteChecklist } = await import('./release-checklist-remote.js');
+  const { openMsgStore } = await import('../msg/msg-store.js');
+  return {
+    mode: () => releaseAutoPublishMode(),
+    redCount: async (version) => summarizeChecklist(await readRemoteChecklist(version) ?? listChecklist(version)).red,
+    openHolds: (version) => openHoldDecisions(new DecisionLedger().list({ status: 'open' }), version),
+    decide: (cardId, reason) => { new DecisionLedger().decide(cardId, APPROVE_OPTION, { kind: 'auto', agent: AUTO_PUBLISH_AGENT, track: 'OP', delegation: 'release.autoPublish on-green (owner opt-in)' }, reason); },
+    notify: (body) => {
+      const store = openMsgStore();
+      try { store.appendWithProvenance({ from: 'RLA', to: 'OP', kind: 'info', body: `[release-auto · 👑 보고] ${body}` }, `release-auto:${body.slice(0, 120)}`); }
+      finally { store.close(); }
+    },
   };
 }
 
 export function registerReleaseCritpathCommand(release: Command, depsFactory: (log: (line: string) => void) => Promise<CritpathDeps> = defaultCritpathDeps): void {
   release.command('critpath')
-    .description('수동 크리티컬 패스 한 명령 — prepare → 승인 대기. 원장 human 표식은 미검증이므로 자동 publish/npm 실행을 허용하지 않는다(rc 75)')
+    .description('수동 크리티컬 패스 한 명령 — prepare → 승인 대기. 원장 human 표식은 미검증이므로 자동 publish/npm 실행을 허용하지 않는다(rc 75) · 주인이 release.autoPublish "on-green" 을 켜고 모든 초록 조건(6시간 안 dry-run·🔴 0·컷 head·HOLD 없음)이면 AUTO 결정 후 계속')
     .requiredOption('--version <x.y.z>', '릴리스 판')
     .requiredOption('--notes-file <md>', '공개 릴리스 본문(승인은 이 파일의 sha256 에 묶인다)')
     .option('--cut-commit <sha>', '컷 커밋(40자) — --branch 와 둘 중 하나')

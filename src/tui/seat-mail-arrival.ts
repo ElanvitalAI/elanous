@@ -1,3 +1,4 @@
+import { isHandRaiseMail } from './hand-raise-reply-gate.js';
 import { debug } from '../debug/log.js';
 import { emitTurnLife } from '../debug/turn-life.js';
 import { readSeatMailSnapshot, resolveSeatId, type SeatMailSnapshot, type SeatMailWatchStatus } from './seat-mail-boot.js';
@@ -33,7 +34,7 @@ export const DEFAULT_SEAT_MAIL_POLL_MS = 15_000;
  * SEAT-MESSAGE-BUS stage 1 — with the seat doorbell armed, polling is only the safety net (watch failure · a missed
  * ring → `tui.seat-mail bell-missed`). Without a bell (no seat · watch failed) the watcher keeps the 15s poll above.
  */
-export const SEAT_MAIL_SAFETY_POLL_MS = 120_000;
+export const SEAT_MAIL_SAFETY_POLL_MS = DEFAULT_SEAT_MAIL_POLL_MS;
 
 /** Rings inside this window share one ledger read (3 posts within 100 ms → one read with all three). */
 export const SEAT_MAIL_BELL_DEBOUNCE_MS = 250;
@@ -46,7 +47,7 @@ export const SEAT_MAIL_BELL_STAT_MS = 200;
 
 /**
  * Two OS watches on the bell, either one is enough:
- * - fs.watch on the bell folder (inotify on linux — instant). Probed on node-b (bun 1.4.2 · macOS 11-24): silent for a
+ * - fs.watch on the bell folder (inotify on linux — instant). Probed on 원격 호스트 (bun 1.4.2 · macOS 11-24): silent for a
  *   path under a symlink (/var → /private/var), and FSEvents batches 0.4–0.8 s behind on the real path — so it is
  *   the fast path only, opened on the realpath.
  * - fs.watchFile on each bell file (stat, {@link SEAT_MAIL_BELL_STAT_MS}) — fires on creation and every ring on every
@@ -108,10 +109,12 @@ export function resolveDefaultSeatBell(cwd: string, env: NodeJS.ProcessEnv = pro
 
 /**
  * ELN-SEAT-MAIL-REPLAY — at most this many per-message seat-mail notices wait in the queue; the rest collapse into ONE
- * summary notice. Each notice opens its own turn, so 20 is already hours of turns. 11-18 live unread inboxes were
- * REL 8 and JUD 2, so an ordinary seat never meets the cap. `ELANOUS_SEAT_MAIL_QUEUE_CAP` (≥ 1) or the watcher option.
+ * summary notice. Waiting notices drain as ONE bundle per idle turn, so the cap bounds queue memory, not turns.
+ * SEAT-QUEUE-CAPACITY (CEO 11-25): 20 → 100 — a coordinator seat (OP) took 20+ mails in a
+ * burst and starved; 100 matches NEXT_TUI_NOTICE_CAP (the queue's own notice cap, which also bounds this path).
+ * `ELANOUS_SEAT_MAIL_QUEUE_CAP` (≥ 1) or the watcher option.
  */
-export const SEAT_MAIL_QUEUE_CAP = 20;
+export const SEAT_MAIL_QUEUE_CAP = 100;
 
 /**
  * SEAT-STEER-PREEMPT JUD-B MF — a decision mail (any sender) is never folded into the overflow summary. A decision
@@ -191,6 +194,8 @@ export interface SeatMailArrivalInfo {
   readonly msgId?: number;
   /** 큐 항목과 같은 문면(seatMessageNotice — 머리줄 ⊕ msg:<id> ⊕ 전문). */
   readonly text: string;
+  /** The mail's original body (no notice framing) — the autopilot goal text source. */
+  readonly body?: string;
   /** 받은 자리. */
   readonly seat: string;
   /** 보낸 자리. */
@@ -201,10 +206,34 @@ export interface SeatMailArrivalInfo {
   readonly crownDirective?: string | null;
   /** The ledger `replyTo` (structured reply correlation — never parsed from the body). */
   readonly replyTo?: number;
+  /** The ledger `kind` (MSG-WAIT-CONTRACT ④ — a question/decision the receiver must answer). */
+  readonly kind?: string;
   readonly createdAt?: string;
+  /** AUTOPILOT-GOAL-CLEARING — structured refs (`goal-done:<ref>` · `goal:replace`) · the request contract (crown→pin bar). */
+  readonly refs?: readonly string[];
+  readonly doneWhen?: string;
+  readonly deadlineAt?: string;
+  /** CROWN-GOAL-APPLY — the structured goal field (`msg post --goal`); the autopilot controller applies it. */
+  readonly goal?: string;
   /** SEAT-MAIL-COALESCE-NOTICE — an info mail: it waits for the next digest (no mid-turn carry, no wake of its own). */
   readonly passive?: boolean;
+  /** MAIL-TRIAGE-TASKQUEUE — the structured fields arrival triage classifies and keys by (with `kind` above). */
+  readonly supersedes?: number;
+  /** DIRECTIVE-EXPIRY (Q5) — the structured expiry (ISO) the mail carries. */
+  readonly expiresAt?: string;
+  readonly correlationId?: string;
+  readonly resultState?: 'done' | 'failed';
+  /** SEAT-MAIL-PASSIVE-DEFAULT — router inputs the triage reads (needs-reply · priority · sender above on the ladder). */
+  readonly needsAck?: boolean;
+  readonly priority?: number;
+  readonly senderAbove?: boolean;
+  /** SEAT-TURN-FOLLOWUPS ② — replyTo is a mail this seat sent · a `cell:` ref names a cell this seat owns/assigned. */
+  readonly replyToOwn?: boolean;
+  readonly cellDelegated?: boolean;
 }
+
+/** MAIL-TRIAGE-TASKQUEUE — a queue cancel with this reason means «merged into an open task»: the mail is settled as absorbed. */
+export const TRIAGE_MERGED_CANCEL_REASON = 'triage-merged';
 
 export function createSeatMailArrivalWatcher(
   cwd: string,
@@ -243,9 +272,31 @@ export function createSeatMailArrivalWatcher(
      * passed. `false` = off.
      */
     bell?: SeatBellOptions | false;
+    /**
+     * HAND-RAISE-REPLY-GATE — a ✋ NEED HUMAN mail (refs `block:` ⊕ `reason:`) is closed by an outcome, not by the turn:
+     * at the turn end `replied` (= closed on the ledger: resolve · reject · escalate · reply) is asked; none → the mail is
+     * recorded `seen` but never acked/done, its outcome is `unanswered`, and `noteUnanswered` hands it to the gate
+     * (5 min P0 reminder · the HAND-RAISE-LADDER sweep auto-escalates at 10 min).
+     */
+    handRaise?: {
+      replied: (q: { msgId: number; seat: string; sender: string; correlationId?: string }) => boolean;
+      noteUnanswered: (q: { msgId: number; seat: string; sender: string; correlationId?: string; reason?: string; arrivedAt?: number }) => void;
+    };
+    /** LEADER-HAND-CONTRACT ② — the leader card for a ✋ arriving at `seat` (null/throw = no card · fail-open). */
+    leaderHandCard?: (seat: string) => string | null;
     heartbeat?: { getSessionId: () => string | null; seatStateRoot?: string; host?: string;
       schedule?: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
       cancel?: (timer: ReturnType<typeof setInterval>) => void };
+    /**
+     * SEAT-MAIL-PASSIVE-DEFAULT — does `sender` sit above `recipient` on the federation ladder? (a request from above is a
+     * work order and opens a turn; from a peer/subordinate it rides the digest). undefined/absent = unknown → fail-safe turn.
+     */
+    senderAbove?: (sender: string, recipient: string) => boolean | undefined;
+    /**
+     * SEAT-TURN-FOLLOWUPS ② — delegation facts from the ledger: did `seat` send mail `replyTo`? did `seat` assign (or own)
+     * one of `cells`? A delegated result wakes the delegator (seat-mail-turn-policy.ts `delegated-result`). Fail-open: absent/throw = no.
+     */
+    delegation?: { replyToOwn(replyTo: number, seat: string): boolean; cellDelegated(cells: readonly string[], seat: string): boolean };
   } = {},
 ): SeatMailArrivalWatcher {
   const read = deps.readSnapshot ?? readSeatMailSnapshot;
@@ -267,6 +318,19 @@ export function createSeatMailArrivalWatcher(
   const log = deps.log ?? ((event: string, data: Record<string, unknown>) => {
     try { debug.log('tui.next', event, data, { level: 'warn' }); } catch { /* observability is fail-open */ }
   });
+  const senderAboveField = (sender: string, recipient: string): { senderAbove?: boolean } => {
+    let above: boolean | undefined;
+    try { above = deps.senderAbove?.(sender, recipient); } catch { above = undefined; }
+    return above === undefined ? {} : { senderAbove: above };
+  };
+  const delegationFields = (message: { replyTo?: number; refs?: readonly string[] }, seat: string): { replyToOwn?: true; cellDelegated?: true } => {
+    const out: { replyToOwn?: true; cellDelegated?: true } = {};
+    if (!deps.delegation) return out;
+    try { if (typeof message.replyTo === 'number' && message.replyTo > 0 && deps.delegation.replyToOwn(message.replyTo, seat)) out.replyToOwn = true; } catch { /* fail-open */ }
+    const cells = (message.refs ?? []).filter((ref) => ref.startsWith('cell:')).map((ref) => ref.slice('cell:'.length).trim()).filter(Boolean);
+    try { if (cells.length > 0 && deps.delegation.cellDelegated(cells, seat)) out.cellDelegated = true; } catch { /* fail-open */ }
+    return out;
+  };
   /** msgIds this watcher already put in the queue (this process). The ledger side (cursor · seen) covers a restart. */
   const offered = new Set<number>();
   /** msgIds whose re-delivery was already reported (one `seat-mail-dedupe-hit` per msgId, not one per poll). */
@@ -275,7 +339,9 @@ export function createSeatMailArrivalWatcher(
   /** Highest msgId an overflow summary already announced — a truncated read that brings nothing newer adds no summary. */
   let summarizedThrough = 0;
   /** queue item id → message for notices this watcher made; the «seen» tap reads only these. */
-  type NoticeMessage = { msgId: number; seat: string; message: Parameters<typeof producers.seatMessageArrived>[0]; attempt: number };
+  type NoticeMessage = { msgId: number; seat: string; message: Parameters<typeof producers.seatMessageArrived>[0]; attempt: number;
+    /** HAND-RAISE-REPLY-GATE — this mail is a ✋ NEED HUMAN (structured refs); its correlation id. */
+    handRaise?: { correlationId?: string; reason?: string } };
   const noticeMessages = new Map<string, NoticeMessage>();
   /**
    * Handed to the running turn, waiting for its outcome. ELN-SEAT-LIVE 11-18: «seen» used to be written the moment the
@@ -303,6 +369,16 @@ export function createSeatMailArrivalWatcher(
       // (seen on a completed turn · retry on failed/cancelled) — releasing it here would leave it processed but never acked.
       if (item.status === 'cancelled' && item.cancelReason === 'mid-turn-carried') {
         inTurn.set(item.id, mapped);
+        return;
+      }
+      // MAIL-TRIAGE-TASKQUEUE — a duplicate / status delta merged into an open task costs no turn: it is absorbed
+      // (seen · done · acked by id) right here; the task it joined closes on its own result event.
+      if (item.status === 'cancelled' && item.cancelReason === TRIAGE_MERGED_CANCEL_REASON && source) {
+        adapter.settle('notice', [mapped.msgId], 'responded');
+        source.receipts?.record({ messageId: mapped.msgId, recipient: mapped.seat, state: 'seen', queueItemId: item.id });
+        source.receipts?.recordDone?.({ messageId: mapped.msgId, recipient: mapped.seat });
+        source.receipts?.ack?.({ messageId: mapped.msgId, recipient: mapped.seat });
+        log('seat-mail-triage-merged', { msgId: mapped.msgId, seat: mapped.seat });
         return;
       }
       if (item.status === 'delivered') {
@@ -378,6 +454,22 @@ export function createSeatMailArrivalWatcher(
     const seen = new Set(settled.seen);
     const retry = new Set(settled.retry);
     for (const [itemId, mapped] of finished) {
+      // HAND-RAISE-REPLY-GATE — a ✋ the turn did not answer stays open: seen (not re-offered) but never acked / done.
+      if (seen.has(mapped.msgId) && mapped.handRaise && deps.handRaise) {
+        const query = { msgId: mapped.msgId, seat: mapped.seat, sender: mapped.message.sender,
+          ...(mapped.handRaise.correlationId ? { correlationId: mapped.handRaise.correlationId } : {}),
+          ...(mapped.handRaise.reason ? { reason: mapped.handRaise.reason } : {}) };
+        let replied = false;
+        try { replied = deps.handRaise.replied(query); } catch (error) { log('seat-mail-hand-raise-check-failed', { msgId: mapped.msgId, error: String(error).slice(0, 200) }); }
+        if (!replied) {
+          source.receipts?.record({ messageId: mapped.msgId, recipient: mapped.seat, state: 'seen', queueItemId: itemId });
+          const arrivedAt = mapped.message.createdAt ? Date.parse(mapped.message.createdAt) : NaN;
+          try { deps.handRaise.noteUnanswered({ ...query, ...(Number.isFinite(arrivedAt) ? { arrivedAt } : {}) }); } catch { /* fail-open: the log line below is the record */ }
+          log('seat-mail-hand-raise-open', { msgId: mapped.msgId, seat: mapped.seat, sender: mapped.message.sender });
+          try { turnLifeLog('turn-life:event-acked', { eventId: mapped.msgId, msgId: mapped.msgId, itemId, source: 'seat-mail', outcome: 'unanswered', state: 'open' }); } catch { /* observability is fail-open */ }
+          continue;
+        }
+      }
       if (seen.has(mapped.msgId)) {
         source.receipts?.record({ messageId: mapped.msgId, recipient: mapped.seat, state: 'seen', queueItemId: itemId });
         // [seat-mail #16 wiring · S7 트리거] done 계기 — 턴이 이 우편에 답을 마친 순간(seen 정착 = answered).
@@ -505,22 +597,43 @@ export function createSeatMailArrivalWatcher(
         ...headerFieldsOf(message),
         ...(message.origin ? { origin: message.origin } : {}),
         ...(typeof message.replyTo === 'number' ? { replyTo: message.replyTo } : {}),
+        recipient: read.seat, ...(message.deadlineAt ? { deadlineAt: message.deadlineAt } : {}),
+        ...(typeof message.priority === 'number' ? { priority: message.priority } : {}),
         ...noticeTotalField(read),
         ...(message.createdAt === undefined ? {} : { createdAt: message.createdAt }),
+        // SEAT-MAIL-PASSIVE-DEFAULT — the router's structured inputs (refs · result · needs-reply · ladder position).
+        ...(message.refs?.length ? { refs: message.refs } : {}), ...(message.result ? { resultState: message.result.state } : {}),
+        ...(message.needsAck === true ? { needsAck: true } : {}), ...(message.doneWhen ? { doneWhen: message.doneWhen } : {}),
+        ...senderAboveField(message.from, read.seat),
+        ...delegationFields(message, read.seat),
       };
-      const item = producers.seatMessageArrived(input);
+      let handCard: string | null = null;
+      if (deps.leaderHandCard && isHandRaiseMail(message)) { try { handCard = deps.leaderHandCard(read.seat); } catch { handCard = null; } }
+      const item = producers.seatMessageArrived(handCard ? { ...input, handCard } : input);
       if (item === null) continue;
       // OBSERVE-TURN-EVENT-LIFECYCLE — 우편 한 통 도착(큐 적입 직후; busy 여부는 onArrived 문이 판정).
       try { turnLifeLog('turn-life:event-arrived', { source: 'seat-mail', eventId: message.id, msgId: message.id, itemId: item.id, arrivedAt: Date.now() }); } catch { /* observability is fail-open */ }
       offered.add(message.id);
       msgIds.push(message.id);
-      arrivals.push({ msgId: message.id, seat: read.seat, sender: message.from, text: item.text, ...(item.passive ? { passive: true } : {}),
+      arrivals.push({ msgId: message.id, seat: read.seat, sender: message.from, text: item.text, body: message.body, ...(item.passive ? { passive: true } : {}),
         ...(message.origin ? { origin: message.origin } : {}),
         ...(message.intent ? { intent: message.intent } : {}),
+        ...(message.kind ? { kind: message.kind } : {}),
         ...(message.crownDirective ? { crownDirective: message.crownDirective } : {}),
         ...(typeof message.replyTo === 'number' ? { replyTo: message.replyTo } : {}),
+        ...(message.refs?.length ? { refs: message.refs } : {}), ...(message.doneWhen ? { doneWhen: message.doneWhen } : {}),
+        ...(message.deadlineAt ? { deadlineAt: message.deadlineAt } : {}),
+        ...(message.goal ? { goal: message.goal } : {}),
+        ...(typeof message.supersedes === 'number' ? { supersedes: message.supersedes } : {}),
+        ...(message.expiresAt ? { expiresAt: message.expiresAt } : {}),
+        ...(message.correlationId ? { correlationId: message.correlationId } : {}), ...(message.result ? { resultState: message.result.state } : {}),
+        ...(message.needsAck === true ? { needsAck: true } : {}), ...(typeof message.priority === 'number' ? { priority: message.priority } : {}),
+        ...(typeof input.senderAbove === 'boolean' ? { senderAbove: input.senderAbove } : {}),
+        ...(input.replyToOwn ? { replyToOwn: true } : {}), ...(input.cellDelegated ? { cellDelegated: true } : {}),
         ...(message.createdAt ? { createdAt: message.createdAt } : {}) });
-      noticeMessages.set(item.id, { msgId: message.id, seat: read.seat, message: input, attempt: 1 });
+      noticeMessages.set(item.id, { msgId: message.id, seat: read.seat, message: input, attempt: 1,
+        ...(isHandRaiseMail(message) ? { handRaise: { ...(message.correlationId ? { correlationId: message.correlationId } : {}),
+          ...(message.refs?.find((r) => r.startsWith('reason:')) ? { reason: message.refs.find((r) => r.startsWith('reason:'))!.slice('reason:'.length) } : {}) } } : {}) });
       src.receipts?.record({ messageId: message.id, recipient: read.seat, state: 'delivered', queueItemId: item.id });
     }
     // OP #129667 ① — 상한 밖 우편(over)은 원장 안내 한 줄로 접는다(완료선: 넘치면 안내 한 줄 · main #39526 seat-mail-replay 계약 복원).

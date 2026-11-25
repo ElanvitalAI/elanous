@@ -48,7 +48,7 @@ test('completion keeps start order and snapshots preserve completed log rows wit
   rows = updateToolActivity(rows, { phase: 'finish', id: 'a', name: 'read_file' }, 2000);
   expect(rows.map(row => row.id)).toEqual(['a', 'b']);
   rows = updateToolActivity(rows, { phase: 'snapshot', calls: [{ id: 'b', name: 'Bash' }] }, 3000);
-  expect(toolActivityLines(rows, 4000)).toEqual([
+  expect(toolActivityLines(rows, 4000, { expanded: true })).toEqual([
     `${D} read_file(a.md) 2s`,
     `${R} Bash(bun test) 3s`,
   ]);
@@ -159,23 +159,23 @@ test('NEXT-TUI-TOOL-LOG-NOT-PINNED: tool rows sit at their text offset in one ch
   const rows = [{ id: 'b', name: 'Read', target: 'b.txt', startedAt: 0, finishedAt: 0 },
     { id: 'a', name: 'Write', target: 'a.txt', startedAt: 0 }];
   const text = 'first\nsecond\n';
-  const lines = interleavedTurnLines(rows, new Map([['a', 6], ['b', 6]]), text, 0, (chunk) => ['T:' + chunk.trim()]);
+  const lines = interleavedTurnLines(rows, new Map([['a', 6], ['b', 6]]), text, 0, (chunk) => ['T:' + chunk.trim()], { expanded: true });
   // Same offset keeps start order; text before the tools renders above, after them below.
   expect(lines).toEqual(['T:first', `${D} Read(b.txt)`, `${R} Write(a.txt)`, 'T:second']);
   // A tool without a recorded offset started after the text seen so far; an offset past a redacted preview is clamped.
-  expect(interleavedTurnLines(rows, new Map([['b', 99]]), 'only\n', 0, (chunk) => ['T:' + chunk.trim()]))
+  expect(interleavedTurnLines(rows, new Map([['b', 99]]), 'only\n', 0, (chunk) => ['T:' + chunk.trim()], { expanded: true }))
     .toEqual(['T:only', `${D} Read(b.txt)`, `${R} Write(a.txt)`]);
 });
 
 test('consecutive finished calls of one tool fold into one «Name ×N» row; running rows and other tools do not fold', () => {
   const finished = (id: string, name: string, target: string) => ({ id, name, target, startedAt: 0, finishedAt: 0 });
   const run = Array.from({ length: TOOL_FOLD_MIN_RUN }, (_, index) => finished(`r${index}`, 'Read', `f${index}.ts`));
-  expect(toolActivityLines(run, 1000)).toEqual([`${D} Read ×${TOOL_FOLD_MIN_RUN} · last f${TOOL_FOLD_MIN_RUN - 1}.ts`]);
+  expect(toolActivityLines(run, 1000, { expanded: true })).toEqual([`${D} Read ×${TOOL_FOLD_MIN_RUN} · last f${TOOL_FOLD_MIN_RUN - 1}.ts`]);
   // One short of the threshold stays as individual rows.
-  expect(toolActivityLines(run.slice(1), 1000)).toEqual(run.slice(1).map((row) => `${D} Read(${row.target})`));
+  expect(toolActivityLines(run.slice(1), 1000, { expanded: true })).toEqual(run.slice(1).map((row) => `${D} Read(${row.target})`));
   // A running call at the end of a run is never folded into it; a different tool breaks the run.
   const mixed = [...run, { id: 'w', name: 'Write', target: 'o.ts', startedAt: 0 }];
-  expect(toolActivityLines(mixed, 1000)).toEqual([`${D} Read ×${TOOL_FOLD_MIN_RUN} · last f${TOOL_FOLD_MIN_RUN - 1}.ts`, `${R} Write(o.ts) 1s`]);
+  expect(toolActivityLines(mixed, 1000, { expanded: true })).toEqual([`${D} Read ×${TOOL_FOLD_MIN_RUN} · last f${TOOL_FOLD_MIN_RUN - 1}.ts`, `${R} Write(o.ts) 1s`]);
 });
 
 test('classic-style rows are English, glyph-led, and drop sub-second times', () => {

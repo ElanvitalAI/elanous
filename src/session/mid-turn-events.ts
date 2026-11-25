@@ -21,6 +21,9 @@ export interface MidTurnEventItem {
   /** Seat mail provenance (sender · intent) — the drain renders seat mail as untrusted data. */
   readonly from?: string;
   readonly intent?: string | null;
+  readonly crownDirective?: string | null;
+  readonly originKind?: string | null;
+  readonly viaLedger?: boolean;
 }
 
 /** pending-input.ts:29 계약 — 배수된 문면 전체와 항목 전체를 받는다. */
@@ -41,7 +44,7 @@ const onceKey = (kind: string, id: string): string => `${kind}\u0000${id}`;
  */
 export function enqueueMidTurnEvent(
   sessionId: string,
-  event: { kind: string; id: string; text: string; from?: string; intent?: string | null },
+  event: { kind: string; id: string; text: string; from?: string; intent?: string | null; crownDirective?: string | null; originKind?: string | null; viaLedger?: boolean },
   onDrained?: MidTurnDrainedCallback,
 ): boolean {
   const queue = sessions.get(sessionId) ?? [];
@@ -61,6 +64,9 @@ export function enqueueMidTurnEvent(
     occurredAt: Date.now(),
     ...(event.from === undefined ? {} : { from: event.from }),
     ...(event.intent === undefined ? {} : { intent: event.intent }),
+    ...(event.crownDirective ? { crownDirective: event.crownDirective } : {}),
+    ...(event.originKind ? { originKind: event.originKind } : {}),
+    ...(event.viaLedger === true ? { viaLedger: true } : {}),
     ...(onDrained === undefined ? {} : { onDrained }),
   };
   queue.push(item);

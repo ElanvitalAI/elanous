@@ -132,3 +132,27 @@ test('a rewrite that keeps every chat row writes no tombstone', () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('bottom-pinned flow: an older exchange scrolling up under a newer answer on screen is not a vanish', () => {
+  const exchange = (n: number): SerializedMessage[] => [
+    { role: 'user', content: `Question number ${n} about the landing queue state.`, ts: `2026-11-25T01:${String(10 + n * 2).padStart(2, '0')}:00.000Z` },
+    { role: 'assistant', content: `Answer number ${n}: ${'the queue moved one step forward and the receipt is posted. '.repeat(8)}`,
+      ts: `2026-11-25T01:${String(11 + n * 2).padStart(2, '0')}:00.000Z`, replyFinal: true },
+  ];
+  const events: TranscriptVanishEvent[] = [];
+  const observe = createTranscriptVanishDetector((event) => events.push(event));
+  const view = createNextTuiPublicHistoryView();
+  const before = [0, 1, 2, 3].flatMap(exchange);
+  const beforeView = view(before, false);
+  const beforeBody = frameOf(beforeView).body;
+  expect(beforeBody.map(plain).some((line) => line.includes('Question number 2 about'))).toBe(true);
+  observe(detectorFrame(before, beforeView, beforeBody, false));
+  const after = [...before, ...[4, 5].flatMap(exchange)];
+  const afterView = view(after, false);
+  const afterBody = frameOf(afterView).body;
+  // The older exchange left the top edge; the newest answer is on screen.
+  expect(afterBody.map(plain).some((line) => line.includes('Question number 2 about'))).toBe(false);
+  expect(afterBody.map(plain).some((line) => line.includes('Answer number 5:'))).toBe(true);
+  observe(detectorFrame(after, afterView, afterBody, false));
+  expect(events).toEqual([]);
+});

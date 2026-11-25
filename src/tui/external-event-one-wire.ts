@@ -48,11 +48,21 @@ export function dispatchExternalEventOne(input: {
   readonly startChatTurn: (text: string, status: string) => void;
   readonly log: (event: string, fields: Record<string, unknown>) => void;
 }): void {
-  if (!input.dispatch.startTurn) {
-    input.log('queue-notice-not-injected', { source: input.opened.source, remaining: input.remaining });
-    if (input.dispatch.wakeQueue) input.injectKey();
+  // 11-25 OP deaf: a not-injected notice is already off the queue — a full ledger, or three refusals in a row,
+  // still start the turn (the mail must reach the model); otherwise the next queued item is woken.
+  const dispatch = input.dispatch.startTurn ? input.dispatch : noticeOneDispatch({
+    injected: false, remaining: input.remaining, streak: notInjectedStreak + 1,
+    ...(input.opened.refusal === undefined ? {} : { refusal: input.opened.refusal }),
+  });
+  if (!dispatch.startTurn) {
+    notInjectedStreak += 1;
+    input.log('queue-notice-not-injected', { source: input.opened.source, remaining: input.remaining, streak: notInjectedStreak,
+      ...(input.opened.refusal === undefined ? {} : { refusal: input.opened.refusal }) });
+    if (dispatch.wakeQueue) input.injectKey();
     return;
   }
+  if (dispatch.forced) input.log('queue-notice-forced-turn', { source: input.opened.source, reason: dispatch.forced, streak: notInjectedStreak + 1, remaining: input.remaining });
+  notInjectedStreak = 0;
   input.keepOpen(input.opened);
   input.log('queue-dispatched-notice', { source: input.opened.source, remaining: input.remaining });
   input.startChatTurn(input.opened.text, `[notice · ${input.opened.source ?? 'queue'}] auto-submitted`);
@@ -75,6 +85,8 @@ export interface ExternalEventOneOpened {
   readonly occurredAt?: number;
   /** True only when the leaf accepted and injected this id. A duplicate or a refusal is false. */
   readonly injected: boolean;
+  /** Why the ledger did not inject (absent when injected). */
+  readonly refusal?: 'duplicate' | 'full';
   /** The leaf runs this when the notice turn ends. Entry only forwards the turn result. */
   readonly finish: (turnOk: boolean) => Promise<ExternalEventOneNote>;
 }
@@ -96,9 +108,12 @@ function failedReceipt(ledger: ExternalEventLedger, id: string, occurredAt: numb
 
 /** One book for the TUI process. Tests reset it. */
 let sessionLedger: ExternalEventLedger = createExternalEventLedger();
+/** Not-injected notices in a row (reset by any started notice turn). */
+let notInjectedStreak = 0;
 
 export function resetExternalEventOneWire(ledger: ExternalEventLedger = createExternalEventLedger()): ExternalEventLedger {
   sessionLedger = ledger;
+  notInjectedStreak = 0;
   return sessionLedger;
 }
 
@@ -131,6 +146,7 @@ export function openExternalEventOne(input: {
     receivedAt,
     ...(occurredAt === undefined ? {} : { occurredAt }),
     injected: noted.injected,
+    ...(noted.phase === 'duplicate' ? { refusal: 'duplicate' as const } : noted.phase === 'refused' ? { refusal: 'full' as const } : {}),
     finish: (turnOk: boolean) => Promise.resolve(finishExternalEventOne({
       id: input.id,
       ...(occurredAt === undefined ? {} : { occurredAt }),

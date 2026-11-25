@@ -36,7 +36,7 @@ import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { envLiteral } from '../platform/env-literal.js';
 import { firstRunEnvironment, isNexusFirstRunPass, type NexusFirstRunReceipt } from '../../scripts/release-loop/nexus-first-run.js';
 import { getUserConfig } from '../user-config/reader.js';
-import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItems, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind, type ChecklistDispatchKind } from '../release-loop/checklist.js';
+import { addItem, addItems, parseChecklistBulkFile, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItems, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind, type ChecklistDispatchKind } from '../release-loop/checklist.js';
 import * as features from '../release-loop/feature-store.js';
 import { evidencePlan, fetchMergedChecklistPrs, landedButYellow, type MergedPrRunner } from '../release-loop/landed-but-yellow.js';
 import { formatSchedule, getSchedule, listSchedules, planIncrementalSweepTick, setSchedule } from '../release-loop/release-schedule.js';
@@ -72,6 +72,7 @@ import { registerRfcCommands } from './rfc-cli.js';
 import { checklistCodenames, checklistVersion, isReleaseVersion, readChecklistContext, registerChecklistReadCommands, type ChecklistEvidenceReader } from './release-checklist-read-cli.js';
 import { syncLinearProgress } from '../decisions/linear-progress-sync.js';
 import { registerReleaseRunStatusCommand } from './release-run-status-cli.js';
+import { registerReleaseGraphCommands } from './release-graph-cli.js';
 import { registerReleaseCritpathCommand } from './release-critpath-cli.js';
 
 export const GATE_SHARD_JSON_PAGE_MAX_BYTES = 60_000;
@@ -693,6 +694,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
   registerReleaseRunStatusCommand(release);
   registerReleaseCritpathCommand(release);
+  registerReleaseGraphCommands(release);
   release.command('gate-shards').description('실행 중에도 읽는 게이트 조각 원장(시도·귀속·증거)')
     .requiredOption('--version <v>', '조회할 판').option('--all', '과거 전이와 재시도까지 조회').option('--json', '결과 JSON')
     .option('--offset <N>', 'JSON 결과에서 건너뛸 조각 수', '0').option('--limit <N>', 'JSON 한 페이지의 조각 수', '20')
@@ -1098,7 +1100,8 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--allow-duplicate-id', '다른 판에 같은 id 가 있어도 경고 후 추가')
     .option('--strict', '대상 경로·완료 경계 경고가 있으면 저장 전 거부')
     .option('--ref <path...>', '근거 문서 — 저장소 상대 경로[#절] (반복 가능)')
-    .action(async (id: string, title: string, opts: { ref?: string[]; owner?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean; allowDuplicateId?: boolean; strict?: boolean }, cmd: Command) => {
+    .option('--body <text>', '내용 — 무엇·왜(제목 한 줄 밖의 본문)').option('--done <criterion>', '완료 판정식 — 무엇이 관측되면 끝인가').option('--source <quote>', '출처 — 요청 원문 또는 원 우편 id')
+    .action(async (id: string, title: string, opts: { body?: string; done?: string; source?: string; ref?: string[]; owner?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean; allowDuplicateId?: boolean; strict?: boolean }, cmd: Command) => {
     const { version, json } = context(cmd);
     if (!mayWrite(cmd)) return;
     const { normalizeEvidenceCommandLines } = await import('../task-agent/evidence-command-normalize.js');
@@ -1108,9 +1111,31 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     for (const warning of normalized.warnings) console.error(`⚠ ${warning}`);
     const dispatchKind = opts.kind && !['screen', 'postpub'].includes(opts.kind) ? opts.kind as ChecklistDispatchKind : undefined;
     warnChecklistTargetPaths({ title, refs: opts.ref, dispatchKind }, opts.strict);
-    const data = addItem(version, { id, title, ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.kind !== undefined && !dispatchKind ? { kind: opts.kind as ChecklistKind } : {}), ...(dispatchKind ? { dispatchKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator ? { accelerator: true } : {}) }, { allowDuplicateId: opts.allowDuplicateId });
+    const data = addItem(version, { id, title, ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.kind !== undefined && !dispatchKind ? { kind: opts.kind as ChecklistKind } : {}), ...(dispatchKind ? { dispatchKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator ? { accelerator: true } : {}), ...(opts.body !== undefined ? { body: opts.body } : {}), ...(opts.done !== undefined ? { doneCriterion: opts.done } : {}), ...(opts.source !== undefined ? { source: opts.source } : {}) }, { allowDuplicateId: opts.allowDuplicateId });
     if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 추가`);
   });
+  withContext(checklist.command('add-bulk').description('칸 여럿을 파일(JSONL 또는 마크다운 표)에서 한 트랜잭션으로 추가 · 모든 행을 먼저 검사하고 하나라도 틀리면 아무것도 안 쓴다'))
+    .requiredOption('--file <path>', 'JSONL(한 줄에 객체 하나) 또는 | id | title | priority | owner | body | done | source | refs | deadline-version | accelerator | 마크다운 표')
+    .option('--format <format>', 'jsonl|md (생략하면 첫 줄로 판별)').option('--dry-run', '계획만 출력하고 쓰지 않는다')
+    .option('--allow-duplicate-id', '다른 판에 같은 id 가 있어도 추가')
+    .action(async (opts: { file: string; format?: string; dryRun?: boolean; allowDuplicateId?: boolean }, cmd: Command) => {
+      const { version, json } = context(cmd);
+      if (opts.format !== undefined && opts.format !== 'jsonl' && opts.format !== 'md') throw new CliUserError(`잘못된 형식: ${opts.format}`, 'jsonl|md');
+      let text: string;
+      try { text = readFileSync(opts.file, 'utf8'); } catch (error) { throw new CliUserError(`파일을 읽지 못했다: ${opts.file} (${error instanceof Error ? error.message : String(error)})`); }
+      const rows = parseChecklistBulkFile(text, opts.format as 'jsonl' | 'md' | undefined);
+      if (!opts.dryRun && !mayWrite(cmd)) return;
+      const result = addItems(version, rows, { allowDuplicateId: opts.allowDuplicateId, dryRun: opts.dryRun });
+      if (json) console.log(JSON.stringify({ version: result.version, dryRun: result.dryRun, ok: result.errors.length === 0, added: result.added, errors: result.errors }));
+      else if (result.errors.length) {
+        for (const row of result.errors) console.error(`⛔ 행 ${row.row}${row.id ? ` ${row.id}` : ''}: ${row.errors.join(' · ')}`);
+        console.error(`⛔ ${result.errors.length}행 오류 — 아무것도 쓰지 않았다 (${rows.length}행 중)`);
+      } else {
+        for (const item of result.added) console.log(`${result.dryRun ? '· 드라이런' : '✅'} ${item.id} ${item.priority ?? '-'} ${item.owner ?? '-'} · ${item.title}`);
+        console.log(result.dryRun ? `· 드라이런 ${result.added.length}칸 → ${version} (쓰지 않음)` : `✅ 합계 ${result.added.length}칸 ${version} 추가`);
+      }
+      if (result.errors.length) process.exitCode = 1;
+    });
   withContext(checklist.command('set <ids...>').description('칸 상태·근거·담당·처분 갱신 (여럿 가능 · 하나라도 틀리면 전부 취소)'))
     .option('--status <status>', 'green|yellow|red|done').option('--evidence <evidence>', '근거').option('--owner <owner>', '담당')
     .option('--disposition <disposition>', 'move|known-issue|block').option('--kind <kind>', 'screen = 다섯 화면 짝 칸 · 근거에 짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 … 한 줄 · postpub = 발행 뒤 실측 칸 — 판 관문이 발행 전 판정에서 빼고 따로 센다 · code|ops|measure|decision|umbrella = 발사 분류')
@@ -1118,16 +1143,17 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--ceo-minutes <minutes>', '대표 손 분량(분)').option('--ceo-date <date>', '대표 손 날짜 YYYY-MM-DD')
     .option('--accelerator', '가속 등급 부여').option('--no-accelerator', '가속 등급 해제(기본은 없음)')
     .option('--ref <path...>', '근거 문서 더하기 — 저장소 상대 경로[#절] (반복 가능 · 중복 제거)')
-    .action((ids: string[], opts: { ref?: string[]; status?: string; evidence?: string; owner?: string; disposition?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[] | false; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean }, cmd: Command) => {
+    .option('--body <text>', '내용 — 무엇·왜 (빈 문자열이면 지운다)').option('--done <criterion>', '완료 판정식 (빈 문자열이면 지운다)').option('--source <quote>', '출처 — 요청 원문 또는 원 우편 id (빈 문자열이면 지운다)')
+    .action((ids: string[], opts: { body?: string; done?: string; source?: string; ref?: string[]; status?: string; evidence?: string; owner?: string; disposition?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[] | false; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean }, cmd: Command) => {
       const { version, json } = context(cmd);
       if (opts.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(opts.status)) throw new CliUserError(`잘못된 상태: ${opts.status}`, 'green|yellow|red|done');
       if (opts.disposition !== undefined && !['move', 'known-issue', 'block'].includes(opts.disposition)) throw new CliUserError(`잘못된 처분: ${opts.disposition}`, 'move|known-issue|block');
-      if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined && opts.disposition === undefined && opts.kind === undefined && opts.priority === undefined && opts.deadlineVersion === undefined && opts.predecessor === undefined && opts.ceoMinutes === undefined && opts.ceoDate === undefined && opts.accelerator === undefined && opts.ref === undefined) throw new CliUserError('갱신할 칸을 지정하라', '--ref · --status · --evidence · --owner · --disposition · --kind · --priority · --deadline-version · --predecessor · --ceo-minutes · --ceo-date · --accelerator · --no-accelerator 중 하나');
+      if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined && opts.disposition === undefined && opts.kind === undefined && opts.priority === undefined && opts.deadlineVersion === undefined && opts.predecessor === undefined && opts.ceoMinutes === undefined && opts.ceoDate === undefined && opts.accelerator === undefined && opts.ref === undefined && opts.body === undefined && opts.done === undefined && opts.source === undefined) throw new CliUserError('갱신할 칸을 지정하라', '--ref · --body · --done · --source · --status · --evidence · --owner · --disposition · --kind · --priority · --deadline-version · --predecessor · --ceo-minutes · --ceo-date · --accelerator · --no-accelerator 중 하나');
       if (opts.status === 'green' && !ownerMatches(actor(), 'OP') && !ownerMatches(actor(), 'OPC'))
         throw new CliUserError('초록 판정은 OP 또는 OPC만 기록할 수 있다 — 판정국에 [GREEN-REQ]를 보내 판정을 요청하라', 'release checklist set <id> --evidence "[GREEN-REQ] …"');
       if (!mayWrite(cmd)) return;
       const dispatchKind = opts.kind && !['screen', 'postpub'].includes(opts.kind) ? opts.kind as ChecklistDispatchKind : undefined;
-      const data = setItems(version, ids, { ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined && !dispatchKind ? { kind: opts.kind as ChecklistKind } : {}), ...(dispatchKind ? { dispatchKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor === false ? [] : opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}) }, process.env.ELANOUS_TRACK || 'cli');
+      const data = setItems(version, ids, { ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined && !dispatchKind ? { kind: opts.kind as ChecklistKind } : {}), ...(dispatchKind ? { dispatchKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor === false ? [] : opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}), ...(opts.body !== undefined ? { body: opts.body.trim() ? opts.body : null } : {}), ...(opts.done !== undefined ? { doneCriterion: opts.done.trim() ? opts.done : null } : {}), ...(opts.source !== undefined ? { source: opts.source.trim() ? opts.source : null } : {}) }, process.env.ELANOUS_TRACK || 'cli');
       for (const id of ids) {
         const item = data.items.find((entry) => entry.id === id);
         const why = item?.kind === 'screen' && item.status === 'green' ? parityGap(item.evidence) : null;

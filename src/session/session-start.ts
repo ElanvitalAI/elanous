@@ -189,19 +189,24 @@ function resumeInsertIndex(argv: readonly string[], parts: readonly string[], re
 }
 
 /** 대시보드 TUI 루트 이어하기 — 우선순위 `--resume <id>` > `--continue`·id 없는 `--resume`(최신 세션) >
- *  이름 있는 dashboard의 활성 세션 선택 > (폐기 예정) `ELANOUS_RESUME_SESSION`.
- *  이름 있는 dashboard는 활성 표식이 없거나 낡으면 새 세션으로 시작한다. */
+ *  이름 있는 dashboard의 명시 붙기(`session resume` one-shot) > (폐기 예정) `ELANOUS_RESUME_SESSION`.
+ *  이름 있는 dashboard는 명시 붙기 표지가 없거나 낡으면 새 세션으로 시작한다(전역 active 표지는 보지 않는다). */
 export function resolveRootResumeSessionId(input: {
   flagId?: string;
   continueLatest: boolean;
-  /** A named dashboard is an explicit attachment surface: session resume sets the active marker first. */
+  /**
+   * A named dashboard (`--name`) starts a NEW session. It attaches only to a session the operator
+   * just picked with `session resume <id>` (one-shot pending-attach marker) — never to the global
+   * `active` marker, which a live seat TUI keeps overwriting with its own session (11-25: a
+   * `--name` tab attached to the live OP session).
+   */
   namedDashboard?: boolean;
-  activeSessionId?: () => string | null;
+  pendingAttachSessionId?: () => string | null;
   sessionExists?: (id: string) => boolean;
   /** 폐기 예정 env 읽기 — 명시 인자가 하나도 없을 때만 «부른다»(읽기 자체가 폐기 경고를 낸다 · r2 must-fix). */
   readEnvId: () => string | null | undefined;
   latest: () => string | null;
-}): { sessionId?: string; source: 'flag' | 'continue' | 'continue-none' | 'named-active' | 'env' | 'none' } {
+}): { sessionId?: string; source: 'flag' | 'continue' | 'continue-none' | 'named-attach' | 'env' | 'none' } {
   const flagId = (input.flagId ?? '').trim();
   if (flagId) return { sessionId: flagId, source: 'flag' };
   if (input.continueLatest) {
@@ -209,12 +214,12 @@ export function resolveRootResumeSessionId(input: {
     return latest ? { sessionId: latest, source: 'continue' } : { source: 'continue-none' };
   }
   if (input.namedDashboard) {
-    let active: string | null = null;
-    try { active = input.activeSessionId?.()?.trim() || null; } catch { /* stale marker is treated as no selection */ }
-    if (active) {
+    let pending: string | null = null;
+    try { pending = input.pendingAttachSessionId?.()?.trim() || null; } catch { /* unreadable marker → new session */ }
+    if (pending) {
       let exists = true;
-      try { if (input.sessionExists) exists = input.sessionExists(active); } catch { exists = false; }
-      if (exists) return { sessionId: active, source: 'named-active' };
+      try { if (input.sessionExists) exists = input.sessionExists(pending); } catch { exists = false; }
+      if (exists) return { sessionId: pending, source: 'named-attach' };
     }
     return { source: 'none' };
   }

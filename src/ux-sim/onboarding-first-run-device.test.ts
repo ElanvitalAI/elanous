@@ -41,7 +41,7 @@ describe('onboarding first-run menu device', () => {
   // 이 리터럴은 «이 화면의 고정 문구» 라는 골의 판정 대상이라 의도적으로 남긴다 — 두 시험의 나머지 단언은
   // 모두 상수를 읽으므로, 문구 변경은 이 한 곳의 의도적 갱신 없이는 통과하지 못한다.
   test('pins the frozen menu wording the production renderer must keep printing', () => {
-    expect(FIRST_RUN_MENU_CHOICES).toBe('1 Codex, 2 Grok, 3 Claude, 4 OpenRouter, 5 GLM');
+    expect(FIRST_RUN_MENU_CHOICES).toBe('  1  Codex\n  2  Grok\n  3  Claude\n  4  OpenRouter\n  5  GLM');
     expect(FIRST_RUN_MENU_CHOICES).toBe(formatProviderMenu(orderProviderChoices([])));
   });
 
@@ -57,12 +57,12 @@ describe('onboarding first-run menu device', () => {
 
   test('recognizes the first-run menu in Korean and English output', () => {
     expect(countFirstRunMenuRenders('Choose LLM (1 Codex)')).toBe(1);
-    expect(countFirstRunMenuRenders('처음 실행 LLM 설정')).toBe(1);
-    expect(countFirstRunMenuRenders('Choose LLM · 처음 실행 LLM 설정')).toBe(1);
-    expect(FIRST_RUN_MENU_MARKERS).toEqual(['Choose LLM', '처음 실행 LLM 설정']);
+    expect(countFirstRunMenuRenders('First run: set up an LLM')).toBe(1);
+    expect(countFirstRunMenuRenders('Choose LLM · First run: set up an LLM')).toBe(1);
+    expect(FIRST_RUN_MENU_MARKERS).toEqual(['Choose LLM', 'First run: set up an LLM']);
     expect(FIRST_RUN_MENU_CHOICE_MARKERS).toEqual([
-      '1 Codex, 2 Grok, 3 Claude, 4 OpenRouter, 5 GLM',
-      '1 Codex 구독 로그인 (권장) · 2 OpenRouter 내 키 사용 · 3 기타 API 키 입력 · Enter 건너뛰기',
+      '  1  Codex\n  2  Grok\n  3  Claude\n  4  OpenRouter\n  5  GLM',
+      '1 Codex login with a ChatGPT plan (recommended) · 2 Use my OpenRouter key · 3 Enter another API key · Enter to skip',
     ]);
   });
 

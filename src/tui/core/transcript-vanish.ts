@@ -79,17 +79,29 @@ export function createTranscriptVanishDetector(log: (event: TranscriptVanishEven
       const row = index === undefined ? undefined : frame.displayed[index];
       if (isChatRow(row)) onScreen.set(id, { role: row.role, chars: row.content.length, createdAt: row.ts, content: row.content });
     }
+    // The newest answer on screen now: an older row that left the top edge under it scrolled up with the flow of
+    // the chat (bottom-pinned growth), which is not a vanish (11-25: 906/h slice-window events were this flow).
+    let newestAnswerOnScreen = -1;
+    for (const [id, seen] of onScreen) {
+      const index = savedIndex.get(id);
+      if (seen.role === 'assistant' && index !== undefined && index > newestAnswerOnScreen) newestAnswerOnScreen = index;
+    }
     const prior = previous;
     previous = { sessionId: frame.sessionId, onScreen, scroll: frame.scroll };
     if (!prior || prior.sessionId !== frame.sessionId) return; // a session switch is not a vanish
+    // A pending echo (`user@<ts>` · no turn_id yet) is re-keyed when the child persists it: the same line is still on
+    // screen under its saved id, which is not a vanish (11-25 OP be2bc47e 17:13:57 · visible 6 → 6).
+    const shownNow = new Set([...onScreen.values()].map((one) => `${one.role}\u0000${one.content}`));
     for (const [id, seen] of prior.onScreen) {
       if (onScreen.has(id)) continue;
+      if (shownNow.has(`${seen.role}\u0000${seen.content}`)) continue;
       const index = savedIndex.get(id);
       let cause: TranscriptVanishCause;
       if (index === undefined) cause = frame.reload ?? 'other';
       else if (isChatRow(frame.displayed[index])) {
         if (!frame.evaluated.has(id)) continue; // outside the tail window this frame looked at — not judged
         if (frame.userScrolled || frame.scroll !== prior.scroll) continue; // the person moved the viewport
+        if (index < newestAnswerOnScreen) continue; // scrolled up under a newer answer that is on screen
         cause = 'slice-window';
       } else cause = seen.role === 'user' ? 'notice-strip' : frame.busy ? 'turn-hide' : 'other';
       log({

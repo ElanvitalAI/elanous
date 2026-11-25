@@ -1,10 +1,13 @@
-import type { NextTuiQueueItem, NextTuiQueueMailSpan, NextTuiQueueNoticeSource } from './queue.js';
+import type { NextTuiQueueItem, NextTuiQueueMailSpan, NextTuiQueueNoticeSource, NextTuiQueueTriageMeta } from './queue.js';
 import { isUrgentSeatMail } from '../seat-mail-priority.js';
-import { isInfoSeatMail, seatMailDigestLine, seatMailDigestPrefix } from '../seat-mail-digest.js';
+import { SEAT_MAIL_DIGEST_BODY_CHARS, SEAT_MAIL_PASSIVE_DIGEST_BODY_CHARS, seatMailDigestLine, seatMailDigestPrefix } from '../seat-mail-digest.js';
+import { seatMailRoute } from '../seat-mail-turn-policy.js';
 import { seatMessageContextBlock, type ContextHeaderInput } from '../../msg/msg-context-header.js';
 import type { MessageOrigin } from '../../msg/msg-store.js';
 import { legacyIntent } from '../../msg/msg-receipts.js';
 import { classifySeatMail } from '../queue-finish-first.js';
+import { FEDERATION_WORK_ORDER_NOTE, federationWorkOrderFrame, neutraliseFrameTags } from '../../chat/interjection.js';
+import { seatMailTrustFor } from '../../msg/seat-mail-trust.js';
 
 /**
  * ELN-CHILD-NOTICE-INTO-QUEUE (IMPL-TASK-QUEUE-1117 D칸) — 완료·도착 사건을 입력 큐의
@@ -14,8 +17,8 @@ import { classifySeatMail } from '../queue-finish-first.js';
 
 /** 큐에서 생산자가 쓰는 표면만 — 단위시험은 가짜 없이 진짜 큐를 그대로 쓴다. */
 export interface ChildNoticeQueue {
-  enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta?: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string; mailClass?: 'P0' | 'P1' | 'P2'; mailIntent?: string; replyTo?: number; mail?: NextTuiQueueMailSpan }): NextTuiQueueItem;
-  enqueueCapsuleDoneNotice?(text: string, capsuleId: string, status: string, occurredAt?: number): NextTuiQueueItem | null;
+  enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta?: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string; mailClass?: 'P0' | 'P1' | 'P2'; mailIntent?: string; mailKind?: string; replyTo?: number; mail?: NextTuiQueueMailSpan; triage?: NextTuiQueueTriageMeta }): NextTuiQueueItem;
+  enqueueCapsuleDoneNotice?(text: string, capsuleId: string, status: string, occurredAt?: number, wake?: boolean): NextTuiQueueItem | null;
   readonly items: readonly NextTuiQueueItem[];
 }
 
@@ -89,10 +92,41 @@ export function eventWatchNotice(line: string): string | null {
 
 /** SEAT-INBOX B1-C §3a — 메시지 한 통 = notice 한 항목. 문구 = §5d 머리줄 ⊕ msg:<id> ⊕ 전문(모델 맥락 그대로). */
 export type SeatMessageNoticeInput = ContextHeaderInput & { id: number; body: string; origin?: MessageOrigin;
-  createdAt?: string; unreadTotal?: number; replyTo?: number };
-export function seatMessageNotice(message: SeatMessageNoticeInput): string {
-  const body = seatMessageContextBlock(message);
-  return message.unreadTotal === undefined ? body : `${body}\n\n[미읽음 총 ${message.unreadTotal}통]`;
+  /** BULK-TRIAGE — the recipient seat, the ledger deadline and priority (structured · only the triage card reads them). */
+  recipient?: string; deadlineAt?: string; priority?: number;
+  createdAt?: string; unreadTotal?: number; replyTo?: number;
+  /** SEAT-MAIL-PASSIVE-DEFAULT — the structured fields the turn router reads (seat-mail-turn-policy.ts). */
+  refs?: readonly string[]; resultState?: 'done' | 'failed'; needsAck?: boolean; doneWhen?: string;
+  /** The sender sits above the recipient on the federation ladder (computed by the arrival watcher; absent = unknown). */
+  senderAbove?: boolean;
+  /** SEAT-TURN-FOLLOWUPS ② — replyTo is a mail this seat sent · a `cell:` ref names a cell this seat owns/assigned. */
+  replyToOwn?: boolean; cellDelegated?: boolean;
+  /** LEADER-HAND-CONTRACT ② — the leader ✋ card appended after the mail (open ✋ table ⊕ standard answers ⊕ seat memories). */
+  handCard?: string };
+export function seatMessageNotice(message: SeatMessageNoticeInput, declaredSeats?: ReadonlySet<string>): string {
+  return seatMessageNoticeParts(message, declaredSeats).text;
+}
+
+/**
+ * FED-MAIL-WORK-ORDER — the notice text and where the mail's own body sits in it. Mail from a declared federation seat
+ * (or a crown relay) is a work order: lead note ⊕ `<federation_work_order>` frame (body tags neutralised). Any other
+ * mail keeps the plain header block unchanged. Trust comes from structured fields only.
+ */
+export function seatMessageNoticeParts(message: SeatMessageNoticeInput, declaredSeats?: ReadonlySet<string>, viaLedger = false): { text: string; bodyAt: number; bodyLength: number } {
+  // Same origin source as the mid-turn path (arrival.origin.kind); `fromKind` only for callers that carry no origin.
+  const trust = seatMailTrustFor({ from: message.fromSeat ?? message.sender, originKind: message.origin?.kind ?? message.fromKind ?? null,
+    crownDirective: message.crownDirective ?? null, viaLedger }, declaredSeats);
+  const tail = message.unreadTotal === undefined ? '' : `\n\n[미읽음 총 ${message.unreadTotal}통]`;
+  if (!trust.trusted) {
+    const block = seatMessageContextBlock(message);
+    return { text: `${block}${tail}`, bodyAt: block.length - message.body.length, bodyLength: message.body.length };
+  }
+  const body = neutraliseFrameTags(message.body);
+  const frame = federationWorkOrderFrame({ msgId: message.id, from: message.fromSeat ?? message.sender,
+    intent: message.intent ?? legacyIntent(message.kind), crownDirective: message.crownDirective ?? null });
+  const lead = `${FEDERATION_WORK_ORDER_NOTE}\n${frame.open}\n`;
+  const block = seatMessageContextBlock({ ...message, body });
+  return { text: `${lead}${block}\n${frame.close}${tail}`, bodyAt: lead.length + block.length - body.length, bodyLength: body.length };
 }
 
 /**
@@ -118,9 +152,10 @@ export function createChildNoticeProducers(queue: ChildNoticeQueue) {
     harnessChildFinished(info: Parameters<typeof harnessChildNotice>[0], occurredAt?: number): NextTuiQueueItem | null {
       return enqueueOnce(harnessChildNotice(info), 'harness-child', occurredAt);
     },
-    capsuleDone(event: Parameters<typeof capsuleDoneNotice>[0], occurredAt?: number): NextTuiQueueItem | null {
+    /** RUNSHELL-BG-ENDS-TURN — `wake`: the capsule's started result promised a wake (the row is actionable at once). */
+    capsuleDone(event: Parameters<typeof capsuleDoneNotice>[0], occurredAt?: number, wake?: boolean): NextTuiQueueItem | null {
       if (queue.enqueueCapsuleDoneNotice) return queue.enqueueCapsuleDoneNotice(
-        capsuleDoneNotice(event), event.capsuleId, event.status, occurredAt);
+        capsuleDoneNotice(event), event.capsuleId, event.status, occurredAt, wake);
       return enqueueOnce(capsuleDoneNotice(event), 'capsule-done', occurredAt);
     },
     seatMailArrived(info: Parameters<typeof seatMailNotice>[0], occurredAt?: number): NextTuiQueueItem | null {
@@ -147,20 +182,36 @@ export function createChildNoticeProducers(queue: ChildNoticeQueue) {
       const stillQueued = queue.items.some((item) => item.kind === 'notice' && item.source === 'seat-mail' && item.msgId === message.id);
       if (stillQueued) return null;
       const occurredAt = message.createdAt === undefined ? undefined : Date.parse(message.createdAt);
-      return queue.enqueueNotice(seatMessageNotice(message), 'seat-mail', {
+      // Only the ledger arrival watcher feeds this producer (seat-mail-arrival.ts) — the authenticated source.
+      const notice = seatMessageNoticeParts(message, undefined, true);
+      const routed = seatMailRoute({ ...message, origin: message.origin ?? null });
+      const passive = routed.route === 'passive';
+      // SEAT-TURN-FOLLOWUPS ② — a delegated result is P1: it joins open work after the 60 s window (several results → one turn).
+      const delegatedResult = routed.reason === 'delegated-result';
+      return queue.enqueueNotice(message.handCard ? `${notice.text}\n${message.handCard}` : notice.text, 'seat-mail', {
         msgId: message.id,
         ...(isUrgentSeatMail(message) ? { urgent: true } : {}),
-        // SEAT-MAIL-COALESCE-NOTICE — info mail waits for the next digest; every mail carries its one digest line.
-        ...(isInfoSeatMail(message) ? { passive: true } : {}),
-        digest: seatMailDigestLine(message),
+        // SEAT-MAIL-PASSIVE-DEFAULT — only ✋ · crown · question/needs-reply · P0 alert · failed result · an order from above
+        // open a turn; every other mail waits for the 10-min digest. Every mail carries its one digest line.
+        ...(passive ? { passive: true } : {}),
+        digest: seatMailDigestLine(message, passive ? SEAT_MAIL_PASSIVE_DIGEST_BODY_CHARS : SEAT_MAIL_DIGEST_BODY_CHARS),
         // QUEUE-FINISH-FIRST — the class rides the item from the structured ledger fields (never the body).
-        mailClass: classifySeatMail({ intent: message.intent ?? legacyIntent(message.kind), fromKind: message.fromKind ?? null,
+        mailClass: delegatedResult ? 'P1' : classifySeatMail({ intent: message.intent ?? legacyIntent(message.kind), fromKind: message.fromKind ?? null,
           crownDirective: message.crownDirective ?? null, ...(message.origin ? { origin: message.origin } : {}) }),
         mailIntent: message.intent ?? legacyIntent(message.kind),
+        ...(message.kind ? { mailKind: message.kind } : {}),
         ...(message.replyTo === undefined ? {} : { replyTo: message.replyTo }),
         // NOTICE-FOLD-1LINE — the mail's own body inside this text and inside its digest line, by construction.
-        mail: { sender: message.fromSeat ?? message.sender, bodyAt: seatMessageContextBlock(message).length - message.body.length,
-          bodyLength: message.body.length, digestBodyAt: seatMailDigestPrefix(message).length },
+        mail: { sender: message.fromSeat ?? message.sender, bodyAt: notice.bodyAt,
+          bodyLength: notice.bodyLength, digestBodyAt: seatMailDigestPrefix(message).length },
+        // BULK-TRIAGE — the structured fields the bulk triage card ranks by (body clipped · never re-parsed).
+        triage: { from: message.fromSeat ?? message.sender, ...(message.recipient ? { to: message.recipient } : {}),
+          ...(message.kind ? { kind: message.kind } : {}), ...(message.intent ? { intent: message.intent } : {}),
+          ...(message.crownDirective ? { crownDirective: message.crownDirective } : {}),
+          ...((message.origin?.kind ?? message.fromKind) ? { originKind: (message.origin?.kind ?? message.fromKind)! } : {}),
+          ...(message.deadlineAt ? { deadline: message.deadlineAt } : {}),
+          ...(typeof message.priority === 'number' ? { priority: message.priority } : {}),
+          body: message.body.length <= 300 ? message.body : message.body.slice(0, 300) },
         ...(occurredAt === undefined || Number.isNaN(occurredAt) ? {} : { occurredAt }),
       });
     },

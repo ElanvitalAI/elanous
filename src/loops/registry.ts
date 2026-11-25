@@ -884,6 +884,11 @@ export function appendLoopLog(id: string, text: string, stateRoot = effectiveIns
 export async function setLoopEnabled(id: string, enabled: boolean, yes = false, opts: LoopRegistryOptions = {}): Promise<unknown> {
   const loop = loopStatus(id, opts);
   const action = enabled ? 'start' : 'stop';
+  // A trigger-registry graph is fired by the one `loop trigger tick` entry; a second direct graph cron would
+  // bypass its dedupe, goal check, and shadow→live cutover.
+  const header = (parseYaml(readFileSync(join(resolve(opts.root ?? defaultLoopRoot()), loop.file), 'utf8')) as { loop?: { managed_by?: unknown } } | null)?.loop;
+  if (header?.managed_by === 'trigger-registry')
+    throw new Error(`loop ${id} is managed by the graph trigger registry — use: eln loop trigger register / install`);
   if (!loop.jobs.length && (!enabled || !loop.trigger.cron)) throw new Error(`loop ${id} has no cron job to ${action}`);
   // Registration creates a new cron; toggling an already installed legacy cron remains supported.
   if (enabled && !loop.jobs.length && !loop.root) throw new Error(`loop ${id} requires root (조율자|수호자) for new registration`);

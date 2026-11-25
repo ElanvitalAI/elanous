@@ -319,7 +319,7 @@ describe('dispatchGrep — bounds + pagination (requires rg)', () => {
     const r = await dispatchGrep({ pattern: 'needle', path: dir, head_limit: 10 });
     expect(r.truncated).toBe(true);
     expect(r.numFiles).toBeLessThanOrEqual(10);
-    expect(r.output).toContain('more results');
+    expect(r.output).toContain('truncated: 40 more matching files');
     expect(r.output).toContain('offset:');
   });
 

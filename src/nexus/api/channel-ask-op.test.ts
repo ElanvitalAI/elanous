@@ -168,7 +168,7 @@ test('ten simulated Telegram questions complete received → forwarded → OP an
     for (const { questionId, index, chatId } of [...queued].reverse()) {
       if (index === 2 || index === 6) await new Promise((resolve) => setTimeout(resolve, 10));
       // Simulate OP answering through the actual message CLI posting path.
-      await opCli.parseAsync(['msg', 'post', `fake answer ${index}`, '--from', 'OP', '--to', 'TELEGRAM', '--reply-to', String(questionId), '--json'], { from: 'user' });
+      await opCli.parseAsync(['msg', 'post', `fake answer ${index}`, '--from', 'OP', '--to', 'TELEGRAM', '--reply-to', String(questionId), '--kind', 'status', '--json'], { from: 'user' });
       const answer = JSON.parse(opCliOut.pop()!) as { id: number };
       expect(await deliverChannelOpReply(store, answer.id, transport, { instance: 'test-instance' }))
         .toMatchObject({ status: 'delivered' });

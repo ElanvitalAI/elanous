@@ -129,7 +129,7 @@ export function drawView(view: ViewInput): string {
 
 /** The status line: where the pane is and how to leave. (Status words from status-vocab come with the left list, stage 3.) */
 export function statusLine(pane: string, note?: string): string {
-  return ` ${pane}${note ? ` · ${note}` : ''} · ctrl+b q 분리 `;
+  return ` ${pane}${note ? ` · ${note}` : ''} · ctrl+b q detach `;
 }
 
 /** Keys from stdin, decoded as ONE stream: a multi-byte character (Korean…) split across two chunks is joined, never replaced. */
@@ -202,7 +202,11 @@ export interface PaneRow {
   /** SIDETAB-TWO-MARKS: the seat state code the pane published, its reason, and the seat's unread mail — the attention mark's inputs. */
   readonly seatState?: SeatState;
   readonly seatReason?: BlockReason;
+  readonly seatSource?: 'reported' | 'derived';
   readonly unread?: number;
+  /** DEMO-FANOUT-LIVE-OP-SEAT: the pane that opened this one through the tool door (a worker child) and the turns it finished. */
+  readonly parentPane?: string;
+  readonly turnsDone?: number;
 }
 
 /** Mark of a host the federated list reports down (design DESIGN-ELS-SIDETAB-SERVER §원격 «⇄aws1 ✕»; same «✕ ⇄host · 연결 끊김» as the sidetab rows). */
@@ -276,7 +280,8 @@ export function parsePaneRows(listJson: string): PaneRow[] {
     const row = raw as Record<string, unknown>;
     if (typeof row.pane !== 'string' || typeof row.address !== 'string') continue;
     const wsId = row.address.split('/')[0] ?? '';
-    rows.push({ pane: row.pane, ...(typeof row.tab === 'string' ? { tabId: row.tab } : {}), wsId, ...(coordinators.has(wsId) ? { role: 'coordinator' as const } : {}), ...(row.spaceCoordinator === true ? { spaceCoordinator: true } : {}), ...(typeof row.seat === 'string' && row.seat ? { seat: row.seat } : {}), workspace: String(row.workspace ?? ''), title: `${String(tabs.find(tab => tab.id === row.tab)?.label ?? row.title ?? row.pane)} ${buildBadge(row.build)}`, state: rowState(row), ...markFields(row), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
+    rows.push({ pane: row.pane, ...(typeof row.tab === 'string' ? { tabId: row.tab } : {}), wsId, ...(coordinators.has(wsId) ? { role: 'coordinator' as const } : {}), ...(row.spaceCoordinator === true ? { spaceCoordinator: true } : {}), ...(typeof row.seat === 'string' && row.seat ? { seat: row.seat } : {}), workspace: String(row.workspace ?? ''), title: `${String(tabs.find(tab => tab.id === row.tab)?.label ?? row.title ?? row.pane)} ${buildBadge(row.build)}`, state: rowState(row), ...markFields(row), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}),
+      ...(typeof row.parentPane === 'string' && row.parentPane ? { parentPane: row.parentPane, turnsDone: typeof row.turnsDone === 'number' && Number.isSafeInteger(row.turnsDone) && row.turnsDone > 0 ? row.turnsDone : 0 } : {}) });
   }
   return coordinatorFirst(rows);
 }
@@ -312,15 +317,15 @@ export function parseRemoteRows(listJson: string): PaneRow[] {
 function rowState(row: Record<string, unknown>): string {
   const status = parsePaneSeatStatus(row.status);
   // SIDETAB-TWO-MARKS: a seat that needs a person (or waits on a reply/timer) is IDLE in slot 1; the attention mark says why.
-  if (status && (needsPerson(status.state, status.reason) || isWaiting(status.state, status.reason))) return 'idle';
+  if (status && (needsPerson(status.state, status.reason, status.source) || isWaiting(status.state, status.reason, status.source))) return 'idle';
   return status ? wordOfSeatState(status.state) : String(row.activityState ?? row.state ?? '');
 }
 
 /** SIDETAB-TWO-MARKS: the attention inputs of a list row (codes and the mail badge only). */
-function markFields(row: Record<string, unknown>): Pick<PaneRow, 'seatState' | 'seatReason' | 'unread'> {
+function markFields(row: Record<string, unknown>): Pick<PaneRow, 'seatState' | 'seatReason' | 'seatSource' | 'unread'> {
   const status = parsePaneSeatStatus(row.status);
   const mail = (row.unreadMail as { count?: unknown } | null | undefined)?.count;
-  return { ...(status ? { seatState: status.state, ...(status.reason ? { seatReason: status.reason } : {}) } : {}),
+  return { ...(status ? { seatState: status.state, ...(status.reason ? { seatReason: status.reason } : {}), seatSource: status.source } : {}),
     ...(typeof mail === 'number' && mail > 0 ? { unread: mail } : {}) };
 }
 
@@ -446,4 +451,4 @@ export function createAppFrameWriter(write: (text: string) => void): (screen: st
   };
 }
 
-export const SIDEBAR_HELP = 'ctrl+b: m move tab · , rename tab · j/k 이동 · w 작업공간 · 1-9 · c 새 pane · a 엘라누스 채팅 · N 새 작업공간 · x 닫기 · D 작업공간 닫기 · s 사이드바 · g agents 정렬 · q 분리';
+export const SIDEBAR_HELP = 'ctrl+b: m move tab · , rename tab · j/k move · w workspace · 1-9 · c new pane · a Elanous chat · N new workspace · x close · D close workspace · s sidebar · g sort agents · PgUp/PgDn/Home/End list · ←/→ tabs · q detach';

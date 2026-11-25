@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 // In the isolated child, install the parent key before the gateway captures it.
 import { testRunShellIssuer as issuer } from '../../shell-primitive/runshell-test-issuer.js';
-import { buildRunShellTool, dispatchRunShell, scriptCommandPolicy } from './shell.js';
+import { buildRunShellTool, dispatchRunShell, RUN_SHELL_ENTRY_VARIANTS, scriptCommandPolicy } from './shell.js';
 import { defaultCheckScript } from './run-shell-default-checks.js';
 import { runShellScript } from './run-shell-script.js';
 import { createRunShellApprovalIssuer, RUNSHELL_PUBLIC_KEY_ENV, RUNSHELL_APPROVAL_RESULT, type RunShellApprovalCall } from '../../tui-client/next-runshell-approval.js';
@@ -99,8 +99,8 @@ test('non-OP seat checks use an exact count request and never request mail bodie
   expect(() => defaultCheckScript({ check: '30-minute', checkSeat: 'OTHER', checkVersion: '0.3.35' })).toThrow();
   const schema = buildRunShellTool().parameters as { properties: { checkSeat: { enum: string[] } } };
   expect(schema.properties.checkSeat.enum).toEqual(['OP', 'JUD', 'JUD-B', 'REL', 'RES']);
-  const contract = buildRunShellTool().parameters as { oneOf: { required: string[] }[] };
-  expect(contract.oneOf.find((branch) => branch.required.includes('check'))?.required).toEqual(['check', 'checkSeat', 'checkVersion']);
+  expect(RUN_SHELL_ENTRY_VARIANTS.find((branch) => branch.includes('check'))).toEqual(['check', 'checkSeat', 'checkVersion']);
+  expect(buildRunShellTool().parameters).not.toHaveProperty('oneOf');
   expect(() => defaultCheckScript({ check: '30-minute', checkSeat: 'OP', checkVersion: '0.3.35' })).toThrow();
 });
 
@@ -123,8 +123,8 @@ test('default check input contract matches local policy and schema', async () =>
   let approvals = 0;
   await expect(dispatchRunShell({ ...base, checkPreviousGreen: 10000 }, { scriptApproval: async () => { approvals++; return { allowed: true, priorHumanApproval: false }; } })).rejects.toThrow('previous green');
   expect(approvals).toBe(0);
-  const schema = buildRunShellTool().parameters as { oneOf: Array<{ required: string[] }>; properties: { checkPreviousGreen: { minimum: number; maximum: number } } };
-  expect(schema.oneOf.find((variant) => variant.required.includes('check'))?.required).not.toContain('checkPreviousGreen');
+  const schema = buildRunShellTool().parameters as { properties: { checkPreviousGreen: { minimum: number; maximum: number } } };
+  expect(RUN_SHELL_ENTRY_VARIANTS.find((variant) => variant.includes('check'))).not.toContain('checkPreviousGreen');
   expect(schema.properties.checkPreviousGreen).toMatchObject({ minimum: 0, maximum: 9999 });
 });
 

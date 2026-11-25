@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
-import { addItem, cellsReferencingDoc, claimItem, checklistEvidenceChain, checklistGate, checklistHistory, cutChecklistGate, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseChecklistTargetPaths, parseOwner, parityGap, refRoots, postP0StallAlerts, removeItem, renderRefsStatus, seedFromRoadmap, setItem, setMust, summarize, summarizeChecklist } from './checklist.js';
+import { addItem, assignItem, cellsReferencingDoc, claimItem, checklistEvidenceChain, checklistGate, checklistHistory, cutChecklistGate, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseChecklistTargetPaths, parseOwner, parityGap, refRoots, postP0StallAlerts, removeItem, renderRefsStatus, seedFromRoadmap, setItem, setMust, summarize, summarizeChecklist } from './checklist.js';
 import { registerReleaseCommands } from '../cli/release-cli.js';
 import { collectChecklistEvidenceStages, registerReleaseChecklistReadCommands, type ChecklistEvidenceCommandRunner, type ChecklistEvidenceReader } from '../cli/release-checklist-read-cli.js';
 import * as features from './feature-store.js';
@@ -1171,4 +1171,31 @@ describe('OP-STALL-P0-HOURLY: stalled P0 head mails OP once', () => {
       expect(mails().length).toBe(1);
     } finally { store.close(); }
   });
+});
+
+// CHECKLIST-OWNER-HAND-SEATS (TRACE-OP-RESOURCE-OPTIMIZATION-1125 §6-2): a hand seat in a v2 seat registry owns a cell,
+// and seat assign records actor ⊕ reason when it moves an owner. Literal expectations.
+test('CHECKLIST-OWNER-HAND-SEATS: a v2-registered hand seat is a valid owner · assignItem moves the owner with actor and reason', () => {
+  const dir = root();
+  const seatState = join(dir, 'seat-state');
+  mkdirSync(seatState, { recursive: true });
+  const registryPath = join(seatState, 'seat-registry.json');
+  writeFileSync(registryPath, JSON.stringify({ version: 2, seats: [
+    { address: 'HAND-ELN-V2X', host: 'mshq', runtime: 'eln', delivery: 'queue', replyBody: 'agent', optIn: true },
+  ] }));
+  expect(parseOwner('HAND-ELN-V2X')).toEqual({ seat: 'HAND-ELN-V2X' });
+  addItem('9.9.9', { id: 'ASSIGN-1', title: 'assign me', owner: 'TC' });
+  const moved = assignItem('9.9.9', 'ASSIGN-1', 'HAND-ELN-V2X', { actor: 'OP', reason: 'idle hand × open cell' });
+  expect(moved.from).toBe('TC');
+  expect(moved.outcome).toBe('assigned');
+  expect(listChecklist('9.9.9').items.find((item) => item.id === 'ASSIGN-1')?.owner).toBe('HAND-ELN-V2X');
+  const claim = listChecklist('9.9.9').history.filter((row) => row.id === 'ASSIGN-1' && row.field === 'claim').at(-1);
+  expect(claim?.by).toBe('OP');
+  expect(claim?.from).toBe('TC');
+  expect(claim?.to).toBe('HAND-ELN-V2X');
+  expect(claim?.reason).toBe('idle hand × open cell');
+  expect(assignItem('9.9.9', 'ASSIGN-1', 'HAND-ELN-V2X', { actor: 'OP', reason: 'again' }).outcome).toBe('same');
+  rmSync(registryPath);
+  expect(() => parseOwner('HAND-ELN-V2X')).toThrow(CliUserError);
+  expect(() => assignItem('9.9.9', 'ASSIGN-1', 'HAND-ELN-V2X', { actor: 'OP', reason: 'gone' })).toThrow(CliUserError);
 });

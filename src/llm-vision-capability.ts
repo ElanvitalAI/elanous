@@ -66,6 +66,7 @@
  *  values from src/llm.ts plus 'openai-codex' which is what
  *  makeCodexProvider exposes (separate from 'openai' Chat). */
 import { getCatalog } from './registry/loader.js';
+import { cachedOpenRouterVision, normalizeOpenRouterUpstreamId } from './llm/openrouter-vision-lookup.js';
 
 export type LlmBrand =
   | 'anthropic'
@@ -75,7 +76,9 @@ export type LlmBrand =
   | 'gemini'
   | 'local'
   // 대표 2026-09-23 — 게이트웨이. 비전은 «이름»이 아니라 카탈로그 폴드의 `vision` 사실로 판정한다.
-  | 'openrouter';
+  | 'openrouter'
+  // VISION-CATALOG-BUILTIN (대표 2026-11-25) — Z.ai GLM 직결(`makeZaiCodingPlanProvider` 가 호환 공급자를 'glm' 이름으로 만든다).
+  | 'glm';
 
 /**
  * U22·c (2026-05-18) — coarse-grained vision capability hint by brand
@@ -99,6 +102,8 @@ export function brandLikelyVisionCapable(brand: LlmBrand | undefined): boolean {
       return true;
     case 'local':
       return false; // local model 일반적으로 text-only
+    case 'glm':
+      return true; // GLM 직결은 이미지가 든 요청을 비전 형제(glm-5.3-flash)로 돌린다(zai-coding-plan.ts)
     case 'openrouter':
       return true; // 모델을 모를 때는 다른 cloud brand 와 같은 낙관(모델을 알면 isVisionCapableModel 이 카탈로그로 가른다)
   }
@@ -121,6 +126,62 @@ export type VisionWireAxis = 'userMessage' | 'toolResult';
  *  curated list below. Empty/null model id → defaults to `false` so
  *  callers without an explicit model selection get the conservative
  *  fallback. */
+/**
+ * VISION-CATALOG-BUILTIN (대표 2026-11-25 «이미지는 모든 공급자에서») — 내장 비전 사실.
+ * 발견 스냅숏이 없거나(시험 우주) 낡아도 현행 주력 모델의 이미지 입력을 «모른다»로 떨어뜨리지 않는다.
+ * 근거 = OpenRouter `GET /api/v1/models` `architecture.input_modalities` 실측 2026-11-25:
+ *   anthropic/claude-{opus-5.5,sonnet-5.5,sonnet-5,haiku-5.5,fable-5.x,opus-4.x} = text+image+file ·
+ *   x-ai/grok-4.{20,3,5,6,7} = text+image+file · google/gemini-3.x = text+image+… ·
+ *   openai/gpt-6.x(terra·sol·luna·astra) = text+image+file ·
+ *   z-ai/glm-5.3-flash(·flashx) · glm-5v-turbo · glm-4.6v · glm-4.5v = image ✅ / z-ai/glm-5.3 · 5.2 · 5.1 · 5 · 4.7(-flash) · 4.6 · 4.5 = text-only ❌.
+ * 입력 = upstream id(`<vendor>/<model>`, 소문자 · `openrouter/` 없음). 반환 = 사실(true/false) 또는 undefined(모른다).
+ */
+export function builtinVisionFact(upstreamId: string): boolean | undefined {
+  const id = upstreamId.toLowerCase();
+  const slash = id.indexOf('/');
+  if (slash < 0) return undefined;
+  const vendor = id.slice(0, slash);
+  const model = id.slice(slash + 1);
+  switch (vendor) {
+    case 'anthropic':
+      return model.startsWith('claude-') ? true : undefined;
+    case 'x-ai':
+      return /^grok-([4-9]|\d{2,})/.test(model) && !model.startsWith('grok-code') ? true : undefined;
+    case 'google':
+      return model.startsWith('gemini-') ? true : undefined;
+    case 'openai':
+      if (model.startsWith('gpt-4o') || isGpt5OrLaterGeneration(model)) return true;
+      return undefined;
+    case 'z-ai':
+      return glmVisionFact(model);
+    default:
+      return undefined;
+  }
+}
+
+/** GLM 비전 규칙(z.ai id 와 OpenRouter `z-ai/` id 공용) — flash 5.3+ 와 «V» 변형만 이미지 · 나머지 glm 은 text-only. */
+export function glmVisionFact(model: string): boolean | undefined {
+  const m = model.toLowerCase().replace(/^z-ai\//, '');
+  if (!m.startsWith('glm-')) return undefined;
+  if (/^glm-\d+(\.\d+)?v(\b|-|$)/.test(m)) return true;           // glm-4.5v · glm-4.6v · glm-5v-turbo
+  const flash = /^glm-(\d+)(?:\.(\d+))?-flash/.exec(m);
+  if (flash) {
+    const major = Number(flash[1]);
+    const minor = Number(flash[2] ?? 0);
+    return major > 5 || (major === 5 && minor >= 3);                // glm-5.3-flash(·flashx) ✅ · glm-4.7-flash ❌
+  }
+  return false;
+}
+
+/** OpenRouter 비전 «사실» — 카탈로그(발견 폴드·손 YAML) → 내장 표 → 공급자 메타데이터 캐시 순. 모르면 undefined. */
+export function openRouterVisionFact(model: string): boolean | undefined {
+  const m = model.toLowerCase();
+  const rec = getCatalog().models.get(m) ?? getCatalog().models.get(model);
+  if (rec && rec.vision !== undefined) return rec.vision === 'images' || rec.vision === 'pdf' || rec.vision === 'video';
+  const upstream = normalizeOpenRouterUpstreamId(model);
+  return builtinVisionFact(upstream) ?? cachedOpenRouterVision(upstream);
+}
+
 /** gpt-5 «이후» 세대(gpt-6·gpt-7 …)인가 — 이름 접두가 아니라 «세대 숫자»로 가른다.
  *  ⛔ 2026-09-23: `startsWith('gpt-5')` 가 gpt-6 을 비전 불가로 읽어 운영 기본(gpt-6-sol)에 이미지를 안 보냈다.
  *  codex 모델 캐시 실측: gpt-6-sol·astra·luna 전부 `input_modalities: [text, image]`.
@@ -206,10 +267,16 @@ export function isVisionCapableModel(
       //   카탈로그 폴드(`/api/v1/models` 의 `architecture.input_modalities` → `vision`)만 믿는다.
       //   카탈로그에 없으면(스냅숏 미갱신) «모른다» → 보내지 않는다(400 보다 텍스트 전용이 낫다).
       //   toolResult: Chat Completions 의 tool 메시지는 text-only(openai 와 같은 제약).
+      //   VISION-CATALOG-BUILTIN (11-25) — 카탈로그에 없으면 내장 표 → 메타데이터 캐시(openRouterVisionFact).
       if (axis !== 'userMessage') return false;
-      const vision = getCatalog().models.get(m)?.vision ?? getCatalog().models.get(model)?.vision;
-      return vision === 'images' || vision === 'pdf' || vision === 'video';
+      return openRouterVisionFact(model) === true;
     }
+
+    case 'glm':
+      // Z.ai GLM 직결(OpenAI 호환 Chat Completions · user content 의 `image_url`). 도구 메시지는 text-only 라
+      // userMessage 축이 follow-up(합성 user 메시지) 우회를 켠다 — openai·grok 과 같은 제약.
+      if (axis !== 'userMessage') return false;
+      return glmVisionFact(m) === true;
 
     case 'gemini':
       // Gemini native wire (messagesToGeminiInput in src/llm.ts):

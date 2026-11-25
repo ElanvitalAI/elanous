@@ -19,6 +19,11 @@ export interface QueueIdleWatchdogDeps {
   /** Sends the wake key for this wake kind. `false` = refused (boot person-first · terminal not raw) — logged, retried next window. */
   wake: (event: 'idle-stall-wake' | 'boot-wake') => boolean;
   log: QueueIdleWatchdogLog;
+  /**
+   * 11-25 OP deaf: a stall with HELD mail (finish-first) is not fixed by a knock — the door keeps holding. Before the
+   * stall wake, this releases the held mail as one digest; true = something was released (logged).
+   */
+  releaseHeld?: () => boolean;
   /** Idle-with-queue time after which the queue is judged stalled. */
   stallMs: number;
 }
@@ -81,6 +86,7 @@ export function createQueueIdleWatchdog(deps: QueueIdleWatchdogDeps): QueueIdleW
       }
       const idleMs = now - idleSince;
       if (idleMs < deps.stallMs) return { kind: 'waiting', idleMs };
+      if (deps.releaseHeld?.() === true) deps.log('idle-stall-release-held', { queued: deps.queued(), idleMs });
       return fire('idle-stall-wake', idleMs, { stallMs: deps.stallMs });
     },
     noteDispatch(): void {

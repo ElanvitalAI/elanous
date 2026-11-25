@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, setSystemTime, test } from 'bun:test';
 import { createNextTuiQueue } from './core/queue.js';
 import {
-  classifySeatMail, createQueueFinishFirst, decideIdleQueue, heldChip, heldPeekBlock, midTurnMailAction, NO_WAITS,
+  classifyOpBatchItem, classifySeatMail, createQueueFinishFirst, decideIdleQueue, heldChip, heldPeekBlock, midTurnMailAction, NO_WAITS,
   type QueueClassItem,
 } from './queue-finish-first.js';
 import { mailReplyId } from '../op-requirements/turn-end.js';
@@ -363,5 +363,62 @@ describe('QUEUE-P1-3MIN — P1 hold-and-resume, never > 3 min (13:1x)', () => {
   test('P1 never waited more than 180 s in any scenario of this suite', () => {
     expect(p1Waits.length).toBeGreaterThan(0);
     expect(Math.max(...p1Waits)).toBeLessThanOrEqual(180_000);
+  });
+});
+
+describe('11-25 OP deaf — an idle seat with held mail is released by the stall watchdog', () => {
+  test('self-addressed P2 mail held for work-in-progress: forceRelease → the next decide is release(idle-stall)', () => {
+    const { ff, queue, logs, queued } = rig();
+    ff.noteTurnEnd({ workInProgress: true });
+    // from=OP to=OP: msg-wake skips it (skipped-self), the TUI watcher still queues it as an ordinary P2 info mail.
+    queue.enqueueNotice('[seat mail #901] OP → OP relay', 'seat-mail', { msgId: 901, mailClass: 'P2', mailIntent: 'info' });
+    queue.enqueueNotice('[seat mail #902] OP → OP follow-up', 'seat-mail', { msgId: 902, mailClass: 'P2', mailIntent: 'info' });
+    expect(ff.decide(queued()).kind).toBe('continue');
+    expect(ff.heldCount()).toBe(2);
+    expect(ff.forceRelease()).toBe(true);
+    expect(ff.decide(queued())).toEqual({ kind: 'release', reason: 'idle-stall' });
+    expect(logs.filter((l) => l.event === 'idle-stall-release').map((l) => l.data)).toEqual([{ held: 2 }]);
+    expect(logs.filter((l) => l.event === 'released').map((l) => l.data)).toEqual([{ reason: 'idle-stall', count: 2, continuations: 0 }]);
+    expect(ff.heldCount()).toBe(0);
+    // One-shot: nothing held now → forceRelease is a no-op.
+    expect(ff.forceRelease()).toBe(false);
+  });
+});
+
+describe('OP-INBOX-PULSE-BATCH — OP seat holds every non-P0 mail for the pulse', () => {
+  const mail = (id: string, extra: Partial<QueueClassItem> = {}): QueueClassItem =>
+    ({ id, text: `mail ${id}`, kind: 'notice', source: 'seat-mail', enqueuedAt: 0, ...extra });
+
+  test('class: request/decision/related/graph-node → P2; crown · alert · release-stop · person → P0', () => {
+    expect(classifyOpBatchItem(mail('a', { mailClass: 'P1', mailIntent: 'request' }))).toBe('P2');
+    expect(classifyOpBatchItem(mail('b', { mailClass: 'P1', mailIntent: 'decision' }))).toBe('P2');
+    expect(classifyOpBatchItem(mail('c', { replyTo: 7 }), { replyTo: new Set([7]) })).toBe('P2');
+    expect(classifyOpBatchItem({ id: 'g', text: 'stall', kind: 'notice', source: 'graph-node' })).toBe('P2');
+    expect(classifyOpBatchItem(mail('d', { mailClass: 'P0' }))).toBe('P0');
+    expect(classifyOpBatchItem(mail('e', { mailClass: 'P2', mailKind: 'release-stop' }))).toBe('P0');
+    expect(classifyOpBatchItem({ id: 'u', text: 'hi', kind: 'user' })).toBe('P0');
+    expect(classifySeatMail({ intent: 'alert' })).toBe('P0');
+  });
+
+  test('idle OP with a decision held → hold(pulse-batch), not deliver-p1; other seats unchanged', () => {
+    const items = [mail('a', { mailClass: 'P1', mailIntent: 'decision' })];
+    const base = { items, waits: NO_WAITS, workInProgress: false, continuationsWhileHolding: 0, awaitingStartSince: null, continuationTried: false, now: 60_000 };
+    expect(decideIdleQueue({ ...base, opBatch: true })).toEqual({ kind: 'hold', heldIds: ['a'], reason: 'pulse-batch' });
+    expect(decideIdleQueue(base).kind).toBe('deliver-p1');
+  });
+
+  test('pulse opened → one release; 30 min without pulse → starvation release; idle stall does not force', () => {
+    let t = 0;
+    const ff = createQueueFinishFirst({ now: () => t, opBatch: true });
+    const items = [mail('a', { mailClass: 'P2' }), mail('b', { mailClass: 'P1', mailIntent: 'request' })];
+    expect(ff.decide(items).kind).toBe('hold');
+    expect(ff.forceRelease()).toBe(false);
+    expect(ff.holding()).toBe(true);
+    ff.notePulse();
+    expect(ff.decide(items)).toEqual({ kind: 'release', reason: 'pulse' });
+    t = 29 * 60_000;
+    expect(ff.decide(items).kind).toBe('hold');
+    t = 30 * 60_000;
+    expect(ff.decide(items)).toEqual({ kind: 'release', reason: 'starvation' });
   });
 });

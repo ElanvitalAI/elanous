@@ -133,6 +133,8 @@ export function applyIsolatedRoot(dir: string): void {
       } else if (sync.isTestConfigStale(dir)) {
         console.error(`[test-isolation] ⚠️ 운영 config 가 테스트 사본보다 최신 — 'elanous config sync-test' 로 갱신 권장`);
       }
+      // VISION-CATALOG-BUILTIN (11-25) — 모델 사실 캐시(발견 스냅숏·비전 캐시)는 config 처럼 옮긴다(자격 0).
+      sync.syncTestModelFactCaches(dir);
       // 부팅 불변식 — 테스트 프로세스의 config 경로는 반드시 test 루트 안.
       // (위 강제로 항상 참이어야 하나, 미래 회귀를 기동 거부로 잡는다.)
       const paths = require('../nexus/config/paths.js') as typeof import('../nexus/config/paths.js');

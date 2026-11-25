@@ -163,7 +163,7 @@ describe('MsgPost collapsed result summary (first slice)', () => {
       const collapsed = variants?.collapsed.join('\n') ?? '';
       const expanded = variants?.expanded?.join('\n') ?? '';
       const callRow = renderToolCallEvent(call, baseConfig)?.join('\n') ?? '';
-      expect(collapsed).toContain(`#${result.message.id}`);
+      expect(collapsed).toContain(`#${result.message!.id}`);
       expect(collapsed).not.toContain(BODY_ONE);
       expect(callRow).not.toContain(BODY_ONE);
       expect(expanded).toContain(result.output);
@@ -243,12 +243,12 @@ describe('MsgPost collapsed result summary (first slice)', () => {
       expect(current).not.toEqual(generic);
       const collapsed = replaceBlock(current)?.collapsedLines.join('\n') ?? '';
       const genericCollapsed = replaceBlock(generic)?.collapsedLines.join('\n') ?? '';
-      expect(collapsed).toContain(`#${result.message.id}`);
+      expect(collapsed).toContain(`#${result.message!.id}`);
       expect(collapsed).toContain('post');
       expect(collapsed).toContain('TC');
       expect(collapsed).not.toContain(BODY_ONE);
       expect(genericCollapsed).toContain('result (');
-      expect(genericCollapsed).not.toContain(`#${result.message.id}`);
+      expect(genericCollapsed).not.toContain(`#${result.message!.id}`);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

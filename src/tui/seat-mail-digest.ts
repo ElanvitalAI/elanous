@@ -20,6 +20,11 @@ export const SEAT_MAIL_INFO_KINDS: readonly string[] = ['info', 'ack', 'receipt'
 
 /** Body characters one digest line keeps. */
 export const SEAT_MAIL_DIGEST_BODY_CHARS = 120;
+/**
+ * SEAT-MAIL-PASSIVE-DEFAULT — a passive mail's digest line keeps fewer body characters: passive mail is now most of the
+ * traffic (status · reply · notice), and its line is the only context it costs (SIM-STEWARD-AB-1125: status share).
+ */
+export const SEAT_MAIL_PASSIVE_DIGEST_BODY_CHARS = 24;
 
 /** The first line of a digest turn — the count header (NOTICE-FOLD-1LINE skips it for the folded preview). */
 export const SEAT_MAIL_DIGEST_HEAD = '[seat-mail digest]';
@@ -48,9 +53,9 @@ export function isInfoSeatMail(message: SeatMailDigestInput): boolean {
 }
 
 /** One digest line: `#id · from · kind · first 120 body chars` (whitespace folded to single spaces). */
-export function seatMailDigestLine(message: SeatMailDigestInput): string {
+export function seatMailDigestLine(message: SeatMailDigestInput, maxBody: number = SEAT_MAIL_DIGEST_BODY_CHARS): string {
   const flat = message.body.replace(/\s+/gu, ' ').trim();
-  const body = flat.length <= SEAT_MAIL_DIGEST_BODY_CHARS ? flat : `${flat.slice(0, SEAT_MAIL_DIGEST_BODY_CHARS)}…`;
+  const body = flat.length <= maxBody ? flat : `${flat.slice(0, maxBody)}…`;
   return `${seatMailDigestPrefix(message)}${body}`;
 }
 
@@ -67,6 +72,39 @@ export interface SeatMailBundleNotice {
   readonly msgId?: number;
   readonly digest?: string;
   readonly passive?: boolean;
+  /** NOTICE-FOLD-1LINE span — the sender and where the body starts inside `digest` (grouped passive lines read it). */
+  readonly mail?: { readonly sender: string; readonly digestBodyAt?: number };
+}
+
+
+/**
+ * SEAT-MAIL-PASSIVE-DEFAULT — passive mail from one sender with 2+ mails in a bundle folds into ONE line:
+ * `- TC-H3 ×3 · #12 status · #15 - · #33 notice`. A sender with one passive mail keeps its own (short) digest line.
+ * Every id stays listed (the ack after the turn is per id; `eln msg show <id>` reads a body).
+ */
+function digestLines(mail: readonly SeatMailBundleNotice[]): string[] {
+  const groups = new Map<string, SeatMailBundleNotice[]>();
+  const senderOf = (notice: SeatMailBundleNotice): string | null => (notice.passive === true && notice.mail?.sender ? notice.mail.sender : null);
+  for (const notice of mail) {
+    const sender = senderOf(notice);
+    if (sender === null) continue;
+    if (!groups.has(sender)) groups.set(sender, []);
+    groups.get(sender)!.push(notice);
+  }
+  const lines: string[] = [];
+  for (const notice of mail) {
+    const sender = senderOf(notice);
+    const group = sender === null ? undefined : groups.get(sender);
+    if (!group || group.length === 1) { lines.push(`- ${notice.digest}`); continue; }
+    if (group[0] !== notice) continue; // the group line sits where its first mail arrived
+    const ids = group.map((member) => {
+      const at = member.mail?.digestBodyAt;
+      const parts = (typeof at === 'number' ? member.digest!.slice(0, at) : '').split(' · ');
+      return `#${member.msgId} ${parts.length >= 3 && parts[2] ? parts[2] : '-'}`;
+    });
+    lines.push(`- ${sender} ×${group.length} · ${ids.join(' · ')}`);
+  }
+  return lines;
 }
 
 /**
@@ -81,7 +119,7 @@ export function seatMailBundleText(notices: readonly SeatMailBundleNotice[]): st
   const info = mail.filter((notice) => notice.passive === true);
   const action = mail.filter((notice) => notice.passive !== true);
   const header = `${SEAT_MAIL_DIGEST_HEAD} ${mail.length} mails — ${action.length} need action · ${info.length} info (every mail listed here is acked automatically after this turn)`;
-  const lines = mail.map((notice) => `- ${notice.digest}`);
+  const lines = digestLines(mail);
   const blocks = action.map((notice) => notice.text);
   return [[header, ...lines].join('\n'), ...blocks, ...rest.map((notice) => notice.text)].join('\n\n');
 }

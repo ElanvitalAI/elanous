@@ -80,7 +80,7 @@ test('internal fanout completion opens no automatic turn; a direct background Ag
         ]),
         [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify([
           { when: 'Research this question from the angle', name: 'OmniSearch', args: { query: 'fixed widget standard' } },
-          { when: 'BG-GO', name: 'Agent', args: { description: 'bg probe', prompt: 'BGPROBE run in the background', run_in_background: true } },
+          { when: 'BG-GO', name: 'Agent', args: { description: 'bg probe', prompt: 'BGPROBE run in the background', reason: 'fixture', run_in_background: true } },
         ]),
         // Only the background child is slow, so its completion lands after its own turn has gone idle.
         [TEST_FAKE_LLM_DELAY_MS_ENV]: '4000', [TEST_FAKE_LLM_DELAY_WHEN_ENV]: 'BGPROBE',

@@ -24,7 +24,7 @@ test('Claude HQ user conversation syncs three originals and search returns them;
   ];
   const contents = rows.map(row => JSON.stringify(row)).join('\n') + '\n';
   writeFileSync(file, contents);
-  const opts = { claudeRoot, stateDir: join(root, 'state'), codexRoot: join(root, 'codex'), grokRoot: join(root, 'grok'), surfaceDb: join(root, 'surface'), repoRoot: join(root, 'missing') };
+  const opts = { claudeRoot, stateDir: join(root, 'state'), codexRoot: join(root, 'codex'), grokRoot: join(root, 'grok'), surfaceDb: join(root, 'surface'), repoRoot: join(root, 'missing'), embed: null };
   const lines: string[] = [];
   const cli = new Command(); cli.exitOverride();
   registerDirectivesCommands(cli, opts, { log: value => lines.push(String(value)) });

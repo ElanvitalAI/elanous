@@ -13,8 +13,9 @@ export function oneLineTitle(title: string): string {
 
 /** Read-only CLI view of the same traffic snapshot returned by the Nexus resource GET. */
 export function registerResourceCommands(program: Command, observe: () => TrafficResult = observeLoopResources): void {
-  program.command('resource').description('자리별 루프 자원 관측 (읽기 전용)')
-    .command('status').description('자리별 공급·다음 칸·임대 상태')
+  const resource = program.command('resource').description('자리별 루프 자원 관측 · 매시 자원 최적화 표(RESOURCE-OPT-HOURLY)');
+  registerResourceOptCommands(resource);
+  resource.command('status').description('자리별 공급·다음 칸·임대 상태')
     .option('--json', '관측 스냅샷 JSON 출력')
     .action(async (opts: { json?: boolean }) => {
       let resource: TrafficResult;
@@ -44,5 +45,60 @@ export function registerResourceCommands(program: Command, observe: () => Traffi
         console.log(`${seat}\t${row.running}/${row.cap}\t${cell ? `1 · ${cell.id} ${oneLineTitle(cell.title)}` : '0'}\t${row.borrowed}/${row.lent}\t${reason}`);
       }
       if (resource.unassigned > 0) console.log(`미배정\t${resource.unassigned}`);
+    });
+}
+
+/**
+ * RESOURCE-OPT-HOURLY (L1) · RELEASE-GOAL-FROM-LEDGER (L4).
+ *   resource optimize            — print the matching table the OP TUI turns into its hourly assignment turn (no LLM)
+ *   resource optimize --now      — on demand: the running OP TUI opens the assignment turn now (trigger file)
+ *   resource optimize --last     — the last closed table: idle · unowned · assigned · rejected · unhandled
+ *   resource goal-line           — the current release goal line (plan/schedule ledgers) for shell ticks
+ */
+export function registerResourceOptCommands(resource: Command): void {
+  resource.command('optimize').description('Hourly matching table: idle seats × unowned/2h-stalled cells · PRs without same-head pregate · judge queue')
+    .option('--now', 'ask the running OP TUI to open the assignment turn now')
+    .option('--exceptions <tableJson>', 'LOOP-TRAFFIC R1: open the assignment turn for only these rows (a table JSON from --json, rows = the ones R1 could not assign)')
+    .option('--last', 'show the last closed table record')
+    .option('--seat <seat>', 'the HQ coordinator seat', 'OP')
+    .option('--json', 'JSON')
+    .action(async (opts: { now?: boolean; exceptions?: string; last?: boolean; seat: string; json?: boolean }) => {
+      const gate = await import('../resource-opt/assignment-gate.js');
+      if (opts.last) {
+        const record = gate.readResourceOptRecord(gate.resourceOptDir());
+        if (opts.json) { await writeStdoutJson(`${JSON.stringify(record)}\n`); return; }
+        console.log(gate.resourceOptBoardLine(record) ?? 'resource optimize: no table closed yet');
+        return;
+      }
+      if (opts.now || opts.exceptions) {
+        const { writeResourceOptTrigger } = await import('../resource-opt/gather.js');
+        let table: import('../resource-opt/matching-table.js').MatchingTable | undefined;
+        if (opts.exceptions) {
+          const { readFileSync } = await import('node:fs');
+          try { table = JSON.parse(readFileSync(opts.exceptions, 'utf8')) as typeof table; }
+          catch (error) { console.error(`resource optimize --exceptions: unreadable table (${String(error).slice(0, 120)})`); process.exitCode = 1; return; }
+          if (!table || !Array.isArray(table.rows) || !table.summary) { console.error('resource optimize --exceptions: not a matching table'); process.exitCode = 1; return; }
+        }
+        const path = writeResourceOptTrigger(gate.resourceOptDir(), process.env.ELANOUS_TRACK || 'cli', table);
+        debug.log('resource', 'optimize-trigger', { path });
+        console.log(`Asked the OP TUI to open the assignment turn now (${path}).`);
+        return;
+      }
+      const { gatherMatchingTable } = await import('../resource-opt/gather.js');
+      const { formatAssignmentPrompt } = await import('../resource-opt/matching-table.js');
+      const table = await gatherMatchingTable({ seat: opts.seat.toUpperCase() });
+      if (!table) { console.error(`resource optimize: ${opts.seat} is not the HQ coordinator seat in the els listing`); process.exitCode = 1; return; }
+      if (opts.json) { await writeStdoutJson(`${JSON.stringify(table)}\n`); return; }
+      console.log(formatAssignmentPrompt(table));
+    });
+  resource.command('goal-line').description('The current release goal line from the ledgers (PLAN status: current → schedule → package)')
+    .option('--json', 'JSON')
+    .action(async (opts: { json?: boolean }) => {
+      const { deriveReleaseGoal, releaseGoalLine } = await import('../ops-dashboard/release-goal.js');
+      const { homedir } = await import('node:os');
+      const { join } = await import('node:path');
+      const goal = deriveReleaseGoal({ hqRoot: join(homedir(), 'elanous-hq') });
+      if (opts.json) { await writeStdoutJson(`${JSON.stringify({ ...goal, line: releaseGoalLine(goal, Date.now()) })}\n`); return; }
+      console.log(releaseGoalLine(goal, Date.now()));
     });
 }

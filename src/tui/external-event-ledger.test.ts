@@ -49,7 +49,7 @@ describe('external event ledger', () => {
 
   test('a full book keeps the old rows and refuses the next id', () => {
     const book = createExternalEventLedger(2);
-    expect(EXTERNAL_EVENT_LEDGER_CAP).toBe(200);
+    expect(EXTERNAL_EVENT_LEDGER_CAP).toBe(1000);
     book.receive({ id: 'a', kind: 'mail', source: 'OP', at: 1 });
     book.receive({ id: 'b', kind: 'mail', source: 'OP', at: 2 });
     expect(book.receive({ id: 'c', kind: 'mail', source: 'OP', at: 3 })).toEqual({ ok: false, reason: 'full' });
@@ -59,5 +59,41 @@ describe('external event ledger', () => {
     book.inject('b', 6);
     book.handle('b', 7);
     expect(book.missed()).toMatchObject({ rows: [], refused: 1, count: 1 });
+  });
+});
+
+describe('11-25 OP deaf — a long session never fills the book with finished rows', () => {
+  test('a full book evicts its oldest handled row and accepts the next id', () => {
+    const book = createExternalEventLedger(2);
+    book.receive({ id: 'a', kind: 'mail', source: 'OP', at: 1 });
+    book.inject('a', 2);
+    book.handle('a', 3);
+    book.receive({ id: 'b', kind: 'mail', source: 'OP', at: 4 });
+    expect(book.receive({ id: 'c', kind: 'mail', source: 'OP', at: 5 })).toMatchObject({ ok: true, row: { id: 'c' } });
+    expect(book.rows().map((row) => row.id)).toEqual(['b', 'c']);
+    expect(book.missed()).toMatchObject({ refused: 0, count: 2 });
+  });
+
+  test('1001 handled notices in a row: the 1001st is still accepted (the incident was the 201st refused at the old cap 200)', () => {
+    const book = createExternalEventLedger();
+    for (let i = 1; i <= 1000; i += 1) {
+      book.receive({ id: `q${i}`, kind: 'mail', source: 'OP', at: i });
+      book.inject(`q${i}`, i);
+      book.handle(`q${i}`, i);
+    }
+    expect(book.receive({ id: 'q1001', kind: 'mail', source: 'OP', at: 1001 })).toMatchObject({ ok: true });
+    expect(book.rows()).toHaveLength(1000);
+  });
+
+  test('SEAT-QUEUE-CAPACITY — 1000 unhandled events all stay in the default book; only the 1001st is refused', () => {
+    const book = createExternalEventLedger();
+    for (let i = 1; i <= 1000; i += 1) {
+      expect(book.receive({ id: `u${i}`, kind: 'mail', source: 'OP', at: i })).toMatchObject({ ok: true });
+    }
+    expect(book.rows()).toHaveLength(1000);
+    expect(book.rows()[0]!.id).toBe('u1');
+    expect(book.rows()[999]!.id).toBe('u1000');
+    expect(book.receive({ id: 'u1001', kind: 'mail', source: 'OP', at: 1001 })).toEqual({ ok: false, reason: 'full' });
+    expect(book.missed()).toMatchObject({ refused: 1, count: 1001 });
   });
 });

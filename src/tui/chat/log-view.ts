@@ -220,7 +220,7 @@ export function hangingIndentFor(renderedRow: string): number {
 /** Leading blank lines are dropped so a reply starts on its first text row. Replies carry no speaker label
  *  (classic TUI: the user's input is the «>» prompt line, the answer stands alone). */
 function assistantMarkdownLines(text: string, columns: number, resetOnWrap = true): string[] {
-  const rendered = renderMarkdown(breatheMarkdown(safeLogText(text).replace(/^(?:[ \t]*\n)+/, '')));
+  const rendered = renderMarkdown(breatheMarkdown(safeLogText(text).replace(/^(?:[ \t]*\n)+/, '')), { columns });
   return rendered.split('\n').flatMap((part) =>
     wrapRenderedLine(highlightLinks(part), columns, resetOnWrap, hangingIndentFor(part)));
 }
@@ -439,6 +439,52 @@ function visibleUserText(content: string): string {
 const isLogRole = (message: SerializedMessage): boolean =>
   message.role === 'user' || message.role === 'assistant' || message.role === 'tool';
 
+// TUI-LONG-PASTE-SPIN (대표 11-25 «아예 죽는 문제 · 크리티컬») — a frame used to re-wrap EVERY saved row (4.9k rows ·
+// 4 MB of tool output · ICU word segmentation) whenever the message array identity changed, and a running turn whose
+// echo never retired changed it every 250 ms tick: 11–13 s per frame on the live OP seat, then a frozen loop.
+// A row's rendering depends only on the row object and the inputs below, so it is kept per row object: a frame
+// re-wraps only rows it has not seen (one new row per delta), whatever the array identity does.
+interface RowRenderMemo { readonly key: string; readonly lines: readonly string[] }
+const rowRenderMemo = new WeakMap<SerializedMessage, RowRenderMemo>();
+/** Rows actually wrapped (cache misses) since load — the deterministic cost counter the perf test reads. */
+let rowRenderMisses = 0;
+export function logViewRowRenderMisses(): number { return rowRenderMisses; }
+
+/** Everything outside the row that changes its pixels: colour level and the band theme (NO_COLOR · theme env). */
+function rowStyleKey(): string {
+  return `${chalk.level}|${userTurnBandEnabled() ? userTurnBandSgr() : 'plain'}`;
+}
+
+function memoMessageLines(
+  message: SerializedMessage,
+  index: number,
+  columns: number,
+  expandedToolIndexes: ReadonlySet<number> | undefined,
+  display: InterimDisplay | undefined,
+  styleKey: string,
+): readonly string[] {
+  const open = (message as NoticeDisplayRow).noticeOpenParts;
+  const key = `${columns}|${styleKey}|${expandedToolIndexes?.has(index) ? 1 : 0}|${display ? `${display.kind}:${display.kind === 'folded' ? display.line : display.origin}` : ''}|${open ? open.join(',') : ''}`;
+  const hit = rowRenderMemo.get(message);
+  if (hit && hit.key === key) return hit.lines;
+  rowRenderMisses += 1;
+  const lines = messageLines(message, index, columns, expandedToolIndexes, display);
+  rowRenderMemo.set(message, { key, lines });
+  return lines;
+}
+
+/** Rendered height of each saved row (0 for a non-log row) — the same rendering as logViewLines, from the row memo. */
+export function logViewRowHeights(
+  messages: readonly SerializedMessage[],
+  columns: number,
+  expandedToolIndexes?: ReadonlySet<number>,
+): number[] {
+  const plan = planInterimDisplay(messages);
+  const styleKey = rowStyleKey();
+  return messages.map((message, index) => isLogRole(message)
+    ? memoMessageLines(message, index, columns, expandedToolIndexes, plan.get(index), styleKey).length : 0);
+}
+
 export function logViewLines(
   messages: readonly SerializedMessage[],
   columns: number,
@@ -455,11 +501,12 @@ export function logViewLinesWithInsertions(
   afterMessageIndex: ReadonlyMap<number, readonly string[]> = new Map(),
 ): string[] {
   const plan = planInterimDisplay(messages);
+  const styleKey = rowStyleKey();
   const lines: string[] = [];
   for (const [index, message] of messages.entries()) {
     if (!isLogRole(message)) continue;
-    lines.push(...messageLines(message, index, columns, expandedToolIndexes, plan.get(index)));
-    lines.push(...(afterMessageIndex.get(index) ?? []));
+    for (const line of memoMessageLines(message, index, columns, expandedToolIndexes, plan.get(index), styleKey)) lines.push(line);
+    for (const line of afterMessageIndex.get(index) ?? []) lines.push(line);
   }
   return lines.length > 0 ? lines : ['No chat history'];
 }
@@ -496,12 +543,13 @@ export function toolFoldBlockRanges(
 ): ToolFoldBlockRange[] {
   const foldable = new Set(toolFoldBlockStarts(messages, columns));
   const plan = planInterimDisplay(messages);
+  const styleKey = rowStyleKey();
   const ranges: ToolFoldBlockRange[] = [];
   let line = 0;
   for (const [index, message] of messages.entries()) {
     if (!isLogRole(message)) continue;
     // Same per-message rendering as logViewLines (lines + one blank separator), interim plan included.
-    const height = messageLines(message, index, columns, expanded, plan.get(index)).length;
+    const height = memoMessageLines(message, index, columns, expanded, plan.get(index), styleKey).length;
     const notice = foldable.has(index) ? noticeOfRow(message) : null;
     if (notice?.parts?.length) {
       // NOTICE-FOLD-1LINE — each mail of the notice is its own fold target, at the rows it renders.

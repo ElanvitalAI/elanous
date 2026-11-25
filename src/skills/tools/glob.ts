@@ -7,7 +7,10 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // "does file X exist?" / "list all .py files under src/" queries
 // because it skips file content scanning entirely.
 //
-// Implementation uses `rg --files --glob <pat>` — we already require
+// Implementation uses `rg --files --iglob <pat>` — case-insensitive by
+// default (search-bench #40045 ablation: dropping case-insensitivity cost
+// recall@5 −0.22 overall, −0.44 on docs — the single biggest lever; a seat
+// guesses `*approval*` for `GraphApprovalCard.tsx`). We already require
 // rg for the Grep tool, so no new binary dependency. rg's file
 // discovery also respects .gitignore by default, which matches the
 // user's mental model (the one big reason LLMs typically want Glob
@@ -20,7 +23,9 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 import { statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { getSessionCwd } from '../../session/working-dir.js';
+import { expandHomePath } from '../../agent/path-policy.js';
 import { rgListFiles } from '../../tool-runtime/ripgrep-core.js';
+import { mapToLatest, staleCwdFor, staleCwdHint } from '../../knowledge/stale-cwd.js';
 
 
 const DEFAULT_HEAD_LIMIT = 200;
@@ -53,15 +58,16 @@ export function buildGlobTool(): LLMToolSpec {
   return {
     name: 'Glob',
     description:
-      'Find files by path pattern. Cheaper than Grep when you only need filenames — ' +
-      'no content scan. Supports standard globs: `**/*.ts`, `src/**/*.test.{ts,tsx}`, ' +
-      '`*.md`. Respects .gitignore so node_modules / build dirs are skipped. Results ' +
-      `are sorted newest-first, bounded by head_limit (default ${DEFAULT_HEAD_LIMIT}); ` +
-      'paginate via `offset` when the match set is large.',
+      'Find files by path pattern — the first search tool to reach for when the topic names a file. ' +
+      'Case-insensitive by default (`*approval*` also finds `GraphApprovalCard.tsx` and `APPROVAL.md`). ' +
+      'Paths only, no content scan; standard globs (`**`, `{ts,tsx}`); respects .gitignore. Examples: ' +
+      '`**/*approval*card*` (a feature whose filename you can guess) · `docs/**/*release*.md` (a design doc by topic). ' +
+      `Results are sorted newest-first, bounded by head_limit (default ${DEFAULT_HEAD_LIMIT}); ` +
+      'paginate via `offset` when the match set is large. Then Grep inside the hits, then Read the best one.',
     parameters: {
       type: 'object',
       properties: {
-        pattern: { type: 'string', description: 'Glob pattern. Examples: "**/*.ts", "src/**/*.{ts,tsx}", "*.md".' },
+        pattern: { type: 'string', description: 'Glob pattern, matched case-insensitively. Examples: "**/*approval*", "src/**/*.{ts,tsx}", "*.md".' },
         no_ignore: { type: 'boolean', description: 'Include paths excluded by .gitignore or .ignore, including hidden observation state. .git is always excluded.' },
         path: { type: 'string', description: 'Directory to search from. Defaults to current working directory.' },
         head_limit: { type: 'number', description: `Max paths to return (default ${DEFAULT_HEAD_LIMIT}, cap ${MAX_HEAD_LIMIT}).` },
@@ -72,7 +78,7 @@ export function buildGlobTool(): LLMToolSpec {
   };
 }
 
-/** Dispatch a Glob call — shells out to `rg --files --glob <pattern>`,
+/** Dispatch a Glob call — shells out to `rg --files --iglob <pattern>`,
  *  sorts by mtime descending, applies offset + head_limit, and
  *  returns a formatted string result. Throws on missing rg, invalid
  *  pattern, or timeout. */
@@ -83,7 +89,7 @@ export async function dispatchGlob(args: Record<string, unknown>): Promise<GlobR
   // WD6 — default search path is the session working directory so
   // relative globs ("src/**/*.ts") resolve against the active project.
   const sessionCwd = getSessionCwd();
-  const searchPath = args.path ? resolve(sessionCwd, String(args.path)) : sessionCwd;
+  const searchPath = args.path ? resolve(sessionCwd, expandHomePath(String(args.path))) : sessionCwd;
   const head = Math.min(
     MAX_HEAD_LIMIT,
     Math.max(1, Number(args.head_limit) || DEFAULT_HEAD_LIMIT),
@@ -101,7 +107,7 @@ export async function dispatchGlob(args: Record<string, unknown>): Promise<GlobR
     : pattern;
 
   // 공유 discovery 프리미티브(ripgrep-core) — 존재 맵·미션 루프와 동일한 rg --files --glob.
-  const rg = rgListFiles({ roots: [searchPath], globs: [normalizedPattern], noIgnore: args.no_ignore === true, maxBuffer: GLOB_MAX_BUFFER, timeoutMs: GLOB_TIMEOUT_MS });
+  const rg = rgListFiles({ roots: [searchPath], iglobs: [normalizedPattern], noIgnore: args.no_ignore === true, maxBuffer: GLOB_MAX_BUFFER, timeoutMs: GLOB_TIMEOUT_MS });
   if (!rg.ok) {
     if (rg.errorKind === 'missing-rg') throw new Error('ripgrep (rg) not found on PATH. Install via `brew install ripgrep` or equivalent.');
     if (rg.errorKind === 'timeout') throw new Error(`rg killed by signal (likely timeout after ${GLOB_TIMEOUT_MS}ms)`);
@@ -117,7 +123,9 @@ export async function dispatchGlob(args: Record<string, unknown>): Promise<GlobR
     try { return { p, mtime: statSync(p).mtimeMs }; }
     catch { return { p, mtime: 0 }; }
   });
-  stamped.sort((a, b) => b.mtime - a.mtime);
+  // Equal mtimes are common; rg traversal order is not guaranteed across calls.
+  // Break ties by path so offset pages remain stable while the tree is unchanged.
+  stamped.sort((a, b) => b.mtime - a.mtime || (a.p < b.p ? -1 : a.p > b.p ? 1 : 0));
 
   const numFiles = stamped.length;
   const start = Math.min(offset, numFiles);
@@ -134,8 +142,27 @@ export async function dispatchGlob(args: Record<string, unknown>): Promise<GlobR
     ? `\n\n… ${numFiles - end} more — call again with offset=${end} to paginate.`
     : '';
 
+  // 낡은 cwd 트리면 latest 의 같은 상대 경로도 찾아 붙인다(stale-cwd.ts · 실패는 조용히 생략).
+  let latest = '';
+  let hint = '';
+  try {
+    const stale = staleCwdFor(sessionCwd);
+    const mapped = stale ? mapToLatest(searchPath, stale) : null;
+    if (stale && mapped) {
+      const lr = rgListFiles({ roots: [mapped], iglobs: [normalizedPattern], noIgnore: args.no_ignore === true, maxBuffer: GLOB_MAX_BUFFER, timeoutMs: GLOB_TIMEOUT_MS });
+      if (lr.ok) {
+        hint = `[${staleCwdHint(stale)}]\n`;
+        const shown = [...lr.paths].sort().slice(0, head);
+        const more = lr.paths.length > shown.length ? `\n… ${lr.paths.length - shown.length} more in latest` : '';
+        latest = shown.length > 0
+          ? `\n\n[latest: ${stale.latestRoot}] ${lr.paths.length} file${lr.paths.length === 1 ? '' : 's'}\n${shown.join('\n')}${more}`
+          : `\n\n[latest: ${stale.latestRoot}] no files matched`;
+      }
+    }
+  } catch { /* 보조 검색 실패는 본 결과를 막지 않는다 */ }
+
   return {
-    output: body.length > 0 ? `${header}\n\n${body}${tail}` : header,
+    output: `${hint}${body.length > 0 ? `${header}\n\n${body}${tail}` : header}${latest}`,
     numFiles,
     numShown,
     truncated,

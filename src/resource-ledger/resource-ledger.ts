@@ -162,7 +162,27 @@ export interface HostReadinessHeartbeat {
     tmpDiskUsedPercent: number;
     rootDiskFreeGb?: number;
     tmpDiskFreeGb?: number;
+    /** Raw 1-minute load average (RES patrol ceilings are absolute, «before load 100»). */
+    load1?: number;
+    /** bun processes and their summed RSS on the host (RES patrol leak watch). */
+    bunProcesses?: number;
+    bunRssMb?: number;
   };
+}
+
+/** RES-POLICY-GUARDIAN — one resource decision: the guardian's «would» (policy) or the RES tab's actual call.
+ *  Shadow pairs share pairId; the report compares them (LOOP-AGENTS §2 rule 10). */
+export interface ResDecisionRow {
+  source: 'guardian' | 'res-tab';
+  action: string;
+  host: string;
+  decision: 'allow' | 'deny' | 'ask';
+  rule: string;
+  policyVersion: string;
+  pairId?: string;
+  ref?: string;
+  /** Who took the actual decision on a `res-tab` row (pregate.py · hosts-cli · fleet.cloud-burst …); absent = the RES tab. */
+  actor?: string;
 }
 
 export type GuardianHostLeaseEvent = { event: 'guardian-host-lease'; at: string; record: GuardianHostLeaseRecord };
@@ -192,7 +212,8 @@ export type ResourceLedgerEvent =
   | { event: 'slot-capacity-policy'; at: string; writer: 'RES'; policy: { kind: SlotLeaseKind; host: string; capacity: number; version?: string } }
   | { event: 'train-worker-policy'; at: string; policy: TrainWorkerPolicy }
   | { event: 'guardian-cost-snapshot'; at: string; snapshot: GuardianCostSnapshot }
-  | { event: 'host-readiness-heartbeat'; at: string; heartbeat: HostReadinessHeartbeat };
+  | { event: 'host-readiness-heartbeat'; at: string; heartbeat: HostReadinessHeartbeat }
+  | { event: 'res-decision'; at: string; row: ResDecisionRow };
 
 export interface ResourceMeasurement {
   host: string;
@@ -295,6 +316,13 @@ export function recordTrainWorkerPolicy(policy: TrainWorkerPolicy, now = new Dat
   withLedgerLock(path, () => appendEvent(event, path));
 }
 
+/** RES-POLICY-GUARDIAN — persist one RES decision row (guardian would / RES tab actual). */
+export function recordResDecision(row: ResDecisionRow, now = new Date(), path = resourceLedgerPath()): void {
+  const event: ResourceLedgerEvent = { event: 'res-decision', at: now.toISOString(), row };
+  parseResourceLedgerEvents(`${JSON.stringify(event)}\n`);
+  withLedgerLock(path, () => appendEvent(event, path));
+}
+
 /** Persist one validated host readiness heartbeat into the Nexus resource ledger. */
 export function recordHostReadinessHeartbeat(heartbeat: HostReadinessHeartbeat, path = resourceLedgerPath()): void {
   const event: ResourceLedgerEvent = { event: 'host-readiness-heartbeat', at: heartbeat.at, heartbeat };
@@ -318,7 +346,7 @@ const KNOWN_RESOURCE_LEDGER_EVENT_TYPES = new Set([
   'lease-created', 'lease-heartbeat', 'lease-ended', 'lease-reaped', 'pool-declared', 'pool-pod-receipt',
   'lease.requested', 'lease.granted', 'lease.queued', 'lease.denied', 'lease.released', 'lease.expired', 'lease.violation',
   'guardian-host-lease', 'guardian-host-lease-conflict', 'guardian-host-lease-admitted', 'guardian-host-lease-admission-denied',
-  'train-worker-policy', 'guardian-cost-snapshot', 'host-readiness-heartbeat', 'slot-capacity-policy',
+  'train-worker-policy', 'guardian-cost-snapshot', 'host-readiness-heartbeat', 'slot-capacity-policy', 'res-decision',
 ]);
 
 export function parseResourceLedgerEvents(text: string): ResourceLedgerEvent[] {
@@ -482,9 +510,19 @@ function parseResourceLedgerEventsWithObservations(text: string): {
           || !isNonNegativeMetric(sample.loadPercent) || !isNonNegativeMetric(sample.load15Percent)
           || !isPercent(sample.memoryAvailablePercent) || !isPercent(sample.rootDiskUsedPercent)
           || !isPercent(sample.tmpDiskUsedPercent)
-          || ['rootDiskFreeGb', 'tmpDiskFreeGb'].some(key => sample[key] !== undefined
+          || ['rootDiskFreeGb', 'tmpDiskFreeGb', 'load1', 'bunProcesses', 'bunRssMb'].some(key => sample[key] !== undefined
             && (!Number.isFinite(sample[key]) || Number(sample[key]) < 0)))))
         throw new Error(`resource ledger invalid host readiness heartbeat at line ${index + 1}`);
+    }
+    if (eventType === 'res-decision') {
+      const decision = isRecord(row.row) ? row.row : undefined;
+      if (!decision || !['guardian', 'res-tab'].includes(String(decision.source)) || !validGuardianText(decision.action)
+        || !validHost(String(decision.host ?? '')) || !['allow', 'deny', 'ask'].includes(String(decision.decision))
+        || !validGuardianText(decision.rule) || !validGuardianText(decision.policyVersion)
+        || (decision.pairId !== undefined && !validGuardianText(decision.pairId))
+        || (decision.ref !== undefined && !validGuardianText(decision.ref))
+        || (decision.actor !== undefined && !validGuardianText(decision.actor)))
+        throw new Error(`resource ledger invalid RES decision at line ${index + 1}`);
     }
     if (eventType === 'train-worker-policy') {
       const policy = row.policy;

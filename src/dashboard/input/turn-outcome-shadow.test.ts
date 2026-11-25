@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import { KNOWN_LOG_EVENT_NAMES } from '../../cli/log-event-names.js';
 import { extractCommitments } from './commitment-extract.js';
 import { NEGATIVE_COMMITMENTS, POSITIVE_COMMITMENTS } from './commitment-extract.fixtures.js';
-import { COMMITMENT_LEDGER_ENV, recordReplyCommitments } from './commitment-ledger.js';
+import { COMMITMENT_LEDGER_ENV, recordReplyCommitments } from '../../commitment/ledger.js';
 import {
   compareTurnOutcome,
   TURN_OUTCOME_MISMATCH_EVENT, type PlanOutcomeReadView,

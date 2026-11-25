@@ -1,10 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { redactSecretText } from '../../debug/log.js';
 import type { RunShellDispatchResult } from './shell.js';
+import { debug } from '../../debug/log.js';
+import { parseRunShellSearch, searchCommandPolicy, SEARCH_SCRIPT_EXECUTABLES } from './run-shell-search-policy.js';
 
 type Step = { id: string; command: string[]; select: string[]; headLines: number; projection?: 'checklist-evidence' };
 type StepReceipt = { id: string; outcome: string; exitCode: number | null; stdoutSha256: string; bytes: number;
-  selected?: Record<string, string | number | boolean | null>; preview?: string; truncated: boolean; error?: string };
+  selected?: Record<string, string | number | boolean | null>; preview?: string; truncated: boolean; error?: string;
+  /** RUNSHELL-SEARCH-PARITY — search steps: hits ⊕ raw stdout bytes vs bytes returned in this summary. */
+  search?: { hits: number; rawBytes: number; returnedBytes: number } };
 
 const ID = /^[a-z][a-z0-9_-]{0,31}$/;
 const REF = /^\$ref:([a-z][a-z0-9_-]{0,31})\.([A-Za-z][A-Za-z0-9_.]{0,63})$/;
@@ -118,7 +122,7 @@ function allowedValue(kind: ValueKind, value: string): boolean {
 }
 
 function assertScriptExecutable(argv: readonly string[]): void {
-  if (!['eln', 'elanous', 'git', 'gh', 'kubectl', ...Object.keys(HOST_READ_RULES), ...Object.keys(HOST_APPROVAL_RULES)].includes(argv[0] ?? '')) throw new Error('RunShell script refuses executable');
+  if (!['eln', 'elanous', 'git', 'gh', 'kubectl', ...SEARCH_SCRIPT_EXECUTABLES, ...Object.keys(HOST_READ_RULES), ...Object.keys(HOST_APPROVAL_RULES)].includes(argv[0] ?? '')) throw new Error('RunShell script refuses executable');
 }
 
 function matchesReadRule(argv: readonly string[], rule: ReadRule): boolean {
@@ -145,6 +149,14 @@ function matchesReadRule(argv: readonly string[], rule: ReadRule): boolean {
     && !positionals.some((value, index) => !allowedValue(rule.positionals[index]!, value));
 }
 
+/** The hit count RunShell dispatch attached to a search result (`search.hits`), or null when absent. */
+function searchHitCount(result: RunShellDispatchResult): number | null {
+  const search = result.search;
+  if (!search || typeof search !== 'object') return null;
+  const hits = (search as { hits?: unknown }).hits;
+  return typeof hits === 'number' && Number.isInteger(hits) && hits >= 0 ? hits : null;
+}
+
 function isLocal30MinuteCheck(argv: readonly string[]): boolean {
   if (argv[0] !== 'eln' || argv[1] !== 'ops' || argv[2] !== 'check-30m') return false;
   const seen = new Set<string>();
@@ -164,6 +176,9 @@ function isLocal30MinuteCheck(argv: readonly string[]): boolean {
 
 /** Classify the whole argv. A gh read still needs approval because it reaches the network. */
 export function scriptCommandPolicy(argv: readonly string[]): ScriptCommandPolicy {
+  // RUNSHELL-SEARCH-PARITY — rg · git grep · ast-grep/sg · eln docs search: read-only forms run without a prompt.
+  const search = searchCommandPolicy(argv);
+  if (search) return search;
   if (isLocal30MinuteCheck(argv)) return 'read-local';
   const cost = ['eln', 'usage', 'runs', '--since', '30m', '--by', 'role', '--json'];
   if (argv.length === cost.length && argv.every((part, index) => part === cost[index])) return 'read-local';
@@ -304,7 +319,13 @@ export async function runShellScript(
     const stepOutcome = deadline.aborted && !signal?.aborted && result.outcome === 'aborted' ? 'timeout' : result.outcome;
     let projection: Pick<StepReceipt, 'selected' | 'preview'> = {};
     let projectionError = '';
-    if (result.outcome === 'exit' && result.exitCode === 0) {
+    const searchStep = parseRunShellSearch(argv);
+    // A search with no hits exits 1 — that is an answer («not found»), not a failed step. Judge it from the
+    // dispatch's structured hit count (stdout may carry a [search] hint or rg --json stats), not stdout emptiness.
+    const structuredHits = searchHitCount(result);
+    const searchMiss = !!searchStep && result.outcome === 'exit' && result.exitCode === 1
+      && (structuredHits !== null ? structuredHits === 0 : !result.stdout.trim());
+    if (result.outcome === 'exit' && (result.exitCode === 0 || searchMiss)) {
       try { projection = project(step, result); }
       catch (error) { projectionError = redactSecretText(error instanceof Error ? error.message : String(error)).slice(0, 256); }
     } else if (stepOutcome === 'exit' && result.exitCode !== null && result.exitCode !== 0) {
@@ -318,17 +339,25 @@ export async function runShellScript(
       ...projection,
       ...(projectionError ? { error: projectionError } : {}),
     };
+    if (searchStep) {
+      const returned = (projection.preview ?? '') + (projection.selected ? JSON.stringify(projection.selected) : '');
+      receipt.search = { hits: searchMiss ? 0 : structuredHits ?? result.stdout.split('\n').filter((l) => l.trim() && !l.startsWith('[search] ')).length,
+        rawBytes: typeof result.searchRawBytes === 'number' ? result.searchRawBytes : Buffer.byteLength(result.stdout),
+        returnedBytes: Buffer.byteLength(returned) };
+    }
     receipts.push(receipt);
     prior.set(step.id, receipt);
     if (tolerateCheckInboxFailure && step.id === 'inbox' && !stepSignal.aborted
       && (projectionError || (stepOutcome === 'exit' && result.exitCode !== 0))) continue;
     if (projectionError) { outcome = 'spawn-error'; exitCode = null; break; }
-    if (stepOutcome !== 'exit' || result.exitCode !== 0) {
+    if (stepOutcome !== 'exit' || (result.exitCode !== 0 && !searchMiss)) {
       outcome = stepOutcome;
       exitCode = result.exitCode;
       break;
     }
   }
+  const searchReceipts = receipts.filter((r) => r.search);
+  if (searchReceipts.length) debug.log('shell.run', 'script.summary', { runId, searchSteps: searchReceipts.map((r) => ({ id: r.id, ...r.search })) });
   let stdout = JSON.stringify({ runId, steps: receipts });
   if (Buffer.byteLength(stdout) > SUMMARY_LIMIT) {
     stdout = JSON.stringify({ runId, steps: receipts.map(({ id, outcome: stepOutcome, exitCode: code, stdoutSha256, bytes, truncated: wasTruncated }) =>
