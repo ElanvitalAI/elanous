@@ -415,7 +415,8 @@ function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string,
     }
   }
   const devOfRelease = new RegExp(`^${releaseVersion.replaceAll('.', '\\.')}\\-dev\\.(0|[1-9][0-9]*)$`);
-  if (kind === 'release' || branchCut ? !devOfRelease.test(current) && !(kind === 'dev-bump' && current === releaseVersion) : current !== source) {
+  if (kind === 'release' || branchCut ? !devOfRelease.test(current) && !(kind === 'dev-bump' && current === releaseVersion) : current !== source && !(kind === 'dev-bump' && devOfRelease.test(current))) {
+    // OP 11-26: main may still read <v>-dev.N when no stable bump landed on main (0.3.36 dev-bump failure); <v> or <v>-dev.N both bump to <v+1>-dev.0.
     throw new Error(`origin/main version ${current} is not ${source} (target ${target})`);
   }
 

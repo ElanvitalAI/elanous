@@ -144,7 +144,7 @@ export function runBurstWorld(opts: BurstWorldOptions): BurstWorldFrame[] {
       return { name: h.name, kind: h.kind, used, cap: h.cap, role: `hands ${used}`, state: used >= h.cap ? 'cap' : 'on' };
     });
     const openBurstHands = Math.max(0, hands - baseHands);
-    const plan: BurstPlanTick = { tick: t, mode, pressure, lanes: lanes.map(({ label, now, plan: p, queue }) => ({ label, now, plan: p, queue })), hands, spendUsd: spend, openBurstHands };
+    const plan: BurstPlanTick = { tick: t, mode, pressure, lanes: lanes.map(({ label, now, plan: p, queue }) => ({ label, now: now ?? 0, plan: p ?? 0, queue: queue ?? 0 })), hands, spendUsd: spend, openBurstHands };
     const snapshot: BurstBoardSnapshot = {
       release: '0.3.37', mode, tick: t, rhythmMin: 60, preset: '4h', trigger: 'CEO «all resources»',
       elapsedSec: Math.max(0, t - tAllIn) * 120, totalSec: 4 * 3600, pressure, pressureAlarm: alarm ? 0 : 2,
@@ -157,7 +157,7 @@ export function runBurstWorld(opts: BurstWorldOptions): BurstWorldFrame[] {
     };
     // «still» = the planner state did not change (tick-driven breath and blink are allowed to differ between ticks, not frames)
     const key = JSON.stringify({ ...plan, tick: 0 }) + JSON.stringify(handList) + fresh;
-    frames.push({ snapshot, plan, still: key === prevKey && !fresh && lanes.every((l) => l.queue + l.now === 0 || l.speed === 0) && handList.every((h) => h.state !== 'new') });
+    frames.push({ snapshot, plan, still: key === prevKey && !fresh && lanes.every((l) => (l.queue ?? 0) + (l.now ?? 0) === 0 || l.speed === 0) && handList.every((h) => h.state !== 'new') });
     prevKey = key;
   }
   return frames;

@@ -3,7 +3,8 @@
   "name": "LLM provider sim world assembler and scenario helpers",
   "implementation": [
     "src/ux-sim/llm-provider-world/world.ts",
-    "src/ux-sim/llm-provider-world/scenarios.ts"
+    "src/ux-sim/llm-provider-world/scenarios.ts",
+    "src/ux-sim/llm-provider-world/three-role-sequence.ts"
   ],
   "tests": [
     "src/ux-sim/llm-provider-world/scenarios.test.ts"

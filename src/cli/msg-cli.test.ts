@@ -1995,3 +1995,21 @@ describe('MSG-FILTERS-RELAX — msg list re-reads acknowledged mail', () => {
     expect(JSON.parse(f.stdout.at(-1)!).map((row: { id: number }) => row.id)).toEqual([1]);
   });
 });
+
+test('MSG-ADDRESS-DID-YOU-MEAN: a near-miss undeclared address is refused with a suggestion; a new address still posts', async () => {
+  const { didYouMeanAddress } = await import('./msg-cli.js');
+  expect(didYouMeanAddress('OP-CLAUDE', ['CLAUDE-OP', 'OP'])).toBe('CLAUDE-OP');
+  expect(didYouMeanAddress('JUD-33', ['JUD-3', 'OP'])).toBe('JUD-3');
+  expect(didYouMeanAddress('BRANDNEW', ['CLAUDE-OP', 'OP'])).toBe(null);
+  expect(didYouMeanAddress('CLAUDE-OP', ['CLAUDE-OP'])).toBe(null);
+  const f = fixture('', () => ({ wakeDeps: {
+    listHerdrPanes: () => [],
+    readRegistry: () => ({ status: 'ready', registry: { version: 1, seats: [] } }),
+  } }));
+  await f.run('post', 'seed', '--from', 'OP', '--to', 'CLAUDE-OP');
+  await f.run('post', 'typo', '--from', 'OP', '--to', 'OP-CLAUDE');
+  expect(f.exits.at(-1)).not.toBe(0);
+  expect(f.stderr.some(line => line.includes('did you mean CLAUDE-OP'))).toBe(true);
+  const store = f.store();
+  try { expect(store.list('OP-CLAUDE')).toEqual([]); } finally { store.close(); }
+});

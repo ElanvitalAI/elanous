@@ -25,7 +25,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { CLOSED_FIRST_CLASS_KEEP, GOAL_FEED_MARK, deriveEffectiveGoal, firstClassText as firstClassGoalText, firstClassFromMail, GOAL_TASK_REF, goalFeedBlock, sanitizeGoalText, sameDerived, type DerivedGoal, type FirstClassGoal, type GoalMailSignal } from './dynamic-goal.js';
-import { goalApplyFromMail, goalAppliedLine, type GoalLadder } from './crown-goal-apply.js';
+import { goalApplyFromMail, goalAppliedLine, goalSetterVerdict, type GoalLadder } from './crown-goal-apply.js';
 import { addPin, expirePins, pinPriority, pinToClose, taskPinEntries, taskPinFeed, taskPinRows, type PinEntry, type ExpiredPin, type PinPriority, type TaskPin } from './task-pins.js';
 import { BLOCKED_MS, GOAL_DEFAULT_DEADLINE_MS, GOAL_RATE_WINDOW_MS, GOAL_EXPIRE_GRACE_MS, GOAL_REJECT_TEXT, GOAL_REPLACE_REF, HISTORY_KEEP, HISTORY_ROW_SHOW_MS, LOOP_SIG_KEEP, NARROW_DEADLINE_MS, SLOW_CHECK_EVERY_MS,
   THRASH_REPLACEMENTS, THRASH_WINDOW_MS, FREEZE_MS, blockedDue, burnDue, checklistCheckTrue, clearedLine, crownPinBar, describeCheck, escapeLine, expiredLine, fileCheckTrue,
@@ -75,6 +75,8 @@ export interface AutopilotState {
   by?: string;
   /** Origin of the turn now running (written by the TUI at turn start) — the goal tools refuse writes in an 'auto' turn. */
   turnOrigin?: 'human' | 'auto';
+  /** OP-GOAL-EXPLICIT-ONLY — the running person turn's own words (last {@link TURN_TEXT_KEEP} chars) · absent in an auto turn. */
+  turnText?: string;
   /** AUTOPILOT-DYNAMIC-GOAL-FEED — open first-class goals (crown · human directive · war); the latest overrides standing. */
   firstClass?: FirstClassGoal[];
   /** Closed first-class ids (a re-delivered crown mail never re-opens its goal) — last CLOSED_FIRST_CLASS_KEEP. */
@@ -209,7 +211,7 @@ export function autopilotPolicyParagraph(state: AutopilotState | null, goals: re
     + '사람에게는 돈·보안 사고·되돌릴 수 없는 행동·방향 결정만 결정 카드(decisions raise)로 올린다. '
     + '스스로 정한 결정마다 autopilot_set({decided:{kind, criterion}}) 한 번으로 기록한다. '
     + '지금 할 수 있는 다음 단계가 남아 있으면 턴을 끝내지 말고 이 턴에서 이어서 한다 — 완료 기준에 닿거나 진짜 막힘(다른 자리·외부 결과 대기·사람 결정)일 때만 끝낸다. 끝낼 때만 무엇을 기다리는지·다음 점검 시각을 한 줄로 남긴다 — 깨움은 자율주행이 건다. '
-    + '사람의 새 요청·다른 방향·긴급 지시도 그냥 입력이다 — 처리하되 자율주행은 켜진 채로 둔다. 사람의 요청이 이번 턴을 넘는 여러 단계 일(산출물·계획·결정 · 기한·목표 수치)이면 autopilot_set({on:true, goal:"<한 줄>", done_criterion:"<완료 판정 한 줄>", deadline:"HH:MM", expected_turns:N, done_check?})로 작업 골(핀 · 입력창 위 · 최대 3)을 세운다(3턴 미만·15분 이하 일·우편 답장·후속 확인은 골이 아니다 · 자율주행 골은 30분에 1개 · 핀 변경은 30분에 3번) — 자율주행 골(🚗 칩)은 바꾸지 않는다(kind:"autopilot" 은 판 골·대표 P0 지시만). 지금 답할 질문·상태 확인·한 걸음 명령·맞장구는 골이 아니다. 작업 골이 끝나면 autopilot_set({goal_done:true, kind:"task", goal:"<그 줄>"}). 백그라운드 에이전트를 띄웠으면 «아직 없음»으로 끝내지 말고 초안부터 낸다. '
+    + '사람의 새 요청·다른 방향·긴급 지시도 그냥 입력이다 — 처리하되 자율주행은 켜진 채로 둔다. 작업 골(📌 핀 · 입력창 위 · 최대 3)은 사람이 «이걸 골로 잡아»처럼 골 설정을 명시할 때만 세운다 — autopilot_set({on:true, goal:"<한 줄>", explicit_ask:"<사람 말 그대로>", done_criterion:"<완료 판정 한 줄>", deadline:"HH:MM", expected_turns:N}). 질문·상태 확인·요청·기한 있는 부탁·우편 답장·후속 확인은 골이 아니다 — 이번 턴에 답하거나 처리한다(추론으로 골을 만들지 않는다). 자율주행 골(🚗 칩)은 바꾸지 않는다(kind:"autopilot" 은 판 골·대표 P0 지시만). 작업 골이 끝나면 autopilot_set({goal_done:true, kind:"task", goal:"<그 줄>"}). 백그라운드 에이전트를 띄웠으면 «아직 없음»으로 끝내지 말고 초안부터 낸다. '
     + '보통 우편·요청은 골이 아니다(약속 원장·체크리스트) — 골은 사람·대표 지시만 바꾼다. 1급 골(대표 지시)의 일이 끝나면 autopilot_set({goal_done:true})로 닫는다 — 상시 골이 돌아온다. 기한이 지나면 부분 결과로 닫기(outcome:"partial") · 기한 연장({on:true, deadline}) · 포기(outcome:"dropped", reason) 중 하나를 고른다. '
     + '멈추는 것은 사람이 «이제부터 내가 운전하겠다»(autopilot_set({on:true, hold:true})) 또는 «자율주행 멈춰»(autopilot_set({on:false}))라고 명시할 때뿐이다.' + stack;
 }
@@ -244,6 +246,30 @@ export interface AutopilotSetRequest {
   /** with goalDone — done (default) · partial (closed with a partial result) · dropped (with reason). */
   outcome?: 'done' | 'partial' | 'dropped';
   reason?: string;
+  /**
+   * OP-GOAL-EXPLICIT-ONLY (대표 11-26 04:5x) — the person's own words that ask to set this as a goal, quoted verbatim from
+   * the running person turn. A model-set goal without it (or with a quote not found in that turn) is refused: a question
+   * or a request is answered inside the turn, never pinned.
+   */
+  explicitAsk?: string;
+}
+
+/** OP-GOAL-EXPLICIT-ONLY — how much of the person turn is kept for the quote check. */
+export const TURN_TEXT_KEEP = 4000;
+/** OP-GOAL-EXPLICIT-ONLY — the shortest quote accepted (a one-letter quote proves nothing). */
+export const EXPLICIT_ASK_MIN_CHARS = 4;
+const quoteNorm = (s: string): string => s.normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
+/**
+ * OP-GOAL-EXPLICIT-ONLY — is this goal backed by the person's explicit ask? Structural check only: the turn is a person
+ * turn and the quoted words are a verbatim substring of it. Whether the words ask for a goal is the model's judgment
+ * (prompt + tool description); this refuses the inferred case (no quote / quote invented / not a person turn).
+ */
+export function explicitGoalAskReason(state: Pick<AutopilotState, 'turnOrigin' | 'turnText'>, quote: string | undefined): string | null {
+  const q = quoteNorm(quote ?? '');
+  if (!q) return 'no-explicit-ask';
+  if (q.length < EXPLICIT_ASK_MIN_CHARS) return 'explicit-ask-too-short';
+  if (state.turnOrigin !== 'human' || !state.turnText) return 'not-a-person-turn';
+  return quoteNorm(state.turnText).includes(q) ? null : 'explicit-ask-not-in-turn';
 }
 
 export interface AutopilotDecisionCard { title: string; reason: string; goal: string | undefined; sessionId: string | undefined }
@@ -326,7 +352,7 @@ export type AutopilotTurnEndResult = {
 /** The nudge text when a turn ends with only «not yet» while background agents still run for the open goal. */
 export const awaitAgentsNudge = (goal: string | undefined, running: number): string =>
   `${goal ? `🎯 지금 골: ${goal} — ` : ''}백그라운드 에이전트 ${running}개가 아직 돈다. «아직 없음»으로 끝내지 말고 초안부터 내고 결과 오면 갱신한다.`
-  + (goal ? '' : ' 이번 턴을 넘는 여러 단계 일이면 autopilot_set({on:true, goal, done_criterion, deadline})로 작업 골(핀)을 세운다.');
+  + (goal ? '' : ' 사람이 골 설정을 명시하면(explicit_ask 에 그 말 인용) autopilot_set({on:true, goal, explicit_ask, done_criterion, deadline})로 작업 골(핀)을 세운다 — 질문·요청은 골이 아니다.');
 /** The re-feed text when a background agent finishes while a first-class goal is open. */
 export const agentDoneRefeed = (goal: string, done: AutopilotBackgroundDone): string =>
   `🎯 지금 골: ${goal} — 백그라운드 에이전트 «${short(done.summary, 60)}» 끝남(${done.status}) · capsule:${done.capsuleId}. 결과를 합쳐 완료 기준까지 이어서 간다.`;
@@ -634,6 +660,19 @@ export function createAutopilot(deps: AutopilotDeps) {
     }
     // Re-delivery: the same mail never re-opens its goal.
     if (state.firstClass?.some((g) => g.id === decision.id) || state.closedFirstClass?.includes(decision.id)) return false;
+    if ((m.refs ?? []).includes(GOAL_TASK_REF)) {
+      const deadline = m.deadlineAt ? Date.parse(m.deadlineAt) : NaN;
+      const done = m.doneWhen?.trim();
+      if (!done || !Number.isFinite(deadline) || deadline <= t) {
+        log('goal-apply-refused', { reason: 'task-requires-done-and-future-deadline', msgId: m.msgId ?? null });
+        return false;
+      }
+      pinGoal({ id: `pin:${decision.id}`, text: decision.goal, done, deadline, priority: 1, at: t, task: true });
+      state = { ...state, closedFirstClass: [...(state.closedFirstClass ?? []), decision.id].slice(-CLOSED_FIRST_CLASS_KEEP) };
+      log('goal-applied', { source: decision.source, by: decision.by, msgId: m.msgId ?? null, goal: decision.goal, applied: true, kind: 'task' });
+      save();
+      return true;
+    }
     const mailExpiry = m.expiresAt ? Date.parse(m.expiresAt) : NaN;
     const goal: FirstClassGoal = { id: decision.id, source: decision.crown ? 'crown' : 'human', text: decision.goal, at: t,
       ...(m.doneWhen?.trim() ? { done: m.doneWhen.trim() } : {}), ...(Number.isFinite(mailExpiry) ? { expiresAt: mailExpiry } : {}),
@@ -812,9 +851,11 @@ export function createAutopilot(deps: AutopilotDeps) {
     goalsFile,
     paragraph: (): string | null => autopilotPolicyParagraph(state, goals(), now()),
     /** The TUI marks each turn's origin so the goal tools (REPL child) can refuse writes in autonomous turns. */
-    noteTurnStart(origin: 'human' | 'auto'): void {
-      if (state.turnOrigin === origin) return;
-      state = { ...state, turnOrigin: origin };
+    noteTurnStart(origin: 'human' | 'auto', text?: string): void {
+      const kept = origin === 'human' && text ? text.slice(-TURN_TEXT_KEEP) : undefined;
+      if (state.turnOrigin === origin && state.turnText === kept) return;
+      const { turnText: _old, ...rest } = state;
+      state = { ...rest, turnOrigin: origin, ...(kept ? { turnText: kept } : {}) };
       save();
     },
     isActive: (): boolean => active(),
@@ -861,7 +902,19 @@ export function createAutopilot(deps: AutopilotDeps) {
       for (const m of mails) {
         if (typeof m.supersedes !== 'number') continue;
         refresh();
-        if (clearGoal(`goal:${m.supersedes}`, 'retracted', 'dropped', `retracted by ${m.sender ?? 'mail'}${m.msgId ? ` msg:${m.msgId}` : ''}`)) applied = true;
+        const reason = `retracted by ${m.sender ?? 'mail'}${m.msgId ? ` msg:${m.msgId}` : ''}`;
+        if (clearGoal(`goal:${m.supersedes}`, 'retracted', 'dropped', reason)) applied = true;
+        // Task pins use a separate ID; only an authorized goal setter may retract one.
+        const verdict = goalSetterVerdict({ sender: m.sender, seat: deps.seat, crownDirective: m.crownDirective, ladder: deps.federationLadder });
+        if (verdict.ok) {
+          if (clearGoal(`pin:goal:${m.supersedes}`, 'retracted', 'dropped', reason)) applied = true;
+          // Remember even an early retraction so later delivery cannot resurrect the goal.
+          const id = `goal:${m.supersedes}`;
+          if (!state.closedFirstClass?.includes(id)) {
+            state = { ...state, closedFirstClass: [...(state.closedFirstClass ?? []), id].slice(-CLOSED_FIRST_CLASS_KEEP) };
+            save();
+          }
+        }
       }
       for (const m of mails) {
         if (typeof m.goal !== 'string' || !m.goal.trim()) continue;
@@ -1037,6 +1090,15 @@ export function createAutopilot(deps: AutopilotDeps) {
         log('goal-refused', { goal, reason: 'autonomous-turn', current: state.goal });
         return { ok: false, text: '골은 사람·대표 지시만 바꾼다 — 보통 우편·요청은 약속 원장·체크리스트에 적는다' };
       }
+      // OP-GOAL-EXPLICIT-ONLY — a model-set task goal (📌 pin) needs the person's explicit ask, quoted from this person turn.
+      // (The 🚗 chip goal — kind:"autopilot" — stays the standing / crown direction under its own bar and rate limits.)
+      if (goal && source === 'tool' && kind === 'task' && !req.hold) {
+        const why = explicitGoalAskReason(state, req.explicitAsk);
+        if (why) {
+          log('goal-refused', { goal, reason: why, current: state.goal });
+          return { ok: false, text: `Not a goal: ${why}. A goal is set only when the person explicitly says to set it as a goal (quote their words in explicit_ask) or a crown mail carries a goal field. Answer the question or do the request in this turn.` };
+        }
+      }
       if (goal && source === 'tool' && !doneCriterion) {
         log('goal-refused', { goal, reason: 'no-done-criterion', current: state.goal });
         return { ok: false, text: '골에는 완료 기준(done_criterion · 한 줄 판정)이 필요하다 — 이번 턴에 끝나는 질문·상태 확인·한 걸음 명령은 골이 아니다' };
@@ -1094,7 +1156,7 @@ export function createAutopilot(deps: AutopilotDeps) {
       }
       state = { v: 1, on: true, since: t, by: source, ...(state.standing ? { standing: state.standing } : {}), ...goalTier(),
         ...(goal ? { goal } : state.goal ? { goal: state.goal } : {}), ...(until !== undefined ? { until } : {}),
-        ...(state.turnOrigin ? { turnOrigin: state.turnOrigin } : {}) };
+        ...(state.turnOrigin ? { turnOrigin: state.turnOrigin } : {}), ...(state.turnText ? { turnText: state.turnText } : {}) };
       log('on', { reason: source, goal: state.goal, ...(until !== undefined ? { until } : {}) });
       // A person's goal = a first-class directive (it overrides the standing goal until goal_done closes it).
       // A newer person's direction supersedes the older one (crown goals underneath stay open).

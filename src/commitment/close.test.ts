@@ -40,7 +40,7 @@ function harness(lockWaitMs?: number) {
 describe('CommitmentClose — 도구로 닫기', () => {
   test('done = 근거 저장 ⊕ armed 깨우개 cancelled ⊕ 이후 틱은 notice 0', async () => {
     const h = harness();
-    const result = dispatchCommitmentClose({ id: 'c-1', status: 'done', evidence: 'PR #40050 merged, receipt pregate-40050.json' }, { ledger: h.ledger, timer: h.timer });
+    const result = await dispatchCommitmentClose({ id: 'c-1', status: 'done', evidence: 'PR #40050 merged, receipt pregate-40050.json' }, { ledger: h.ledger, timer: h.timer });
     expect(result.ok).toBe(true);
     expect(result.output).toBe('Commitment c-1 (REVIEW-1) → done · wakers cancelled: w-1');
     expect(h.ledger.get('REVIEW-1', 'c-1')?.status).toBe('done');
@@ -63,28 +63,28 @@ describe('CommitmentClose — 도구로 닫기', () => {
     expect(listWakers('REVIEW-1', h.timer)[0]?.status).toBe('cancelled');
   });
 
-  test('자리를 주면 그 자리에서 · 안 주면 id 로 찾는다', () => {
+  test('자리를 주면 그 자리에서 · 안 주면 id 로 찾는다', async () => {
     const h = harness();
-    expect(dispatchCommitmentClose({ id: 'c-1', status: 'done', evidence: 'ok', seat: 'review-1' }, { ledger: h.ledger, timer: h.timer }).seat).toBe('REVIEW-1');
+    expect((await dispatchCommitmentClose({ id: 'c-1', status: 'done', evidence: 'ok', seat: 'review-1' }, { ledger: h.ledger, timer: h.timer })).seat).toBe('REVIEW-1');
   });
 
-  test('근거 없음·여러 줄·틀린 상태는 거부 · 원장 그대로', () => {
+  test('근거 없음·여러 줄·틀린 상태는 거부 · 원장 그대로', async () => {
     const h = harness();
-    expect(dispatchCommitmentClose({ id: 'c-1', status: 'done', evidence: '  ' }, { ledger: h.ledger, timer: h.timer }).output)
+    expect((await dispatchCommitmentClose({ id: 'c-1', status: 'done', evidence: '  ' }, { ledger: h.ledger, timer: h.timer })).output)
       .toBe('CommitmentClose failed: evidence is required: one line (test result, receipt path, PR, or what blocks it)');
-    expect(dispatchCommitmentClose({ id: 'c-1', status: 'done', evidence: 'a\nb' }, { ledger: h.ledger, timer: h.timer }).output)
+    expect((await dispatchCommitmentClose({ id: 'c-1', status: 'done', evidence: 'a\nb' }, { ledger: h.ledger, timer: h.timer })).output)
       .toBe('CommitmentClose failed: evidence must be one line');
-    expect(dispatchCommitmentClose({ id: 'c-1', status: 'dropped', evidence: 'x' }, { ledger: h.ledger, timer: h.timer }).ok).toBe(false);
+    expect((await dispatchCommitmentClose({ id: 'c-1', status: 'dropped', evidence: 'x' }, { ledger: h.ledger, timer: h.timer })).ok).toBe(false);
     expect(h.ledger.get('REVIEW-1', 'c-1')?.status).toBe('open');
     expect(listWakers('REVIEW-1', h.timer)[0]?.status).toBe('armed');
   });
 });
 
 describe('CommitmentClose — 실패 경로', () => {
-  test('없는 id = 충돌 오류 · 아무것도 안 바뀐다', () => {
+  test('없는 id = 충돌 오류 · 아무것도 안 바뀐다', async () => {
     const h = harness();
     expect(() => closeCommitment({ id: 'c-404', status: 'done', evidence: 'x' }, { ledger: h.ledger, timer: h.timer })).toThrow(CommitmentLifecycleConflict);
-    expect(dispatchCommitmentClose({ id: 'c-404', status: 'done', evidence: 'x' }, { ledger: h.ledger, timer: h.timer }).output)
+    expect((await dispatchCommitmentClose({ id: 'c-404', status: 'done', evidence: 'x' }, { ledger: h.ledger, timer: h.timer })).output)
       .toBe('CommitmentClose failed: commitment not found: c-404 (list open ones: eln commitment list)');
     expect(listWakers('REVIEW-1', h.timer)[0]?.status).toBe('armed');
   });

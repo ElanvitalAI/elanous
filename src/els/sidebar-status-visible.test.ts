@@ -45,7 +45,7 @@ test('sidebar: space lines carry no status mark, the coordinator is ⭐, and the
   expect(workingAt).toBeGreaterThan(-1);
   expect(idleAt).toBeGreaterThan(workingAt);               // 같은 스페이스 안: 일하는 것 → 쉬는 것(OP #134199 ②)
   expect(lines.findIndex((line, at) => at > agentsHead && line.includes('🟡'))).toBeGreaterThan(-1);
-  expect(lines[workingAt - 1]!.trim()).toBe('▾ NAME-W1 · 2'); // ELS-PANE-LABEL-MODEL-FIRST: a «▾ SPACE · n» head per space
+  expect(lines[workingAt - 1]!.trim().replace(/ {2,}/g, ' ')).toBe('⌄ NAME-W1 2'); // SIDETAB-SPACE-HEADER-BAND: a «⌄ SPACE … n» head per space
 });
 
 test('focused space expands to «N agents · branch» and no space shows more than two lines', () => {

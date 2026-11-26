@@ -8,6 +8,9 @@ import { debug } from '../debug/log.js';
 export const RESEARCH_ROUTE_CATEGORY = 'research';
 export const RESEARCH_ROUTE_EVENT = 'route';
 export const RESEARCH_ROUTE_EVENTS = [RESEARCH_ROUTE_EVENT] as const;
+/** WEBCHAT-ORDINARY-SKIP-GROUNDING — a turn whose caller turned default research entry off (member web chat); no
+ * route decision is made on such a turn, so it is not one of the route events above. */
+export const RESEARCH_ROUTE_DEFAULT_OFF_EVENT = 'default-entry-off';
 
 /** Tools that give a turn a web-grounding path; a turn whose pool has none is outside the structured route. */
 export const RESEARCH_ROUTE_WEB_TOOLS: ReadonlySet<string> = new Set(['WebSearch', 'OmniSearch', 'WebFetch']);

@@ -153,11 +153,15 @@ export function registerLlmDetectCommand(program: Command): void {
         const llm = await import('../llm.js');
         const { getUserConfig } = await import('../user-config.js');
         const { trimToBudget } = await import('../tokens.js');
-        const result = await llmQuery({ text, deps: {
+        // Plain mode streams the reply as it arrives (an orchestration's reduce tab fills in live); --json stays one line.
+        let streamed = false;
+        const onDelta = options.json ? undefined : (delta: string): void => { if (delta) { streamed = true; process.stdout.write(delta); } };
+        const result = await llmQuery({ text, ...(onDelta ? { onDelta } : {}), deps: {
           getUserConfig, decideProviderForConfig: llm.decideProviderForConfig, getProviderForConfig: llm.getProviderForConfig,
           streamLLM: llm.streamLLM, trimToBudget,
         } });
         if (options.json) process.stdout.write(JSON.stringify({ sessionId: null, ...result, logPath: null, budget: null }) + '\n');
+        else if (streamed) process.stdout.write('\n');
         else process.stdout.write(result.reply.endsWith('\n') ? result.reply : `${result.reply}\n`);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

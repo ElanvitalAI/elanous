@@ -74,7 +74,7 @@ export function remoteMark(env: Record<string, string | undefined> = process.env
 }
 
 /** Line 1 tail after the mark, and the dim line 2 (empty when there is nothing to say). */
-export function agentEntry(input: AgentEntryInput, nowMs: number): { readonly head: string; readonly detail: string } {
+export function agentEntry(input: AgentEntryInput, nowMs: number): { readonly head: string; readonly detail: string; readonly model?: string } {
   const hand = parseHandTitle(input.title);
   const model = modelLabel(input.model ?? commandModel(input.command));
   // ELS-REMOTE-SEAT-MARK (대표 11-25 «not too loud»): a seat of another host carries a quiet single-width «⇄» right after its id.
@@ -82,5 +82,5 @@ export function agentEntry(input: AgentEntryInput, nowMs: number): { readonly he
   const lent = hand?.space && hand.space.toUpperCase() !== input.groupSpace.toUpperCase() ? `@${hand.space}` : undefined;
   // the cell goes last: a narrow sidebar cuts it, never the short facts before it.
   const parts = [lent, runtimeLabel(input.agent), input.remote ? `⇄${input.remote}` : undefined, ageLabel(input.lastEventAtMs, nowMs), hand?.cell ? cut(hand.cell, 18) : undefined];
-  return { head, detail: parts.filter((part): part is string => !!part).join(' · ') };
+  return { head, detail: parts.filter((part): part is string => !!part).join(' · '), ...(model ? { model } : {}) };
 }

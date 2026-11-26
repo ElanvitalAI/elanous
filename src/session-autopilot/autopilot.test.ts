@@ -136,7 +136,8 @@ test('a new / urgent directive while AUTO → still AUTO with the goal replaced;
 test('model-facing paragraph: ON says directives never pause (only explicit hold / off); paused text = explicit hold only', () => {
   const on = autopilotPolicyParagraph({ v: 1, on: true, goal: 'g' }, [], T0) ?? '';
   expect(on).toContain('사람의 새 요청·다른 방향·긴급 지시도 그냥 입력이다 — 처리하되 자율주행은 켜진 채로 둔다.');
-  expect(on).toContain('autopilot_set({on:true, goal:"<한 줄>", done_criterion:"<완료 판정 한 줄>", deadline:"HH:MM", expected_turns:N, done_check?})로 작업 골(핀 · 입력창 위 · 최대 3)을 세운다');
+  expect(on).toContain('작업 골(📌 핀 · 입력창 위 · 최대 3)은 사람이 «이걸 골로 잡아»처럼 골 설정을 명시할 때만 세운다');
+  expect(on).toContain('질문·상태 확인·요청·기한 있는 부탁·우편 답장·후속 확인은 골이 아니다 — 이번 턴에 답하거나 처리한다(추론으로 골을 만들지 않는다).');
   expect(on).toContain('멈추는 것은 사람이 «이제부터 내가 운전하겠다»(autopilot_set({on:true, hold:true})) 또는 «자율주행 멈춰»(autopilot_set({on:false}))라고 명시할 때뿐이다.');
   const held = autopilotPolicyParagraph({ v: 1, on: true, goal: 'g', paused: { at: T0, hold: true, lastHumanAt: T0 } }, [], T0) ?? '';
   expect(held).toBe('## 🚗 자율주행 일시정지 (사람이 «내가 운전하겠다»고 명시함) · 목표: g\n사람이 직접 운전하겠다고 말했다 — 사람의 말을 따른다. 사람이 «다시 자율주행»이라고 하면 autopilot_set({on:true})를 부른다.');

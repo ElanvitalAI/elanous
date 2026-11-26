@@ -918,6 +918,32 @@ test('app: ✕ with something running asks «⚠ N개 실행 중 — 종료?»; 
   expect(h.requests.filter((r) => r.op === 'close-workspace')).toEqual([{ op: 'close-workspace', ws: 'w1', confirmed: true }]);
 });
 
+// ---- ELS-QUIT-CLICK (대표 11-26): a real click = press + release; the release must not cancel the ✕ confirm ----------
+const release = (x: number, y = 24): string => `\u001b[<0;${x};${y}m`;
+test('app: ✕ Quit click (press+release) with something running keeps «⚠ 1 running — quit?» up; y then closes and leaves', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'working')));
+  await h.app.start();
+  h.app.key(click(76)); h.app.key(release(76));
+  expect(h.lastScreen()).toContain('⚠ 1 running — quit? · y confirm · any other key cancels');
+  h.app.key('y');
+  expect(await h.app.done).toEqual({ code: 0, message: '' });
+  expect(h.requests.filter((r) => r.op === 'close-workspace')).toEqual([{ op: 'close-workspace', ws: 'w1', confirmed: true }]);
+});
+test('app: ✕ Quit press and release in one read also keeps the confirm up', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'working')));
+  await h.app.start();
+  h.app.key(click(76) + release(76));
+  expect(h.lastScreen()).toContain('⚠ 1 running — quit?');
+  expect(h.requests.filter((r) => r.op === 'close-workspace')).toEqual([]);
+});
+test('app: ⏏ Background click (press+release) leaves with code 0 and closes nothing', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'working')));
+  await h.app.start();
+  h.app.key(click(65) + release(65));
+  expect(await h.app.done).toEqual({ code: 0, message: '' });
+  expect(h.requests.filter((r) => r.op === 'close' || r.op === 'close-workspace')).toEqual([]);
+});
+
 // ---- ELS-MOUSE ③ (OP #101585): 탭 클릭 → 그 탭 포커스 — attach·입력·반전 표식이 모두 클릭한 탭으로 간다 -------------
 const TAB_ROW_CLICK_Y = 1;   // 탭 줄 = 화면 첫 줄(사이드바 오른쪽 · FU3 배치)
 const P2_TAB_CLICK_X = 40;   // 사이드바 28칸 + 구분선 1칸 + 첫 탭 8칸 + 간격 1칸 오른쪽, 두 번째 탭 안(패딩 다음 칸 · 1 기반 SGR 좌표)

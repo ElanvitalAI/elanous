@@ -4,6 +4,8 @@
 //
 // slugFromName is a deterministic character transform (Unicode -> [a-z0-9]), not a classifier of what a name means.
 
+import { OWNER_UNLOCKABLE_HANDLES } from './member-owner-unlock.js';
+
 /** Public handle length bounds (claim API regex ^[a-z][a-z0-9]{2,19}$ and the relay's DNS user label). 출처: members-api.ts PUT /v1/members/handle. */
 export const HANDLE_MIN = 3;
 export const HANDLE_MAX = 20;
@@ -21,9 +23,15 @@ export const RESERVED_MEMBER_HANDLES: ReadonlySet<string> = new Set(['admin', 'u
  */
 export const STATIC_DISPATCH_HANDLE_NAMES: ReadonlySet<string> = new Set(['www', 'docs', 'api', 'admin', 'relay', 'mail', 'app', 'v1']);
 
-export function isReservedHandle(candidate: string, mayHoldJoosung = false): boolean {
-  return STATIC_DISPATCH_HANDLE_NAMES.has(candidate)
-    || (RESERVED_MEMBER_HANDLES.has(candidate) && !(candidate === 'user' && mayHoldJoosung));
+/**
+ * `ownerUnlocked` is true only after the claim route verified an owner unlock code AND the store verified the owner account
+ * (member-owner-unlock.ts). It frees the owner-unlockable reserved names; a relay route name such as «admin» stays reserved.
+ */
+export function isReservedHandle(candidate: string, mayHoldJoosung = false, ownerUnlocked = false): boolean {
+  if (STATIC_DISPATCH_HANDLE_NAMES.has(candidate)) return true;
+  if (!RESERVED_MEMBER_HANDLES.has(candidate)) return false;
+  if (candidate === 'user' && mayHoldJoosung) return false;
+  return !(ownerUnlocked && OWNER_UNLOCKABLE_HANDLES.has(candidate));
 }
 
 /** True when the candidate satisfies the format and is not one of our own names (taken-ness is the caller's business). */

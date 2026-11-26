@@ -90,9 +90,16 @@ export function startNextTuiTurn(input: Omit<NextTuiTurnInput, 'signal'>, deps: 
     secretPreviewBlocked ||= securityText.toUpperCase().includes(pemOpening);
     pemOpeningTail = securityText.slice(-(pemOpening.length - 1));
     if (replace) {
-      // TUI-ANSWER-VANISH-ON-TOOLCALL — a tool-round clear frame hands the streamed pre-tool
-      // lines to the screen holder before the preview restarts clean; a blocked secret clears silently.
-      if (preview.trim() !== '' && !secretPreviewBlocked) deps.onHeldAnswer?.(preview);
+      // ELN-TRANSCRIPT-APPEND-ONLY (대표 11-26): the assistant text the person has already seen stays on screen. A
+      // tool-round clear or a restarted model round no longer wipes it (the live flow lost every earlier step and a
+      // new round looked like the answer being rewritten); the next round's text is appended after a blank line, so
+      // the tool rows anchored by offset into this text keep their place. Unclassified (diagnostic) text still resets.
+      if (previewSource === 'assistant-text' && preview.trim() !== '' && !secretPreviewBlocked) {
+        // Everything shown before this round is handed to the screen holder for the settled transcript.
+        deps.onHeldAnswer?.(preview.trimEnd());
+        if (!preview.endsWith('\n\n')) preview += '\n\n';
+        return;
+      }
       preview = '';
       previewSource = undefined;
       clearRenderTimer();
@@ -109,6 +116,8 @@ export function startNextTuiTurn(input: Omit<NextTuiTurnInput, 'signal'>, deps: 
       deps.onPreview?.('', true);
       return;
     }
+    // ELN-TRANSCRIPT-APPEND-ONLY: shown assistant text is never dropped for a diagnostic chunk that follows it.
+    if (previewSource === 'assistant-text' && source !== 'assistant-text' && preview.trim() !== '') return;
     // Never promote an earlier unclassified chunk when a typed assistant delta arrives.
     if (source !== previewSource) preview = '';
     previewSource = source;

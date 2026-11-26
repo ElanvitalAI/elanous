@@ -2,7 +2,7 @@
 // log lines), mail is captured, detection is injected. Expectations are independent literals (QUICKPASS-GOLDEN ids,
 // commands, counts). The golden-ledger scenario suite (48 assertions) runs through seat-state/REL/evidence/quickpass-sim.
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ConditionProbes } from '../loops/trigger-conditions.js';
@@ -90,11 +90,36 @@ describe('plan', () => {
     expect(steps.filter(s => s.always).map(s => s.id)).toEqual(['traffic-restore']);
   });
 
+  test('npm step: missing or empty token file fails fast and never runs npm publish', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'npm-tok-'));
+    try {
+      const bin = join(dir, 'bin'); mkdirSync(bin);
+      const calls = join(dir, 'calls.txt');
+      writeFileSync(join(bin, 'npm'), `#!/bin/sh\necho "$1" >> ${calls}\n[ "$1" = view ] && exit 1\nexit 0\n`, { mode: 0o755 });
+      for (const [name, content] of [['missing', null], ['empty', '\n'], ['ok', 'tok123\n']] as const) {
+        const tok = join(dir, `tok-${name}`);
+        if (typeof content === 'string') writeFileSync(tok, content as string);
+        writeFileSync(calls, '');
+        const cmd = releaseSteps(V, CLOCK, { notesFile: '/h/notes.md', prepDir: '/h/prep' }, { ...OPTS, npmTokenFile: tok } as typeof OPTS).find(s => s.id === 'npm')!.cmd;
+        const r = Bun.spawnSync(['sh', '-c', cmd ?? 'exit 99'], { env: { PATH: `${bin}:/usr/bin:/bin` } });
+        const seen = readFileSync(calls, 'utf8');
+        if (name === 'ok') { expect(r.exitCode).toBe(0); expect(seen).toBe('view\npublish\n'); continue; }
+        expect(r.exitCode).toBe(1);
+        expect(seen).toBe('view\n');
+        expect(r.stderr.toString()).toContain('npm: token file missing or empty');
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('commands are the golden ledger lines', () => {
     const byId = new Map(stepsFor(loadRun(root, V)!, OPTS).map(s => [s.id, s.cmd]));
     expect(byId.get('prepare')).toBe('cd /r/.claude/wt/release-0.3.36 && bun bin/elanous.mjs --config-dir /i release critpath --version 0.3.36 --cut-commit $(cat /h/cut.sha) --notes-file /h/notes.md --dry-run');
     expect(byId.get('publish')).toBe('cd /r/.claude/wt/release-0.3.36 && bun bin/elanous.mjs --config-dir /i release publish --dir /h/prep --notes-file /h/notes.public.md --yes');
-    expect(byId.get('npm')).toBe('npm view elanous@0.3.36 version | grep -qx 0.3.36 || npm publish /h/prep/dist/elanous.tgz --ignore-scripts --access public --loglevel warn');
+    const npmCmd = byId.get('npm') ?? '';
+    expect(npmCmd.startsWith('npm view elanous@0.3.36 version | grep -qx 0.3.36 || ')).toBe(true);
+    expect(npmCmd).toContain('NPM_CONFIG_USERCONFIG=$T/npmrc npm publish /h/prep/dist/elanous.tgz --ignore-scripts --access public --loglevel warn');
+    expect(npmCmd).toContain("/secrets/npm-token");
+    expect(npmCmd).toContain('rm -rf "$T"');
     expect(byId.get('cut-push')).toBe('cd /r/.claude/wt/release-0.3.36 && git push -q origin HEAD:refs/heads/release/0.3.36');
     expect(byId.get('els-restart')).toBe('launchctl kickstart -k gui/501/dev.elanous.els');
     expect(byId.get('rail')).toBe("RAIL_HOSTS='local mbp node-b minim5' zsh /hq/seat-state/OP/tools/rail-now.sh");

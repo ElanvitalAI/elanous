@@ -23,7 +23,8 @@ export const AUTH_OWNER_TOKEN_ENV = 'ELANOUS_ELS_OWNER_TOKEN';
  * taps a pane's live output stream, so it is mutating and judged as `do` (pane credential, own workspace).
  * `child` reads are decided by MUTATING_CHILD_ACTIONS below (tree/summary are reads; status updates state).
  */
-export const READ_OPS: ReadonlySet<string> = new Set(['ping', 'auth', 'ls', 'subscribe', 'grep', 'read', 'status']);
+// GOAL-ORCHESTRATION-NL: tile-frame is the tile view's read of a pane screen (same data as read); without it every tile drew blank.
+export const READ_OPS: ReadonlySet<string> = new Set(['ping', 'auth', 'ls', 'subscribe', 'grep', 'read', 'tile-frame', 'status']);
 /** `child` actions that mutate the tree; tree and summary are reads. */
 const MUTATING_CHILD_ACTIONS: ReadonlySet<string> = new Set(['start', 'end', 'pin', 'unpin', 'dismiss', 'progress', 'status']);
 

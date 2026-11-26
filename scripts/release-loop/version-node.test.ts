@@ -956,7 +956,7 @@ test('branch-cut dev-bump accepts main still on the released -dev line when rele
   }
 });
 
-test('dev-bump does not infer branch-cut mode from a missing or unrelated release branch', () => {
+test('dev-bump accepts main still on the released -dev line without a release branch (0.3.36-dev.0 -> 0.3.37-dev.0)', () => {
   for (const output of [
     { commit: 'cut-sha' },
     { outcome: 'ok', commit: 'cut-sha', branch: 'release/0.2.37' },
@@ -968,9 +968,9 @@ test('dev-bump does not infer branch-cut mode from a missing or unrelated releas
       outputs: { 'version-release': output } });
     try {
       const result = run('dev-bump', '--json');
-      expect(result.status).toBe(1);
-      expect(result.output.error).toContain('origin/main version 0.2.38-dev.0 is not 0.2.38');
-      expect(result.calls).not.toContain('pr land');
+      expect(result.status).toBe(0);
+      expect(result.output).toMatchObject({ outcome: 'ok', kind: 'dev-bump', version: '0.2.39-dev.0', commit: 'merged-sha' });
+      expect(result.calls).toContain('bun bin/elanous.mjs pr land --commit-message version: 0.2.39-dev.0');
     } finally {
       if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
       else process.env.ELANOUS_GRAPH_CONTEXT = previous;

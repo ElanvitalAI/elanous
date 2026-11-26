@@ -15,13 +15,15 @@ export interface HostTileProps {
   readonly role?: string;
   readonly state: HostState;
   readonly next?: boolean;
+  /** A simulated host (replay / test universe) — labelled «sim» so nobody reads it as a paid VM. */
+  readonly sim?: boolean;
   readonly frame: number;
 }
 
 const BAR = 6;
 
 export function renderHostTile(props: HostTileProps, width: number): string {
-  const name = pad(clean(props.name), 7);
+  const name = pad(`${clean(props.name)}${props.sim ? ' sim' : ''}`, props.sim ? 9 : 7);
   if (props.state === 'off') return fit(`${name} ○ off`, width);
   if (props.state === 'card') return fit(`${name} $? cloud card pending — press v to approve`, width);
   const cap = Math.max(1, props.cap);

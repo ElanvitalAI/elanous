@@ -236,6 +236,9 @@ export interface LLMMessage {
   transientPreamble?: true;
   /** Internal marker for the user message belonging to the active turn. */
   transientTurnUser?: true;
+  /** Compactor-only provenance of a user row (`from.kind` of the stored row; ignored by every serializer). Present and
+   *  not 'human' = machine mail / system notice, never preserved as the person's words (CEO-UTTERANCE-TAGGED-LAST ④). */
+  speaker?: 'human' | 'agent' | 'system';
 }
 
 function toolUseNames(messages: readonly LLMMessage[]): string[] {
@@ -9306,7 +9309,12 @@ export async function streamLLMWithTools(
         if (pending.length > 0) {
           const { buildInterjectionContent } = require('./chat/interjection.js') as typeof import('./chat/interjection.js');
           // IMAGE-IN-STEER-FU — operator items may carry images: they join this user message as real image parts.
-          const content = buildInterjectionContent(pending, 'mid-turn');
+          // MAIL-ENVELOPE-INFO-NOT-ORDER — the mid-turn path decides trust with the same declared seats as the notice path
+          // (structured intent rides each seat-mail item), so info mail joins the digest, never the work-order frame.
+          const { declaredFederationSeats } = require('./msg/seat-mail-trust.js') as typeof import('./msg/seat-mail-trust.js');
+          let declaredSeats: ReadonlySet<string> | undefined;
+          try { declaredSeats = declaredFederationSeats(); } catch { declaredSeats = undefined; }
+          const content = buildInterjectionContent(pending, 'mid-turn', declaredSeats);
           if (content) {
             const message = typeof content === 'string' ? content : content.flatMap((part) => (part.type === 'text' ? [part.text] : [])).join('\n');
             const imageParts = typeof content === 'string' ? 0 : content.filter((part) => part.type === 'image').length;

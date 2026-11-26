@@ -9,6 +9,7 @@
 // renders the live screen and the owner saves it as the pane's scrollback, exactly like a local `els read`. The
 // bind address must be loopback or inside the tailnet.
 
+import { remoteResize } from './local-viewer-size.js';
 import { appendFileSync, readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { join } from 'node:path';
@@ -214,8 +215,9 @@ async function routeResize(core: ElsCore, hostName: string, info: ElsHttpRequest
   }
   const paneId = core.locate(address.ws, address.tab, address.pane);
   if (!paneId) { policy.audit({ source, op: 'resize', from: request.from, address: request.address, result: 'unknown pane' }); return json(404, { error: 'unknown pane' }); }
-  const done = core.resize(paneId, request.cols, request.rows);
-  policy.audit({ source, op: 'resize', from: request.from, address: request.address, result: done.message });
+  // ELS-PANE-HEIGHT: a viewer attached on this host keeps its size; the remote ask does not shrink the pane under it.
+  const { result: done, kept } = remoteResize(core, paneId, request.cols, request.rows, `host:${request.from}`);
+  policy.audit({ source, op: 'resize', from: request.from, address: request.address, result: kept ? `kept ${done.message}: a local view is attached` : done.message });
   return done.exitCode === 0 ? json(200, { message: done.message }) : json(done.exitCode === 2 ? 400 : 409, { error: done.message });
 }
 
@@ -266,7 +268,7 @@ function serveHttpAttach(core: ElsCore, hostName: string, policy: ElsDoPolicy, r
   const cols = Number(url.searchParams.get('cols'));
   const rows = Number(url.searchParams.get('rows'));
   if (Number.isInteger(cols) && cols > 0 && Number.isInteger(rows) && rows > 0) {
-    void core.resize(paneId, cols, rows);   // a refused resize is not fatal: the frames tell the true size
+    void remoteResize(core, paneId, cols, rows, `host:${from}`);   // a refused resize is not fatal: the frames tell the true size
   }
   policy.audit({ source, op: 'attach', from, pane: paneId, result: 'attached' });
   res.writeHead(200, { 'content-type': 'application/x-ndjson', 'cache-control': 'no-store' });   // no content length → chunked
@@ -305,7 +307,7 @@ function serveHttpAttach(core: ElsCore, hostName: string, policy: ElsDoPolicy, r
       const done = core.input(paneId, value.bytes);
       if (done.exitCode !== 0) send({ type: 'error', message: done.message });
     } else if (value.op === 'resize' && typeof value.cols === 'number' && typeof value.rows === 'number') {
-      const done = core.resize(paneId, value.cols, value.rows);
+      const { result: done } = remoteResize(core, paneId, value.cols, value.rows, `host:${from}`);
       if (done.exitCode !== 0) send({ type: 'error', message: done.message });
       else poke();
     }

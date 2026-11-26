@@ -27,6 +27,50 @@ function harness() {
 
 const staleCrown = { msgId: 150, crownDirective: '700', sender: 'CLAUDE-OP', body: '오전 결과 전체를 한 장으로', text: 'msg:150 · 오전 결과 전체를 한 장으로' };
 
+test('retracting a task goal mail removes its pin without reopening it', () => {
+  const h = harness();
+  const mail = { msgId: 160, sender: 'OP', goal: '정리 작업', refs: ['goal:task'], doneWhen: '정리 완료', deadlineAt: new Date(T0 + 3_600_000).toISOString() };
+  expect(h.pilot.observeMail([mail])).toBe(true);
+  expect(h.pilot.observeMail([{ msgId: 161, sender: 'OP', supersedes: 160 }])).toBe(true);
+  expect(h.pilot.state().pins ?? []).toHaveLength(0);
+  expect(h.pilot.observeMail([mail])).toBe(false);
+});
+test('unauthorized retraction cannot remove an authorized task pin', () => {
+  const h = harness();
+  const mail = { msgId: 160, sender: 'OP', goal: '정리 작업', refs: ['goal:task'], doneWhen: '정리 완료', deadlineAt: new Date(T0 + 3_600_000).toISOString() };
+  expect(h.pilot.observeMail([mail])).toBe(true);
+  h.pilot.observeMail([{ msgId: 161, sender: 'TC', supersedes: 160 }]);
+  expect(h.pilot.state().pins).toHaveLength(1);
+});
+
+test('retraction in same delivery prevents task pin reopening', () => {
+  const h = harness();
+  const mail = { msgId: 160, sender: 'OP', goal: '정리 작업', refs: ['goal:task'], doneWhen: '정리 완료', deadlineAt: new Date(T0 + 3_600_000).toISOString() };
+  h.pilot.observeMail([{ msgId: 161, sender: 'OP', supersedes: 160 }, mail]);
+  expect(h.pilot.state().pins ?? []).toHaveLength(0);
+});
+
+test('authorized task goal mail creates a pin without replacing the autopilot goal', () => {
+  const h = harness();
+  h.pilot.observeMail([staleCrown]);
+  const before = h.pilot.state().goal;
+  const mail = { msgId: 160, sender: 'OP', goal: '정리 작업', refs: ['goal:task'], doneWhen: '정리 완료', deadlineAt: new Date(T0 + 3_600_000).toISOString() };
+  expect(h.pilot.observeMail([mail])).toBe(true);
+  expect(h.pilot.state().goal).toBe(before);
+  expect(h.pilot.state().pins?.map((p) => [p.text, p.done])).toEqual([['정리 작업', '정리 완료']]);
+  expect(h.pilot.observeMail([mail])).toBe(false);
+});
+
+test('task mail fails closed without a done condition or future deadline', () => {
+  const h = harness();
+  h.pilot.observeMail([staleCrown]);
+  const before = h.pilot.state().goal;
+  const base = { sender: 'OP', goal: 'task', refs: ['goal:task'] };
+  expect(h.pilot.observeMail([{ ...base, msgId: 161, deadlineAt: new Date(T0 + 1000).toISOString() }])).toBe(false);
+  expect(h.pilot.observeMail([{ ...base, msgId: 162, doneWhen: 'done', deadlineAt: new Date(T0 - 1000).toISOString() }])).toBe(false);
+  expect(h.pilot.state().goal).toBe(before);
+  expect(h.pilot.state().pins ?? []).toEqual([]);
+});
 test('maySetGoal: OP and CLAUDE-OP may; TC may not; any sender with a crown-directive id may', () => {
   expect(maySetGoal('OP')).toBe(true);
   expect(maySetGoal('claude-op')).toBe(true);

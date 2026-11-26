@@ -1,0 +1,468 @@
+{
+  "schema": 1,
+  "tool": "A161",
+  "head": "d707b9f6643c09697be07a2b086e005a19b009c3",
+  "base": "03ac89488403e0313e99252dc5bf0f88032f4f63",
+  "pr": 39192,
+  "host": "minim5",
+  "actualHost": "minim5",
+  "runnerPid": 8019,
+  "rawDir": "/var/folders/h6/hfjjfgw91tq5tvv1vh1s8x2h0000gn/T/res-a161-y6o19dbk",
+  "focused": [
+    "scripts/release-loop/gate-cut-preflight-sim.test.ts"
+  ],
+  "steps": [
+    {
+      "name": "fetch-main",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "-c",
+        "import fcntl,subprocess,sys,time\nrepo,remote=sys.argv[1:3]\nlock=open(repo+'/pregate-fetch-main.lock','a'); fcntl.flock(lock,fcntl.LOCK_EX)\nrc=1\nfor i in range(3):\n    rc=subprocess.run(['git','-C',repo,'fetch','--no-tags',remote,'+refs/heads/main:refs/remotes/origin/main']).returncode\n    if rc==0: break\n    time.sleep(2*(i+1))\nsys.exit(rc)\n",
+        "/Users/op/elanous-hq/repo.git",
+        "origin"
+      ],
+      "startedAt": 1795441294.665832,
+      "pid": 8252,
+      "exit": 0,
+      "finishedAt": 1795441295.8095639
+    },
+    {
+      "name": "fetch-head",
+      "command": [
+        "git",
+        "-C",
+        "/Users/op/elanous-hq/repo.git",
+        "fetch",
+        "--no-tags",
+        "origin",
+        "d707b9f6643c09697be07a2b086e005a19b009c3"
+      ],
+      "startedAt": 1795441295.8155992,
+      "pid": 8491,
+      "exit": 0,
+      "finishedAt": 1795441296.173652
+    },
+    {
+      "name": "fetch-base",
+      "command": [
+        "git",
+        "-C",
+        "/Users/op/elanous-hq/repo.git",
+        "fetch",
+        "--no-tags",
+        "origin",
+        "03ac89488403e0313e99252dc5bf0f88032f4f63"
+      ],
+      "startedAt": 1795441296.231742,
+      "pid": 8579,
+      "exit": 0,
+      "finishedAt": 1795441296.695332
+    },
+    {
+      "name": "checkout",
+      "command": [
+        "git",
+        "-C",
+        "/Users/op/elanous-hq/repo.git",
+        "worktree",
+        "add",
+        "--detach",
+        "/var/folders/h6/hfjjfgw91tq5tvv1vh1s8x2h0000gn/T/res-a161-y6o19dbk/source",
+        "d707b9f6643c09697be07a2b086e005a19b009c3"
+      ],
+      "startedAt": 1795441296.7631161,
+      "pid": 8694,
+      "exit": 0,
+      "finishedAt": 1795441300.090296
+    },
+    {
+      "name": "merge-main",
+      "command": [
+        "git",
+        "-c",
+        "user.name=a161-pregate",
+        "-c",
+        "user.email=a161-pregate@res.local",
+        "merge",
+        "--no-edit",
+        "1837ad8392f9a9d14593d55955569e86953f350b"
+      ],
+      "startedAt": 1795441300.411954,
+      "pid": 9482,
+      "exit": 0,
+      "finishedAt": 1795441301.616447
+    },
+    {
+      "name": "diff-check",
+      "command": [
+        "git",
+        "diff",
+        "--check",
+        "03ac89488403e0313e99252dc5bf0f88032f4f63",
+        "d707b9f6643c09697be07a2b086e005a19b009c3"
+      ],
+      "startedAt": 1795441301.62364,
+      "pid": 9731,
+      "exit": 0,
+      "finishedAt": 1795441301.767692
+    },
+    {
+      "name": "frozen-install",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "env",
+        "-i",
+        "HOME=/var/folders/h6/hfjjfgw91tq5tvv1vh1s8x2h0000gn/T/res-a161-y6o19dbk/install-home",
+        "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "BUN_INSTALL_CACHE_DIR=/Users/op/.cache/res-pregate-bun-cache",
+        "/Users/op/.bun/bin/bun",
+        "install",
+        "--frozen-lockfile"
+      ],
+      "startedAt": 1795441301.875941,
+      "pid": 9776,
+      "exit": 0,
+      "finishedAt": 1795441303.211165
+    },
+    {
+      "name": "pwa-frozen-install",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "env",
+        "-i",
+        "HOME=/var/folders/h6/hfjjfgw91tq5tvv1vh1s8x2h0000gn/T/res-a161-y6o19dbk/install-home",
+        "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "BUN_INSTALL_CACHE_DIR=/Users/op/.cache/res-pregate-bun-cache",
+        "/Users/op/.bun/bin/bun",
+        "install",
+        "--frozen-lockfile"
+      ],
+      "startedAt": 1795441303.2120929,
+      "pid": 10093,
+      "exit": 0,
+      "finishedAt": 1795441303.872145
+    },
+    {
+      "name": "rules-and-ratchets",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+        "test",
+        "test/rules-contract.test.ts"
+      ],
+      "startedAt": 1795441304.020423,
+      "pid": 10258,
+      "slotWaitSec": 4.2,
+      "exit": 0,
+      "finishedAt": 1795441324.5627542
+    },
+    {
+      "name": "interference-ratchet",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+        "test",
+        "scripts/ratchets/test-interference-patterns.test.ts"
+      ],
+      "startedAt": 1795441324.8451252,
+      "pid": 14428,
+      "exit": 0,
+      "finishedAt": 1795441327.0765371
+    },
+    {
+      "name": "focused",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+        "test",
+        "scripts/release-loop/gate-cut-preflight-sim.test.ts"
+      ],
+      "startedAt": 1795441327.077355,
+      "pid": 14888,
+      "slotWaitSec": 4.1,
+      "exit": 1,
+      "finishedAt": 1795441373.237466
+    },
+    {
+      "name": "baseline-install",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "env",
+        "-i",
+        "HOME=/var/folders/h6/hfjjfgw91tq5tvv1vh1s8x2h0000gn/T/res-a161-y6o19dbk/install-home",
+        "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "BUN_INSTALL_CACHE_DIR=/Users/op/.cache/res-pregate-bun-cache",
+        "/Users/op/.bun/bin/bun",
+        "install",
+        "--frozen-lockfile"
+      ],
+      "startedAt": 1795441377.556555,
+      "pid": 25637,
+      "exit": 0,
+      "finishedAt": 1795441378.862518
+    },
+    {
+      "name": "baseline-focused",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+        "test",
+        "scripts/release-loop/gate-cut-preflight-sim.test.ts"
+      ],
+      "startedAt": 1795441378.863631,
+      "pid": 25930,
+      "slotWaitSec": 4.4,
+      "exit": 1,
+      "finishedAt": 1795441386.7450619
+    },
+    {
+      "name": "changed-tsc",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+        "run",
+        "scripts/ci-typecheck-changed.ts",
+        "--local"
+      ],
+      "startedAt": 1795441390.2962592,
+      "pid": 28560,
+      "slotWaitSec": 4.4,
+      "exit": 0,
+      "finishedAt": 1795442179.209912
+    },
+    {
+      "name": "public-leak-check",
+      "command": [
+        "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+        "run",
+        "scripts/public-export.ts",
+        "--leak-check",
+        "--files",
+        "scenarios/ux-sim/fixtures/release-cut-0306-shards.json",
+        "scripts/release-loop/gate-cut-preflight-sim.test.ts",
+        "src/dispatch/myelin-priority-bridge.ts",
+        "src/dispatch/opportunistic-launcher.ts",
+        "src/mss/myelin.ts",
+        "test-typecheck-baseline.txt",
+        "test/dispatch/myelin-priority-bridge.test.ts",
+        "test/mss/myelin.test.ts"
+      ],
+      "startedAt": 1795442179.336064,
+      "pid": 10035,
+      "exit": 0,
+      "finishedAt": 1795442200.135262
+    }
+  ],
+  "status": "GATES_PASS_REVIEW_REQUIRED",
+  "security": {
+    "status": "REVIEW_REQUIRED",
+    "scope": "added lines only; heuristic candidates, never a security PASS",
+    "candidates": []
+  },
+  "historicalProofImported": false,
+  "selfReview": {
+    "status": "WARN_MISSING",
+    "path": null,
+    "sha256": null,
+    "pr": 39192,
+    "head": "d707b9f6643c09697be07a2b086e005a19b009c3",
+    "mustFix": null,
+    "warning": "self-review-result-missing"
+  },
+  "reviewCap": 6,
+  "bun": "1.4.2",
+  "bunPath": "/Users/op/.bun/bin/bun",
+  "bunSha256": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5",
+  "guardPath": "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+  "guardSha256": "f27672208e517e769e42e3ac4750266d5a5cb92292711e350119cebb8678fc05",
+  "runtimeMode": "host-default",
+  "rawSha256": {
+    "fetch-base.raw": "68957d81ed158b78ce946433393b66866eb97332833d152ee52a16f7ed18ca5d",
+    "isolation-head.raw": "ffbfe62e619da17f9aba90d34af53992a6fd3e7090866c5bec205299306e598e",
+    "fetch-head.raw": "ca3e9cf38ce95d5d24babcdb2124cab59ebb14008e4eb9fba83f12f1a607cdd8",
+    "changed-tsc.raw": "49ac66d91664fb4e12fa6e7f035097204a87cf25fdd39b47f542da85c3cf9be2",
+    "frozen-install.raw": "9828a386d6d71255bf74daa3fad6fd03fd2f79b1c0b88d7f743e33510226d47c",
+    "interference-ratchet.raw": "94096227823b875b0f0a7348276484c9a475a650f6518c581e33e6604b43c5b2",
+    "baseline-install.raw": "4f5ace1867b052cf03936afc6b7f208804b396a814cac1fad6f5b32b46fe1703",
+    "diff-check.raw": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "baseline-focused.raw": "ea0c1601e453f2e76402507c9ff92c769d7e905ebba3b647b5b0d1699036162e",
+    "public-leak-check.raw": "149e402147187916e8539136eb4d31511e6006df908375308795103e0ec61809",
+    "fetch-main.raw": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "focused.raw": "8b9b7819900d3d10a674f4e0fa06770feade426cbacf7545a3c28d89ce5ce4c1",
+    "merge-main.raw": "46d9490d05330705aa8a7b2c20c406842188c357fe70e084cc3b18894211563d",
+    "rules-and-ratchets.raw": "c4289c07fee19a07b93f1d828a04f03fc9657f5e707cdae0b15ea5b2d2725862",
+    "pwa-frozen-install.raw": "19613548162736f77ea8b8032e6545ad74a2d0e3b76e69d9057c92661a8d9a6f",
+    "checkout.raw": "3caddd4e63b2057e8d9acab35005210fd3bd3cb7cf95b04b30e66a22463756c2"
+  },
+  "originMain": "1837ad8392f9a9d14593d55955569e86953f350b",
+  "lockSha256": "2e88d2bb59a46a538aef956ee552880ea9da8cd511e852d90418fe89a68c7515",
+  "gradeDetail": {
+    "grade": "L3",
+    "reason": "export-removed-with-other-changes",
+    "landLane": "full-required",
+    "steps": [
+      "full-gate"
+    ],
+    "files": [
+      {
+        "path": "scenarios/ux-sim/fixtures/release-cut-0306-shards.json",
+        "category": "production",
+        "deleted": false,
+        "renamed": false,
+        "added": 0,
+        "removed": 2,
+        "code": 2,
+        "exportRemoved": 0
+      },
+      {
+        "path": "scripts/release-loop/gate-cut-preflight-sim.test.ts",
+        "category": "test",
+        "deleted": false,
+        "renamed": false,
+        "added": 3,
+        "removed": 3,
+        "code": 6,
+        "exportRemoved": 0
+      },
+      {
+        "path": "src/dispatch/myelin-priority-bridge.ts",
+        "category": "production",
+        "deleted": true,
+        "renamed": false,
+        "added": 0,
+        "removed": 100,
+        "code": 52,
+        "exportRemoved": 4
+      },
+      {
+        "path": "src/dispatch/opportunistic-launcher.ts",
+        "category": "production",
+        "deleted": false,
+        "renamed": false,
+        "added": 1,
+        "removed": 1,
+        "code": 0,
+        "exportRemoved": 0
+      },
+      {
+        "path": "src/mss/myelin.ts",
+        "category": "production",
+        "deleted": true,
+        "renamed": false,
+        "added": 0,
+        "removed": 234,
+        "code": 139,
+        "exportRemoved": 9
+      },
+      {
+        "path": "test-typecheck-baseline.txt",
+        "category": "doc",
+        "deleted": false,
+        "renamed": false,
+        "added": 0,
+        "removed": 2,
+        "code": 0,
+        "exportRemoved": 0
+      },
+      {
+        "path": "test/dispatch/myelin-priority-bridge.test.ts",
+        "category": "test",
+        "deleted": true,
+        "renamed": false,
+        "added": 0,
+        "removed": 136,
+        "code": 117,
+        "exportRemoved": 0
+      },
+      {
+        "path": "test/mss/myelin.test.ts",
+        "category": "test",
+        "deleted": true,
+        "renamed": false,
+        "added": 0,
+        "removed": 180,
+        "code": 159,
+        "exportRemoved": 0
+      }
+    ],
+    "deletedPaths": [
+      "src/dispatch/myelin-priority-bridge.ts",
+      "src/mss/myelin.ts",
+      "test/dispatch/myelin-priority-bridge.test.ts",
+      "test/mss/myelin.test.ts"
+    ],
+    "changedTestPaths": [
+      "scripts/release-loop/gate-cut-preflight-sim.test.ts"
+    ],
+    "changedProductionPaths": [
+      "scenarios/ux-sim/fixtures/release-cut-0306-shards.json",
+      "src/dispatch/opportunistic-launcher.ts"
+    ],
+    "productionCodeLines": 193,
+    "testCodeLines": 282,
+    "filesOmitted": 0
+  },
+  "grade": "L3",
+  "gradeReason": "export-removed-with-other-changes",
+  "landLane": "full-required",
+  "mainMerged": true,
+  "mainMergeHead": "a05352f7c82883e491ed3eb13d933b5db29e985f",
+  "ratchets": [
+    "PLUGIN-ONLY-RATCHET",
+    "NUMGUARD",
+    "R-LIVE10",
+    "TEST-INTERFERENCE-RATCHET"
+  ],
+  "landChecks": {
+    "baseAncestorOfMain": true,
+    "importsMissing": []
+  },
+  "light": {
+    "bunCache": "/Users/op/.cache/res-pregate-bun-cache"
+  },
+  "pwaLockSha256": "f734d92db9702d1bf57bb3033a1614fa71efa37b7c9087f30ac2dbaebd232ec6",
+  "reviewWorkItem": "tc-sub/delete-myelin",
+  "rulesBase": "1837ad8392f9a9d14593d55955569e86953f350b",
+  "rulesMain": "1837ad8392f9a9d14593d55955569e86953f350b",
+  "focusedBaseline": {
+    "mine": 1,
+    "onMain": 1,
+    "newFailures": []
+  },
+  "releasePathChanged": 8,
+  "publicLeakCheck": "MEASURED",
+  "mode": "full",
+  "minutes": 15.13
+}

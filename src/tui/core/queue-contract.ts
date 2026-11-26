@@ -32,7 +32,7 @@ export type NextTuiQueueBoundary = 'tool-result' | 'idle';
  * ELN-CHILD-NOTICE-INTO-QUEUE; this file only owns their place in the order.
  */
 export type NextTuiQueueItemKind = 'user' | 'notice';
-export type NextTuiQueueNoticeSource = 'sidetab' | 'harness-child' | 'seat-mail' | 'seat-mail-guide' | 'graph-node' | 'event-watch' | 'capsule-done' | 'ceo-ingress' | 'work-pull';
+export type NextTuiQueueNoticeSource = 'sidetab' | 'harness-child' | 'seat-mail' | 'seat-mail-guide' | 'graph-node' | 'event-watch' | 'capsule-done' | 'ceo-ingress' | 'work-pull' | 'scheduled-wake';
 
 /** Input mode decides batching: a slash command or `!` shell line never travels with ordinary chat. */
 export type NextTuiQueueMode = 'chat' | 'command' | 'shell';

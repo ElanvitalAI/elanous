@@ -20,6 +20,7 @@ interface Pending {
   readonly challenge: string;
   readonly pollHash: Buffer;
   readonly userCodeHash: Buffer;
+  readonly startedAt: number;
   readonly callerKey: string;
   readonly csrf: string;
   readonly expiresAt: number;
@@ -34,6 +35,10 @@ export interface MemberConnectEntryOptions {
   readonly memberForRequest: (request: Request) => string | null;
   readonly origin: string;
   readonly enabled?: boolean;
+  /** Where a browser without a member session signs in (the approve page links here instead of a bare 401). */
+  readonly loginUrl?: string;
+  /** The signed-in member home that lists this member's bound pending requests. */
+  readonly homeUrl?: string;
   readonly now?: () => number;
   /** Internal test seam; production callers use the bounded default. */
   readonly bodyReadTimeoutMs?: number;
@@ -106,8 +111,49 @@ async function readBody(request: Request, timeoutMs: number): Promise<Record<str
 }
 
 /** One process holds only short-lived challenges. App auth codes remain in the existing member store. */
+/**
+ * A pending request the member already opened while signed in — listed on that member's home only.
+ * The verification code is never part of it: the member must still type the code shown in their own TUI.
+ */
+export interface MemberPendingConnectRequest {
+  readonly id: string;
+  readonly csrf: string;
+  readonly startedAt: string;
+  /** The connect start records no device label today (the CLI sends none), so this is always null. */
+  readonly deviceLabel: null;
+  readonly expiresInSeconds: number;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]!);
+}
+
+function safeHref(value: string | undefined): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.protocol === 'http:' ? escapeHtml(url.toString()) : null;
+  } catch { return null; }
+}
+
+/** MEMBER-CONNECT-APPROVE-HOME: in-app browsers (Telegram) carry no member cookie — say so instead of a bare 401. */
+function noSessionPage(loginUrl: string | undefined, homeUrl: string | undefined): Response {
+  const login = safeHref(loginUrl);
+  const home = safeHref(homeUrl);
+  const links = [
+    login ? `<a href="${login}">로그인하기</a>` : '',
+    home ? `<a href="${home}">내 엘라누스 열기</a>` : '',
+  ].filter(Boolean).join(' · ');
+  const html = `<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Elanous TUI 연결 승인</title><h1>로그인이 필요합니다</h1><p data-connect-no-session>이 브라우저에는 로그인 세션이 없습니다 — Safari/Chrome 에서 열거나, 내 엘라누스(로그인 후) → 연결 요청 승인 에서 승인하세요.</p><p>텔레그램·메신저 안의 브라우저는 로그인 정보를 공유하지 않습니다. 메뉴의 «브라우저에서 열기» 로 이 링크를 Safari/Chrome 에서 여세요. 요청은 2분 뒤 만료됩니다.</p>${links ? `<p>${links}</p>` : ''}</html>`;
+  return new Response(html, { status: 401, headers: { 'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'private, no-store', 'referrer-policy': 'no-referrer',
+    'content-security-policy': "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" } });
+}
+
 export function createMemberConnectEntry(options: MemberConnectEntryOptions): {
   handle(request: Request, callerKey?: string): Promise<Response | undefined>;
+  /** Unexpired, unapproved requests this member opened while signed in (bound by the approve-page GET). */
+  pendingForMember(memberId: string): MemberPendingConnectRequest[];
 } {
   const pending = new Map<string, Pending>();
   const startAttempts = new Map<string, { count: number; expiresAt: number }>();
@@ -119,7 +165,15 @@ export function createMemberConnectEntry(options: MemberConnectEntryOptions): {
     for (const [id, item] of pending) if (item.expiresAt <= at) pending.delete(id);
     for (const [key, entry] of startAttempts) if (entry.expiresAt <= at) startAttempts.delete(key);
   };
-  return { async handle(request, callerKey = 'unknown') {
+  return { pendingForMember(memberId) {
+    prune();
+    const at = now();
+    return [...pending.entries()]
+      .filter(([, item]) => item.previewMemberId === memberId && !item.code && !item.issuing && item.expiresAt > at)
+      .map(([id, item]) => ({ id, csrf: item.csrf, startedAt: new Date(item.startedAt).toISOString(), deviceLabel: null,
+        expiresInSeconds: Math.max(1, Math.ceil((item.expiresAt - at) / 1000)) }));
+  },
+  async handle(request, callerKey = 'unknown') {
     const url = new URL(request.url);
     const path = url.pathname;
     if (!['/v1/members/connect/start', '/v1/members/connect/approve', '/v1/members/connect/poll'].includes(path)) return undefined;
@@ -152,7 +206,7 @@ export function createMemberConnectEntry(options: MemberConnectEntryOptions): {
       pending.set(id, { state: body.state, challenge: body.codeChallenge,
         pollHash: createHash('sha256').update(body.pollSecret).digest(),
         userCodeHash: createHash('sha256').update(printedCode).digest(), callerKey: caller,
-        csrf: randomBytes(18).toString('base64url'), expiresAt: now() + TTL_MS });
+        csrf: randomBytes(18).toString('base64url'), startedAt: now(), expiresAt: now() + TTL_MS });
       return response({ approvalUrl: `${options.origin}/v1/members/connect/approve?id=${id}`, id,
         userCode: printedCode, expiresInSeconds: TTL_MS / 1000 }, 201);
     }
@@ -202,7 +256,8 @@ export function createMemberConnectEntry(options: MemberConnectEntryOptions): {
     }
 
     const memberId = options.memberForRequest(request);
-    if (!memberId) return response({ error: 'unauthorized' }, 401);
+    if (!memberId) return request.method === 'GET' ? noSessionPage(options.loginUrl, options.homeUrl)
+      : response({ error: 'unauthorized' }, 401);
     try {
       if (!options.store.activeForAuth(memberId)) return response({ error: 'unauthorized' }, 401);
     } catch { return response({ error: 'member-state-unavailable' }, 503); }

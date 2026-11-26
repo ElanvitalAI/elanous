@@ -51,7 +51,8 @@ test('turn-start compaction in the turn child: the next reload keeps the shown r
 
   // Pre-fix: no onCompact reached the TUI, so the store was shown as it is — the screen reorders and the mail shrinks.
   expect(heads(reloaded)).not.toEqual(heads(shown));
-  expect(reloaded.some((row) => row.content === '[seat-mail 9001 from TC] [notice · seat-mail]')).toBe(true);
+  // CEO-UTTERANCE-TAGGED-LAST ④ — the mail row is not the person: it is not kept verbatim in the store.
+  expect(reloaded.some((row) => row.content.startsWith('[notice · seat-mail]\nmail line two'))).toBe(false);
 
   // Cache-neutral evidence: the bytes on disk and the provider request built from them, before the display merge.
   const file = join(root, `${id}.jsonl`);

@@ -5,6 +5,7 @@
   "implementation": [
     "src/ux-sim/sim-world/types.ts",
     "src/ux-sim/sim-world/recorder.ts",
+    "src/ux-sim/sim-world/expect-load.ts",
     "src/ux-sim/sim-world/expect.ts",
     "src/ux-sim/sim-world/ratchet.ts",
     "src/ux-sim/sim-world/kernel.ts",

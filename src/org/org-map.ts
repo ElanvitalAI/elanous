@@ -18,6 +18,8 @@ export const DUTY_ROLES: Readonly<Record<string, readonly OrgRole[]>> = {
   'release-supervision': ['steward', 'coo', 'cto', 'leader'],
   'resource-supervision': ['steward', 'coo', 'cto', 'leader'],
   'landing': ['judge', 'steward', 'coo', 'cto', 'leader'],
+  // Independent judiciary (11-26): HOLD · disputes · 4 security vetoes · release NO-GO — judge only, escalates OP → CEO.
+  'veto': ['judge'],
   'pulse-owner': EXEC,
   'digest-recipient': EXEC,
   'escalation-parent': ['coo', 'cto', 'leader'],
@@ -52,7 +54,7 @@ export const DEFAULT_ORG: OrgMap = {
     judge: { leader: 'JUD' }, release: { leader: 'REL' }, resource: { leader: 'RES' },
   },
   duties: {
-    'board': 'OP', 'beacon-watch': 'OP', 'release-supervision': 'REL', 'resource-supervision': 'RES', 'landing': 'JUD',
+    'board': 'OP', 'beacon-watch': 'OP', 'release-supervision': 'REL', 'resource-supervision': 'RES', 'landing': 'JUD', 'veto': 'JUD',
     'pulse-owner': 'OP', 'digest-recipient': 'OP', 'escalation-parent': 'OP', 'trigger-owner': 'OP', 'steward-cards': 'OP',
     'brand': 'MK', 'digital-marketing': 'MK', 'promotion': 'MK',
     'surface-owner:mobile': 'UX', 'surface-owner:desktop': 'UX', 'surface-owner:messenger': 'UX', 'surface-owner:web': 'UX',

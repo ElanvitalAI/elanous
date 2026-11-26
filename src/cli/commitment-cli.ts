@@ -2,7 +2,7 @@
 // Waker notices name this CLI as the twin of the CommitmentClose seat tool.
 // Exit codes: 0 = ok · 1 = unknown id or lifecycle conflict (double close) · 2 = argument or ledger error.
 import type { Command } from 'commander';
-import { closeCommitment, type CloseCommitmentDeps, type CommitmentCloseStatus } from '../commitment/close.js';
+import { closeCommitmentChecked, type CloseCommitmentDeps, type CommitmentCloseStatus } from '../commitment/close.js';
 import { CommitmentLedger, CommitmentLifecycleConflict, type CommitmentEntry, type CommitmentStatus } from '../commitment/ledger.js';
 
 export interface CommitmentCliDeps extends CloseCommitmentDeps {
@@ -11,7 +11,7 @@ export interface CommitmentCliDeps extends CloseCommitmentDeps {
 }
 
 const LIST_STATUS: Readonly<Record<string, readonly CommitmentStatus[] | null>> = {
-  open: ['open'], blocked: ['blocked'], done: ['done'], dropped: ['dropped'], live: ['open', 'blocked'], all: null,
+  open: ['open'], blocked: ['blocked'], done: ['done'], dropped: ['dropped'], reassigned: ['reassigned'], live: ['open', 'blocked'], all: null,
 };
 
 function formatEntry(e: CommitmentEntry): string {
@@ -47,17 +47,18 @@ export function registerCommitmentCommands(program: Command, deps: CommitmentCli
       }
     });
 
-  for (const status of ['done', 'blocked'] as const satisfies readonly CommitmentCloseStatus[]) {
+  for (const status of ['done', 'blocked', 'reassigned'] as const satisfies readonly CommitmentCloseStatus[]) {
     cmd.command(`${status} <id>`)
       .description(status === 'done'
-        ? 'Mark a commitment done with one line of evidence and cancel its waker'
-        : 'Mark a commitment blocked with one line saying what blocks it and cancel its waker')
-      .requiredOption('--evidence <line>', status === 'done' ? 'One line: test result, receipt path or PR' : 'One line: what blocks it')
+        ? 'Mark a commitment done with one line of evidence and cancel its waker (refused unless its done-when predicate holds)'
+        : status === 'reassigned' ? 'Mark a commitment reassigned with one line saying to whom and why, and cancel its waker'
+          : 'Mark a commitment blocked with one line saying what blocks it and cancel its waker')
+      .requiredOption('--evidence <line>', status === 'done' ? 'One line: test result, receipt path or PR' : status === 'reassigned' ? 'One line: to whom and why' : 'One line: what blocks it')
       .option('--seat <seat>', 'Owning seat (found by id when omitted)')
       .option('--json')
-      .action((id: string, opts: { evidence: string; seat?: string; json?: boolean }) => {
+      .action(async (id: string, opts: { evidence: string; seat?: string; json?: boolean }) => {
         try {
-          const { entry, cancelledWakers } = closeCommitment({ id, status, evidence: opts.evidence, ...(opts.seat ? { seat: opts.seat } : {}) }, deps);
+          const { entry, cancelledWakers } = await closeCommitmentChecked({ id, status, evidence: opts.evidence, ...(opts.seat ? { seat: opts.seat } : {}) }, deps);
           const wakers = cancelledWakers.map(w => w.id);
           if (opts.json) out.log(JSON.stringify({ ok: true, entry, cancelledWakers: wakers }, null, 2));
           else out.log(`Commitment ${entry.id} (${entry.seat}) → ${entry.status} · wakers cancelled: ${wakers.length === 0 ? 'none' : wakers.join(', ')}`);

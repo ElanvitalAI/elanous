@@ -21,6 +21,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { evaluatePredicate, type ConditionProbes, type Predicate } from '../loops/trigger-conditions.js';
 
@@ -149,6 +150,7 @@ export function releaseSteps(version: string, clock: ReleaseClock, files: { note
   const N = q(files.notesFile); const NP = q(files.notesFile.replace(/\.md$/, '') + '.public.md');
   const SHA = q(join(home, 'cut.sha'));
   const D = q(files.prepDir);
+  const NT = q((opts as { npmTokenFile?: string }).npmTokenFile ?? join(getElanousConfigDir(), 'secrets', 'npm-token'));
   const tree = `cd ${W} && bun bin/elanous.mjs${paths.instanceRoot ? ` --config-dir ${q(paths.instanceRoot)}` : ''}`;
   const pollLedger = join(seat, 'REL', `poll-${v}.jsonl`);
   const s = (d: Omit<StepDef, 'quick' | 'checks' | 'hard' | 'host' | 'maxWaitMin'> & Partial<Pick<StepDef, 'quick' | 'checks' | 'hard' | 'host' | 'maxWaitMin'>>): StepDef =>
@@ -188,7 +190,9 @@ export function releaseSteps(version: string, clock: ReleaseClock, files: { note
     s({ id: 'publish', phase: 'L-5', label: 'publish: public repo push + GH release + 5 assets', needs: ['prepare', 'go', 'notes-public'], clock: at('publish'), host: 'publish', hard: true, expectMin: 0.5,
       cmd: `${tree} release publish --dir ${D} --notes-file ${NP} --yes` }),
     s({ id: 'npm', phase: 'L-6', label: 'npm: present (publish it from the same tgz only when missing)', needs: ['publish'], hard: true, expectMin: 1,
-      cmd: `npm view elanous@${v} version | grep -qx ${v} || npm publish ${D}/dist/elanous.tgz --ignore-scripts --access public --loglevel warn` }),
+      // NPM-STEP-AUTH (0.3.36 E404): the shell has no npm login — auth via a temp npmrc from the token file (never printed).
+      // A missing or empty token file fails fast before npm publish (Terra r1).
+      cmd: `npm view elanous@${v} version | grep -qx ${v} || (TOK=$(tr -d '\\n' < ${NT} 2>/dev/null); [ -n "$TOK" ] || { echo "npm: token file missing or empty: "${NT} >&2; exit 1; }; T=$(mktemp -d) && (umask 077; printf '//registry.npmjs.org/:_authToken=%s\\n' "$TOK" > $T/npmrc) && NPM_CONFIG_USERCONFIG=$T/npmrc npm publish ${D}/dist/elanous.tgz --ignore-scripts --access public --loglevel warn; rc=$?; rm -rf "$T"; exit $rc)` }),
     s({ id: 'verify', phase: 'L-7', label: 'verify (install · self-update · uninstall · notes page) — RC≠0 is a known-issue', needs: ['publish'], expectMin: 1,
       cmd: `${tree} release verify --version ${v} --public-repo ${pub}` }),
     s({ id: 'docs', phase: 'L-7', label: 'docs pages', needs: ['publish'], expectMin: 15,

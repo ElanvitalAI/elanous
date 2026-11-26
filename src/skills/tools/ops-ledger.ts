@@ -351,6 +351,9 @@ export async function dispatchMsgPost(rawArgs: Record<string, unknown>, deps: Ms
   // COND-WATCH — parse before storing: a bad condition never leaves a stored message behind.
   const watchRaw = filledString(rawArgs.watch, 'watch');
   const watch = watchRaw === undefined ? undefined : parseWatch(watchRaw);
+  // OP-CLOSE-ON-OUTCOME (대표 11-26) — an OP delegation names its outcome (done-when) so the commitment closes on facts, not a reply.
+  if (envelope.from.toUpperCase() === 'OP' && envelope.intent === 'request' && watch === undefined && waitForPr === undefined)
+    throw new Error("OP request needs 'watch' (the done-when outcome: cell-status:<id>=<status> · pr-merged:<n> · pregate-receipt:<n> · seat-idle:<SEAT> · file-exists:<path>) — a sent request or a reply is not the outcome");
   if (watch !== undefined) envelope.body = withWatchFooter(envelope.body, watch);
   // #38516 r2 MF3: recovery names THIS attempt's commit by its token — never an older identical row.
   const attemptToken = randomUUID();

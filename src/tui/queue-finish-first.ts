@@ -53,6 +53,16 @@ export { P1_PAUSE_NOTE } from '../chat/interjection.js';
 export const RESUME_PAUSED_WORK_PROMPT = 'Resume the paused work from your one-line checkpoint (the requirement is still open) and carry it to its result.';
 /** OP-INBOX-PULSE-BATCH: the OP batch is released after the next pulse turn, or at the latest this long after arrival. */
 export const OP_BATCH_MAX_HOLD_MS = 30 * 60_000;
+/**
+ * OP-BATCH-IDLE-DUE (CEO 11-26 11:5x «eln OP does not receive mail» · footer «📩 103 held» idle > 1 h) — mail that needs
+ * OP's action (request · decision · question · result; never a `notice` bulletin / waker) does not wait for the pulse
+ * on an idle OP: it goes once it waited this long (seat idle, or the continuation already had its try).
+ */
+export const OP_BATCH_ACTION_IDLE_MS = 60_000;
+/** OP-BATCH-IDLE-DUE: actionable mail waits at most this long even while OP's own work runs (one continuation boundary). */
+export const OP_BATCH_ACTION_MAX_MS = 3 * 60_000;
+/** OP-BATCH-IDLE-DUE: the held batch is bounded — this many held items release as one digest without waiting. */
+export const OP_BATCH_HELD_CAP = 50;
 /** OP-INBOX-PULSE-BATCH: the structured mail kind (`--kind release-stop`) that stops a release — always immediate. */
 export const RELEASE_STOP_MAIL_KIND = 'release-stop';
 /** P2 waits at most this long while work is in progress. */
@@ -152,7 +162,8 @@ export function classifyOpBatchItem(item: QueueClassItem, waits: WorkWaits = NO_
   if (item.source === 'seat-mail' && (item.mailKind ?? '').toLowerCase() === RELEASE_STOP_MAIL_KIND) return 'P0';
   const base = classifyQueueItem(item, waits);
   if (base === 'P0') return 'P0';
-  if (item.source === 'seat-mail' || item.source === 'graph-node') return 'P2';
+  // OP-WAKE-COMMIT-BATCH — a due self-wake (and the work-pull / late-wake inbox) rides the pulse digest too.
+  if (item.source === 'seat-mail' || item.source === 'graph-node' || item.source === 'scheduled-wake' || item.source === 'work-pull') return 'P2';
   return base;
 }
 
@@ -202,7 +213,7 @@ export type IdleQueueDecision =
   /** QUEUE-P1-3MIN: these P1 items go now (P2 stays held); `paused` = the open work pauses and resumes after. */
   | { readonly kind: 'deliver-p1'; readonly ids: readonly string[]; readonly paused: boolean; readonly heldIds: readonly string[] }
   /** Held mail goes now — one digest turn, P1 first. */
-  | { readonly kind: 'release'; readonly reason: 'work-done' | 'no-progress' | 'starvation' | 'continuation-not-started' | 'idle-stall' | 'pulse' };
+  | { readonly kind: 'release'; readonly reason: 'work-done' | 'no-progress' | 'starvation' | 'continuation-not-started' | 'idle-stall' | 'pulse' | 'action-due' | 'overflow' };
 
 export interface IdleQueueInput {
   readonly items: readonly QueueClassItem[];
@@ -277,7 +288,9 @@ export function decideIdleQueue(input: IdleQueueInput): IdleQueueDecision {
 
 /**
  * OP-INBOX-PULSE-BATCH 판정식 — pure. nothing held → pass · pulse opened → release(pulse) · some held mail waited ≥ 30 min →
- * release(starvation) · a P0 queued → pass-unheld · open work, continuation not tried → continue (peek) · else hold.
+ * release(starvation) · ≥ {@link OP_BATCH_HELD_CAP} held → release(overflow) · a P0 queued → pass-unheld · actionable mail
+ * waited ≥ 60 s with no open-work turn due, or ≥ 3 min → release(action-due) · open work, continuation not tried →
+ * continue (peek) · else hold.
  */
 function decideOpBatch(input: IdleQueueInput): IdleQueueDecision {
   const classed = input.items.map((item) => ({ item, cls: classifyOpBatchItem(item, input.waits) }));
@@ -285,12 +298,27 @@ function decideOpBatch(input: IdleQueueInput): IdleQueueDecision {
   if (held.length === 0) return { kind: 'pass' };
   const heldIds = held.map((c) => c.item.id);
   if (input.pulseDue) return { kind: 'release', reason: 'pulse' };
-  if (held.some(({ item }) => { const at = arrivedAt(item); return at !== undefined && input.now - at >= OP_BATCH_MAX_HOLD_MS; })) {
-    return { kind: 'release', reason: 'starvation' };
-  }
+  const waited = (item: QueueClassItem): number => { const at = arrivedAt(item); return at === undefined ? 0 : input.now - at; };
+  if (held.some(({ item }) => waited(item) >= OP_BATCH_MAX_HOLD_MS)) return { kind: 'release', reason: 'starvation' };
+  // OP-BATCH-IDLE-DUE — bounded: a flood never piles up past the cap waiting for a pulse that may not come.
+  if (held.length >= OP_BATCH_HELD_CAP) return { kind: 'release', reason: 'overflow' };
   if (classed.some((c) => c.cls === 'P0')) return { kind: 'pass-unheld', heldIds };
-  if (input.workInProgress && input.awaitingStartSince === null && !input.continuationTried) return { kind: 'continue', heldIds };
+  const actionWait = held.filter(({ item }) => opBatchActionable(item, input.waits)).reduce((max, { item }) => Math.max(max, waited(item)), -1);
+  const openWorkHasTurn = input.workInProgress && input.awaitingStartSince === null && !input.continuationTried;
+  // Actionable mail: 60 s on an idle OP (no open work, or the continuation had its try); 3 min cap even with open work.
+  if (actionWait >= OP_BATCH_ACTION_MAX_MS || (actionWait >= OP_BATCH_ACTION_IDLE_MS && !openWorkHasTurn)) return { kind: 'release', reason: 'action-due' };
+  if (openWorkHasTurn) return { kind: 'continue', heldIds };
   return { kind: 'hold', heldIds, reason: 'pulse-batch' };
+}
+
+/**
+ * OP-BATCH-IDLE-DUE — held mail that needs OP's action, from structured fields only: a seat mail whose base class is P1
+ * (request · decision) or whose intent is flush-worthy (question · result), and whose ledger kind is not `notice`
+ * (bulletins and waker lines ride the pulse). Scheduled wakes, work-pull and graph-node stalls keep riding the pulse.
+ */
+export function opBatchActionable(item: QueueClassItem, waits: WorkWaits = NO_WAITS): boolean {
+  if (item.source !== 'seat-mail' || (item.mailKind ?? '').toLowerCase() === 'notice') return false;
+  return classifyQueueItem(item, waits) === 'P1' || FLUSH_WORTHY_INTENTS.has((item.mailIntent ?? '').toLowerCase());
 }
 
 /**

@@ -57,9 +57,9 @@ test('multi-step human request: the model sets goal + done criterion → human g
 
 test('a goal without a done criterion is refused (status ask / one-step command stays a normal turn)', async () => {
   const h = harness();
-  h.pilot.noteTurnStart('human');
+  h.pilot.noteTurnStart('human', 'OP 활동 보여줘');
   const out = await dispatchAutopilotTool('autopilot_set', { on: true, goal: 'OP 활동 보여줘' }, { cwd: dir, file, now: () => T0 });
-  expect(out).toEqual({ error: '골에는 완료 기준(done_criterion · 한 줄 판정)이 필요하다 — 이번 턴에 끝나는 질문·상태 확인·한 걸음 명령은 골이 아니다' });
+  expect(out).toEqual({ error: 'Not a goal: no-explicit-ask. A goal is set only when the person explicitly says to set it as a goal (quote their words in explicit_ask) or a crown mail carries a goal field. Answer the question or do the request in this turn.' });
   h.pilot.refresh();
   expect(h.pilot.state().goal).toBe('0.3.36 개발');
 });
@@ -100,7 +100,7 @@ test('human request turn ends with «not yet» while 3 agents run → one «초�
   const h = harness();
   h.pilot.noteHuman();
   const first = h.pilot.turnEnded({ selfInitiated: false, failed: false, fingerprint: '아직 결과가 없어', backgroundRunning: 3, stateChanged: false });
-  expect(first.nudge).toBe('백그라운드 에이전트 3개가 아직 돈다. «아직 없음»으로 끝내지 말고 초안부터 내고 결과 오면 갱신한다. 이번 턴을 넘는 여러 단계 일이면 autopilot_set({on:true, goal, done_criterion, deadline})로 작업 골(핀)을 세운다.');
+  expect(first.nudge).toBe('백그라운드 에이전트 3개가 아직 돈다. «아직 없음»으로 끝내지 말고 초안부터 내고 결과 오면 갱신한다. 사람이 골 설정을 명시하면(explicit_ask 에 그 말 인용) autopilot_set({on:true, goal, explicit_ask, done_criterion, deadline})로 작업 골(핀)을 세운다 — 질문·요청은 골이 아니다.');
   // The nudge turn itself (not a person's line) ends the same way → no second nudge.
   expect(h.pilot.turnEnded({ selfInitiated: false, failed: false, fingerprint: '아직', backgroundRunning: 3, stateChanged: false }).nudge).toBeUndefined();
   expect(h.logs.filter(([e]) => e === 'await-agents-nudge').length).toBe(1);

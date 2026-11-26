@@ -299,10 +299,72 @@ export function sweepWaitContracts(store: MsgStore, input: { now: number; involv
 
 // ── 4. receiver obligation ───────────────────────────────────────────────────────────────────
 
-/** Did `seat` post back to `sender` after question #msgId (linked or not)? The question gate's `closed` dep. */
-export function questionAnsweredOn(store: MsgStore, q: { readonly msgId: number; readonly seat: string; readonly sender: string }): boolean {
-  return replyMatch(store, { id: q.msgId, from: q.sender, to: q.seat }) !== null;
+// MSG-PENDING-QUESTION-STALE (OP 11-26 · #178447 banner stayed after #178703 answered it without --reply-to): a pending
+// question closes on ANY of — (a) a later mail seat→asker whose replyTo or a ref names the id · (b) any later mail
+// seat→asker · (c) the question acked/cleared at the seat · an operator dismiss (audit row) — and the TUI retracts its line.
+// (d) /new drops the open items (gate.dropAll) and keeps one digest line.
+
+export type QuestionClosedBy = 'reply-to' | 'ref' | 'sender' | 'acked' | 'dismissed';
+export const QUESTION_DISMISS_KEY = (id: number): string => `msg-question-dismiss:${id}`;
+export const QUESTION_DISMISSED_REF = 'question-dismissed:';
+
+const refNamesId = (ref: string, id: number): boolean => {
+  const n = String(id);
+  return ref === n || ref.endsWith(`:${n}`) || ref.endsWith(`#${n}`);
+};
+
+/** Why question #msgId (sender → seat) is closed, or null while it is still open. */
+export function questionClosedBy(store: MsgStore, q: { readonly msgId: number; readonly seat: string; readonly sender: string }): QuestionClosedBy | null {
+  const seat = canon(q.seat);
+  const asker = canon(q.sender);
+  if (store.findByProvenanceKey(QUESTION_DISMISS_KEY(q.msgId))) return 'dismissed';
+  const rows = store.db.query('SELECT id FROM msg_messages WHERE id > ? AND sender = ? AND recipient = ? ORDER BY id ASC LIMIT ?')
+    .all(q.msgId, seat, asker, THREAD_SCAN_LIMIT) as { id: number }[];
+  let first: QuestionClosedBy | null = null;
+  for (const { id } of rows) {
+    const m = store.getMessage(id);
+    if (!m) continue;
+    if (m.replyTo === q.msgId) return 'reply-to';
+    if ((m.refs ?? []).some((r) => refNamesId(r, q.msgId))) return 'ref';
+    first ??= 'sender';
+  }
+  if (first) return first;
+  const acked = store.db.query('SELECT 1 AS one FROM msg_message_acks WHERE message_id = ? AND recipient = ? LIMIT 1').get(q.msgId, seat);
+  return acked ? 'acked' : null;
 }
+
+/** Did `seat` close question #msgId from `sender` (reply · ref · any later mail · ack/clear · dismiss)? The gate's `closed` dep. */
+export function questionAnsweredOn(store: MsgStore, q: { readonly msgId: number; readonly seat: string; readonly sender: string }): boolean {
+  return questionClosedBy(store, q) !== null;
+}
+
+export interface QuestionDismissResult { readonly auditId: number; readonly fresh: boolean; readonly seat: string; readonly asker: string }
+
+/**
+ * Operator dismiss of a pending-question banner: one audit row on the ledger (provenance `msg-question-dismiss:<id>`,
+ * notice by → seat, refs `question-dismissed:<id>` · `dismissed-by:<seat>`) ⊕ the question acked at its receiver.
+ * Idempotent. Throws when the id is not a question/decision.
+ */
+export function dismissQuestion(store: MsgStore, input: { id: number; by: string; reason?: string; log?: WaitLog }): QuestionDismissResult {
+  const m = store.getMessage(input.id);
+  if (!m) throw new Error(`message #${input.id} not found`);
+  if (!isAnswerExpectedMail(m)) throw new Error(`#${input.id} is not a question/decision (kind ${m.kind ?? '-'})`);
+  const seat = canon(m.to);
+  const asker = canon(m.from);
+  const by = canon(input.by);
+  const written = appendOnce(store, QUESTION_DISMISS_KEY(input.id), () => ({
+    from: by, to: seat, kind: 'notice', intent: 'info',
+    refs: [`${QUESTION_DISMISSED_REF}${input.id}`, `dismissed-by:${by}`],
+    body: `[❓ dismissed] question #${input.id} from ${asker} dismissed by ${by}${input.reason ? ` — ${input.reason}` : ''}`,
+  }));
+  try { store.ackMessage(seat, input.id); } catch { /* the audit row alone closes it */ }
+  if (written.fresh) { try { (input.log ?? ((e, d) => { try { debug.log('msg.question', e, d); } catch { /* fail-open */ } }))('dismissed', { question: input.id, seat, asker, by, auditId: written.mail.id }); } catch { /* fail-open */ } }
+  return { auditId: written.mail.id, fresh: written.fresh, seat, asker };
+}
+
+/** /new — the one digest line for the dropped pending questions (English UI text). */
+export const questionDigestLine = (opens: readonly { readonly sender: string; readonly msgId: number }[]): string =>
+  `❓ ${opens.length} pending question${opens.length === 1 ? '' : 's'} from the last session dropped: ${opens.map((o) => `${o.sender} #${o.msgId}`).join(', ')} — reopen with: eln msg thread <id>`;
 
 /** The P0 line for an unanswered question (English UI text). */
 export const questionResurfaceLine = (sender: string, waitedMs: number, msgId: number): string =>

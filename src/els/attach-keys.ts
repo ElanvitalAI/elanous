@@ -8,7 +8,7 @@ import type { MouseReport } from './attach-mouse.js';
 export type KeyAction =
   | 'detach' | 'next' | 'previous' | 'next-workspace' | 'toggle-sidebar' | 'new' | 'new-workspace'
   | 'new-chat' | 'rename-tab' | 'close' | 'close-workspace' | 'help' | 'goto' | 'scroll-up' | 'scroll-down' | 'move-tab' | 'toggle-agents-order'
-  | 'expand-all' | 'collapse-all' | 'toggle-active' | 'toggle-group' | 'list-page-up' | 'list-page-down' | 'list-home' | 'list-end' | 'tabs-left' | 'tabs-right';
+  | 'expand-all' | 'collapse-all' | 'toggle-active' | 'toggle-group' | 'list-page-up' | 'list-page-down' | 'list-home' | 'list-end' | 'tabs-left' | 'tabs-right' | 'tile';
 
 export type KeyEvent =
   | { readonly kind: 'input'; readonly bytes: string }
@@ -30,6 +30,8 @@ const AFTER_PREFIX: Readonly<Record<string, KeyAction>> = {
   // ELS-GROUP-FOLD-CONTROL: + / - expand / collapse every agent group · space or enter folds the selected pane's group.
   // ELS-ACTIVE-ONLY-FILTER: A flips «Active only» (lowercase a is already «new elanous chat»).
   '+': 'expand-all', '-': 'collapse-all', ' ': 'toggle-group', '\r': 'toggle-group', A: 'toggle-active',
+  // ELS-TILE-MODE: t shows every pane of this workspace as a live grid (and from a zoomed tab, back to the grid).
+  t: 'tile',
 };
 
 // ELS-SCROLL-MOUSE: after the prefix, PgUp/PgDn/Home/End page the side list and ←/→ scroll the tab row (the keys alone

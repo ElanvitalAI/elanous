@@ -213,6 +213,8 @@ export interface WaitProbes {
   seatIdle?(seat: string): Promise<boolean>;
   /** Any mail from `from` to `to` stored at or after sinceIso — the mail id, or null. */
   mailFrom?(from: string, to: string, sinceIso: string): Promise<number | null>;
+  /** OP-CLOSE-ON-OUTCOME — the assignee seat's pane in one line (state · last screen line), null when unknown. */
+  seatPane?(seat: string): Promise<string | null>;
 }
 
 export interface SelfTimerDeps {
@@ -442,10 +444,37 @@ async function conditionMet(r: Resolved, waker: WakerRecord, now: Date): Promise
   }
 }
 
+/**
+ * OP-CLOSE-ON-OUTCOME — measure a done-when predicate once, from facts (the same probes a watch uses).
+ * `met` true/false with the evidence line, or `missing` with why the facts could not be read (never a guess).
+ */
+export type PredicateResult = { kind: 'met'; evidence: string } | { kind: 'not-met'; evidence: string } | { kind: 'missing'; reason: string };
+export async function measurePredicate(condition: string, input: { seat: string; sinceIso: string }, deps: SelfTimerDeps = {}): Promise<PredicateResult> {
+  const r = resolveDeps(deps);
+  const now = r.now();
+  const probeWaker: WakerRecord = { id: 'predicate', seat: canonicalSeatId(input.seat), commitmentId: 'predicate', condition,
+    armedAt: input.sinceIso, deadlineAt: now.toISOString(), status: 'armed', checks: 0 };
+  try {
+    const { met, evidence } = await conditionMet(r, probeWaker, now);
+    return met ? { kind: 'met', evidence } : { kind: 'not-met', evidence: evidence || `${condition} does not hold` };
+  } catch (error) {
+    return { kind: 'missing', reason: String(error instanceof Error ? error.message : error).slice(0, 200) };
+  }
+}
+
+/** OP-CLOSE-ON-OUTCOME — the one-line verdict a check-at wake and the digest carry. */
+export function formatPredicateLine(condition: string, result: PredicateResult): string {
+  if (result.kind === 'met') return `done-when ${condition} = HOLDS · facts: ${result.evidence}`;
+  if (result.kind === 'not-met') return `done-when ${condition} = NOT MET · facts: ${result.evidence}`;
+  return `done-when ${condition} = FACTS MISSING · ${result.reason}`;
+}
+
 /** 닫는 문 안내 — 실제로 있는 도구·CLI 이름만 적는다(#160639·#160695: 없는 «원장 done» 을 찾다 NEED HUMAN). */
 export function formatCloseHint(commitmentId: string): string {
   return `닫기: CommitmentClose(id=${commitmentId}, status=done, evidence=<근거 한 줄>) 또는 eln commitment done ${commitmentId} --evidence "<근거>"`
-    + ` · 막혔으면 status=blocked / eln commitment blocked ${commitmentId} --evidence "<사유>"`;
+    + ` · 막혔으면 status=blocked / eln commitment blocked ${commitmentId} --evidence "<사유>"`
+    + ` · 다른 손으로 넘겼으면 status=reassigned / eln commitment reassigned ${commitmentId} --evidence "<누구에게·왜>"`
+    + ' · done-when 이 있으면 done 은 그 조건이 사실로 찰 때만 받는다(회신·«기존 수행선 유지»는 완료가 아니다)';
 }
 
 /** COND-WATCH — the one wake a satisfied watch sends: the evidence line, and the commitment is already closed. */
@@ -459,9 +488,12 @@ export function formatFiredNotice(w: WakerRecord, commitment: CommitmentEntry | 
     + ` (${formatCloseHint(w.commitmentId)})`;
 }
 
-export function formatExpiredNotice(w: WakerRecord, commitment: CommitmentEntry | undefined): string {
+export function formatExpiredNotice(w: WakerRecord, commitment: CommitmentEntry | undefined, facts?: { predicate?: string; pane?: string }): string {
   return `⌛ 깨우개 만료(expired) · ${w.condition} · ${w.armedAt} ~ ${w.deadlineAt} 안에 조건이 안 찼다 · 약속 ${w.commitmentId}`
-    + `${commitment ? ` «${commitment.text}»` : ''} — 다시 걸거나 정리한다 (${formatCloseHint(w.commitmentId)})`;
+    + `${commitment ? ` «${commitment.text}»` : ''}`
+    + (facts?.predicate ? `\n  ${facts.predicate}` : '')
+    + (facts?.pane ? `\n  ${commitment?.assignee ?? 'assignee'} pane: ${facts.pane}` : '')
+    + `\n  — 다시 걸거나 정리한다 (${formatCloseHint(w.commitmentId)})`;
 }
 
 /**
@@ -496,9 +528,11 @@ export async function evaluateWaker(seat: string, id: string, deps: SelfTimerDep
   const now = r.now();
   let met = false;
   let evidence = '';
+  let probeFailed: string | undefined;
   try {
     ({ met, evidence } = await conditionMet(r, current, now));
   } catch (error) {
+    probeFailed = String(error instanceof Error ? error.message : error).slice(0, 200);
     r.emit(SELF_TIMER_LOG_CATEGORY, SELF_TIMER_EVENTS.probeError, { seat: s, wakerId: id, condition: current.condition, error: String(error).slice(0, 200) });
   }
   const checked = { checks: current.checks + 1, lastCheckedAt: now.toISOString() };
@@ -556,7 +590,16 @@ export async function evaluateWaker(seat: string, id: string, deps: SelfTimerDep
       }
     }
     const expiring = updateWaker(r, s, id, { ...checked, status: 'expired', closedAt: now.toISOString() });
-    const messageId = await r.postNotice(s, formatExpiredNotice(current, commitment));
+    // OP-CLOSE-ON-OUTCOME — the check-at wake carries the predicate result from facts (and the assignee's pane when known).
+    const predicateCond = commitment?.doneWhen ?? (cond.kind === 'time' || cond.kind === 'mail-reply' ? undefined : current.condition);
+    const predicate = predicateCond === undefined ? undefined
+      : predicateCond === current.condition ? formatPredicateLine(predicateCond, evidence ? { kind: 'not-met', evidence } : probeFailed ? { kind: 'missing', reason: probeFailed } : { kind: 'not-met', evidence: `${predicateCond} does not hold` })
+        : formatPredicateLine(predicateCond, await measurePredicate(predicateCond, { seat: s, sinceIso: current.armedAt }, shared(deps, r)));
+    let pane: string | undefined;
+    if (commitment?.assignee && r.probes.seatPane) {
+      try { pane = (await r.probes.seatPane(commitment.assignee)) ?? undefined; } catch (error) { pane = `facts missing (${String(error).slice(0, 80)})`; }
+    }
+    const messageId = await r.postNotice(s, formatExpiredNotice(current, commitment, { ...(predicate ? { predicate } : {}), ...(pane ? { pane } : {}) }));
     const waker = messageId === null ? expiring : updateWaker(r, s, id, { noticeMessageId: messageId });
     r.emit(SELF_TIMER_LOG_CATEGORY, SELF_TIMER_EVENTS.expired, { seat: s, wakerId: id, commitmentId: current.commitmentId, condition: current.condition, noticeMessageId: messageId });
     if (current.autoClose) r.emit(COMMITMENT_WATCH_CATEGORY, COMMITMENT_WATCH_EVENTS.expired, { kind: parseWaitCondition(current.condition).kind, seat: s, wakerId: id, commitmentId: current.commitmentId });
@@ -756,6 +799,13 @@ export function defaultWaitProbes(): WaitProbes {
       const listed = spawnJson(['els', 'ls', '--json']) as { panes?: { seat?: string | null; state?: string; status?: { state?: string } | null }[] };
       const panes = (listed.panes ?? []).filter((p) => (p.seat ?? '').toUpperCase() === seat);
       return panes.length > 0 && panes.every((p) => (p.status?.state ?? p.state ?? '').toUpperCase() === 'IDLE');
+    },
+    async seatPane(seat) {
+      // One els journal read (no screen scrape): the seat's pane state and title.
+      const listed = spawnJson(['els', 'ls', '--json']) as { panes?: { seat?: string | null; state?: string; title?: string | null; status?: { state?: string; detail?: string | null } | null }[] };
+      const panes = (listed.panes ?? []).filter((p) => (p.seat ?? '').toUpperCase() === seat.toUpperCase());
+      if (panes.length === 0) return null;
+      return panes.map((p) => `${(p.status?.state ?? p.state ?? '?').toUpperCase()}${p.status?.detail ? ` ${p.status.detail}` : p.title ? ` ${p.title}` : ''}`).join(' | ').slice(0, 240);
     },
     async mailFrom(from, to, sinceIso) {
       const { openMsgStoreReadOnly } = await import('./msg-store.js');

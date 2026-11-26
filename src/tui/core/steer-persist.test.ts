@@ -38,7 +38,7 @@ test('steer then reload: the person row is saved after the tool call it joined a
   expect(saved[2]!.steerJoined).toBe(true);
   expect(typeof saved[2]!.turn_id).toBe('string');
   const shown = nextTuiPublicHistory(saved);
-  expect(shown[2]!.content).toBe('why no reply?\n(joined mid-turn)');
+  expect(shown[2]!.content).toBe('why no reply?');
   // The next turn start reloads the same ledger: the row keeps its id.
   expect(loadSession(id, root)!.messages[2]!.turn_id).toBe(saved[2]!.turn_id);
 });

@@ -165,6 +165,11 @@ export interface CoreTurnContext {
   /** ELN-PROMPT-CACHE-PIN — the caller keeps one tool set per session: deferred tools are not warm-preloaded from
    *  this turn's text (the tools array and the deferred announce stay byte-identical across turns). */
   stableToolSet?: boolean;
+  /** WEBCHAT-ORDINARY-SKIP-GROUNDING (OP 11-26) — how research is entered on a turn whose pool has a web tool.
+   *  Absent / `'default'` = the 1121 structured route (question-plan call first, default ENTER). `'on-request'` = the
+   *  member web chat: no default entry and no plan call before the first token; research runs only on the existing
+   *  confirmed fact path, and otherwise the model answers as an ordinary turn and may call its own search tools. */
+  researchEntry?: 'default' | 'on-request';
   /** Full prompt (system + history + current user blocks). */
   messages: LLMMessage[];
   /** Optional provider request-size hook. Only providers with a measured

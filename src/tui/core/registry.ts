@@ -311,6 +311,32 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     requiredFlags: [],
     helpSummary: '(운영) 지시를 Linear 이슈로 기록',
   },
+  {
+    // GOAL-ORCHESTRATION-NL — registry-only like /directive: Enter falls through to the person's turn and the model
+    // receives "/orch <goal>"; the Orchestrate tool's description tells it to plan → confirm → run.
+    id: 'orch',
+    action: 'command',
+    slash: ['/orch'],
+    slashPrefixes: ['/orch'],
+    phrases: [],
+    roles: ['human'],
+    minimumMaturity: 'stable',
+    requiredFlags: [],
+    helpSummary: 'Orchestrate a goal across agents in els tiles',
+  },
+  {
+    // INVEST-PANEL-NL — registry-only like /orch: the model receives "/invest <company> [question]" and the Orchestrate
+    // tool plans it as preset invest-panel (live Invest Research Board → 최종 결론 in chat).
+    id: 'invest',
+    action: 'command',
+    slash: ['/invest'],
+    slashPrefixes: ['/invest'],
+    phrases: [],
+    roles: ['human'],
+    minimumMaturity: 'stable',
+    requiredFlags: [],
+    helpSummary: 'Expert-panel investment research on a company (live board)',
+  },
 ];
 
 const NEXT_TUI_EXACT_SLASH_ROUTES = new Map<string, NextTuiRoute[]>();

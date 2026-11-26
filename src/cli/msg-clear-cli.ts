@@ -162,3 +162,36 @@ export function registerMsgResetCommand(msg: Command, deps: MsgClearCliDeps & { 
       } catch (e) { fail(`msg reset: ${(e as Error).message}`); } finally { store.close(); }
     });
 }
+
+/**
+ * MSG-PENDING-QUESTION-STALE — `eln msg question dismiss <id> --by <seat>`: an operator closes a pending-question banner
+ * that no reply cleared. Writes one audit row (provenance `msg-question-dismiss:<id>`) and acks the question.
+ */
+export function registerMsgQuestionCommand(msg: Command, deps: MsgClearCliDeps): void {
+  const out = deps.out ?? console;
+  const setExitCode = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
+  const question = msg.command('question').description('Pending questions (❓ banners): dismiss <id> --by <seat>');
+  question.command('dismiss <id>').description('Dismiss a pending-question banner — writes an audit row and acks the question')
+    .option('--by <seat>', 'acting seat: the receiving seat, its coordinator, OP or CLAUDE-OP (required)')
+    .option('--reason <text>').option('--json')
+    .action(async (rawId: string, opts: { by?: string; reason?: string; json?: boolean }) => {
+      const fail = (line: string): void => { out.error(line); setExitCode(1); };
+      if (!opts.by) return fail('msg question dismiss: --by <seat> is required');
+      const id = Number(rawId);
+      if (!Number.isSafeInteger(id) || id < 1) return fail(`msg question dismiss: bad id ${rawId}`);
+      const lib = await import('../msg/msg-wait-contract.js');
+      const store = deps.openStore();
+      try {
+        const m = store.getMessage(id);
+        if (!m) return fail(`msg question dismiss: #${id} not found`);
+        let ladder: Pick<FederationLadder, 'parentOf'> | null = null;
+        try { ladder = deps.ladder ? deps.ladder() : (require('../msg/hand-raise-ladder.js') as typeof import('../msg/hand-raise-ladder.js')).loadFederationLadder(); } catch { ladder = null; }
+        if (!mayClear(opts.by, m.to, ladder)) return fail(`msg question dismiss: ${opts.by} may not dismiss a question to ${m.to}`);
+        const r = lib.dismissQuestion(store, { id, by: opts.by, ...(opts.reason ? { reason: opts.reason } : {}) });
+        if (opts.json) out.log(JSON.stringify({ dismissed: id, seat: r.seat, asker: r.asker, auditId: r.auditId, fresh: r.fresh }));
+        else out.log(`dismissed question #${id} (${r.asker} → ${r.seat}) · audit #${r.auditId}${r.fresh ? '' : ' (already dismissed)'}`);
+      } catch (e) {
+        fail(`msg question dismiss: ${(e as Error).message}`);
+      } finally { store.close(); }
+    });
+}

@@ -26,6 +26,18 @@ Write the final summary in plain text with exactly these sections:
 ## Instructions
 - explicit user preferences, approvals, prohibitions, or process rules
 
+## CEO instructions (verbatim)
+- every instruction the CEO (the human, <human from="CEO">) gave that still stands, quoted word for word with its
+  time when known. Never paraphrase and never mark a standing directive as done because time passed. "- none" if none.
+
+## Who's who
+- each correspondent (the CEO, seats such as OP · TC · RES · JUD, agents, systems) · their role · what they own or
+  are waiting on from us. Mail from seats is information or a request from that seat, not the CEO's words.
+
+## World
+- organization (structure, kingdoms, who reports to whom), release (current version, cut/publish times, holds),
+  board (open cells, PRs, landings) — the facts needed to act without re-reading the transcript.
+
 ## Discoveries
 - facts learned from reading code, docs, tool output, or debugging
 

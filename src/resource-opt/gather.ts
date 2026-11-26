@@ -65,7 +65,18 @@ export async function gatherMatchingTable(opts: { seat: string; hqRoot?: string;
     judgeQueue = triage.rows.judge.map((row) => ({ id: row.id, owner: row.owner, sinceMs: updated.get(row.id) ?? now, ...(row.mergedPrs[0] ? { pr: row.mergedPrs[0] } : {}) }));
   } catch (error) { unmeasured.push(`judge-queue(${short(error)})`); }
 
-  return buildMatchingTable({ now, version, hqSeat, panes, cells, prs, greenLanes, judgeQueue, unmeasured, ...(opts.refused?.length ? { refused: opts.refused } : {}) });
+  // STEWARD-RX-CURRENT-PLAN — maker ≠ judge by role: org-map role (eln org) ⊕ federation ladder parent.
+  let isJudge: ((seat: string) => boolean) | undefined;
+  try {
+    const [{ isJudgeRole }, { loadOrgMap }, { loadFederationLadder }] = await Promise.all([
+      import('../seat/hand-pool.js'), import('../org/org-map.js'), import('../msg/hand-raise-ladder.js')]);
+    const org = loadOrgMap().org;
+    let ladder: { parentOf(seat: string): string } | null = null;
+    try { ladder = loadFederationLadder(); } catch { ladder = null; }
+    isJudge = (seat) => isJudgeRole(seat, { roleOf: (s) => org.seats[s.toUpperCase()]?.role, ...(ladder ? { parentOf: (s: string) => ladder!.parentOf(s) } : {}) });
+  } catch (error) { unmeasured.push(`org-roles(${short(error)})`); }
+
+  return buildMatchingTable({ now, version, hqSeat, ...(isJudge ? { isJudge } : {}), panes, cells, prs, greenLanes, judgeQueue, unmeasured, ...(opts.refused?.length ? { refused: opts.refused } : {}) });
 }
 
 export const RESOURCE_OPT_TRIGGER = 'trigger';

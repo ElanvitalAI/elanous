@@ -2,7 +2,7 @@
 // graph runner, with the 15 panel/mentor nodes running in parallel, and the report/dashboard carry the demo contract.
 // Expectations are literals (independent of the handlers' own constants).
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseGraphTemplateYaml } from '../../../src/self-implement/graph-yaml.js';
@@ -81,6 +81,10 @@ test('dry-run (fixtures) completes ≤ 5 min with 15 panel nodes in parallel; re
   // Private mentor frames never reach the dashboard.
   expect(JSON.stringify(d)).not.toContain('관점:');
   expect(Object.values(d.sources).every((s) => s === 'fixture')).toBe(true);
+  // DEMO-SOURCES-VIA-SECRET: every panel prompt carries the source rule and source-tagged factsheet lines.
+  const prompts = readdirSync(join(outDir, 'panes')).filter((f) => f.endsWith('.prompt.md')).map((f) => readFileSync(join(outDir, 'panes', f), 'utf8'));
+  expect(prompts.length).toBeGreaterThanOrEqual(15);
+  expect(prompts.every((t) => t.includes('출처 규칙:') && t.includes('«(페르소나 의견)»') && t.includes('[출처: EODHD (omni-market) · fixture]'))).toBe(true);
 }, 120_000);
 
 test('weighted consensus follows the attractiveness-panel formula (literal case)', () => {

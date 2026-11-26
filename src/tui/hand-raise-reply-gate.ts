@@ -47,6 +47,8 @@ export interface HandRaiseOpen extends HandRaiseQuery {
   /** When the ✋ mail arrived (ledger created_at, else the moment it was found unanswered). */
   readonly openedAt: number;
   surfaced: boolean;
+  /** The line this item put on the screen/queue (MSG-PENDING-QUESTION-STALE: retracted when the item closes). */
+  surfacedLine?: string;
 }
 
 /**
@@ -82,6 +84,11 @@ export interface HandRaiseGateDeps {
   /** Put one P0 item at the top of the queue (and wake the idle door). */
   readonly surface: (line: string, opens: readonly HandRaiseOpen[]) => void;
   readonly log?: (event: string, data: Record<string, unknown>) => void;
+  /**
+   * MSG-PENDING-QUESTION-STALE — an item closed (answered · acked · dismissed) or expired after its line was surfaced:
+   * take that line back off the screen and the queue. Omitted = the line stays (old behaviour).
+   */
+  readonly retract?: (line: string, open: HandRaiseOpen) => void;
 }
 
 export interface HandRaiseReplyGate {
@@ -90,6 +97,8 @@ export interface HandRaiseReplyGate {
   /** Re-check every open ✋ (outcome → closed · 5 min → P0 reminder · ≥3 same shape → one bulk item). */
   tick(): void;
   open(): readonly HandRaiseOpen[];
+  /** /new — drop every open item (their surfaced lines are retracted) and return them for one digest line. */
+  dropAll(): readonly HandRaiseOpen[];
 }
 
 const minutes = (ms: number): number => Math.max(0, Math.floor(ms / 60_000));
@@ -130,6 +139,10 @@ export function createHandRaiseReplyGate(deps: HandRaiseGateDeps, options: OpenI
   const surface = (line: string, list: readonly HandRaiseOpen[]): void => {
     try { deps.surface(line, list); } catch (error) { log('needhuman.surface-failed', { msgIds: list.map((o) => o.msgId), error: String(error).slice(0, 200) }); }
   };
+  const retract = (open: HandRaiseOpen): void => {
+    if (!open.surfacedLine || !deps.retract) return;
+    try { deps.retract(open.surfacedLine, open); } catch (error) { log('needhuman.retract-failed', { msgId: open.msgId, error: String(error).slice(0, 200) }); }
+  };
   return {
     noteUnanswered(input) {
       if (opens.has(input.msgId)) return;
@@ -147,11 +160,13 @@ export function createHandRaiseReplyGate(deps: HandRaiseGateDeps, options: OpenI
         const closed = closedSafe(open);
         if (closed === true) {
           opens.delete(open.msgId);
+          retract(open);
           log('needhuman.replied', { msgId: open.msgId, seat: open.seat, sender: open.sender, waitedMs: waited });
           continue;
         }
         if (waited >= HAND_RAISE_FORGET_AFTER_MS) {
           opens.delete(open.msgId);
+          retract(open);
           log('needhuman.expired', { msgId: open.msgId, seat: open.seat, sender: open.sender, waitedMs: waited });
         }
       }
@@ -173,9 +188,19 @@ export function createHandRaiseReplyGate(deps: HandRaiseGateDeps, options: OpenI
         if (open.surfaced || t - open.openedAt < surfaceAfterMs) continue;
         open.surfaced = true;
         log('needhuman.unanswered', { msgId: open.msgId, seat: open.seat, sender: open.sender, waitedMs: t - open.openedAt });
-        surface(surfaceLine(open.sender, t - open.openedAt, open.msgId), [open]);
+        const line = surfaceLine(open.sender, t - open.openedAt, open.msgId);
+        open.surfacedLine = line;
+        surface(line, [open]);
       }
     },
     open: () => [...opens.values()],
+    dropAll() {
+      const dropped = [...opens.values()];
+      opens.clear();
+      bulkSurfaced.clear();
+      for (const open of dropped) retract(open);
+      if (dropped.length > 0) log('needhuman.dropped-on-new', { msgIds: dropped.map((o) => o.msgId) });
+      return dropped;
+    },
   };
 }

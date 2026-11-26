@@ -10,6 +10,8 @@
 //    (assignment-gate.ts). Pure: every input is passed in, so fixtures decide the table.
 
 export const RESOURCE_OPT_STALL_MS = 2 * 60 * 60_000;
+import { isJudgeHand } from '../seat/hand-pool.js';
+
 export const RESOURCE_OPT_JUDGE_AGE_MS = 30 * 60_000;
 export const RESOURCE_OPT_ROW_CAP = 20;
 
@@ -37,6 +39,11 @@ export interface MatchingInput {
    * the cell out of matching, so the idle seat falls through to the next candidate cell instead of idling all hour.
    */
   refused?: ReadonlyArray<{ readonly cell: string; readonly seat?: string }>;
+  /**
+   * STEWARD-RX-CURRENT-PLAN — maker ≠ judge: a seat on the judge side (org-map role judge · federation role · ladder
+   * parent) is never an implementer candidate. JUD·JUDGE·REVIEW ids are excluded even without this predicate.
+   */
+  isJudge?: (seat: string) => boolean;
 }
 
 export type MatchingRow =
@@ -86,11 +93,15 @@ export function hasSameHeadReceipt(pr: number, headSha: string, lanes: readonly 
 
 export function buildMatchingTable(input: MatchingInput): MatchingTable {
   const hq = input.hqSeat.toUpperCase();
+  const judgeSide = (seat: string): boolean => {
+    if (isJudgeHand(seat)) return true;
+    try { return input.isJudge?.(seat) === true; } catch { return false; }
+  };
   // Idle seats: one per seat (oldest idle since wins), never the HQ coordinator itself; oldest idle first.
   const idleBySeat = new Map<string, number | null>();
   for (const pane of input.panes) {
     const seat = pane.seat?.trim().toUpperCase();
-    if (!seat || seat === hq || pane.state !== 'IDLE') continue;
+    if (!seat || seat === hq || pane.state !== 'IDLE' || judgeSide(seat)) continue;
     const since = typeof pane.since === 'number' && Number.isFinite(pane.since) ? pane.since : null;
     const prior = idleBySeat.get(seat);
     if (prior === undefined || (since !== null && (prior === null || since < prior))) idleBySeat.set(seat, since);

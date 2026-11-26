@@ -543,6 +543,16 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let wakeupBusConsumer: WakeupBusConsumer | null = null;
   let wakeupBusTurn: string | null = null;
   // QUEUE-FINISH-FIRST (CEO 11-24 12:4x) — the seat's own work finishes before ordinary mail opens a turn.
+  // OP-WAKE-COMMIT-BATCH — the digest window starts at the previous batch turn (done rows since then).
+  let opDigestSince = Date.now();
+  const opPulseDigest = (wakes: number): string | null => {
+    try {
+      const { readPulseDigest } = require('../op-control/pulse-digest.js') as typeof import('../op-control/pulse-digest.js');
+      const text = readPulseDigest('OP', opDigestSince, wakes);
+      opDigestSince = Date.now();
+      return text;
+    } catch { return null; }
+  };
   const finishFirst = createQueueFinishFirst({ log: (category, event, data) => { debug.log(category, event, data); }, holdOnlyWhileBusy: seatPassiveFlush,
     // OP-INBOX-PULSE-BATCH (대표 11-26) — the OP seat (same resolution as the seat-mail bell) batches non-P0 mail to the pulse.
     opBatch: detectSeat(process.cwd())?.seat === 'OP' });
@@ -737,6 +747,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // TUI-ANSWER-VANISH-ON-TOOLCALL — pre-tool streamed lines a tool-round clear frame pulled off the
   // screen, kept as display-only rows under the turn's question (never persisted, never replayed to the model).
   const heldAnswerRows = new Map<string, { anchor: number; userContent: string; text: string }>();
+  /** ELN-TRANSCRIPT-APPEND-ONLY — earlier rounds' text, still on screen in the live preview; moved to heldAnswerRows at settle. */
+  const heldDuringTurn = new Map<string, { anchor: number; userContent: string; text: string }>();
   /** Every graph loop this session showed: settled turns first, then the running turn. */
   const sessionGraphViews = (): GraphLoopView[] => [...projectGraphLoopViews([
     ...(settledTurnTools.get(id ?? '') ?? []).flatMap((entry) => entry.graph ?? []), ...graphView.events]).values()];
@@ -1230,6 +1242,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       render();
     },
     log: (event, data) => { debug.log('tui', event, data); },
+    // MSG-PENDING-QUESTION-STALE — answered/acked/dismissed after it surfaced: take the banner and its queued item back.
+    retract: (line, open) => {
+      removeQueuedNotice({ source: 'seat-mail', text: line, reason: 'question-closed' });
+      const head = safeStatusText(`❓ ${open.sender} asked #${open.msgId} `);
+      notices = notices.filter((row) => !row.startsWith(head));
+      render();
+    },
   }, { surfaceAfterMs: 10 * 60_000, bulk: false, eventPrefix: 'msg.question',
     surfaceLine: (sender, waitedMs, msgId) => (require('../msg/msg-wait-contract.js') as typeof import('../msg/msg-wait-contract.js')).questionResurfaceLine(sender, waitedMs, msgId) });
   let handLadder: { at: number; ladder: import('../msg/hand-raise-ladder.js').FederationLadder; humanLead?: import('../msg/hand-raise-ladder.js').HumanLeadPort } | null = null;
@@ -3237,7 +3256,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         const head = bundle.notices[0]!;
         // SEAT-MAIL-COALESCE-NOTICE — the bundle's seat mail is ONE digest (count + one line per mail · action bodies).
         // BULK-TRIAGE — ≥ 3 notices: one triage card (fixed id) at the head of the ONE bundle turn · logs triage.bulk-card.
-        const joined = triageBundleText(`${seatMailBundleText(bundle.notices)}${pauseNote}`, bundle.notices).text;
+        // OP-WAKE-COMMIT-BATCH — the OP batch turn opens with ONE digest whose outcomes are pre-evaluated from facts.
+        const pulseDigest = finishFirst.opBatch() && !keepHeldIds ? opPulseDigest(bundle.notices.filter((n) => n.source === 'scheduled-wake').length) : null;
+        const joined = `${pulseDigest ? `${pulseDigest}\n\n` : ''}${triageBundleText(`${seatMailBundleText(bundle.notices)}${pauseNote}`, bundle.notices).text}`;
         keepNoticeHeadMeta(head.id, joined, bundle.notices);
         turnStartLabel = { door: 'queue-notice', text: joined, source: head.source ?? undefined, eventId: head.msgId ?? head.id }; // 출처: #38804 — eventId = msgId ?? id
         // OP #129546 ① — 묶음 30통이면 30통 전체가 이 dispatch 한 번에 결속된다(머리만이 아니라):
@@ -3364,7 +3385,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     activeTurnRunId = turnRunId;
     turnFrom = from;
     // SESSION-AUTOPILOT — the running turn's origin: goal writes in an autonomous turn become proposal cards.
-    try { autopilot?.noteTurnStart(from?.kind === 'human' ? 'human' : 'auto'); } catch { /* fail-open */ }
+    try { autopilot?.noteTurnStart(from?.kind === 'human' ? 'human' : 'auto', from?.kind === 'human' ? turnText : undefined); } catch { /* fail-open */ }
     // SCHEDULE-WAKEUP-TURN-CAP: every real turn start gets its own gate turn id (notice/mail/queue turns skip the gate's open paths).
     wakeup?.gate.noteTurnStarted();
     // RAIL30 ① — only a mail-opened turn counts toward the sender-side back-pressure's turns/h (self-wakes · goal drive do not).
@@ -3630,7 +3651,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         for (let index = messages.length - 1; index >= 0 && anchor < 0; index -= 1)
           if (messages[index]!.role === 'user' && stripQueueModelContext(messages[index]!.content) === turnText) anchor = index;
         // The displayed bubble of that row (a long notice body is folded · public-history ⑤), so the anchor matches.
-        if (anchor >= 0) heldAnswerRows.set(turnSessionId, { anchor, userContent: publicUserText(messages[anchor]!.content), text });
+        // ELN-TRANSCRIPT-APPEND-ONLY: the live preview keeps this text on screen while the turn runs (no duplicate rows);
+        // the settled transcript gets it at settle, above the final round.
+        if (anchor >= 0) heldDuringTurn.set(turnSessionId, { anchor, userContent: publicUserText(messages[anchor]!.content), text });
       },
       onPreview: (preview, replace, source) => {
         // A replaced reply restarts the text; earlier tools now precede all of it.
@@ -3788,6 +3811,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         // the pre-tool streamed lines live only in the live preview. Hand them to the screen
         // holder before the live state is discarded, so the settled transcript keeps them
         // above the tool rows of the same turn (same holder, settle path).
+        const heldRounds = heldDuringTurn.get(turnSessionId);
+        if (heldRounds) { heldAnswerRows.set(turnSessionId, heldRounds); heldDuringTurn.delete(turnSessionId); }
         if (!heldAnswerRows.has(turnSessionId) && streamPreview !== null && streamPreview.sessionId === turnSessionId
           && visibleToolActivity.length > 0) {
           const heldText = heldPreToolText(streamPreview, toolTextOffsets);
@@ -4057,6 +4082,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         ...pulseDep,
         // OP-INBOX-PULSE-BATCH — the pulse turn opened: the held OP batch goes at the next idle boundary.
         onPulseOpened: () => { finishFirst.notePulse(); },
+        // OP-WAKE-COMMIT-BATCH (대표 11-26) — on the OP seat a due self-wake joins the held batch (one pulse digest turn).
+        ...(finishFirst.opBatch() ? { holdScheduledWake: (text: string) => { queue.enqueueNotice(text, 'scheduled-wake', { occurredAt: Date.now() }); render(); return true; } } : {}),
       });
       // ⭐ OP-CRON-PROMPTS O2 — TUI 재기동해도 예약 깨움이 살게 파일에 저장·시작 복원한다(대화가 바뀌면 다시 묶는다).
       const wakeupScheduler = wakeup.scheduler;
@@ -5293,6 +5320,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             bindWakeupSession?.(id);
             restoreMessageBlockSession(id);
             lastFoldTargetKey = null;
+            // MSG-PENDING-QUESTION-STALE (d) — the old session's pending-question banners end with it; one digest line stays.
+            try {
+              const dropped = questionGate.dropAll();
+              if (dropped.length > 0) pushNotice((require('../msg/msg-wait-contract.js') as typeof import('../msg/msg-wait-contract.js')).questionDigestLine(dropped));
+            } catch { /* fail-open */ }
             expandedNoticeRows.clear();
             lastResumeRows = null;
             session = loadSession(id);

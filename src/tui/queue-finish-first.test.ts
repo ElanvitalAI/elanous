@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, setSystemTime, test } from 'bun:test';
 import { createNextTuiQueue } from './core/queue.js';
 import {
-  classifyOpBatchItem, classifySeatMail, createQueueFinishFirst, decideIdleQueue, heldChip, heldPeekBlock, midTurnMailAction, NO_WAITS,
+  classifyOpBatchItem, classifySeatMail, createQueueFinishFirst, decideIdleQueue, heldChip, opBatchActionable, heldPeekBlock, midTurnMailAction, NO_WAITS,
   type QueueClassItem,
 } from './queue-finish-first.js';
 import { mailReplyId } from '../op-requirements/turn-end.js';
@@ -400,9 +400,9 @@ describe('OP-INBOX-PULSE-BATCH — OP seat holds every non-P0 mail for the pulse
     expect(classifySeatMail({ intent: 'alert' })).toBe('P0');
   });
 
-  test('idle OP with a decision held → hold(pulse-batch), not deliver-p1; other seats unchanged', () => {
+  test('idle OP with a fresh decision held → hold(pulse-batch), not deliver-p1; other seats unchanged', () => {
     const items = [mail('a', { mailClass: 'P1', mailIntent: 'decision' })];
-    const base = { items, waits: NO_WAITS, workInProgress: false, continuationsWhileHolding: 0, awaitingStartSince: null, continuationTried: false, now: 60_000 };
+    const base = { items, waits: NO_WAITS, workInProgress: false, continuationsWhileHolding: 0, awaitingStartSince: null, continuationTried: false, now: 59_000 };
     expect(decideIdleQueue({ ...base, opBatch: true })).toEqual({ kind: 'hold', heldIds: ['a'], reason: 'pulse-batch' });
     expect(decideIdleQueue(base).kind).toBe('deliver-p1');
   });
@@ -410,7 +410,7 @@ describe('OP-INBOX-PULSE-BATCH — OP seat holds every non-P0 mail for the pulse
   test('pulse opened → one release; 30 min without pulse → starvation release; idle stall does not force', () => {
     let t = 0;
     const ff = createQueueFinishFirst({ now: () => t, opBatch: true });
-    const items = [mail('a', { mailClass: 'P2' }), mail('b', { mailClass: 'P1', mailIntent: 'request' })];
+    const items = [mail('a', { mailClass: 'P2' }), mail('b', { mailClass: 'P2', mailIntent: 'report' })];
     expect(ff.decide(items).kind).toBe('hold');
     expect(ff.forceRelease()).toBe(false);
     expect(ff.holding()).toBe(true);
@@ -420,5 +420,57 @@ describe('OP-INBOX-PULSE-BATCH — OP seat holds every non-P0 mail for the pulse
     expect(ff.decide(items).kind).toBe('hold');
     t = 30 * 60_000;
     expect(ff.decide(items)).toEqual({ kind: 'release', reason: 'starvation' });
+  });
+});
+
+describe('OP-BATCH-IDLE-DUE — mail that needs OP action wakes an idle OP within a minute (11-26 11:5x «📩 103 held»)', () => {
+  const mail = (id: string, extra: Partial<QueueClassItem> = {}): QueueClassItem =>
+    ({ id, text: `mail ${id}`, kind: 'notice', source: 'seat-mail', enqueuedAt: 0, ...extra });
+  const base = { waits: NO_WAITS, workInProgress: false, continuationsWhileHolding: 0, awaitingStartSince: null, continuationTried: false, opBatch: true };
+
+  test('actionable = seat mail request · decision · question · result, never a notice bulletin / wake / graph stall / info', () => {
+    expect(opBatchActionable(mail('a', { mailClass: 'P1', mailIntent: 'request', mailKind: 'request' }))).toBe(true);
+    expect(opBatchActionable(mail('b', { mailClass: 'P1', mailIntent: 'decision', mailKind: 'decision' }))).toBe(true);
+    expect(opBatchActionable(mail('c', { mailClass: 'P2', mailIntent: 'question', mailKind: 'question' }))).toBe(true);
+    expect(opBatchActionable(mail('d', { mailClass: 'P1', mailIntent: 'request', mailKind: 'notice' }))).toBe(false);
+    expect(opBatchActionable(mail('e', { mailClass: 'P2', mailIntent: 'info', mailKind: 'report' }))).toBe(false);
+    expect(opBatchActionable({ id: 'w', text: 'wake', kind: 'notice', source: 'scheduled-wake', enqueuedAt: 0 })).toBe(false);
+    expect(opBatchActionable({ id: 'g', text: 'stall', kind: 'notice', source: 'graph-node', enqueuedAt: 0 })).toBe(false);
+  });
+
+  test('idle OP: a decision held 60 s releases the whole batch (action-due); info alone keeps holding', () => {
+    const items = [mail('i', { mailClass: 'P2', mailIntent: 'info' }), mail('d', { mailClass: 'P1', mailIntent: 'decision', enqueuedAt: 1_000 })];
+    expect(decideIdleQueue({ ...base, items, now: 60_999 })).toEqual({ kind: 'hold', heldIds: ['i', 'd'], reason: 'pulse-batch' });
+    expect(decideIdleQueue({ ...base, items, now: 61_000 })).toEqual({ kind: 'release', reason: 'action-due' });
+    expect(decideIdleQueue({ ...base, items: [items[0]!], now: 29 * 60_000 })).toEqual({ kind: 'hold', heldIds: ['i'], reason: 'pulse-batch' });
+  });
+
+  test('open work: continuation first; after its try the 60 s rule applies; 3 min cap even with a fresh turn due', () => {
+    const items = [mail('r', { mailClass: 'P1', mailIntent: 'request' })];
+    expect(decideIdleQueue({ ...base, items, workInProgress: true, now: 90_000 })).toEqual({ kind: 'continue', heldIds: ['r'] });
+    expect(decideIdleQueue({ ...base, items, workInProgress: true, continuationTried: true, now: 90_000 })).toEqual({ kind: 'release', reason: 'action-due' });
+    expect(decideIdleQueue({ ...base, items, workInProgress: true, now: 180_000 })).toEqual({ kind: 'release', reason: 'action-due' });
+  });
+
+  test('bounded: 50 held info items release as one digest (overflow); 49 keep holding', () => {
+    const many = (n: number) => Array.from({ length: n }, (_, i) => mail(`m${i}`, { mailClass: 'P2', mailIntent: 'info' }));
+    expect(decideIdleQueue({ ...base, items: many(49), now: 1_000 }).kind).toBe('hold');
+    expect(decideIdleQueue({ ...base, items: many(50), now: 1_000 })).toEqual({ kind: 'release', reason: 'overflow' });
+  });
+
+  test('stateful: the idle timer sees releaseDue at 60 s for a held request (door wakes), released logged with reason', () => {
+    let t = 0;
+    const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const ff = createQueueFinishFirst({ now: () => t, opBatch: true, log: (_c, event, data) => { logs.push({ event, data }); } });
+    const items = [mail('r', { mailClass: 'P1', mailIntent: 'request', enqueuedAt: 0 })];
+    expect(ff.decide(items).kind).toBe('hold');
+    expect(ff.heldCount()).toBe(1);
+    t = 59_000;
+    expect(ff.releaseDue(items)).toBe(false);
+    t = 60_000;
+    expect(ff.releaseDue(items)).toBe(true);
+    expect(ff.decide(items)).toEqual({ kind: 'release', reason: 'action-due' });
+    expect(ff.heldCount()).toBe(0);
+    expect(logs.filter((l) => l.event === 'released').map((l) => l.data)).toEqual([{ reason: 'action-due', count: 1, continuations: 0 }]);
   });
 });

@@ -24,7 +24,7 @@ import type { InputSourceKind } from '../input/input-source-kind.js';
 import { getProviderForConfigAsync, streamLLM, streamLLMWithTools, resolveDefaultOutputTokens, type LLMMessage, type LLMOpts, type LLMProvider, type ContentBlock } from '../llm.js';
 import type { LLMProviderName, UserConfig } from '../user-config/types.js';
 import {
-  estimateMessagesTokens, estimateTokens, trimToBudget, budget, formatBudget,
+  estimateMessagesTokens, estimateTokens, budget, formatBudget,
   DEFAULT_TOKEN_BUDGET,
 } from '../tokens.js';
 import { buildMemoryInjection, buildMemoryInjectionLLM, recordMemoryTurnUsage } from '../memory.js';
@@ -35,8 +35,10 @@ import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
 import { isSimpleQuestionFastRoute } from '../model-tier/simple-question-fast-route.js';
 import { recordTurn } from '../status/metrics.js';
 import { createMeasuredTurnUsage, type MeasuredTurnUsage } from './turn-usage.js';
-import { shouldFireTurnStartCompact, trimKeepingAnchorAndLatestTurn, TURN_COMPACT_HISTORY_TOKENS } from './long-session-compact.js';
+import { shouldFireTurnStartCompact, TURN_COMPACT_HISTORY_TOKENS } from './long-session-compact.js';
 import { compactSessionHistory } from './compact-session.js';
+import { resolveModelContextWindow } from '../models/context-window.js';
+import { KEEP_HUMAN_TURNS, isHumanSourceRow, resolveTurnInputCap, shouldCompactForWindow, trimKeepingRecentHumans, type TurnInputCap } from './turn-budget.js';
 import { CHAT_DEFAULTS } from '../user-config/chat.js';
 import type { CompactProvider } from '../compact/provider.js';
 import { clearNoOpBackoff, compactRegrowHeld, noOpBackoffHeld, recordCompactRegrowHold, recordNoOpBackoff } from '../compact/auto-state.js';
@@ -238,7 +240,11 @@ export interface CreateRunTurnSessionOpts extends Partial<CreateSessionOpts> {
 /** Convert stored session messages → LLM wire messages. System and tool
  *  entries are passed through as text-only; multi-part content blocks
  *  stored in `toolResult` are collapsed into string form for simplicity. */
-export function toLLM(messages: SerializedMessage[], systemPrompt?: string): LLMMessage[] {
+export function toLLM(
+  messages: SerializedMessage[],
+  systemPrompt?: string,
+  onRow?: (source: SerializedMessage, wire: LLMMessage) => void,
+): LLMMessage[] {
   const out: LLMMessage[] = [];
   // OP-LONG-SESSION-COMPACT (D2) — the turn's system prompt is never dropped. A stored head row only
   // stands in for it when it IS that prompt (identical text, no duplicate). The old
@@ -257,7 +263,9 @@ export function toLLM(messages: SerializedMessage[], systemPrompt?: string): LLM
       : m.role === 'assistant' ? 'assistant'
       : m.role === 'system' ? 'system'
       : 'user';
-    out.push({ role, content: m.content });
+    const row: LLMMessage = { role, content: m.content };
+    onRow?.(m, row);
+    out.push(row);
   }
   return out;
 }
@@ -370,9 +378,9 @@ const childContextComposedSessions = new Set<string>();
  */
 export const RESUME_BOUNDARY_BLOCK = [
   '## Resumed session boundary',
-  'This session was resumed after a restart. Everything said above this point — earlier requests and any turn that was',
-  'interrupted — is already finished or superseded: do not redo it or continue it on your own. Act on the current message;',
-  'continue earlier work only if the current message asks for it.',
+  'This session was resumed after a restart. Earlier one-off tasks and any turn that was interrupted are done or',
+  'paused: do not redo them or continue them on your own — act on the current message, and continue earlier work only',
+  'if it asks for it. Standing CEO directives (rules, priorities, roles, deadlines the CEO set) still apply.',
 ].join('\n');
 const resumeBoundaryShownSessions = new Set<string>();
 
@@ -552,8 +560,25 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   //    swap the string content of the latest user message for
   //    ContentBlock[] so the provider adapter sends them multimodally.
   // The request as it is actually sent (per-turn volatile context and images attached), before any trim.
+  // SEAT-CONTEXT-BUDGET-WINDOW — wire rows that came from a human (from.kind === 'human'); the trim keeps them.
+  const humanWire = new WeakSet<LLMMessage>();
   const buildTurnWire = (systemPrompt?: string, history = messages): LLMMessage[] => {
-    const wire = withTurnVolatileContext(toLLM([...history, userMsg], systemPrompt), turnVolatileBlocks);
+    const wire = withTurnVolatileContext(toLLM([...history, userMsg], systemPrompt, (source, row) => {
+      // Legacy rows have no `from`: a plain user row (not a tool result) counts as human (Terra r1).
+      if (isHumanSourceRow(source)) humanWire.add(row);
+    }), turnVolatileBlocks);
+    // CEO-UTTERANCE-TAGGED-LAST — a person's turn: harness parts (recall · notifications · queue context) become tagged
+    // non-human blocks and the person's words are the LAST part, as <human from="CEO">. Stored text is unchanged.
+    if (opts.from?.kind === 'human') {
+      const lastUser = wire.map(message => message.role).lastIndexOf('user');
+      const last = wire[lastUser];
+      if (last && last.role === 'user') {
+        const { humanLastContent } = require('./human-envelope.js') as typeof import('./human-envelope.js');
+        wire[lastUser] = { ...last, content: humanLastContent(opts.userText, opts.userImages ?? []) };
+        humanWire.add(wire[lastUser]!);
+      }
+      return wire;
+    }
     if (opts.userImages && opts.userImages.length > 0) {
       // The current user message is the last `user` row.
       const lastUser = wire.map(message => message.role).lastIndexOf('user');
@@ -564,11 +589,21 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
           { type: 'text', text: opts.userText },
         ];
         wire[lastUser] = { role: 'user', content: blocks };
+        if (opts.from === undefined) humanWire.add(wire[lastUser]!);
       }
     }
     return wire;
   };
-  const turnInputCap = opts.maxTokens ?? DEFAULT_TOKEN_BUDGET;
+  // SEAT-CONTEXT-BUDGET-WINDOW — the cap is window-relative and measured on top of the fixed prefix
+  //   (system prompt + this turn's volatile blocks), so the prefix can never starve history. An explicit
+  //   opts.maxTokens keeps its flat trim-only contract.
+  const turnWindow = resolveModelContextWindow(llmOpts?.model ?? provider.defaultModel);
+  const prefixTokensOf = (wire: LLMMessage[]): number =>
+    estimateMessagesTokens(wire.filter((m, i) => m.role === 'system' && (i === 0 || m.cacheVolatile === true)));
+  const capFor = (wire: LLMMessage[]): TurnInputCap => opts.maxTokens !== undefined
+    ? { cap: opts.maxTokens, prefixTokens: prefixTokensOf(wire), historyAllowance: Math.max(0, opts.maxTokens - prefixTokensOf(wire)), window: turnWindow }
+    : resolveTurnInputCap({ window: turnWindow, prefixTokens: prefixTokensOf(wire), outputTokens });
+  let turnInputCap = capFor(buildTurnWire(effectiveSystemPrompt)).cap;
   // ⭐ ELN-COMPACT-REAL(OP #135458 §4-4①) — turn-start auto-compaction fires before the trim on
   //   the RECORD only (fixed prefix excluded): history 16k OR the whole measured input 60k,
   //   whichever comes first. The old request-as-sent basis (ratio × min(window, budget), clamped
@@ -579,8 +614,12 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   if (autoCompactCfg.enabled && opts.maxTokens === undefined) {
     const turnModelId = llmOpts?.model ?? provider.defaultModel;
     const historyUsedTokens = estimateMessagesTokens(toLLM([...messages, userMsg]));
-    const fullInputTokens = estimateMessagesTokens(buildTurnWire(effectiveSystemPrompt));
-    if (shouldFireTurnStartCompact(historyUsedTokens, fullInputTokens)) {
+    const startWire = buildTurnWire(effectiveSystemPrompt);
+    const fullInputTokens = estimateMessagesTokens(startWire);
+    const startCap = capFor(startWire);
+    // History is about to be dropped by the trim → a compaction is needed; regrow-hold must not suppress it.
+    const historyDropping = fullInputTokens > startCap.cap;
+    if (shouldFireTurnStartCompact(historyUsedTokens, fullInputTokens) || shouldCompactForWindow(historyUsedTokens, fullInputTokens, startCap)) {
       // ⭐ §4-4③ — a no-op force buys nothing by repeating: hold off re-forcing until the
       //   record has grown +25% past the level measured at the last no-op.
       if (noOpBackoffHeld(opts.sessionId, historyUsedTokens)) {
@@ -588,7 +627,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
           sessionId: opts.sessionId, historyUsedTokens, fullInputTokens,
           fired: false, reason: 'no-op-backoff', // 출처: #135458 §4-4③
         }, { level: 'info' });
-      } else if (compactRegrowHeld(opts.sessionId, historyUsedTokens, TURN_COMPACT_HISTORY_TOKENS)) {
+      } else if (!historyDropping && compactRegrowHeld(opts.sessionId, historyUsedTokens, TURN_COMPACT_HISTORY_TOKENS)) {
         // ELN-COMPACT-EVERY-TURN — the last compaction's summary is the cache boundary; keep it until the record
         // has regrown by a full trigger's worth (hysteresis), instead of rewriting the prefix every turn.
         debug.log('compact.session', 'turn-start', {
@@ -634,13 +673,25 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   // fit, the turn fails with ✗ before any provider call.
   const assembleTurnMessages = (systemPrompt?: string, history = messages): { kept: LLMMessage[]; dropped: number; used: number } => {
     const wire = buildTurnWire(systemPrompt, history);
-    if (!compactedThisTurn) return trimToBudget(wire, turnInputCap);
-    const trimmed = trimKeepingAnchorAndLatestTurn(wire, turnInputCap, estimateMessagesTokens);
+    const capInfo = capFor(wire);
+    turnInputCap = capInfo.cap;
+    const trimmed = trimKeepingRecentHumans(wire, turnInputCap, estimateMessagesTokens, i => humanWire.has(wire[i]!), KEEP_HUMAN_TURNS);
+    if (trimmed.dropped > 0) {
+      debug.log('session.trim', 'dropped', {
+        sessionId: opts.sessionId, dropped: trimmed.dropped, keptHumanTurns: trimmed.keptHumanTurns,
+        cap: turnInputCap, prefixTokens: capInfo.prefixTokens, window: capInfo.window, used: trimmed.used,
+      }, { level: trimmed.keptHumanTurns < 2 ? 'warn' : 'info' });
+      if (trimmed.keptHumanTurns < 2) {
+        opts.onStatusLine?.(`⚠ context trimmed — only ${trimmed.keptHumanTurns} human turn(s) kept (dropped ${trimmed.dropped} rows · cap ${turnInputCap.toLocaleString('en-US')} · prefix ${capInfo.prefixTokens.toLocaleString('en-US')})`);
+      }
+    }
+    // Over budget stops the turn whether or not a compaction ran (backoff, auto-compact off, explicit
+    // maxTokens): an oversized request is never sent (Terra r1).
     if (trimmed.overBudget) {
       debug.log('session.compact', 'over-budget', {
         sessionId: opts.sessionId, usedTokens: trimmed.used, capTokens: turnInputCap,
       }, { level: 'error' });
-      const line = `✗ 문맥 예산 초과 — 압축 뒤에도 보존 항목만 ${trimmed.used.toLocaleString('en-US')} 토큰 > 상한 ${turnInputCap.toLocaleString('en-US')} · 이 턴을 멈춤`;
+      const line = `✗ 문맥 예산 초과 — ${compactedThisTurn ? '압축 뒤에도 ' : ''}보존 항목만 ${trimmed.used.toLocaleString('en-US')} 토큰 > 상한 ${turnInputCap.toLocaleString('en-US')} · 이 턴을 멈춤`;
       opts.onStatusLine?.(line);
       throw new Error(line);
     }

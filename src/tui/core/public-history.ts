@@ -2,8 +2,10 @@ import { queueNoticeBody, stripQueueModelContext } from '../../chat/interjection
 import type { SerializedMessage } from '../../session/index.js';
 import { projectKnownAuthFailure, savedFailureCause, streamReplyFailure, streamReplyFinal } from './next-public-reply.js';
 
-/** Marker under a person's line that joined a running turn at a tool boundary. */
+/** TUI-JOINED-MIDTURN-REMOVE — the old marker text; it is no longer rendered under a steer (kept so callers that
+ *  assert its absence can name it). */
 export const STEER_JOINED_MARK = '(joined mid-turn)';
+
 
 /** While a turn runs, its own answer is still the live preview. `true` hides the trailing answer outright; `{ since }`
  *  hides it only when it was saved at or after the running turn started (TUI-ANSWER-VANISH-ON-TOOLCALL ④). */
@@ -65,8 +67,9 @@ function publicUserRow(message: SerializedMessage): SerializedMessage {
   if (hit) return hit;
   // A200 · ELN-QUEUE-SUPERSEDE — interrupted-on-purpose and «대체 후보» lines are model context; the bubble shows the person's words.
   const row = message.steerJoined === true
-    // TUI-ANSWER-VANISH-ON-TOOLCALL ③ — a steer reads as the person's message, marked where it joined.
-    ? { ...message, content: `${stripQueueModelContext(message.content)}\n${STEER_JOINED_MARK}` }
+    // TUI-ANSWER-VANISH-ON-TOOLCALL ③ — a steer reads as the person's message, where it joined (TUI-JOINED-MIDTURN-REMOVE:
+    // no «(joined mid-turn)» mark under it — the CEO asked for the person's words only).
+    ? { ...message, content: stripQueueModelContext(message.content) }
     : stripQueueModelContext(message.content) !== message.content
       ? { ...message, content: publicUserText(message.content) }
       : message;

@@ -1,0 +1,418 @@
+{
+  "schema": 1,
+  "tool": "A161",
+  "head": "125b88e8f22c97dca0df7d93f5e03afd93ae9046",
+  "base": "8a8f348a92598a62adcb13e83c30a5a6f7827e75",
+  "pr": 39636,
+  "host": "node-b",
+  "actualHost": "MacStudioB1",
+  "runnerPid": 8288,
+  "rawDir": "/var/folders/6w/lwcnwd3146s1sd01fxn67ggr0000gn/T/res-a161-2sfybtkj",
+  "focused": [
+    "src/supervision/seat-stall-watch.test.ts",
+    "src/supervision/op-mail-coverage-watch.test.ts"
+  ],
+  "steps": [
+    {
+      "name": "fetch-main",
+      "command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "-c",
+        "import fcntl,subprocess,sys,time\nrepo,remote=sys.argv[1:3]\nlock=open(repo+'/pregate-fetch-main.lock','a'); fcntl.flock(lock,fcntl.LOCK_EX)\nrc=1\nfor i in range(3):\n    rc=subprocess.run(['git','-C',repo,'fetch','--no-tags',remote,'+refs/heads/main:refs/remotes/origin/main']).returncode\n    if rc==0: break\n    time.sleep(2*(i+1))\nsys.exit(rc)\n",
+        "/Users/op/elanous-hq/repo-fresh.git",
+        "origin"
+      ],
+      "startedAt": 1795353879.459425,
+      "pid": 8400,
+      "exit": 0,
+      "finishedAt": 1795353880.291296
+    },
+    {
+      "name": "fetch-head",
+      "command": [
+        "git",
+        "-C",
+        "/Users/op/elanous-hq/repo-fresh.git",
+        "fetch",
+        "--no-tags",
+        "origin",
+        "125b88e8f22c97dca0df7d93f5e03afd93ae9046"
+      ],
+      "startedAt": 1795353880.3079412,
+      "pid": 8466,
+      "exit": 0,
+      "finishedAt": 1795353881.11831
+    },
+    {
+      "name": "fetch-base",
+      "command": [
+        "git",
+        "-C",
+        "/Users/op/elanous-hq/repo-fresh.git",
+        "fetch",
+        "--no-tags",
+        "origin",
+        "8a8f348a92598a62adcb13e83c30a5a6f7827e75"
+      ],
+      "startedAt": 1795353881.135288,
+      "pid": 8528,
+      "exit": 0,
+      "finishedAt": 1795353881.2075012
+    },
+    {
+      "name": "checkout",
+      "command": [
+        "git",
+        "-C",
+        "/Users/op/elanous-hq/repo-fresh.git",
+        "worktree",
+        "add",
+        "--detach",
+        "/var/folders/6w/lwcnwd3146s1sd01fxn67ggr0000gn/T/res-a161-2sfybtkj/source",
+        "125b88e8f22c97dca0df7d93f5e03afd93ae9046"
+      ],
+      "startedAt": 1795353881.2284758,
+      "pid": 8540,
+      "exit": 0,
+      "finishedAt": 1795353886.5048351
+    },
+    {
+      "name": "merge-main",
+      "command": [
+        "git",
+        "-c",
+        "user.name=a161-pregate",
+        "-c",
+        "user.email=a161-pregate@res.local",
+        "merge",
+        "--no-edit",
+        "8a8f348a92598a62adcb13e83c30a5a6f7827e75"
+      ],
+      "startedAt": 1795353886.890673,
+      "pid": 8925,
+      "exit": 0,
+      "finishedAt": 1795353886.963669
+    },
+    {
+      "name": "diff-check",
+      "command": [
+        "git",
+        "diff",
+        "--check",
+        "8a8f348a92598a62adcb13e83c30a5a6f7827e75",
+        "125b88e8f22c97dca0df7d93f5e03afd93ae9046"
+      ],
+      "startedAt": 1795353888.922106,
+      "pid": 9038,
+      "exit": 0,
+      "finishedAt": 1795353888.994576
+    },
+    {
+      "name": "frozen-install",
+      "command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "env",
+        "-i",
+        "HOME=/var/folders/6w/lwcnwd3146s1sd01fxn67ggr0000gn/T/res-a161-2sfybtkj/install-home",
+        "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "/Users/op/.bun/bin/bun",
+        "install",
+        "--frozen-lockfile"
+      ],
+      "startedAt": 1795353889.035302,
+      "pid": 9049,
+      "slotWaitSec": 5.0,
+      "exit": 0,
+      "finishedAt": 1795353911.6153479
+    },
+    {
+      "name": "pwa-frozen-install",
+      "command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "env",
+        "-i",
+        "HOME=/var/folders/6w/lwcnwd3146s1sd01fxn67ggr0000gn/T/res-a161-2sfybtkj/install-home",
+        "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "/Users/op/.bun/bin/bun",
+        "install",
+        "--frozen-lockfile"
+      ],
+      "startedAt": 1795353911.616423,
+      "pid": 10548,
+      "slotWaitSec": 5.0,
+      "exit": 0,
+      "finishedAt": 1795353923.68417
+    },
+    {
+      "name": "rules-and-ratchets",
+      "command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+        "test",
+        "test/rules-contract.test.ts"
+      ],
+      "startedAt": 1795353923.7071629,
+      "pid": 11424,
+      "slotWaitSec": 5.1,
+      "exit": 0,
+      "finishedAt": 1795353951.735342
+    },
+    {
+      "name": "focused",
+      "command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+        "test",
+        "src/supervision/seat-stall-watch.test.ts",
+        "src/supervision/op-mail-coverage-watch.test.ts"
+      ],
+      "startedAt": 1795353951.7363179,
+      "pid": 13488,
+      "exit": 0,
+      "finishedAt": 1795353951.923924
+    },
+    {
+      "name": "changed-tsc",
+      "command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+        "run",
+        "scripts/ci-typecheck-changed.ts",
+        "--local"
+      ],
+      "startedAt": 1795353951.925087,
+      "pid": 13506,
+      "slotWaitSec": 5.1,
+      "exit": 0,
+      "finishedAt": 1795354016.5637062
+    }
+  ],
+  "status": "LIGHT_PASS_NOT_FULL_GATE",
+  "security": {
+    "status": "REVIEW_REQUIRED",
+    "scope": "added lines only; heuristic candidates, never a security PASS",
+    "candidates": [
+      {
+        "path": "graphs/ops/recipes.yaml",
+        "line": 44,
+        "category": "path-traversal"
+      },
+      {
+        "path": "graphs/ops/recipes.yaml",
+        "line": 47,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/supervision/op-mail-coverage-watch.ts",
+        "line": 3,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/supervision/op-mail-coverage-watch.ts",
+        "line": 207,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/supervision/op-mail-coverage-watch.ts",
+        "line": 261,
+        "category": "value-output"
+      },
+      {
+        "path": "src/supervision/op-mail-coverage-watch.ts",
+        "line": 266,
+        "category": "value-output"
+      },
+      {
+        "path": "src/supervision/seat-stall-watch.ts",
+        "line": 2,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/supervision/seat-stall-watch.ts",
+        "line": 187,
+        "category": "value-output"
+      },
+      {
+        "path": "src/supervision/seat-stall-watch.ts",
+        "line": 192,
+        "category": "value-output"
+      }
+    ]
+  },
+  "historicalProofImported": false,
+  "selfReview": {
+    "status": "WARN_MISSING",
+    "path": null,
+    "sha256": null,
+    "pr": 39636,
+    "head": "125b88e8f22c97dca0df7d93f5e03afd93ae9046",
+    "mustFix": null,
+    "warning": "self-review-result-missing"
+  },
+  "reviewCap": 8,
+  "bun": "1.4.2",
+  "bunPath": "/Users/op/.bun/bin/bun",
+  "bunSha256": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5",
+  "guardPath": "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+  "guardSha256": "f27672208e517e769e42e3ac4750266d5a5cb92292711e350119cebb8678fc05",
+  "runtimeMode": "host-default",
+  "rawSha256": {
+    "fetch-base.raw": "be884445b27706864c135d585851e37b9d27e3426cc3d947c7bd3f7a701a5773",
+    "fetch-head.raw": "b83094190a90913153e134711811e583c740e8b211518e71e5864ea9800294e5",
+    "changed-tsc.raw": "1ac6ee8da11145a6e7b64b883eac8048b4ee8056ff33b40100d9ac067aefd544",
+    "frozen-install.raw": "b694b4f0c58d174359299ed9a02a932089e655294d8a029fdd2952ccbe35935c",
+    "diff-check.raw": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "fetch-main.raw": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "focused.raw": "310858adec9cbc6425610ad5b1cb781b15f52080da7b885d82bcec975ef75832",
+    "merge-main.raw": "e5d6c99aec87ec07a2d1b5c1222d8b690d0a61c3548a55c795fff56db9450d0d",
+    "rules-and-ratchets.raw": "0a5bdabf4eb3913dce4f62b49b4c9a2ff52596f30883ed70e8913d8cc146f218",
+    "pwa-frozen-install.raw": "ed94be3e35a94e6bf5899122173abed01e10d418712a988a358462579455069d",
+    "checkout.raw": "735b75aad9a07652b0183b8300a7f2235ea291b44d9ddaeeca0f427741e06ee0"
+  },
+  "originMain": "8a8f348a92598a62adcb13e83c30a5a6f7827e75",
+  "lockSha256": "2e88d2bb59a46a538aef956ee552880ea9da8cd511e852d90418fe89a68c7515",
+  "gradeDetail": {
+    "grade": "L2",
+    "reason": "production-large-light-default",
+    "landLane": "normal",
+    "steps": [
+      "diff-check",
+      "rules-and-ratchets",
+      "focused",
+      "changed-tsc",
+      "focused-import-neighbor"
+    ],
+    "files": [
+      {
+        "path": "graphs/ops/op-mail-coverage-watch.yaml",
+        "category": "production",
+        "deleted": false,
+        "renamed": false,
+        "added": 24,
+        "removed": 0,
+        "code": 18,
+        "exportRemoved": 0
+      },
+      {
+        "path": "graphs/ops/recipes.yaml",
+        "category": "production",
+        "deleted": false,
+        "renamed": false,
+        "added": 6,
+        "removed": 0,
+        "code": 4,
+        "exportRemoved": 0
+      },
+      {
+        "path": "graphs/ops/seat-stall-watch.yaml",
+        "category": "production",
+        "deleted": false,
+        "renamed": false,
+        "added": 23,
+        "removed": 0,
+        "code": 18,
+        "exportRemoved": 0
+      },
+      {
+        "path": "src/supervision/op-mail-coverage-watch.test.ts",
+        "category": "test",
+        "deleted": false,
+        "renamed": false,
+        "added": 181,
+        "removed": 0,
+        "code": 147,
+        "exportRemoved": 0
+      },
+      {
+        "path": "src/supervision/op-mail-coverage-watch.ts",
+        "category": "production",
+        "deleted": false,
+        "renamed": false,
+        "added": 269,
+        "removed": 0,
+        "code": 214,
+        "exportRemoved": 0
+      },
+      {
+        "path": "src/supervision/seat-stall-watch.test.ts",
+        "category": "test",
+        "deleted": false,
+        "renamed": false,
+        "added": 106,
+        "removed": 0,
+        "code": 82,
+        "exportRemoved": 0
+      },
+      {
+        "path": "src/supervision/seat-stall-watch.ts",
+        "category": "production",
+        "deleted": false,
+        "renamed": false,
+        "added": 195,
+        "removed": 0,
+        "code": 154,
+        "exportRemoved": 0
+      }
+    ],
+    "deletedPaths": [],
+    "changedTestPaths": [
+      "src/supervision/op-mail-coverage-watch.test.ts",
+      "src/supervision/seat-stall-watch.test.ts"
+    ],
+    "changedProductionPaths": [
+      "graphs/ops/op-mail-coverage-watch.yaml",
+      "graphs/ops/recipes.yaml",
+      "graphs/ops/seat-stall-watch.yaml",
+      "src/supervision/op-mail-coverage-watch.ts",
+      "src/supervision/seat-stall-watch.ts"
+    ],
+    "productionCodeLines": 408,
+    "testCodeLines": 229,
+    "filesOmitted": 0
+  },
+  "grade": "L2",
+  "gradeReason": "production-large-light-default",
+  "landLane": "normal",
+  "mainMerged": true,
+  "mainMergeHead": "125b88e8f22c97dca0df7d93f5e03afd93ae9046",
+  "gradeFocused": [
+    "src/supervision/op-mail-coverage-watch.test.ts",
+    "src/supervision/seat-stall-watch.test.ts"
+  ],
+  "ratchets": [
+    "PLUGIN-ONLY-RATCHET",
+    "NUMGUARD",
+    "R-LIVE10",
+    "TEST-INTERFERENCE-RATCHET"
+  ],
+  "landChecks": {
+    "baseAncestorOfMain": true,
+    "importsMissing": []
+  },
+  "pwaLockSha256": "f734d92db9702d1bf57bb3033a1614fa71efa37b7c9087f30ac2dbaebd232ec6",
+  "reviewWorkItem": "pool4-shadow-mailcov-r2",
+  "rulesBase": "8a8f348a92598a62adcb13e83c30a5a6f7827e75",
+  "rulesMain": "8a8f348a92598a62adcb13e83c30a5a6f7827e75",
+  "mode": "light",
+  "minutes": 2.32
+}

@@ -149,9 +149,8 @@ describe('ELN-COMPACT-REAL ① — 턴 시작 트리거는 기록만 잰다(고�
     for (const row of conversation(6, 1)) appendMessage(session.id, row);
     const log = spyOn(debug, 'log');
     try {
-      // 프롬프트 단독으로 24K 트림 상한을 넘는 우주 — 발화 뒤 턴은 D1 계약대로 ✗ 로 멈춘다.
-      await expect(turn(provider, session.id, 'current request', { systemPrompt: 'P'.repeat(HUGE_PROMPT_CHARS) }))
-        .rejects.toThrow('문맥 예산 초과');
+      // SEAT-CONTEXT-BUDGET-WINDOW — 상한은 고정 접두 위에서 잰다: 접두가 아무리 커도 턴은 멈추지 않는다.
+      await turn(provider, session.id, 'current request', { systemPrompt: 'P'.repeat(HUGE_PROMPT_CHARS) });
       expect(turnStart(log).map(event => event.fired)).toEqual([true]);
     } finally { log.mockRestore(); }
   });
@@ -167,16 +166,21 @@ describe('ELN-COMPACT-REAL ② — agent/system 알림은 한 줄 스텁, 사람
     }
     const beforeRows = loadSession(session.id)!.messages.length;
     const beforeChars = stringChars(session.id);
-    const result = await compactSessionHistory(session.id, { config: CHAT_DEFAULTS.autoCompact, force: true, modelId: MODEL, provider: summarizer });
+    const seen: (readonly LLMMessage[])[] = [];
+    const recordingSummarizer: CompactProvider = { ...summarizer, async summarize(args) { seen.push(args.messages); return summarizer.summarize(args); } };
+    const result = await compactSessionHistory(session.id, { config: CHAT_DEFAULTS.autoCompact, force: true, modelId: MODEL, provider: recordingSummarizer });
     expect(result.fired).toBe(true);
     expect(result.layer3Applied).toBe(true);
     const after = loadSession(session.id)!.messages;
     // 원문 소멸 — 알림 본문·미읽음 꼬리는 어디에도 남지 않는다(옛 동작: 75통 전부 원문 보존).
     expect(after.some(row => typeof row.content === 'string' && row.content.includes('[미읽음 총'))).toBe(false);
-    // 알림마다 msgId·from 한 줄 스텁이 산다.
-    for (let i = 0; i < MAIL_COUNT; i++) {
-      expect(after.some(row => typeof row.content === 'string' && row.content.includes(`[seat-mail #${135400 + i} from JUD-3]`))).toBe(true);
+    // CEO-UTTERANCE-TAGGED-LAST ④ — mail is not the person: its one-line stub (msgId · from · body) goes to the summary
+    // instead of being preserved as a human row.
+    const summarized = JSON.stringify(seen);
+    for (let i = 0; i < MAIL_COUNT; i += 1) {
+      expect(summarized).toContain(`[seat-mail #${135400 + i} from JUD-3]`);
     }
+    expect(after.filter(row => typeof row.content === 'string' && row.content.startsWith(STUB_PREFIX)).length).toBeLessThan(MAIL_COUNT);
     // 사람 입력(전송원 부재)은 원문 그대로.
     expect(after.some(row => row.content === 'OP 지시: 랜딩 큐를 계속 밀어라.')).toBe(true);
     // 스텁은 한 줄이다(줄바꿈 없음).
@@ -200,7 +204,8 @@ describe('ELN-COMPACT-REAL ② — agent/system 알림은 한 줄 스텁, 사람
     const result = await compactSessionHistory(session.id, { config: CHAT_DEFAULTS.autoCompact, force: true, modelId: MODEL, provider: summarizer });
     expect(result.fired).toBe(true);
     const after = loadSession(session.id)!.messages;
-    expect(after.some(row => typeof row.content === 'string' && row.content.includes('[seat-mail #9001 from SYS]'))).toBe(true);
+    // ④ the system notice is not the person: it is not kept as a verbatim human row (stub or summary only).
+    expect(after.some(row => row.content === '[system notice] 야간 정비 창구 03:00-03:20')).toBe(false);
     expect(after.some(row => row.content === '사람이 직접 친 지시문')).toBe(true);
   });
 });

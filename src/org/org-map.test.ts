@@ -82,10 +82,11 @@ describe('sim: org changes mid-run', () => {
     // removing the tc space orphans TC's board duty → refused; removing judge space orphans landing → refused
     expect(await c.run('org', 'remove-space', 'tc')).toBe(1);
     expect(await c.run('org', 'remove-space', 'judge')).toBe(1);
-    // move landing away first, then judge space can go
+    // landing can leave the judiciary, but veto (judge-only) keeps the judge space alive (11-26 split)
     expect(await c.run('org', 'move', 'landing', '--to', 'OP')).toBe(0);
-    expect(await c.run('org', 'remove-space', 'judge')).toBe(0);
-    expect(loadOrgMap({ cwd: root, home: join(root, 'home') }).org.spaces.judge).toBeUndefined();
+    expect(await c.run('org', 'remove-space', 'judge')).toBe(1);
+    expect(await c.run('org', 'move', 'veto', '--to', 'OP')).toBe(1);
+    expect(loadOrgMap({ cwd: root, home: join(root, 'home') }).org.duties.veto).toBe('JUD');
     const final = loadOrgMap({ cwd: root, home: join(root, 'home') }).org;
     expect(validateOrg(final)).toEqual([]);
     expect(c.errs.some(e => e.includes('role judge not allowed'))).toBe(true);
@@ -100,6 +101,8 @@ describe('sim: org changes mid-run', () => {
     expect(await c.run('org', 'move', 'landing', '--to', 'TC')).toBe(0);
     const m = loadOrgMap({ cwd: root, home: join(root, 'home') }).org;
     expect([m.duties['release-supervision'], m.duties['resource-supervision'], m.duties.landing]).toEqual(['TC', 'TC', 'TC']);
+    expect(m.duties.veto).toBe('JUD');
+    expect(orgParentOf(m, 'JUD')).toBe('OP');
     expect(c.posted.filter(p => p.to === 'TC' && p.refs.some(r => r === 'forwarded:7' || r === 'forwarded:8')).length).toBe(2);
     expect(c.posted.filter(p => p.body.startsWith('[org · 정보')).map(p => p.to).sort()).toEqual(['JUD', 'REL', 'RES', 'TC', 'TC', 'TC']);
     expect(validateOrg(m)).toEqual([]);
@@ -165,7 +168,7 @@ describe('sim: org changes mid-run', () => {
     expect(j.duties.brand).toBe('MK');
     expect(j.parents['TC-ADV']).toBe('TC');
     await c.run('org', 'show', '--status-row');
-    expect(c.outs.at(-1)!.startsWith('org · 8 seats · 7 spaces · 18 duties · default')).toBe(true);
+    expect(c.outs.at(-1)!.startsWith('org · 8 seats · 7 spaces · 19 duties · default')).toBe(true);
     expect(existsSync(join(root, 'state'))).toBe(false);
   });
 });

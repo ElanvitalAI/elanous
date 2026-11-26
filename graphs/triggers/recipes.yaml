@@ -74,3 +74,6 @@ space-advisor-tick:
 release-traffic-tick:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/release-traffic.ts"'
   timeout_ms: 1900000 # A few config get/set + one ssh probe; update-all after publish can take ≤30 min.
+land-graph-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" land graph tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 2700000 # Live: up to 2 lands × op-direct-land-v2 preflight (~20 min each on minim5).

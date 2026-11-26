@@ -2,15 +2,20 @@
 # 옮긴 뒤 `--update` 로 ratchet down 한다. 정본 레지스트리는 스캔에서 제외된다.
 scripts/backend-explore-bench.ts 4
 scripts/bench-report.test.ts 6
-scripts/llm-cost-ledger.test.ts 12
+scripts/demo-invest-orch/conductor.test.ts 1
+scripts/demo/demo-up.sh 1
 scripts/measure-decomposer-promotion-ab.ts 1
 scripts/measure-fabric-arc-ab.ts 1
+scripts/op-behavior-live.ts 1
+scripts/op-behavior-prompt.test.ts 1
+scripts/op-behavior-prompt.ts 1
+scripts/op-ownership-three-live.ts 1
 scripts/qwen-pipeline-bench.ts 3
+scripts/release-loop/tui-node-checks.test.ts 1
 scripts/run-mission.ts 6
 scripts/se-backend-bench.ts 1
-scripts/se-mission-expand.ts 1
 scripts/se-elanous-self-tune.ts 7
-scripts/webclone/loop/fire-fc1.sh 1
+scripts/se-mission-expand.ts 1
 scripts/webclone/loop/fire-real14-ab.sh 2
 scripts/webclone/loop/fire-real17-ab.sh 2
 scripts/webclone/loop/fire-real18-ab.sh 2

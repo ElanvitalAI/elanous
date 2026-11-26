@@ -97,6 +97,8 @@ export type MemberCodeValidation =
   | { readonly valid: true; readonly kind: 'referral' | 'event'; readonly referredReward: 'none' | null; readonly benefit?: 'non-monetary'; readonly finalizesAt?: string }
   | { readonly valid: false; readonly reason: 'invalid' | 'inactive' | 'exhausted' };
 
+export type OwnerUnlockOutcome = 'claimed' | 'not-unlockable' | 'not-owner' | 'bad-code' | 'unavailable' | 'claim-failed';
+
 export interface MemberStore {
   /** Persisted deletion state is authoritative for every new app credential or owner mutation. */
   activeForAuth(memberId: string): boolean;
@@ -124,7 +126,17 @@ export interface MemberStore {
   handleForMember(memberId: string): string | null;
   canClaimReservedJoosung(memberId: string): boolean;
   memberForHandle(handle: string): string | null;
-  claimHandle(memberId: string, handle: string, previousPublicUserSlug?: string): string;
+  /** `options.ownerUnlocked` = the route verified an owner unlock code; the store still re-checks the owner pin inside the claim. */
+  claimHandle(memberId: string, handle: string, previousPublicUserSlug?: string, options?: { readonly ownerUnlocked?: boolean }): string;
+  /** MEMBER-HANDLE-OWNER-UNLOCK — is this active member's Google email the pinned owner (same pin as the user claim)? */
+  isReservedHandleOwner(memberId: string): boolean;
+  /**
+   * MEMBER-HANDLE-OWNER-UNLOCK — atomically count this member's code attempts since `windowStartsAt` and, under `limit`, record a new
+   * audit row and return its id. Over the limit it records a 'rate-limited' row and returns null. No code value is ever stored.
+   */
+  beginOwnerUnlockAttempt(memberId: string, handle: string, at: string, windowStartsAt: string, limit: number): string | null;
+  finishOwnerUnlockAttempt(attemptId: string, outcome: OwnerUnlockOutcome): void;
+  ownerUnlockAttempts(memberId: string): Array<{ readonly handle: string; readonly outcome: string; readonly at: string }>;
   /** MEMBER-JOURNEY S2 — read-only: is this public handle free for `memberId` (or anyone)? Taken includes retired slugs. Alternatives only when not ok. */
   handleAvailability(candidate: string, memberId?: string): MemberHandleAvailability;
   /** WEBCHAT-PIN-LEDGER-RECONNECT (OP #104299/#104391) — durable (handle, memberId) claim enumeration for relay reconnect re-pinning; read-only. */
@@ -158,6 +170,11 @@ export interface MemberStore {
   renameAppSlotForMember(memberId: string, rawName: unknown, now?: string): MemberAppSlotRename;
   ensureNativeAppSlotForMember(memberId: string, now?: string): MemberAppSlot | null;
   createSession(memberId: string, now?: string): { token: string; expiresAt: string };
+  /** MEMBER-CONNECT-NO-MOUNT — `member connect` session issued from the member and their own slot, not from a mounted app.
+   * Same `aps_` shape and 60-minute life as an app owner session; accepted only where an app owner session is
+   * (owner check · connector key self-issue). Used when the member's app is not mounted on this host. */
+  issueMemberConnectSession?(memberId: string, appId: string, now?: string): { sessionToken: string; expiresAt: string };
+  memberForConnectSession?(token: string, now?: string): { memberId: string; appId: string } | null;
   memberForSession(token: string, now?: string): MemberProfile | null;
   reserveEventTry(memberId: string, eventCode: string, maxAttempts: number, now?: string): string | null;
   completeEventTry(reservationId: string, now?: string): boolean;
@@ -167,6 +184,8 @@ export interface MemberStore {
 }
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60_000;
+/** Matches the app owner session default (app-auth DEFAULT_SESSION_TTL_MS). */
+const CONNECT_SESSION_TTL_MS = 60 * 60_000;
 function validNewsletterPreference(value: MemberNewsletterPreferenceInput): boolean {
   return (value.choice === 'opted_in' || value.choice === 'declined') && value.revision === 'newsletter-v1';
 }
@@ -320,6 +339,11 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       created_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT
     );
     CREATE INDEX IF NOT EXISTS member_sessions_member ON member_sessions(member_id, expires_at);
+    CREATE TABLE IF NOT EXISTS member_connect_sessions (
+      token_hash TEXT PRIMARY KEY, member_id TEXT NOT NULL REFERENCES members(id), app_id TEXT NOT NULL,
+      created_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS member_connect_sessions_member ON member_connect_sessions(member_id, expires_at);
     CREATE TABLE IF NOT EXISTS member_event_try_attempts (
       id TEXT PRIMARY KEY, member_id TEXT NOT NULL REFERENCES members(id), event_code TEXT NOT NULL,
       requested_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'completed' CHECK(status IN ('reserved', 'completed')),
@@ -349,6 +373,13 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       id TEXT PRIMARY KEY, member_id TEXT NOT NULL REFERENCES members(id), requested_at TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'cancelled'))
     );
+    CREATE TABLE IF NOT EXISTS member_owner_unlock_attempts (
+      id TEXT PRIMARY KEY, member_id TEXT NOT NULL REFERENCES members(id), handle TEXT NOT NULL,
+      outcome TEXT NOT NULL CHECK(outcome IN ('started', 'claimed', 'not-unlockable', 'not-owner', 'bad-code', 'unavailable',
+        'claim-failed', 'rate-limited')),
+      at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS member_owner_unlock_attempts_member ON member_owner_unlock_attempts(member_id, at);
     DROP TABLE IF EXISTS member_signup_states;
   `);
   // Old referral tables used NOCASE, which made each mixed-case secret accept many spellings.
@@ -827,6 +858,32 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       return (db.query('SELECT handle FROM member_handles WHERE member_id = ?').get(memberId) as { handle: string } | null)?.handle ?? null;
     },
     canClaimReservedJoosung(memberId) { assertOpen(); return activeForAuth(memberId) && reservedOwnerMatches(memberId); },
+    isReservedHandleOwner(memberId) { assertOpen(); return activeForAuth(memberId) && reservedOwnerMatches(memberId); },
+    beginOwnerUnlockAttempt(memberId, handle, at, windowStartsAt, limit) {
+      assertOpen();
+      const auditHandle = handle.slice(0, 64);
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const count = db.query(`SELECT COUNT(*) AS n FROM member_owner_unlock_attempts
+          WHERE member_id = ? AND at > ? AND outcome != 'rate-limited'`).get(memberId, windowStartsAt) as { n: number };
+        const id = randomUUID();
+        const limited = Number(count.n) >= limit;
+        db.query('INSERT INTO member_owner_unlock_attempts (id, member_id, handle, outcome, at) VALUES (?, ?, ?, ?, ?)')
+          .run(id, memberId, auditHandle, limited ? 'rate-limited' : 'started', at);
+        db.exec('COMMIT');
+        return limited ? null : id;
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
+    finishOwnerUnlockAttempt(attemptId, outcome) {
+      assertOpen();
+      db.query(`UPDATE member_owner_unlock_attempts SET outcome = ? WHERE id = ? AND outcome = 'started'`).run(outcome, attemptId);
+    },
+    ownerUnlockAttempts(memberId) {
+      assertOpen();
+      return (db.query('SELECT handle, outcome, at FROM member_owner_unlock_attempts WHERE member_id = ? ORDER BY at, rowid')
+        .all(memberId) as Array<{ handle: string; outcome: string; at: string }>)
+        .map(row => ({ handle: row.handle, outcome: row.outcome, at: row.at }));
+    },
     memberForHandle(handle) { assertOpen(); return memberForHandle(handle); },
     publicUserSlugForMember(memberId) { assertOpen(); return publicUserSlugForMember(memberId); },
     publicUserSlugForApp(appSlug) {
@@ -862,7 +919,7 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       if (verdict === 'ok') return { status: 'ok', alternatives: [] };
       return { status: verdict, alternatives: suggestAlternatives(candidate, value => status(value) !== 'ok') };
     },
-    claimHandle(memberId, requested, previousPublicUserSlug) {
+    claimHandle(memberId, requested, previousPublicUserSlug, claimOptions) {
       assertOpen();
       const handle = requested;
       if (!/^[a-z][a-z0-9_]{2,29}$/.test(handle)
@@ -871,7 +928,8 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       db.exec('BEGIN IMMEDIATE');
       try {
         if (!activeForAuth(memberId)) throw new Error('member is not active for handle change');
-        if (isReservedHandle(handle, handle === 'user' && reservedOwnerMatches(memberId))) {
+        const ownerPinned = reservedOwnerMatches(memberId);
+        if (isReservedHandle(handle, handle === 'user' && ownerPinned, claimOptions?.ownerUnlocked === true && ownerPinned)) {
           throw new Error('reserved member ID');
         }
         const current = db.query('SELECT handle FROM member_handles WHERE member_id = ?').get(memberId) as { handle: string } | null;
@@ -1172,6 +1230,31 @@ export function createMemberStore(options: { readonly path?: string; readonly no
         return session;
       } catch (error) { db.exec('ROLLBACK'); throw error; }
     },
+    issueMemberConnectSession(memberId, appId, at = iso(nowMs())) {
+      assertOpen();
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        if (!activeForAuth(memberId)) throw new Error('member is not active for session');
+        const slot = db.query('SELECT app_id FROM member_app_slots WHERE member_id = ?').get(memberId) as { app_id: string } | null;
+        if (!slot || slot.app_id !== appId) throw new Error('member app slot mismatch');
+        db.query('DELETE FROM member_connect_sessions WHERE expires_at <= ?').run(at);
+        const sessionToken = 'aps_' + randomBytes(32).toString('base64url');
+        const expiresAt = iso(Date.parse(at) + CONNECT_SESSION_TTL_MS);
+        db.query('INSERT INTO member_connect_sessions (token_hash, member_id, app_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)')
+          .run(hash(sessionToken), memberId, appId, at, expiresAt);
+        db.exec('COMMIT');
+        return { sessionToken, expiresAt };
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
+    memberForConnectSession(token, at = iso(nowMs())) {
+      assertOpen();
+      if (!token || token.length > 512 || !token.startsWith('aps_')) return null;
+      const row = db.query(`SELECT s.member_id, s.app_id FROM member_connect_sessions s
+        JOIN member_app_slots a ON a.member_id = s.member_id AND a.app_id = s.app_id
+        WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?`).get(hash(token), at) as { member_id: string; app_id: string } | null;
+      if (!row || !activeForAuth(row.member_id)) return null;
+      return { memberId: row.member_id, appId: row.app_id };
+    },
     memberForSession(token, at = iso(nowMs())) {
       assertOpen();
       if (!token || token.length > 512) return null;
@@ -1220,6 +1303,7 @@ export function createMemberStore(options: { readonly path?: string; readonly no
         db.query(`INSERT INTO member_deletion_requests (id, member_id, requested_at) VALUES (?, ?, ?)`)
           .run(randomUUID(), session.member_id, at);
         db.query('UPDATE member_sessions SET revoked_at = ? WHERE member_id = ? AND revoked_at IS NULL').run(at, session.member_id);
+        db.query('UPDATE member_connect_sessions SET revoked_at = ? WHERE member_id = ? AND revoked_at IS NULL').run(at, session.member_id);
         db.exec('COMMIT');
         return true;
       } catch (error) { db.exec('ROLLBACK'); throw error; }

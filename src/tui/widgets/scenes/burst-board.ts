@@ -22,9 +22,12 @@ export type BurstMode = 'calm' | 'burst' | 'exiting' | 'done';
 
 export interface BurstLane {
   readonly label: string;
-  readonly now: number;
-  readonly plan: number;
-  readonly queue: number;
+  /** Lane size now / after the planner's step; undefined = not measured («no data»). */
+  readonly now?: number;
+  readonly plan?: number;
+  readonly queue?: number;
+  /** The planner's lane pressure (1 = at target); null = not measured. */
+  readonly pressure?: number | null;
   /** Minutes; undefined = «—». */
   readonly waitMin?: number;
   readonly leadMin?: number;
@@ -57,7 +60,8 @@ export interface BurstBoardSnapshot {
   readonly trigger?: string;
   readonly elapsedSec: number;
   readonly totalSec: number;
-  readonly pressure: number;
+  /** 0..1 board pressure from the planner; null = not measured. */
+  readonly pressure: number | null;
   readonly pressureAlarm: number;
   readonly deadline: string;
   readonly forecast: string;
@@ -76,6 +80,17 @@ export interface BurstBoardSnapshot {
   /** Exit sequence step 1..4 while `mode` = exiting. */
   readonly exitStep?: number;
   readonly receipt?: BurstReceipt;
+  /** Where the numbers came from: the live probes or the replay's synthetic world (both through the real planner). */
+  readonly source?: 'live' | 'replay';
+  /** Sources that could not be read this refresh — shown as «no data», never a crash. */
+  readonly gaps?: readonly string[];
+  /** The planner's decisions this refresh (`eln pulse burst plan`). */
+  readonly plan?: readonly { readonly lane: string; readonly from: number; readonly to: number; readonly why: string; readonly blocked?: string }[];
+  readonly pressures?: readonly { readonly lane: string; readonly pressure: number | null; readonly why: string }[];
+  readonly burstId?: string;
+  readonly handsMeasured?: boolean;
+  readonly hostsMeasured?: boolean;
+  readonly clock?: string;
 }
 
 export const BURST_FRAMES = 4;
@@ -83,6 +98,7 @@ const KEYS = '[b]urst [p]lan [x]exit [?]';
 export const EXIT_STEPS = ['Stop new launches', 'Finish in-flight', 'Close hands', 'Cloud off'] as const;
 
 const dash = (v: number | undefined): string => (v === undefined ? '—' : `${num(v)}m`);
+const n = (v: number | undefined): string => (v === undefined ? '—' : num(v));
 
 function header(s: BurstBoardSnapshot, width: number): string {
   const dot = renderPulseDot({ tick: s.tick, busy: s.mode === 'burst' || s.mode === 'exiting' });
@@ -98,9 +114,9 @@ function header(s: BurstBoardSnapshot, width: number): string {
 }
 
 function topLine(s: BurstBoardSnapshot, width: number): string {
-  const p = Math.min(1, Math.max(0, s.pressure));
-  const alarm = p >= s.pressureAlarm ? ' PRESSURE' : '';
-  const gauge = `Pressure ${bar(p, width >= 100 ? 14 : 8)} ${p.toFixed(2)}${alarm}`;
+  const p = s.pressure === null ? null : Math.min(1, Math.max(0, s.pressure));
+  const alarm = p !== null && p >= s.pressureAlarm ? ' PRESSURE' : '';
+  const gauge = p === null ? 'Pressure no data' : `Pressure ${bar(p, width >= 100 ? 14 : 8)} ${p.toFixed(2)}${alarm}`;
   const fc = `Deadline ${clean(s.deadline)} · forecast ${clean(s.forecast)} ${s.forecastOk ? '✓' : '✗'}${s.forecastWas ? ` (was ${clean(s.forecastWas)})` : ''}`;
   const spend = `Spend $${s.spendUsd.toFixed(2)} / $${num(s.ceilingUsd)}`;
   return fit(width >= 100 ? `${gauge}   ${fc}   ${spend}` : `${gauge} · ${fc}`, width);
@@ -114,17 +130,17 @@ function laneRows(s: BurstBoardSnapshot, width: number, frame: number): string[]
     ? `${pad('Pipeline', labelW)}  now → plan  queue  wait  lead  flow →`
     : `${pad('Pipeline', labelW)} now→plan  q wait flow →`;
   const rows = s.lanes.flatMap((lane, i) => {
-    const flow = renderFlowLane({ items: lane.queue + (s.mode === 'exiting' ? 0 : lane.now), speed: lane.speed, blocked: lane.bottleneck, tick: s.tick + i, frame }, flowW);
+    const flow = renderFlowLane({ items: (lane.queue ?? 0) + (s.mode === 'exiting' ? 0 : lane.now ?? 0), speed: lane.speed, blocked: lane.bottleneck, tick: s.tick + i, frame }, flowW);
     const badge = lane.steppedBy && frame < BURST_FRAMES / 2
       ? `▲ +${lane.steppedBy} ${lane.label.toLowerCase()}`
-      : lane.bottleneck ? '▲ bottleneck' : lane.plan > lane.now ? '▲ step queued' : lane.plan < lane.now ? '▼ scale down' : '═';
+      : lane.bottleneck ? '▲ bottleneck' : lane.now === undefined ? 'no data' : (lane.plan ?? lane.now) > lane.now ? '▲ step queued' : (lane.plan ?? lane.now) < lane.now ? '▼ scale down' : '═';
     const note = wide && lane.note ? `  ${clean(lane.note)}` : '';
     const label = pad(` ${i + 1} ${clean(lane.label)}`, labelW);
     const line = wide
-      ? `${label}  ${pad(`${padStart(num(lane.now), 3)} → ${num(lane.plan)}`, 10)}  ${padStart(num(lane.queue), 5)}  ${padStart(dash(lane.waitMin), 4)}  ${padStart(dash(lane.leadMin), 4)}  ${flow} ${badge}${note}`
-      : `${label} ${pad(`${num(lane.now)}→${num(lane.plan)}`, 8)} ${padStart(num(lane.queue), 2)} ${padStart(dash(lane.waitMin), 4)} ${flow} ${badge}`;
+      ? `${label}  ${pad(`${padStart(n(lane.now), 3)} → ${n(lane.plan)}`, 10)}  ${padStart(n(lane.queue), 5)}  ${padStart(dash(lane.waitMin), 4)}  ${padStart(dash(lane.leadMin), 4)}  ${flow} ${badge}${note}`
+      : `${label} ${pad(`${n(lane.now)}→${n(lane.plan)}`, 8)} ${padStart(n(lane.queue), 2)} ${padStart(dash(lane.waitMin), 4)} ${flow} ${badge}`;
     if (!wide || !lane.widened) return [fit(line, width)];
-    const second = renderFlowLane({ items: Math.ceil((lane.queue + lane.now) / 2), speed: lane.speed, tick: s.tick + i + 3, frame }, flowW);
+    const second = renderFlowLane({ items: Math.ceil(((lane.queue ?? 0) + (lane.now ?? 0)) / 2), speed: lane.speed, tick: s.tick + i + 3, frame }, flowW);
     return [fit(line, width), fit(`${' '.repeat(labelW + 30)}${second}`, width)];
   });
   return [fit(head, width), ...rows];

@@ -74,9 +74,9 @@ test('a seat whose stored goal still names the released version is replaced on t
 test('a task goal (model default) is a bottom pin — never the chip; goal_done kind:task unpins it', async () => {
   const h = harness({ coordinator: true });
   h.pilot.refresh();
-  h.pilot.noteTurnStart('human');
+  h.pilot.noteTurnStart('human', '0.3.36 로스터랑 택틱 한 장, 이걸 골로 잡아줘');
   const out = await dispatchAutopilotTool('autopilot_set',
-    { on: true, goal: '0.3.36 로스터 + 택틱', done_criterion: '로스터 표와 택틱 한 장 발송', deadline: '07:00', expected_turns: 4 }, { cwd: root, file, now: () => T0 });
+    { explicit_ask: '이걸 골로 잡아줘', on: true, goal: '0.3.36 로스터 + 택틱', done_criterion: '로스터 표와 택틱 한 장 발송', deadline: '07:00', expected_turns: 4 }, { cwd: root, file, now: () => T0 });
   expect(out).toEqual({ ok: true, status: '📌 1 · 0.3.36 로스터 + 택틱' });
   h.pilot.refresh();
   expect(h.pilot.statusText()).toBe('🚗 AUTO · 0.3.35 개발 · demo D-1');
@@ -90,7 +90,7 @@ test('a task goal (model default) is a bottom pin — never the chip; goal_done 
 
 test('a pin needs a done criterion and a deadline', () => {
   const h = harness();
-  expect(h.pilot.set({ on: true, goal: '택틱 한 장', doneCriterion: '문서 링크 발송', expectedTurns: 3 }, 'tool'))
+  h.pilot.noteTurnStart('human', '이거 골로 잡아'); expect(h.pilot.set({ explicitAsk: '골로 잡아', on: true, goal: '택틱 한 장', doneCriterion: '문서 링크 발송', expectedTurns: 3 }, 'tool'))
     .toEqual({ ok: false, text: '작업 골(핀)에는 완료 기준(done_criterion)과 기한(deadline «HH:MM»·ISO)이 둘 다 필요하다' });
   expect(h.pilot.pins()).toEqual([]);
 });
@@ -98,7 +98,7 @@ test('a pin needs a done criterion and a deadline', () => {
 test('the 4th pin evicts the lowest-priority pin (oldest among equals) — logged; «📌 n» shows the count', () => {
   const h = harness();
   // AUTOPILOT-GOAL-CLEARING: ≤ 3 pin changes per 30 min — pins 11 min apart stay under the rate limit.
-  const pin = (goal: string, priority: string) => { h.advance(11 * MIN); return h.pilot.set({ on: true, goal, doneCriterion: `${goal} 끝`, deadline: '09:00', priority, expectedTurns: 3 }, 'tool'); };
+  const pin = (goal: string, priority: string) => { h.advance(11 * MIN); h.pilot.noteTurnStart('human', `${goal} 골로 잡아`); return h.pilot.set({ explicitAsk: `${goal} 골로 잡아`, on: true, goal, doneCriterion: `${goal} 끝`, deadline: '09:00', priority, expectedTurns: 3 }, 'tool'); };
   pin('A 핀', 'P1'); pin('B 핀', 'P2'); pin('C 핀', 'P1');
   expect(pin('D 핀', 'P1')).toEqual({ ok: true, text: '📌 3 · D 핀 (밀림: B 핀)' });
   expect(h.events('pin-evicted').map((d) => [d.text, d.priority, d.by])).toEqual([['B 핀', 2, 'D 핀']]);
@@ -116,7 +116,7 @@ test('the 4th pin evicts the lowest-priority pin (oldest among equals) — logge
 
 test('deadline + 30 min unpins and leaves one «expired» line for 30 min', () => {
   const h = harness();
-  h.pilot.set({ on: true, goal: '데모 리허설 노트', doneCriterion: '노트 발송', deadline: '04:00', expectedMinutes: 20 }, 'tool');
+  h.pilot.noteTurnStart('human', '이거 골로 잡아'); h.pilot.set({ explicitAsk: '골로 잡아', on: true, goal: '데모 리허설 노트', doneCriterion: '노트 발송', deadline: '04:00', expectedMinutes: 20 }, 'tool');
   const due = h.pilot.pins()[0]!.deadline;
   h.advance(due - T0 + 29 * MIN);
   h.pilot.tick();

@@ -38,7 +38,7 @@ import { ensureResearchAnswerHasSourceUrl } from '../research/evidence-attributi
 import { MARKET_DATA_NO_SOURCE_LINE, MARKET_DATA_NUMBER_RULE, appendUnverifiedNumberWarning } from '../research/market-evidence.js';
 import { needsGroundingFirst, hasGroundingSources, isCitationGuardedQuestion, isExecutionOrLocalRequest, GROUNDING_UNAVAILABLE, GROUNDING_PARTIAL, groundingPartialHeader } from './grounding-first.js';
 import {
-  decideResearchRoute, logResearchRoute, obviousLocalCommand, RESEARCH_ROUTE_WEB_TOOLS, settleUnconfirmedRoute,
+  decideResearchRoute, logResearchRoute, obviousLocalCommand, RESEARCH_ROUTE_CATEGORY, RESEARCH_ROUTE_DEFAULT_OFF_EVENT, RESEARCH_ROUTE_WEB_TOOLS, settleUnconfirmedRoute,
   type ResearchRouteDecision, type ResearchRouteFields,
 } from './research-route.js';
 import { CitationLedger, countVerifiedCitations, createCitationStreamFilter, sanitizeCitations } from './citation-guard.js';
@@ -758,10 +758,19 @@ export async function runCoreTurn(
   // by default and only the question plan's structured `localOnly: true` (or the one obvious-local pre-filter) takes it
   // out. The sentence classifiers below no longer decide entry on such a turn (they only pick the grounding-first MODE and the route of turns with no web tool).
   const orderedNonResearchWorkflow = isOrderedNonResearchWorkflow(surfaceUserText);
+  const webToolInPool = ctx.tools.some((tool) => RESEARCH_ROUTE_WEB_TOOLS.has(tool.name));
+  // WEBCHAT-ORDINARY-SKIP-GROUNDING (OP 11-26 · local soak first token p50 19.1 s): the member web chat does not enter
+  // research by default — the question-plan call alone held every ordinary line's first token. The turn keeps its web
+  // tools (the model calls them for sourced facts) and the existing confirmed fact path below still enters research.
+  const researchOnRequest = ctx.researchEntry === 'on-request';
   const structuredRouteEligible = options.researchRouteOverride === undefined
     && Boolean(surfaceUserText?.trim())
-    && ctx.tools.some((tool) => RESEARCH_ROUTE_WEB_TOOLS.has(tool.name))
+    && webToolInPool
+    && !researchOnRequest
     && !orderedNonResearchWorkflow;
+  if (researchOnRequest && webToolInPool && options.researchRouteOverride === undefined && surfaceUserText?.trim()) {
+    debug.log(RESEARCH_ROUTE_CATEGORY, RESEARCH_ROUTE_DEFAULT_OFF_EVENT, { ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}), surface: 'member-webchat' });
+  }
   // WEBCHAT-ONE-LINE-APP-BUILD (OP 11-17): a line a plugin pins with «force» (the one-line app request) is not a
   // research question — with a web tool in the pool, research used to be entered by default and the pin below was then
   // skipped, so the web chat (and any surface with web tools) answered «만들어 배포해줘» as research. Same verdict on

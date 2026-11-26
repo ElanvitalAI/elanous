@@ -143,6 +143,9 @@ export async function runDaemonPromptTurn(opts: {
   surfaceResolutionReason?: SurfaceKindResolutionReason;
   /** Optional confirm channels for the triggering chat surface. */
   surfaceHitlChannels?: ConfirmChannel[];
+  /** WEBCHAT-ORDINARY-SKIP-GROUNDING — the member web chat passes `'on-request'`: no default research entry (see
+   *  `CoreTurnContext.researchEntry`). Other callers omit it and keep the structured route. */
+  researchEntry?: 'default' | 'on-request';
   /** Server-authenticated human owner for this request; absent for delegated or unverified callers. */
   verifiedOwner?: { id: string; appSlug?: string };
   /** Verified app-bound member owner proof for Nexus deployment tools. */
@@ -360,6 +363,7 @@ export async function runDaemonPromptTurn(opts: {
     tools,
     dispatchTool,
     signal: ctrl.signal,
+    ...(opts.researchEntry ? { researchEntry: opts.researchEntry } : {}),
     ...(terminal?.llmOpts.budgetGrant ? { budgetGrant: terminal.llmOpts.budgetGrant } : {}),
     callbacks: {
       onTurnComplete: (newMessages: LLMMessage[]): void => {

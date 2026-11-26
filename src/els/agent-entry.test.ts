@@ -43,12 +43,12 @@ test('hand title (#40117 format) read back; ages', () => {
 });
 
 test('entry: eln seat = «SEAT model», lent codex hand on node-b = cell · @space · codex-cli · ⇄node-b · age; never «eln»', () => {
-  expect(agentEntry({ name: 'OP', title: 'OP', agent: 'eln', model: 'gpt-6.1-terra', groupSpace: 'op' }, 0)).toEqual({ head: 'OP terra', detail: '' });
+  expect(agentEntry({ name: 'OP', title: 'OP', agent: 'eln', model: 'gpt-6.1-terra', groupSpace: 'op' }, 0)).toEqual({ head: 'OP terra', detail: '', model: 'terra' });
   expect(agentEntry({ name: 'TC-H-CX-1', title: 'TC-H-CX-1 · UX · SIDETAB-INFO · terra', agent: 'codex', command: ['codex', '-m', 'gpt-6.1-terra'],
-    groupSpace: 'hands', remote: 'node-b', lastEventAtMs: 1_000 }, 181_000)).toEqual({ head: 'TC-H-CX-1 🌐 terra', detail: '@UX · codex-cli · ⇄node-b · 3m · SIDETAB-INFO' });
+    groupSpace: 'hands', remote: 'node-b', lastEventAtMs: 1_000 }, 181_000)).toEqual({ head: 'TC-H-CX-1 🌐 terra', detail: '@UX · codex-cli · ⇄node-b · 3m · SIDETAB-INFO', model: 'terra' });
   expect(agentEntry({ name: 'UX', title: 'UX', agent: 'claude', groupSpace: 'ux' }, 0)).toEqual({ head: 'UX', detail: 'claude-code' });
   expect(agentEntry({ name: 'TC-H-CC-2', title: 'TC-H-CC-2 · TC · A-VERY-LONG-CELL-IDENTIFIER-99 · opus', agent: 'eln', model: 'claude-opus-5-5', groupSpace: 'TC' }, 0))
-    .toEqual({ head: 'TC-H-CC-2 opus', detail: 'A-VERY-LONG-CELL-…' });
+    .toEqual({ head: 'TC-H-CC-2 opus', detail: 'A-VERY-LONG-CELL-…', model: 'opus' });
 });
 
 // ── sim world ──
@@ -84,10 +84,11 @@ for (const [cols, rowsN] of [[120, 36], [80, 24]] as const) {
       // stable truncation: the same world draws the same lines twice
       expect(layoutSpaceList(rows, n ? 'p3' : undefined, width, height).lines).toEqual(layout.lines);
       if (n > 0) {
-        expect(text.some((line) => line.includes('▾ MK ·'))).toBe(true);           // p3 lives in «mk»: its group stays open
+        expect(text.some((line) => /› MK +\d/.test(line))).toBe(false);          // p3 lives in «mk»: its group is never folded (its head may scroll above)
+        expect(layout.groupHeads?.filter((head) => head.ws === 'mk').every((head) => !head.folded) ?? true).toBe(true);
         expect(text.some((line) => line.includes('MK') && line.includes('grok'))).toBe(true);
       }
-      if (n === 120) expect(text.some((line) => line.includes('▸ '))).toBe(true);   // other groups fold to their heads
+      if (n === 120) expect(layout.scroll).toBeDefined();   // the agents region scrolls (ELS-SIDE-SPLIT-SCROLL) with the selected group open
     });
   }
 }

@@ -214,7 +214,7 @@ describe('MsgPost --watch', () => {
       { openStore: () => new MsgStore(join(w.root, 'messages.db')), followUp: async () => ({ commitmentId: 'c', wakerId: 'w', condition: 'pr-merged:40064', merged: false, watch: false }) });
     expect(res.suggestedWatch).toBe('pregate-receipt:40064');
     expect(res.output).toContain('suggest watch pregate-receipt:40064');
-    const plain = await dispatchMsgPost({ from: 'OP', to: 'TC', body: 'pregate 영수 #40065 회신해 달라', intent: 'request' },
+    const plain = await dispatchMsgPost({ from: 'REL', to: 'TC', body: 'pregate 영수 #40065 회신해 달라', intent: 'request' },
       { openStore: () => new MsgStore(join(w.root, 'messages.db')), followUp: async () => ({ commitmentId: 'c', wakerId: 'w', condition: 'mail-reply:9', merged: false, watch: false }) });
     expect(plain.suggestedWatch).toBeUndefined();
   });

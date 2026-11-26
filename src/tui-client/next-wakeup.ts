@@ -230,6 +230,11 @@ export interface NextTuiWakeupDeps {
   pulse?: { readonly inboxPath: string; readonly consumedPath: string };
   /** OP-INBOX-PULSE-BATCH: a pulse turn opened (the held OP mail batch is due). */
   onPulseOpened?: () => void;
+  /**
+   * OP-WAKE-COMMIT-BATCH: the OP seat holds a due scheduled wake for the pulse digest instead of opening a turn.
+   * true = held (queued; the scheduler records it as delivered) · false = the ordinary door path.
+   */
+  holdScheduledWake?: (text: string, reason: string) => boolean;
 }
 
 export interface NextTuiWakeup {
@@ -278,7 +283,19 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
     ...(deps.pacing ? { pacing: deps.pacing } : {}),
   });
   gate.port.attach(deps.requestYield);
-  const scheduler = createDashboardWakeupScheduler(gate, {
+  let heldWakeSeq = 0;
+  const schedulerGate = deps.holdScheduledWake ? {
+    startTurnIfIdle: (text: string, opts: Parameters<typeof gate.startTurnIfIdle>[1]): ReturnType<typeof gate.startTurnIfIdle> => {
+      if (opts.origin === 'scheduled' && deps.holdScheduledWake!(text, opts.reason ?? '')) {
+        deps.log?.('tui.wakeup', 'held-for-pulse', { reason: opts.reason ?? '' });
+        return { opened: true, turnId: `pulse-held-${++heldWakeSeq}` };
+      }
+      return gate.startTurnIfIdle(text, opts);
+    },
+    isInternalTurnActive: () => gate.isInternalTurnActive(),
+    lastTurnId: () => gate.lastTurnId(),
+  } : gate;
+  const scheduler = createDashboardWakeupScheduler(schedulerGate, {
     notify: deps.notify,
     ...(deps.now ? { now: deps.now } : {}),
     ...(deps.setTimer ? { setTimer: deps.setTimer } : {}),

@@ -28,12 +28,15 @@ export const STEWARD_UNAVAILABLE = 'unavailable';
 /** A refusal is retried (and may be raised again) after this long — the writer may have landed. */
 export const STEWARD_REFUSAL_TTL_MS = 2 * 60 * 60_000;
 const MAX_PASSES = 4;
+/** STEWARD-RX-CURRENT-PLAN — at most this many exception rows reach OP per digest (one digest per pulse). */
+export const STEWARD_MAX_EXCEPTIONS = 5;
 
 export interface StewardDeps {
   /** Build the matching table with these refusals excluded (no LLM · ledgers). null = not the HQ seat / nothing readable. */
   build(refused: ReadonlyArray<{ cell: string; seat?: string }>): Promise<MatchingTable | null>;
-  /** `eln seat assign <seat> <cell>` — SeatAssign's own checks (writer · coordinator) decide. */
-  assign(row: AssignRow): Promise<StewardAssignResult>;
+  /** `eln seat assign <seat> <cell> --version <table version>` — SeatAssign's own checks (writer · coordinator) decide.
+   *  STEWARD-RX-CURRENT-PLAN: the table's version (PLAN `status: current`) is passed so SeatAssign reads the same board. */
+  assign(row: AssignRow, version: string): Promise<StewardAssignResult>;
   /** One pregate request mail to the PR author (routine). */
   requestPregate?(row: PregateRow): Promise<boolean> | boolean;
   /** One mail to the judge seat for an aged judge row (routine). */
@@ -66,6 +69,8 @@ export function createSteward(deps: StewardDeps): Steward {
   const log = (event: string, data: Record<string, unknown>): void => { try { deps.log?.(event, data); } catch { /* fail-open */ } };
   const refused = new Map<string, { cell: string; seat?: string; code: string; at: number }>();
   const raised = new Map<string, number>();
+  // STEWARD-RX-CURRENT-PLAN — a (cell · seat) pair already raised to OP is never raised again (OP rejected or acted).
+  const raisedPairs = new Set<string>();
   const pregateSent = new Set<string>();
   const judgeSent = new Set<string>();
 
@@ -88,7 +93,7 @@ export function createSteward(deps: StewardDeps): Steward {
         for (const row of table.rows) {
           if (row.kind !== 'assign') continue;
           let res: StewardAssignResult;
-          try { res = await deps.assign(row); } catch (error) { res = { ok: false, code: 'error', reason: String(error).slice(0, 200) }; }
+          try { res = await deps.assign(row, table.version); } catch (error) { res = { ok: false, code: 'error', reason: String(error).slice(0, 200) }; }
           if (res.ok) {
             outcome.assigned.push({ seat: row.seat, cell: row.cell });
             log('steward-assigned', { seat: row.seat, cell: row.cell, trigger: reason });
@@ -102,7 +107,10 @@ export function createSteward(deps: StewardDeps): Steward {
           refusedThisPass = true;
           log('steward-refused', { seat: row.seat, cell: row.cell, code, reason: res.reason.slice(0, 200) });
           const raiseKey = `${row.cell}|${code}`;
-          if (!raised.has(raiseKey)) { raised.set(raiseKey, now()); outcome.exceptions.push({ row, code, reason: res.reason }); }
+          const pairKey = `${row.cell.toUpperCase()}|${row.seat.toUpperCase()}`;
+          if (raised.has(raiseKey) || raisedPairs.has(pairKey)) continue;
+          if (outcome.exceptions.length >= STEWARD_MAX_EXCEPTIONS) { log('steward-exception-capped', { seat: row.seat, cell: row.cell, code }); continue; }
+          raised.set(raiseKey, now()); raisedPairs.add(pairKey); outcome.exceptions.push({ row, code, reason: res.reason });
         }
         if (!refusedThisPass) break; // nothing new excluded: the next build would offer the same rows
       }

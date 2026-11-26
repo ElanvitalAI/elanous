@@ -2,6 +2,9 @@
 // Ledgers: release checklist (owner) · seat mail (assignment) · wakeRecipient (idle-only typing) · gh/git (writers).
 
 import { spawnSync } from 'node:child_process';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { resolveCurrentVersion } from '../ops-dashboard/current-version.js';
 import { debug } from '../debug/log.js';
 import { assignItem, checklistDevVersion, listChecklist } from '../release-loop/checklist.js';
 import { declaredFederationSeats } from '../msg/seat-mail-trust.js';
@@ -48,7 +51,10 @@ export function liveSeatAssignDeps(): SeatAssignDeps {
     },
     federationSeats: () => declaredFederationSeats({ stateRoot: resolveSeatStateRoot() }),
     findCell: (cellId, version) => {
-      const v = version ?? checklistDevVersion();
+      // STEWARD-RX-CURRENT-PLAN — default = the current release (PLAN `status: current` → schedule → package), not the
+      // package dev version: after a roster move (0.3.36 → 0.3.37) before the bump PR lands, the package still says 0.3.36.
+      let v = version ?? '';
+      if (!v) { try { v = resolveCurrentVersion({ hqRoot: join(homedir(), 'elanous-hq') }).version; } catch { v = checklistDevVersion(); } }
       const item = listChecklist(v).items.find(row => row.id === cellId);
       return item ? { version: v, item } : undefined;
     },

@@ -739,9 +739,7 @@ function parseBulkMarkdown(lines: string[]): ChecklistAddInput[] {
 
 export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; provenance?: Provenance; knownIssue?: string | null; body?: string | null; doneCriterion?: string | null; source?: string | null; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
   const out = setItemGuarded(v, id, patch, by);
-  // fed-state (SIGNAL-STATE-NOT-MAIL) — fail-open: green / owner change become typed cell facts.
-  if (patch.status === 'green') recordFact({ type: 'cell', cell: id, state: 'green', seat: by, ref: v, source: 'checklist' });
-  else if (patch.owner !== undefined) recordFact({ type: 'cell', cell: id, state: patch.owner && patch.owner !== '-' ? 'claim' : 'release', seat: by, ref: v, source: 'checklist' });
+  recordCellFacts(v, [id], patch, by);
   return out;
 }
 
@@ -818,7 +816,18 @@ function setItemGuarded(v: string, id: string, patch: Parameters<typeof setItem>
 }
 
 export function setItems(v: string, ids: string[], patch: Parameters<typeof setItem>[2], by: string): Checklist {
-  return setItemsGuarded(v, ids, patch, by);
+  const out = setItemsGuarded(v, ids, patch, by);
+  // `checklist set` (the CLI door) goes through here, not setItem — without this the ledger never saw a green.
+  recordCellFacts(v, ids, patch, by);
+  return out;
+}
+
+/** fed-state (SIGNAL-STATE-NOT-MAIL) — fail-open: green / owner change become typed cell facts. */
+function recordCellFacts(v: string, ids: readonly string[], patch: { status?: ChecklistStatus; owner?: string }, by: string): void {
+  for (const id of ids) {
+    if (patch.status === 'green') recordFact({ type: 'cell', cell: id, state: 'green', seat: by, ref: v, source: 'checklist' });
+    else if (patch.owner !== undefined) recordFact({ type: 'cell', cell: id, state: patch.owner && patch.owner !== '-' ? 'claim' : 'release', seat: by, ref: v, source: 'checklist' });
+  }
 }
 
 function setItemsGuarded(v: string, ids: string[], originalPatch: Parameters<typeof setItem>[2], by: string, expected?: Pick<ChecklistItem, 'title' | 'status' | 'evidence'>): Checklist {

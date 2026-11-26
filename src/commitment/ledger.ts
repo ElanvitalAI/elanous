@@ -34,8 +34,9 @@ import { debug } from '../debug/log.js';
 import { extractCommitments, type CommitmentPattern, type CommitmentWaitHint } from './commitment-extract.js';
 import { compareTurnOutcome, type PlanOutcomeReadView, type TurnOutcomeEmit, type TurnOutcomeVerdict } from './turn-outcome-shadow.js';
 
-export type CommitmentStatus = 'open' | 'done' | 'dropped' | 'blocked';
-export const COMMITMENT_TERMINAL: ReadonlySet<CommitmentStatus> = new Set(['done', 'dropped']);
+export type CommitmentStatus = 'open' | 'done' | 'dropped' | 'blocked' | 'reassigned';
+/** OP-CLOSE-ON-OUTCOME — reassigned = the work moved to another owner (reason names who) · terminal like done/dropped. */
+export const COMMITMENT_TERMINAL: ReadonlySet<CommitmentStatus> = new Set(['done', 'dropped', 'reassigned']);
 
 /** 이 항목에 묶인 깨우개(I3 `eln msg wait-for`) — 원장은 참조만 든다(깨우개 상태의 정본은 깨우개 저장소). */
 export interface CommitmentWakerRef {
@@ -66,8 +67,17 @@ export interface CommitmentEntry {
   updatedAt: string;
   /** done 의 근거(시험·영수증 참조 한 줄) — done 전이에 필수. */
   doneEvidence?: string;
-  /** dropped·blocked 의 사유 한 줄. */
+  /** dropped·blocked·reassigned 의 사유 한 줄. */
   reason?: string;
+  /**
+   * OP-CLOSE-ON-OUTCOME — the done-when predicate (a watch condition: `cell-status:<id>=<status>` · `pr-merged:<n>` ·
+   * `pregate-receipt:<n>` · `seat-idle:<SEAT>` · …). When set, `done` is accepted only while it holds (facts, not a reply).
+   */
+  doneWhen?: string;
+  /** OP-CLOSE-ON-OUTCOME — when the predicate is checked and the owner woken with the result (ISO). */
+  checkAt?: string;
+  /** OP-CLOSE-ON-OUTCOME — who the work was delegated to (the mail recipient) · the seat pane is peeked at check-at. */
+  assignee?: string;
 }
 
 export interface CommitmentAddInput {
@@ -79,6 +89,9 @@ export interface CommitmentAddInput {
   pattern?: CommitmentPattern;
   waitHint?: CommitmentWaitHint;
   planTaskId?: string;
+  doneWhen?: string;
+  checkAt?: string;
+  assignee?: string;
 }
 
 /** 종단 항목 조작·없는 항목 조작 — 아무것도 바꾸지 않고 던진다(opencode LifecycleConflict 꼴 · §6 불변식 2). */
@@ -230,6 +243,9 @@ export class CommitmentLedger {
       ...(input.pattern ? { pattern: input.pattern } : {}),
       ...(input.waitHint ? { waitHint: input.waitHint } : {}),
       ...(input.planTaskId ? { planTaskId: input.planTaskId } : {}),
+      ...(input.doneWhen ? { doneWhen: input.doneWhen } : {}),
+      ...(input.checkAt ? { checkAt: input.checkAt } : {}),
+      ...(input.assignee ? { assignee: input.assignee } : {}),
       wakers: [], createdAt: at, updatedAt: at,
     };
     this.write(seat, [...entries, entry]);
@@ -292,6 +308,12 @@ export class CommitmentLedger {
   markBlocked(seat: string, id: string, reason: string): CommitmentEntry {
     if (!reason?.trim()) throw new Error('blocked requires a reason');
     return this.transition(seat, id, 'blocked', { reason: reason.trim() });
+  }
+
+  /** OP-CLOSE-ON-OUTCOME — open|blocked → reassigned · 사유 필수(누구에게 · 왜). */
+  markReassigned(seat: string, id: string, reason: string): CommitmentEntry {
+    if (!reason?.trim()) throw new Error('reassigned requires a reason (to whom, and why)');
+    return this.transition(seat, id, 'reassigned', { reason: reason.trim() });
   }
 
   /** blocked → open(막힘 풀림). */

@@ -3,6 +3,7 @@
 // as `deps`, so the same logic runs under a real terminal and under tests. The app is a client: closing it (ctrl+b q)
 // leaves the server and every pane as they were.
 
+import { createSizeReassert } from './local-viewer-size.js';
 import { buttonsLayout, hitButton } from './attach-buttons.js';
 import { planVoice, type VoiceDoor } from './voice-control.js';
 import { createVoicePopup } from './voice-popup.js';
@@ -15,12 +16,14 @@ import { readActiveBaton } from './baton.js';
 import { isServerAway, noteAfterFrame, RECONNECT_NOTE, type AttachFrame, type AttachHandlers, type Attached } from './attach-client.js';
 import { createKeyRouter, type KeyAction } from './attach-keys.js';
 import { composeView, emptyCoordinatorSpaces, emptyRemoteCoordinators, FIRST_RUN_HINT, NARROW_BELOW_COLS, parsePaneRows, parseRemoteRows, SIDEBAR_HELP, sidebarWidthFor, UNREACHABLE_MARK, type PaneRow } from './attach-view.js';
+import { withLoopStates } from './loop-agents.js';
 import { buildTabDropdown, layoutSpaceList, isActiveSeat, buildTabRow, dropdownTargets, withCommands, type DropdownTarget } from './space-tabs-view.js';
 import { interpretMouse, wheelBytes, type MouseLayout, type MouseReport } from './attach-mouse.js';
 import type { WheelRoute } from '../pty-shell/registry.js';
 import { withNewDefaults } from './cli-args.js';
 import type { ElsResult } from './core.js';
 import type { ElsRequest } from './server.js';
+import { assignSlots, drawTileFrame, modelOf, parseStageFeed, spaceTile, stageHeader, stageLane, stageRibbon, tileLayout, type StageFeed, moveFocus, tileGrid, MAX_TILES, TILE_REFRESH_MS, type TileFrameInput, type TileGridSpec, type TileInput } from './tile-view.js';
 
 /** ELS-STALE-CLIENT: the one-line hint while this client is older than the server it talks to. */
 export const STALE_CLIENT_HINT = '새 빌드 있음 · q 로 나갔다 다시 els';
@@ -63,6 +66,19 @@ export interface AttachAppDeps {
    * They join the same left list under «⇄host …»; selecting one shows its screen (polled), typing into it is refused
    * (input goes through `els do`). Absent = a local-only view.
    */
+  /** ELS-TILE-MODE: open in tile mode — every pane of `ws` (absent = the selected pane's workspace) as a live grid. */
+  readonly tile?: { readonly ws?: string; readonly grid?: TileGridSpec;
+    /** ALL mode (every pane of every space, space→tab order) · SPACES mode (one tile per space) · --active (working only) ·
+     *  remote false = local panes only · autoPageMs = ① auto-advance pages. */
+    readonly all?: boolean; readonly spaces?: boolean; readonly active?: boolean; readonly remote?: boolean; readonly autoPageMs?: number;
+    /** ELS-TILE-STAGE: staged demo layout; `readFeed` returns the conductor's feed file text (JSON lines), polled with the tiles. */
+    readonly stage?: { readonly readFeed?: () => string | undefined } };
+  readonly now?: () => number;
+  /** GOAL-ORCHESTRATION-NL: a goal run that just started in this els (its workspace + stage feed). A new key switches the
+   *  window to the staged tile view of that workspace — the orchestration cascades in front of the person. */
+  readonly stageWatch?: (workspaces: readonly string[]) => { readonly key: string; readonly ws: string; readonly readFeed: () => string | undefined } | undefined;
+  /** SIDETAB-LOOP-AGENTS-UNDER-SPACE: loop-agent facts for the heartbeat rows (cached registry read; absent = plain rows). */
+  readonly loopFacts?: import('./loop-agents.js').LoopFactsSource;
   readonly remote?: { readonly list: () => Promise<ElsResult>; readonly read: (address: string) => Promise<ElsResult>;
     /** REMOTE-PANE-SIZE: set the remote pane's PTY to this viewer's pane area (the remote SIGWINCH). */
     readonly resize?: (address: string, cols: number, rows: number) => Promise<ElsResult> };
@@ -149,11 +165,14 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       void deps.remote!.resize!(row.pane, size.cols, size.rows).then((answer) => { if (answer.exitCode !== 0) remoteSizeSent = ''; }, () => { remoteSizeSent = ''; });
     }, REMOTE_RESIZE_DEBOUNCE_MS);
   };
+  // ELS-PANE-HEIGHT r2: the focused view puts its pane rect back when the frames say the PTY is another size.
+  const sizeReassert = createSizeReassert({ send: (size) => { const now = paneSize(); if (attached && now.cols === size.cols && now.rows === size.rows) attached.resize(size.cols, size.rows); } });
   const remember = (): void => {
     if (selected && !remoteRows.some((row) => row.pane === selected)) lastLocal = selected;
     try { deps.memory.save({ sidebar: sidebarOpen, ...(lastLocal ? { lastPane: lastLocal } : {}), ...(groupFolds.size > 0 ? { groupFolds: Object.fromEntries(groupFolds) } : {}), ...(activeOnly ? { activeOnly } : {}) }); } catch { /* the view works without its memory */ }
   };
-  const everyRow = (): PaneRow[] => [...rows, ...remoteRows];
+  // SIDETAB-LOOP-AGENTS-FU: a loop tab's state = its trigger's (exception → failed/red) in the side list, tab row and tiles.
+  const everyRow = (): PaneRow[] => withLoopStates([...rows, ...remoteRows], deps.loopFacts?.facts());
   // ELS-MOUSE (OP #100984): 마우스 해석용 마지막 배치 + 스크롤백 히스토리/오프셋
   // ELS-NARROW-TAB-DROPDOWN: under NARROW_BELOW_COLS the top row is «emoji tab ▾»; open, the tab list is drawn under it.
   let dropdown = false;
@@ -297,8 +316,250 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   // dropdown come from the listing poll and the person's own actions — those renders recompute them; a frame render
   // reuses the last computed chrome (no listing walk, no baton file read on the typing path).
   let chrome: { cols: number; height: number; width: number; tabs: { line?: string }; overlay?: readonly string[]; sidebar: readonly string[] | null } | undefined;
+  // ---- ELS-TILE-MODE: the live grid. Screens come from the server's memory (`tile-frame`), ~2 fps, single-flight; the
+  // frame writer repaints only changed rows. Tile mode is read-only: arrows/hjkl move the focus, Enter zooms in.
+  let tileMode = false;
+  let tileWs = deps.tile?.ws;
+  let tileGridSpec: TileGridSpec = deps.tile?.grid ?? 'auto';
+  let stageLayoutSeq = 0;
+  let tileFocus = 0;
+  let tileTimer: unknown;
+  let tileBusy = false;
+  let tileArmed = false;
+  const tileScreens = new Map<string, string>();
+  const now = deps.now ?? Date.now;
+  const tileFirstSeen = new Map<string, number>();
+  let stageFeed: StageFeed | undefined;
+  let stageSpot: { pane: string; until: number; key: string } | undefined;
+  let stageTick = 0;
+  const voteSeen: number[] = [];
+  // ELS-TILE-DEMO-QUICKWINS: level (all ← spaces ← space), page, stable slots, counters clock, done flash.
+  let tileLevel: 'all' | 'spaces' | 'space' = deps.tile?.spaces ? 'spaces' : deps.tile?.all ? 'all' : 'space';
+  let tilePage = 0;
+  let tilePageAt = 0;
+  let tileSlots: (string | undefined)[] = [];
+  let tileSlotKey = '';
+  const tileStarted = now();
+  const tileDoneAt = new Map<string, number>();
+  const tileLastState = new Map<string, string>();                                 // the tick each vote (by index) first appeared
+  let stageCfg: { readonly readFeed?: () => string | undefined } | undefined = deps.tile?.stage;
+  let stageWatchKey: string | undefined;
+  const stageView = (): Parameters<typeof drawTileFrame>[0]['stage'] => {
+    if (!stageCfg) return undefined;
+    const t = now();
+    const panes = tileRows().map((row) => row.pane);
+    for (const pane of panes) if (!tileFirstSeen.has(pane)) tileFirstSeen.set(pane, t);
+    for (const pane of tileFirstSeen.keys()) if (!panes.includes(pane)) tileFirstSeen.delete(pane);
+    const fresh = new Set([...tileFirstSeen].filter(([, at]) => t - at < 1_500).map(([pane]) => pane));
+    const resolvePane = (ref: string | undefined): string | undefined => ref === undefined ? undefined
+      : tileRows().find((row) => row.pane === ref || row.tabId === ref || row.title === ref || row.title.replace(/ \[[^\]]*\]$/, '') === ref)?.pane
+        // GOAL-ORCHESTRATION-NL: «zoom risk» names a tab loosely — a unique case-insensitive title match.
+        ?? (() => { const low = ref.toLowerCase(); const hits = ref.length >= 2 ? tileRows().filter((row) => row.title.toLowerCase().includes(low)) : []; return hits.length === 1 ? hits[0]!.pane : undefined; })();
+    const verdict = resolvePane(stageFeed?.verdictPane);
+    const spot = stageSpot && t < stageSpot.until ? resolvePane(stageSpot.pane) : undefined;
+    const solo = verdict ?? spot;
+    const votes = stageFeed?.votes?.length ?? 0;
+    voteSeen.length = Math.min(voteSeen.length, votes);
+    while (voteSeen.length < votes) voteSeen.push(stageTick);
+    const lane = stageLane(stageFeed, stageTick, voteSeen.map((at) => stageTick - at), deps.size().cols);
+    const tiles = tileInputs();
+    const counters = stageFeed?.counters;
+    const models = new Set(tiles.map((tile) => tile.model).filter(Boolean)).size;
+    const header = stageHeader({ agents: counters?.agents ?? tiles.filter((tile) => !tile.hole).length, models: counters?.models ?? models,
+      ...(counters?.toolCalls !== undefined ? { toolCalls: counters.toolCalls } : {}), ...(counters?.cited !== undefined ? { cited: counters.cited } : {}),
+      elapsedMs: counters?.elapsedMs ?? t - tileStarted });
+    for (const tile of tiles) {
+      const before = tileLastState.get(tile.pane);
+      if (before !== undefined && before !== 'done' && tile.state === 'done') tileDoneAt.set(tile.pane, t);
+      tileLastState.set(tile.pane, tile.state);
+    }
+    const flashDone = new Set([...tileDoneAt].filter(([, at]) => t - at < 1_500).map(([pane]) => pane));
+    const layout = tileLayout({ cols: deps.size().cols, rows: deps.size().rows, tiles, focus: 0, grid: tileGridSpec, page: tilePage, fold: true }, deps.size().rows - 3);
+    const onPage = new Set(layout.visible.map((tile) => tile?.pane));
+    const pageFlash = layout.pages > 1 && [...fresh].some((pane) => !onPage.has(pane));
+    return { ribbon: stageRibbon(stageFeed), header, lane, fresh, flashDone, pageFlash, pulse: stageTick % 2 === 0, ...(solo ? { solo } : {}),
+      ...(solo && stageFeed?.spotlightCaption ? { caption: stageFeed.spotlightCaption } : {}), ...(stageFeed?.receipt ? { receipt: stageFeed.receipt } : {}) };
+  };
+  const tileRows = (): PaneRow[] => {
+    let all = everyRow();
+    if (deps.tile?.remote === false) all = all.filter((row) => !row.remote);
+    if (deps.tile?.active) all = all.filter((row) => row.state === 'working');
+    if (tileLevel !== 'space') {                                  // ALL / SPACES: space → tab order (first appearance of each space)
+      const order = [...new Set(all.map((row) => row.wsId))];
+      return [...all].sort((a, b) => order.indexOf(a.wsId) - order.indexOf(b.wsId));
+    }
+    const ws = tileWs !== undefined ? all.find((row) => row.workspace === tileWs || row.wsId === tileWs)?.wsId : (current()?.wsId ?? all[0]?.wsId);
+    return all.filter((row) => row.wsId === ws);
+  };
+  const titleOf = (row: PaneRow): string => row.title.replace(/ \[[^\]]*\]$/, '') || row.pane;
+  /** SPACES: the representative pane of each space (first working, else the first). */
+  const spaceGroups = (): { wsId: string; name: string; rows: PaneRow[] }[] => {
+    const groups = new Map<string, { wsId: string; name: string; rows: PaneRow[] }>();
+    for (const row of tileRows()) { const g = groups.get(row.wsId) ?? { wsId: row.wsId, name: row.workspace, rows: [] }; g.rows.push(row); groups.set(row.wsId, g); }
+    return [...groups.values()];
+  };
+  const repOf = (rows: readonly PaneRow[]): PaneRow | undefined => rows.find((row) => row.state === 'working' && !row.remote) ?? rows.find((row) => !row.remote);
+  const lastLine = (screen: string | undefined): string | undefined => screen?.replace(/\u001b\[[0-9;:?]*[A-Za-z]/g, '').split('\n').map((line) => line.trim()).filter((line) => line && !line.startsWith('[screen')).at(-1);
+  const tileInputs = (): TileInput[] => {
+    if (tileLevel === 'spaces') return spaceGroups().map((g) => {
+      const coordinator = g.rows.find((row) => row.role === 'coordinator' || row.spaceCoordinator);
+      const rep = repOf(g.rows);
+      const line = lastLine(rep ? tileScreens.get(rep.pane) : undefined);
+      return spaceTile({ id: g.wsId, name: g.name, ...(coordinator ? { coordinator: titleOf(coordinator) } : {}), panes: g.rows.map((row) => ({ title: titleOf(row), state: row.state })), ...(line ? { line } : {}) });
+    });
+    const rows = tileRows();
+    const byPane = new Map(rows.map((row) => [row.pane, row]));
+    const key = `${tileLevel}|${tileWs ?? ''}`;
+    if (key !== tileSlotKey) { tileSlots = []; tileSlotKey = key; }
+    const { cols, rows: height } = deps.size();
+    tileSlots = assignSlots(tileSlots, rows.map((row) => row.pane), (n) => { const g = tileGrid(Math.max(1, Math.min(MAX_TILES, n)), tileGridSpec, cols, height); return g.c * g.r; });
+    return tileSlots.map((pane): TileInput => {
+      const row = pane !== undefined ? byPane.get(pane) : undefined;
+      if (!row) return { pane: `hole:${tileSlots.indexOf(pane)}`, title: '', state: 'idle', hole: true };
+      const screen = tileScreens.get(row.pane);
+      const model = modelOf(row.title, row.seat, row.cwd, screen?.slice(0, 2_000));
+      return { pane: row.pane, title: titleOf(row), state: row.state, ...(row.seat ? { tag: row.seat } : {}),
+        ...(row.remote ? { remote: true } : {}), ...(row.state === 'exited' ? { closed: true } : {}), ...(model ? { model } : {}),
+        ...(tileLevel === 'all' ? { space: row.workspace } : {}), ...(screen !== undefined ? { screen } : {}) };
+    });
+  };
+  const frameInput = (): TileFrameInput => {
+    const { cols, rows: height } = deps.size();
+    const tiles = tileInputs();
+    const live = tiles.filter((tile) => !tile.hole).length;
+    const label = tileLevel === 'all' ? 'ALL' : tileLevel === 'spaces' ? 'SPACES' : `TILE ${tileRows()[0]?.workspace ?? tileWs ?? ''}`;
+    const nav = tileLevel === 'spaces' ? 'Enter open space · Esc all' : `Enter zoom${tileLevel === 'space' ? ' · Esc spaces' : ''}`;
+    const status = live === 0 ? `${label} · ${tileWs && tileLevel === 'space' ? `no panes in «${tileWs}»` : 'no panes'} · waiting · ctrl+b q quit`
+      : `${label} · ${live} ${tileLevel === 'spaces' ? 'spaces' : 'panes'} · arrows/hjkl focus · ${nav} · ctrl+b q quit${note ? ` · ${note}` : ''}`;
+    const stage = stageView();
+    return { cols, rows: height, tiles, focus: tileFocus, grid: tileGridSpec, status, page: tilePage, fold: stageCfg !== undefined && tileLevel !== 'spaces', ...(stage ? { stage } : {}) };
+  };
+  const frameLayout = (view: TileFrameInput) => tileLayout(view, view.rows - [view.stage?.ribbon, view.stage?.header, view.stage?.lane, view.stage?.receipt].filter((x) => x !== undefined).length);
+  const renderTile = (): void => {
+    let view = frameInput();
+    const layout = frameLayout(view);
+    if (layout.page !== tilePage) { tilePage = layout.page; view = { ...view, page: tilePage }; }
+    if (tileFocus >= layout.visible.length) { tileFocus = Math.max(0, layout.visible.length - 1); view = { ...view, focus: tileFocus }; }
+    deps.write(drawTileFrame(view));
+  };
+  const pollTiles = async (): Promise<void> => {
+    if (!tileMode || tileBusy || finished) return;
+    tileBusy = true;
+    try {
+      if (deps.tile?.autoPageMs && now() - tilePageAt >= deps.tile.autoPageMs) {   // ① auto-advance (wraps)
+        const pages = frameLayout(frameInput()).pages;
+        if (tilePageAt !== 0) tilePage = pages > 1 ? (tilePage + 1) % pages : 0;
+        tilePageAt = now();
+      }
+      const shownPanes = tileLevel === 'spaces' ? new Set(spaceGroups().map((g) => repOf(g.rows)?.pane))
+        : new Set(frameLayout(frameInput()).visible.map((tile) => tile?.pane));
+      const wanted = tileRows().filter((row) => shownPanes.has(row.pane) && !row.remote && row.state !== 'exited');
+      const keep = new Set(wanted.map((row) => row.pane));
+      for (const pane of tileScreens.keys()) if (!keep.has(pane)) tileScreens.delete(pane);   // flat memory: gone panes leave
+      let changed = false;
+      await Promise.all(wanted.map(async (row) => {
+        try {
+          const answer = await deps.request({ op: 'tile-frame', pane: row.pane });
+          if (answer.exitCode === 0 && tileScreens.get(row.pane) !== answer.message) { tileScreens.set(row.pane, answer.message); changed = true; }
+        } catch { /* a pane gone mid-read shows its last screen until the list drops it */ }
+      }));
+      if (stageCfg) {
+        stageTick++;
+        let text: string | undefined;
+        try { text = stageCfg.readFeed?.(); } catch { text = undefined; }
+        const feed = parseStageFeed(text);
+        if (feed?.layout && feed.layout.seq !== stageLayoutSeq) {          // GOAL-ORCHESTRATION-NL: voice/text layout
+          const l = feed.layout;
+          if (stageLayoutSeq !== 0 || l.seq > 0) {
+            if (l.grid) tileGridSpec = l.grid;
+            if (l.level && l.level !== tileLevel) { tileLevel = l.level; tileFocus = 0; tilePage = 0; tileScreens.clear(); }
+            if (l.page !== undefined) {
+              const pages = frameLayout(frameInput()).pages;
+              tilePage = l.page === 'next' ? (tilePage + 1) % Math.max(1, pages) : l.page === 'prev' ? (tilePage + pages - 1) % Math.max(1, pages) : Math.min(l.page, Math.max(0, pages - 1));
+            }
+            if (l.zoom === '') stageSpot = undefined;
+          }
+          stageLayoutSeq = l.seq;
+        }
+        if (feed?.spotlightPane) {
+          const key = `${feed.spotlightPane}|${feed.phase ?? ''}|${feed.spotlightMs ?? ''}`;
+          if (stageSpot?.key !== key) stageSpot = { pane: feed.spotlightPane, until: now() + (feed.spotlightMs ?? 5_000), key };
+        }
+        stageFeed = feed;
+        changed = true;                                         // the pulse and the feed repaint every tick (damage-only)
+      }
+      if (changed && tileMode && !finished) renderTile();
+    } finally { tileBusy = false; }
+  };
+  const enterTile = (): void => {
+    if (finished) return;
+    tileMode = true;
+    tileArmed = false;
+    const at = tileRows().findIndex((row) => row.pane === selected);
+    if (at >= 0) tileFocus = at;
+    generation++; attached?.detach(); attached = undefined;   // no pane is attached while the grid shows
+    if (tileTimer === undefined) tileTimer = deps.setInterval(() => { void pollTiles(); }, stageCfg ? TILE_REFRESH_MS / 2 : TILE_REFRESH_MS);
+    renderTile();
+    void pollTiles();
+  };
+  const zoomTile = (): void => {
+    const picked = frameLayout(frameInput()).visible[tileFocus];
+    if (tileLevel === 'spaces') {                                 // drill into that space's tab tiles
+      const wsId = picked?.pane.replace(/^space:/, '');
+      if (!wsId) return;
+      tileLevel = 'space'; tileWs = wsId; tileFocus = 0; tilePage = 0; tileScreens.clear(); note = ''; renderTile(); void pollTiles(); return;
+    }
+    const row = tileRows().find((r) => r.pane === picked?.pane);
+    if (!row || row.state === 'exited') { note = row ? 'pane closed' : ''; renderTile(); return; }
+    tileMode = false;
+    if (tileTimer !== undefined) { deps.clearInterval(tileTimer); tileTimer = undefined; }
+    tileScreens.clear();
+    tileWs = row.workspace;
+    note = 'ctrl+b t back to tile';
+    if (row.pane === selected) { selected = undefined; }
+    select(row.pane);
+  };
+  const tileKey = (text: string): void => {
+    let rest = text;
+    while (rest) {
+      if (tileArmed) {
+        tileArmed = false;
+        const char = rest[0]!; rest = rest.slice(1);
+        if (char === 'q') { finish(0, ''); return; }
+        continue;                                               // t (already tiled) and every other prefix key: nothing
+      }
+      const arrow = /^\u001b(?:\[|O)([ABCD])/.exec(rest);
+      if (arrow) {
+        const dir = ({ A: 'up', B: 'down', C: 'right', D: 'left' } as const)[arrow[1] as 'A' | 'B' | 'C' | 'D'];
+        const layout = frameLayout(frameInput());
+        tileFocus = moveFocus(tileFocus, dir, layout.visible.length, layout.c);
+        rest = rest.slice(arrow[0].length); note = ''; renderTile(); continue;
+      }
+      const char = rest[0]!; rest = rest.slice(1);
+      if (char === '\u0002') { tileArmed = true; continue; }
+      const dir = ({ h: 'left', j: 'down', k: 'up', l: 'right' } as const)[char as 'h' | 'j' | 'k' | 'l'];
+      if (dir) {
+        const layout = frameLayout(frameInput());
+        tileFocus = moveFocus(tileFocus, dir, layout.visible.length, layout.c);
+        note = ''; renderTile(); continue;
+      }
+      if (char === '\r' || char === '\n') { zoomTile(); return; }
+      if (char === '[' || char === ']') {                        // ① pages
+        const pages = frameLayout(frameInput()).pages;
+        tilePage = (tilePage + (char === ']' ? 1 : pages - 1)) % pages; tileFocus = 0; tilePageAt = now(); note = ''; renderTile(); void pollTiles(); continue;
+      }
+      if (char === '\u001b' && (rest === '' || !/^[\[O]/.test(rest))) {   // a lone Esc: up one level (space → spaces → all)
+        if (tileLevel === 'all') continue;
+        tileLevel = tileLevel === 'space' ? 'spaces' : 'all'; tileFocus = 0; tilePage = 0; tileScreens.clear(); note = ''; renderTile(); void pollTiles(); continue;
+      }
+      if (char === '\u001b') { rest = rest.replace(/^[\[O][0-9;<>?]*[@-~]?/, ''); continue; }   // other escapes (mouse…) dropped
+      // Every other key: tile mode is read-only.
+    }
+  };
+
   const render = (frameOnly = false): void => {
     if (finished) return;
+    if (tileMode) { renderTile(); return; }
     const { cols, rows: height } = deps.size();
     if (frameOnly && chrome && chrome.cols === cols && chrome.height === height && !newTab.isOpen() && !movePicker) {
       const kept = chrome;
@@ -322,7 +583,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     // Read at every paint so return/expiry removes the badge on the next poll, without trusting a pane title.
     let actingSeat: string | undefined;
     try { actingSeat = deps.actingSeat ? deps.actingSeat() : readActiveBaton(dirname(elsJournalPath()), Date.now())?.acting; } catch { /* unavailable is not an active badge */ }
-    const list = width ? layoutSpaceList(shown, selected, width, height - 1, deps.env.HOME, ceoSideUnavailable ? -1 : ceoPendingRed, [...emptyCoordinatorSpaces(lsAnswer, rows), ...remoteEmpty], selectedEmpty, agentsGrouped ? 'grouped' : 'status', actingSeat, listTop, groupFolds, activeOnly, spacesTop) : undefined;
+    const list = width ? layoutSpaceList(shown, selected, width, height - 1, deps.env.HOME, ceoSideUnavailable ? -1 : ceoPendingRed, [...emptyCoordinatorSpaces(lsAnswer, rows), ...remoteEmpty], selectedEmpty, agentsGrouped ? 'grouped' : 'status', actingSeat, listTop, groupFolds, activeOnly, spacesTop, deps.loopFacts?.facts()) : undefined;
     listMarks = { heads: list?.groupHeads ?? [], ...(list?.foldAll ? { foldAll: list.foldAll } : {}), ...(list?.activeBox ? { active: list.activeBox } : {}) };
     listScroll = list?.scroll;
     spacesScroll = list?.spacesScroll;
@@ -343,6 +604,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     if (escapeTimer) clearTimeout(escapeTimer);
     escapePending = '';
     deps.clearInterval(timer);
+    if (tileTimer !== undefined) { deps.clearInterval(tileTimer); tileTimer = undefined; }
     generation++;
     attached?.detach();
     resolveDone({ code, message });
@@ -366,6 +628,9 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       scroll = next.back;                // the server tells how far this frame is above the live bottom
       wheelPassthrough = next.wheelPassthrough === true;
       wheelRoute = next.wheelRoute ?? 'host';   // ELS-WHEEL-SCROLLBACK: the frame carries the pane's own wheel lane
+      // ELS-OP-INPUT-FLICKER: a view that is not the pane's size owner never re-asserts — it letterboxes.
+      if (next.sizeOwner === false) sizeReassert.reset();
+      else if (Number.isInteger(next.cols) && Number.isInteger(next.rows)) sizeReassert.frame(next.pane, { cols: next.cols, rows: next.rows }, paneSize());
       render(true);
     },
     onError: (message) => { if (mine === generation) { note = message; render(); } },   // typing refused (view-only attach): said, not swallowed
@@ -426,6 +691,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     wrapped = false;                                             // any move other than the wrap itself ends the wrap
     generation++;
     const mine = generation;
+    sizeReassert.reset();
     attached?.detach();
     attached = undefined;
     selected = pane;
@@ -750,9 +1016,10 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     const row = current();
     if (selectedEmpty && action === 'next-workspace') { nextWorkspace(); return; }
     if (selectedEmpty && ['next', 'previous'].includes(action)) { select(everyRow()[0]?.pane); return; }
-    if (selectedEmpty && !['detach', 'toggle-sidebar', 'help', 'new', 'new-chat', 'new-workspace', 'close-workspace', 'toggle-agents-order', 'expand-all', 'collapse-all', 'toggle-active'].includes(action)) { note = '빈 작업공간에는 pane이 없습니다'; render(); return; }
+    if (selectedEmpty && !['detach', 'toggle-sidebar', 'help', 'new', 'new-chat', 'new-workspace', 'close-workspace', 'toggle-agents-order', 'expand-all', 'collapse-all', 'toggle-active', 'tile'].includes(action)) { note = '빈 작업공간에는 pane이 없습니다'; render(); return; }
     switch (action) {
       case 'detach': finish(0, ''); return;
+      case 'tile': enterTile(); return;
       case 'next': move(1); return;
       case 'previous': move(-1); return;
       case 'next-workspace': nextTab(); return;
@@ -850,6 +1117,9 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
           else if (event.kind === 'mouse') { if (event.report.release) pressConsumed = false; else pressConsumed = (event.report.button & 0x40) === 0; }
           return;
         }
+        // ELS-QUIT-CLICK (대표 11-26): the release of the ✕ click that raised this confirm (or any mouse report) must not count
+        // as «any other key» — it cancelled the prompt in the same instant, so clicking ✕ Quit with something running did nothing.
+        if (confirm && event.kind === 'mouse') { if (event.report.release) pressConsumed = false; else pressConsumed = (event.report.button & 0x40) === 0; return; }
         if (confirm) {
           const pending = confirm;
           confirm = undefined;
@@ -934,8 +1204,21 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     done,
     async start(pane) {
       try {
+        const myWorkspaces = (): string[] => [...new Set(rows.flatMap((row) => [row.workspace, row.wsId]))];
+        let stageBaseline = false;
         timer = deps.setInterval(() => {
           void refreshRemote();
+          if (deps.stageWatch && !finished && stageBaseline) {
+            let run: ReturnType<NonNullable<AttachAppDeps['stageWatch']>>;
+            try { run = deps.stageWatch(myWorkspaces()); } catch { run = undefined; }
+            if (run && run.key !== stageWatchKey && rows.some((row) => row.workspace === run!.ws || row.wsId === run!.ws)) {
+              stageWatchKey = run.key;
+              stageCfg = { readFeed: run.readFeed };
+              stageFeed = undefined; stageSpot = undefined; tileFirstSeen.clear();
+              tileWs = run.ws; tileLevel = 'space'; tilePage = 0; tileFocus = 0;
+              if (tileMode) { tileScreens.clear(); renderTile(); } else enterTile();
+            }
+          }
           refresh().then(async (listed) => {
             if (listed && !finished && !selected && !selectedEmpty && rows.length === 0 && !automaticCreateAttempted) {
               automaticCreateAttempted = true;
@@ -944,9 +1227,14 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
           }).catch((error: unknown) => finish(1, `els: ${error instanceof Error ? error.message : String(error)}`));
         }, deps.pollMs);
         await refresh(false, pane);
+        // A run already active when this window opened is not «new»: remember it once the workspaces are listed.
+        if (deps.stageWatch) { try { stageWatchKey = deps.stageWatch(myWorkspaces())?.key; } catch { /* no runs dir */ } }
+        stageBaseline = true;
         void refreshRemote();                                      // the other hosts join the list when they answer
         if (finished) return;
         if (pane) select(pane);
+        if (deps.tile) { enterTile(); return; }
+        if (pane) { /* attached above */ }
         else if (rows.length === 0 && !selectedEmpty && !automaticCreateAttempted) {
           automaticCreateAttempted = true;
           await create(undefined, undefined, true);             // an empty server opens with one shell, like herdr's first workspace
@@ -955,6 +1243,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     },
     key(text) {
       if (finished) return;
+      if (tileMode) { tileKey(text); return; }
       frameModalInput(text);
     },
     resized() { const size = paneSize(); attached?.resize(size.cols, size.rows); pushRemoteSize(); render(); },

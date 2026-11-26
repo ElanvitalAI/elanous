@@ -44,3 +44,14 @@ test('no runtime identity (not darwin, process gone) registers nothing', async (
   expect(await ensureOpRuntimeRegistered({ env: opPane, run: r.run, runtime: () => undefined, entry: '/e' })).toBe(false);
   expect(r.calls.length).toBe(0);
 });
+
+test('ELS-OP-AUTOREG-TRACK: the server-minted OP pane without ELANOUS_TRACK still registers (seat from ELANOUS_ELS_WS)', async () => {
+  const r = recorder();
+  const env = { ELANOUS_ELS_WS: 'OP', ELANOUS_ELS_PANE_TOKEN: 'a'.repeat(48), ELANOUS_ELS_SOCKET: '/u/els/els.sock' };
+  expect(await ensureOpRuntimeRegistered({ env, run: r.run, runtime: () => ({ pid: 7, start: '1:2' }), entry: '/e' })).toBe(true);
+  expect(r.calls.length).toBe(1);
+  resetOpRuntimeRegistrationForTesting();
+  const other = recorder();
+  expect(await ensureOpRuntimeRegistered({ env: { ...env, ELANOUS_ELS_WS: 'JUDGE' }, run: other.run, runtime: () => ({ pid: 7, start: '1:2' }), entry: '/e' })).toBe(false);
+  expect(other.calls.length).toBe(0);
+});

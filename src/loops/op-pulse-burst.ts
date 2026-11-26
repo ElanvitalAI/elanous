@@ -137,7 +137,7 @@ export function pressures(s: PressureSignals): LanePressure[] {
   const scale = (v: number | null) => v === null ? null : Math.round(v * f * 100) / 100;
   const gate = scale(ratio(s.gateWaitMin, s.gateWaitTargetMin));
   return [
-    { lane: 'hands', pressure: scale(production), why: `target gap ${s.targetGapRatio ?? '?'} · backlog ${s.readyBacklog ?? '?'}/${s.hands ?? '?'} hands · deadline ×${f.toFixed(2)}` },
+    { lane: 'hands', pressure: scale(production), why: `target gap ${s.targetGapRatio === null || s.targetGapRatio === undefined ? '?' : Math.round(s.targetGapRatio * 100) / 100} · backlog ${s.readyBacklog ?? '?'}/${s.hands ?? '?'} hands · deadline ×${f.toFixed(2)}` },
     { lane: 'remote', pressure: scale(production), why: 'same as hands (local tabs first, remote when hands hit max)' },
     { lane: 'ta', pressure: scale(backlog), why: `ready backlog ${s.readyBacklog ?? '?'} vs ${s.hands ?? '?'}×${s.readyPerHand}` },
     { lane: 'review', pressure: scale(ratio(s.reviewWaitMin, s.reviewWaitTargetMin)), why: `review wait ${s.reviewWaitMin ?? '?'}m vs ${s.reviewWaitTargetMin}m` },

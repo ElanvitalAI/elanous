@@ -1,0 +1,35 @@
+[heavy-slot] acquired 2/8: /Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun
+bun test v1.4.2 (744846f84)
+
+src/supervision/op-mail-coverage-watch.test.ts:
+(pass) isMailJudged > matches a `#<id>` reference in a judgment row [0.09ms]
+(pass) isMailJudged > a longer judgment reference must not match a shorter mail id [0.02ms]
+(pass) isMailJudged > no reference means unjudged (fail-closed) [0.02ms]
+(pass) parseLedgerCreatedAtMs > parses a Z-suffixed ledger timestamp [0.07ms]
+(pass) parseLedgerCreatedAtMs > forces a zoneless ledger timestamp to UTC, never the host zone
+(pass) parseLedgerCreatedAtMs > returns undefined for unparseable values (fail-closed) [0.02ms]
+(pass) findUnjudgedMail > reports an in-window unjudged mail as 주제 불일치 and keeps the window edge [0.10ms]
+(pass) findUnjudgedMail > appends one 미스캔 gap at the last scanned id when the scan truncated [0.02ms]
+(pass) findUnjudgedMail > fail-closed on invalid clock or window
+(pass) runOpMailCoverageWatch > records one «판단 없음» row per gap and raises one 🔴 OP mail [1.94ms]
+(pass) runOpMailCoverageWatch > a newly judged mail leaves no gap and a new unjudged mail alarms again [0.58ms]
+(pass) runOpMailCoverageWatch > a truncated scan surfaces the 미스캔 gap in the alarm [0.82ms]
+(pass) runOpMailCoverageWatch > a higher threshold records the gap without the OP mail [0.63ms]
+(pass) parseMailCoverageGraphContext > reads seats from graph context input [0.05ms]
+(pass) parseMailCoverageGraphContext > rejects malformed context (fail-closed) [0.04ms]
+
+src/supervision/seat-stall-watch.test.ts:
+(pass) lastSeatRecordMs > parses a KST row into epoch milliseconds [0.14ms]
+(pass) lastSeatRecordMs > accepts the Z form of the same instant [0.01ms]
+(pass) lastSeatRecordMs > picks the latest of several entries
+(pass) lastSeatRecordMs > returns undefined for text without a valid entry (fail-closed)
+(pass) findStalledSeats > stays silent under the default threshold [0.04ms]
+(pass) findStalledSeats > flags a stall at and past the threshold with whole minutes [0.02ms]
+(pass) findStalledSeats > fail-closed on invalid now or threshold [0.01ms]
+(pass) runSeatStallWatch > raises one 🔴 OP mail per stall and the same stall alarms once [0.85ms]
+(pass) runSeatStallWatch > a new entry opens a new stall window that alarms again [0.46ms]
+
+ 24 pass
+ 0 fail
+ 53 expect() calls
+Ran 24 tests across 2 files. [98.00ms]

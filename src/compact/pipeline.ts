@@ -230,6 +230,8 @@ export function computeAnchorCount(
  *  구조적 기준(content 블록 type)이지 키워드·정규식 분류가 아니다. compact-session 의
  *  overflow 재시도 drop 후보 선정도 이 계약을 공유한다(JUD-B #124147 · OP #124161). */
 export function isHumanUserMessage(m: LLMMessage): boolean {
+  // CEO-UTTERANCE-TAGGED-LAST ④ — human means the stored row's `from.kind === 'human'` when the provenance is known.
+  if (m.speaker !== undefined && m.speaker !== 'human') return false;
   return m.role === 'user'
     && (typeof m.content === 'string'
       || !(m.content as ContentBlock[]).some(b => (b as ContentBlock).type === 'tool_result'));

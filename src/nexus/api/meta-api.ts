@@ -1421,6 +1421,9 @@ export async function handlePromptStreamPost(
                 ...(resolvePromptHitlChannels(typeof body.sessionId === 'string' ? body.sessionId : '', opts) ?? {}),
                 ...(effectiveSurface ? { toolSurface: effectiveSurface } : {}),
                 ...(pdfSurface ? { fastPathEnabled: false } : {}),
+                // WEBCHAT-ORDINARY-SKIP-GROUNDING (OP 11-26): a member web-chat turn (wcs_ / emt_ relay channel) does
+                // not enter research by default — ordinary lines answer at once, sourced facts keep the fact path + tools.
+                ...(webChatMember !== undefined ? { researchEntry: 'on-request' as const } : {}),
                 ...(projectContext?.cwd || opts.toolCwd ? { toolCwd: projectContext?.cwd ?? opts.toolCwd } : {}),
                 ...(projectContext?.instructions ? { projectInstructions: projectContext.instructions } : {}),
                 signal: turnAbortController.signal,

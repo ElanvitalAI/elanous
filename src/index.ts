@@ -347,6 +347,9 @@ const registerGraphCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'graph'
 const registerLoopCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'loop'
   ? (() => undefined)
   : (require('./loops/loop-cli.js') as typeof import('./loops/loop-cli.js')).registerLoopCommands) as typeof import('./loops/loop-cli.js').registerLoopCommands;
+const registerLandCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'land'
+  ? (() => undefined)
+  : (require('./cli/land-graph-cli.js') as typeof import('./cli/land-graph-cli.js')).registerLandCommands) as typeof import('./cli/land-graph-cli.js').registerLandCommands;
 const registerResourceCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'resource'
   ? (() => undefined)
   : (require('./cli/resource-cli.js') as typeof import('./cli/resource-cli.js')).registerResourceCommands) as typeof import('./cli/resource-cli.js').registerResourceCommands;
@@ -1320,6 +1323,8 @@ registerWhereCommand(program);
 registerBenchCommands(program);
 registerShadowCommand(program);
 registerLlmDetectCommand(program);
+// GOAL-ORCHESTRATION-NL: `eln orchestrate validate|plan|run|control|stop|layout|status` (orchestration/v1 specs).
+if (!INDEX_FAST_ROOT) (require('./orchestration/cli.js') as typeof import('./orchestration/cli.js')).registerOrchestrationSpecCommands(program);
 registerStorageDetectCommand(program);
 registerLeaderCommands(program);
 registerPodCommands(program);
@@ -1701,6 +1706,7 @@ registerStartCommand(program);
 registerGroundingSourcesCli(program);
 registerGraphCommands(program);
 registerLoopCommands(program);
+registerLandCommands(program);
 registerResourceCommands(program);
 // RFC 실행·착지 루프 §3 — 태스크 컨텍스트 카드(`elanous card list|show` · ⛔ `task`/`tasks` 는 TOX 몫).
 registerCardCommand(program);
@@ -9207,6 +9213,8 @@ if (!INDEX_FAST_ROOT) {
 registerTasksCommands(program);
 registerBriefCommands(program);
 if (!INDEX_FAST_ROOT) (await import('./cli/burst-board-cli.js')).registerBurstBoardCommand(program);
+if (!INDEX_FAST_ROOT) (await import('./cli/invest-board-cli.js')).registerInvestBoardCommand(program);
+if (!INDEX_FAST_ROOT) (await import('./cli/orchestrate-cli.js')).registerOrchestrateCommand(program);
 registerLabelsCommands(program);
 registerMsgCommands(program);
 // CROWN-GOAL-APPLY — `autopilot goal set --seat <SEAT> "<goal>" --from OP`: a structured goal mail the seat's TUI applies.

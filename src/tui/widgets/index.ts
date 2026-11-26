@@ -13,3 +13,4 @@ export { renderFlowLane, type FlowLaneProps } from './flow-lane.js';
 export { renderTicker, type TickerEvent, type TickerProps } from './ticker.js';
 export { renderHostTile, type HostTileProps, type HostState } from './host-tile.js';
 export { renderSparkline } from './sparkline.js';
+export { panel, besides, fitRow, gaugeSegs, sparkSegs, chip, paintRow, rowText, rowCells, type Row, type Seg, type Tone, type PanelOpts } from './panel.js';

@@ -7,9 +7,9 @@
 //               live-failure fallback. A live data node that fails falls back to its fixture and says so (source field).
 // Safety: research only. Nothing here places, stages or simulates an order; the Conatus judge node reads the trade
 // mandate and records «집행: 비활성» — it never calls an executor.
-import { execFile, spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { curateStageHeadlines, tickerHeadlines } from './headline-curate.js';
 import { panelName } from '../../src/tui/widgets/scenes/invest-run.js';
@@ -25,6 +25,8 @@ const SKILLS = process.env.INVEST_DEMO_SKILLS_DIR ?? join(homedir(), '.claude/sk
 export const MENTOR_PACK_PATH = join(homedir(), 'elanous-hq/seat-state/OP/demo-aib/mentor-seed-pack-1121.md');
 /** The mentor pack was formed on this date; the event-shock node collects what happened after it. */
 export const MENTOR_PACK_DATE = '2026-11-21';
+/** The risk expert's 11-21 lecture summary (extracted from the camp recording). */
+export const JANG_RISK_SUMMARY = process.env.INVEST_DEMO_RISK_SUMMARY ?? join(homedir(), 'elanous-hq/pub/sites/yp-stock-forum/jang-risk-1121/summary.md');
 
 export type Runtime = 'eln' | 'codex' | 'claude';
 export interface DemoInput {
@@ -213,6 +215,18 @@ async function liveOr<T extends { source: string }>(ctx: InProcessHandlerContext
   }
 }
 
+/** Apify apidojo~tweet-scraper via the apify-x-asset-sentiment skill (token from the skill's env file — never printed). */
+async function apifyTweets(searches: readonly string[], maxItems: number): Promise<CrawlItem[]> {
+  const cwd = join(SKILLS, 'apify-x-asset-sentiment');
+  const out = join(tmpdir(), `invest-apify-${process.pid}-${Date.now()}.json`);
+  const args = searches.flatMap((q) => ['--search', q]);
+  const script = `source scripts/_load_env.sh 2>/dev/null; exec python3 scripts/run_tweet_scraper.py ${args.map(shq).join(' ')} --min-favs 5 --max-items ${maxItems} --sort Latest --out ${shq(out)}`;
+  const r = await run('bash', ['-c', script], { cwd, timeoutMs: 120_000 });
+  if (r.code !== 0) throw new Error(`apify exit ${r.code}`);
+  const raw = JSON.parse(readFileSync(out, 'utf8')) as Array<{ url?: string; text?: string; fullText?: string; createdAt?: string; likeCount?: number }>;
+  return raw.filter((t) => t.url).slice(0, 12).map((t) => ({ title: String(t.fullText ?? t.text ?? '').replace(/\s+/gu, ' ').slice(0, 160), url: String(t.url), snippet: `${t.createdAt ?? ''} · ${t.likeCount ?? 0} likes`, query: 'apify' }));
+}
+
 // ── Conatus ────────────────────────────────────────────────────────────────────────────────────────────────────────
 export interface ConatusResearchResult { source: string; pack: 'investment'; needed: boolean; reason: string; ok: boolean; summary: string; durationMs: number; skill: string; fallbackReason?: string }
 /** The Conatus research agent takes minutes (measured 11-24: > 150 s); a pre-warmed live result keeps the run ≤ 5 min. */
@@ -331,12 +345,15 @@ export interface PanelAnswer {
   tier?: string; weight?: number; emoji?: string;
   // mentor only
   slot?: number; gist?: string; direction?: string; scenario?: { q1: string; q2: string; h2: string }; verification?: HookResult[];
+  /** Risk expert only: applied from the risk lecture summary (riskSource) — never invented when the summary is absent. */
+  risk?: { verdict: string; maxPositionPct: number | null; stop: string; hedge: string; stopKo?: string; hedgeKo?: string }; riskSource?: 'lecture-summary' | 'pending';
 }
 
 function promptFor(role: 'panel' | 'mentor', who: { persona?: Persona; mentor?: Mentor }, question: string, factsheet: string, eventText: string, hooks: HookResult[]): string {
   const common = [`질문: «${question}» (삼성전자·SK하이닉스는 예시 종목).`, '', '## 공유 팩트시트 (엘라누스 그래프가 방금 모은 실데이터)', factsheet, '',
     `## 이벤트 충격 · 최근 7일 뉴스 (${MENTOR_PACK_DATE} 이후)`, eventText, ''];
-  const rules = ['규칙: 리서치 의견만. 주문·매매 지시 금지. 도구 호출·파일 쓰기 하지 말고 위 자료로만 답한다. 한국어 5~7문장 뒤, 마지막 줄에 JSON 한 줄만.'];
+  const rules = ['규칙: 리서치 의견만. 주문·매매 지시 금지. 도구 호출·파일 쓰기 하지 말고 위 자료로만 답한다. 한국어 5~7문장 뒤, 마지막 줄에 JSON 한 줄만.',
+    '출처 규칙: 숫자·사건 같은 사실은 위 줄의 [출처] 또는 URL 을 괄호로 붙여서만 말한다. 출처 없는 판단·전망은 문장 끝에 «(페르소나 의견)» 을 붙인다. «출처 확보 실패» 항목은 사실로 쓰지 않는다. 기억으로 숫자를 지어내지 않는다.'];
   if (role === 'mentor') {
     const m = who.mentor!;
     return [`너는 투자 멘토 «${m.name}»의 관점 틀을 적용하는 분석가다. 아래 틀은 ${MENTOR_PACK_DATE}에 형성됐다 — 그 뒤 이벤트(아래 뉴스)가 이 관점을 강화하는지 약화하는지 이유와 함께 말하라.`,
@@ -352,69 +369,25 @@ function promptFor(role: 'panel' | 'mentor', who: { persona?: Persona; mentor?: 
 
 interface CliResult { text: string; model: string; account: string; pane: string; durationMs: number; code: number }
 const shq = (s: string) => `'${s.replace(/'/gu, `'\\''`)}'`;
-/** One panel CLI run: a script that the els pane (or a headless child) executes; the answer lands in <dir>/<id>.out. */
+/** One panel CLI run: the shared worker child (src/orchestrate/worker.ts) in an els pane or headless; the answer lands in <dir>/<id>.out. */
 async function runPanelCli(id: string, label: string, binding: PanelNodeInput, prompt: string, dir: string, input: DemoInput, simulated?: string): Promise<CliResult> {
-  mkdirSync(dir, { recursive: true });
-  const promptFile = join(dir, `${id}.prompt.md`), outFile = join(dir, `${id}.out`), rcFile = join(dir, `${id}.rc`), script = join(dir, `${id}.sh`);
-  writeFileSync(promptFile, prompt);
-  const scrub = binding.runtime === 'claude' ? 'unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDECODE CLAUDE_CODE_ENTRYPOINT'
-    : binding.runtime === 'codex' ? 'unset OPENAI_API_KEY CODEX_API_KEY' : ':';
+  const { writeWorkerScript, runWorkerScript, parseWorkerOutput } = await import('../../src/orchestrate/worker.js');
+  const files = writeWorkerScript({ id, label, binding, prompt, dir, ...(simulated !== undefined ? { simulated, simDelayMs: input.simDelayMs ?? 1500 } : {}) });
   const model = binding.model;
-  let body: string;
-  if (simulated !== undefined) {
-    writeFileSync(join(dir, `${id}.sim.txt`), simulated);
-    const lines = Math.max(1, simulated.split('\n').length);
-    body = `while IFS= read -r line || [ -n "$line" ]; do printf '%s\\n' "$line"; sleep ${Math.max(0.02, (input.simDelayMs ?? 1500) / 1000 / lines).toFixed(3)}; done < ${shq(join(dir, `${id}.sim.txt`))} | tee ${shq(outFile)}`;
-  } else if (binding.runtime === 'eln') {
-    const env = [binding.provider ? `ELANOUS_LLM_PROVIDER=${shq(binding.provider)}` : '', model ? `ELANOUS_LLM_MODEL=${shq(model)}` : ''].filter(Boolean).join(' ');
-    body = `${env} bun ${shq(join(REPO_ROOT, 'bin/elanous.mjs'))} llm --json "$(cat ${shq(promptFile)})" | tee ${shq(outFile)}`;
-  } else if (binding.runtime === 'codex') {
-    body = `CODEX_HOME=${shq(process.env.INVEST_DEMO_CODEX_HOME ?? join(homedir(), '.codex-third-owner'))} codex exec --skip-git-repo-check --ephemeral -s read-only -C ${shq(dir)} ${model ? `-m ${shq(model)} ` : ''}-o ${shq(`${outFile}.last`)} - < ${shq(promptFile)} 2>&1 | tee ${shq(outFile)}`;
-  } else {
-    body = `claude -p --model ${shq(model ?? 'haiku')} --no-session-persistence --disallowed-tools Bash Edit Write WebFetch WebSearch < ${shq(promptFile)} 2>&1 | tee ${shq(outFile)}`;
-  }
-  writeFileSync(script, ['#!/bin/bash', `export PATH=${shq(process.env.PATH ?? '')}`, `export HOME=${shq(homedir())}`,
-    ...(process.env.ELANOUS_STATE_DIR ? [`export ELANOUS_STATE_DIR=${shq(process.env.ELANOUS_STATE_DIR)}`] : []), scrub,
-    `printf '\\033[1m▶ %s\\033[0m\\n' ${shq(`${label} · ${binding.runtime}${model ? ` · ${model}` : ''}${simulated !== undefined ? ' · simulated' : ''}`)}`,
-    `printf '%s\\n\\n' ${shq(prompt.split('\n')[0]!.slice(0, 120))}`, body, 'rc=${PIPESTATUS[0]}', `echo $rc > ${shq(rcFile)}`, 'printf "\\n[done rc=%s]\\n" $rc', ''].join('\n'));
-  const started = Date.now();
   const timeoutMs = simulated !== undefined ? (input.simDelayMs ?? 1500) + 30_000 : input.panelTimeoutMs ?? 150_000;
-  let pane = 'headless';
-  if (input.els) {
-    const ws = input.elsWorkspace ?? 'invest-demo';
-    // DEMO-INVEST-ELS-TARGET: the tab opens in the els this run targets (its universe's, or --els-socket) — through this
-    // tree's own CLI unless INVEST_DEMO_ELN names another, never through the installed operational binary by default.
+  // DEMO-INVEST-ELS-TARGET: the tab opens in the els this run targets (its universe's, or --els-socket) — through this
+  // tree's own CLI unless INVEST_DEMO_ELN names another, never through the installed operational binary by default.
+  const els = input.els ? (() => {
     const target = investElsTarget(process.env, input.elsSocket);
     const cli = process.env.INVEST_DEMO_ELN ? [process.env.INVEST_DEMO_ELN] : [process.execPath, join(REPO_ROOT, 'bin/elanous.mjs')];
-    const r = await run(cli[0]!, [...cli.slice(1), 'side', 'new', '--ws', ws, '--title', investTabTitle(id, binding.runtime), '--cwd', dir, '--', 'bash', script],
-      { timeoutMs: 15_000, env: investElsEnv(process.env, target) });
-    if (r.code === 0) pane = `els:${ws}/${label}`;
-  }
-  let code = 1;
-  if (pane === 'headless') {
-    const child = spawn('bash', [script], { stdio: 'ignore' });
-    code = await new Promise<number>((done) => {
-      const timer = setTimeout(() => { child.kill('SIGTERM'); done(124); }, timeoutMs);
-      child.on('exit', (c) => { clearTimeout(timer); done(c ?? 1); });
-    });
-  } else {
-    while (Date.now() - started < timeoutMs && !existsSync(rcFile)) await sleep(500);
-    code = existsSync(rcFile) ? Number(readFileSync(rcFile, 'utf8').trim()) : 124;
-  }
-  const raw = existsSync(`${outFile}.last`) ? readFileSync(`${outFile}.last`, 'utf8') : existsSync(outFile) ? readFileSync(outFile, 'utf8') : '';
-  let text = raw, usedModel = model ?? (simulated !== undefined ? recordedDefaultModel(binding.runtime) : binding.runtime === 'claude' ? 'haiku' : 'default');
-  if (simulated === undefined && binding.runtime === 'eln') {
-    let j: { reply?: string; model?: string; provider?: string } | undefined;
-    for (const line of raw.trim().split('\n').reverse()) { try { j = JSON.parse(line) as typeof j; break; } catch { /* not the envelope line */ } }
-    if (j?.reply) { text = j.reply; usedModel = `${j.provider ?? ''}/${j.model ?? ''}`; }
-  }
-  if (simulated === undefined && binding.runtime === 'codex') {
-    const m = /^model:\s*(\S+)/mu.exec(existsSync(outFile) ? readFileSync(outFile, 'utf8') : '');
-    if (m) usedModel = m[1]!;
-  }
+    return { cli, ws: input.elsWorkspace ?? 'invest-demo', title: `INV·${investTabTitle(id, binding.runtime, label)}`, env: investElsEnv(process.env, target) };
+  })() : undefined;
+  const r = await runWorkerScript(files, { timeoutMs, cwd: dir, ...(els ? { els } : {}) });
+  const parsed = simulated === undefined ? parseWorkerOutput(binding.runtime, r.raw, existsSync(files.outFile) ? readFileSync(files.outFile, 'utf8') : '') : { text: r.raw };
+  const usedModel = parsed.model ?? model ?? (simulated !== undefined ? recordedDefaultModel(binding.runtime) : binding.runtime === 'claude' ? 'haiku' : 'default');
   const account = simulated !== undefined ? 'fixture' : binding.runtime === 'claude' ? 'claude CLI login (subscription; API keys scrubbed)'
     : binding.runtime === 'codex' ? `codex CLI · CODEX_HOME=${process.env.INVEST_DEMO_CODEX_HOME ?? '~/.codex-third-owner'} (subscription; API keys scrubbed)` : 'eln test-universe router';
-  return { text, model: usedModel, account, pane, durationMs: Date.now() - started, code };
+  return { text: parsed.text, model: usedModel, account, pane: r.pane, durationMs: r.durationMs, code: r.code };
 }
 
 const ACTIONS = new Set(['BUY', 'HOLD', 'SELL']);
@@ -428,6 +401,9 @@ function parseAnswer(text: string): Partial<PanelAnswer> | undefined {
   return { action: action as PanelAnswer['action'], confidence, view: String(j.view ?? '').slice(0, 240), divergence: j.divergence === undefined ? undefined : String(j.divergence).slice(0, 200),
     eventImpact: j.eventImpact === undefined ? undefined : String(j.eventImpact).slice(0, 20), eventWhy: j.eventWhy === undefined ? undefined : String(j.eventWhy).slice(0, 200),
     direction: j.direction === undefined ? undefined : String(j.direction).slice(0, 40),
+    ...(j.risk && typeof j.risk === 'object' ? { risk: (() => { const r = j.risk as Record<string, unknown>; const pct = Number(r.maxPositionPct);
+      return { verdict: String(r.verdict ?? '').slice(0, 40), maxPositionPct: Number.isFinite(pct) ? Math.max(0, Math.min(100, pct)) : null, stop: String(r.stop ?? '').slice(0, 160), hedge: String(r.hedge ?? '').slice(0, 160),
+        ...(r.stopKo ? { stopKo: String(r.stopKo).slice(0, 160) } : {}), ...(r.hedgeKo ? { hedgeKo: String(r.hedgeKo).slice(0, 160) } : {}) }; })() } : {}),
     scenario: scenario ? { q1: String(scenario.q1 ?? '').slice(0, 120), q2: String(scenario.q2 ?? '').slice(0, 120), h2: String(scenario.h2 ?? '').slice(0, 120) } : undefined };
 }
 
@@ -529,7 +505,17 @@ export function createInvestDemoHandlers(): InProcessHandlerRegistry {
   handlers.flows = (ctx) => liveOr(ctx, 'flows', liveFlows);
   handlers.score = (ctx) => liveOr(ctx, 'score', () => liveScore(resultOf<{ ticker: string }>(ctx, 'plan')?.ticker ?? '005930.KO'));
   handlers.news = (ctx) => liveOr(ctx, 'news', async () => ({ source: 'live:omni-crawl', ...(await crawl('2027 코스피 전망 삼성전자 SK하이닉스', ['--time-range', 'week', '--limit', '6'])) }));
-  handlers['x-pulse'] = (ctx) => liveOr(ctx, 'x-pulse', async () => ({ source: 'live:omni-crawl/grok-x', ...(await crawl('KOSPI 2027 outlook Samsung SK hynix', ['--engine', 'grok-x'], 90_000)) }));
+  // X: Apify tweet-scraper (real tweets with URLs) ∥ grok-x summary. Either may fail alone; both failing → fixture fallback.
+  handlers['x-pulse'] = (ctx) => liveOr(ctx, 'x-pulse', async () => {
+    const t0 = new Date().toISOString();
+    const [tweets, grok] = await Promise.allSettled([apifyTweets(['Samsung Electronics stock', '$005930 OR KOSPI Samsung OR "SK hynix" HBM'], 20), crawl('KOSPI 2027 outlook Samsung SK hynix', ['--engine', 'grok-x'], 90_000)]);
+    const items = tweets.status === 'fulfilled' ? tweets.value : [];
+    const summary = grok.status === 'fulfilled' ? grok.value.summary : null;
+    if (!items.length && !summary) throw new Error(`x-pulse: apify ${tweets.status === 'rejected' ? String(tweets.reason).slice(0, 120) : 'empty'} · grok-x ${grok.status}`);
+    return { source: items.length ? 'live:apify-tweet-scraper+grok-x' : 'live:omni-crawl/grok-x', items: [...items, ...(grok.status === 'fulfilled' ? grok.value.items : [])], summary,
+      calls: [{ tool: 'apify tweet-scraper', n: tweets.status === 'fulfilled' ? 2 : 0, ok: tweets.status === 'fulfilled', items: items.length, startedAt: t0, endedAt: new Date().toISOString() },
+        { tool: 'omni-crawl grok-x', n: 1, ok: grok.status === 'fulfilled', items: summary ? 1 : 0, startedAt: t0, endedAt: new Date().toISOString() }] };
+  });
   handlers['event-shock'] = (ctx) => liveOr(ctx, 'event-shock', async () => {
     // Query wording matters (measured 11-24): «reinstated NVIDIA CEO» surfaced the 11-17 «will not reinstate» stories first;
     // the board-statement wording surfaces the 11-23 reinstatement and the NVDA +30% day.
@@ -544,17 +530,23 @@ export function createInvestDemoHandlers(): InProcessHandlerRegistry {
     const market = resultOf<MarketResult>(ctx, 'market'), flows = resultOf<FlowsResult>(ctx, 'flows'), score = resultOf<ScoreResult>(ctx, 'score');
     const news = resultOf<{ items: CrawlItem[] }>(ctx, 'news'), x = resultOf<{ summary: string | null; items: CrawlItem[] }>(ctx, 'x-pulse');
     const event = resultOf<{ items: CrawlItem[] }>(ctx, 'event-shock'), conatus = resultOf<ConatusResearchResult>(ctx, 'conatus-research');
+    // DEMO-SOURCES-VIA-SECRET: in a live run a node that fell back to its recorded fixture is not a source — its line
+    // says «출처 확보 실패» and carries no numbers, so no panelist can state a fact from it. Every other line names its source.
+    const srcOf = (r: unknown): string | undefined => (r as { source?: string } | undefined)?.source;
+    const dead = (r: unknown): boolean => !input.fixtures && (!r || /^fixture/u.test(srcOf(r) ?? ''));
+    const gap = (what: string) => `${what}: 출처 확보 실패 — 사실로 쓰지 말 것`;
+    const tag = (r: unknown, provider: string) => `[출처: ${provider} · ${srcOf(r) ?? '?'}]`;
     const line = (k: string, unit = '') => { const v = market?.series[k]; return v ? `${k} ${Math.round(v.last * 100) / 100}${unit} (${v.date} · 1M ${v.chg1m ?? '?'}% · 3M ${v.chg3m ?? '?'}% · 1Y 고 ${Math.round(v.high1y)} 저 ${Math.round(v.low1y)})` : `${k} 없음`; };
     const facts = [
-      `시세: ${['KOSPI', 'SAMSUNG', 'SKHYNIX', 'SOXX', 'NVDA'].map((k) => line(k)).join(' | ')}`,
-      `거시: ${line('US10Y', '%')} | ${line('DXY')} | ${line('USDKRW')} | ${line('WTI')}`,
-      flows ? `수급(KOSPI, 백만원): 외국인 5일 ${flows.kospi.foreign5dMillion} · 20일 ${flows.kospi.foreign20dMillion} · 기관 5일 ${flows.kospi.inst5dMillion} · 삼성전자 외국인 5일 ${flows.samsungForeign5dShares ?? '?'}주` : '수급 없음',
-      score ? `매력도(asset-attractiveness semis · ${score.symbol} · ${score.asOf}): ${score.total}/100 · ${score.signal} · z ${score.z} · ${Object.entries(score.tiers).map(([k, v]) => `${k} ${v.score}`).join(' · ')}` : '매력도 없음',
-      `뉴스: ${(news?.items ?? []).slice(0, 4).map((i) => i.title).join(' / ')}`,
-      `X 여론: ${(x?.summary ?? '').replace(/\s+/gu, ' ').slice(0, 400)}`,
-      `코나투스 리서치: ${(conatus?.summary ?? '').replace(/\s+/gu, ' ').slice(0, 500)}`,
-    ].join('\n');
-    const eventText = (event?.items ?? []).slice(0, 8).map((i) => `- ${i.title} — ${i.snippet.slice(0, 160)} (${i.url})`).join('\n') || '- (수집 없음)';
+      dead(market) ? gap('시세·거시') : `시세: ${['KOSPI', 'SAMSUNG', 'SKHYNIX', 'SOXX', 'NVDA'].map((k) => line(k)).join(' | ')} ${tag(market, 'EODHD (omni-market)')}`,
+      dead(market) ? '' : `거시: ${line('US10Y', '%')} | ${line('DXY')} | ${line('USDKRW')} | ${line('WTI')} ${tag(market, 'EODHD (omni-market)')}`,
+      dead(flows) ? gap('수급') : flows ? `수급(KOSPI, 백만원): 외국인 5일 ${flows.kospi.foreign5dMillion} · 20일 ${flows.kospi.foreign20dMillion} · 기관 5일 ${flows.kospi.inst5dMillion} · 삼성전자 외국인 5일 ${flows.samsungForeign5dShares ?? '?'}주 ${tag(flows, 'KIS·KRX (kr-flow)')}` : '수급 없음',
+      dead(score) ? gap('매력도') : score ? `매력도(asset-attractiveness semis · ${score.symbol} · ${score.asOf}): ${score.total}/100 · ${score.signal} · z ${score.z} · ${Object.entries(score.tiers).map(([k, v]) => `${k} ${v.score}`).join(' · ')} ${tag(score, 'asset-attractiveness 모델 점수')}` : '매력도 없음',
+      dead(news) ? gap('뉴스') : `뉴스: ${(news?.items ?? []).slice(0, 4).map((i) => `${i.title} (${i.url})`).join(' / ')}`,
+      dead(x) ? gap('X 여론') : `X 여론: ${(x?.summary ?? '').replace(/\s+/gu, ' ').slice(0, 400)} ${tag(x, (x?.items ?? []).slice(0, 3).map((i) => i.url).join(' ') || 'X')}`,
+      dead(conatus) ? gap('코나투스 리서치') : `코나투스 리서치: ${(conatus?.summary ?? '').replace(/\s+/gu, ' ').slice(0, 500)} ${tag(conatus, 'Conatus research')}`,
+    ].filter(Boolean).join('\n');
+    const eventText = dead(event) ? `- ${gap('이벤트 뉴스')}` : (event?.items ?? []).slice(0, 8).map((i) => `- ${i.title} — ${i.snippet.slice(0, 160)} (${i.url})`).join('\n') || '- (수집 없음)';
     let mentors: Mentor[]; let mentorSource: string;
     const packPath = input.mentorPack ?? (input.fixtures ? join(FIXTURE_DIR, 'mentor-pack.fixture.md') : MENTOR_PACK_PATH);
     try { mentors = parseMentorPack(readFileSync(packPath, 'utf8')); mentorSource = packPath === MENTOR_PACK_PATH ? 'private-pack' : packPath.startsWith(FIXTURE_DIR) ? 'fixture' : 'custom'; }
@@ -577,6 +569,14 @@ export function createInvestDemoHandlers(): InProcessHandlerRegistry {
       label = mentor.name;
       prompt = promptFor('mentor', { mentor }, plan.question, fs.factsheet, fs.eventText, verification);
       base = { slot: mentor.slot, gist: mentor.gist, verification };
+      if (mentor.name.startsWith('장우진')) {
+        // The risk expert (대표 11-26): his 11-21 risk lecture summary drives a risk verdict; absent → «source pending», nothing invented.
+        const summary = existsSync(JANG_RISK_SUMMARY) && !input.fixtures ? readFileSync(JANG_RISK_SUMMARY, 'utf8').slice(0, 6000) : '';
+        base = { ...base, riskSource: summary ? 'lecture-summary' : 'pending' };
+        if (summary) prompt += ['', '## 리스크 관리 강의 요약 (11-21 용평 캠프 · 원문 인용 금지 · 틀만 적용)', summary, '',
+          '위 리스크 틀(포지션 크기 · 손절 규칙 · «1월 충격 → 2분기 유동성 회복» 국면)을 오늘 실데이터에 적용해 JSON 에 "risk" 를 더하라 — risk 값은 영어로:',
+          '강의에는 손절 % 가 없다 — 지어내지 말고 강의의 지수 수준 규칙(7,500 부터 비중 축소 · 1차 바닥 4,600~4,800 · 최악 ≈3,200 등 요약에 있는 것만)을 오늘 KOSPI·수급에 적용하라. 강의 인용은 하지 말 것.', '"risk":{"verdict":"REDUCE|HOLD SIZE|ADD","maxPositionPct":0-100,"stop":"one English line: his index-level rule applied to today (levels from the lecture)","hedge":"one English line: hedge / re-entry condition from his regime view","stopKo":"stop 과 같은 내용 한국어 한 줄","hedgeKo":"hedge 와 같은 내용 한국어 한 줄"}'].join('\n');
+      }
     } else {
       const persona = loadPanel().personas.find((p) => p.id === binding.persona);
       if (!persona) return ok({ id: ctx.nodeId, role: 'panel', label: binding.persona ?? ctx.nodeId, runtime: binding.runtime, model: '-', account: '-', pane: '-', status: 'failed', durationMs: 0, source: '-', error: 'unknown persona' } satisfies PanelAnswer);
@@ -679,9 +679,9 @@ export function createInvestDemoHandlers(): InProcessHandlerRegistry {
       framework: score ? { total: score.total, signal: score.signal, z: score.z, tiers: score.tiers, asOf: score.asOf } : null,
       events: tickerHeadlines(plan.ticker, [resultOf<{ items: CrawlItem[] }>(ctx, 'news')?.items ?? [], event?.items ?? []]).slice(0, 8).map((i) => ({ title: i.title, url: i.url })),
       panel: panel.map((a) => ({ id: a.id, label: a.label, emoji: a.emoji, tier: a.tier, weight: a.weight, runtime: a.runtime, model: a.model, pane: a.pane, status: a.status,
-        action: a.action ?? null, confidence: a.confidence ?? null, view: a.view ?? null, eventImpact: a.eventImpact ?? null, durationMs: a.durationMs })),
+        action: a.action ?? null, confidence: a.confidence ?? null, divergence: a.divergence ?? null, view: a.view ?? null, eventImpact: a.eventImpact ?? null, durationMs: a.durationMs })),
       mentors: mentors.map((a) => ({ id: a.id, name: a.label, gist: a.gist, runtime: a.runtime, model: a.model, status: a.status, direction: a.direction ?? null, action: a.action ?? null,
-        confidence: a.confidence ?? null, durationMs: a.durationMs, pane: a.pane, scenario: a.scenario ?? null, changeSince1121: a.eventImpact ? { impact: a.eventImpact, why: a.eventWhy ?? '' } : null,
+        confidence: a.confidence ?? null, durationMs: a.durationMs, pane: a.pane, scenario: a.scenario ?? null, risk: a.risk ?? null, riskSource: a.riskSource ?? null, changeSince1121: a.eventImpact ? { impact: a.eventImpact, why: a.eventWhy ?? '' } : null,
         verification: a.verification ?? [] })),
       consensus: { panel: c.panel, mentors: c.mentors, overall: c.overall },
       decisions: triage.items.map((i) => ({ id: i.id, title: i.title, mode: i.mode, criterion: i.criterion })), decisionSummary: triage.summary,
@@ -717,8 +717,10 @@ export function createInvestDemoHandlers(): InProcessHandlerRegistry {
 }
 
 /** Product text for the els tab of one panelist — English stage name · runtime («Global macro · eln»). */
-export const investTabTitle = (nodeId: string, runtime: string): string =>
-  `${panelName(nodeId.replace(/-retry$/u, ''))} · ${runtime}${nodeId.endsWith('-retry') ? ' · retry' : ''}`;
+export const investTabTitle = (nodeId: string, runtime: string, label?: string): string =>
+  `${(label && EXPERT_EN[label.replace(/\s*\(.*$/u, '').trim()]) ?? panelName(nodeId.replace(/-retry$/u, ''))} · ${runtime}${nodeId.endsWith('-retry') ? ' · retry' : ''}`;
+/** Romanized names of the camp experts (the pack is Korean; tab titles and the board are English). */
+export const EXPERT_EN: Readonly<Record<string, string>> = { '빈센트': 'Vincent', '박병창': 'Park Byung-chang', '장우진': 'Jang Woo-jin · Risk' };
 
 /** «25 decisions → 24 automatic · 1 for you» — the English line the run summary prints. */
 export const investDecisionSummaryEn = (total: number, human: number): string =>

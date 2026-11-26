@@ -23,7 +23,7 @@ test('seat OP with a live eln pane and a dead-eln shell pane: exactly one row, t
     pane('p1', { seat: 'OP', kind: 'eln', command: ['eln'], fgCommand: ['eln'] }),
     pane('p2', { seat: 'OP', kind: 'shell', command: ['eln'] }),
   ] })).toEqual([
-    ' ▾ OP · 1',
+    ' ⌄ OP                         1',
     ' ⚪ OP',
   ]);
 });
@@ -33,7 +33,7 @@ test('seat whose only pane is an exited shell: one «⏹ OP exited» row, even w
     pane('p2', { seat: 'OP', kind: 'shell', command: ['eln'] }),
     pane('p3', { seat: 'OP', state: 'exited', activityState: 'exited', command: ['eln'] }),
   ] })).toEqual([
-    ' ▾ OP · 1',
+    ' ⌄ OP                         1',
     ' ⏹ OP exited',
   ]);
 });
@@ -51,10 +51,10 @@ test('a seat that lives in another space keeps only its live row; another seat\'
     { address: 'w2/t9/p9', workspace: 'tc', tab: 't9', pane: 'p9', title: 'OP', state: 'working', activityState: 'working', seat: 'OP', kind: 'codex', command: ['codex'], fgCommand: ['codex'] },
     pane('p5', { title: 'TC', seat: 'TC', kind: 'claude', command: ['claude'], fgCommand: ['claude'] }),
   ] })).toEqual([
-    ' ▾ OP · 1',
+    ' ⌄ OP                         1',
     ' ⚪ TC',
     '    claude-code',
-    ' ▾ TC · 1',
+    ' ⌄ TC                         1',
     ' 🟢 OP',
     '    codex-cli',
   ]);

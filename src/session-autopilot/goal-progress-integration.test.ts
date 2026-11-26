@@ -18,10 +18,10 @@ const end = () => {
   return { selfInitiated: true, failed: false, stateChanged: true, fingerprint: `turn-${turnSeq}`, toolRows: [] as [] };
 };
 const openTaskGoal = (pilot: ReturnType<typeof createAutopilot>, doneCheck: string) =>
-  pilot.set({
-    on: true, goal: '0.3.36 그린 5개 칸', doneCriterion: '판정 한 줄', kind: 'task',
+  (pilot.noteTurnStart('human', '0.3.36 그린 5개 칸 골로 잡아'), pilot.set({
+    explicitAsk: '골로 잡아', on: true, goal: '0.3.36 그린 5개 칸', doneCriterion: '판정 한 줄', kind: 'task',
     deadline: '2026-11-30T00:00:00.000Z', expectedMinutes: 60, doneCheck,
-  }, 'tool');
+  }, 'tool'));
 
 const root = mkdtempSync(join(tmpdir(), 'goal-driven-integration-'));
 afterAll(() => rmSync(root, { recursive: true, force: true }));

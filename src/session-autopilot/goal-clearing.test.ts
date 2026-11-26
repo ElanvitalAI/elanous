@@ -157,7 +157,7 @@ test('threshold: too small · no deadline · ≤1 autopilot goal / 30 min · ≤
   expect(goal(h, '로스터 재조정').ok).toBe(true);
   h.advance(10 * MIN);
   expect(goal(h, '다른 골')).toEqual({ ok: false, text: '자율주행 골은 30분에 1개까지 — 지금 골을 끝내거나(goal_done) 30분 뒤에 바꾼다' });
-  const pin = (text: string) => h.pilot.set({ on: true, goal: text, doneCriterion: `${text} 끝`, deadline: iso(h.now() + 60 * MIN), expectedMinutes: 20 }, 'tool');
+  h.pilot.noteTurnStart('human', '이거 골로 잡아'); const pin = (text: string) => h.pilot.set({ explicitAsk: '골로 잡아', on: true, goal: text, doneCriterion: `${text} 끝`, deadline: iso(h.now() + 60 * MIN), expectedMinutes: 20 }, 'tool');
   expect([pin('핀 1').ok, pin('핀 2').ok, pin('핀 3').ok]).toEqual([true, true, true]);
   expect(pin('핀 4')).toEqual({ ok: false, text: '작업 골(핀) 변경은 30분에 3번까지 — 지금 핀부터 끝낸다' });
   expect(h.events('goal-rejected').map((d) => d.reason)).toEqual(['too-small', 'rate-autopilot', 'rate-pin']);

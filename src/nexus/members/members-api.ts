@@ -14,7 +14,15 @@ import {
   type MemberStore,
   type MemberSignupIntent,
   type MemberNewsletterPreferenceInput,
+  type OwnerUnlockOutcome,
 } from "./member-store.js";
+import {
+  OWNER_UNLOCK_ATTEMPT_LIMIT,
+  OWNER_UNLOCK_ATTEMPT_WINDOW_MS,
+  OWNER_UNLOCK_CODE_MAX_CHARS,
+  OWNER_UNLOCKABLE_HANDLES,
+  checkOwnerUnlockCode,
+} from "./member-owner-unlock.js";
 import {
   createAppLifecycleStore,
   type AppLifecycleStore,
@@ -192,6 +200,8 @@ export interface MembersApiOptions {
   /** Exact website origin allowed to use the member cookie cross-origin. */
   readonly webOrigin?: string;
   readonly now?: () => number;
+  /** Where the owner unlock secret file path is read (ELANOUS_MEMBER_OWNER_UNLOCK_CODE_FILE); tests pass an isolated env. */
+  readonly ownerUnlockEnv?: NodeJS.ProcessEnv;
   readonly appLifecycle?: AppLifecycleReader;
   /** Lazily resolve the lifecycle store so transient startup failures can recover on a later read. */
   readonly getAppLifecycle?: () => AppLifecycleReader;
@@ -204,6 +214,9 @@ export interface MembersApiOptions {
     appId: string,
     memberId: string,
   ) => { readonly sessionToken: string; readonly expiresAt: string };
+  /** MEMBER-CONNECT-NO-MOUNT — is this app slug mounted on this host's app host? When it says false, `member connect`
+   * exchange issues the session from the member and their slot (store) instead of the mounted app. Absent = mounted. */
+  readonly appMounted?: (appSlug: string) => boolean;
   readonly resolveVerifiedOwner?: (
     appSlug: string,
     sessionCredential: string,
@@ -594,6 +607,7 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
       "app auth redirects must be exact allowlisted elanous:// URIs",
     );
   const now = options.now ?? Date.now;
+  const ownerUnlockEnv = options.ownerUnlockEnv ?? process.env;
   const cloudBackupRoute =
     options.cloudBackupRoute ??
     createMemberCloudBackupRoute({ memberStore: options.store });
@@ -604,13 +618,38 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
     options.deploymentApprovals ?? {},
   );
   const tokens = createMemberTokenApi({ store: options.store, now });
+  /** MEMBER-CONNECT-NO-MOUNT — owner for a store-issued connect session; undefined = not such a session (fall through). */
+  const connectSessionOwner = (
+    bearer: string,
+    appSlug: string | null,
+  ): { memberId: string; userSlug?: string; plan?: string; entitlements?: Readonly<Record<string, unknown>> } | null | undefined => {
+    const found = options.store.memberForConnectSession?.(
+      bearer,
+      new Date(now()).toISOString(),
+    );
+    if (!found) return undefined;
+    const slot = options.store.appSlotForMember(found.memberId);
+    if (!slot || slot.appId !== found.appId) return null;
+    if (appSlug && slot.appSlug !== appSlug) return null;
+    const plan = options.store.memberPlanForMember(found.memberId);
+    const userSlug = options.store.publicUserSlugForMember(found.memberId);
+    return {
+      memberId: found.memberId,
+      ...(userSlug ? { userSlug } : {}),
+      ...(plan ? { plan: plan.plan, entitlements: plan.entitlements } : {}),
+    };
+  };
   const connectEntry = createMemberConnectEntry({
     store: options.store,
     origin: callback.origin,
     now,
     enabled: Boolean(
-      options.issueOwnerSession && options.store.createAppAuthCode,
+      (options.issueOwnerSession || options.store.issueMemberConnectSession) &&
+        options.store.createAppAuthCode,
     ),
+    // MEMBER-CONNECT-APPROVE-HOME: a browser without a member session gets guidance, not a bare 401.
+    loginUrl: new URL("/members/", webOrigin).toString(),
+    homeUrl: new URL("/v1/members/home", callback.origin).toString(),
     memberForRequest: (request) => {
       try {
         const token = sessionFromCookie(request);
@@ -760,8 +799,12 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
         let appMemberId: string | undefined;
         try {
           appMemberId = appKeyBearer
-            ? options.resolveVerifiedMemberOwner?.(appKeyBearer, options.store)
-                ?.memberId
+            ? (options.store.memberForConnectSession?.(
+                appKeyBearer,
+                new Date(now()).toISOString(),
+              )?.memberId ??
+              options.resolveVerifiedMemberOwner?.(appKeyBearer, options.store)
+                ?.memberId)
             : undefined;
         } catch {
           return respond(json({ error: "unauthorized" }, 401));
@@ -1167,6 +1210,14 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           // The handle address <handle>.elanous.app is shown as text only: the relay serves <app>--<user>
           // hosts, and the web /app redirects to «곧 열립니다», so neither is a button target.
           myElanous: { handleAddress: handle ? `${handle}.elanous.app` : null },
+          // MEMBER-CONNECT-APPROVE-HOME: only requests this member already opened while signed in.
+          connectRequests: (() => {
+            try {
+              return connectEntry.pendingForMember(member.id);
+            } catch {
+              return null;
+            }
+          })(),
           siteUrl: new URL("/", webOrigin).toString(),
           // MEMBER-JOURNEY S3: the handle confirmation step moved from the static site
           // (/members/) onto the member server itself — same origin as this home.
@@ -1416,21 +1467,29 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           : null;
         const webSlot =
           appSlug && member ? options.store.appSlotForMember(member.id) : null;
-        const owner = appSlug
-          ? member
-            ? webSlot?.appSlug === appSlug
-              ? { memberId: member.id }
-              : null
-            : options.resolveVerifiedOwner?.(
-                appSlug,
-                bearer ?? request.headers.get("cookie") ?? "",
-                options.store,
-              )
-          : bearer?.startsWith("aps_")
-            ? options.resolveVerifiedMemberOwner?.(bearer, options.store)
-            : member
-              ? { memberId: member.id }
-              : null;
+        // MEMBER-CONNECT-NO-MOUNT: a store-issued connect session proves the member and their own slot.
+        const connect =
+          !member && bearer?.startsWith("aps_")
+            ? connectSessionOwner(bearer, appSlug)
+            : undefined;
+        const owner =
+          connect !== undefined
+            ? connect
+            : appSlug
+              ? member
+                ? webSlot?.appSlug === appSlug
+                  ? { memberId: member.id }
+                  : null
+                : options.resolveVerifiedOwner?.(
+                    appSlug,
+                    bearer ?? request.headers.get("cookie") ?? "",
+                    options.store,
+                  )
+              : bearer?.startsWith("aps_")
+                ? options.resolveVerifiedMemberOwner?.(bearer, options.store)
+                : member
+                  ? { memberId: member.id }
+                  : null;
         return withCors(
           request,
           owner ? json(owner) : json({ error: "unauthorized" }, 401),
@@ -1759,12 +1818,24 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
             webOrigin,
           );
         }
+        // MEMBER-HANDLE-OWNER-UNLOCK: the only optional field is `ownerUnlockCode` (a non-empty string, never stored or echoed).
+        const bodyKeys =
+          body && typeof body === "object" && !Array.isArray(body)
+            ? Object.keys(body)
+            : [];
+        const ownerUnlockCode = (body as { ownerUnlockCode?: unknown } | null)
+          ?.ownerUnlockCode;
         if (
           !body ||
           typeof body !== "object" ||
           Array.isArray(body) ||
-          Object.keys(body).length !== 1 ||
-          typeof (body as { handle?: unknown }).handle !== "string"
+          !bodyKeys.includes("handle") ||
+          bodyKeys.some((key) => key !== "handle" && key !== "ownerUnlockCode") ||
+          typeof (body as { handle?: unknown }).handle !== "string" ||
+          (bodyKeys.includes("ownerUnlockCode") &&
+            (typeof ownerUnlockCode !== "string" ||
+              ownerUnlockCode.length === 0 ||
+              ownerUnlockCode.length > OWNER_UNLOCK_CODE_MAX_CHARS))
         ) {
           return withCors(
             request,
@@ -1784,7 +1855,7 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           if (!/^[a-z][a-z0-9]{2,19}$/.test(requested))
             throw new Error("invalid member ID");
           if (
-            requested === "user" &&
+            (requested === "user" || typeof ownerUnlockCode === "string") &&
             (authorization || member?.id !== memberId)
           ) {
             return withCors(
@@ -1792,6 +1863,54 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
               json({ error: "member-id-reserved" }, 403),
               webOrigin,
             );
+          }
+          // MEMBER-HANDLE-OWNER-UNLOCK (대표 11-26): rate limit first (no secret read over the limit), then the unlockable set
+          // («admin» never), then the owner pin, then the code. Every refusal answers the same 403 so a non-owner learns nothing
+          // about the code; the audit row keeps the precise outcome (never the code).
+          let ownerUnlockAttemptId: string | null = null;
+          let ownerUnlocked = false;
+          if (typeof ownerUnlockCode === "string") {
+            const at = new Date(now()).toISOString();
+            const windowStartsAt = new Date(
+              now() - OWNER_UNLOCK_ATTEMPT_WINDOW_MS,
+            ).toISOString();
+            ownerUnlockAttemptId = options.store.beginOwnerUnlockAttempt(
+              memberId,
+              requested,
+              at,
+              windowStartsAt,
+              OWNER_UNLOCK_ATTEMPT_LIMIT,
+            );
+            if (ownerUnlockAttemptId === null) {
+              debug.log("members.handle", "owner-unlock", { outcome: "rate-limited" }, { level: "warn" });
+              return withCors(
+                request,
+                json({ error: "rate-limited" }, 429),
+                webOrigin,
+              );
+            }
+            const refusal: OwnerUnlockOutcome | null = !OWNER_UNLOCKABLE_HANDLES.has(requested)
+              ? "not-unlockable"
+              : !options.store.isReservedHandleOwner(memberId)
+                ? "not-owner"
+                : (() => {
+                    const verdict = checkOwnerUnlockCode(ownerUnlockCode, ownerUnlockEnv);
+                    return verdict === "match"
+                      ? null
+                      : verdict === "unavailable"
+                        ? "unavailable"
+                        : "bad-code";
+                  })();
+            if (refusal) {
+              options.store.finishOwnerUnlockAttempt(ownerUnlockAttemptId, refusal);
+              debug.log("members.handle", "owner-unlock", { outcome: refusal }, { level: "warn" });
+              return withCors(
+                request,
+                json({ error: "member-id-reserved" }, 403),
+                webOrigin,
+              );
+            }
+            ownerUnlocked = true;
           }
           const slot = options.store.appSlotForMember(memberId);
           const previousUrl = slot ? options.publicAppUrl?.(slot) : null;
@@ -1812,11 +1931,23 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
               /* absent legacy URL needs no migration */
             }
           }
-          const handle = options.store.claimHandle(
-            memberId,
-            requested,
-            previousUserSlug,
-          );
+          let handle: string;
+          try {
+            handle = options.store.claimHandle(
+              memberId,
+              requested,
+              previousUserSlug,
+              ownerUnlocked ? { ownerUnlocked: true } : undefined,
+            );
+          } catch (claimError) {
+            if (ownerUnlockAttemptId)
+              options.store.finishOwnerUnlockAttempt(ownerUnlockAttemptId, "claim-failed");
+            throw claimError;
+          }
+          if (ownerUnlockAttemptId) {
+            options.store.finishOwnerUnlockAttempt(ownerUnlockAttemptId, "claimed");
+            debug.log("members.handle", "owner-unlock", { outcome: "claimed" });
+          }
           // The claim is durable in the member store; the relay pin is best-effort
           // so a temporarily offline relay never fails the claim itself.
           try {
@@ -2383,7 +2514,11 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           return exchangeResponse("method-refused", 405, {
             error: "method-not-allowed",
           });
-        if (!options.issueOwnerSession || !options.store.consumeAppAuthCode)
+        if (
+          (!options.issueOwnerSession &&
+            !options.store.issueMemberConnectSession) ||
+          !options.store.consumeAppAuthCode
+        )
           return exchangeResponse("issuer-unavailable", 503, {
             error: "app-session-unavailable",
           });
@@ -2445,16 +2580,37 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
             error: "app-slot-not-found",
           });
         try {
-          const issued = options.store.withActiveForAuth(
-            exchanged.memberId,
-            () => options.issueOwnerSession!(slot.appSlug, exchanged.memberId),
-          );
+          // MEMBER-CONNECT-NO-MOUNT (OP 11-26 15:42): a slot whose app was never built is not mounted on
+          // the members host, so the app issuer throws. The session then comes from the member and their own
+          // slot (store-issued, same aps_ shape and life); a mounted app keeps the app owner session.
+          const fromApp =
+            options.issueOwnerSession !== undefined &&
+            (options.appMounted?.(slot.appSlug) ?? true);
+          if (!fromApp && !options.store.issueMemberConnectSession)
+            return exchangeResponse("issuer-unavailable", 503, {
+              error: "app-session-unavailable",
+            });
+          // The store issuer re-checks deletion state inside its own transaction (a throw lands in the 503 below).
+          const issued = fromApp
+            ? options.store.withActiveForAuth(exchanged.memberId, () =>
+                options.issueOwnerSession!(slot.appSlug, exchanged.memberId),
+              )
+            : options.store.activeForAuth(exchanged.memberId)
+              ? {
+                  active: true as const,
+                  value: options.store.issueMemberConnectSession!(
+                    exchanged.memberId,
+                    slot.appId,
+                    new Date(now()).toISOString(),
+                  ),
+                }
+              : { active: false as const };
           if (!issued.active)
             return exchangeResponse("member-inactive", 401, {
               error: "unauthorized",
             });
           const session = issued.value;
-          return exchangeResponse("session-issued", 200, {
+          return exchangeResponse(fromApp ? "session-issued" : "member-session-issued", 200, {
             appId: slot.appId,
             sessionToken: session.sessionToken,
             tokenType: "Bearer",
@@ -2712,6 +2868,7 @@ export function createConfiguredMembersApi(
   options: Pick<
     MembersApiOptions,
     | "issueOwnerSession"
+    | "appMounted"
     | "resolveVerifiedOwner"
     | "resolveVerifiedMemberOwner"
     | "publicAppUrl"
@@ -2810,6 +2967,7 @@ export function createConfiguredMembersApi(
     ...(options.issueOwnerSession
       ? { issueOwnerSession: options.issueOwnerSession }
       : {}),
+    ...(options.appMounted ? { appMounted: options.appMounted } : {}),
     ...(options.resolveVerifiedOwner
       ? { resolveVerifiedOwner: options.resolveVerifiedOwner }
       : {}),

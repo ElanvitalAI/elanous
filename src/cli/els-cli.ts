@@ -13,9 +13,11 @@ import { createHash } from 'node:crypto';
 import { elsSkillText, type SkillVerb } from '../els/skill.js';
 import { formatPaneStatus, type PaneStatus } from '../els/pane-status.js';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { prodInstanceRoot } from '../instance/resolve.js';
+import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
+import { createLoopFactsSource } from '../els/loop-agents.js';
+import { spawnElanous } from '../instance/spawn-elanous.js';
 import { dirname, join } from 'node:path';
 import type { Command } from 'commander';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
@@ -31,7 +33,9 @@ import { guardLeave, realProcess } from '../els/attach-leave.js';
 import { sidebarWidthFor } from '../els/attach-view.js';
 import { buildBadge, changedRowsPaint, createAppFrameWriter, createPaneViewMouse, createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, fitCells, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from '../els/attach-view.js';
 import { attachRemote } from '../els/remote-attach-client.js';
+import { parseTileGrid, TILE_GRIDS } from '../els/tile-view.js';
 import { requestEls } from '../els/client.js';
+import { stateDirSourceForChild } from '../agent/identity-env.js';
 import { AUTO_ACTING_SEAT } from '../els/baton.js';
 import { readPipedStdin } from './piped-stdin.js';
 import { grepScreens, type GrepHit, type GrepScreen } from '../els/pane-grep.js';
@@ -48,7 +52,7 @@ import { requestRemotePtyControl } from '../pty-shell/pty-control-ipc.js';
 import { desiredSha } from '../nexus/host-registry/desired-sha.js';
 import { readInstalledIdentity } from './self-update.js';
 import type { PaneState } from '../els/space.js';
-import { askHitlOnTerminal, controlledDo, controlledInput, journalControl } from '../els/control-cli.js';
+import { askHitlOnTerminal, controlledDo, controlledInput, journalControl, registerFanoutCommands } from '../els/control-cli.js';
 import { prepareOpUpdate, readStandingApproval, revokeStandingApproval, standingApprovalPath, writeStandingApproval } from '../els/update-all-op-approval.js';
 import { debug } from '../debug/log.js';
 import { mcpHitlAsk } from '../els/mcp-hitl.js';
@@ -448,6 +452,9 @@ export function registerElsCommands(program: Command): void {
       const started = await startElsServer(http ? { http } : {});
       if ('exitCode' in started) { emit(started); return; }
       process.stdout.write(`els serve: listening on ${elsSocketPath()} (pid ${process.pid})\n`);
+      // SIDETAB-LOOP-AGENTS-FU: loop-agent tabs come back with the server — one detached `loop trigger tabs` (idempotent) a few
+      // seconds after listening; a failure only means no loop tabs until the next register/promote.
+      setTimeout(() => { try { spawnElanous(['loop', 'trigger', 'tabs'], { stdio: 'ignore', detached: true }).unref(); } catch { /* best effort */ } }, 3_000).unref();
       const stop = (): void => { void started.close().then(() => process.exit(0)); };
       process.once('SIGTERM', stop);
       process.once('SIGINT', stop);
@@ -774,11 +781,24 @@ export function registerElsCommands(program: Command): void {
     .option('--host <name>', 'open the pane on a registered host (els/hosts.json) instead of this one')
     .argument('[command...]', 'command after -- (default: $SHELL)')
     .action((command: string[] = [], opts: { ws?: string; cwd?: string; title?: string; raw?: boolean; host?: string }) => createPane(opts, command, false));
+  registerFanoutCommands(side, { emit, stateRoot: elanousStateRoot, childStateEnv: (root) => ({ ELANOUS_STATE_DIR: root, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(root) }), close: (pane) => federation().close(pane, process.env.ELANOUS_TRACK || process.env.ELANOUS_SEAT || 'unknown') });
   // RELEASE-BOARD: `els open release-board [<v>]` opens the board in a new pane of this workspace.
   side.command('open <board> [version]').description('Open a board in a new pane: release-board')
     .action((board: string, version: string | undefined) => {
       if (board !== 'release-board') { emit({ exitCode: 2, message: `els open: unknown board «${board}» — one of: release-board` }); return; }
       return createPane({ title: 'Release Board' }, ['elanous', 'release', 'graph', 'board', ...(version ? [version] : [])], false);
+    });
+  // BURST-BOARD-GENERAL: `els widget add <name> [--ws W]` — a read-only board as a tab «▦ <name>» (journaled: back after restart).
+  const widget = side.command('widget').description('Read-only board widgets as tabs: add <name> [--ws W] · ls');
+  widget.command('ls').description('List the board widgets (name · ready/unavailable · what it shows)')
+    .action(async () => { const { widgetListing } = await import('../els/widget-registry.js'); emit({ exitCode: 0, message: widgetListing(process.env) }); });
+  widget.command('add <name>').description('Open a board widget as a tab «▦ <name>» in this workspace (or --ws W)')
+    .option('--ws <name>', 'workspace (default: the els workspace this shell runs in, else the folder name)')
+    .action(async (name: string, opts: { ws?: string }) => {
+      const { widgetLaunch, widgetWorkspace } = await import('../els/widget-registry.js');
+      const w = widgetLaunch(name, process.env);
+      if (!w.ok) { emit({ exitCode: 2, message: `els widget add: ${w.reason}` }); return; }
+      return createPane({ ws: widgetWorkspace(opts.ws, process.env, process.cwd()), title: w.title }, [...w.command], false);
     });
   side.command('read <pane>')
     .description('Read a pane: a local pane id, ws/tab/pane, or host:ws/tab/pane on a registered host')
@@ -892,9 +912,50 @@ export function registerElsCommands(program: Command): void {
       if (opts.before && opts.workspace) return emit({ exitCode: 2, message: 'els tab move: --before and --workspace cannot be combined' });
       return opts.workspace ? ask({ op: 'move-tab', tab: id, ws: opts.workspace }) : ask({ op: 'reorder', kind: 'tab', id, ...(opts.before ? { before: opts.before } : {}) });
     });
-  side.command('attach <pane>')
-    .description('Show a local pane or registered host:ws/tab/pane live (ctrl+b q detaches)')
-    .action(async (ref: string) => {
+  // ELS-TILE-MODE: `els tile` / `els attach --tile --ws <ws>` — the panes of one workspace as a live grid (ctrl+b t toggles).
+  const runTile = async (opts: { ws?: string; grid?: string; stage?: boolean; feed?: string; all?: boolean; spaces?: boolean; active?: boolean; remote?: boolean; autoPage?: string }): Promise<void> => {
+    const grid = parseTileGrid(opts.grid);
+    if (!grid) { emit({ exitCode: 2, message: `els tile: --grid must be one of ${TILE_GRIDS.join(' | ')}` }); return; }
+    if (!process.stdin.isTTY || !process.stdout.isTTY) { emit({ exitCode: 2, message: 'els tile: needs a terminal (use `els pane read` from scripts)' }); return; }
+    if (insideElsPane(process.env, elsSocketPath())) { emit({ exitCode: 1, message: NESTED_ELS_MESSAGE }); return; }
+    const ready = await ensureServer(supervisorDeps());
+    if (!ready.ok) { emit({ exitCode: 1, message: ready.message }); return; }
+    adoptOwnerCredential();
+    const feed = opts.feed;
+    const stage = opts.stage || feed ? { stage: { ...(feed ? { readFeed: (): string | undefined => { try { const text = readFileSync(feed, 'utf8'); return text.slice(-16_384); } catch { return undefined; } } } : {}) } } : {};
+    const autoPageMs = opts.autoPage !== undefined ? Math.round(Number(opts.autoPage) * 1000) : undefined;
+    if (autoPageMs !== undefined && !(autoPageMs >= 1000)) { emit({ exitCode: 2, message: 'els tile: --auto-page needs seconds ≥ 1' }); return; }
+    process.exitCode = await runAppView(undefined, undefined, { ...(opts.ws ? { ws: opts.ws } : {}), grid, ...stage,
+      ...(opts.all ? { all: true } : {}), ...(opts.spaces ? { spaces: true } : {}), ...(opts.active ? { active: true } : {}),
+      ...(opts.remote === false ? { remote: false } : {}), ...(autoPageMs ? { autoPageMs } : {}) });
+  };
+  side.command('tile')
+    .description('Show every pane of a workspace at once as a live grid (arrows/hjkl focus · Enter zoom · ctrl+b t back · ctrl+b q quit)')
+    .option('--ws <workspace>', 'the workspace to tile (default: the current one)')
+    .option('--grid <grid>', 'auto | 2x2 | 3x3 | 4x3', 'auto')
+    .option('--stage', 'staged demo layout: conductor ribbon, new-tile highlight, pulsing active tiles, spotlight/verdict/receipt from --feed')
+    .option('--feed <file>', 'with --stage: JSON-lines feed the conductor appends ({phase,nodes,spotlightPane,spotlightMs,verdictPane,receipt,spotlightCaption,counters})')
+    .option('--all', 'every pane of every space in one grid (space band + label · space→tab order · paged)')
+    .option('--spaces', 'one tile per space (coordinator · hands · status dots · live line) · Enter opens · Esc goes up')
+    .option('--active', 'only working panes')
+    .option('--no-remote', 'leave out 🌐 remote panes')
+    .option('--auto-page <sec>', 'advance pages every <sec> seconds (demo)')
+    .action((opts: { ws?: string; grid?: string; stage?: boolean; feed?: string; all?: boolean; spaces?: boolean; active?: boolean; remote?: boolean; autoPage?: string }) => runTile(opts));
+  side.command('attach [pane]')
+    .description('Show a local pane or registered host:ws/tab/pane live (ctrl+b q detaches) · --tile shows a workspace as a live grid')
+    .option('--tile', 'open in tile mode (every pane of --ws as a live grid)')
+    .option('--ws <workspace>', 'with --tile: the workspace to tile')
+    .option('--grid <grid>', 'with --tile: auto | 2x2 | 3x3 | 4x3', 'auto')
+    .option('--stage', 'with --tile: staged demo layout (see els tile --help)')
+    .option('--feed <file>', 'with --stage: the conductor feed (JSON lines)')
+    .option('--all', 'every pane of every space in one grid (space band + label · space→tab order · paged)')
+    .option('--spaces', 'one tile per space (coordinator · hands · status dots · live line) · Enter opens · Esc goes up')
+    .option('--active', 'only working panes')
+    .option('--no-remote', 'leave out 🌐 remote panes')
+    .option('--auto-page <sec>', 'advance pages every <sec> seconds (demo)')
+    .action(async (ref: string | undefined, opts: { tile?: boolean; ws?: string; grid?: string; stage?: boolean; feed?: string; all?: boolean; spaces?: boolean; active?: boolean; remote?: boolean; autoPage?: string }) => {
+      if (opts.tile || opts.all || opts.spaces) { await runTile(opts); return; }
+      if (!ref) { process.stderr.write('els attach: needs a pane (or --tile --ws <workspace>)\n'); process.exitCode = 2; return; }
       // The route seam first: a host on a route kind this build has no transport for (relay · vm) gets no request at all.
       const windowTarget = federation().attachTarget(ref);
       if (windowTarget && 'refused' in windowTarget) { process.stderr.write(`${windowTarget.refused}\n`); process.exitCode = 2; return; }
@@ -1133,11 +1194,35 @@ export function viewerPaneArea(terminal: { cols: number; rows: number }, sidebar
   return { cols: Math.max(10, terminal.cols - (left ? left + 1 : 0)), rows: Math.max(3, terminal.rows - 2) };
 }
 
+/** GOAL-ORCHESTRATION-NL: the newest running goal orchestration (`eln orchestrate run` inside els) — its workspace and
+ *  stage feed, so the bare els window can switch to its staged tile view. One small readdir per poll; no run → undefined. */
+export function orchestrationStageWatch(workspaces: readonly string[]): { key: string; ws: string; readFeed: () => string | undefined } | undefined {
+  const { elanousStateRoot } = require('../autopilot/state-paths.js') as typeof import('../autopilot/state-paths.js');
+  const root = join(elanousStateRoot(), 'orchestrations');
+  let names: string[];
+  try { names = readdirSync(root).filter((n) => n.startsWith('orch-')).sort(); } catch { return undefined; }
+  // Newest active els run IN ONE OF THIS WINDOW'S WORKSPACES first; a newer finished, headless or foreign-workspace run
+  // never hides it. Run folders are small; finished ones are skipped by one stat each.
+  const mine = new Set(workspaces);
+  for (const id of [...names].reverse()) {
+    if (existsSync(join(root, id, 'report.json'))) continue;
+    try {
+      const run = JSON.parse(readFileSync(join(root, id, 'run.json'), 'utf8')) as { backend?: string; workspace?: string };
+      if (run.backend !== 'els' || !run.workspace || !mine.has(run.workspace)) continue;
+      const feed = join(root, id, 'feed.jsonl');
+      return { key: id, ws: run.workspace, readFeed: () => { try { return readFileSync(feed, 'utf8').slice(-16_384); } catch { return undefined; } } };
+    } catch { /* half-written run.json: next */ }
+  }
+  return undefined;
+}
+
 /** The terminal side of bare `els`: raw keys → the app, window size → the app, the app's drawing → stdout. */
-function runAppView(sidebar: boolean | undefined, initialPane?: string): Promise<number> {
+function runAppView(sidebar: boolean | undefined, initialPane?: string, tile?: AttachAppDeps['tile']): Promise<number> {
   const decodeKeys = createKeyDecoder();
   const hosts = federation();                                    // the other hosts' panes (registered els hosts + herdr), read-only
   const app = createAttachApp({
+    // SIDETAB-LOOP-AGENTS-UNDER-SPACE: the side list's heartbeat rows read the trigger registry (cached ≥10 s, read-only).
+    loopFacts: createLoopFactsSource(`${effectiveInstanceRoot()}/graph-trigger-registry.db`),
     // ELS-VOICE-CONTROL-POPUP: ctrl+b : asks the cheap one-shot model (budget tier; local LM Studio fallback) — null = rules.
     voiceModel: async (prompt) => (await import('../domains/signal-dedup.js')).llmOnce(prompt),
     remote: { list: () => hosts.list(), read: (address) => hosts.read(address),
@@ -1159,6 +1244,7 @@ function runAppView(sidebar: boolean | undefined, initialPane?: string): Promise
     chatCommand: elanousCommandFor({ prefixEnv: process.env.ELANOUS_INSTALL_PREFIX, home: homedir(), exists: existsSync, execPath: process.execPath, entry: process.argv[1] }),
     memory: viewMemory(),
     ...(sidebar === undefined ? {} : { sidebar }),
+    ...(tile ? { tile } : { stageWatch: orchestrationStageWatch }),
   });
   const onKey = (chunk: Buffer): void => app.key(decodeKeys(chunk));
   const onResize = (): void => app.resized();

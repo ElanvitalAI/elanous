@@ -180,7 +180,7 @@ describe('TUI-ANSWER-VANISH-ON-TOOLCALL — an answer on screen survives the tur
     const screen = nextTuiPublicHistory(loadSession(id)!.messages);
     const saved = loadSession(id)!.messages;
     const toolAt = saved.map((row) => row.role).lastIndexOf('tool');
-    const echoAt = screen.findIndex((row) => row.role === 'user' && row.content === '모르겠습니다. 하면 되나요?\n(joined mid-turn)');
+    const echoAt = screen.findIndex((row) => row.role === 'user' && row.content === '모르겠습니다. 하면 되나요?');
     const nextAnswerAt = screen.findIndex((row) => row.role === 'assistant' && row.content === '확인했습니다. 끝까지 추적하겠습니다.');
     expect(echoAt).not.toBe(-1);
     expect(echoAt).toBeGreaterThan(toolAt);

@@ -12,7 +12,8 @@
  *       (programmatic) caller is read as kind=info · needsReply=false — passive, not a turn.
  *    F  self-mail and coach injections leave the mailbox — a seat's mail to itself becomes a scheduled wake
  *       (`self-wakes.ts`); a coach mail without needsReply/crown becomes a coach note (`coach-notes.ts`, one line per
- *       30 min into the next turn). Only coach mail with needsReply or a crown flag stays mail.
+ *       30 min into the next turn). Coach mail with needsReply, a crown flag, or that answers the receiver's own ask
+ *       (replyTo a mail the receiver sent) stays mail.
  *    G  back-pressure — when the receiver's pending passive queue > N (default 30) or its MAIL-OPENED turns/h > M
  *       (default 20 · self-wakes and goal-drive turns do not count · RAIL30 ①), a non-urgent post is folded into the
  *       receiver's digest ledger instead of becoming a row: «receiver saturated — recorded to ledger/digest».
@@ -166,12 +167,15 @@ export type PostDestination = 'mailbox' | 'self-wake' | 'coach-note';
  * F — where a post goes. A seat's mail to itself is a scheduled wake (a human's or a crown relay stays mail); a coach
  * mail is a coach note unless it needs a reply or carries a crown flag.
  */
-export function postDestination(input: PostShapeInput & { needsReply?: boolean | null }): PostDestination {
+export function postDestination(input: PostShapeInput & { needsReply?: boolean | null; answersReceiverAsk?: boolean }): PostDestination {
   const from = input.from.toUpperCase();
   const to = input.to.toUpperCase();
   const keepsMail = Boolean(input.crownDirective) || lower(input.origin?.kind) === 'human' || hasRef(input.refs, 'telegram-message:');
   if (from === to && !keepsMail) return 'self-wake';
-  if (COACH_SEATS.includes(from) && !keepsMail && input.needsReply !== true) return 'coach-note';
+  // COACH-REPLY-AS-MAIL (OP #180740 re-ask loop · 11-26) — a coach post answering the receiver's own ask (replyTo a mail
+  // the receiver sent, explicit or auto-threaded) is an answer, not an injection: it stays mail so the receiver's
+  // reply-watch (`mail-from:<coach>` · `mail-reply:<id>`) closes, and it is outside the 30-min coach budget.
+  if (COACH_SEATS.includes(from) && !keepsMail && input.needsReply !== true && input.answersReceiverAsk !== true) return 'coach-note';
   return 'mailbox';
 }
 

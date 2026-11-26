@@ -6,7 +6,7 @@ import { formatMessage, registerMsgListCommand } from './msg-list-cli.js';
 import { readUnreadCount } from '../msg/msg-store.js';
 import { registerMsgWaitForCommands } from './msg-wait-for-cli.js';
 import { registerMsgHandCommands } from './msg-hand-cli.js';
-import { registerMsgClearCommand, registerMsgResetCommand } from './msg-clear-cli.js';
+import { registerMsgClearCommand, registerMsgQuestionCommand, registerMsgResetCommand } from './msg-clear-cli.js';
 import { registerMsgRequirementCommands } from './msg-requirement-cli.js';
 import { registerMsgReceiptsCommands } from './msg-receipts-cli.js';
 import { existsSync, mkdirSync } from 'node:fs';
@@ -14,6 +14,7 @@ import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { ensureAuthToken } from '../auth/acp-token.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { knownSeats } from '../msg/msg-reset.js';
 import { canonicalMessageAddress, canonicalSeatId, defaultMsgStorePath, openMsgStore, openMsgStoreReadOnly, type Message, type MessageEnvelope, type MsgStore } from '../msg/msg-store.js';
 import { archiveDeliveredRows, defaultArchivePath, MSG_ARCHIVE_DEFAULT_DAYS } from '../msg/msg-archive.js';
 import { buildMsgHookOutput, seatFromCwd, type MsgHookEvent, type MsgHookFormat } from '../msg/msg-hook.js';
@@ -614,6 +615,13 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       const unroutable = undeclared || route.reason?.startsWith('dead-');
       if (opts.rejectUndeclared && route.wake === 'none' && unroutable)
         throw new Error(`undeclared or dead message address: ${to} (${route.reason})`);
+      // MSG-ADDRESS-DID-YOU-MEAN (OP #177316 «OP-CLAUDE» ≠ CLAUDE-OP · silently stored, never delivered): an undeclared
+      // address that is a near miss of a known recipient is refused with the suggestion. A genuinely new address still posts.
+      if (route.wake === 'none' && undeclared) {
+        const known = (() => { try { const s = open(); try { return knownSeats(s); } finally { s.close(); } } catch { return [] as string[]; } })();
+        const suggestion = didYouMeanAddress(to, known);
+        if (suggestion) throw new Error(`unknown message address: ${to} — did you mean ${suggestion}? (nothing was stored)`);
+      }
       if (route.wake === 'none' && undeclared) out.error(`${route.reason} · wake=none · ${to}: 수신 패널을 찾지 못했습니다 (거부하려면 --reject-undeclared)`);
       debug.log('msg.post', 'caller-runtime', { runtime: process.env.ELANOUS_AGENT_RUNTIME?.trim() || 'unknown', to });
       // Validate the auto-reply target before saving — a mismatched flag must not leave a stored message behind.
@@ -698,12 +706,15 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
             const joined = store.coalesceInto(envelope.from, envelope.to, envelope.body, COALESCE_WINDOW_MS, (deps.now ?? (() => new Date()))());
             if (joined !== null) { coalescedInto = joined.id; return joined; }
           }
+          // MSG-WAIT-CONTRACT ① — thread onto the recipient's newest unanswered question/decision (or a mail it waits on)
+          // BEFORE the gate (same order as the MsgPost tool): a reply to the receiver's own ask is judged as one (F keeps a
+          // coach answer as mail · G never folds it).
+          Object.assign(envelope, threadedEnvelope(store, envelope, noReplyTo || to === 'TA'));
           gate = gatePost({ envelope, entrance: 'cli', ...(opts.needsReply === undefined ? {} : { needsReply: opts.needsReply }), ...(senderAbove === undefined ? {} : { senderAbove }) },
             storeGateDeps(store, deps.divertedRoot ?? divertedRootForStore(store.storePath)));
           if (gate.action !== 'post') return null;
           Object.assign(envelope, { kind: gate.envelope.kind, needsAck: gate.envelope.needsAck });
-          // MSG-WAIT-CONTRACT ① — thread onto the recipient's newest unanswered question/decision (or a mail it waits on).
-          return store.post(threadedEnvelope(store, envelope, noReplyTo || to === 'TA'), { dedupe: opts.dedupe !== false, attemptToken });
+          return store.post(envelope, { dedupe: opts.dedupe !== false, attemptToken });
         });
       } catch (error) {
         // Only an ambiguous STORAGE error (lock / busy / I-O around COMMIT) can hide a commit. A validation refusal
@@ -943,6 +954,7 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
   registerMsgHandCommands(msg, { openStore: open, out, setExitCode, ...(deps.now === undefined ? {} : { now: deps.now }) });
   // MSG-CLEAR (CEO 11-25) — bulk-ack by filters (receipt · undo) ⊕ reset = delete by seat/space/federation (snapshot · restore).
   registerMsgClearCommand(msg, { openStore: open, out, setExitCode, ...(deps.now === undefined ? {} : { now: deps.now }) });
+  registerMsgQuestionCommand(msg, { openStore: open, out, setExitCode });
   registerMsgResetCommand(msg, { openStore: open, out, setExitCode, ...(deps.now === undefined ? {} : { now: deps.now }) });
   // SEAT-INBOX B1-C — 영수증 읽기·구독(receipts --follow = 우체국 SSE) ⊕ 명시 영수증(receipt).
   registerMsgReceiptsCommands(msg, { openStore: open, out, setExitCode, ...(deps.now === undefined ? {} : { now: deps.now }),
@@ -1340,3 +1352,30 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
 
 // Preserve the historical formatter export after moving list-only registration.
 export { formatMessage } from './msg-list-cli.js';
+
+/** A known recipient that `to` most likely meant: same dash-separated tokens in another order, or edit distance ≤ 2. */
+export function didYouMeanAddress(to: string, known: readonly string[]): string | null {
+  const t = to.toUpperCase();
+  if (known.some(k => k.toUpperCase() === t)) return null;
+  const tokens = (v: string) => v.toUpperCase().split(/[-_]/).filter(Boolean).sort().join('|');
+  const reordered = known.find(k => tokens(k) === tokens(t));
+  if (reordered) return reordered;
+  if (t.length < 4) return null;
+  let best: { k: string; d: number } | null = null;
+  for (const k of known) {
+    const d = editDistance(t, k.toUpperCase());
+    if (d <= 2 && (!best || d < best.d)) best = { k, d };
+  }
+  return best?.k ?? null;
+}
+
+function editDistance(a: string, b: string): number {
+  if (Math.abs(a.length - b.length) > 2) return 3;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length]!;
+}

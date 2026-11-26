@@ -6,11 +6,12 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { requestEls } from './client.js';
+import { widgetLaunch } from './widget-registry.js';
 import { audit, createControl, type ControlAction, type ControlTarget, type IdResolver, type StructPayload } from './control.js';
 import type { ElsRequest } from './server.js';
 
 export const ELS_CONTROL_TOOL_NAME = 'ElsControl';
-export const ELS_CONTROL_ACTIONS = ['ls', 'status', 'read', 'new', 'do', 'send', 'stop', 'close', 'rename', 'move', 'focus'] as const;
+export const ELS_CONTROL_ACTIONS = ['ls', 'status', 'read', 'new', 'widget', 'do', 'send', 'stop', 'close', 'rename', 'move', 'focus'] as const;
 export type ElsControlAction = (typeof ELS_CONTROL_ACTIONS)[number];
 
 /** Door action per tool action. focus: the door vocabulary + server focus pointer land in the follow-up
@@ -20,6 +21,8 @@ const DOOR_ACTION: Record<ElsControlAction, ControlAction | null> = {
   status: 'status',
   read: 'read',
   new: 'new',
+  // BURST-BOARD-GENERAL: a read-only board tab «▦ <name>» in the caller pane's own workspace — the same door as new.
+  widget: 'new',
   do: 'do',
   // Tool-authored operations need the stricter do gate; the server independently authenticates input.
   send: 'do',
@@ -183,6 +186,12 @@ export async function runElsControl(args: unknown, deps: ElsControlDeps): Promis
       message: `ElsControl: unknown action ${JSON.stringify(str(a.action))} — actions: ${ELS_CONTROL_ACTIONS.join(' · ')}`,
     };
   }
+  if (action === 'widget') {
+    const w = widgetLaunch(str(a.widget) || str(a.name) || str(a.text), process.env);
+    if (!w.ok) return { tool: ELS_CONTROL_TOOL_NAME, action, allowed: false, ok: false, exitCode: 2, code: 'unknown-widget', reason: w.reason, message: `ElsControl widget: ${w.reason}; nothing was opened` };
+    const opened = await runElsControl({ action: 'new', pane: str(a.pane), title: w.title, text: w.command.join(' ') }, deps);
+    return { ...opened, action };
+  }
   const doorAction = DOOR_ACTION[action];
   if (!doorAction) {
     return {
@@ -319,7 +328,10 @@ export function resetOpRuntimeRegistrationForTesting(): void { opRuntimeRegistra
  */
 export async function ensureOpRuntimeRegistered(deps: OpRuntimeRegistrationDeps = {}): Promise<boolean> {
   const env = deps.env ?? process.env;
-  if (elsControlSeat(env)?.name !== 'OP' || !(env.ELANOUS_ELS_PANE_TOKEN ?? '').trim() || !elsControlSocketPath(env)) return false;
+  // ELS-OP-AUTOREG-TRACK (11-26 05:2x «verified tool seat required»): the server-minted OP pane carries ELANOUS_ELS_WS=OP
+  // but not ELANOUS_TRACK, so the seat name falls back to the pane's workspace. The server still verifies the OP role.
+  const seatName = elsControlSeat(env)?.name ?? ((env.ELANOUS_ELS_WS ?? '').trim() || undefined);
+  if (seatName !== 'OP' || !(env.ELANOUS_ELS_PANE_TOKEN ?? '').trim() || !elsControlSocketPath(env)) return false;
   opRuntimeRegistration ??= (async () => {
     const runtime = (deps.runtime ?? (() => {
       const { runtimeProcessIdentity } = require('./seat-runtime.js') as typeof import('./seat-runtime.js');
@@ -381,13 +393,14 @@ export function buildElsControlTool(): LLMToolSpec {
   return {
     name: ELS_CONTROL_TOOL_NAME,
     description:
-      'ELS panes·tabs 제어 — 모든 동작이 els 제어 문(control-allow.json 허용목록 · 감사 · close 사람 확인)을 경유합니다. 결과는 구조 JSON. 동작: ls·status·read·new·do·send·stop(중단 키 요청; 결과는 read로 확인)·close·rename·move·focus(focus는 후속 델타).',
+      'ELS panes·tabs 제어 — 모든 동작이 els 제어 문(control-allow.json 허용목록 · 감사 · close 사람 확인)을 경유합니다. 결과는 구조 JSON. 동작: ls·status·read·new·widget(읽기 전용 보드 탭 «▦ 이름» — «버스트 보드 탭 띄워줘» → widget burst-board · fed-board · invest-board · release-board)·do·send·stop(중단 키 요청; 결과는 read로 확인)·close·rename·move·focus(focus는 후속 델타).',
     parameters: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: [...ELS_CONTROL_ACTIONS], description: '수행 동작' },
         pane: { type: 'string', description: '대상 pane id — 유일한 대상 지정자입니다. workspace·tab·shell 은 els 저널에서 도구가 직접 조회하며 인자로 받지 않습니다 (new 는 이 pane 의 workspace 에 엽니다)' },
         title: { type: 'string', description: 'new: 새 탭 제목' },
+        widget: { type: 'string', description: 'widget: 보드 이름 — burst-board · fed-board · invest-board · release-board (별칭 burst·federation·invest·release)' },
         text: { type: 'string', description: 'new: the command the new tab runs (e.g. "eln" for an agent tab) · do/send: the line to type into the pane' },
         kind: { type: 'string', description: 'rename·move·close 구조 종류: workspace|tab' },
         id: { type: 'string', description: 'rename·move 구조 대상 id (pane 과 같은 workspace 안이어야 함)' },

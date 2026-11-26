@@ -13,11 +13,11 @@
 
 import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { canonicalSeatId } from '../msg/msg-store.js';
-import { cancelCommitmentWakers, type SelfTimerDeps, type WakerRecord } from '../msg/self-timer-watch.js';
+import { cancelCommitmentWakers, formatPredicateLine, listWakers, measurePredicate, type PredicateResult, type SelfTimerDeps, type WakerRecord } from '../msg/self-timer-watch.js';
 import { CommitmentLedger, CommitmentLifecycleConflict, type CommitmentEntry } from './ledger.js';
 
-export type CommitmentCloseStatus = 'done' | 'blocked';
-export const COMMITMENT_CLOSE_STATUSES: readonly CommitmentCloseStatus[] = ['done', 'blocked'];
+export type CommitmentCloseStatus = 'done' | 'blocked' | 'reassigned';
+export const COMMITMENT_CLOSE_STATUSES: readonly CommitmentCloseStatus[] = ['done', 'blocked', 'reassigned'];
 export const COMMITMENT_CLOSE_TOOL_NAME = 'CommitmentClose';
 
 export interface CloseCommitmentInput {
@@ -32,6 +32,16 @@ export interface CloseCommitmentInput {
 export interface CloseCommitmentDeps {
   ledger?: CommitmentLedger;
   timer?: SelfTimerDeps;
+  /**
+   * OP-CLOSE-ON-OUTCOME — the done-when predicate measured from facts just before closing (closeCommitmentChecked fills
+   * it). A `done` on an entry with `doneWhen` is refused unless this says `met` (or a watch already fired satisfied).
+   */
+  predicate?: PredicateResult;
+}
+
+/** OP-CLOSE-ON-OUTCOME — the refusal when `done` is claimed but the predicate does not hold. */
+export class CommitmentPredicateUnmet extends CommitmentLifecycleConflict {
+  constructor(message: string) { super(message); this.name = 'CommitmentPredicateUnmet'; }
 }
 
 export interface CloseCommitmentResult {
@@ -49,8 +59,8 @@ export function normalizeEvidence(raw: unknown): string {
 
 export function normalizeCloseStatus(raw: unknown): CommitmentCloseStatus {
   const v = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
-  if (v === 'done' || v === 'blocked') return v;
-  throw new Error(`status must be done or blocked (got ${JSON.stringify(raw)})`);
+  if (v === 'done' || v === 'blocked' || v === 'reassigned') return v;
+  throw new Error(`status must be done, blocked or reassigned (got ${JSON.stringify(raw)})`);
 }
 
 export function closeCommitment(input: CloseCommitmentInput, deps: CloseCommitmentDeps = {}): CloseCommitmentResult {
@@ -61,9 +71,36 @@ export function closeCommitment(input: CloseCommitmentInput, deps: CloseCommitme
   const ledger = deps.ledger ?? new CommitmentLedger();
   const seat = input.seat?.trim() ? canonicalSeatId(input.seat) : ledger.findSeat(id);
   if (!seat) throw new CommitmentLifecycleConflict(`commitment not found: ${id} (list open ones: eln commitment list)`);
-  const entry = status === 'done' ? ledger.markDone(seat, id, evidence) : ledger.markBlocked(seat, id, evidence);
+  if (status === 'done') {
+    const current = ledger.get(seat, id);
+    if (current?.doneWhen) {
+      const satisfiedWatch = listWakers(seat, { ...deps.timer, ledger }).some(w => w.commitmentId === id && w.status === 'fired' && w.condition === current.doneWhen && !!w.evidence);
+      if (!satisfiedWatch && deps.predicate?.kind !== 'met') {
+        const line = deps.predicate ? formatPredicateLine(current.doneWhen, deps.predicate) : `done-when ${current.doneWhen} = NOT MEASURED`;
+        throw new CommitmentPredicateUnmet(`done refused: ${line}. A sent request or a reply is not the outcome — close as reassigned or blocked with a reason, or wait for the predicate`);
+      }
+    }
+  }
+  const entry = status === 'done' ? ledger.markDone(seat, id, evidence)
+    : status === 'reassigned' ? ledger.markReassigned(seat, id, evidence) : ledger.markBlocked(seat, id, evidence);
   const cancelledWakers = cancelCommitmentWakers(entry.seat, id, `commitment ${status}`, { ...deps.timer, ledger });
   return { entry, cancelledWakers };
+}
+
+/** OP-CLOSE-ON-OUTCOME — measure the entry's done-when from facts first, then close (the tool and CLI door). */
+export async function closeCommitmentChecked(input: CloseCommitmentInput, deps: CloseCommitmentDeps = {}): Promise<CloseCommitmentResult> {
+  if (normalizeCloseStatus(input.status) === 'done' && deps.predicate === undefined) {
+    const ledger = deps.ledger ?? new CommitmentLedger();
+    const id = typeof input.id === 'string' ? input.id.trim() : '';
+    const seat = input.seat?.trim() ? canonicalSeatId(input.seat) : id ? ledger.findSeat(id) : undefined;
+    const entry = seat ? ledger.get(seat, id) : undefined;
+    if (entry?.doneWhen) {
+      const predicate = await measurePredicate(entry.doneWhen, { seat: entry.seat, sinceIso: entry.createdAt }, { ...deps.timer, ledger });
+      return closeCommitment(input, { ...deps, ledger, predicate });
+    }
+    return closeCommitment(input, { ...deps, ledger });
+  }
+  return closeCommitment(input, deps);
 }
 
 // ── seat tool ───────────────────────────────────────────────────────────────────────
@@ -72,15 +109,17 @@ export function buildCommitmentCloseTool(): LLMToolSpec {
   return {
     name: COMMITMENT_CLOSE_TOOL_NAME,
     description:
-      'Close a commitment (promise) in the commitment ledger — mark it done or blocked with one line of evidence, '
+      'Close a commitment (promise) in the commitment ledger — mark it done, blocked or reassigned with one line of evidence, '
       + 'and cancel its follow-up waker. Use when a waker notice says a commitment should continue or be closed. '
-      + 'CLI twin: `eln commitment done|blocked <id> --evidence "<line>"`. '
+      + 'done is accepted only when the commitment\'s done-when predicate holds in the facts (checklist cell, PR, receipt, seat pane) — '
+      + 'a sent request, a reply or «keep the current line» is not done; close those as reassigned or blocked with a reason. '
+      + 'CLI twin: `eln commitment done|blocked|reassigned <id> --evidence "<line>"`. '
       + 'Keywords: commitment, promise, follow-up, waker, close, done, blocked, 약속, 원장, 닫기, 완료, 막힘.',
     parameters: {
       type: 'object',
       properties: {
         id: { type: 'string', description: 'Commitment id from the waker notice (e.g. c-1a2b3c4d).' },
-        status: { type: 'string', enum: [...COMMITMENT_CLOSE_STATUSES], description: 'done = finished · blocked = cannot continue.' },
+        status: { type: 'string', enum: [...COMMITMENT_CLOSE_STATUSES], description: 'done = the outcome is in the facts (predicate holds) · blocked = cannot continue (why) · reassigned = moved to another owner (to whom, why).' },
         evidence: { type: 'string', description: 'Required, one line: test result, receipt path or PR for done; what blocks it for blocked.' },
         seat: { type: 'string', description: 'Optional seat that owns the commitment; found by id when omitted.' },
       },
@@ -100,9 +139,9 @@ export interface CommitmentCloseToolResult extends Record<string, unknown> {
   cancelledWakers?: string[];
 }
 
-export function dispatchCommitmentClose(args: Record<string, unknown>, deps: CloseCommitmentDeps = {}): CommitmentCloseToolResult {
+export async function dispatchCommitmentClose(args: Record<string, unknown>, deps: CloseCommitmentDeps = {}): Promise<CommitmentCloseToolResult> {
   try {
-    const { entry, cancelledWakers } = closeCommitment({
+    const { entry, cancelledWakers } = await closeCommitmentChecked({
       id: typeof args.id === 'string' ? args.id : '',
       status: args.status as CommitmentCloseStatus,
       evidence: args.evidence as string,

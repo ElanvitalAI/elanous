@@ -1,0 +1,722 @@
+{
+  "schema": 1,
+  "tool": "A161",
+  "head": "e6d2f3e7bf3707772484e38aac88ed1e3a5eb87c",
+  "base": "6f6c715023fff885f0125de2b3aae4fafe011e4a",
+  "pr": 40085,
+  "host": "minim5",
+  "actualHost": "minim5",
+  "runnerPid": 30687,
+  "rawDir": "/var/folders/h6/hfjjfgw91tq5tvv1vh1s8x2h0000gn/T/res-a161-1912ga_w",
+  "focused": [
+    "src/session/context-budget.test.ts",
+    "src/session/session-rotation.test.ts"
+  ],
+  "steps": [
+    {
+      "name": "fetch-main",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "-c",
+        "import fcntl,subprocess,sys,time\nrepo,remote=sys.argv[1:3]\nlock=open(repo+'/pregate-fetch-main.lock','a'); fcntl.flock(lock,fcntl.LOCK_EX)\nrc=1\nfor i in range(3):\n    rc=subprocess.run(['git','-C',repo,'fetch','--no-tags',remote,'+refs/heads/main:refs/remotes/origin/main']).returncode\n    if rc==0: break\n    time.sleep(2*(i+1))\nsys.exit(rc)\n",
+        "/Users/op/elanous-hq/repo.git",
+        "origin"
+      ],
+      "startedAt": 1795615242.243477,
+      "pid": 30695,
+      "exit": 0,
+      "finishedAt": 1795615243.916026
+    },
+    {
+      "name": "fetch-head",
+      "command": [
+        "git",
+        "-C",
+        "/Users/op/elanous-hq/repo.git",
+        "fetch",
+        "--no-tags",
+        "origin",
+        "e6d2f3e7bf3707772484e38aac88ed1e3a5eb87c"
+      ],
+      "startedAt": 1795615243.9243479,
+      "pid": 30726,
+      "exit": 0,
+      "finishedAt": 1795615245.537666
+    },
+    {
+      "name": "fetch-base",
+      "command": [
+        "git",
+        "-C",
+        "/Users/op/elanous-hq/repo.git",
+        "fetch",
+        "--no-tags",
+        "origin",
+        "6f6c715023fff885f0125de2b3aae4fafe011e4a"
+      ],
+      "startedAt": 1795615245.591448,
+      "pid": 30755,
+      "exit": 0,
+      "finishedAt": 1795615245.855308
+    },
+    {
+      "name": "checkout",
+      "command": [
+        "git",
+        "-C",
+        "/Users/op/elanous-hq/repo.git",
+        "worktree",
+        "add",
+        "--detach",
+        "/var/folders/h6/hfjjfgw91tq5tvv1vh1s8x2h0000gn/T/res-a161-1912ga_w/source",
+        "e6d2f3e7bf3707772484e38aac88ed1e3a5eb87c"
+      ],
+      "startedAt": 1795615245.920009,
+      "pid": 30765,
+      "exit": 0,
+      "finishedAt": 1795615249.3354821
+    },
+    {
+      "name": "merge-main",
+      "command": [
+        "git",
+        "-c",
+        "user.name=a161-pregate",
+        "-c",
+        "user.email=a161-pregate@res.local",
+        "merge",
+        "--no-edit",
+        "024f592f4c755c66a06a538b3167a3639b676613"
+      ],
+      "startedAt": 1795615249.7195892,
+      "pid": 30826,
+      "exit": 0,
+      "finishedAt": 1795615251.846974
+    },
+    {
+      "name": "diff-check",
+      "command": [
+        "git",
+        "diff",
+        "--check",
+        "6f6c715023fff885f0125de2b3aae4fafe011e4a",
+        "e6d2f3e7bf3707772484e38aac88ed1e3a5eb87c"
+      ],
+      "startedAt": 1795615252.744695,
+      "pid": 30872,
+      "exit": 0,
+      "finishedAt": 1795615252.846901
+    },
+    {
+      "name": "frozen-install",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "env",
+        "-i",
+        "HOME=/var/folders/h6/hfjjfgw91tq5tvv1vh1s8x2h0000gn/T/res-a161-1912ga_w/install-home",
+        "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "BUN_INSTALL_CACHE_DIR=/Users/op/.cache/res-pregate-bun-cache",
+        "/Users/op/.bun/bin/bun",
+        "install",
+        "--frozen-lockfile"
+      ],
+      "startedAt": 1795615252.957435,
+      "pid": 30877,
+      "exit": 0,
+      "finishedAt": 1795615254.906129
+    },
+    {
+      "name": "pwa-frozen-install",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "env",
+        "-i",
+        "HOME=/var/folders/h6/hfjjfgw91tq5tvv1vh1s8x2h0000gn/T/res-a161-1912ga_w/install-home",
+        "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "BUN_INSTALL_CACHE_DIR=/Users/op/.cache/res-pregate-bun-cache",
+        "/Users/op/.bun/bin/bun",
+        "install",
+        "--frozen-lockfile"
+      ],
+      "startedAt": 1795615254.906837,
+      "pid": 30913,
+      "exit": 0,
+      "finishedAt": 1795615255.486309
+    },
+    {
+      "name": "rules-and-ratchets",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+        "test",
+        "test/rules-contract.test.ts"
+      ],
+      "startedAt": 1795615255.6320581,
+      "pid": 30925,
+      "slotWaitSec": 3.2,
+      "exit": 0,
+      "finishedAt": 1795615279.663764
+    },
+    {
+      "name": "focused",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+        "test",
+        "src/session/context-budget.test.ts",
+        "src/session/session-rotation.test.ts"
+      ],
+      "startedAt": 1795615279.664644,
+      "pid": 31495,
+      "exit": 0,
+      "finishedAt": 1795615280.083057
+    },
+    {
+      "name": "changed-tsc",
+      "command": [
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+        "/Users/op/elanous-hq/seat-state/K-EAST/tools/heavy-slot.py",
+        "--class",
+        "review",
+        "--",
+        "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+        "run",
+        "scripts/ci-typecheck-changed.ts",
+        "--local"
+      ],
+      "startedAt": 1795615280.0838552,
+      "pid": 31508,
+      "slotWaitSec": 3.2,
+      "exit": 0,
+      "finishedAt": 1795615540.484385
+    }
+  ],
+  "status": "LIGHT_PASS_NOT_FULL_GATE",
+  "security": {
+    "status": "REVIEW_REQUIRED",
+    "scope": "added lines only; heuristic candidates, never a security PASS",
+    "candidates": [
+      {
+        "path": "src/session/chat.ts",
+        "line": 592,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 3,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 10,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 11,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 12,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 13,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 14,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 17,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 18,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 18,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 20,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 21,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 23,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 59,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 60,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 61,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 62,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 63,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 105,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 106,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "line": 107,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.ts",
+        "line": 3,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.ts",
+        "line": 6,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/context-budget.ts",
+        "line": 6,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.ts",
+        "line": 9,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.ts",
+        "line": 13,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.ts",
+        "line": 14,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.ts",
+        "line": 18,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.ts",
+        "line": 24,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.ts",
+        "line": 50,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/context-budget.ts",
+        "line": 52,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 10,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 11,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 11,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 12,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 13,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 22,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 69,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 96,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 99,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 110,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 156,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 159,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 170,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 178,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 182,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 183,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 186,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "line": 191,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 10,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 10,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 11,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 12,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 13,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 14,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 15,
+        "category": "path-traversal"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 17,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 20,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 91,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 103,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 105,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 107,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 133,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 164,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 168,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 169,
+        "category": "value-output"
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "line": 171,
+        "category": "value-output"
+      }
+    ]
+  },
+  "historicalProofImported": false,
+  "selfReview": {
+    "status": "WARN_MISSING",
+    "path": null,
+    "sha256": null,
+    "pr": 40085,
+    "head": "e6d2f3e7bf3707772484e38aac88ed1e3a5eb87c",
+    "mustFix": null,
+    "warning": "self-review-result-missing"
+  },
+  "reviewCap": 6,
+  "bun": "1.4.2",
+  "bunPath": "/Users/op/.bun/bin/bun",
+  "bunSha256": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5",
+  "guardPath": "/Users/op/elanous-hq/seat-state/OP/tools/hq-find-guard/bin/bun",
+  "guardSha256": "f27672208e517e769e42e3ac4750266d5a5cb92292711e350119cebb8678fc05",
+  "runtimeMode": "host-default",
+  "rawSha256": {
+    "fetch-base.raw": "c5c8ede42876b81115a6f46ae370c908e9f120f870a83a92d350a536b3bb73ea",
+    "fetch-head.raw": "8fb87b5db09bc7733badbdc8dfdbc1a976a4b2144e7353a68b9b8737a399075b",
+    "changed-tsc.raw": "c350faffc6cca8bb4a0f033180c226299c7de25bd59a80f50899435ffe5bac5a",
+    "frozen-install.raw": "99e72a0b2c5d1500af584e0a7ebc7e1995130bfb5b18af5b39198d015c9aaf1d",
+    "diff-check.raw": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "fetch-main.raw": "48ce0fac5933ed20d07503035154ed806e1bf0a9568a62e9d29b051a3495732f",
+    "focused.raw": "6dc98a095c7bd9939d6993a19a8c6b6bf9d0a155f9afd5c7618388ef794529db",
+    "merge-main.raw": "89edc83f936e083aa35d05006bef912604b10a086f74ddf3b2a677582a7af95b",
+    "rules-and-ratchets.raw": "917fa048c23802cec9269cde549b251905193c10f56dd848c676d4298fa3a37e",
+    "pwa-frozen-install.raw": "2a9ab732439456caf36d8c1f31913ebc1a2de50b90b7cacfe239c5feca2d9d80",
+    "checkout.raw": "ff5f1ca175894f494f8af167e0e75870cb3cb188a82a7d41f8f541c7f0550bf4"
+  },
+  "originMain": "024f592f4c755c66a06a538b3167a3639b676613",
+  "lockSha256": "2e88d2bb59a46a538aef956ee552880ea9da8cd511e852d90418fe89a68c7515",
+  "gradeDetail": {
+    "grade": "L2",
+    "reason": "production-large-light-default",
+    "landLane": "normal",
+    "steps": [
+      "diff-check",
+      "rules-and-ratchets",
+      "focused",
+      "changed-tsc",
+      "focused-import-neighbor"
+    ],
+    "files": [
+      {
+        "path": "src/compact/pipeline.ts",
+        "category": "production",
+        "deleted": false,
+        "renamed": false,
+        "added": 5,
+        "removed": 0,
+        "code": 2,
+        "exportRemoved": 0
+      },
+      {
+        "path": "src/session/chat.ts",
+        "category": "production",
+        "deleted": false,
+        "renamed": false,
+        "added": 21,
+        "removed": 0,
+        "code": 14,
+        "exportRemoved": 0
+      },
+      {
+        "path": "src/session/compact-session.ts",
+        "category": "production",
+        "deleted": false,
+        "renamed": false,
+        "added": 5,
+        "removed": 0,
+        "code": 3,
+        "exportRemoved": 0
+      },
+      {
+        "path": "src/session/context-budget.test.ts",
+        "category": "test",
+        "deleted": false,
+        "renamed": false,
+        "added": 124,
+        "removed": 0,
+        "code": 102,
+        "exportRemoved": 0
+      },
+      {
+        "path": "src/session/context-budget.ts",
+        "category": "production",
+        "deleted": false,
+        "renamed": false,
+        "added": 54,
+        "removed": 0,
+        "code": 27,
+        "exportRemoved": 0
+      },
+      {
+        "path": "src/session/session-rotation.test.ts",
+        "category": "test",
+        "deleted": false,
+        "renamed": false,
+        "added": 193,
+        "removed": 0,
+        "code": 156,
+        "exportRemoved": 0
+      },
+      {
+        "path": "src/session/session-rotation.ts",
+        "category": "production",
+        "deleted": false,
+        "renamed": false,
+        "added": 179,
+        "removed": 0,
+        "code": 135,
+        "exportRemoved": 0
+      },
+      {
+        "path": "src/user-config/chat.ts",
+        "category": "production",
+        "deleted": false,
+        "renamed": false,
+        "added": 7,
+        "removed": 0,
+        "code": 5,
+        "exportRemoved": 0
+      }
+    ],
+    "deletedPaths": [],
+    "changedTestPaths": [
+      "src/session/context-budget.test.ts",
+      "src/session/session-rotation.test.ts"
+    ],
+    "changedProductionPaths": [
+      "src/compact/pipeline.ts",
+      "src/session/chat.ts",
+      "src/session/compact-session.ts",
+      "src/session/context-budget.ts",
+      "src/session/session-rotation.ts",
+      "src/user-config/chat.ts"
+    ],
+    "productionCodeLines": 186,
+    "testCodeLines": 258,
+    "filesOmitted": 0
+  },
+  "grade": "L2",
+  "gradeReason": "production-large-light-default",
+  "landLane": "normal",
+  "mainMerged": true,
+  "mainMergeHead": "8bcb9fa79c7cc355e1cae3156215a85ad78e0d13",
+  "gradeFocused": [
+    "src/session/context-budget.test.ts",
+    "src/session/session-rotation.test.ts"
+  ],
+  "ratchets": [
+    "PLUGIN-ONLY-RATCHET",
+    "NUMGUARD",
+    "R-LIVE10",
+    "TEST-INTERFERENCE-RATCHET"
+  ],
+  "landChecks": {
+    "baseAncestorOfMain": true,
+    "importsMissing": []
+  },
+  "light": {
+    "bunCache": "/Users/op/.cache/res-pregate-bun-cache"
+  },
+  "pwaLockSha256": "f734d92db9702d1bf57bb3033a1614fa71efa37b7c9087f30ac2dbaebd232ec6",
+  "reviewWorkItem": "fix/cc2-ctx-rotation-main-1125",
+  "rulesBase": "024f592f4c755c66a06a538b3167a3639b676613",
+  "rulesMain": "024f592f4c755c66a06a538b3167a3639b676613",
+  "mode": "light",
+  "minutes": 4.99
+}

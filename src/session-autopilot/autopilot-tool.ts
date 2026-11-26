@@ -17,7 +17,7 @@ export const AUTOPILOT_ON_VERBS = ['시작', '켜', 'on'] as const;
 export const AUTOPILOT_OFF_VERBS = ['끝', '꺼', '해제', '종료', 'off'] as const;
 
 /** The one system-prompt line (stable prefix · present when the tool is in the profile). */
-export const AUTOPILOT_PROMPT_LINE = `자율주행 모드: 사람의 말이 ${AUTOPILOT_WORDS.map((w) => `«${w}»`).join('·')} 모드를 켜거나(${AUTOPILOT_ON_VERBS.join('·')}) 끄는(${AUTOPILOT_OFF_VERBS.join('·')}) 뜻이면 — 낱말과 켜기/끄기 동사가 있으면 확인 없이 — 바로 ${AUTOPILOT_TOOL_NAME}({on:true, goal?} | {on:false})를 부른다. «다시 자율주행»=on:true · «이제부터 내가 운전하겠다»=on:true,hold:true. 새 요청·다른 방향·긴급 지시는 자율주행을 멈추지 않는다 — 켜진 채로 처리하고, 새 방향이면 {on:true, goal}로 목표만 바꾼다. 사람이 목표(단기 발행 일정·중기 데모 같은 마일스톤·장기 월/분기)를 정하거나 고치거나 지우면 ${AUTOPILOT_GOAL_SET_TOOL_NAME}/${AUTOPILOT_GOAL_REMOVE_TOOL_NAME} 을 부른다 — 목표를 스스로 만들지 않는다.`;
+export const AUTOPILOT_PROMPT_LINE = `자율주행 모드: 사람의 말이 ${AUTOPILOT_WORDS.map((w) => `«${w}»`).join('·')} 모드를 켜거나(${AUTOPILOT_ON_VERBS.join('·')}) 끄는(${AUTOPILOT_OFF_VERBS.join('·')}) 뜻이면 — 낱말과 켜기/끄기 동사가 있으면 확인 없이 — 바로 ${AUTOPILOT_TOOL_NAME}({on:true, goal?} | {on:false})를 부른다. «다시 자율주행»=on:true · «이제부터 내가 운전하겠다»=on:true,hold:true. 새 요청·다른 방향·긴급 지시는 자율주행을 멈추지 않는다 — 켜진 채로 처리하고, 새 방향이면 {on:true, goal}로 목표만 바꾼다. 사람이 목표(단기 발행 일정·중기 데모 같은 마일스톤·장기 월/분기)를 정하거나 고치거나 지우면 ${AUTOPILOT_GOAL_SET_TOOL_NAME}/${AUTOPILOT_GOAL_REMOVE_TOOL_NAME} 을 부른다 — 목표를 스스로 만들지 않는다. 📌 작업 골은 사람이 «골로 잡아» 처럼 골 설정을 명시할 때만(explicit_ask 에 그 말을 그대로 인용) — 질문·요청·기한 있는 부탁은 이번 턴에 답하거나 처리한다.`;
 
 export function buildAutopilotTools(): LLMToolSpec[] {
   return [
@@ -28,7 +28,8 @@ export function buildAutopilotTools(): LLMToolSpec[] {
         type: 'object',
         properties: {
           on: { type: 'boolean', description: 'true = start / resume · false = stop' },
-          goal: { type: 'string', description: 'what to drive toward — only for a person\'s request whose done-state needs work beyond this turn (deliverable · plan · multi-step decision · deadline/target); a question answerable now, a status ask, an ack or a one-step command is NOT a goal' },
+          goal: { type: 'string', description: 'what to drive toward — ONLY when the person explicitly says to set it as a goal (e.g. «이걸 골로 잡아», «make this a goal»). A question, a status ask, a request, an ack or a command is NOT a goal even with a deadline — answer or do it in this turn' },
+          explicit_ask: { type: 'string', description: 'required with goal — the person\'s own words from this turn that ask to set the goal, quoted verbatim (checked against the turn; refused when absent or not found)' },
           done_criterion: { type: 'string', description: 'required with goal — one judgment line that says when the goal is done' },
           kind: { type: 'string', enum: ['task', 'autopilot'], description: 'task (default) = a multi-step deliverable — shown as a pin above the input, NOT the autopilot goal; needs done_criterion + deadline; at most 3 pins. autopilot = only the seat\'s standing/version goal or a crown P0 direction — replaces the 🚗 AUTO goal' },
           deadline: { type: 'string', description: 'required with any goal — «HH:MM» or ISO time it is due (one nudge at the deadline, expired 30 min after). Without goal = extend the open goal\'s deadline' },
@@ -96,6 +97,7 @@ export async function dispatchAutopilotTool(name: string, args: Record<string, u
       ...(args.done_check !== undefined ? { doneCheck: args.done_check } : {}),
       ...(args.outcome === 'done' || args.outcome === 'partial' || args.outcome === 'dropped' ? { outcome: args.outcome } : {}),
       ...(typeof args.reason === 'string' ? { reason: args.reason } : {}),
+      ...(typeof args.explicit_ask === 'string' ? { explicitAsk: args.explicit_ask } : {}),
       ...(args.decided && typeof args.decided === 'object' ? { decided: args.decided as { kind: string; criterion: string } } : {}),
     };
     const result = pilot.set(req, 'tool');

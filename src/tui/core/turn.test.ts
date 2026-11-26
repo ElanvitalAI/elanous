@@ -48,7 +48,7 @@ test('Esc sim aborts the runner, ignores late stream, and blocks auto continuati
   expect(decideNextTuiAutoContinue(result, 0, '')).toBe('none');
 });
 
-test('assistant provenance never promotes unclassified text and replace clears the preview', async () => {
+test('assistant provenance never promotes unclassified text; a new round appends to shown assistant text (ELN-TRANSCRIPT-APPEND-ONLY)', async () => {
   const previews: Array<{ text: string; source?: string }> = [];
   let clock = 40;
   const turn = startNextTuiTurn({ sessionId: 's1', text: 'stream' }, {
@@ -65,8 +65,8 @@ test('assistant provenance never promotes unclassified text and replace clears t
   });
   await turn.done;
   expect(previews.filter((preview) => preview.source === 'assistant-text').map((preview) => preview.text))
-    .toEqual(['공연 설계 ', '공연 설계 진행 중', '공개 답변']);
-  expect(previews.some((preview) => preview.text === '' && preview.source === undefined)).toBe(true);
+    .toEqual(['공연 설계 ', '공연 설계 진행 중', '공연 설계 진행 중\n\n공개 답변']);
+  expect(previews.some((preview) => preview.text.includes('diagnostic') && preview.source === 'assistant-text')).toBe(false);
 });
 
 test('abort immediately clears the preview even while the runner is still shutting down', async () => {
@@ -283,4 +283,26 @@ test('ordinary long responses continue showing newly streamed text beyond the pr
     onPreview: text => screens.push(nextAssistantPreviewText(text)), onSettled: () => {},
   }).done;
   expect(screens.at(-1)).toContain('LATEST-ORDINARY-FRAME ');
+});
+
+// ELN-TRANSCRIPT-APPEND-ONLY (대표 11-26): a later model round (tool round / research re-entry / guard replace) must not
+// wipe the assistant text already on screen — it appends, and the earlier rounds go to the holder for the settled view.
+test('a replace frame after shown assistant text appends the next round and holds the earlier rounds', async () => {
+  const previews: string[] = []; const held: string[] = []; let clock = 0;
+  const turn = startNextTuiTurn({ sessionId: 's1', text: 'multi' }, {
+    now: () => (clock += 100),
+    run: async (_input, delta) => {
+      delta('Round one answer.', false, 'assistant-text');
+      delta('', true);
+      delta('Round two answer.', false, 'assistant-text');
+      delta('whole new text from a re-entered turn', true);
+      delta('Round three.', false, 'assistant-text');
+    },
+    onPreview: (text) => previews.push(text),
+    onHeldAnswer: (text) => held.push(text),
+  });
+  await turn.done;
+  expect(previews.at(-1)).toBe('Round one answer.\n\nRound two answer.\n\nRound three.');
+  expect(previews.every((text) => text === '' || text.startsWith('Round one answer.'))).toBe(true);
+  expect(held).toEqual(['Round one answer.', 'Round one answer.\n\nRound two answer.']);
 });

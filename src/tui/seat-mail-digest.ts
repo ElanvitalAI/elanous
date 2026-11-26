@@ -113,6 +113,48 @@ function digestLines(mail: readonly SeatMailBundleNotice[]): string[] {
  * are. A bundle of one action mail and nothing else keeps its plain text (no digest wrapper for a single mail).
  */
 export function seatMailBundleText(notices: readonly SeatMailBundleNotice[]): string {
+  return foldMailDigests(seatMailBundleTextRaw(notices));
+}
+
+const DIGEST_OPEN = '<mail_digest count="';
+const DIGEST_CLOSE = '</mail_digest>';
+const UNREAD_TAIL = /\n\n\[미읽음 총 (\d+)통\]$/u;
+
+/**
+ * MAIL-ENVELOPE-INFO-NOT-ORDER — a turn carries ONE `<mail_digest count=N>` block: every single-mail digest block in the
+ * bundle text is merged (one lead note, one line per mail) and the per-mail «[미읽음 총 N통]» tails collapse into one
+ * unread count (the latest). Reads only our own block grammar. 순수.
+ */
+export function foldMailDigests(text: string): string {
+  const parts = text.split('\n\n');
+  const entries: string[] = [];
+  const kept: string[] = [];
+  let unread: number | undefined;
+  let note: string | undefined;
+  for (let i = 0; i < parts.length; i++) {
+    let part = parts[i]!;
+    const tail = UNREAD_TAIL.exec(`\n\n${part}`);
+    if (tail && part.startsWith('[미읽음 총 ')) { unread = Number(tail[1]); continue; }
+    if (part.startsWith(DIGEST_OPEN)) {
+      // A digest block may span several «\n\n» pieces when a body holds blank lines: join until its close tag.
+      while (!part.includes(DIGEST_CLOSE) && i + 1 < parts.length) part = `${part}\n\n${parts[++i]!}`;
+      const lines = part.split('\n');
+      const m = /unread="(\d+)"/u.exec(lines[0] ?? '');
+      if (m) unread = Number(m[1]);
+      note ??= lines[1];
+      const end = lines.lastIndexOf(DIGEST_CLOSE);
+      entries.push(lines.slice(2, end < 0 ? undefined : end).join('\n'));
+      continue;
+    }
+    kept.push(part);
+  }
+  if (entries.length === 0 && unread === undefined) return text;
+  const block = entries.length === 0 ? [] : [`${DIGEST_OPEN}${entries.length}"${unread === undefined ? '' : ` unread="${unread}"`}>\n${note ?? ''}\n${entries.join('\n')}\n${DIGEST_CLOSE}`];
+  const unreadLine = entries.length === 0 && unread !== undefined ? [`[미읽음 총 ${unread}통]`] : [];
+  return [...kept, ...block, ...unreadLine].join('\n\n');
+}
+
+function seatMailBundleTextRaw(notices: readonly SeatMailBundleNotice[]): string {
   const mail = notices.filter((notice) => notice.source === 'seat-mail' && typeof notice.digest === 'string');
   const rest = notices.filter((notice) => !mail.includes(notice));
   if (mail.length === 0 || (mail.length === 1 && mail[0]!.passive !== true)) return notices.map((notice) => notice.text).join('\n\n');

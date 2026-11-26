@@ -493,6 +493,13 @@ export function buildReplTools(options: {
       });
     }
   }
+  if (options.nextTui) {
+    // GOAL-ORCHESTRATION-NL: «/orch <goal>» or a plain goal → plan · confirm · run · progress · stop/layout by words.
+    const orch = require('../orchestration/tool.js') as typeof import('../orchestration/tool.js');
+    const spec = orch.buildOrchestrateTool();
+    specs.push(spec);
+    dispatchByName.set(spec.name, args => orch.dispatchOrchestrate(args));
+  }
   const packQuery = buildInstalledPackQueryTool();
   specs.push(packQuery);
   dispatchByName.set(packQuery.name, args => dispatchInstalledPackQuery(args));
@@ -551,7 +558,7 @@ export function buildReplTools(options: {
   {
     const commitments = require('../commitment/close.js') as typeof import('../commitment/close.js');
     specs.push(commitments.buildCommitmentCloseTool());
-    dispatchByName.set(commitments.COMMITMENT_CLOSE_TOOL_NAME, async args => commitments.dispatchCommitmentClose(args as Record<string, unknown>).output);
+    dispatchByName.set(commitments.COMMITMENT_CLOSE_TOOL_NAME, async args => (await commitments.dispatchCommitmentClose(args as Record<string, unknown>)).output);
   }
   // HAND-RAISE-LADDER — every ✋ ends in one outcome (resolve · reject · escalate); the auto-escalation notice names this tool.
   {
@@ -1288,7 +1295,8 @@ async function runOneTurn(
   //    시스템 프롬프트가 아니라 이번 호출의 사용자 역할 텍스트 블록 — 캐시 접두를 흔들지 않는다.
   try {
     const recall = (require('../seat-memory/seat-memory-layers.js') as typeof import('../seat-memory/seat-memory-layers.js'))
-      .seatMemoryRecallText({ cwd: getSessionCwd(), userText, sessionId });
+      // CEO-UTTERANCE-TAGGED-LAST ⑦ — keyed on the person's line only (a bundle keys on mail bodies, never on harness lines).
+      .seatMemoryRecallText({ cwd: getSessionCwd(), userText: (require('../session/human-envelope.js') as typeof import('../session/human-envelope.js')).recallKeyText(userText, from?.kind), sessionId });
     if (recall) userImages.unshift({ type: 'text', text: recall });
   } catch { /* 회상만 빠진다 */ }
   const surfaceRunId = onJsonMessageBlock ? randomUUID() : undefined;

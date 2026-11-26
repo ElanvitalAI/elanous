@@ -1,4 +1,8 @@
 // fed-state reader — the four federation KPIs (one definition for pulse · board · CLI).
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { type Fact, readFacts } from './ledger.js';
 
 export interface FedKpi {
@@ -63,7 +67,40 @@ export function fedKpi(opts: { window?: string; now?: Date; path?: string } = {}
   const start = new Date(end.getTime() - parseWindow(opts.window ?? '1h'));
   // hand state carries over: read everything up to end (hand facts are few; window filter applied inside).
   const { facts } = readFacts({ until: end, path: opts.path });
-  return computeFedKpi(facts, start, end);
+  // Lands mostly happen outside `pr land` (judge poller · direct merges) and never write a land fact — the
+  // KPI read landed 0/h while main took 13 merges/h (OP 11-26 08:0x). main's first-parent «(#N)» commits are
+  // the land truth; fold them in (deduped by ref in computeFedKpi). Explicit-path callers (tests) stay pure.
+  const lands = opts.path ? [] : gitLandFacts(start, end);
+  return computeFedKpi(lands.length ? [...facts, ...lands] : facts, start, end);
+}
+
+/** First-parent main merge commits in [start, end) as land facts. Fail-open (no repo → []), cached 60 s per window. */
+const gitLandCache = new Map<string, { at: number; facts: Fact[] }>();
+export function gitLandFacts(start: Date, end: Date, gitDir: string = process.env.ELANOUS_FED_GIT_DIR || join(homedir(), 'elanous-hq', 'repo.git')): Fact[] {
+  const key = `${gitDir}|${Math.floor(start.getTime() / 60_000)}|${Math.floor(end.getTime() / 60_000)}`;
+  const hit = gitLandCache.get(key);
+  if (hit && Date.now() - hit.at < 60_000) return hit.facts;
+  let facts: Fact[] = [];
+  try {
+    if (!existsSync(gitDir)) return [];
+    const r = spawnSync('git', ['--git-dir', gitDir, 'log', 'origin/main', '--first-parent', `--since=${start.toISOString()}`, `--until=${end.toISOString()}`, '--format=%cI%x09%s'], { encoding: 'utf8', timeout: 5_000 });
+    if (r.status === 0) facts = parseGitLandLog(r.stdout, start, end);
+  } catch { facts = []; }
+  if (gitLandCache.size > 64) gitLandCache.clear();
+  gitLandCache.set(key, { at: Date.now(), facts });
+  return facts;
+}
+
+/** Pure: `%cI\t%s` lines → land facts for commits whose subject ends «(#N)» and whose time is in [start, end). */
+export function parseGitLandLog(stdout: string, start: Date, end: Date): Fact[] {
+  const out: Fact[] = [];
+  for (const line of stdout.split('\n')) {
+    const [ts, subj] = line.split('\t');
+    const m = subj ? /\(#(\d+)\)\s*$/.exec(subj) : null;
+    const t = ts ? Date.parse(ts) : NaN;
+    if (m && Number.isFinite(t) && t >= start.getTime() && t < end.getTime()) out.push({ ts: new Date(t).toISOString(), type: 'land', ref: m[1], source: 'git:main' });
+  }
+  return out;
 }
 
 export function formatFedKpi(k: FedKpi): string {

@@ -1,5 +1,7 @@
 // RESOURCE-OPT-STEWARD — live wiring: SeatAssign through the CLI (`eln seat assign … --json` · #40072), routine requests
 // as one ledger mail each. Kept out of steward.ts so the steward stays pure (fixtures decide it).
+import { vetoOwner } from '../org/land-authority.js';
+import type { OrgDeps } from '../org/org-map.js';
 import { execFile } from 'node:child_process';
 import type { MatchingRow } from './matching-table.js';
 import { STEWARD_UNAVAILABLE, type StewardAssignResult, type StewardDeps } from './steward.js';
@@ -19,10 +21,10 @@ export function parseSeatAssignOutput(stdout: string, exitCode: number | null): 
   return { ok: false, code: STEWARD_UNAVAILABLE, reason: `seat assign gave no result (exit ${exitCode ?? 'signal'})` };
 }
 
-export function liveStewardAssign(actor = 'OP'): (row: AssignRow) => Promise<StewardAssignResult> {
-  return async (row) => {
+export function liveStewardAssign(actor = 'OP'): (row: AssignRow, version?: string) => Promise<StewardAssignResult> {
+  return async (row, version) => {
     const { elanousInvocation } = await import('../instance/spawn-elanous.js');
-    const inv = elanousInvocation(['seat', 'assign', row.seat, row.cell, '--from', actor, '--json',
+    const inv = elanousInvocation(['seat', 'assign', row.seat, row.cell, '--from', actor, '--json', ...(version ? ['--version', version] : []),
       '--why', `[steward ${row.id}] ${row.priority} ${row.why} · idle ${row.idleMin ?? '?'}m`]);
     return new Promise((resolve) => {
       execFile(inv.command, [...inv.args], { timeout: 60_000, maxBuffer: 4 * 1024 * 1024, env: inv.env }, (error, stdout) => {
@@ -33,8 +35,8 @@ export function liveStewardAssign(actor = 'OP'): (row: AssignRow) => Promise<Ste
   };
 }
 
-/** Routine requests as ledger mail from the HQ seat (one per PR head / judge cell — the steward dedupes). */
-export function liveStewardRequests(post: (mail: { from: string; to: string; kind: string; intent: 'request'; body: string; refs: string[] }) => unknown, actor = 'OP'):
+/** Routine requests as ledger mail (judge requests → the org map's veto owner · JUD-SPLIT-FU-CONSUMERS) from the HQ seat (one per PR head / judge cell — the steward dedupes). */
+export function liveStewardRequests(post: (mail: { from: string; to: string; kind: string; intent: 'request'; body: string; refs: string[] }) => unknown, actor = 'OP', orgDeps: OrgDeps = {}):
   Pick<StewardDeps, 'requestPregate' | 'requestJudge'> {
   return {
     requestPregate: (row) => {
@@ -44,7 +46,7 @@ export function liveStewardRequests(post: (mail: { from: string; to: string; kin
       return true;
     },
     requestJudge: (row) => {
-      post({ from: actor, to: 'JUD', kind: 'request', intent: 'request', refs: [`cell:${row.cell}`, ...(row.pr ? [`pr:${row.pr}`] : []), 'steward:judge'],
+      post({ from: actor, to: vetoOwner(orgDeps), kind: 'request', intent: 'request', refs: [`cell:${row.cell}`, ...(row.pr ? [`pr:${row.pr}`] : []), 'steward:judge'],
         body: `[steward] judge ${row.cell}${row.pr ? ` #${row.pr}` : ''} — waiting ${row.ageMin}m in the judge queue` });
       return true;
     },

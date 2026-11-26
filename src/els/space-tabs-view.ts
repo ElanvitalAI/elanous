@@ -12,6 +12,7 @@ import { clipCells, fitCells, UNREACHABLE_MARK, wordOfState, type PaneRow } from
 import { STATUS, type StatusWord } from './status-vocab.js';
 import { seatMarks, type SeatMarkInput } from './seat-marks.js';
 import { agentEntry, remoteMark } from './agent-entry.js';
+import { heartbeatRow, isLoopTabTitle, loopFoldKey, loopsFoldedByDefault, loopsSubHead, type LoopFacts } from './loop-agents.js';
 
 export interface SpaceTabRow extends PaneRow {
   readonly command?: readonly string[];
@@ -131,8 +132,23 @@ export function paneEmoji(row: SpaceTabRow): string {
 
 const markInput = (row: SpaceTabRow): SeatMarkInput =>
   ({ word: wordOfState(row.state), ...(row.seatState ? { seatState: row.seatState } : {}), ...(row.seatReason ? { seatReason: row.seatReason } : {}), ...(row.seatSource ? { seatSource: row.seatSource } : {}), ...(row.unread ? { unread: row.unread } : {}) });
-/** SIDETAB-TWO-MARKS: slot 1 (activity) glued to slot 2 (attention): «⚪✋», «🟢✉3», «⚪⏳», «🟢». */
-const twoMarks = (row: SpaceTabRow): string => { const marks = seatMarks(markInput(row)); return `${marks.activity}${marks.attention}`; };
+/** SIDETAB-TWO-MARKS: slot 1 (activity) glued to slot 2 (attention): «⚪✋», «⚪⏳», «🟢» — the unread «✉N» moved after the name. */
+/** SIDETAB-POLISH-1126 (대표 11-26 11:2x «안 읽은 수는 이름 뒤»): the agents panel leads with the activity dot (and ✋/⏳), and the
+ *  unread count «✉N» trails the name — «🟢 OP terra ✉123». Still a badge: a narrow row cuts the name first, never the count. */
+const leadMark = (row: SpaceTabRow): string => { const marks = seatMarks(markInput(row)); return `${marks.activity}${marks.attention.startsWith('✉') ? '' : marks.attention}`; };
+const unreadBadge = (row: SpaceTabRow): string => { const attention = seatMarks(markInput(row)).attention; return attention.startsWith('✉') ? ` ${attention}` : ''; };
+/**
+ * SIDETAB-POLISH-1126 (대표 11-26 «서브 조율자를 맨 위에 · 다른 색»): the space's own coordinator seat — the workspace
+ * `coordinatorSeat` (row.spaceCoordinator from the server) or the seat named like the space (OP in OP · TC in TC · JUD in
+ * JUDGE) — heads that space's list. A hand («TC-H-…») or a worker child is never the coordinator.
+ */
+export function isSpaceCoordinatorRow(row: SpaceTabRow, spaceName: string): boolean {
+  if (row.parentPane) return false;
+  if (row.spaceCoordinator) return true;
+  const seat = (row.seat ?? '').toLocaleUpperCase(), name = spaceName.toLocaleUpperCase();
+  if (!seat || !name || seat.includes('-')) return false;
+  return seat === name || (Math.min(seat.length, name.length) >= 3 && (name.startsWith(seat) || seat.startsWith(name)));
+}
 /** The group header count of seats waiting on a person: « ✋2» (empty when none). */
 const personCount = (panes: readonly SpaceTabRow[]): string => { const n = panes.filter((row) => !row.stale && seatMarks(markInput(row)).needsPerson).length; return n > 0 ? ` ✋${n}` : ''; };
 
@@ -278,9 +294,14 @@ export function nestWorkerChildren<T extends { readonly row: SpaceTabRow }>(entr
   return top.flatMap((entry) => [entry, ...(childrenOf.get(entry.row.pane) ?? [])]);
 }
 
-export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: string | undefined, width: number, height: number, home?: string, ceoPendingRed = 0, emptyCoordinators: readonly { wsId: string; name: string; remote?: string; stale?: boolean }[] = [], selectedEmpty?: string, agentsOrder: 'grouped' | 'status' = 'grouped', actingSeat?: string, listTop?: number, groupFolds: GroupFolds = new Map(), activeOnly = false, spacesTop?: number): SpaceListLayout {
+/** SIDETAB-POLISH-1126: stable — the space's coordinator rows first, the rest in their rank order. */
+export function coordinatorFirst<T extends { readonly row: SpaceTabRow }>(list: readonly T[], spaceName: string): T[] {
+  return [...list.filter((entry) => isSpaceCoordinatorRow(entry.row, spaceName)), ...list.filter((entry) => !isSpaceCoordinatorRow(entry.row, spaceName))];
+}
+
+export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: string | undefined, width: number, height: number, home?: string, ceoPendingRed = 0, emptyCoordinators: readonly { wsId: string; name: string; remote?: string; stale?: boolean }[] = [], selectedEmpty?: string, agentsOrder: 'grouped' | 'status' = 'grouped', actingSeat?: string, listTop?: number, groupFolds: GroupFolds = new Map(), activeOnly = false, spacesTop?: number, loopFacts: ReadonlyMap<string, LoopFacts> = new Map()): SpaceListLayout {
   const chosen = selectedEmpty ?? selectedSpace(rows, selectedPane);
-  type Item = { readonly text: string; readonly ws?: string; readonly pane?: string; readonly mode?: 'focus' | 'dim'; readonly bold?: boolean; readonly group?: { readonly ws: string; readonly folded: boolean } };
+  type Item = { readonly text: string; readonly ws?: string; readonly pane?: string; readonly mode?: 'focus' | 'dim'; readonly bold?: boolean; readonly coordinator?: boolean; readonly dimTail?: string; readonly group?: { readonly ws: string; readonly folded: boolean }; readonly band?: { readonly name: string; readonly right: string }; readonly painted?: string };
   // 출처: OP #134199/#134203 — 스페이스 줄에는 동작 상태를 표시하지 않는다(조율자 ⭐ 표식과 원격 사망 ✕만).
   const isActing = (row: SpaceTabRow): boolean => !!actingSeat && !row.remote && row.seat === actingSeat;
   const nameOf = (space: Space): string => `${nameHead(space)}${personCount(space.panes)}`;
@@ -349,7 +370,9 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
     const rankedAll: readonly { readonly space: Space; readonly row: SpaceTabRow }[] = agentsOrder === 'status'
       ? agentSpaces.flatMap((space) => space.panes.map((row) => ({ space, row }))).sort((a, b) => rankOf(a.row) - rankOf(b.row))
       : agentSpaces.flatMap((space) => [...space.panes].sort((a, b) => rankOf(a) - rankOf(b)).map((row) => ({ space, row })));
-    const ranked = rankedAll.filter((entry) => keep(entry.row));
+    // SIDETAB-LOOP-AGENTS-UNDER-SPACE: a loop-agent tab («↻ <id>») is drawn as a heartbeat row under its space, not as a seat row.
+    const isLoop = (row: SpaceTabRow): boolean => isLoopTabTitle(row.title) !== undefined;
+    const ranked = rankedAll.filter((entry) => keep(entry.row) && !isLoop(entry.row));
     // ELS-PANE-LABEL-MODEL-FIRST: an entry reads «<mark> <SEAT> <model>» and, dim under it, «cell · @lent space · runtime (not
     // eln) · ⇄host · age» (agent-entry.ts). «grouped» draws a «⊟ SPACE · n» head per space; when the entries would not fit, every
     // group but the selected pane's folds to its head («⊞») — a click on a head selects its first pane and so opens it.
@@ -372,14 +395,15 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
           if (twoLine && row.exit?.last) out.push({ text: headCells(`       ${row.exit.last}`, width), mode: 'dim' });
           continue;
         }
-        const mark = row.stale ? UNREACHABLE_MARK : twoMarks(row);
+        const mark = row.stale ? UNREACHABLE_MARK : leadMark(row);
+        const coordinator = isSpaceCoordinatorRow(row, space.name);
         // DEMO-FANOUT-LIVE-OP-SEAT: a worker child sits indented under its parent («↳») with ✓ once its task turn finished;
         // the parent carries «done/total» of its children.
         const child = !!row.parentPane && ordered.some((entry) => entry.row.pane === row.parentPane);
         const progress = workerProgress(row.pane, rows);
         const indent = child ? '  ↳ ' : '';
         const entry = agentEntry({ name: `${row.seat ?? (row.agent && labelName(row) === row.agent ? space.name.toLocaleUpperCase() : labelName(row))}${row.remote ? `@${row.remote.toLowerCase()}` : ''}`, title: tabName(row.title), ...(row.agent ? { agent: row.agent } : {}), ...(row.model ? { model: row.model } : {}), ...(row.command ? { command: row.command } : {}), groupSpace: space.name, ...(row.remote ? { remote: row.remote } : {}), ...(row.lastEventAtMs ? { lastEventAtMs: row.lastEventAtMs } : {}) }, now);
-        out.push({ text: badgedLine(` ${indent}${mark} ${isActing(row) ? '[OP 대행] ' : ''}${entry.head}`, `${child && workerDone(row) ? ' ✓' : ''}${progress ? ` ${progress.done}/${progress.total}` : ''}`, width - 1), pane: row.pane, ws: space.wsId, ...(row.spaceCoordinator ? { bold: true } : {}), ...(row.pane === selectedPane ? { mode: 'focus' as const } : {}) });
+        out.push({ text: badgedLine(` ${indent}${mark} ${isActing(row) ? '[OP 대행] ' : ''}${entry.head}`, `${row.stale ? '' : unreadBadge(row)}${child && workerDone(row) ? ' ✓' : ''}${progress ? ` ${progress.done}/${progress.total}` : ''}`, width - 1), pane: row.pane, ws: space.wsId, ...(row.spaceCoordinator || coordinator ? { bold: true } : {}), ...(coordinator ? { coordinator: true } : {}), ...(entry.model ? { dimTail: entry.model } : {}), ...(row.pane === selectedPane ? { mode: 'focus' as const } : {}) });
         if (twoLine && entry.detail) out.push({ text: headCells(`    ${child ? '    ' : ''}${entry.detail}`, width), mode: 'dim' });
       }
       return out;
@@ -402,7 +426,7 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
       };
       const homed = ranked.map((entry) => ({ ...entry, home: homeOf(entry) }));
       const homes = [...agentSpaces.filter((space) => homed.some((entry) => entry.home === space)), ...made.values()];
-      const groups = homes.map((space) => ({ space, list: homed.filter((entry) => entry.home === space) }))
+      const groups = homes.map((space) => ({ space, list: coordinatorFirst(homed.filter((entry) => entry.home === space), space.name) }))
         .map((group) => ({ ...group, items: entryItems(group.list) })).filter((group) => (group.items.shown ?? 0) > 0);
       const opened = groups.map((group) => group.items);
       const room = height - (height >= 3 ? 1 : 0) - (height >= 2 ? 1 : 0);
@@ -421,8 +445,23 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
       }
       groups.forEach((group, at) => {
         const folded = folds.has(at);
-        items.push({ text: headCells(` ${folded ? '▸' : '▾'} ${group.space.name.toLocaleUpperCase()} · ${activeOnly ? `${group.items.shown}/${rankedAll.filter((entry) => !isBareShell(entry.row) && homeOf(entry) === group.space).length}` : group.items.shown}${personCount(group.list.map((entry) => entry.row))}`, width), ws: group.space.wsId, pane: group.list[0]!.row.pane, group: { ws: group.space.wsId, folded } });
+        // SIDETAB-SPACE-HEADER-BAND (대표 11-26 07:1x): a full-width band · bold name · count (and ✋) on the right · ⌄/› fold.
+        const count = `${activeOnly ? `${group.items.shown}/${rankedAll.filter((entry) => !isBareShell(entry.row) && homeOf(entry) === group.space).length}` : group.items.shown}${personCount(group.list.map((entry) => entry.row))}`;
+        const loops = rankedAll.filter((entry) => isLoop(entry.row) && homeOf(entry) === group.space).map((entry) => entry.row).sort((a, b) => a.title.localeCompare(b.title));
+        const loopErrors = loops.filter((row) => loopFacts.get(isLoopTabTitle(row.title)!)?.tone === 'error').length;
+        const loopCount = loops.length ? ` ↻${loops.length}${loopErrors ? ` ✖${loopErrors}` : ''}` : '';
+        items.push({ text: ` ${folded ? GROUP_FOLDED : GROUP_OPEN} ${group.space.name.toLocaleUpperCase()} ${count}${loopCount}`, band: { name: group.space.name.toLocaleUpperCase(), right: `${count}${loopCount}` }, ws: group.space.wsId, pane: group.list[0]!.row.pane, group: { ws: group.space.wsId, folded } });
         if (!folded) items.push(...opened[at]!);
+        if (!folded && loops.length) {
+          // «↻ loops n» sub-header (its own fold, open by default) and one heartbeat row per loop tab — a click selects that tab.
+          const key = loopFoldKey(group.space.wsId);
+          const loopsFolded = groupFolds.get(key) ?? loopsFoldedByDefault(loops.length);
+          items.push({ text: loopsSubHead(loops.length, loopsFolded, loopErrors), mode: 'dim', ws: group.space.wsId, pane: loops[0]!.pane, group: { ws: key, folded: loopsFolded } });
+          if (!loopsFolded) for (const row of loops) {
+            const id = isLoopTabTitle(row.title)!;
+            items.push({ text: heartbeatRow(id, loopFacts.get(id), now, width, false), painted: heartbeatRow(id, loopFacts.get(id), now, width, true), pane: row.pane, ws: group.space.wsId, ...(row.pane === selectedPane ? { mode: 'focus' as const } : {}) });
+          }
+        }
       });
     }
   }
@@ -458,8 +497,11 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
         if (item.pane !== undefined) spaces.push({ y: lines.length + 1, ws: item.ws, pane: item.pane });
         else emptySpaces.push({ y: lines.length + 1, ws: item.ws });
       }
-      const fitted = fitCells(item.text, textWidth);
-      const text = item.bold ? `\u001b[1m${fitted}\u001b[22m` : fitted;
+      if (item.band && item.group) { lines.push(spaceHeadBand(item.group.folded, item.band.name, item.band.right, textWidth) + glyph); continue; }
+      if (item.painted !== undefined && item.mode !== 'focus' && Bun.stringWidth(item.text) === textWidth) { lines.push(item.painted + glyph); continue; }
+      const fitted = dimModelTail(fitCells(item.text, textWidth), item.dimTail, !!item.bold);
+      const bolded = item.bold ? `\u001b[1m${fitted}\u001b[22m` : fitted;
+      const text = item.coordinator ? `${COORDINATOR_ON}${bolded}${COORDINATOR_OFF}` : bolded;
       lines.push((item.mode === 'focus' ? `${FOCUS_ON}${text}${FOCUS_OFF}` : item.mode === 'dim' ? `\u001b[2m${text}\u001b[22m` : text) + glyph);
     }
   };
@@ -550,6 +592,38 @@ export interface TabRow {
 const TAB_SEP = '  ';
 const TAB_PAD = '  ';
 const NEW_TAB = '+';
+export const GROUP_OPEN = '⌄';
+export const GROUP_FOLDED = '›';
+// Theme token: a mid grey band reads a shade off the panel on both dark and light terminals (bright-black background).
+export const SPACE_HEAD_BAND_ON = '\u001b[100m';
+export const SPACE_HEAD_BAND_OFF = '\u001b[49m';
+/** SIDETAB-SPACE-HEADER-BAND: one group header row, exactly `width` display cells (CJK/emoji-aware) inside the band. */
+export function spaceHeadBand(folded: boolean, name: string, right: string, width: number): string {
+  if (width <= 0) return '';
+  const lead = ` ${folded ? GROUP_FOLDED : GROUP_OPEN} `;
+  const tail = right ? `${right} ` : '';
+  const nameRoom = Math.max(0, width - Bun.stringWidth(lead) - Bun.stringWidth(tail) - 1);
+  if (Bun.stringWidth(lead) + Bun.stringWidth(tail) + 1 > width) return `${SPACE_HEAD_BAND_ON}${fitCells(`${lead}${name}`, width)}${SPACE_HEAD_BAND_OFF}`;
+  const shown = Bun.stringWidth(name) <= nameRoom ? name : `${clipCells(name, Math.max(0, nameRoom - 1))}…`;
+  const gap = width - Bun.stringWidth(lead) - Bun.stringWidth(shown) - Bun.stringWidth(tail);
+  return `${SPACE_HEAD_BAND_ON}${lead}\u001b[1m${shown}\u001b[22m${' '.repeat(gap)}${tail}${SPACE_HEAD_BAND_OFF}`;
+}
+/** ELS-SIDE-MODEL-DIM (대표 11-26): the model tail of an agent entry («TC terra») is faint (SGR 2); the seat name stays normal.
+ *  Only escapes are inserted, so the cell width of the fitted line is unchanged (CJK/emoji safe). A tail cut off by the fit is left alone. */
+export function dimModelTail(fitted: string, model: string | undefined, bold = false): string {
+  if (!model) return fitted;
+  const at = fitted.lastIndexOf(` ${model}`);
+  if (at < 0) return fitted;
+  const from = at + 1, to = from + model.length;
+  return `${fitted.slice(0, from)}${MODEL_DIM_ON}${model}${MODEL_DIM_OFF}${bold ? '\u001b[1m' : ''}${fitted.slice(to)}`;
+}
+export const MODEL_DIM_ON = '\u001b[2m';
+export const MODEL_DIM_OFF = '\u001b[22m';
+/** SIDETAB-POLISH-1126: the space coordinator's row — bold in the terminal palette's cyan (SGR 36). A 16-colour palette slot,
+ *  so it follows the terminal's own light/dark theme (no fixed RGB); reverse video (the selection) still reads over it. */
+export const COORDINATOR_ON = '\u001b[36m';
+export const COORDINATOR_OFF = '\u001b[39m';
+
 const FOCUS_ON = '\u001b[7m';
 const FOCUS_OFF = '\u001b[27m';
 export const TAB_ACTIVE_ON = '\u001b[44;37m';

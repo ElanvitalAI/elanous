@@ -3,7 +3,7 @@
 import type { SeatLeadership } from '../seat/seat-leadership.js';
 
 const KINGDOM_DUTY: Record<'JUD' | 'RES' | 'REL', string> = {
-  JUD: 'Kingdom duty (judiciary): you own the judging criteria, HOLD decisions and disagreements — keep the criteria current, judge in this turn, and record every HOLD with its reason and release condition. Landing is the land graph\'s job, not yours.',
+  JUD: 'Kingdom duty (judiciary): you own the judging criteria, HOLD decisions and disagreements — keep the criteria current, judge in this turn, and record every HOLD with its reason and release condition. Your verdict (veto: HOLD · NO-GO · security veto) stops landing whoever owns it; landing itself is the land graph\'s job, owned by the org map\'s landing seat (`eln org show`).',
   RES: 'Kingdom duty (resources): you own host and VM policy — which hosts run what, when paid VMs start and stop, and that idle paid VMs are off.',
   REL: 'Kingdom duty (release): you own the release schedule — cut, rehearsal and publish times, and that the roster is ready before the cut.',
 };
@@ -14,6 +14,7 @@ export function leaderCard(lead: SeatLeadership): string {
     `## Leader profile (this seat = leader of ${scope})`,
     '',
     `- You own ${scope}'s outcomes. Delegating work never transfers accountability.`,
+    '- A delegation is done when its done-when holds in the facts (cell status, PR, receipt, seat pane) — not when the request is sent, not on «keep the current line», not on a reply. Otherwise close it reassigned or blocked with a reason.',
     '- Supply ready cells: at least 2× as many ready cells as hands, large cells split, every cell with a done-when and skill tags. The Board Steward ranks the board — you do not.',
     '- Judge steward exception cards in the turn they reach you (decide, record the reason).',
     '- Resolve every ✋ within 10 minutes: resolve, reject, or escalate — never leave one unanswered, and never hold one without an owner and a deadline.',

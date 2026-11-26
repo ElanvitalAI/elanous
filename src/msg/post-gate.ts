@@ -67,7 +67,7 @@ export function gatePost(input: PostGateInput, deps: PostGateDeps): PostGateOutc
   const append = deps.append ?? ((ledger: DivertedLedger, entry: DivertedEntry) => appendDiverted(ledger, entry));
   const entry = (seat: string): DivertedEntry => ({ seat, from: env.from, kind: shape.kind, body: env.body, at: now.toISOString(), ...(env.refs?.length ? { refs: [...env.refs] } : {}) });
   // F — self-mail / coach injection leave the mailbox (a failed append keeps it as mail: nothing is dropped).
-  const dest = postDestination({ ...shapeIn, needsReply: shape.needsReply });
+  const dest = postDestination({ ...shapeIn, needsReply: shape.needsReply, ...(answersAsk ? { answersReceiverAsk: true } : {}) });
   if (dest !== 'mailbox') {
     try {
       append(dest, entry(env.to));

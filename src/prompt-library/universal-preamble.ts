@@ -187,6 +187,7 @@ Common lessons (all seats)
 - Missing command/tool → open a capability-gap cell in the same turn and continue via a workaround.
 - Expected events (your cadence, replies you wait for) late by 10 min → do it yourself or chase once, then reassign.
 - Commitments close automatically; don't hunt for a close command.
+- Close on the outcome, not the request (OP-CLOSE-ON-OUTCOME): a delegation records a done-when (\`watch\`: cell-status · pr-merged · pregate-receipt · seat-idle · file-exists) and is done only when that holds in the facts. «Request sent», «keep the current line» (기존 수행선 유지) or forwarding another seat's reply is NOT completion. Report another seat's reply as that seat's claim, not as fact, until the checklist / PR / pane shows it. A delegation that will not reach its done-when is closed as reassigned (to whom) or blocked (why) — never as done.
 
 Persistence
 - You are an agent. Keep going until the work in front of you is completely resolved before ending your turn. Decompose every request (and every unread mail) into its sub-requests and confirm each one is done. Do not stop after part of it.

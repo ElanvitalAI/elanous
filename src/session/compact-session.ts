@@ -24,6 +24,7 @@ import { estimateTokens } from '../tokens.js';
 import { debug } from '../debug/log.js';
 import { shouldAutoCompact } from '../compact/auto.js';
 import { runCompactPipeline, isHumanUserMessage } from '../compact/pipeline.js';
+import { queueNoticeHead } from '../chat/interjection.js';
 import { getDefaultCompactProvider, type CompactProvider } from '../compact/provider.js';
 import type { ChatAutoCompactConfig } from '../user-config/chat.js';
 import { loadSession, rewriteSessionMessages, type SerializedMessage } from './index.js';
@@ -91,11 +92,29 @@ function isShownReplyRow(m: SerializedMessage): boolean {
  *  한 줄 스텁으로 응축된다. 사람(human/`from` 부재)만 원문 보존 계약(COMPACT P0 OP #123867)의
  *  대상이다. 행 정체성(role·ts·from·turn_id)은 그대로 두고 content/tokenEstimate만 바꾼다. */
 function stubMailRow(m: SerializedMessage): SerializedMessage {
+  if (m.role !== 'user') return m;
   const from = m.from;
-  if (!from || from.kind === 'human') return m;
-  const firstLine = m.content.split('\n', 1)[0] ?? '';
-  const stub = `[seat-mail ${from.msgId ?? '(unnumbered)'} from ${from.seat ?? from.kind}] ${firstLine}`;
+  if (from?.kind === 'human') return m;
+  // A queue notice row saved without `from` (the TUI notice door) is machine mail too.
+  const noticeHead = !from ? queueNoticeHead(m.content) : null;
+  if (!from && !noticeHead) return m;
+  // ④ The stub keeps the mail's own body, not the boilerplate lead note / frame line.
+  const body = mailStubBody(m.content);
+  const sender = from ? (from.seat ?? from.kind) : (noticeHead?.senders?.join(',') || noticeHead?.source || 'notice');
+  const stub = `[seat-mail ${from?.msgId ?? noticeHead?.msgIds?.join(',') ?? '(unnumbered)'} from ${sender}] ${body}`;
   return { ...m, content: stub, tokenEstimate: estimateTokens(stub) };
+}
+
+/** Max body characters a compacted mail stub keeps. */
+export const MAIL_STUB_BODY_CHARS = 400;
+
+/** The mail's own words in a stored notice row: our harness lines (lead notes · frame/digest tags · headers · unread
+ *  counts) are dropped, `msg:<id> · ` / digest-entry heads are cut, the rest is folded to one line. 순수. */
+export function mailStubBody(content: string, max = MAIL_STUB_BODY_CHARS): string {
+  const { recallKeyText } = require('./human-envelope.js') as typeof import('./human-envelope.js');
+  const flat = recallKeyText(content, undefined).replace(/\s+/gu, ' ').trim();
+  const text = flat || (content.split('\n', 1)[0] ?? '');
+  return text.length <= max ? text : `${text.slice(0, max)}…`;
 }
 
 /** SerializedMessage → LLM wire role, for conversation rows only (audit rows never get here). */
@@ -105,7 +124,12 @@ function toLLMMessage(m: SerializedMessage): LLMMessage {
     : m.role === 'assistant' ? 'assistant'
     : m.role === 'system' ? 'system'
     : 'user';
-  return { role, content: m.content };
+  // ④ human = from.kind === 'human'; a notice row saved without `from` is machine mail; a legacy row without `from`
+  // that is not a notice stays human (old sessions recorded no source).
+  const speaker: LLMMessage['speaker'] = role !== 'user' ? undefined
+    : m.from ? m.from.kind
+    : queueNoticeHead(m.content) || m.content.startsWith('[seat-mail ') ? 'system' : undefined;
+  return speaker ? { role, content: m.content, speaker } : { role, content: m.content };
 }
 
 /** Collapse an LLM message back to a stored string. Continuation

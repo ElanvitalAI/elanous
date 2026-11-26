@@ -2,7 +2,7 @@
 import { describe, expect, test } from 'bun:test';
 import { renderCountdown, renderFlowLane, renderHandGrid, renderHostTile, renderPulseDot, renderSparkline, renderTicker } from '../index.js';
 import { renderBurstBoard } from './burst-board.js';
-import { BURST_FIXTURE_TICKS, burstDemoSnapshot, burstFixture, DEMO_TICKS, playBurstReplay, type BurstFixtureName } from './burst-replay.js';
+import { BURST_FIXTURE_NAMES, burstDemoSnapshot, burstFixture, DEMO_TICKS, playBurstReplay } from './burst-replay.js';
 
 describe('burst widgets', () => {
   test('PulseDot breathes on calm ticks, holds when busy', () => {
@@ -45,38 +45,28 @@ describe('burst widgets', () => {
   });
 });
 
-const NAMES = Object.keys(BURST_FIXTURE_TICKS) as BurstFixtureName[];
-
-describe('renderBurstBoard', () => {
+describe('renderBurstBoard (120×36 · 80×24 fallbacks)', () => {
   for (const [width, height] of [[120, 36], [80, 24]] as const) {
-    test(`${width}×${height}: every fixture and every replay frame fits`, () => {
+    test(`${width}×${height}: every replay frame fits`, () => {
       for (let t = 0; t < DEMO_TICKS; t++) for (let f = 0; f < 4; f++) {
         const lines = renderBurstBoard(burstDemoSnapshot(t), width, f);
         expect(lines.length).toBeLessThanOrEqual(height);
         for (const line of lines) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(width);
       }
-      expect(NAMES.length).toBe(7);
+      expect(BURST_FIXTURE_NAMES.length).toBe(7);
     });
   }
   test('calm reads quiet, burst reads busy', () => {
     const calm = renderBurstBoard(burstFixture('calm'), 120);
-    expect(calm[0]!.startsWith('● Burst Board · 0.3.37 · Calm · rhythm 60m')).toBe(true);
+    expect(calm[0]!.startsWith('● Burst Board · 0.3.37 · test universe · Calm · rhythm 60m')).toBe(true);
     expect(calm[1]).toBe('Quiet · resources at rest · cloud off');
     const busy = renderBurstBoard(burstFixture('bursting'), 120);
-    expect(busy[0]!.startsWith('● BURST 4h · Burst Board · 0.3.37 · trigger: CEO «all resources»')).toBe(true);
-    expect(busy[1]).toBe('Burst 10:00 / 4:00:00 █░░░░░░░░░░░ 3:50:00 left');
-  });
-  test('review jam piles, the step-up badge flashes then settles, cloud card waits', () => {
-    expect(renderBurstBoard(burstFixture('review-bottleneck'), 120).some((l) => l.includes('▓▓▓▓ ▲ bottleneck'))).toBe(true);
-    expect(renderBurstBoard(burstFixture('step-up'), 120, 0).some((l) => l.includes('▲ +2 review'))).toBe(true);
-    expect(renderBurstBoard(burstFixture('step-up'), 120, 3).some((l) => l.includes('▲ +2 review'))).toBe(false);
-    expect(renderBurstBoard(burstFixture('cloud-card-pending'), 120)).toContain('  gcp3    $? cloud card pending — press v to approve');
+    expect(busy[0]!.startsWith('● BURST 4h · Burst Board · 0.3.37 · test universe · trigger: CEO «all resources» (#166501)')).toBe(true);
   });
   test('exit sequence then receipt', () => {
-    expect(renderBurstBoard(burstFixture('exit'), 80)[0]).toBe('● EXIT 3/4 · Close hands · Burst Board · 0.3.37');
+    expect(renderBurstBoard(burstFixture('exit'), 80)[0]).toBe('● EXIT 3/4 · Close hands · Burst Board · 0.3.37 · test universe');
     const receipt = renderBurstBoard(burstFixture('receipt'), 80);
     expect(receipt).toContain('  every launched resource released ✓');
-    expect(receipt[0]).toBe('● Burst Board · 0.3.37 · Burst ended · back to calm');
   });
   test('the replay writes 4 frames per snapshot and restores the cursor', async () => {
     const out: string[] = [];

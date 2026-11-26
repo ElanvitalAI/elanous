@@ -6,7 +6,7 @@ import { seatMessageContextBlock, type ContextHeaderInput } from '../../msg/msg-
 import type { MessageOrigin } from '../../msg/msg-store.js';
 import { legacyIntent } from '../../msg/msg-receipts.js';
 import { classifySeatMail } from '../queue-finish-first.js';
-import { FEDERATION_WORK_ORDER_NOTE, federationWorkOrderFrame, neutraliseFrameTags } from '../../chat/interjection.js';
+import { FEDERATION_WORK_ORDER_NOTE, MAIL_DIGEST_CLOSE, MAIL_DIGEST_NOTE, federationWorkOrderFrame, isOrderMail, neutraliseFrameTags } from '../../chat/interjection.js';
 import { seatMailTrustFor } from '../../msg/seat-mail-trust.js';
 
 /**
@@ -107,6 +107,12 @@ export function seatMessageNotice(message: SeatMessageNoticeInput, declaredSeats
   return seatMessageNoticeParts(message, declaredSeats).text;
 }
 
+/** `- #id · from · intent · ` — the head of one digest entry (header fields are seat/intent tokens only). 순수. */
+export function mailDigestEntryHead(id: number, from: string, intent: string | null | undefined): string {
+  const token = (value: string | null | undefined): string => (value && /^[A-Za-z0-9_-]{1,64}$/u.test(value) ? value : '?');
+  return `- #${Number.isSafeInteger(id) ? id : '?'} · ${token(from)} · ${token(intent ?? 'info')} · `;
+}
+
 /**
  * FED-MAIL-WORK-ORDER — the notice text and where the mail's own body sits in it. Mail from a declared federation seat
  * (or a crown relay) is a work order: lead note ⊕ `<federation_work_order>` frame (body tags neutralised). Any other
@@ -122,6 +128,14 @@ export function seatMessageNoticeParts(message: SeatMessageNoticeInput, declared
     return { text: `${block}${tail}`, bodyAt: block.length - message.body.length, bodyLength: message.body.length };
   }
   const body = neutraliseFrameTags(message.body);
+  const intent = message.intent ?? legacyIntent(message.kind);
+  // MAIL-ENVELOPE-INFO-NOT-ORDER — trusted info/status mail is information: one compact <mail_digest> entry, no
+  // work-order frame, no «받음 + 첫 행동» ritual. A bundle folds these entries into ONE digest (seatMailBundleText).
+  if (!isOrderMail({ intent, crownDirective: message.crownDirective ?? null })) {
+    const unread = message.unreadTotal === undefined ? '' : ` unread="${message.unreadTotal}"`;
+    const head = `<mail_digest count="1"${unread}>\n${MAIL_DIGEST_NOTE}\n${mailDigestEntryHead(message.id, message.fromSeat ?? message.sender, intent)}`;
+    return { text: `${head}${body}\n${MAIL_DIGEST_CLOSE}`, bodyAt: head.length, bodyLength: body.length };
+  }
   const frame = federationWorkOrderFrame({ msgId: message.id, from: message.fromSeat ?? message.sender,
     intent: message.intent ?? legacyIntent(message.kind), crownDirective: message.crownDirective ?? null });
   const lead = `${FEDERATION_WORK_ORDER_NOTE}\n${frame.open}\n`;

@@ -38,9 +38,12 @@ export async function armMessageFollowUp(message: Message, pr: number | undefine
     : pr === undefined ? `mail-reply:${message.id}` : `pr-merged:${pr}`;
   const isWatch = watch !== undefined;
   const withinMs = isWatch ? WATCH_FOLLOW_UP_MS : FOLLOW_UP_MS;
+  // OP-CLOSE-ON-OUTCOME — a watched delegation records its done-when predicate, its check-at time and the assignee.
+  const checkAt = new Date(Date.now() + withinMs).toISOString();
   const commitment = ledger.add({ seat: message.from, sessionId: `msg:${message.id}`,
     text: isWatch ? `Watch ${condition} (message #${message.id} to ${message.to})` : `Follow up on message #${message.id} to ${message.to}`,
-    evidence: `MsgPost #${message.id}`, source: 'explicit' }).entry;
+    evidence: `MsgPost #${message.id}`, source: 'explicit',
+    ...(isWatch || pr !== undefined ? { doneWhen: condition } : {}), checkAt, assignee: message.to }).entry;
   const armed = armWaker({ seat: message.from, commitmentId: commitment.id, condition, withinMs, ...(isWatch ? { autoClose: true } : {}) }, { ...deps.timer, ledger });
   let alive = false;
   if (armed.waker.watcherPid !== undefined) { try { process.kill(armed.waker.watcherPid, 0); alive = true; } catch { /* stale watcher can be restarted */ } }

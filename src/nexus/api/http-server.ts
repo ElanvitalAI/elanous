@@ -1782,6 +1782,8 @@ function defaultMembersApi(
             ? {
                 issueOwnerSession: (appId, memberId) =>
                   nexusAppHost.issueOwnerSession(appId, memberId),
+                // MEMBER-CONNECT-NO-MOUNT: an unbuilt slot app is not mounted; connect then uses the member issuer.
+                appMounted: (appSlug) => nexusAppHost.slugs.includes(appSlug),
                 resolveVerifiedOwner: (appSlug, credential, members) =>
                   resolveVerifiedOwner(
                     nexusAppHost,

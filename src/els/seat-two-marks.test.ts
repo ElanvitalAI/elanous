@@ -69,8 +69,10 @@ const listWith = (status: unknown, extra: Record<string, unknown> = {}): string 
   { pane: 'p1', address: 'JUD/t1/p1', tab: 't1', workspace: 'JUD', title: 'JUD-B', state: 'idle', activityState: 'idle', cwd: '/tmp', status, ...extra }] });
 const rowsOf = (json: string) => layoutSpaceList(withCommands(parsePaneRows(json), json), 'p1', 40, 24).lines.join('\n');
 
-test('unread mail 3 reads ✉3 in slot 2', () => {
-  expect(rowsOf(listWith({ state: 'IDLE', since: 1, source: 'derived' }, { unreadMail: { count: 3 } }))).toContain('⚪✉3 JUD-B');
+test('unread mail 3 reads ✉3 after the name (SIDETAB-POLISH-1126), not in the lead', () => {
+  const shown = rowsOf(listWith({ state: 'IDLE', since: 1, source: 'derived' }, { unreadMail: { count: 3 } }));
+  expect(shown).toContain('⚪ JUD-B ✉3');
+  expect(shown).not.toContain('⚪✉3');
 });
 
 test('idle with a timer wait reads ⚪⏳', () => {

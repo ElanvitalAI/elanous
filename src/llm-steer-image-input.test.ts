@@ -215,5 +215,5 @@ test('interjection content: images ride as parts before the framed text; text-on
   expect(list[0]).toEqual({ type: 'image', mediaType: 'image/png', base64: PNG_B64 });
   expect(list).toHaveLength(2);
   expect(list[1]!.type).toBe('text');
-  expect(list[1]!.text).toContain('<user_query>\nlook\n</user_query>');
+  expect(list[1]!.text).toContain('<human from="CEO">\nlook\n</human>');
 });

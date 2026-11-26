@@ -3,7 +3,7 @@ import { mkdtempSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recordFact, readFacts } from './ledger.js';
-import { computeFedKpi, fedKpi, hqBlockLines } from './kpi.js';
+import { computeFedKpi, fedKpi, hqBlockLines, parseGitLandLog } from './kpi.js';
 import { turnOpenerOf } from './turn-writer.js';
 
 const at = (m: number) => new Date(Date.UTC(2026, 10, 25, 20, m)).toISOString();
@@ -86,5 +86,26 @@ describe('steward HQ block digest', () => {
     recordFact({ ts: at(10), type: 'work', state: 'block', seat: 'MK', cell: 'OLD', to: 'TC' }, p);
     recordFact({ ts: at(45), type: 'work', state: 'block', seat: 'MK', cell: 'DOCS-UMBRELLA-SYNC', to: 'TC', kind: 'review' }, p);
     expect(hqBlockLines(Date.parse(at(60)), p)).toEqual(['DOCS-UMBRELLA-SYNC → TC (MK) · review']);
+  });
+});
+
+describe('fed-state land truth from main (OP 11-26 · KPI read 0/h while main took 13)', () => {
+  test('first-parent «(#N)» subjects in window become land facts; others are skipped', () => {
+    const log = [
+      '2026-11-25T20:40:00Z\tfix(a): one (#40001)',
+      '2026-11-25T20:50:00Z\tMerge branch x',
+      '2026-11-25T20:10:00Z\tfix(b): before window (#40002)',
+      '',
+    ].join('\n');
+    const f = parseGitLandLog(log, new Date('2026-11-25T20:30:00Z'), new Date('2026-11-25T21:00:00Z'));
+    expect(f).toEqual([{ ts: '2026-11-25T20:40:00.000Z', type: 'land', ref: '40001', source: 'git:main' }]);
+  });
+  test('a pr-land fact and the git commit for the same PR count once', () => {
+    const k = computeFedKpi([
+      { ts: '2026-11-25T20:40:05Z', type: 'land', ref: '40001', source: 'pr-land' },
+      { ts: '2026-11-25T20:40:00Z', type: 'land', ref: '40001', source: 'git:main' },
+      { ts: '2026-11-25T20:45:00Z', type: 'land', ref: '40003', source: 'git:main' },
+    ], new Date('2026-11-25T20:30:00Z'), new Date('2026-11-25T21:00:00Z'));
+    expect(k.landed).toBe(2);
   });
 });

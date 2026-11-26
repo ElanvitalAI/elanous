@@ -37,6 +37,7 @@ import { warmLoginEnv } from './login-env-handoff.js';
 import { holderPty, consumeScreenSnapshot, reattachHolder, restoreScreenFromSnapshot, sweepOrphanHolderResidue } from './holder.js';
 import { doPolicy, startElsHttp, type ElsHttpBind } from './http.js';
 import { startStallAlert, type StallAlert, type StallAlertDeps } from './stall-alert.js';
+import { noteLocalViewer, dropLocalViewer, noteResize, setResizeLog, claimSizeOwner, localResizeAllowed, isSizeOwner } from './local-viewer-size.js';
 import { startMailWakeWatcher, type MailWakeDeps, type MailWakeWatcher } from './mail-wake-watcher.js';
 import { startElsHttpV1 } from './http-v1.js';
 import { appendSendAudit, type ControlExecute } from './control.js';
@@ -135,6 +136,8 @@ export type ElsRequest =
   | { readonly op: 'close-tab'; readonly tab: string; readonly confirmed?: boolean }
   | { readonly op: 'do'; readonly pane: string; readonly text: string; readonly from: string; readonly at?: { readonly ws: string; readonly tab: string } }
   | { readonly op: 'snapshot'; readonly pane: string }
+  /** ELS-TILE-MODE: the pane's current ANSI screen from memory — read-only, nothing persisted (the tile grid's refresh). */
+  | { readonly op: 'tile-frame'; readonly pane: string }
   | { readonly op: 'record'; readonly pane: string }
   | { readonly op: 'input-line'; readonly pane: string; readonly text: string; readonly from: string; readonly at?: { readonly ws: string; readonly tab: string } }
   | { readonly op: 'interrupt'; readonly pane: string }
@@ -374,9 +377,9 @@ async function dispatch(core: ElsCore, request: ElsRequest, parent: SpawnParent 
     let allowed = false;
     // OP-HANDLES-L2: the coordinator grant (journal ⊕ federation) covers typing / close / close-tab on federation seat panes.
     const coordinatorGranted = (): boolean => !!coordinatorGrantForSeat(core, stateRoot, seat?.seat, (seat as { pane?: string } | undefined)?.pane ?? callerPane, request);
-    if (request.op === 'read' || request.op === 'snapshot' || request.op === 'record' || request.op === 'status' || request.op === 'close' || request.op === 'build' || request.op === 'do' || request.op === 'input-line' || request.op === 'interrupt' || request.op === 'send' || request.op === 'send-verified' || request.op === 'input') {
+    if (request.op === 'read' || request.op === 'tile-frame' || request.op === 'snapshot' || request.op === 'record' || request.op === 'status' || request.op === 'close' || request.op === 'build' || request.op === 'do' || request.op === 'input-line' || request.op === 'interrupt' || request.op === 'send' || request.op === 'send-verified' || request.op === 'input') {
       const recording = request.op === 'record' && typeof request.pane === 'string' ? recordingFor(core, request.pane) : undefined;
-      allowed = typeof request.pane === 'string' && (ownPane(request.pane) || ((request.op === 'read' || request.op === 'status' || hqTypingRequest(request)) && !!core.paneExists(request.pane) && hqReadObserver(seat?.seat, callerPane, journal)) || (request.op === 'record' &&
+      allowed = typeof request.pane === 'string' && (ownPane(request.pane) || ((request.op === 'read' || request.op === 'tile-frame' || request.op === 'status' || hqTypingRequest(request)) && !!core.paneExists(request.pane) && hqReadObserver(seat?.seat, callerPane, journal)) || (request.op === 'record' &&
         ((!recording && request.pane === callerPane && callerPane !== undefined) || (!!recording &&
           (recording.paneId === callerPane || (!!seat && seat.seat !== 'unknown' && recording.ownerSeat === seat.seat))))));
       if (allowed && (request.op === 'read' || request.op === 'do' || request.op === 'input-line') && request.at) allowed = core.locate(request.at.ws, request.at.tab, request.pane) === core.paneExists(request.pane);
@@ -450,6 +453,9 @@ async function dispatch(core: ElsCore, request: ElsRequest, parent: SpawnParent 
       const peer = uid !== undefined && pid !== undefined && firstSeat ? await firstSeat() : undefined;
       // An unassigned pane credential must not override a verified peer with the sentinel
       // "unknown". Refuse rather than silently assigning a possibly conflicting identity.
+      // ELS-OP-AUTOREG-TRACK: a pane opened before its seat was known holds a hand credential with seat 'unknown'. When the
+      // verified peer behind that same pane is the registered OP runtime, the pane is the OP pane: spawn as OP.
+      if (peer?.seat === 'OP' && parent?.kind === 'hand' && parent.seat === 'unknown' && (!callerPane || !peer.pane || peer.pane === callerPane)) parent = { kind: 'op' };
       if (peer && parent?.kind === 'hand' && parent.seat === 'unknown') {
         return { exitCode: 1, message: 'els new: pane credential has unknown seat; resolve seat before creating a pane' };
       }
@@ -525,6 +531,11 @@ async function dispatch(core: ElsCore, request: ElsRequest, parent: SpawnParent 
       if (!request.at) return core.do(request.pane, request.text, request.from);
       const paneId = core.locate(request.at.ws, request.at.tab, request.pane);
       return paneId ? core.do(paneId, request.text, request.from) : { exitCode: 1, message: `els do: unknown pane ${request.at.ws}/${request.at.tab}/${request.pane}` };
+    }
+    case 'tile-frame': {
+      const paneId = core.paneExists(request.pane);
+      if (!paneId) return { exitCode: 1, message: `els tile: unknown pane ${request.pane}` };
+      return core.frame(paneId);
     }
     case 'snapshot': {
       const paneId = core.paneExists(request.pane);
@@ -714,9 +725,12 @@ function serveAttach(core: ElsCore, socket: Socket, request: Extract<ElsRequest,
   if (attachState.stopping) { socket.end(SERVER_STOPPING_END); return; }
   const paneId = typeof request.pane === 'string' ? core.paneExists(request.pane) : undefined;
   if (!paneId) { socket.end(`${JSON.stringify({ type: 'end', exitCode: 1, message: `els attach: unknown pane ${String(request.pane)}` })}\n`); return; }
+  setResizeLog(core, (line) => { try { appendFileSync(join(auditDir, 'pane-resize.jsonl'), line, { mode: 0o600 }); } catch { /* best effort */ } });
   if (request.cols !== undefined && request.rows !== undefined) {
+    // ELS-OP-INPUT-FLICKER: attaching (the person selected this pane in this view) is activity — this view owns the size.
+    claimSizeOwner(core, paneId, socket);
     const sized = core.resize(paneId, request.cols, request.rows);
-    if (sized.exitCode === 0) childTabsOf.get(core)?.redraw(paneId);
+    if (sized.exitCode === 0) { noteResize(core, paneId, { cols: request.cols, rows: request.rows }, 'viewer:local'); noteLocalViewer(core, paneId, socket, { cols: request.cols, rows: request.rows }); childTabsOf.get(core)?.redraw(paneId); }
     if (sized.exitCode !== 0 && sized.exitCode !== 1) { socket.end(`${JSON.stringify({ type: 'end', exitCode: sized.exitCode, message: sized.message })}\n`); return; }
   }
   attachState.sockets.add(socket);
@@ -827,11 +841,11 @@ function serveAttach(core: ElsCore, socket: Socket, request: Extract<ElsRequest,
           for (let i = 0; i < body.length; i++) if (body[i] !== lastRows[i]) changed.push({ i: i + 1, t: body[i]! });
           // A rewrite of most of the screen pays more in JSON per row than one full frame — send the full frame instead.
           if (changed.length > 0 && changed.length <= Math.ceil(body.length * 0.6)) {
-            send({ type: 'frame-diff', pane: paneId, seq: ++seq, cols: size.cols, rows: size.rows, back: shown, ...(wheelPassthrough ? { wheelPassthrough: true } : {}), ...(wheelRoute !== 'host' ? { wheelRoute } : {}), count: body.length, lines: changed });
+            send({ type: 'frame-diff', pane: paneId, seq: ++seq, cols: size.cols, rows: size.rows, back: shown, ...(isSizeOwner(core, paneId, socket) ? {} : { sizeOwner: false }), ...(wheelPassthrough ? { wheelPassthrough: true } : {}), ...(wheelRoute !== 'host' ? { wheelRoute } : {}), count: body.length, lines: changed });
             sentDiff = true;
           }
         }
-        if (!sentDiff) send({ type: 'frame', pane: paneId, seq: ++seq, cols: size.cols, rows: size.rows, back: shown, ...(wheelPassthrough ? { wheelPassthrough: true } : {}), ...(wheelRoute !== 'host' ? { wheelRoute } : {}), screen: screen.message });
+        if (!sentDiff) send({ type: 'frame', pane: paneId, seq: ++seq, cols: size.cols, rows: size.rows, back: shown, ...(isSizeOwner(core, paneId, socket) ? {} : { sizeOwner: false }), ...(wheelPassthrough ? { wheelPassthrough: true } : {}), ...(wheelRoute !== 'host' ? { wheelRoute } : {}), screen: screen.message });
         lastRows = body;
       }
       if (attachState.stopping) { send({ type: 'end', exitCode: 1, message: 'the server is stopping' }); socket.end(); return; }
@@ -859,6 +873,9 @@ function serveAttach(core: ElsCore, socket: Socket, request: Extract<ElsRequest,
     clearInterval(timer);
     sub?.dispose();
     attachState.sockets.delete(socket);
+    // ELS-OP-INPUT-FLICKER: the owner left — the latest active remaining view's size applies.
+    const promoted = dropLocalViewer(core, paneId, socket);
+    if (promoted && core.resize(paneId, promoted.cols, promoted.rows).exitCode === 0) noteResize(core, paneId, promoted, 'viewer:local(promoted)');
     const views = attachState.focusViews?.get(paneId);
     views?.delete(socket);
     if (views?.size === 0) attachState.focusViews?.delete(paneId);
@@ -884,6 +901,10 @@ function serveAttach(core: ElsCore, socket: Socket, request: Extract<ElsRequest,
       if (Number.isInteger(message.lines)) { back = Math.max(0, back + message.lines); poke(); }
     } else if (message.op === 'input') {
       if (back > 0) { back = 0; poke(); }                   // typing returns to the live bottom
+      // ELS-OP-INPUT-FLICKER (herdr semantics): typing in a view that is not the size owner makes it the owner and moves
+      // the PTY to its rect once; typing again in the owner changes nothing.
+      const claimed = claimSizeOwner(core, paneId, socket);
+      if (claimed && core.resize(paneId, claimed.cols, claimed.rows).exitCode === 0) { noteResize(core, paneId, claimed, 'viewer:local(active)'); childTabsOf.get(core)?.redraw(paneId); poke(); }
       // ELS-INPUT-FAST-PATH (OP #128948 1순위): a typed key is latency itself — the door already authenticated this
       // attach line, so an ordinary key goes straight to the PTY: no screen render, no pane lock (never queues behind
       // a `do`), no synchronous audit write. Approval letters and control bytes keep the guarded machine lane, and
@@ -922,9 +943,12 @@ function serveAttach(core: ElsCore, socket: Socket, request: Extract<ElsRequest,
         }
       }
     } else if (message.op === 'resize') {
+      // ELS-OP-INPUT-FLICKER: only the size owner (the last active view) resizes the PTY — its terminal resize or its
+      // re-assert. Another view's size is remembered for when it becomes active, never applied (it letterboxes).
+      if (!localResizeAllowed(core, paneId, socket)) { noteLocalViewer(core, paneId, socket, { cols: message.cols, rows: message.rows }); return; }
       const done = core.resize(paneId, message.cols, message.rows);
       if (done.exitCode !== 0) send({ type: 'error', message: done.message });
-      else { childTabsOf.get(core)?.redraw(paneId); poke(); }
+      else { noteResize(core, paneId, { cols: message.cols, rows: message.rows }, 'viewer:local'); noteLocalViewer(core, paneId, socket, { cols: message.cols, rows: message.rows }); childTabsOf.get(core)?.redraw(paneId); poke(); }
     } else send({ type: 'error', message: 'els attach: only input, resize and scroll are accepted here' });
   });
 }
@@ -1289,7 +1313,7 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
     // 판정되고, 그 뒤의 input/resize 줄도 같은 판정을 받는다 (serveAttach judge).
     // A pane descendant cannot regain the human read path by omitting its pane credential.
     // Only positively verified human ancestry may use the uncredentialed read path.
-    if (!toolDoor && role.kind === 'outsider' && (request.op === 'read' || request.op === 'status' || request.op === 'grep' || request.op === 'attach')) {
+    if (!toolDoor && role.kind === 'outsider' && (request.op === 'read' || request.op === 'tile-frame' || request.op === 'status' || request.op === 'grep' || request.op === 'attach')) {
       handled = true;
       if (request.op === 'attach') attachLine = bufferEarly;
       void ready.then(async core => {
