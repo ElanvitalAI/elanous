@@ -1,0 +1,19 @@
+{
+  "id": "LLM-POLICY-PANEL-SCENARIOS",
+  "name": "Nexus LLM policy panel failure-path scenarios",
+  "kind": "llm-policy-panel-sim",
+  "device": "LLM-POLICY-PANEL-SIM",
+  "implementation": [
+    "src/ux-sim/llm-policy-panel-sim.ts"
+  ],
+  "tests": [
+    "src/ux-sim/llm-policy-panel-sim.test.ts"
+  ],
+  "trigger": "Call the real handleLlmPolicyGet/handleLlmPolicyPut over a temporary config dir: owner write, stranger write, invalid schema, two concurrent writes, and a missing-file read.",
+  "observe": [
+    "each case records ux.sim.llm-policy-panel/case with caseId, pass, and HTTP status in the isolated test logs",
+    "rejection reasons are non-empty and the previous policy file stays byte-for-byte",
+    "the concurrent race settles on exactly one of the two valid documents"
+  ],
+  "expected": "All five cases pass with statuses 200/401/400 and the previous policy is never overwritten by a rejected or unauthorized write (OP #125562 failure-path contract)."
+}

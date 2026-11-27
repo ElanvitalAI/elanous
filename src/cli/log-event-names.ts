@@ -1215,6 +1215,8 @@ export const KNOWN_LOG_EVENT_NAMES: ReadonlySet<string> = new Set([
   "request-size",
   "request-size-compact",
   "request-size-compact-error",
+  "request-size-retry",
+  "request-size-trim-oldest",
   "request-watch-fail",
   "request.error",
   "request.out",

@@ -22,7 +22,11 @@ type PregateRow = Extract<MatchingRow, { kind: 'pregate' }>;
 type JudgeRow = Extract<MatchingRow, { kind: 'judge' }>;
 
 /** Refusal codes that make the CELL unassignable for every seat (not only this pair). */
-export const STEWARD_CELL_WIDE_CODES: readonly string[] = ['live-writer', 'unknown-cell', 'closed-cell'];
+export const STEWARD_CELL_WIDE_CODES: readonly string[] = ['live-writer', 'unknown-cell', 'closed-cell', 'off-target'];
+/** SEAT-ASSIGN-GUARD (11-27): SeatAssign's own guards. Off-target = the cell is not in the target release (cell-wide);
+ *  rate-folded = that row was oscillation or an over-cap repeat (the cell became a pull hint). Neither is an exception for
+ *  OP. ASSIGN-CAP-POLICY (11-27 10:4x): a fold no longer ends the run — distinct cells to fresh idle hands still pass. */
+export const STEWARD_SILENT_CODES: readonly string[] = ['off-target', 'rate-folded'];
 /** SeatAssign answered «not installed» — the steward cannot act; the caller falls back to the full table. */
 export const STEWARD_UNAVAILABLE = 'unavailable';
 /** A refusal is retried (and may be raised again) after this long — the writer may have landed. */
@@ -106,13 +110,14 @@ export function createSteward(deps: StewardDeps): Steward {
           refused.set(key, { cell: row.cell, ...(cellWide ? {} : { seat: row.seat }), code, at: now() });
           refusedThisPass = true;
           log('steward-refused', { seat: row.seat, cell: row.cell, code, reason: res.reason.slice(0, 200) });
+          if (STEWARD_SILENT_CODES.includes(code)) continue;
           const raiseKey = `${row.cell}|${code}`;
           const pairKey = `${row.cell.toUpperCase()}|${row.seat.toUpperCase()}`;
           if (raised.has(raiseKey) || raisedPairs.has(pairKey)) continue;
           if (outcome.exceptions.length >= STEWARD_MAX_EXCEPTIONS) { log('steward-exception-capped', { seat: row.seat, cell: row.cell, code }); continue; }
           raised.set(raiseKey, now()); raisedPairs.add(pairKey); outcome.exceptions.push({ row, code, reason: res.reason });
         }
-        if (!refusedThisPass) break; // nothing new excluded: the next build would offer the same rows
+        if (!refusedThisPass) break; // nothing new excluded: same rows next build
       }
       const table = outcome.table;
       for (const row of table?.rows ?? []) {

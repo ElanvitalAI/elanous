@@ -1,11 +1,13 @@
 import { registeredSeats } from '../seat-address/seat-address.js';
+import { LOOP_AGENT_SEATS } from '../msg/msg-store.js';
+import { V2_AGENT_SEATS } from '../loop-agent/seats.js';
 
 /** Current single-root aliases. Address issuance and `loop:` aliases belong to a later slice. */
 // `wake` = how a post reaches a body that is not already listening. The coordinator ticks on cron
 // (08·12·18) until its SSE reply body is switched on; the guardian has no reply body to wake.
 export const LOOP_MESSAGE_ROUTES = {
   orchestrator: { msgAddress: 'COORDINATOR', replyBody: 'rules', wake: 'cron' },
-  guardian: { msgAddress: 'GUARDIAN', replyBody: 'none', wake: 'none' },
+  guardian: { msgAddress: 'GUARDIAN', replyBody: 'agent', wake: 'cron' }, // 수호자 v2 reads its mail on every wake
 } as const;
 
 /**
@@ -57,13 +59,17 @@ export function messageRouteFor(address: string): { msgAddress: string; replyBod
   const name = address.trim().toUpperCase();
   const loop = Object.values(LOOP_MESSAGE_ROUTES).find(route => route.msgAddress === name);
   if (loop) return loop;
+  // LOOP-AGENT v2 (e.g. JUDGE-BUTLER): its body reads its own mail on every wake (trigger: events ⊕ ≤10 min).
+  if (Object.values(LOOP_AGENT_SEATS).includes(name)) return { msgAddress: name, replyBody: 'agent', wake: 'cron' };
+  // SUPERVISOR-REVIVE-1127 v2 supervisors: the body answers its mail on every wake (trigger: subject events ⊕ max_wait).
+  if (Object.values(V2_AGENT_SEATS).includes(name)) return { msgAddress: name, replyBody: 'agent', wake: 'cron' };
   return Object.hasOwn(SEAT_MESSAGE_ROUTES, name) ? SEAT_MESSAGE_ROUTES[name]! : null;
 }
 
 /** A notice is advisory; durable posting to these valid names still succeeds. */
 export function noReplyBodyNotice(address: string): string | null {
   const name = address.trim().toUpperCase();
-  return name === LOOP_MESSAGE_ROUTES.guardian.msgAddress || name === 'ORCHESTRATOR' || name === 'STEWARD'
+  return name === 'ORCHESTRATOR' || name === 'STEWARD'
     ? '이 주소는 읽는 몸이 없다 — 지금은 OP'
     : null;
 }
@@ -72,6 +78,8 @@ export function noReplyBodyNotice(address: string): string | null {
 export function unsupportedLoopAddressNotice(address: string): string | null {
   if (!/^loop:/i.test(address.trim())) return null;
   const id = address.trim().slice(5).toLowerCase();
+  if (Object.hasOwn(LOOP_AGENT_SEATS, id)) return null; // an addressable loop agent (msg-store LOOP_AGENT_SEATS)
+  if (Object.hasOwn(V2_AGENT_SEATS, id)) return null; // a v2 supervisor (src/loop-agent/seats.ts)
   const route = loopMessageRoute(id);
   return route.msgAddress && route.replyBody !== 'none'
     ? `${address.trim()} 는 아직 주소가 아니다 — 지금 읽는 주소는 ${route.msgAddress} (eln loop list --json 의 msgAddress)`

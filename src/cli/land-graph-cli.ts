@@ -11,21 +11,34 @@
  * Mode is never a flag: live only when config `land.graph.mode` = live; otherwise shadow.
  */
 import type { Command } from 'commander';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getElanousConfigDir, getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { userConfigPath } from '../user-config.js';
 import { landingOwner, mayRunLandOps } from '../org/land-authority.js';
+import { defaultRetryHosts, nextHost, tscHostsFor } from '../land-graph/red-receipt.js';
+import { filterRoutable, hostsFor } from '../kit/resource-facts/index.js';
+import type { RefreshResult } from '../land-graph/finisher.js';
+import { gitAt } from '../git-fs/smart-run.js';
+import { prDelta } from '../git-smart/delta.js';
+import { discoverParents, smartRefresh, smartRefreshSync, type SmartRefreshResult } from '../git-smart/smart-refresh.js';
 import {
   clearHold, focusedCounts, isDocOnly, readHolds, readLedger, replayAttempt, SECURITY4, setHold, tickLand,
-  type Focused, type LandDeps, type Mode, type PrInfo, type Receipt, type ReplayRow,
+  type BaselineDiff, type Focused, type LandDeps, type Mode, type PrInfo, type Receipt, type ReplayRow, type TerraReview,
 } from '../land-graph/land-graph.js';
 
-interface LandConfig { orgPath?: unknown; repo?: unknown; mode?: unknown; slots?: unknown; cardSeat?: unknown; landCmd?: unknown; authors?: unknown }
+interface LandConfig { orgPath?: unknown; repo?: unknown; mode?: unknown; slots?: unknown; cardSeat?: unknown; landCmd?: unknown; authors?: unknown; retryHosts?: unknown }
+/** `land.graph.retryHosts` (tsc-timeout re-runs) · default = the registry's retry hosts (resource facts) · a configured host the
+ *  registry rules out for tsc (unhealthy · reserved · off · HQ) is dropped · `first` moves to the front. */
+export function retryHosts(cfg: { retryHosts?: unknown }, first?: string): string[] {
+  const configured = Array.isArray(cfg.retryHosts) && cfg.retryHosts.every(h => typeof h === 'string' && /^[\w.-]+$/.test(h)) && cfg.retryHosts.length ? filterRoutable(cfg.retryHosts as string[], 'tsc') : [];
+  const list = configured.length ? configured : defaultRetryHosts();
+  return first ? [first, ...list.filter(h => h !== first)] : [...list];
+}
 
 function readConfig(): LandConfig {
   const path = getElanousConfigDirOverride() ? join(effectiveInstanceRoot(), 'config.json') : userConfigPath();
@@ -71,26 +84,35 @@ function ghJson(args: string[], repo: LandRepo): unknown {
   return JSON.parse(out.stdout);
 }
 
-interface GhPr { number: number; headRefOid: string; baseRefName: string; isDraft: boolean; state: string; title: string; author?: { login?: string }; files?: Array<{ path: string }> }
-const FIELDS = 'number,headRefOid,baseRefName,isDraft,state,title,author,files';
+interface GhPr { number: number; headRefOid: string; baseRefName: string; isDraft: boolean; state: string; title: string; author?: { login?: string }; files?: Array<{ path: string }>;
+  headRefName?: string; isCrossRepository?: boolean; createdAt?: string; body?: string }
+const FIELDS = 'number,headRefOid,baseRefName,isDraft,state,title,author,files,headRefName,isCrossRepository,createdAt,body';
 
 function toPr(p: GhPr, authors: Record<string, string>): PrInfo {
   const login = p.author?.login ?? '';
   return { number: p.number, head: p.headRefOid, base: p.baseRefName, draft: p.isDraft, state: p.state as PrInfo['state'], title: p.title,
-    author: authors[login] ?? 'OP', files: (p.files ?? []).map(f => f.path) };
+    author: authors[login] ?? 'OP', files: (p.files ?? []).map(f => f.path),
+    ...(p.headRefName ? { headRef: p.headRefName } : {}), ...(p.isCrossRepository ? { crossRepo: true } : {}), ...(p.createdAt ? { createdAt: p.createdAt } : {}),
+    ...(typeof p.body === 'string' ? { body: p.body } : {}) };
 }
 
-function receiptDirs(pr: number): string[] {
-  const root = join(seatState(), 'RES', 'evidence', 'PREGATE-GREEN');
+function receiptDirs(pr: number, kind: 'PREGATE-GREEN' | 'PREGATE-RED' = 'PREGATE-GREEN'): string[] {
+  const root = join(seatState(), 'RES', 'evidence', kind);
   if (!existsSync(root)) return [];
   return readdirSync(root).filter(n => n.startsWith(`${pr}-`)).map(n => join(root, n));
 }
-interface RawReceipt { head?: unknown; host?: unknown; focused?: unknown; rawDir?: unknown; steps?: unknown; rawSha256?: unknown }
+/** LAND-STEWARD RED-RECEIPT: same-head PREGATE-RED receipts, newest first (read as `red` receipts; decide() keeps only focused/tsc-timeout reds). */
+export function redReceipts(dirs: string[], head: string, pr?: number): Receipt[] {
+  return dirs.filter(d => d.split('/').pop()!.includes(`-${head.slice(0, 12)}-`) && existsSync(join(d, 'receipt.json')))
+    .map(d => { try { return { d, m: statSync(join(d, 'receipt.json')).mtimeMs }; } catch { return { d, m: 0 }; } })
+    .sort((a, b) => b.m - a.m).map(x => readReceipt(x.d, { red: true, expectedPr: pr })).filter((r): r is Receipt => !!r && r.head === head);
+}
+interface RawReceipt { pr?: unknown; head?: unknown; host?: unknown; focused?: unknown; rawDir?: unknown; steps?: unknown; rawSha256?: unknown; grade?: unknown; focusedBaseline?: unknown; failure?: unknown; patchId?: unknown }
 /** Receipt layout written by RES pregate.py (light and full): receipt.json with steps[] {name, exit} and rawSha256 {<stage>.raw: sha}. */
-export function readReceipt(dir: string): Receipt | null {
+export function readReceipt(dir: string, o: { red?: boolean; expectedPr?: number } = {}): Receipt | null {
   try {
     const r = JSON.parse(readFileSync(join(dir, 'receipt.json'), 'utf8')) as RawReceipt;
-    if (typeof r.head !== 'string') return null;
+    if (typeof r.head !== 'string' || (o.expectedPr !== undefined && r.pr !== o.expectedPr)) return null;
     const steps = Array.isArray(r.steps) ? r.steps as Array<{ name?: unknown; exit?: unknown }> : [];
     const step = steps.find(x => x && x.name === 'focused');
     const sha = r.rawSha256 && typeof r.rawSha256 === 'object' ? (r.rawSha256 as Record<string, unknown>)['focused.raw'] : undefined;
@@ -102,8 +124,21 @@ export function readReceipt(dir: string): Receipt | null {
       rawDir: typeof r.rawDir === 'string' ? r.rawDir : '',
       focusedExit: step && typeof step.exit === 'number' ? step.exit : null,
       ...(typeof sha === 'string' ? { focusedSha: sha } : {}),
+      ...(typeof r.grade === 'string' ? { grade: r.grade } : {}),
+      ...(focusedBaselineOf(r.focusedBaseline)),
+      ...(typeof r.patchId === 'string' && /^[0-9a-f]{40}$/.test(r.patchId) ? { patchId: r.patchId } : {}),
+      ...(o.red ? { red: { failed: steps.filter(x => x && typeof x.name === 'string' && typeof x.exit === 'number' && x.exit !== 0).map(x => ({ name: x.name as string, exit: x.exit as number })),
+        ...(typeof r.failure === 'string' ? { failure: r.failure } : {}) } } : {}),
     };
   } catch { return null; }
+}
+
+/** pregate A244 ③ `focusedBaseline` {mine, onMain, newFailures[]} — only a well-formed record counts. */
+function focusedBaselineOf(v: unknown): { focusedBaseline?: NonNullable<Receipt['focusedBaseline']> } {
+  if (!v || typeof v !== 'object') return {};
+  const o = v as Record<string, unknown>;
+  if (typeof o.mine !== 'number' || typeof o.onMain !== 'number' || !Array.isArray(o.newFailures)) return {};
+  return { focusedBaseline: { mine: o.mine, onMain: o.onMain, newFailures: o.newFailures.map(String) } };
 }
 
 /** Local copies of focused.raw a receipt dir may carry (seat mirrors: <dir>/focused.raw · raws/ · raw/), then the host temp rawDir. */
@@ -152,6 +187,95 @@ export function parseFocused(text: string): Focused {
   return pass ? { pass: Number(pass[1]), fail: fail ? Number(fail[1]) : 0 } : 'unreadable';
 }
 
+const readJsonFile = (p: string): Record<string, unknown> | null => {
+  try { const v = JSON.parse(readFileSync(p, 'utf8')) as unknown; return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : null; } catch { return null; }
+};
+
+/** The review of this exact head: review-results/pr-<PR>-<head12>.json written by `elanous self review` on a policy route (Terra · Claude ACP · grok fallback).
+ *  Security findings = structured securityFindings · a securityClass · legacy findings[] in a security-4 category without a disposition. */
+export function readTerraReview(dir: string, pr: number, head: string): TerraReview | null {
+  const j = readJsonFile(join(dir, `pr-${pr}-${head.slice(0, 12)}.json`));
+  if (!j || typeof j.verdict !== 'string' || j.reviewed !== true || j.invalid === true) return null; // a completed review only
+  // The model that actually answered must satisfy the review routing policy (LLM-ROUTE-BY-GUARDIAN: Terra · Claude ACP ·
+  // grok fallback — never GLM), not one hardcoded engine: an 11-11 grok-fallback review is a review.
+  const model = String(j.respondedModel ?? j.model ?? '');
+  const { acceptReviewModel } = require('../kit/resource-facts/index.js') as typeof import('../kit/resource-facts/index.js');
+  if (!acceptReviewModel(model).ok) return null;
+  if (j.headCommit !== head) return null;
+  const sec: string[] = [];
+  if (typeof j.securityClass === 'string' && j.securityClass) sec.push(`class:${j.securityClass}`);
+  for (const x of Array.isArray(j.securityFindings) ? j.securityFindings : []) {
+    const o = x && typeof x === 'object' ? x as Record<string, unknown> : {};
+    sec.push(`${String(o.securityClass ?? o.kind ?? 'security')}:${String(o.text ?? x).slice(0, 60)}`);
+  }
+  for (const x of Array.isArray(j.findings) ? j.findings as Array<Record<string, unknown>> : []) {
+    if (x && SECURITY4.includes(String(x.category ?? '').toLowerCase()) && !x.disposition) sec.push(`${String(x.category)}:${String(x.title ?? '').slice(0, 60)}`);
+  }
+  return { verdict: j.verdict, securityFindings: sec };
+}
+
+/** JUD veto verdicts on file for this head: review-results/{hold,jud,judb,jud3,judb-security}-<PR>-<head12>.json with verdict HOLD. */
+export function readJudHold(dir: string, pr: number, head: string): { reason: string; by: string } | null {
+  for (const pre of ['hold', 'jud', 'judb', 'jud3', 'judb-security']) {
+    const j = readJsonFile(join(dir, `${pre}-${pr}-${head.slice(0, 12)}.json`));
+    if (!j || String(j.verdict ?? '').toLowerCase() !== 'hold') continue;
+    if (typeof j.headCommit === 'string' && j.headCommit !== head) continue;
+    const reviewer = typeof j.reviewer === 'string' ? j.reviewer : '';
+    if (reviewer && !/^JUD/i.test(reviewer)) continue; // only the judiciary's verdicts are vetoes
+    const why = Array.isArray(j.mustFix) && j.mustFix.length ? String(j.mustFix[0]).slice(0, 100) : '';
+    const kind = typeof j.securityClass === 'string' && j.securityClass ? `security ${j.securityClass}` : 'HOLD';
+    return { reason: `${kind} verdict ${pre}-${pr}-${head.slice(0, 12)}${why ? ` · ${why}` : ''}`, by: 'JUD' };
+  }
+  return null;
+}
+
+/** Baseline failure-name diff receipt for this head (land-name-diff-check.py format · introducedFailureNames = []).
+ *  Looked up in the receipt dir and the OP evidence nd<PR>/ dirs of the last 3 days. headPass is read from the head raw log. */
+export function findBaselineDiff(dirs: string[], head: string): BaselineDiff | null {
+  for (const d of dirs) {
+    let names: string[] = [];
+    try { names = readdirSync(d).filter(n => /^(namediff|receipt|nd)[\w.-]*\.json$/.test(n)); } catch { continue; }
+    for (const n of names) {
+      const j = readJsonFile(join(d, n));
+      if (!j || j.head !== head || !Array.isArray(j.introducedFailureNames) || j.introducedFailureNames.length !== 0) continue;
+      if (typeof j.command !== 'string' || !j.command || !Array.isArray(j.headFailureNames) || typeof j.headLog !== 'string') continue;
+      let log = '';
+      try { log = readFileSync(j.headLog, 'utf8'); } catch { continue; }
+      const f = parseFocused(log);
+      if (f === 'unreadable' || !('pass' in f) || f.pass === 0) continue;
+      return { receipt: join(d, n), command: j.command, headPass: f.pass, headFail: j.headFailureNames.length };
+    }
+  }
+  return null;
+}
+
+/** extra.json for op-direct-land-v2.sh. Numbers come only from a receipt (A138): L0 doc-only and a swept raw carry no
+ *  headTestRun (op-waiver plain mode needs none) · a baseline-name-diff carries the diff's own head run. */
+export function landExtra(pr: PrInfo, r: Receipt, why: string, focused: Focused, ctx: { lane?: string; baselineDiff?: BaselineDiff | null } = {}): Record<string, unknown> {
+  const receipt = join(r.dir, 'receipt.json');
+  const base = { receipt, note: `land-graph (JUD-RELAX · veto only) · ${why}` };
+  if (ctx.lane === 'L0-doc-only') return base;
+  const nd = ctx.baselineDiff;
+  const counts = focusedCounts(focused);
+  if (counts && counts.fail === 0 && counts.pass > 0) return { ...base, headTestRun: { sha: pr.head, command: `bun test ${r.focused.join(' ')}`, pass: counts.pass, fail: 0, exit: 0, receipt } };
+  if (nd) return { ...base, baselineNameDiff: { receipt: nd.receipt }, headTestRun: { sha: pr.head, command: nd.command, pass: nd.headPass, fail: nd.headFail, exit: 1, receipt } };
+  return base; // swept raw with focused step exit 0: the receipt is the evidence, no hand-written counts
+}
+
+/**
+ * PATH for the golden-path land command. The trigger runs under launchd, whose PATH resolves `python3` to the macOS
+ * system Python 3.9 — and land-name-diff-check.py (PEP 604 `str | None` annotations) dies there with a TypeError, so
+ * v2 printed «STOP baseline failure-name diff» for every live land on 11-26 (0 landed). Package-manager bin dirs that
+ * exist go first, so `python3` is the same interpreter the seats use by hand.
+ */
+export function landToolPath(path: string | undefined, exists: (dir: string) => boolean = existsSync): string {
+  const front = ['/opt/homebrew/bin', '/usr/local/bin'].filter(d => exists(d));
+  if (path === undefined) return front.join(':');
+  // Keep every original segment (an empty one means the cwd) in order; only the moved dirs leave their old place.
+  const rest = path.split(':').filter(d => !front.includes(d));
+  return front.length ? [...front, ...rest].join(':') : path;
+}
+
 export function defaultLandDeps(over: Partial<LandDeps> = {}): LandDeps {
   const cfg = readConfig();
   const authors = (cfg.authors && typeof cfg.authors === 'object' ? cfg.authors : {}) as Record<string, string>;
@@ -159,6 +283,11 @@ export function defaultLandDeps(over: Partial<LandDeps> = {}): LandDeps {
   const slots = typeof cfg.slots === 'number' && cfg.slots > 0 ? cfg.slots : 1; // single-flight by default: one merge at a time
   const target = landTarget(cfg);
   const repoCwd = target.root ?? process.cwd();
+  // 착지 집사 policy pack (graphs/loop-agents/land-steward/policies.yaml · decision 11-27): only explicit lane pins reorder a
+  // land run; no pins (or no pack) → no `order` → tickLand's own landOrder, exactly as before. The pack's `mode` is the
+  // steward's live order (stewardDeps), never applied here.
+  const policy = (require('../land-steward/policy.js') as typeof import('../land-steward/policy.js'));
+  const pinned = policy.pinOrder(policy.loadLandPolicy());
   return {
     now: () => new Date(),
     stateRoot: effectiveInstanceRoot(),
@@ -171,12 +300,14 @@ export function defaultLandDeps(over: Partial<LandDeps> = {}): LandDeps {
     async prNow(n) { return toPr(ghJson(['pr', 'view', String(n), '--json', FIELDS], target) as GhPr, authors); },
     receipt(pr, head) {
       // Several hosts may hold a same-head receipt (…-minim5 · …-node-b): prefer one whose focused raw is still readable locally.
-      const rs = receiptDirs(pr).filter(d => d.split('/').pop()!.startsWith(`${pr}-${head.slice(0, 12)}-`))
-        .map(readReceipt).filter((r): r is Receipt => !!r && r.head === head);
-      return rs.find(r => localFocusedRaw(r) !== null) ?? rs[0] ?? null;
+      const all = receiptDirs(pr).map(d => readReceipt(d, { expectedPr: pr })).filter((r): r is Receipt => !!r);
+      const rs = all.filter(r => r.head === head && r.dir.split('/').pop()!.startsWith(`${pr}-${head.slice(0, 12)}-`));
+      // GREEN same head → GREEN reused by patch-id → RED same head (RED-RECEIPT · decide() keeps only focused / tsc-timeout reds).
+      return rs.find(r => localFocusedRaw(r) !== null) ?? rs[0] ?? reuseByPatchId(all, head, p => patchIdOf(repoCwd, p, pr))
+        ?? redReceipts(receiptDirs(pr, 'PREGATE-RED'), head, pr)[0] ?? null;
     },
     olderReceiptHead(pr, head) {
-      const rs = receiptDirs(pr).map(readReceipt).filter((r): r is Receipt => !!r && r.head !== head);
+      const rs = receiptDirs(pr).map(d => readReceipt(d, { expectedPr: pr })).filter((r): r is Receipt => !!r && r.head !== head);
       return rs.length ? rs[rs.length - 1]!.head : null;
     },
     focused: r => readFocused(r),
@@ -187,30 +318,42 @@ export function defaultLandDeps(over: Partial<LandDeps> = {}): LandDeps {
         return (j.findings ?? []).filter(x => SECURITY4.includes(String(x.category ?? '').toLowerCase()) && !x.disposition).map(x => `${x.category}:${x.title ?? ''}`.slice(0, 80));
       } catch { return []; }
     },
-    async land(pr, r, why) {
+    terra: (pr, head) => readTerraReview(join(getElanousConfigDir(), 'review-results'), pr, head),
+    judHold: (pr, head) => readJudHold(join(getElanousConfigDir(), 'review-results'), pr, head),
+    baselineDiff(pr, head) {
+      const days = [0, 1, 2].map(k => join(seatState(), 'OP', 'evidence', ymd(new Date(Date.now() - k * 86_400_000)), `nd${pr}`));
+      const own = [...receiptDirs(pr), ...receiptDirs(pr, 'PREGATE-RED')].filter(d => d.split('/').pop()!.startsWith(`${pr}-${head.slice(0, 12)}-`));
+      return findBaselineDiff([...own, ...days], head);
+    },
+    async land(pr, r, why, ctx) {
       const e = join(seatState(), 'OP', 'evidence', ymd(new Date())); mkdirSync(e, { recursive: true });
       const extra = join(e, `land-graph-extra-${pr.number}.json`);
-      const focused = this.focused(r);
-      const pass = focusedCounts(focused)?.pass ?? 0;
-      writeFileSync(extra, JSON.stringify({ receipt: join(r.dir, 'receipt.json'), note: `land-graph (판정국 자치) · ${why}`,
-        headTestRun: { sha: pr.head, command: `bun test ${r.focused.join(' ')}`, pass, fail: 0, exit: 0, receipt: join(r.dir, 'receipt.json') } }));
+      const focused: Focused = ctx?.lane === 'L0-doc-only' ? 'unreadable' : this.focused(r);
+      writeFileSync(extra, JSON.stringify(landExtra(pr, r, why, focused, ctx ?? {})));
       const cmd = typeof cfg.landCmd === 'string' ? cfg.landCmd : join(seatState(), 'OP', 'tools', 'op-direct-land-v2.sh');
       const out = spawnSync('zsh', [cmd, String(pr.number), pr.head, `land-graph 착지 · ${why}`, extra],
-        { encoding: 'utf8', cwd: repoCwd, env: { ...process.env, ...(target.slug ? { GH_REPO: target.slug } : {}), LAND_RATCHET_HOST: 'minim5', LAND_TSC_HOSTS: 'minim5' }, timeout: 40 * 60_000 }); // Source: v2 preflight ≤ ~30 min on minim5.
+        { encoding: 'utf8', cwd: repoCwd, env: { ...process.env, PATH: landToolPath(process.env.PATH), ...(target.slug ? { GH_REPO: target.slug } : {}), LAND_RATCHET_HOST: 'minim5',
+          // TSC-TIMEOUT: an unmeasured land-time tsc retries on the next host of the rotation (minim5 first, as before).
+          LAND_TSC_HOSTS: tscHostsFor(ctx?.tscAttempt ?? 0, retryHosts(cfg, hostsFor('tsc')[0])) }, timeout: 40 * 60_000 }); // Source: v2 preflight ≤ ~30 min on the first registry tsc host.
       const text = `${out.stdout ?? ''}\n${out.stderr ?? ''}`;
       appendFileSync(join(e, `land-graph-${pr.number}.log`), text);
       return { rc: out.status ?? 99, text };
     },
     staleRevert(pr) {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { detectStaleBaseRevert } = require('../land-guard/stale-base-revert.js') as typeof import('../land-guard/stale-base-revert.js');
+      const { detectStaleBaseRevert, parseDeclaredRemovals } = require('../land-guard/stale-base-revert.js') as typeof import('../land-guard/stale-base-revert.js');
       const cwd = repoCwd;
       const g = (args: string[]) => spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: 120_000 }); // Source: one fetch of main + the PR head.
       const f = g(['fetch', '-q', 'origin']);
       if (f.status !== 0) return { ok: false, why: `fetch failed: ${(f.stderr ?? '').trim().slice(0, 120)}` };
       if (g(['cat-file', '-e', `${pr.head}^{commit}`]).status !== 0) g(['fetch', '-q', 'origin', `pull/${pr.number}/head`]);
-      const r = detectStaleBaseRevert(cwd, 'origin/main', pr.head);
-      return r.ok ? { ok: true } : { ok: false, why: r.hits.map(h => `${h.file}←${h.commit.slice(0, 10)}`).join(', ').slice(0, 200) };
+      // REVERT-GUARD-DECLARED-SUPERSEDE: the PR body's «의도된 삭제: <path|#PR> (<reason>)» lines are honored.
+      const r = detectStaleBaseRevert(cwd, 'origin/main', pr.head, { declared: parseDeclaredRemovals(pr.body) });
+      if (r.ok) return { ok: true };
+      // SMART-MERGE ①: say whether each wiped file is in the PR's own change (merge-base..head) — «not own» = a stale copy.
+      const own = prDelta(gitAt(cwd), pr.head);
+      const ownFiles = new Set('error' in own ? [] : own.files);
+      return { ok: false, why: r.hits.map(h => `${h.file}←${h.commit.slice(0, 10)}${'error' in own ? '' : ownFiles.has(h.file) ? ' (own)' : ' (not own)'}`).join(', ').slice(0, 240) };
     },
     post(to, body) {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -221,7 +364,226 @@ export function defaultLandDeps(over: Partial<LandDeps> = {}): LandDeps {
     record(line) {
       appendFileSync(join(seatState(), 'OP', `COACH-ACTIONS-${ymd(new Date())}.md`), `- ${line}\n`);
     },
+    finisher: finisherDeps(target, repoCwd, retryHosts(cfg)),
+    smartMerge: smartMergeDeps(target),
+    baseMerged(pr) {
+      // The base branch's own PR merged → the stack's lower layer is in main.
+      const v = ghJson(['pr', 'list', '--head', pr.base, '--state', 'merged', '--json', 'number', '--limit', '1'], target) as unknown[];
+      return Array.isArray(v) && v.length > 0;
+    },
+    retargetToMain(pr) {
+      const inv = ghInvocation(['pr', 'edit', String(pr.number), '--base', 'main'], target);
+      const out = spawnSync(gh(), inv.args, { encoding: 'utf8', timeout: 60_000, ...(inv.cwd ? { cwd: inv.cwd } : {}) });
+      return out.status === 0 ? { ok: true } : { ok: false, why: (out.stderr ?? '').trim().slice(0, 160) };
+    },
+    superseded: pr => supersededInMain(repoCwd, pr),
+    ...cellLinkDeps(),
+    closePr(pr, comment) {
+      const inv = ghInvocation(['pr', 'close', String(pr.number), '--comment', comment], target);
+      const out = spawnSync(gh(), inv.args, { encoding: 'utf8', timeout: 60_000, ...(inv.cwd ? { cwd: inv.cwd } : {}) });
+      return out.status === 0 ? { ok: true } : { ok: false, why: (out.stderr ?? '').trim().slice(0, 160) };
+    },
+    ...(pinned ? { order: pinned } : {}),
     ...over,
+  };
+}
+
+// ── PATCHID-1127 receipt reuse ─────────────────────────────────────────────────────────────────────────────────
+
+const patchIds = new Map<string, string | null>();
+/** patch-id of the PR-own change: git diff $(git merge-base origin/main <head>) <head> | git patch-id --stable · null when unreadable. */
+export function patchIdOf(repo: string, head: string, pr?: number, mainRef = 'origin/main'): string | null {
+  const key = `${repo}\0${mainRef}\0${head}`;
+  if (patchIds.has(key)) return patchIds.get(key)!;
+  // SMART-MERGE ①: the one PR-own delta definition (src/git-smart/delta.ts prDelta).
+  const g = gitAt(repo, { timeoutMs: 60_000 });
+  if (g(['cat-file', '-e', `${head}^{commit}`]).status !== 0 && pr) g(['fetch', '-q', 'origin', `pull/${pr}/head`]);
+  const d = prDelta(g, head, mainRef);
+  const id = 'error' in d ? null : d.patchId;
+  patchIds.set(key, id);
+  return id;
+}
+
+/** A GREEN receipt of an older head whose PR-own change has the same patch-id (only main merged since) counts for `head`. */
+export function reuseByPatchId(receipts: readonly Receipt[], head: string, pidOf: (sha: string) => string | null): Receipt | null {
+  const older = receipts.filter(r => r.head !== head);
+  if (!older.length) return null;
+  const cur = pidOf(head);
+  if (!cur) return null;
+  for (const r of [...older].reverse()) {
+    const old = r.patchId ?? pidOf(r.head);
+    if (old && old === cur) return { ...r, head, reusedFrom: r.head };
+  }
+  return null;
+}
+
+// ── LAND-CELL-LINK adapters ──────────────────────────────────────────────────────────────────────────────────
+
+/** Cell of the release in play (`release.graph.version`) · attach = the `checklist evidence add` store call. Checklist read once per tick. */
+export function cellLinkDeps(): Pick<LandDeps, 'cellLink' | 'attachCell'> {
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  const { readReleaseGraphVersion } = require('../ops-dashboard/current-version.js') as typeof import('../ops-dashboard/current-version.js');
+  const { listChecklist } = require('../release-loop/checklist.js') as typeof import('../release-loop/checklist.js');
+  const { matchCell } = require('../land-graph/cell-link.js') as typeof import('../land-graph/cell-link.js');
+  /* eslint-enable @typescript-eslint/no-require-imports */
+  let cache: { at: number; version: string; items: ReturnType<typeof listChecklist>['items'] } | null = null;
+  const current = () => {
+    const version = readReleaseGraphVersion();
+    if (!version) return null;
+    if (!cache || cache.version !== version || Date.now() - cache.at > 60_000) {
+      try { cache = { at: Date.now(), version, items: listChecklist(version).items }; } catch { return null; }
+    }
+    return cache;
+  };
+  return {
+    cellLink(pr) { const c = current(); return c && c.items.length ? matchCell(pr, c.items) : undefined; },
+    attachCell(cell, pr) {
+      const c = current(); if (!c) return { ok: false, why: 'no release.graph.version' };
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const features = require('../release-loop/feature-store.js') as typeof import('../release-loop/feature-store.js');
+      const snap = listChecklist(c.version);
+      features.evidenceAdd(cell, c.version, `#${pr.number}`, 'land-graph', snap.released, snap.dev);
+      cache = null;
+      return { ok: true };
+    },
+  };
+}
+
+// ── Finisher adapters (LAND-OWNS-RECEIPT) ─────────────────────────────────────────────────────────────────────
+
+const git = (cwd: string, args: string[], timeout = 120_000) => spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout }); // Source: fetch/merge/push of one PR branch.
+
+/** true ⇔ merging the PR head into origin/main changes nothing (ancestor, or squash-landed content): the PR is superseded. */
+export function supersededInMain(repo: string, pr: PrInfo): boolean {
+  if (git(repo, ['fetch', '-q', 'origin', 'main']).status !== 0) return false;
+  if (git(repo, ['cat-file', '-e', `${pr.head}^{commit}`]).status !== 0) git(repo, ['fetch', '-q', 'origin', `pull/${pr.number}/head`]);
+  const mt = git(repo, ['merge-tree', '--write-tree', 'origin/main', pr.head]);
+  if (mt.status !== 0) return false; // conflict or error: not provably contained
+  const tree = (mt.stdout ?? '').split('\n')[0]?.trim();
+  const mainTree = (git(repo, ['rev-parse', 'origin/main^{tree}']).stdout ?? '').trim();
+  return !!tree && tree === mainTree;
+}
+
+/** SMART-MERGE lock dir (one smart-merge per PR across ticks and capsules). */
+export const smartMergeLockDir = () => join(effectiveInstanceRoot(), 'land-graph', 'smart-merge-locks');
+
+/**
+ * Bring a same-repo PR branch onto fresh main (src/git-smart/smart-refresh.ts): rebuild after a squash-landed parent ·
+ * else merge main · rerere + structural ladder · revert guard · plain push (never force). In-tick = no LLM.
+ */
+export function refreshBranch(repo: string, pr: PrInfo, ctx?: { parentHeads?: readonly string[] }): { result: RefreshResult; newHead?: string; why?: string } {
+  if (!pr.headRef || pr.crossRepo) return { result: 'error', why: 'no same-repo head branch' };
+  const parentHeads = withDiscoveredParents(repo, pr.number, pr.head, ctx?.parentHeads ?? [], landTarget());
+  const r = smartRefreshSync({ repo, pr: pr.number, head: pr.head, branch: pr.headRef, ...(parentHeads.length ? { parentHeads } : {}), lockDir: smartMergeLockDir() });
+  return smartResultToRefresh(r);
+}
+
+export function smartResultToRefresh(r: SmartRefreshResult): { result: RefreshResult; newHead?: string; why?: string } {
+  switch (r.result) {
+    case 'merged': case 'rebuilt': return { result: r.result, newHead: r.newHead, ...(r.resolved.length ? { why: `resolved ${r.resolved.map(x => `${x.path}:${x.rule}`).join(', ').slice(0, 160)}` } : {}) };
+    case 'up-to-date': return { result: 'up-to-date' };
+    case 'conflict': return { result: 'conflict', why: r.card.slice(0, 1500) };
+    case 'guard': return { result: 'guard', why: r.card.slice(0, 1500) };
+    case 'needs-llm': return { result: 'needs-llm', why: r.files.slice(0, 5).join(', ') };
+    default: return { result: r.result, why: r.why };
+  }
+}
+
+/**
+ * Given parents ∪ automatically discovered ones: the merged PRs (≠ this one) that contain the branch's own commits
+ * (`gh api repos/<slug>/commits/<sha>/pulls`, newest own commit first · bounded). Fails open to the given list.
+ */
+export function withDiscoveredParents(repo: string, pr: number, head: string, given: readonly string[], target: LandRepo): string[] {
+  const out = new Set(given.map(x => x.toLowerCase()));
+  try {
+    const g = gitAt(repo, { timeoutMs: 60_000 });
+    if (g(['cat-file', '-e', `${head}^{commit}`]).status !== 0) g(['fetch', '-q', 'origin', `pull/${pr}/head`]);
+    if (!target.slug) return [...out];
+    const lookup = (commit: string): string | null => {
+      const v = ghJson(['api', `repos/${target.slug}/commits/${commit}/pulls`], { ...target, slug: null }) as Array<{ number?: number; merged_at?: string | null; head?: { sha?: string } }>;
+      const hit = Array.isArray(v) ? v.find(x => x.number !== pr && !!x.merged_at && typeof x.head?.sha === 'string') : undefined;
+      return hit?.head?.sha ?? null;
+    };
+    for (const h of discoverParents(g, head, 'origin/main', lookup, 20)) out.add(h);
+  } catch { /* discovery is best effort */ }
+  return [...out];
+}
+
+/** SMART-MERGE parents: recent squash-landed heads (one gh call per tick) · the merged head of a stacked PR's base branch. */
+export function smartMergeDeps(target: LandRepo): NonNullable<LandDeps['smartMerge']> {
+  return {
+    mergedHeads() {
+      const v = ghJson(['pr', 'list', '--state', 'merged', '--base', 'main', '--limit', '60', '--json', 'headRefOid'], target) as Array<{ headRefOid?: string }>;
+      return Array.isArray(v) ? v.map(x => x.headRefOid ?? '').filter(h => /^[0-9a-f]{40}$/.test(h)) : [];
+    },
+    mergedBaseHead(pr) {
+      const v = ghJson(['pr', 'list', '--head', pr.base, '--state', 'merged', '--json', 'headRefOid', '--limit', '1'], target) as Array<{ headRefOid?: string }>;
+      const h = Array.isArray(v) ? v[0]?.headRefOid : undefined;
+      return h && /^[0-9a-f]{40}$/.test(h) ? h : null;
+    },
+  };
+}
+
+/**
+ * PREGATE-RETRY host: the guardian's choice when present (guardian v2 #40352/#40362) — its fresh route
+ * (`<state>/res/route.json` {host, at} ≤ 15 min) unless that is the host that timed out, else `eln res host pick --reserved <avoid>`
+ * — then the configured rotation (`land.graph.retryHosts`). Every step fails open to the next.
+ */
+export function retryHost(avoid: string, hosts: readonly string[], o: { stateRoot?: string; nowMs?: number; pick?: (avoid: string) => string | null } = {}): string {
+  const okHost = (h: unknown): h is string => typeof h === 'string' && /^[\w.-]{1,64}$/.test(h) && h !== avoid;
+  try {
+    const r = JSON.parse(readFileSync(join(o.stateRoot ?? effectiveInstanceRoot(), 'res', 'route.json'), 'utf8')) as { host?: unknown; at?: unknown };
+    const age = typeof r.at === 'string' ? (o.nowMs ?? Date.now()) - Date.parse(r.at) : NaN;
+    if (okHost(r.host) && age >= 0 && age <= 15 * 60_000) return r.host; // a future-dated route (clock skew) is not fresh
+  } catch { /* no route file */ }
+  const picked = (() => { try { return (o.pick ?? guardianPick)(avoid); } catch { return null; } })();
+  if (okHost(picked)) return picked;
+  return nextHost(avoid, hosts);
+}
+/** `eln res host pick --reserved <avoid>` through this same CLI (only when the command exists · 90 s: it probes hosts over ssh). */
+function guardianPick(avoid: string): string | null {
+  const bin = process.argv[1];
+  if (!bin || !/elanous\.mjs$/.test(bin)) return null;
+  const r = spawnSync(process.execPath, [bin, 'res', 'host', 'pick', '--reserved', avoid], { encoding: 'utf8', timeout: 90_000 });
+  return r.status === 0 ? (r.stdout ?? '').trim().split('\n').pop() ?? null : null;
+}
+
+/** Detached `pregate <PR> --light` (the RES launcher picks the least-loaded host) · log under the land-graph state dir. */
+export function finisherDeps(target: LandRepo, repo: string, hosts: readonly string[] = defaultRetryHosts()): NonNullable<LandDeps['finisher']> {
+  return {
+    launchPregate(pr, opts) {
+      const tool = join(seatState(), 'RES', 'tools', 'pregate');
+      if (!existsSync(tool)) return { ok: false, why: `${tool} missing` };
+      const dir = join(effectiveInstanceRoot(), 'land-graph', 'finisher'); mkdirSync(dir, { recursive: true });
+      const log = join(dir, `${pr.number}-${pr.head.slice(0, 12)}.log`);
+      const fd = openSync(log, 'a');
+      try {
+        // PREGATE-RETRY: a tsc-timeout re-run goes to the next host of the rotation, never the one that timed out.
+        const host = opts?.avoidHost ? retryHost(opts.avoidHost, hosts) : '';
+        const args = [tool, String(pr.number), '--light', ...(host ? ['--host', host] : [])]; // '' = no routable host → pregate auto-picks
+        const child = spawn('sh', args, { detached: true, stdio: ['ignore', fd, fd], cwd: repo,
+          env: { ...process.env, PATH: landToolPath(process.env.PATH), ...(target.slug ? { GH_REPO: target.slug } : {}) } });
+        child.unref();
+        return child.pid ? { ok: true, pid: child.pid, log } : { ok: false, why: 'spawn failed' };
+      } catch (e) { return { ok: false, why: String(e).slice(0, 120) }; } finally { closeSync(fd); }
+    },
+    alive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } },
+    refresh: (pr, ctx) => refreshBranch(repo, pr, ctx),
+    launchResolve(pr, ctx) {
+      // SMART-MERGE (c): the LLM step runs in a detached capsule — `eln land smart-merge <pr> --llm` (same CLI entry).
+      const dir = join(effectiveInstanceRoot(), 'land-graph', 'finisher'); mkdirSync(dir, { recursive: true });
+      const log = join(dir, `${pr.number}-${pr.head.slice(0, 12)}-smart-merge.log`);
+      const entry = process.argv[1] && /\.(m?[jt]s|mjs|cjs)$/.test(process.argv[1]) ? [process.argv[1]] : [];
+      const args = [...entry, 'land', 'smart-merge', String(pr.number), '--head', pr.head, '--branch', pr.headRef ?? '', '--llm',
+        ...(ctx?.parentHeads?.length ? ['--parent-heads', ctx.parentHeads.join(',')] : [])];
+      const fd = openSync(log, 'a');
+      try {
+        const child = spawn(process.execPath, args, { detached: true, stdio: ['ignore', fd, fd], cwd: repo,
+          env: { ...process.env, PATH: landToolPath(process.env.PATH), ...(target.slug ? { GH_REPO: target.slug } : {}) } });
+        child.unref();
+        return child.pid ? { ok: true, pid: child.pid, log } : { ok: false, why: 'spawn failed' };
+      } catch (e) { return { ok: false, why: String(e).slice(0, 120) }; } finally { closeSync(fd); }
+    },
   };
 }
 
@@ -289,19 +651,29 @@ function handle(fn: () => Promise<void> | void): Promise<void> {
 export function registerLandCommands(program: Command, deps: () => LandDeps = () => defaultLandDeps()): void {
   const land = program.command('land').description('Land graph — judge → land under judge-kingdom autonomy (shadow by default)');
   const graph = land.command('graph').description('Land graph status · plan · tick · replay · synth');
-  graph.command('status').option('--json').action((o: { json?: boolean }) => handle(() => {
+  graph.command('status').option('--json').action((o: { json?: boolean }) => handle(async () => {
     const d = deps(); const rows = readLedger(d.stateRoot).filter(r => !r.synthetic);
     const latest = new Map<number, (typeof rows)[number]>();
     for (const r of rows) if (r.event === 'decision' || r.event === 'refused' || r.event === 'landed') latest.set(r.pr, r);
+    // LAND-STEWARD: closed / merged PRs leave the view (11-27 #39114 · #39243 still listed «refuse stale-base-revert» after close).
+    // Fail-open: when gh cannot list, the ledger view stays whole.
+    const open = await d.listPrs().then(ps => new Set(ps.filter(p => p.state === 'OPEN').map(p => p.number)), () => null);
+    if (open) for (const pr of [...latest.keys()]) if (!open.has(pr)) latest.delete(pr);
     const today = new Date().toISOString().slice(0, 10);
     const v = { mode: d.mode, slots: d.slots, holds: readHolds(d.stateRoot), landedToday: rows.filter(r => r.event === 'landed' && r.at.startsWith(today)).map(r => r.pr), latest: [...latest.values()] };
     emit(v, !!o.json, () => [`land graph · mode ${v.mode} · slots ${v.slots} · landed today ${v.landedToday.length}`,
       ...Object.entries(v.holds).map(([pr, h]) => `HOLD #${pr} · ${h.reason} (${h.by})`),
       ...v.latest.map(r => `#${r.pr} @${r.head.slice(0, 12)} ${r.event === 'decision' ? r.action : r.event}${r.cls ? ` ${r.cls}` : ''} · ${r.why ?? ''}`)].join('\n'));
   }));
-  graph.command('plan').option('--json').action((o: { json?: boolean }) => handle(async () => {
-    const res = await tickLand({ ...deps(), dry: true });
-    emit(res, !!o.json, () => [`plan · mode ${res.mode}${res.error ? ` · ${res.error}` : ''}`, ...res.decisions.map(x => `#${x.pr} ${x.action}${x.cls ? ` ${x.cls}` : ''} · ${x.why}`)].join('\n'));
+  graph.command('plan').option('--json')
+    .option('--reap', 'list open >24h PRs whose whole diff is already in main (dry run)').option('--apply', 'with --reap: close them with a comment')
+    .action((o: { json?: boolean; reap?: boolean; apply?: boolean }) => handle(async () => {
+    const res = await tickLand({ ...deps(), dry: true, ...(o.reap ? { reap: o.apply ? 'apply' as const : 'dry' as const } : {}) });
+    emit(res, !!o.json, () => [`plan · mode ${res.mode} · ready ${res.ready ?? 0}${res.error ? ` · ${res.error}` : ''}`, ...res.decisions.map(x => `#${x.pr} ${x.action}${x.cls ? ` ${x.cls}` : ''} · ${x.why}`),
+      ...(res.finisher ?? []).map(f => `finisher #${f.pr} @${f.head.slice(0, 12)} ${f.kind} ${f.state} · ${f.why}`),
+      ...(res.stale ?? []).map(s => `stale #${s.pr} ${s.ageH}h · ${s.reason}`),
+      ...(res.reaped ?? []).map(r => `reap #${r.pr} ${r.action} · ${r.why}`),
+      ...(res.cells ?? []).map(c => c.cell ? `cell #${c.pr} ${c.action} ${c.cell} (${c.basis})` : `cell #${c.pr} landed-no-cell`)].join('\n'));
     if (res.error) process.exitCode = 1;
   }));
   graph.command('tick').option('--json').action((o: { json?: boolean }) => handle(async () => {
@@ -310,7 +682,9 @@ export function registerLandCommands(program: Command, deps: () => LandDeps = ()
     const seat = process.env.ELANOUS_TRACK ?? landingOwner();
     const res = d.mode === 'live' && !mayRunLandOps(seat) ? { ...(await tickLand({ ...d, mode: 'shadow' })), error: `seat ${seat} may not run land ops (live → shadow)` } : await tickLand(d);
     emit(res, !!o.json, () => res.locked ? 'tick: another tick holds the lock' : [`tick · mode ${res.mode} · landed ${res.landed.join(',') || '—'}${res.error ? ` · ${res.error}` : ''}`,
-      ...res.decisions.map(x => `#${x.pr} ${x.action}${x.cls ? ` ${x.cls}` : ''} · ${x.why}`)].join('\n'));
+      ...res.decisions.map(x => `#${x.pr} ${x.action}${x.cls ? ` ${x.cls}` : ''} · ${x.why}`),
+      ...(res.finisher ?? []).map(f => `finisher #${f.pr} @${f.head.slice(0, 12)} ${f.kind} ${f.state} · ${f.why}`),
+      ...(res.cells ?? []).map(c => c.cell ? `cell #${c.pr} ${c.action} ${c.cell} (${c.basis})${c.why ? ` · ${c.why}` : ''}` : `cell #${c.pr} landed-no-cell`)].join('\n'));
     if (res.error) process.exitCode = 1;
   }));
   graph.command('replay').option('--date <yyyymmdd>', 'evidence day', '20261125').option('--json').action((o: { date: string; json?: boolean }) => handle(() => {
@@ -334,7 +708,54 @@ export function registerLandCommands(program: Command, deps: () => LandDeps = ()
       land: async () => { throw new Error('synthetic never lands'); } });
     emit(res, !!o.json, () => res.decisions.map(x => `[synthetic] #${x.pr} ${x.action}${x.cls ? ` ${x.cls}` : ''} · ${x.why}`).join('\n'));
   }));
+  // SMART-MERGE capsule / hand entry: rebuild-or-merge one PR onto main with the full ladder (rerere → structural → LLM).
+  land.command('smart-merge <pr>').description('Bring a PR branch onto main: stack rebuild after a squash or main merge · conflict ladder · revert guard · plain push')
+    .option('--head <sha>', 'expected PR head (default: the PR\'s current head from gh)').option('--branch <name>', 'PR head branch (default: from gh)')
+    .option('--parent-heads <shas>', 'comma-separated squash-landed heads that may be inside the branch (default: the last 60 merged PR heads)').option('--llm', 'allow the LLM step for hunks rerere / structural left')
+    .option('--dry', 'compute and guard, push nothing').option('--json')
+    .action((pr: string, o: { head?: string; branch?: string; parentHeads?: string; llm?: boolean; dry?: boolean; json?: boolean }) => handle(async () => {
+      const cfg = readConfig(); const target = landTarget(cfg); const repo = target.root ?? process.cwd();
+      let head = o.head; let branch = o.branch;
+      if (!head || !branch) {
+        const v = ghJson(['pr', 'view', String(Number(pr)), '--json', 'headRefOid,headRefName,isCrossRepository,state'], target) as { headRefOid?: string; headRefName?: string; isCrossRepository?: boolean; state?: string };
+        if (v.isCrossRepository) throw new Error(`#${pr} lives in a fork — the smart-merge never pushes there`);
+        if (v.state && v.state !== 'OPEN') throw new Error(`#${pr} is ${v.state}`);
+        head = head ?? v.headRefOid; branch = branch ?? v.headRefName;
+      }
+      if (!head || !branch) throw new Error(`#${pr}: head / branch unknown`);
+      const given = o.parentHeads ? o.parentHeads.split(',').map(x => x.trim()).filter(Boolean)
+        : (() => { try { return [...smartMergeDeps(target).mergedHeads()]; } catch { return []; } })();
+      const parentHeads = withDiscoveredParents(repo, Number(pr), head, given, target);
+      const input = { repo, pr: Number(pr), head, branch, lockDir: smartMergeLockDir(), push: !o.dry, ...(parentHeads.length ? { parentHeads } : {}) };
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const llm = o.llm ? (require('../git-smart/llm.js') as typeof import('../git-smart/llm.js')).defaultSmartMergeLlm() : null;
+      const r = llm ? await smartRefresh({ ...input, llm }) : smartRefreshSync(input);
+      console.log(o.json ? JSON.stringify(r) : `smart-merge #${pr} ${r.result}${'newHead' in r ? ` → ${r.newHead.slice(0, 12)}` : ''}${'why' in r ? ` · ${r.why}` : ''}${'card' in r ? `\n${r.card}` : ''}`);
+      if (!['merged', 'rebuilt', 'up-to-date'].includes(r.result)) process.exitCode = 1;
+    }));
   land.command('hold <pr>').requiredOption('--reason <text>').option('--by <seat>', 'who holds', process.env.ELANOUS_TRACK ?? 'JUD')
     .action((pr: string, o: { reason: string; by: string }) => handle(() => { setHold(deps().stateRoot, Number(pr), o.reason, o.by); console.log(`HOLD #${pr} · ${o.reason}`); }));
-  land.command('unhold <pr>').action((pr: string) => handle(() => { console.log(clearHold(deps().stateRoot, Number(pr)) ? `unhold #${pr}` : `#${pr} was not held`); }));
+  land.command('unhold <pr>').action((pr: string) => handle(() => {
+    // CLAUDE-OP-PROXY-IDENTITY — ELANOUS_TRACK=CLAUDE-OP: only the verified proxy session, audited ⊕ noticed to OP, and
+    // never over a JUD hold (the judiciary's veto stays the judiciary's). Other callers keep today's behavior.
+    const claimed = (process.env.ELANOUS_TRACK ?? '').trim().toUpperCase();
+    if (claimed === 'CLAUDE-OP') {
+      const { resolveProxyActor, auditProxyRefusal } = require('../proxy/proxy-identity.js') as typeof import('../proxy/proxy-identity.js');
+      const hold = readHolds(deps().stateRoot)[String(Number(pr))];
+      if (hold && /^JUD/i.test(hold.by.trim())) {
+        auditProxyRefusal('land-unhold', `#${pr}`, 'jud-hold');
+        throw new Error(`land unhold: #${pr} is held by ${hold.by} (JUD veto) — the proxy never lifts a JUD hold`);
+      }
+      const r = resolveProxyActor({ claimed, op: 'land-unhold', target: `#${pr}` });
+      if (r.kind === 'refused') throw new Error(r.line);
+      // Conditional clear: a JUD hold set between the check and the clear is kept.
+      console.log(clearHold(deps().stateRoot, Number(pr), (h) => !/^JUD/i.test(h.by.trim())) ? `unhold #${pr}` : `#${pr} was not held (or is now a JUD hold)`);
+      return;
+    }
+    console.log(clearHold(deps().stateRoot, Number(pr)) ? `unhold #${pr}` : `#${pr} was not held`);
+  }));
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  (require('./land-rail-watch-cli.js') as typeof import('./land-rail-watch-cli.js')).registerRailWatch(land);
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  (require('../land-steward/cli.js') as typeof import('../land-steward/cli.js')).registerStewardCommands(land, deps);
 }

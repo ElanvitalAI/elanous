@@ -87,7 +87,7 @@ test('loop registry uses the inbox address export and reads unread counts from i
     msgAddress: LOOP_MESSAGE_ROUTES.orchestrator.msgAddress, replyBody: 'rules', wake: 'cron', wakeSource: 'loop-table', unreadCount: 1,
   });
   expect(entries.find(entry => entry.id === 'guardian')).toMatchObject({
-    msgAddress: 'GUARDIAN', replyBody: 'none', wake: 'none', unreadCount: 1,
+    msgAddress: 'GUARDIAN', replyBody: 'agent', wake: 'cron', unreadCount: 1,
   });
   expect(entries.find(entry => entry.id === 'daily')).toMatchObject({ msgAddress: null, replyBody: 'none', wake: 'none', unreadCount: null });
   expect(listAllLoops(f.opts).find(entry => entry.id === 'orchestrator')).toMatchObject({
@@ -496,7 +496,7 @@ test('loop CLI exposes the five lifecycle actions with safe mutation flags', () 
   const program = new Command();
   registerLoopCommands(program);
   const loop = program.commands.find(c => c.name() === 'loop');
-  expect(loop?.commands.map(c => c.name())).toEqual(['list', 'activity', 'status', 'start', 'stop', 'cron', 'run', 'package', 'trigger']);
+  expect(loop?.commands.map(c => c.name())).toEqual(['agent', 'list', 'activity', 'status', 'start', 'stop', 'cron', 'run', 'package', 'trigger', 'butler', 'demote', 'promote', 'guardian']);
   expect(loop?.commands.find(c => c.name() === 'start')?.options.map(o => o.long)).toContain('--yes');
   expect(loop?.commands.find(c => c.name() === 'stop')?.options.map(o => o.long)).toContain('--yes');
   expect(loop?.commands.find(c => c.name() === 'run')?.options.map(o => o.long)).toContain('--dry-run');

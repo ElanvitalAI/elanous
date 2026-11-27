@@ -174,19 +174,9 @@ export function objectCreatorGrants(configDir: string, env: NodeJS.ProcessEnv): 
  *  해석 실패·빈 값 → null(=거부, fail-closed). */
 export type SyncExec = (file: string, args: readonly string[]) => string;
 
-/** JUD hold(13:33) mustFix ① — ⑰: gcloud identity token(JWT) 에서 이 업로드가 실제로 서명할 ADC 자격의
- *  주체(email)를 뽑는다. 서명·발급 경로는 gcloud→Google TLS 가 담당하고 여기선 payload 의 email/email_verified
- *  만 본다(파손·email 부재·미검증 = null → 게시 경로에서 거부). */
-export function gcsAdcPrincipalFromIdentityToken(token: string): string | null {
-  const parts = token.trim().split('.');
-  if (parts.length < 3) return null;
-  try {
-    const payload = JSON.parse(Buffer.from(parts[1]!.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')) as Record<string, unknown>;
-    if (payload.email_verified === false) return null;
-    const email = typeof payload.email === 'string' ? payload.email.trim() : '';
-    return email || null;
-  } catch { return null; }
-}
+// FU(OP #122924 처방 1번) — gcsAdcPrincipalFromIdentityToken(JWT 신원 토큰 판정 ⑰)은 폐지: print-identity-token 은
+// gcloud(594.0.0) auth application-default 그룹에 실존하지 않아 런타임이 전부 거부됐다(2026-11-21 e2e 사전점검 RC=1).
+// principal 은 이제 '같은 스냅샷'의 client_email 에서 나온다(defaultResolveUploadCredential 아래)·실존 명령 계약은 ⑳.
 
 const defaultSyncExec: SyncExec = (file, args) => execFileSync(file, [...args], { encoding: 'utf8', timeout: 15_000 });
 
@@ -209,13 +199,17 @@ export function defaultResolveUploadIdentity(cfg: StorageConfig, exec: SyncExec 
   return null;
 }
 
-/** JUD hold(16:0x) ⑧차 ① — gcs 업로드가 실제로 서명할 '같은 ADC 자격 인스턴스'에서 신원(principal)과 접근 토큰을
- *  함께 도출한다. 앰비언트 ADC 를 gcloud 호출마다 따로 재해석하지 않는다: 원본 ADC 파일(GOOGLE_APPLICATION_CREDENTIALS
- *  우선·없으면 CLOUDSDK_CONFIG|~/.config/gcloud 의 application_default_credentials.json)을 실행별 비공개 스냅샷
- *  (mkdtemp 0700 → 그 안 O_EXCL 0600)으로 딱 한 번 읽어 복사하고, 그 스냅샷 경로를 CLOUDSDK_CONFIG+
- *  GOOGLE_APPLICATION_CREDENTIALS 로 핀해 print-identity-token(⑰ 판정)과 print-access-token 이
- *  모두 그 인스턴스에서만 나오게 한다. 신원 판정 실패 = 접근 토큰을 해석하지 않고 null(fail-closed) ·
- *  해석 실패·빈 토큰 = null · gcs 외 = null(결속 대상 아님) · 스냅샷은 finally 정리(⑲a). */
+/** JUD hold(16:0x) ⑧차 ① + FU(OP #122924 처방 1번) — gcs 업로드가 실제로 서명할 '같은 ADC 자격 인스턴스'에서
+ *  신원(principal)과 접근 토큰을 함께 도출한다. 앰비언트 ADC 를 gcloud 호출마다 따로 재해석하지 않는다: 원본 ADC 파일
+ *  (GOOGLE_APPLICATION_CREDENTIALS 우선·없으면 CLOUDSDK_CONFIG|~/.config/gcloud 의 application_default_credentials.json)을
+ *  실행별 비공개 스냅샷(mkdtemp 0700 → 그 안 O_EXCL 0600)으로 딱 한 번 읽어 복사하고, 그 스냅샷 경로를
+ *  CLOUDSDK_CONFIG+GOOGLE_APPLICATION_CREDENTIALS 로 핀한다. principal 은 '같은 스냅샷'의 client_email(SA 자격 JSON)에서
+ *  읽고(신원 토큰 호출 폐지 — print-identity-token 은 gcloud 에 실존하지 않았다), 접근 토큰은 실존 명령
+ *  print-access-token 이 그 인스턴스에서만 내오게 한다 — 결속 환경변수(CLOUDSDK_CONFIG=<스냅샷 config dir>·
+ *  GOOGLE_APPLICATION_CREDENTIALS=<스냅샷 JSON 경로>)를 자식 프로세스 env 에 실제 전달한다(JUD HOLD #123912 mustFix ②·⑳b⑳c).
+ *  JUD HOLD #123912(OP #123914) mustFix ① — 스냅샷 type 이 service_account 가 아니면(다른 자격 유형 — client_email 이
+ *  있어도) gcloud 호출 없이 즉시 거부한다. client_email 부재·파손 = 접근 토큰 해석 없이 null(fail-closed) ·
+ *  해석 실패·빈 토큰 = null · gcs 외 = null(결속 대상 아님) · 스냅샷은 finally 정리(⑲a·⑳). */
 export interface GcsUploadCredential { principal: string; accessToken: string }
 /** ⑧차 ① — 핀 경로가 담긴 env 로 CLI 를 부르는 동반자(주입 가능). */
 export type EnvSyncExec = (file: string, args: readonly string[], env: NodeJS.ProcessEnv) => string;
@@ -243,8 +237,16 @@ export function defaultResolveUploadCredential(
     const snapshotPath = join(snapshotDir, 'application_default_credentials.json');
     writeFileSync(snapshotPath, instance, { flag: 'wx', mode: 0o600 }); // 배타 생성(O_EXCL — 있으면 실패)
     const pinned: NodeJS.ProcessEnv = { ...env, CLOUDSDK_CONFIG: snapshotDir, GOOGLE_APPLICATION_CREDENTIALS: snapshotPath };
-    const principal = gcsAdcPrincipalFromIdentityToken(exec('gcloud', ['auth', 'application-default', 'print-identity-token'], pinned));
-    if (!principal) return null; // 신원 판정 실패 = 접근 토큰 해석 없이 거부(fail-closed)
+    // FU(OP #122924 처방 1번) — principal 은 '같은 스냅샷'의 client_email(SA 자격 JSON)에서, 접근 토큰은
+    // 실존 명령 print-access-token 에서. print-identity-token 호출은 폐지(실존하지 않는 하위명령 — 런타임 전부 거부).
+    const adc = JSON.parse(instance.toString('utf8')) as Record<string, unknown>; // 파손 = catch → null
+    // JUD HOLD #123912(OP #123914) mustFix ① — principal 결속 표면(client_email)은 service_account 자격 JSON의 필드다:
+    // type 이 service_account 가 아니면(authorized_user 등 다른 자격 유형 — client_email 이 있어도) gcloud 호출 0회로
+    // 즉시 거부한다(fail-closed). 다른 유형의 client_email 로 업로드를 서명하게 두면 주체 결속이 자격 유형과 어긋난다.
+    const adcType = typeof adc.type === 'string' ? adc.type.trim() : '';
+    if (adcType !== 'service_account') return null; // gcloud spawn 0회 — 자격 선택 경로에 닿기 전에 거부
+    const principal = typeof adc.client_email === 'string' ? adc.client_email.trim() : '';
+    if (!principal) return null; // client_email 부재 = 신원 증명 불가 = gcloud 호출 없이 거부(fail-closed)
     const accessToken = exec('gcloud', ['auth', 'application-default', 'print-access-token'], pinned).trim();
     if (!accessToken) return null;
     return { principal, accessToken };

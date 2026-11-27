@@ -79,7 +79,10 @@ describe('✋ to a human-led space', () => {
     return { store, cards, decided, logs, deps };
   }
 
-  test('one card per ✋ at once; no climb at 11 min; climbs to OP at 60 min (the lead\'s timer, not 10)', () => {
+  // #40180 (hand-ladder · stop the ✋ escalation flood to OP): the timer never mails HQ — OP hears of an unanswered ✋ only
+  // through the steward beacon card (one per cause). These two tests still expected a timer mail to OP; they now hold the
+  // current contract: the human lead's card, no climb before its timer, and no timer mail into HQ after it.
+  test('one card per ✋ at once; no climb at 11 min; at 60 min the timer still never mails HQ (beacon card only · #40180)', () => {
     const h = harness();
     try {
       const raised = h.store.post(hand('blk-mk-1'));
@@ -90,8 +93,8 @@ describe('✋ to a human-led space', () => {
       expect(sweepHandRaises(h.store, h.deps)).toEqual([]);
       expect(h.cards.length).toBe(1);
       setSystemTime(new Date(t0 + 60 * ONE_MINUTE));
-      const done = sweepHandRaises(h.store, h.deps);
-      expect(done.map((d) => [d.msgId, d.from, d.to, d.waitedMin])).toEqual([[raised.id, 'MK', 'OP', 60]]);
+      expect(sweepHandRaises(h.store, h.deps)).toEqual([]);
+      expect(h.store.db.query(`SELECT COUNT(*) AS n FROM msg_messages WHERE recipient = 'OP'`).get()).toEqual({ n: 0 });
       expect(h.logs.filter((e) => e === 'needhuman.human-lead-card').length).toBe(1);
     } finally { h.store.close(); }
   });
@@ -122,14 +125,15 @@ describe('✋ to a human-led space', () => {
     } finally { h.store.close(); }
   });
 
-  test('switch off (no port) = the ordinary 10-minute ladder', () => {
+  test('switch off (no port) = the ordinary 10-minute ladder — which also never mails HQ by timer (#40180)', () => {
     const h = harness();
     try {
       const raised = h.store.post(hand('blk-mk-4'));
       const t0 = readHandMail(h.store, raised.id)!.createdAtMs;
       setSystemTime(new Date(t0 + 10 * ONE_MINUTE));
       const { humanLead: _off, ...plain } = h.deps;
-      expect(sweepHandRaises(h.store, plain).map((d) => d.to)).toEqual(['OP']);
+      expect(sweepHandRaises(h.store, plain)).toEqual([]);
+      expect(h.store.db.query(`SELECT COUNT(*) AS n FROM msg_messages WHERE recipient = 'OP'`).get()).toEqual({ n: 0 });
       expect(h.cards).toEqual([]);
     } finally { h.store.close(); }
   });

@@ -49,10 +49,11 @@ export function addedLines(base: string, changed: string): string[] | undefined 
   return changes?.flatMap((insertion) => insertion.lines);
 }
 
-export function classifyConflictHunks(base: string | null | undefined, ours: string | null | undefined, theirs: string | null | undefined, path: string): ConflictHunkAnalysis {
+/** `anyPath` (SMART-MERGE hunk-level use): the append-only rule on one conflict hunk of any file — the caller's tests decide. */
+export function classifyConflictHunks(base: string | null | undefined, ours: string | null | undefined, theirs: string | null | undefined, path: string, opts: { anyPath?: boolean } = {}): ConflictHunkAnalysis {
   const result = { path, hunks: 1, base: base ?? '', ours: ours ?? '', theirs: theirs ?? '' };
   if (base == null || ours == null || theirs == null) return { ...result, verdict: 'unmeasured' };
-  if (!allowedPath(path)) return { ...result, verdict: 'needs-repair' };
+  if (!opts.anyPath && !allowedPath(path)) return { ...result, verdict: 'needs-repair' };
   const oursAdded = additions(base, ours);
   const theirsAdded = additions(base, theirs);
   if (!oursAdded || !theirsAdded) return { ...result, verdict: 'needs-repair' };
@@ -60,8 +61,8 @@ export function classifyConflictHunks(base: string | null | undefined, ours: str
 }
 
 export type AppendMergeResult = { verdict: 'append-only'; content: string } | { verdict: 'needs-repair' | 'unmeasured' };
-export function mergeAppendOnly(base: string, ours: string, theirs: string, path: string): AppendMergeResult {
-  const analysis = classifyConflictHunks(base, ours, theirs, path);
+export function mergeAppendOnly(base: string, ours: string, theirs: string, path: string, opts: { anyPath?: boolean } = {}): AppendMergeResult {
+  const analysis = classifyConflictHunks(base, ours, theirs, path, opts);
   if (analysis.verdict !== 'append-only') return { verdict: analysis.verdict };
   const baseLines = base.split('\n');
   const oursAdded = additions(base, ours)!;

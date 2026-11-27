@@ -23,7 +23,7 @@ const EXPECTED: Record<string, string> = {
   'revert-pr': 'landed',
   'doc-only': 'landed (L0 doc-only)',
   'code-pr-empty-focused': 'refuse no-focused-stage',
-  'hot-file-entry': 'refuse review-required · card TC',
+  'hot-file-entry': 'landed · no JUD review',
   'focused-fail': 'refuse baseline-failing-focused',
   'isolation-gate': 'refuse isolation-gate · card TC',
   'test-interference': 'refuse test-interference',
@@ -33,11 +33,22 @@ const EXPECTED: Record<string, string> = {
   'stale-base-revert-refused': 'refuse stale-base-revert · landings 0',
   'base-changed-retry-once-lands': 'landed · land calls 2',
   'two-prs-one-slot': 'tick1 1 · tick2 1 · double 0',
-  'org-rollback-restores-routing': 'split TC · rollback JUD',
+  'org-rollback-restores-routing': 'split TC · rollback TC,JUD',
+  'swept-raw-exit0-lands': 'landed · no headTestRun counts',
+  'swept-raw-exit1-refused': 'refuse baseline-failing-focused',
+  'baseline-name-diff-ok-lands': 'landed · nd passed to land',
+  'l0-receipt-doc-only-lands': 'landed · lane L0-doc-only',
+  'l0-receipt-code-refused': 'refuse no-focused-stage',
+  'security4-no-terra-waits': 'wait review-required · card TC',
+  'security4-terra-warn-lands': 'landed',
+  'security4-terra-fail-waits': 'wait review-required',
+  'security4-terra-security-finding': 'refuse security-finding',
+  'non-security-terra-fail-lands': 'landed',
+  'jud-hold-verdict-file-vetoes': 'hold · held',
 };
 
 describe('land-graph-world', () => {
-  for (const seed of [1, 7, 42]) {
+  for (const seed of [1, 7, 42, 1126, 38038]) {
     test(`seed ${seed}: every edge case matches · no invariant violation`, async () => {
       const { results, violations } = await runLandWorld(seed);
       expect(violations).toEqual([]);

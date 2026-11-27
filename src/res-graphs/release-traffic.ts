@@ -18,6 +18,8 @@
  * 세 얼굴: 관측 = audit.jsonl + one JSON line per run + the registry fire log / 판단 근거 = release.* facts
  * (trigger-facts.ts) / 수복과 인계 = converge + undo rows + cards to the release-supervision owner (REL steward).
  */
+import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { elanousCliArgv, installedBin } from '../instance/cli-bin.js';
 import { spawnSync } from 'node:child_process';
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -121,7 +123,7 @@ export function trafficTick(d: TrafficDeps): TickResult {
       changes.push(`${host} ${from ?? '∅'}→${to}${d.live ? '' : ' (shadow)'}${ok ? '' : ' FAILED'}`);
       return ok;
     };
-    let failed = false;
+    let failed = false; const failures: string[] = []; // LOOP-EXCEPTION-WATCH: a fail always says why
     if (phase === 'reserve') {
       if (st.phase === 'idle' || !st.phase) st.phase = 'reserve';
       for (const [host, want] of Object.entries(RESERVE)) {
@@ -136,7 +138,7 @@ export function trafficTick(d: TrafficDeps): TickResult {
           continue;
         }
         if (!(host in st.baseline)) st.baseline[host] = cur;
-        if (set(host, want, cur, why)) st.applied[host] = want; else failed = true;
+        if (set(host, want, cur, why)) st.applied[host] = want; else { failed = true; failures.push(`set ${host} pregateSlots ${cur ?? '?'}→${want} failed`); }
       }
       if (!d.hostUp(RELEASE_HOST)) cardOnce(`down-${RELEASE_HOST}`, `release host ${RELEASE_HOST} is not reachable during the reserve window — release graph needs it; absorb host ${ABSORB_HOST} keeps ${RESERVE[ABSORB_HOST]} slots.`);
       const absorb = f[`res.lease.${ABSORB_HOST}.live`];
@@ -157,7 +159,7 @@ export function trafficTick(d: TrafficDeps): TickResult {
           if (target === null) { audit({ host, keep: cur, reason: 'baseline unknown (adopted) and no default — left as is' }); continue; }
           if (cur !== applied) { cardOnce(`restore-hand-${host}`, `${host} slots are ${cur} (changed by hand after our ${applied}) — NOT restoring to ${target}; leave or undo by hand.`); audit({ host, keep: cur, reason: 'hand-changed since our write — not overwritten' }); continue; }
           if (cur === target) continue;
-          if (!set(host, target, cur, `${phase}: ${why}`)) failed = true;
+          if (!set(host, target, cur, `${phase}: ${why}`)) { failed = true; failures.push(`restore ${host} pregateSlots ${cur ?? '?'}→${target} failed`); }
         }
         if (!failed) st.restoredAt = now.toISOString();
         if (phase === 'abort') cardOnce('abort', `window closed without publish (${why}) — slots restored. Check the release graph.`);
@@ -169,19 +171,21 @@ export function trafficTick(d: TrafficDeps): TickResult {
       st.phase = phase;
     }
     writeJson(statePath(d.root, v), st);
-    return { outcome: failed ? 'fail' : 'ok', phase, version: v, changes, cards, why };
+    return { outcome: failed ? 'fail' : 'ok', phase, version: v, changes, cards, why: failed ? `fail: ${failures.join('; ')} · phase ${phase}: ${why}` : why };
   } finally { unlock(); }
 }
 
 // ── live wiring ─────────────────────────────────────────────────────────────
-function elnArgv(): string[] {
-  // ELANOUS_TRAFFIC_ELN = the eln command (test universe: «bun bin/elanous.mjs --config-dir <scratch>»).
-  const raw = (process.env.ELANOUS_TRAFFIC_ELN ?? 'eln').trim();
-  return raw.split(/\s+/);
+export function elnArgv(): string[] {
+  // ELANOUS_TRAFFIC_ELN = the eln command (test universe: «bun bin/elanous.mjs --config-dir <scratch>»). Default: the running
+  // code's own CLI by absolute path — never a bare `eln` (the trigger tick's cron PATH has no eln · cwd is the package dir).
+  const raw = process.env.ELANOUS_TRAFFIC_ELN?.trim();
+  return raw ? raw.split(/\s+/) : elanousCliArgv();
 }
 function eln(args: string[], timeout = 60_000) {
   const [cmd, ...pre] = elnArgv();
-  return spawnSync(cmd!, [...pre, ...args], { encoding: 'utf8', timeout });
+  // env: the live process.env (Bun's spawnSync without it keeps the start-up environ — a stamp set later would not reach the child)
+  return spawnSync(cmd!, [...pre, ...args], { encoding: 'utf8', timeout, env: process.env });
 }
 
 export function trafficOwner(): string {
@@ -203,7 +207,7 @@ export function liveTrafficDeps(input: { live: boolean; root: string; stateRoot:
     hostUp: (host) => spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', host, 'true'], { timeout: 15_000 }).status === 0,
     requestCapacity: (reason) => { const r = eln(['res', 'lease', 'request', '--ram', '64G', '--ttl', '6h', '--requester', 'REL', '--reason', reason], 120_000); return `${r.status === 0 ? 'ok' : 'fail'}: ${String(r.stdout || r.stderr).trim().split('\n')[0] ?? ''}`; },
     // ELANOUS_TRAFFIC_UPDATE_ALL overrides the command (test universe: «true»).
-    updateAll: () => { const [c, ...a] = (process.env.ELANOUS_TRAFFIC_UPDATE_ALL ?? 'els update-all').trim().split(/\s+/); return spawnSync(c!, a, { encoding: 'utf8', timeout: 1_800_000 }).status === 0; },
+    updateAll: () => { const [c, ...a] = (process.env.ELANOUS_TRAFFIC_UPDATE_ALL ?? `${installedBin('els')} update-all`).trim().split(/\s+/); return spawnSync(c!, a, { encoding: 'utf8', timeout: 1_800_000 }).status === 0; },
     card: (body, to) => { eln(['msg', 'post', '--from', 'ORCHESTRATOR', '--to', to, '--kind', 'coord', '--body', body], 30_000); },
     owner: trafficOwner,
   };
@@ -213,14 +217,17 @@ interface Ctx { graphId?: string; runId?: string; input?: { window?: string; sta
 
 export function runTrafficNode(ctx: Ctx, deps?: TrafficDeps): Record<string, unknown> {
   const input = ctx.input ?? {};
-  const stateRoot = input.vars?.stateRoot ?? process.env.ELANOUS_STATE_DIR ?? process.cwd();
+  // the canonical instance root — never process.cwd() (a node runs with cwd = the installed package · #40570 class)
+  const stateRoot = input.vars?.stateRoot ?? process.env.ELANOUS_STATE_DIR ?? effectiveInstanceRoot();
   const seatState = input.vars?.seatState ?? join(process.env.HOME ?? '', 'elanous-hq', 'seat-state');
   const live = input.stage === 'live';
   const root = live ? join(seatState, 'RES', 'graph-state') : (input.shadowDir ?? join(stateRoot, 'loops', 'shadow', 'release-traffic'));
   const r = trafficTick(deps ?? liveTrafficDeps({ live, root, stateRoot, seatState }));
   mkdirSync(join(stateRoot, 'loops'), { recursive: true });
   if (r.outcome !== 'fail') appendFileSync(join(stateRoot, 'loops', 'release-traffic.jsonl'), `${JSON.stringify({ goal: 'met', window: input.window ?? 'manual', live, phase: r.phase, version: r.version, changes: r.changes })}\n`);
-  return { ...r, outcome: r.outcome === 'busy' ? 'ok' : r.outcome, live };
+  // a fail says why AND where it looked (the resolved state root · the CLI it spawned)
+  const why = r.outcome === 'fail' ? `${r.why} · stateRoot ${stateRoot} · eln ${elnArgv().join(' ')}` : r.why;
+  return { ...r, why, outcome: r.outcome === 'busy' ? 'ok' : r.outcome, live, stateRoot };
 }
 
 if (import.meta.main) {

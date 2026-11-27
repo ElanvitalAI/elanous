@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, normalize, resolve } from 'node:path';
 import ts from 'typescript';
 import { exportedDeclarations } from './pr-land-drift-repair.js';
+import { msgPostArgsAsCaller } from '../kit/mail-route/sender.js';
 
 export interface DriftRadarPullRequest {
   number: number;
@@ -340,7 +341,8 @@ export function runTypeDriftRadarAfterLanding(input: { cwd: string; mergeCommit:
       const recipient = map && typeof map === 'object' && author && typeof (map as Record<string, unknown>)[author] === 'string'
         ? (map as Record<string, string>)[author]! : undefined;
       if (!recipient) return false;
-      return run('eln', ['msg', 'post', '--from', 'OPC', '--to', recipient, '--kind', 'report', '--body', body]).status === 0;
+      // KIT mail-route sender — the radar speaks as the seat that runs it (no seat = LAND-GRAPH), never as OPC.
+      return run('eln', msgPostArgsAsCaller({ to: recipient, kind: 'report', body, fallback: 'LAND-GRAPH' })).status === 0;
     },
   });
   if (open.length >= 100) debug.log('pr.land', 'drift-radar-skipped', { reason: 'open-pr-list-truncated', listed: open.length });

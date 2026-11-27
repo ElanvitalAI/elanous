@@ -1,7 +1,8 @@
 import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { saveDirectiveOrigin } from './directive.js';
 import { notifyOutcome, type OutcomeNotifyDeps } from './outcome-notify.js';
 import { readLaunchLedger, saveLaunchLedger, type LaunchEntry } from './launch.js';
@@ -597,4 +598,88 @@ test('a finished run whose PR waits for merge sends the PR link to the wish chat
     expect(sent).toHaveLength(1);
     expect(readLaunchLedger(dir).launches['ELA-1']).toMatchObject({ status: 'merged', reported: true });
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+const installGitCwd = realpathSync(resolve(import.meta.dir, '../..'));
+
+function gitLines(path: string): string[] {
+  return existsSync(path) ? readFileSync(path, 'utf8').split('\n').map(line => line.trim()).filter(Boolean) : [];
+}
+
+test('FINISH-RATE-GH-CWD: localArtifact git worktree list uses resolveDevRepoRoot and skips when the repo is unavailable', () => {
+  const dir = root();
+  const tree = join(dir, 'tree');
+  const repo = join(dir, 'dev-repo');
+  const bin = join(dir, 'bin');
+  const log = join(dir, 'git.log');
+  const argsLog = join(dir, 'git.args');
+  mkdirSync(tree);
+  mkdirSync(repo);
+  mkdirSync(bin);
+  writeFileSync(join(tree, 'report.md'), '# report');
+  const q = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+  const realGit = spawnSync('git', ['--exec-path'], { encoding: 'utf8' }).status === 0
+    ? (Bun.which('git') ?? 'git')
+    : 'git';
+  writeFileSync(join(bin, 'git'), `#!/bin/sh\nif [ "$1" = "-C" ] || [ "$1" = "rev-parse" ]; then\n  exec ${q(realGit)} "$@"\nfi\nprintf '%s\\n' "$PWD" >> ${q(log)}\nprintf '%s\\n' "$*" >> ${q(argsLog)}\nprintf 'worktree %s\\nHEAD abcd\\nbranch refs/heads/harness/report\\n' ${q(tree)}\n`);
+  chmodSync(join(bin, 'git'), 0o755);
+  saveDirectiveOrigin(dir, 'ELA-1', origin);
+  const prevPath = process.env.PATH;
+  process.env.PATH = `${bin}${prevPath ? `:${prevPath}` : ''}`;
+  try {
+    expect(realpathSync(repo)).not.toBe(installGitCwd);
+    const ledger = fixture(dir, entry({ artifactRef: 'report.md', artifactBranch: 'harness/report' }));
+    const files: string[] = [];
+    expect(notifyOutcome(ledger.launches['ELA-1']!, {
+      root: dir, ledger, resolveRepo: () => repo,
+      document: (_to, file) => { files.push(file); return true; },
+      message: () => { throw new Error('expected file from the resolved repo worktree'); },
+    })).toBe('sent');
+    expect(files).toEqual([join(tree, 'report.md')]);
+    expect(gitLines(log).map(cwd => realpathSync(cwd))).toEqual([realpathSync(repo)]);
+    expect(readFileSync(argsLog, 'utf8')).toContain('worktree list --porcelain');
+    expect(gitLines(log).includes(installGitCwd)).toBe(false);
+
+    writeFileSync(log, '');
+    writeFileSync(argsLog, '');
+    const missing = fixture(dir, entry({ artifactRef: 'report.md', artifactBranch: 'harness/report' }));
+    const links: string[] = [];
+    expect(notifyOutcome(missing.launches['ELA-1']!, {
+      root: dir, ledger: missing, resolveRepo: () => null,
+      document: () => { throw new Error('file lookup must be skipped'); },
+      message: (_to, text) => { links.push(text); return true; },
+    })).toBe('sent');
+    expect(gitLines(log)).toEqual([]);
+    expect(links).toEqual(['Requested report · 병합됨 · PR 42 · https://github.com/example/repository/pull/42']);
+
+    const seat = join(dir, 'seat-repo');
+    mkdirSync(seat);
+    const git = (...command: string[]) => {
+      const result = spawnSync(realGit, ['-C', seat, ...command], { encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(`${command.join(' ')}: ${result.stderr || result.stdout}`);
+    };
+    git('init', '-q', '-b', 'main');
+    git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'x (#1)');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    const prevRepo = process.env.ELANOUS_REPO;
+    process.env.ELANOUS_REPO = seat;
+    try {
+      writeFileSync(log, '');
+      writeFileSync(argsLog, '');
+      const resolved = fixture(dir, entry({ artifactRef: 'report.md', artifactBranch: 'harness/report' }));
+      const delivered: string[] = [];
+      expect(notifyOutcome(resolved.launches['ELA-1']!, {
+        root: dir, ledger: resolved,
+        document: (_to, file) => { delivered.push(file); return true; },
+        message: () => { throw new Error('default resolver should still find the worktree'); },
+      })).toBe('sent');
+      expect(delivered).toEqual([join(tree, 'report.md')]);
+      expect(gitLines(log).map(cwd => realpathSync(cwd))).toEqual([realpathSync(seat)]);
+    } finally {
+      if (prevRepo === undefined) delete process.env.ELANOUS_REPO; else process.env.ELANOUS_REPO = prevRepo;
+    }
+  } finally {
+    if (prevPath === undefined) delete process.env.PATH; else process.env.PATH = prevPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

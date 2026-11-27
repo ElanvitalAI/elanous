@@ -1,0 +1,108 @@
+# 판정 집사 (judge-butler) — LOOP-AGENT v3 YAML definition (LOOP-AGENT-V3-SMART · 대표 11-27 12:5x «v3 = 스마트함»).
+# Schema: src/loop-agent/v3/agent-yaml.ts · lint: eln loop agent lint judge-butler
+# This file carries the butler's v3 smartness (reflect · plan · learn-knowhow over its HOLD-narrowing mail). The goal numbers
+# are still READ from goal.yaml (src/judge-butler/cards.ts) — the KPI targets below mirror it and a test keeps them equal,
+# because the body is being changed by other open PRs (#40402 · #40385 · #40410); the full migration follows them.
+apiVersion: elanous/loop-agent@3
+manifest:
+  name: judge-butler
+  version: 1.0.0
+  description: Judge queue butler — signs greens from same-head evidence, keeps the HOLD ledger honest, answers judge-domain hands; learns which receivers never act on its mail.
+  requires:
+    executor: loop-agent@3.1
+    kits: [kpi]
+    node_kinds: [judge-butler.tick, gate, reflect, plan, learn-knowhow]
+    facts: []
+  provides:
+    agent: judge-butler
+    kpis: [greens_per_hour, judge_queue_median_wait, frozen_hands, hand_answer_sla]
+identity:
+  id: judge-butler
+  address: JUDGE-BUTLER
+  rank: sub-coordinator
+  soul: soul.md
+supervisor:
+  duty: veto                        # org duty «veto» → the judge seat (criteria · HOLD changes · security-4)
+goal: Every yellow cell that meets done-when is green; no registered HOLD freezes hands without an owner deciding.
+policies:
+  greens_per_hour_min: 10           # mirrors goal.yaml kpi (the body still reads goal.yaml)
+  judge_queue_median_wait_max_min: 15
+  frozen_hands_max: 0
+  hand_answer_sla_min: 10
+  # v3 smartness (src/loop-agent/v3/smart.ts) — the only numbers reflect · plan · learn read
+  act_grace_min: 30                 # a HOLD-narrowing proposal is «unacted» when, 30 min on, the HOLD is unchanged and the mail not acked
+  lesson_repeat_min: 2              # 2 unacted proposals in a row to the same owner → one lesson
+  reflect_window_min: 60
+  lesson_cap: 12
+  knowhow_promote_min: 2
+  knowhow_cap: 5
+  plan_ambiguity_margin: 0.05
+  unacted_penalty: 0.25
+  plan_llm_per_hour: 4              # LLM judgment node only for a toss-up (voice budget is separate)
+  cost_mail: 0.05
+  cost_escalate_l0: 0.15
+  cost_fold_digest: 0
+kpis:
+  - { name: greens_per_hour, at_least: $policies.greens_per_hour_min, unit: /h }
+  - { name: judge_queue_median_wait, at_most: $policies.judge_queue_median_wait_max_min, unit: min }
+  - { name: frozen_hands, at_most: $policies.frozen_hands_max }
+  - { name: hand_answer_sla, at_most: $policies.hand_answer_sla_min, unit: min }
+never_auto: &never
+  - security-4 paths
+  - criteria change
+  - HOLD create / widen / lift
+soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan (LLM judgment node) and voice load it
+  purpose: 완료 조건을 채운 노랑 칸을 초록으로 서명하고, 주인 없는 HOLD 에 손이 멈추지 않게 한다
+  values:
+    - 증거 없는 초록은 0 — 기준을 낮추지도 필요 이상 올리지도 않는다
+    - 멈춘 손 0 — 범위 없는 HOLD 는 좁히자고 제안한다
+    - 내 권한 밖이면 그렇다고 말하고 바로 올린다
+  do_not: *never
+  voice: 짧고 단정한 한국어 · 증거 id(칸 · PR · 영수 · HOLD · 우편 번호) · 결정 · 주차 · 올림 중 하나로 답한다
+  serves:
+    - "JUD (L0 · veto)"
+    - "HOLD 에 멈춘 손 자리"
+    - "OP (초록 처리량)"
+wake:
+  registered_as: judge-butler
+  trigger:
+    condition:
+      predicate:
+        kind: state-changed
+        parts:
+          - { file: '{seatState}/RES/evidence/PREGATE-GREEN' }
+          - { file: '{stateRoot}/land-graph/ledger.jsonl' }
+          - { file: '{stateRoot}/hold-ledger/events.jsonl' }
+          - { file: '{stateRoot}/release/features.sqlite' }
+          - { file: '{stateRoot}/release/features.sqlite-wal' }
+      cooldown_min: 2
+      max_wait_min: 10
+      on_max_wait: fire
+body:
+  entry_node: tick
+  terminal_nodes: [done, failed]
+  nodes:
+    - { node_id: tick, kind: judge-butler.tick, max_visits: 1 }
+    - { node_id: reflect, kind: reflect, optional: true }        # did the HOLD owner act on my last proposals?
+    - { node_id: plan, kind: plan, optional: true }              # mail the owner · go to the L0 at once · fold into the digest
+    - { node_id: learn, kind: learn-knowhow, optional: true }
+    - { node_id: done, kind: gate }
+    - { node_id: failed, kind: gate }
+  edges:
+    - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }
+actions:                            # for one HOLD-narrowing proposal (security-4 · L0 escalations · ✋ answers are never planned)
+  - { id: mail, channel: mail, target: receiver, serves: [frozen_hands], cost: $policies.cost_mail, default: true }
+  - { id: escalate-l0, channel: mail, target: l0, serves: [frozen_hands], cost: $policies.cost_escalate_l0 }
+  - { id: fold-digest, channel: none, target: none, serves: [], cost: $policies.cost_fold_digest }
+voice:
+  channel: loop:judge-butler
+  speak_on: [kpi-breach]
+  mail: l0-and-receivers
+  per_hour_max: 12
+memory:
+  knowhow: knowhow.md
+budget:
+  llm_turns_per_hour: 16
+levels:
+  start: live
+  values: [live, L1, shadow, off]

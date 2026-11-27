@@ -20,6 +20,8 @@ export interface LoopAgent {
   readonly cron?: string;
   readonly timeZone?: string;
   readonly error?: string | null;
+  /** OUTCOME-DONE-ALARMS: the latest outcome reading (graph_trigger_outcomes) — bad = zero/stale outcome. */
+  readonly outcome?: { readonly summary: string; readonly bad: boolean };
 }
 
 export type LoopTone = 'ok' | 'idle' | 'error';
@@ -27,9 +29,12 @@ export const LOOP_MARK = '↻';
 export const LOOP_GLYPH: Readonly<Record<LoopTone, string>> = { ok: '●', idle: '○', error: '✕' };
 
 /** Green = running or done · red = exception · grey = never fired, stale-skipped, retry wait, retired. */
-export function loopTone(agent: Pick<LoopAgent, 'lastStatus' | 'stage'>): LoopTone {
-  if (agent.lastStatus === 'exception') return 'error';
+export function loopTone(agent: Pick<LoopAgent, 'lastStatus' | 'stage' | 'outcome'>): LoopTone {
+  // A retired (absorbed) loop is grey even when its last fire was an exception — it will never fire again (LOOP-AUDIT-APPLY).
   if (agent.stage === 'retired') return 'idle';
+  if (agent.lastStatus === 'exception') return 'error';
+  // OUTCOME-DONE-ALARMS: «done» with a zero/stale outcome is red too.
+  if (agent.outcome?.bad) return 'error';
   return agent.lastStatus === 'running' || agent.lastStatus === 'dispatched' || agent.lastStatus === 'done' ? 'ok' : 'idle';
 }
 
@@ -337,7 +342,8 @@ export function loopsListLines(space: string, entries: readonly LoopListEntry[],
     const tone = tones[at]!;
     const name = agent.id + ' '.repeat(Math.max(0, nameCells - Bun.stringWidth(agent.id)));
     const spark = sparkline(fireBuckets(entry.fireAtMs, now));
-    const tail = [`${ago(agent.lastAt, now).padStart(3)}`, agent.lastStatus ?? 'never fired', ...(agent.stage !== 'live' ? [agent.stage] : []), loopNext(agent, now) || 'next —'].join(' · ');
+    const tail = [`${ago(agent.lastAt, now).padStart(3)}`, agent.lastStatus ?? 'never fired', ...(agent.outcome ? [`${agent.outcome.bad ? '⚠ ' : ''}${agent.outcome.summary}`] : []),
+      ...(agent.stage !== 'live' ? [agent.stage] : []), loopNext(agent, now) || 'next —'].join(' · ');
     const cursor = at === selected ? '›' : ' ';
     const text = fit(`${cursor} ● ${name} ${spark} ${tail}`);
     if (!colour) { out.push(text); return; }

@@ -11,8 +11,13 @@ loop:
     re-converge when the absorb lease (aws1) or the publish state changes; restore when publish is confirmed OR the
     publishAt + 2h timeout passes. The node converges pregate slots (node-b → 1, aws1 → 5, back to baseline/5 after publish ·
     update-all once), adopts hand-set values, never overwrites a value changed by hand since its write (card instead),
-    writes an audit row + undo per change, single-flight. Owner = REL steward (orgDuty release-supervision when it lands).
-  owner: REL
+    writes an audit row + undo per change, single-flight.
+    Absorbed res-reservation (LOOP-AUDIT-APPLY 11-26 · two writers on one node-b knob off the same release clock): the
+    reservation class (pre-cut · window → publish + 45m · idle) is one more `any` branch, and the `reserve` node after the
+    tick syncs the pregate auto-select reservation (non-release slots on node-b = 1) — one graph, one writer order.
+    Owner = OP (release-supervision: REL absorbed into OP · org map).
+  owner: OP
+  absorbs: [res-reservation]
   trigger:
     condition:
       when:
@@ -25,6 +30,8 @@ loop:
           - { time: { after: 'release.abortedAt + 30m' } }
           - { time: { after: 'release.publishAt + 30m' } }
           - { fact: res.lease.aws1.live, equals: false }
+          # res-reservation's edge: always met, keyed on the reservation class (reserved@version | idle) → one fire per transition.
+          - { kind: res, check: release-phase }
         timeout: { after: 'release.publishAt + 2h', then: abort-restore }
       cooldown_min: 0
   goal:
@@ -43,7 +50,9 @@ entry_node: tick
 terminal_nodes: [done, failed]
 nodes:
   - { node_id: tick, kind: agent, recipe: 'cmd:release-traffic-tick', max_visits: 1 }
+  - { node_id: reserve, kind: agent, recipe: 'cmd:res-reservation-sync', max_visits: 1 }
   - { node_id: done, kind: gate, max_visits: 1 }
   - { node_id: failed, kind: gate, max_visits: 1 }
 edges:
-  - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }
+  - { from: tick, on: outcome, map: { ok: reserve, fail: failed, error: failed } }
+  - { from: reserve, on: outcome, map: { ok: done, fail: failed, error: failed } }

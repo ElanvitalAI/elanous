@@ -29,7 +29,8 @@ export const DEFAULT_LANES: Record<BurstLane, LaneConfig> = {
   review: { min: 0, max: 4, step: 1, cooldownMin: 15, upAt: 1.5, downAt: 0.8, costPerUnitHourUsd: 1 },
   pregate: { min: 0, max: 4, step: 1, cooldownMin: 15, upAt: 1.5, downAt: 0.8, costPerUnitHourUsd: 0 },
   land: { min: 0, max: 3, step: 1, cooldownMin: 15, upAt: 1.5, downAt: 0.8, costPerUnitHourUsd: 0 },
-  judge: { min: 0, max: 3, step: 1, cooldownMin: 15, upAt: 1.5, downAt: 0.8, costPerUnitHourUsd: 1 },
+  // JUD-RELAX (CEO 11-26): JUD keeps the veto only — there is no judge wait lane to scale.
+  judge: { min: 0, max: 0, step: 1, cooldownMin: 15, upAt: 1.5, downAt: 0.8, costPerUnitHourUsd: 1 },
   vm: { min: 0, max: 2, step: 1, cooldownMin: 30, upAt: 2, downAt: 1, costPerUnitHourUsd: 3 },
 };
 
@@ -38,8 +39,8 @@ export interface BurstPreset { name: '2h' | '4h' | '8h'; hours: number; rateGain
 /** Code defaults (rhythm yaml `burst.presets` overrides): rateGain = digestion multiplier the preset is expected to buy. */
 export const DEFAULT_PRESETS: readonly BurstPreset[] = [
   { name: '2h', hours: 2, rateGain: 1.5, budgetUsd: 30, lanes: { hands: 2, remote: 2, ta: 2, review: 1, pregate: 1 } },
-  { name: '4h', hours: 4, rateGain: 2, budgetUsd: 80, lanes: { hands: 4, remote: 4, ta: 4, review: 2, pregate: 2, land: 1, judge: 1 } },
-  { name: '8h', hours: 8, rateGain: 2.5, budgetUsd: 200, lanes: { hands: 8, remote: 6, ta: 6, review: 4, pregate: 4, land: 2, judge: 2 } },
+  { name: '4h', hours: 4, rateGain: 2, budgetUsd: 80, lanes: { hands: 4, remote: 4, ta: 4, review: 2, pregate: 2, land: 1 } },
+  { name: '8h', hours: 8, rateGain: 2.5, budgetUsd: 200, lanes: { hands: 8, remote: 6, ta: 6, review: 4, pregate: 4, land: 2 } },
 ];
 
 export interface BurstConfig { lanes: Record<BurstLane, LaneConfig>; presets: readonly BurstPreset[]; cloudBudgetUsd: number }
@@ -133,7 +134,6 @@ export function pressures(s: PressureSignals): LanePressure[] {
   const backlog = s.readyBacklog !== null && s.hands !== null ? s.readyBacklog / Math.max(1, s.hands * s.readyPerHand) : null;
   const prod = [s.targetGapRatio, backlog].filter((x): x is number => x !== null);
   const production = prod.length ? Math.max(...prod) : null;
-  const judge = [ratio(s.judgeWaitMin, s.judgeWaitTargetMin), s.judgeQueue !== null ? s.judgeQueue / 10 : null].filter((x): x is number => x !== null);
   const scale = (v: number | null) => v === null ? null : Math.round(v * f * 100) / 100;
   const gate = scale(ratio(s.gateWaitMin, s.gateWaitTargetMin));
   return [
@@ -143,7 +143,8 @@ export function pressures(s: PressureSignals): LanePressure[] {
     { lane: 'review', pressure: scale(ratio(s.reviewWaitMin, s.reviewWaitTargetMin)), why: `review wait ${s.reviewWaitMin ?? '?'}m vs ${s.reviewWaitTargetMin}m` },
     { lane: 'pregate', pressure: gate, why: `gate wait ${s.gateWaitMin ?? '?'}m vs ${s.gateWaitTargetMin}m` },
     { lane: 'land', pressure: scale(ratio(s.landQueue, s.landQueueTarget)), why: `land queue ${s.landQueue ?? '?'} vs ${s.landQueueTarget}` },
-    { lane: 'judge', pressure: scale(judge.length ? Math.max(...judge) : null), why: `judge wait ${s.judgeWaitMin ?? '?'}m · queue ${s.judgeQueue ?? '?'}` },
+    // JUD-RELAX (CEO 11-26): landing never waits on a JUD judgement (veto only) — the judge lane carries no pressure.
+    { lane: 'judge', pressure: null, why: 'veto only (JUD-RELAX) — no judge wait lane' },
   ];
 }
 

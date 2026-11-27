@@ -812,11 +812,12 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--cut-at <iso>', '오프셋 포함 컷 시각').option('--land-by <iso>', '오프셋 포함 착지 마감')
     .option('--freeze-from <iso>', '동결 시작').option('--freeze-until <iso>', '동결 종료')
     .option('--publish-at <iso>', '오프셋 포함 발행 시각(실측 컷→발행 중앙값보다 짧으면 경고 · 제안은 schedule show)')
+    .option('--rehearsal-at <iso>', '오프셋 포함 리허설 시각')
     .option('--json', '결과 JSON').option('--hq-override')
-    .action((o: { version: string; cutAt?: string; landBy?: string; freezeFrom?: string; freezeUntil?: string; publishAt?: string; json?: boolean; hqOverride?: boolean }) => {
-      if (o.cutAt === undefined && o.landBy === undefined && o.freezeFrom === undefined && o.freezeUntil === undefined && o.publishAt === undefined) throw new CliUserError('갱신할 시각을 지정하라', '--cut-at <iso> 또는 --land-by <iso> 또는 --publish-at <iso>');
+    .action((o: { version: string; cutAt?: string; landBy?: string; freezeFrom?: string; freezeUntil?: string; publishAt?: string; rehearsalAt?: string; json?: boolean; hqOverride?: boolean }) => {
+      if (o.cutAt === undefined && o.landBy === undefined && o.freezeFrom === undefined && o.freezeUntil === undefined && o.publishAt === undefined && o.rehearsalAt === undefined) throw new CliUserError('갱신할 시각을 지정하라', '--cut-at <iso> 또는 --land-by <iso> 또는 --publish-at <iso> 또는 --rehearsal-at <iso>');
       if (!mayWriteLedger('release schedule set', Boolean(o.hqOverride), scheduleLedgerRoot())) return;
-      const row = setSchedule(o.version, { cutAt: o.cutAt, landBy: o.landBy, freezeFrom: o.freezeFrom, freezeUntil: o.freezeUntil, publishAt: o.publishAt }, process.env.ELANOUS_TRACK || 'cli', scheduleLedgerRoot());
+      const row = setSchedule(o.version, { cutAt: o.cutAt, landBy: o.landBy, freezeFrom: o.freezeFrom, freezeUntil: o.freezeUntil, publishAt: o.publishAt, rehearsalAt: o.rehearsalAt }, process.env.ELANOUS_TRACK || 'cli', scheduleLedgerRoot());
       // A stored publish time shorter than the measured median warns on stderr (one line) — --json stdout stays parseable.
       if (row.publishAt && (o.publishAt !== undefined || o.cutAt !== undefined)) {
         const measure = publishMeasure();
@@ -1144,16 +1145,23 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--accelerator', '가속 등급 부여').option('--no-accelerator', '가속 등급 해제(기본은 없음)')
     .option('--ref <path...>', '근거 문서 더하기 — 저장소 상대 경로[#절] (반복 가능 · 중복 제거)')
     .option('--body <text>', '내용 — 무엇·왜 (빈 문자열이면 지운다)').option('--done <criterion>', '완료 판정식 (빈 문자열이면 지운다)').option('--source <quote>', '출처 — 요청 원문 또는 원 우편 id (빈 문자열이면 지운다)')
-    .action((ids: string[], opts: { body?: string; done?: string; source?: string; ref?: string[]; status?: string; evidence?: string; owner?: string; disposition?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[] | false; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean }, cmd: Command) => {
+    .action(async (ids: string[], opts: { body?: string; done?: string; source?: string; ref?: string[]; status?: string; evidence?: string; owner?: string; disposition?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[] | false; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean }, cmd: Command) => {
       const { version, json } = context(cmd);
       if (opts.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(opts.status)) throw new CliUserError(`잘못된 상태: ${opts.status}`, 'green|yellow|red|done');
       if (opts.disposition !== undefined && !['move', 'known-issue', 'block'].includes(opts.disposition)) throw new CliUserError(`잘못된 처분: ${opts.disposition}`, 'move|known-issue|block');
       if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined && opts.disposition === undefined && opts.kind === undefined && opts.priority === undefined && opts.deadlineVersion === undefined && opts.predecessor === undefined && opts.ceoMinutes === undefined && opts.ceoDate === undefined && opts.accelerator === undefined && opts.ref === undefined && opts.body === undefined && opts.done === undefined && opts.source === undefined) throw new CliUserError('갱신할 칸을 지정하라', '--ref · --body · --done · --source · --status · --evidence · --owner · --disposition · --kind · --priority · --deadline-version · --predecessor · --ceo-minutes · --ceo-date · --accelerator · --no-accelerator 중 하나');
-      if (opts.status === 'green' && !ownerMatches(actor(), 'OP') && !ownerMatches(actor(), 'OPC'))
-        throw new CliUserError('초록 판정은 OP 또는 OPC만 기록할 수 있다 — 판정국에 [GREEN-REQ]를 보내 판정을 요청하라', 'release checklist set <id> --evidence "[GREEN-REQ] …"');
+      // JUD-GREEN-CREDENTIAL: the same writer rule as the light leaf (judges JUD*/REVIEW* ⊕ OP — judging.yaml authority.green_writers);
+      // this path used to allow OP/OPC only, so a judge seat signing through the full entry was refused.
+      const { resolveChecklistWriter } = await import('./release-checklist-set-cli.js');
+      const writer = await resolveChecklistWriter(opts.status);
+      const track = process.env.ELANOUS_TRACK?.trim();
+      const opSeat = !!track && (ownerMatches(track, 'OP') || ownerMatches(track, 'OPC'));
+      if (opts.status === 'green' && !opSeat && !writer.verdict.allowed)
+        throw new CliUserError('초록 판정은 판정자(JUD*·REVIEW*)·OP·OPC만 기록할 수 있다 — 판정국에 [GREEN-REQ]를 보내 판정을 요청하라', 'release checklist set <id> --evidence "[GREEN-REQ] …"');
+      const writerBy = opts.status === 'green' && opSeat ? track! : writer.by;
       if (!mayWrite(cmd)) return;
       const dispatchKind = opts.kind && !['screen', 'postpub'].includes(opts.kind) ? opts.kind as ChecklistDispatchKind : undefined;
-      const data = setItems(version, ids, { ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined && !dispatchKind ? { kind: opts.kind as ChecklistKind } : {}), ...(dispatchKind ? { dispatchKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor === false ? [] : opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}), ...(opts.body !== undefined ? { body: opts.body.trim() ? opts.body : null } : {}), ...(opts.done !== undefined ? { doneCriterion: opts.done.trim() ? opts.done : null } : {}), ...(opts.source !== undefined ? { source: opts.source.trim() ? opts.source : null } : {}) }, process.env.ELANOUS_TRACK || 'cli');
+      const data = setItems(version, ids, { ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined && !dispatchKind ? { kind: opts.kind as ChecklistKind } : {}), ...(dispatchKind ? { dispatchKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor === false ? [] : opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}), ...(opts.body !== undefined ? { body: opts.body.trim() ? opts.body : null } : {}), ...(opts.done !== undefined ? { doneCriterion: opts.done.trim() ? opts.done : null } : {}), ...(opts.source !== undefined ? { source: opts.source.trim() ? opts.source : null } : {}) }, writerBy);
       for (const id of ids) {
         const item = data.items.find((entry) => entry.id === id);
         const why = item?.kind === 'screen' && item.status === 'green' ? parityGap(item.evidence) : null;
@@ -1171,7 +1179,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       if (!mayWrite(cmd)) return;
       try {
         const claimant = process.env.ELANOUS_TRACK ? parseOwner(process.env.ELANOUS_TRACK).seat : 'unknown';
-        assertManualSeatClaimOpenPrOwner(id, claimant, manualSeatClaimDeps);
+        assertManualSeatClaimOpenPrOwner(id, claimant, manualSeatClaimDeps, parseOwner(opts.by).seat);
       }
       catch (error) { throw new CliUserError(error instanceof Error ? error.message : String(error)); }
       const data = claimItem(version, id, opts.by, { force: opts.force, reason: opts.reason, actor: process.env.ELANOUS_TRACK || 'cli' });

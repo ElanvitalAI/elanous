@@ -2,7 +2,7 @@
 name = "diagram-master"
 version = "2.0.0"
 description = "Diagram Master - unified renderer for all diagram engines"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.15"
 dependencies = []
 
 [project.optional-dependencies]

@@ -103,6 +103,8 @@ export interface SeatCarry {
   readonly draft: string;
   readonly queuedPersonLines: readonly string[];
   readonly notices: readonly { readonly text: string; readonly source: string }[];
+  /** FU: in-memory caps (epoch ms of the last act) — e.g. handBlockPullAt (10-min hand-block pull cap). */
+  readonly caps?: Readonly<Record<string, number>>;
   readonly durable: DurableSnapshot;
   readonly durableFiles: Readonly<Record<string, string>>;
 }

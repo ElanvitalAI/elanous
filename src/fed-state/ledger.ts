@@ -9,7 +9,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 
-export const FACT_TYPES = ['land', 'green', 'cell', 'hand', 'judge', 'slot', 'mail', 'turn', 'beat', 'phase', 'steward', 'work'] as const;
+export const FACT_TYPES = ['land', 'green', 'cell', 'hand', 'judge', 'slot', 'mail', 'turn', 'beat', 'phase', 'steward', 'work', 'hold', 'decision'] as const;
 export type FactType = typeof FACT_TYPES[number];
 
 export interface Fact {
@@ -18,7 +18,8 @@ export interface Fact {
   seat?: string;
   cell?: string;
   /** land: pr · cell: claim|block|release|green · hand: idle|busy · mail: post|ack · turn: mail|other ·
-   *  steward: wake|reclaim · work: claimed|empty|block · slot: pregate|land · judge: enqueue|verdict · phase: burst|rhythm */
+   *  steward: wake|reclaim · work: claimed|empty|block · slot: pregate|land · judge: enqueue|verdict · phase: burst|rhythm ·
+   *  cell: assign|veto|reassign (FED-FACT-OP-ACTIONS) · decision: resolve|reject|escalate|raise|propose|decide|record */
   state?: string;
   from?: string;
   to?: string;
@@ -27,6 +28,11 @@ export interface Fact {
   workReady?: boolean;
   ref?: string;
   source?: string;       // writer id (msg-store · checklist · work-next · steward · cli · backfill:<src>)
+  /** FED-FACT-ATTRIBUTION — who decided this state change (the judge, the HOLD writer) · who did the work it closes
+   *  (the cell owner) · who supervises the decider (the L0 seat of a loop agent). `fed eval` 성과 reads these. */
+  decidedBy?: string;
+  doneBy?: string;
+  supervisedBy?: string;
 }
 
 export function fedStatePath(root: string = elanousStateRoot()): string { return join(root, 'fed-state', 'facts.jsonl'); }

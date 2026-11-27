@@ -7,6 +7,8 @@ test('SIM-WAKE-ASSIGN-DEDUPE: shared wake ledger ⊕ live-steward assignment rul
   if (process.env.SIM_OUT) console.log(JSON.stringify({ before, after }));
   // 출처: this device's first measurement (11-25 17:4x) — the literals pin it; a change in either direction is a finding.
   expect(before).toEqual({ h1: 32, h2: 5, wakes: 48, assigns: 6, refused: 0 });
-  // The one H2 left is the P0 push (`--p0`), the exception path by design; its wake is skipped by the ledger.
-  expect(after).toEqual({ h1: 0, h2: 1, wakes: 24, assigns: 1, refused: 5 });
+  // COORD-RIGHTS (CEO 11-27 08:0x · re-measured): the live steward no longer refuses OP — all 6 OP assigns land (refused 0),
+  // audited op-direct. The wake ledger still holds H1 at 0; H2 = 4 (was 1 under the steward refusal, 5 before both rules):
+  // the price of OP control, paid as audited double assigns the steward can veto instead of OP being blocked.
+  expect(after).toEqual({ h1: 0, h2: 4, wakes: 25, assigns: 6, refused: 0 });
 });

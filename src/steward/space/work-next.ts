@@ -15,6 +15,9 @@
 //   A claim outside the home space is a `pool.lend {from: home, to: cellSpace, seat, cell, via: work-next}` row ⊕ the
 //   claim history reason. Maker ≠ judge: JUD-*/REVIEW-* hands claim only judge-space cells and the rest never claim those.
 //   A cell with skill tags is skipped by a hand lacking any of them. No home lock — a closed cell frees the hand.
+// POOL-PULL-NEEDS-SPEC (0.3.38 P1 · OP 11-27 16:30): with `pull.requireDoneWhen` (graphs/policies/seat-assign.yaml) an
+//   unowned cell without a done-when (doneCriterion) is never offered — hands claimed them and asked TC for the KPI
+//   contract (hand blocks 10→34). The ledger row carries `skipped: {needs-spec: [...]}`; the board steward lists them to OP.
 // Two seats racing for one cell: the ledger write is BEGIN IMMEDIATE and the owner swap checks the owner it ranked on
 // (swapOwnerIf); the loser moves to its next candidate. Every call is one row in `<state>/steward/work-next.jsonl`
 // — the 행정관 does not wake a hand that pulled since it went idle.
@@ -70,6 +73,13 @@ export interface WorkNextDeps {
   readonly blockOf?: (cell: BoardCell) => 'blocked' | 'reoffer' | 'reserved' | 'ready' | undefined;
   /** A claimed cell that was parked by `eln work block` — close its block row (resume). */
   readonly resume?: (cell: BoardCell, seat: string) => void;
+  /** PR-DONE: the owner's closing move on its own (waiting) cell — worktree dirty or commits unpushed. null = handed off. */
+  readonly prDone?: (cell: BoardCell) => string | null;
+  /** OP-PULL-HINT: the seat the OP planner hinted this cell to (fresh hints only). The hinted seat gets it first, other
+   *  seats take it only after every unhinted cell — a hint, never a lock. Absent = no hints. */
+  readonly hintOf?: (cell: BoardCell) => string | undefined;
+  /** POOL-PULL-NEEDS-SPEC: policy `pull.requireDoneWhen` — true = unowned cells without a done-when are skipped. Absent = false. */
+  readonly requireDoneWhen?: () => boolean;
 }
 
 export type WorkNextResult =
@@ -114,6 +124,9 @@ export function readyCells(cells: readonly BoardCell[], input: { seat: string; s
       || Date.parse(a.updatedAt) - Date.parse(b.updatedAt) || a.id.localeCompare(b.id));
 }
 
+/** POOL-PULL-NEEDS-SPEC — an unowned cell with no measurable done-when (blank doneCriterion): not offered to hands. */
+export const needsSpec = (c: Pick<BoardCell, 'owner' | 'doneCriterion'>): boolean => unowned(c.owner) && !c.doneCriterion?.trim();
+
 export const cellLine = (c: BoardCell): string => `${c.id} · ${c.title.replace(/\s+/g, ' ').slice(0, 160)} · done-when: ${(c.doneCriterion?.trim() || c.title).replace(/\s+/g, ' ').slice(0, 240)}`;
 
 export function workNext(seatRaw: string, deps: WorkNextDeps, opts: { scope?: string } = {}): WorkNextResult {
@@ -132,15 +145,34 @@ export function workNext(seatRaw: string, deps: WorkNextDeps, opts: { scope?: st
     record({ outcome: 'wip', cell: held.id, ...(mine.length > 1 ? { waiting: mine.filter((c) => waits.get(c.id)).map((c) => `${c.id}:${waits.get(c.id)}`) } : {}) });
     return { code: 4, cell: held, line: `WIP 1 — continue your own cell ${cellLine(held)}` };
   }
+  // PR-DONE: a waiting cell whose PR is not yet handed off (dirty tree · unpushed commits) is closed first.
+  for (const c of mine) {
+    let todo: string | null = null;
+    try { todo = deps.prDone?.(c) ?? null; } catch { todo = null; }
+    if (todo) {
+      record({ outcome: 'pr-done', cell: c.id, todo });
+      return { code: 4, cell: c, line: `PR-DONE — finish your own cell ${cellLine(c)} first: ${todo}; then eln work next` };
+    }
+  }
   const waiting = mine.map((c) => `${c.id}:${waits.get(c.id)}`);
   const isCoordinator = deps.isCoordinator ?? ((s: string) => s === scope);
   // HAND-PULL-ON-BLOCK — a cell blocked on a seat that has not answered is never READY; once it answers, its last holder
   // gets it first (ranked first) and other hands wait out the grace window (cell-block.ts blockState).
   const blockOf = (cell: BoardCell) => { try { return deps.blockOf?.(cell); } catch { return undefined; } };
-  const candidates = poolCandidates(cells, { seat, scope, nowMs, scopeOf: deps.scopeOf, isCoordinator, lastActiveMs: deps.lastActiveMs,
+  const hintOf = (cell: BoardCell) => { try { return deps.hintOf?.(cell)?.trim().toUpperCase() || undefined; } catch { return undefined; } };
+  let requireDoneWhen = false;
+  try { requireDoneWhen = deps.requireDoneWhen?.() === true; } catch { requireDoneWhen = true; }
+  const skippedSpec: string[] = [];
+  const candidates = poolCandidates(cells, { hintedToMe: (cell) => hintOf(cell) === seat, seat, scope, nowMs, scopeOf: deps.scopeOf, isCoordinator, lastActiveMs: deps.lastActiveMs,
     isJudge: deps.isJudge ?? ((s: string) => isJudgeRole(s, { parentOf: deps.scopeOf })), priorityOrder: safeOrder(deps), skills: deps.skillsOf?.(seat) ?? [], ...(deps.waitOf ? { waitOf: deps.waitOf } : {}) })
-    .filter(({ cell }) => { const b = blockOf(cell); return b !== 'blocked' && b !== 'reserved'; });
-  const ordered = [...candidates.filter(({ cell }) => blockOf(cell) === 'reoffer'), ...candidates.filter(({ cell }) => blockOf(cell) !== 'reoffer')];
+    .filter(({ cell }) => { const b = blockOf(cell); return b !== 'blocked' && b !== 'reserved'; })
+    .filter(({ cell }) => { if (!requireDoneWhen || !needsSpec(cell)) return true; skippedSpec.push(cell.id); return false; });
+  const skipped = skippedSpec.length ? { skipped: { 'needs-spec': skippedSpec.slice(0, 20) } } : {};
+  const hintRank = (cell: BoardCell) => { const h = hintOf(cell); return h === seat ? 0 : h ? 2 : 1; };
+  const reoffered = candidates.filter(({ cell }) => blockOf(cell) === 'reoffer');
+  const rest = candidates.filter(({ cell }) => blockOf(cell) !== 'reoffer');
+  // stable: within each hint rank the pool order stands
+  const ordered = [...reoffered, ...[0, 1, 2].flatMap((r) => rest.filter(({ cell }) => hintRank(cell) === r))];
   for (const { cell, space, tier } of ordered) {
     const from = unowned(cell.owner) ? null : cell.owner!;
     const lent = space !== null && space !== scope;
@@ -153,12 +185,13 @@ export function workNext(seatRaw: string, deps: WorkNextDeps, opts: { scope?: st
     if (block) { try { deps.resume?.(cell, seat); } catch { /* the block row only stays open */ } }
     const lend = lent ? { from: scope, to: space!, seat, cell: cell.id, via: 'work-next' as const } : null;
     if (lend) { try { deps.lend?.(lend); } catch { /* observation never blocks a claim */ } }
-    record({ outcome: 'claimed', cell: cell.id, from, tier, leaseUntil: new Date(nowMs + LEASE_MINUTES * MIN).toISOString(), ...(lend ? { event: 'pool.lend', lend } : {}), ...(waiting.length ? { waiting } : {}) });
+    record({ outcome: 'claimed', cell: cell.id, from, tier, leaseUntil: new Date(nowMs + LEASE_MINUTES * MIN).toISOString(), ...(lend ? { event: 'pool.lend', lend } : {}), ...(waiting.length ? { waiting } : {}), ...skipped });
     return { code: 0, cell, from, line: cellLine(cell), ...(lend ? { lentTo: lend.to } : {}), ...(waiting.length ? { waiting } : {}) };
   }
   const breakdown = emptyBreakdown(cells, { seat, candidates: ordered.length, blocked: cells.filter((c) => { const b = blockOf(c); return b === 'blocked' || b === 'reserved'; }).length,
-    waiting: mine.length, judge: (deps.isJudge ?? ((s: string) => isJudgeRole(s, { parentOf: deps.scopeOf })))(seat) });
-  record({ outcome: 'empty', breakdown, ...(waiting.length ? { waiting } : {}) });
+    waiting: mine.length, judge: (deps.isJudge ?? ((s: string) => isJudgeRole(s, { parentOf: deps.scopeOf })))(seat) })
+    + (skippedSpec.length ? ` · needs-spec ${skippedSpec.length} (no done-when — OP sets one)` : '');
+  record({ outcome: 'empty', breakdown, ...(waiting.length ? { waiting } : {}), ...skipped });
   return { code: 3, line: `일감 0 — no READY cell in ${scope} or the pool (${deps.version})`, breakdown };
 }
 
@@ -195,8 +228,9 @@ export interface PoolCandidate { readonly cell: BoardCell; readonly space: strin
 /** Claim order for one hand: pool P0/priority (any space) → home board → other spaces' boards. */
 export function poolCandidates(cells: readonly BoardCell[], input: { seat: string; scope: string; nowMs: number; scopeOf: (seat: string) => string;
   isCoordinator: (seat: string) => boolean; isJudge: (seat: string) => boolean; lastActiveMs: (seat: string) => number | undefined; waitOf?: (cell: BoardCell) => CellWait | null | undefined;
-  priorityOrder: readonly string[]; skills: readonly string[] }): PoolCandidate[] {
+  priorityOrder: readonly string[]; skills: readonly string[]; hintedToMe?: (cell: BoardCell) => boolean }): PoolCandidate[] {
   const judgeHand = input.isJudge(input.seat);
+  const hinted = (c: BoardCell): boolean => { try { return input.hintedToMe?.(c) === true; } catch { return false; } };
   const have = new Set(input.skills.map((s) => s.trim().toLowerCase()));
   const status = new Map(cells.map((c) => [c.id, c.status]));
   const space = (c: BoardCell): string | null => cellSpace(c, input.scopeOf, input.isCoordinator);
@@ -205,11 +239,14 @@ export function poolCandidates(cells: readonly BoardCell[], input: { seat: strin
     .filter((c) => (c.predecessors ?? []).every((p) => { const s = status.get(p); return s === undefined || s === 'green' || s === 'done'; }))
     .filter((c) => !input.waitOf?.(c))
     .filter((c) => (c.skills ?? []).every((t) => have.has(t.trim().toLowerCase())))
-    .filter((c) => judgeHand === (!unowned(c.owner) && input.isJudge(ownerSeat(c.owner))))
+    // OP-PULL-HINT: a cell the OP planner hinted to this hand is claimable by it whoever holds it (the planner picked it as
+    // «nobody on it» — unowned, a coordinator's, or a gone hand's), the way the old direct assign was.
+    .filter((c) => hinted(c) || judgeHand === (!unowned(c.owner) && input.isJudge(ownerSeat(c.owner))))
     .filter((c) => {
       if (unowned(c.owner)) return true;
       const owner = ownerSeat(c.owner);
       if (owner === input.seat) return false;
+      if (hinted(c)) return true;
       if (input.isCoordinator(owner)) return true; // any space's coordinator-held cell is that space's board
       // A hand-owned cell moves only inside its own space, after the lease ran out.
       return input.scopeOf(owner).toUpperCase() === input.scope && boardLeaseUntilMs(c, input.lastActiveMs(owner)) < input.nowMs;

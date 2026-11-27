@@ -1,4 +1,4 @@
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -17,6 +17,80 @@ export function validateStaticExport(candidate: string): void {
   if (readFileSync(index, 'utf8').includes('__next_error__')) {
     throw new Error(`invalid static export: index.html is the Next.js prerender fallback shell (__next_error__) in ${candidate}`);
   }
+}
+
+/** Build marker written into every static export (PWA-RUNTIME-LEAN). An
+ *  installed package compares its `commit` with src/version/packed-revision.json
+ *  to know the packaged PWA is this version's prebuilt output, so `nexus build`
+ *  there needs no apps/pwa/node_modules. Keep the name in sync with
+ *  src/cli/pwa-build.ts PWA_BUILD_MARKER. */
+export const PWA_BUILD_MARKER = 'elanous-pwa-build.json';
+
+/** Commit the build belongs to: the checkout HEAD, or — in an installed
+ *  package without git — the packed revision. Empty when neither is known. */
+export function resolvePwaBuildCommit(appDir: string): string {
+  const repoRoot = resolve(appDir, '../..');
+  // An installed package (packed revision, no .git) names its own commit even
+  // when its prefix happens to sit inside some other git checkout.
+  if (!existsSync(join(repoRoot, '.git'))) {
+    try {
+      const packed = JSON.parse(readFileSync(join(repoRoot, 'src/version/packed-revision.json'), 'utf8')) as { commit?: unknown };
+      if (typeof packed.commit === 'string' && /^[0-9a-f]{40}$/.test(packed.commit)) return packed.commit;
+    } catch { /* no packed revision: not an installed package */ }
+  }
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: appDir, encoding: 'utf8' });
+  const fromGit = head.status === 0 ? head.stdout.trim() : '';
+  return /^[0-9a-f]{40}$/.test(fromGit) ? fromGit : '';
+}
+
+export function writePwaBuildMarker(outDir: string, commit: string, now: Date = new Date()): void {
+  writeFileSync(join(outDir, PWA_BUILD_MARKER), `${JSON.stringify({ commit, builtAt: now.toISOString() })}\n`);
+}
+
+/**
+ * Installer step (PWA-RUNTIME-LEAN): turn the packaged real-directory out
+ * into the `.pwa-generations` symlink layout so later swaps are atomic and no
+ * caller has to move the out aside. Never throws — the real directory stays
+ * served when adoption is not possible. Returns a one-line `pwa.lean` verdict.
+ */
+export function adoptPackagedOut(appDir: string): string {
+  const out = join(resolve(appDir), 'out');
+  try {
+    if (!existsSync(out)) return 'pwa.lean adopt=skip reason=out-missing';
+    if (lstatSync(out).isSymbolicLink()) return 'pwa.lean adopt=skip reason=already-generation';
+    const generation = migrateStoppedOut(out);
+    for (const entry of readdirSync(dirname(out))) {
+      if (entry.startsWith('.out-legacy-')) rmSync(join(dirname(out), entry), { recursive: true, force: true });
+    }
+    return `pwa.lean adopt=generation id=${basename(generation)}`;
+  } catch (error) {
+    const reason = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').slice(0, 200);
+    return `pwa.lean adopt=skip reason=${reason}`;
+  }
+}
+
+/**
+ * Installed package only (PWA-RUNTIME-LEAN fallback): the atomic publisher
+ * refuses a real-directory out, which an install leaves when adoption failed.
+ * After Next has already succeeded, move that directory aside for the
+ * milliseconds of the swap and put it back if publishing fails — the old
+ * rail did `mv out out.pre-rail-*` before a minutes-long build instead.
+ */
+export async function replaceInstalledRealDirOut(appDir: string, publish: () => Promise<unknown>): Promise<void> {
+  const out = join(resolve(appDir), 'out');
+  if (!existsSync(out) || lstatSync(out).isSymbolicLink()) {
+    await publish();
+    return;
+  }
+  const aside = join(resolve(appDir), `.out-pre-lean-${process.pid}-${Date.now()}`);
+  renameSync(out, aside);
+  try {
+    await publish();
+  } catch (error) {
+    if (!existsSync(out)) renameSync(aside, out);
+    throw error;
+  }
+  rmSync(aside, { recursive: true, force: true });
 }
 
 export function resolveNextBuildBin(appDir: string): string {
@@ -171,7 +245,12 @@ export async function runStaticBuild(appDir = resolve(import.meta.dir, '..'), ho
     const appNodeModules = join(appDir, 'node_modules');
     linkRepositoryNodeModules(repoRoot, stagedRepo, appNodeModules);
     if (existsSync(appNodeModules)) symlinkSync(appNodeModules, join(stagedApp, 'node_modules'), 'dir');
-    const buildSha = spawnSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: appDir, encoding: 'utf8' }).stdout.trim();
+    const buildCommit = resolvePwaBuildCommit(appDir);
+    // Keep git's own short form (pwa-formal-update matches it); an installed
+    // package without git uses the packed revision instead of «unknown».
+    const buildSha = existsSync(join(repoRoot, '.git'))
+      ? spawnSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: appDir, encoding: 'utf8' }).stdout?.trim() || buildCommit.slice(0, 10)
+      : buildCommit.slice(0, 10);
     const status = hooks.runBuild
       ? hooks.runBuild(appDir, stagedRepo, stagedApp)
       : spawnSync(process.execPath, [resolveNextBuildBin(appDir), 'build'], {
@@ -180,7 +259,12 @@ export async function runStaticBuild(appDir = resolve(import.meta.dir, '..'), ho
         env: { ...process.env, ...(buildSha ? { ELANOUS_PWA_BUILD_SHA: buildSha } : {}) },
       }).status ?? 1;
     if (status !== 0) throw new Error(`next build failed (${status})`);
-    await publishStaticGeneration(join(stagedApp, 'out'), appDir);
+    if (buildCommit && existsSync(join(stagedApp, 'out'))) writePwaBuildMarker(join(stagedApp, 'out'), buildCommit);
+    if (!existsSync(join(repoRoot, '.git'))) {
+      await replaceInstalledRealDirOut(appDir, () => publishStaticGeneration(join(stagedApp, 'out'), appDir));
+    } else {
+      await publishStaticGeneration(join(stagedApp, 'out'), appDir);
+    }
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
@@ -192,5 +276,7 @@ if (import.meta.main) {
   else if (mode === 'migrate-stopped') {
     const appDir = resolve(import.meta.dir, '..');
     migrateStoppedOut(join(appDir, 'out'));
-  } else throw new Error('usage: static-generation.ts build|migrate-stopped');
+  } else if (mode === 'adopt-packaged') {
+    console.error(adoptPackagedOut(resolve(import.meta.dir, '..')));
+  } else throw new Error('usage: static-generation.ts build|migrate-stopped|adopt-packaged');
 }

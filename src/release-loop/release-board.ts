@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { TickerEvent } from '../tui/widgets/ticker.js';
 import type { BoardStatus, BoardStep, BoardTraffic, ReleaseBoardSnapshot } from '../tui/widgets/scenes/release-board.js';
-import { criticalPath, earliestStart, enterQuickSurgery, runDir, stepsFor, type LedgerRow, type Mode, type PlanOptions, type RunState, type StepDef } from './release-graph-exec.js';
+import { criticalPath, earliestStart, enterQuickSurgery, projectCreatedEvent, runDir, stepsFor, type LedgerRow, type Mode, type PlanOptions, type RunState, type StepDef } from './release-graph-exec.js';
 
 export const GOLDEN_HOSTS = ['mshq', 'minim5', 'node-b', 'publish'] as const;
 export const RELEASE_HOST = 'node-b';
@@ -54,7 +54,8 @@ export function readRun(stateRoot: string, key: string): ReadRun {
       try { ledger.push(JSON.parse(line) as LedgerRow); } catch { /* a torn last line is skipped */ }
     }
   } catch { /* no ledger yet */ }
-  return { ok: true, state, ledger };
+  // Rehearsal instances retain their own ledger semantics; projection is for publish creation only.
+  return { ok: true, state, ledger: /^\d+\.\d+\.\d+$/.test(key) ? projectCreatedEvent(ledger, state) : ledger };
 }
 
 function boardStatus(state: RunState, step: StepDef): BoardStatus {

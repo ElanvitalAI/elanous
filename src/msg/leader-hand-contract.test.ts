@@ -53,7 +53,8 @@ test('tool: a HOLD text is refused even with owner absent; the error lists conti
   catch (e) { message = String(e); }
   expect(message).toContain('continue on top of PR #<n>');
   expect(message).toContain('then proceed in 30 min');
-  expect(message).toContain('new branch from origin/main');
+  expect(message).toContain('uncommitted WIP in the way: ');
+  expect(message).toContain('no reply in 30 min → keep a preservation copy');
   expect(message).toContain('RES/REL are absorbed');
 });
 
@@ -149,4 +150,18 @@ test('leader card: open ✋ table (cause · age · repeat) ⊕ 4 answers ⊕ rul
   expect(card).toContain('seat memory writer-check-2min-rule.md: writer check older than 2 min = stale, proceed');
   expect(card).not.toContain('do not load me');
   store.close();
+});
+
+test('tool: resolving a ✋ that is already resolved is a no-op result (11-26 21:42 OP «dispatch failed: already resolved»)', () => {
+  setSystemTime(new Date(T0));
+  const path = join(root, `m${++n}.db`);
+  const seed = new MsgStore(path); const h = seed.append(hand('TC-H-CC-2', 7)); seed.close();
+  const args = { action: 'resolve', msgId: h.id, text: 'continue on top of PR #40150', owner: 'TC-H-CC-2', deadline: '30m' };
+  const first = dispatchHandRaise(args, { openStore: () => new MsgStore(path), ladder, now: () => T0 });
+  expect(first.mailId).not.toBe(null);
+  const again = dispatchHandRaise(args, { openStore: () => new MsgStore(path), ladder, now: () => T0 + 60_000 });
+  expect(again).toMatchObject({ ok: true, noop: true, mailId: null, output: `✋ #${h.id} is already resolved — nothing sent (no-op). Move on to the next item.` });
+  const s = new MsgStore(path);
+  expect(s.listCreatedBetween('2000-01-01T00:00:00.000Z', '2100-01-01T00:00:00.000Z').filter(m => m.from === 'TC').length).toBe(1);
+  s.close();
 });

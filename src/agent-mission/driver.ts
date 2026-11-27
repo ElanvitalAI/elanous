@@ -30,7 +30,7 @@ import { resolvePtyWebAddress } from '../cli/pty-web-address.js';
 import { verdictForFinalPtyScreen } from '../cli/pty-drive-verdict.js';
 import { reemitPtyUsage } from '../budget/pty-usage-reemit.js';
 import { classifyAuthError } from '../oauth/codex.js';
-import { normalizeFallbackChain, type FallbackStep } from '../oauth/fallback-chain.js';
+import { effectiveFallbackChain, type FallbackStep } from '../oauth/fallback-chain.js';
 import { runPtyControlLoop, controlDepsForHandle, VERIFY_DONE_STOP, type ControlDecision, type ControlObservation, type RunSupervisor } from '../autopilot/pty-control-loop.js';
 import { probeControlStance, stanceBlocksWrite } from '../pty-shell/pty-control-stance.js';
 import { mapControlStance, supervisionObservationFields } from '../self-implement/supervision-vocabulary.js';
@@ -1697,7 +1697,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   if (spec.workdir && spec.chain) throw new Error('workdir 모드는 넘기기 사슬을 쓰지 않는다');
   const llmConfig = getUserConfig().llm;
   const runtimeFallback = deps.runtimeFallback ?? {
-    ...initialRuntimeFallback(backend, normalizeFallbackChain(llmConfig?.fallbackChain, llmConfig?.provider).chain),
+    ...initialRuntimeFallback(backend, effectiveFallbackChain(llmConfig?.fallbackChain, llmConfig?.provider).chain),
     fallbackEligible: spec.agent === undefined && !spec.chain,
   };
   const spawnPty = deps.startPty ?? startPty;

@@ -324,6 +324,8 @@ export async function installLaunchd(opts: LaunchdOpts = {}): Promise<InstallOut
       plistPath: env.plistPath,
     };
   }
+  // WORLD-REGISTRY: an elanous installer registers what it bootstrapped (fail-open — never fails the install).
+  try { (require('../../resource-ledger/world-register.js') as typeof import('../../resource-ledger/world-register.js')).registerLaunchdQuietly({ label: LAUNCHD_LABEL, plist: env.plistPath, purpose: 'nexus daemon', owner: 'TC' }); } catch { /* fail-open */ }
   return { outcome: 'installed', plistPath: env.plistPath, bootstrapped: true, env, ...(notice ? { auxiliaryAiEnvNotice: notice } : {}), ...(keyCache ? { keyCache } : {}) };
 }
 

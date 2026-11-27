@@ -1,0 +1,124 @@
+# 감시자의 감시 (watchers-check) — LOOP-AGENT v3 YAML definition (YAML-SUPERVISORS-DEF · 대표 11-27 12:0x «감독자들도 다 로직·정책 등을 yaml 로»).
+# Schema: src/loop-agent/v3/agent-yaml.ts · executor: src/loop-agent/v3/supervisor.ts · lint: eln loop agent lint watchers-check
+# Tiers: ① rules / thresholds / routing = this file (policies · body edges) · ② deterministic logic = the node kinds it requires
+# (provides.nodes · their tests and the supervisors sim world are the spec) · ③ fuzzy judgment = the voice block (one LLM turn when spoken to · role router · facts-only fold).
+# The ONE definition (YAML-SUPERVISORS-RUNTIME): the trigger registry reads wake: from here (graphs/triggers/<registered_as>.yaml is only the tick shim) and goal.yaml is GENERATED from this file (eln loop agent gen) — only the fallback when this file is refused.
+apiVersion: elanous/loop-agent@3
+manifest:
+  name: watchers-check
+  version: 1.0.0
+  description: "기대 감독자 heartbeat 결손 0 (MISSING · DEAD · BROKEN · BLIND)"
+  requires:
+    executor: loop-agent@3
+    kits: [kpi]
+    node_kinds: [watchers-check.observe, loop-agent.act, loop-agent.learn, loop-agent.judge, loop-agent.finish, gate, reflect, plan, learn-knowhow, retro]
+    facts: []
+  provides:
+    agent: watchers-check
+    kpis: [missing_heartbeats]
+    nodes: [watchers-check.observe]   # tier ② — src/loop-agent/bodies/watchers-check.ts (+ its tests · sim world supervisors)
+identity:
+  id: watchers-check
+  address: WATCHERS-CHECK
+  rank: supervisor
+  soul: soul.md
+supervisor:
+  duty: escalation-parent
+# v2 card fields that live only here — graphs/loop-agents/watchers-check/goal.yaml is GENERATED from this file (eln loop agent gen watchers-check)
+card:
+  name: 감시자의 감시
+  role: &purpose 살아 있어야 할 감독자 전부의 heartbeat 를 보고, 죽은 감독자는 트리거를 한 번 쏴서 깨우고, 깨워도 안 돌아오면 OP 에 올린다
+  temperament: &voice 짧고 단정하다 · 이름과 마지막 beat 나이로 말한다 · 조용한 실패를 싫어한다
+  values: &values
+    - heartbeat 가 없으면 살아 있다고 보지 않는다
+    - 카드가 있는 감독자는 전부 본다 — 한 번도 beat 가 없으면 결손이다
+    - 깨우기는 한 번 · 반복되면 주인이 원인을 본다
+  subject: 감독자 heartbeat 전부 — beats 원장(eln watch beat) 의 모든 v2 카드 loop:<id> · trigger-tick · res-patrol · release-graph-tick · 24시간 안에 살아 있던 감시자
+  actions:
+    - restart
+  wake_events:
+    - 5분마다 (cron */5)
+  voice_role: coordinator
+  fallback_seat: OP
+goal: "기대 감독자 heartbeat 결손 0 (MISSING · DEAD · BROKEN · BLIND)"
+policies:   # tier ① — the only numbers (the body reads them through pv() · change behaviour here, not in code)
+  missing_heartbeats_max: 0
+  max_per_tick: 5
+  cooldown_min: 30
+  escalate_after_min: 30
+  heartbeat_every_min: 5
+  subject_lost_ticks: 3   # unreadable subject this many ticks → reattach proposal to the L0
+  recent_min: 1440   # 이 안에 살아 있다가 나빠진 감시자도 셈
+  # v3 smartness (LOOP-AGENT-V3-SMART-2 · src/loop-agent/v3/smart.ts) — reflect · plan · learn-knowhow · retro read only these
+  act_grace_min: 0   # an action's outcome is known when it returns (acted | failed) — no waiting
+  lesson_repeat_min: 3   # the same action failing 3× in a row on one kind of subject → ONE lesson with the cause
+  reflect_window_min: 60
+  lesson_cap: 12   # active lessons kept (oldest evicted)
+  knowhow_promote_min: 1   # the lesson becomes one knowhow line at once (marker-deduped · plan reads it next tick)
+  knowhow_cap: 5   # learned knowhow lines per agent, total
+  plan_ambiguity_margin: 0   # the shell plan is deterministic (body plan ⊕ knowhow ⊕ fallback)
+  unacted_penalty: 0.25
+  plan_llm_per_hour: 0
+  retro_every_h: 6   # retro (회고): journal ⊕ KPI window → what worked · what failed and why · one change to try
+  cost_act: 0
+kpis:
+  - { name: missing_heartbeats, at_most: $policies.missing_heartbeats_max, unit: "watchers" }
+done_when:
+  - "missing_heartbeats == 0 한 틱"
+  - "모든 v2 카드가 loop:<id> beat 를 남김"
+never_auto: &never
+  - "감독자 코드·카드 고치기 (주인 몫)"
+  - "감독자 수준(level) 바꾸기"
+  - "프로세스 kill · launchd 재적재"
+  - "같은 감독자 30분 안에 두 번 깨우기"
+soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan and voice load it · aliases = one definition with the card
+  purpose: *purpose
+  values: *values
+  do_not: *never
+  voice: *voice
+  serves:
+    - "OP (L0)"
+    - "heartbeat 로 사는 감독자들"
+wake:
+  registered_as: watchers-check-agent
+  trigger:
+    condition:
+      predicate: {"kind":"state-changed","parts":[{"file":"{stateRoot}/watchers/beats.jsonl"}]}
+      cooldown_min: 2
+      max_wait_min: 5
+      on_max_wait: fire
+  failure: { goal_deadline_min: 5, max_attempts: 2, backoff_sec: [60] }   # the registry's goal deadline · attempts · backoff (was graphs/triggers/watchers-check-agent.yaml)
+body:   # tier ① routing — observe outcome → steps (ok · breach · unknown → act; off · error → finish)
+  entry_node: observe
+  terminal_nodes: [done]
+  nodes:
+    - { node_id: observe, kind: watchers-check.observe, max_visits: 1 }
+    - { node_id: act, kind: loop-agent.act, max_visits: 1 }
+    - { node_id: learn, kind: loop-agent.learn, max_visits: 1 }
+    - { node_id: judge, kind: loop-agent.judge, max_visits: 1 }
+    - { node_id: finish, kind: loop-agent.finish, max_visits: 1 }
+    - { node_id: done, kind: gate }
+    - { node_id: reflect, kind: reflect, optional: true }        # v3: did my actions work? same failure N× → a pattern with its cause
+    - { node_id: plan, kind: plan, optional: true }              # v3: the body plan ⊕ learned knowhow → fallback · soul do_not · cited memory
+    - { node_id: learn-knowhow, kind: learn-knowhow, optional: true } # v3: one lesson → one knowhow line
+    - { node_id: retro, kind: retro, optional: true }            # v3: every retro_every_h → retro entry in memory (the voice quotes it)
+  edges:
+    - { from: observe, on: outcome, map: { ok: act, breach: act, unknown: act, off: finish, error: finish } }
+    - { from: act, on: outcome, map: { ok: learn } }
+    - { from: learn, on: outcome, map: { ok: judge } }
+    - { from: judge, on: outcome, map: { ok: finish } }
+    - { from: finish, on: outcome, map: { ok: done } }
+actions:   # v3 plan (LOOP-AGENT-V3-SMART-2): the card rights as plan choices · fallback = what the plan runs once a knowhow line says the action keeps failing
+  - { id: restart, channel: self, target: self, serves: [missing_heartbeats], cost: $policies.cost_act, default: true }
+voice:   # tier ③ — one LLM turn only when spoken to (role router · coordinator) · facts-only fold over budget
+  channel: loop:watchers-check
+  speak_on: [kpi-breach, kpi-recovered, subject-lost]
+  mail: l0-only
+  per_hour_max: 6
+memory:
+  knowhow: knowhow.md
+budget:
+  llm_turns_per_hour: 6
+levels:
+  start: live
+  values: [live, L1, shadow, off]

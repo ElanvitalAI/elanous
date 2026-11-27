@@ -1,6 +1,7 @@
 // Runs each seat-mail scenario in its own universe and judges it against expect.json with the kernel's verdict rule.
 // The kernel CLI (`sim world run`) is #38487; until it lands this test is the runner. An xfail keeps the test green
 // only while the observed red reason equals the row's literal redReason.
+// MR13–MR16 (0.3.38 HAND-RAISE-DOMAIN-ROUTING · DORMANT-SEAT-ROUTE) run here too: POOL-1↔TC echo in one hop · dormant → OP card · domain owners · 2130 window replay (fixtures/hands-2130.json · live Jev answers · plan-limit = auto-continue).
 import { afterEach, expect, setDefaultTimeout, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';

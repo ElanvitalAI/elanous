@@ -12,6 +12,7 @@
  * 'seat-idle:S' | 'file-exists:P' | 'mail-from:S'`) and add the minimum the migrated graphs and the release graph need.
  * Probes are injected (sims use fakes); defaults read gh · checklist · els · the filesystem · npm.
  */
+import { spawnSync as spawnGit } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { liveFacts, parseTimeExpr, resolveTime, type Facts } from './trigger-facts.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
@@ -84,6 +85,7 @@ export interface ConditionProbes {
   cells(): Promise<Array<{ id: string; status: string; owner?: string | null }>>;
   /** Seats whose every pane is idle, with the idle-since time when the journal knows it. */
   idleSeats(): Promise<Array<{ seat: string; sinceMs: number | null }>>;
+  /** Commits on origin/main of the dev repo. Throws when it cannot be counted — never resolves 0 for «unmeasured». */
   landedCount(): Promise<number>;
   handsUpCount(): Promise<number>;
   publishedVersions(): Promise<string[]>;
@@ -426,10 +428,12 @@ export function defaultConditionProbes(): ConditionProbes {
       return [...bySeat].filter(([, v]) => v.idle).map(([seat, v]) => ({ seat, sinceMs: v.sinceMs }));
     },
     async landedCount() {
-      const { spawnSync } = await import('node:child_process');
-      const { repoRoot } = await import('../domains/schedule-registry.js');
-      const out = spawnSync('git', ['-C', repoRoot(), 'rev-list', '--count', 'origin/main'], { encoding: 'utf8' });
-      return Number(out.stdout.trim()) || 0;
+      const { resolveDevRepoRoot } = await import('./throughput-controller-live.js');
+      const repo = resolveDevRepoRoot();
+      const n = countOriginMain(repo);
+      // Unmeasured throws (the caller's settle → null → «측정 실패»); a failed count is never 0.
+      if (n === null) throw new Error(repo ? `git rev-list --count origin/main failed in ${repo}` : 'no git repo with origin/main (ELANOUS_REPO · repo.path · ~/elanous-hq/repo.git)');
+      return n;
     },
     async handsUpCount() {
       // ✋ proxy: OP's unread mail count (hands raised to the coordinator land there first).
@@ -456,4 +460,25 @@ export function defaultConditionProbes(): ConditionProbes {
       try { return (JSON.parse(readFileSync(`${root}/package.json`, 'utf8')) as { version?: string }).version ?? null; } catch { return null; }
     },
   };
+}
+
+// OP-OBSERVE-LANDED (11-27 22:39 live): on an install `repoRoot()` is the package dir — not a git repo — so `git rev-list`
+// printed nothing and `Number('') || 0` told OP «main 총 0» while 8 PRs had landed that hour. The count now reads the dev
+// repo (resolveDevRepoRoot) and every failure is null: no repo · git non-zero · empty/non-numeric output · a zero count
+// (origin/main always has commits, so 0 is a broken read, not a fact).
+export function countOriginMain(
+  repo: string | null,
+  run: (args: string[]) => { status: number | null; stdout: string } = (args) => {
+    const r = spawnGit('git', args, { encoding: 'utf8', timeout: 15_000 });
+    return { status: r.status, stdout: String(r.stdout ?? '') };
+  },
+): number | null {
+  if (!repo) return null;
+  let out: { status: number | null; stdout: string };
+  try { out = run(['-C', repo, 'rev-list', '--count', 'origin/main']); } catch { return null; }
+  if (out.status !== 0) return null;
+  const text = out.stdout.trim();
+  if (!/^\d+$/u.test(text)) return null;
+  const n = Number(text);
+  return n > 0 ? n : null;
 }

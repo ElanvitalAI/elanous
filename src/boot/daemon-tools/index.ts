@@ -71,6 +71,8 @@ import {
 // run with.
 import { buildBashTool, dispatchBash } from '../../skills/tools/index.js';
 import { buildDelegateAgentTool, dispatchDelegateAgent } from './delegate-agent.js';
+// ELN-PERSISTENCE-LADDER ④(§⑫ OP orders ELN-UNIVERSAL-AGENT-1124 · OP #144681) — 위임 실패 직접 1회 우회.
+import { delegateErrorProbe, withDirectFallback } from './delegate-fallback.js';
 // self-build(2026-07-20) — ACP/데몬 서피스에 SelfImplement 노출(acpx·codex 등 외부 에이전트가 elanous
 // self-implement 를 goal-loop+앵커+gate 로 구동). CLI/내부 툴과 같은 코어. PR-open 은 fail-closed.
 import {
@@ -408,7 +410,27 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
         debug.log('substrate.nest', 'spawn-refused', { tool: name, ...nestInfo() }, { level: 'warn' });
         return { error: `nest-cap: 재귀 상한(${nestInfo().max}중) 도달 — delegate_code_agent 비활성(액자 폭주 방지)` };
       }
-      return dispatchDelegateAgent(args, ctx);
+      // 빈 task 는 호출 계약 위반 — «같은 일»이 없으므로 우회 없이 {error} 원문 그대로.
+      if (typeof args.task !== 'string' || !args.task.trim()) {
+        return dispatchDelegateAgent(args as Parameters<typeof dispatchDelegateAgent>[0], ctx);
+      }
+      // ELN-PERSISTENCE-LADDER ④(§⑫) — 위임 실패({error})를 문면 하나로 넘기지 않고 같은 일을
+      // SelfImplement 로 직접 1회 우회(지문 단위 1회 표시 · 중복 부작용 방지)한 뒤
+      // 직접 결과를 주 결과로, 위임 원본 {error} 를 delegateFallback 필드로 함께 보고한다.
+      const report = await withDirectFallback(
+        args,
+        (a) => dispatchDelegateAgent(a as Parameters<typeof dispatchDelegateAgent>[0], ctx),
+        (a) => dispatchSelfImplementManaged(
+          { feature: String(a.task ?? ''), ...(typeof a.cwd === 'string' && a.cwd ? { cwd: a.cwd } : {}) },
+          ctx,
+        ),
+        delegateErrorProbe,
+        { fingerprint: (a) => `${String(a.backend ?? '')}:${String(a.task ?? '')}`, logCategory: 'substrate.delegate-fallback' },
+      );
+      if (!report.bypassed) return report.result;
+      return report.result !== null && typeof report.result === 'object'
+        ? { ...(report.result as Record<string, unknown>), delegateFallback: { reason: report.bypassReason, delegateResult: report.delegateResult } }
+        : report.result;
     }
     const acpRuntime = ACP_SESSION_RUNTIMES.find((runtime) => runtime.spec.name === name);
     if (acpRuntime) {

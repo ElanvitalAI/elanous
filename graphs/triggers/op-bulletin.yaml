@@ -5,9 +5,12 @@ loop:
   root: 조율자
   managed_by: trigger-registry
   description: >-
-    Condition-driven federal bulletin: wake OP when landed count, idle seats, or raised hands changed since the last
-    bulletin (at most every 15 min), or after 30 min regardless. Done-when = seat-state/OPS/BULLETIN-NOW.md is
-    rewritten after the wake. Shadow until two goal-verified fires, then the legacy watchdog bulletin branch is off.
+    Condition-driven federal bulletin: fires when landed count, idle seats, or raised hands changed since the last
+    bulletin (at most every 15 min), or after 30 min regardless. The graph writes the bulletin itself (no LLM): the facts
+    go to seat-state/OPS/BULLETIN-NOW.md (the previous one is appended to the day's BULLETIN-LOG), a kind-bulletin mail
+    goes to every coordinator (no expiry · read on the receiver's next idle), and ONE internal OP turn (retro-turn
+    ledger · not a wake) asks only for the two judgement lines. Done-when = BULLETIN-NOW.md rewritten in the window —
+    met by the graph (11-26: the old OP→OP wake became a self-wake under anti-flood F and the file went stale at 07:09).
   owner: OP
   trigger:
     condition:
@@ -26,19 +29,20 @@ loop:
     kind: marker
     path: '{seatState}/OP/tools/.graph-cutover/op-bulletin'
   cutover_after: 2
-entry_node: wake
+entry_node: write
 terminal_nodes: [done, failed]
 nodes:
-  - node_id: wake
+  - node_id: write
     kind: agent
-    recipe: 'cmd:trigger-wake'
+    recipe: 'cmd:trigger-bulletin-write'
     max_visits: 1
     input:
+      # Facts only (bulletin-write.ts); OP adds «병목 판단 1줄 + 다음 지시 1줄» in ONE internal turn.
+      # Recipients: omitted → every space leader under HQ in the org map (eln org show).
       from: OP
-      to: OP
-      kind: request
-      body: '[graph 깨움 · 연방 공보] OPS-RULES §연방 공보 7칸 양식으로: 지난 30분 입력(카드·스페이스 카드·긴급·착지·초록·els 상태) 종합 → ⓪ 지난 공보 효과 → 병목 1개 → 국면 조정 → 정책·자원·스페이스별 지시. seat-state/OPS/BULLETIN-NOW.md 덮어쓰기(이전 것은 BULLETIN-LOG 에 덧붙임) + 서브 조율자 6(JUD TC UX REL RES MVP-B)에 --kind bulletin.'
+      file: '{seatState}/OPS/BULLETIN-NOW.md'
+      log: '{seatState}/OPS/BULLETIN-LOG-{date}.md'
   - { node_id: done, kind: gate, max_visits: 1 }
   - { node_id: failed, kind: gate, max_visits: 1 }
 edges:
-  - { from: wake, on: outcome, map: { ok: done, fail: failed, error: failed } }
+  - { from: write, on: outcome, map: { ok: done, fail: failed, error: failed } }

@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assessTddBaseHeadTest, judgeTddEvidence, tddPlanFromGoal, parseOffDiffEvidence, receiveObservedTddRed, receiveObservedTddGreen, runTddBaseHeadTest, structuralMissingExport } from './off-diff-evidence.js';
+import { assessTddBaseHeadTest, judgeTddEvidence, tddPlanFromGoal, parseOffDiffEvidence, receiveObservedTddRed, receiveObservedTddGreen, runTddBaseHeadTest, runTddBaseHeadTestWithMainBase, structuralMissingExport } from './off-diff-evidence.js';
 import { classifyAbandonedRun } from './abandoned-classification.js';
 import { ensureDeviceFirstSteps } from './device-first.js';
 
@@ -452,4 +452,53 @@ test('미실행 TDD base 시험은 생략 이유를 관측하고 구현 실패�
   expect(source).toContain("? 'impl-not-ok'");
   expect(source).toContain('implementationFailure: input.implementation.summary.slice(0, 240)');
   expect(source).toContain('terminationReason: implementationStop ||');
+});
+
+test('TDD-RED-MAIN-BASE: a relaunch whose base is the previous head re-measures RED at the origin/main merge-base', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'tdd-main-base-'));
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
+  const goal = ['## 검증 계획 (TDD)', '- ③ 먼저 쓸 시험(RED): bun test src/value.test.ts', '- ④ GREEN 뒤 같은 명령: bun test src/value.test.ts'].join('\n');
+  try {
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    mkdirSync(join(repo, 'node_modules'));
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'tdd-main-base', type: 'module' }));
+    writeFileSync(join(repo, 'bun.lock'), 'fixture-lock\n');
+    writeFileSync(join(repo, 'src', 'value.ts'), "export const value = 'old';\n");
+    git('init', '-b', 'main');
+    git('config', 'user.email', 'fixture@example.invalid');
+    git('config', 'user.name', 'TDD fixture');
+    git('add', 'package.json', 'bun.lock', 'src/value.ts');
+    git('commit', '-m', 'main');
+    const mainSha = git('rev-parse', 'HEAD');
+    git('update-ref', 'refs/remotes/origin/main', mainSha);
+    // the previous run of this goal: fix + test committed (the relaunch starts here)
+    writeFileSync(join(repo, 'src', 'value.ts'), "export const value = 'fixed';\n");
+    writeFileSync(join(repo, 'src', 'value.test.ts'), "import { expect, test } from 'bun:test';\nimport { value } from './value';\ntest('fixed', () => expect(value).toBe('fixed'));\n");
+    git('add', 'src/value.ts', 'src/value.test.ts');
+    git('commit', '-m', 'previous run head');
+    const previousHead = git('rev-parse', 'HEAD');
+    // the relaunch only touches the test (rework) — at the previous head the test is already green
+    writeFileSync(join(repo, 'src', 'value.test.ts'), "import { expect, test } from 'bun:test';\nimport { value } from './value';\ntest('fixed (rework)', () => expect(value).toBe('fixed'));\n");
+
+    expect(runTddBaseHeadTest({ cwd: repo, baseSha: previousHead, goal })).toMatchObject({ accepted: false, reason: 'base-test-did-not-prove-red' });
+    const result = runTddBaseHeadTestWithMainBase({ cwd: repo, baseSha: previousHead, goal });
+    expect(result).toMatchObject({ accepted: true, reason: 'base-red-head-green', baseSha: mainSha, baseSource: 'main-merge-base', baseResult: '0 pass · 1 fail', headResult: '1 pass · 0 fail' });
+
+    // a relaunch that leaves the test untouched: «no changed test since base» also falls back to main
+    git('checkout', '--', 'src/value.test.ts');
+    expect(runTddBaseHeadTestWithMainBase({ cwd: repo, baseSha: previousHead, goal })).toMatchObject({ accepted: true, baseSource: 'main-merge-base' });
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('TDD-RED-MAIN-BASE: other refusals and an unreadable main merge-base keep the immediate-base result', () => {
+  const calls: string[] = [];
+  const run = (input: { baseSha: string }) => { calls.push(input.baseSha); return { accepted: false, reason: 'planned-command-not-safe-bun-test', command: 'x' }; };
+  expect(runTddBaseHeadTestWithMainBase({ cwd: '/nowhere', baseSha: 'b1', goal: '', run, mainBase: () => 'm1' })).toMatchObject({ accepted: false, baseSha: 'b1', baseSource: 'resolved-base' });
+  expect(calls).toEqual(['b1']);
+  const green = (input: { baseSha: string }) => { calls.push(input.baseSha); return { accepted: false, reason: 'base-test-did-not-prove-red', command: 'bun test src/a.test.ts' }; };
+  expect(runTddBaseHeadTestWithMainBase({ cwd: '/nowhere', baseSha: 'b2', goal: '', run: green, mainBase: () => undefined })).toMatchObject({ reason: 'base-test-did-not-prove-red', baseSource: 'resolved-base' });
+  expect(runTddBaseHeadTestWithMainBase({ cwd: '/nowhere', baseSha: 'b3', goal: '', run: green, mainBase: () => 'b3' })).toMatchObject({ baseSource: 'resolved-base' });
+  expect(calls).toEqual(['b1', 'b2', 'b3']);
 });

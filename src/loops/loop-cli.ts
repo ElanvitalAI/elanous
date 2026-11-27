@@ -32,6 +32,8 @@ function allLoopTable(entries: AllLoopEntry[]): void {
 
 export function registerLoopCommands(program: Command, checkerDeps: RegistryAdapterDeps & { root?: string; registryOptions?: LoopRegistryOptions } = {}): void {
   const loop = program.command('loop').description('Inspect and control graph-backed loop agents');
+  // LOOP-AGENT v2 generic shell (대표 11-27 «감독자들을 루프 에이전트 v2 로»): eln loop agent list | <id> card|status|tick|voice|memory|knowhow|lesson.
+  (require('../loop-agent/cli.js') as typeof import('../loop-agent/cli.js')).registerAgentCommands(loop);
   loop.command('list').option('--all', 'Show the full loop registry').option('--json', 'Print JSON')
     .action((opts: { all?: boolean; json?: boolean }) => handle(async () => {
       if (!opts.all) { await output(listLoops(checkerDeps.registryOptions), !!opts.json); return; }
@@ -118,4 +120,8 @@ export function registerLoopCommands(program: Command, checkerDeps: RegistryAdap
       if (!result.ok) process.exitCode = 1;
     }));
   registerTriggerCommands(loop);
+  // 판정 집사 (JUD-BUTLER · 0.3.38) — first loop agent v2.
+  (require('../judge-butler/butler-cli.js') as typeof import('../judge-butler/butler-cli.js')).registerButlerCommands(loop);
+  // 수호자 (guardian · 0.3.38) — second loop agent v2.
+  (require('../guardian-agent/guardian-cli.js') as typeof import('../guardian-agent/guardian-cli.js')).registerGuardianCommands(loop);
 }

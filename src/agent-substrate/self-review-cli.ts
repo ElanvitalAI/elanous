@@ -26,7 +26,6 @@ import { buildReviewObservation, reviewIntentFingerprint, safeLogText } from './
 import { checkCitedReviewPathsAtHead, citedReviewPaths, reviewFindingKey } from './review-finding-key.js';
 import { assessReviewRoundDesignTrigger } from './review-round-design-trigger.js';
 import { DEFAULT_REVIEW_BACKEND, defaultAcpReviewTimeoutSec } from './acp-reviewer.js';
-import { ZAI_OPENROUTER_FALLBACK_MODEL } from '../llm/zai-coding-plan.js';
 import { assessReviewEngineValidity } from './review-engine-validity.js';
 import { debug } from '../debug/log.js';
 import { ACP_BACKENDS, canonicalizeBackendId } from '../acp/backend-registry.js';
@@ -40,11 +39,14 @@ import type { LLMProviderName, ReviewerMixSpec, RoleLlmSpec, SubscriptionReviewe
 import { loadLlmPolicy } from '../policy/llm-policy.js';
 import { listRunLedgers, lookupPrGoalAcceptance, lookupRunLedger, type PrGoalAcceptanceLookup, type RunLedgerEntry, type RunLedgerLookup } from '../self-implement/run-ledger.js';
 import { decideReviewCapPolicy, REVIEW_CAP_R5_LIMIT, REVIEW_CAP_RELEASE_PATHS, reviewCapIncidentId } from './review-cap-policy.js';
-import { NEEDS_CLEAN_BRANCH_DELTA_REFUSALS, needsCleanBranchOutcome } from './review-runner-guard.js';
+import { NEEDS_CLEAN_BRANCH_DELTA_REFUSALS } from './review-runner-guard.js';
+import { gitAt, type GitRun } from '../git-fs/smart-run.js';
+import { deltaSince, SHA40 } from '../git-smart/delta.js';
 
 /** SUBSCRIPTION-EXHAUST-REROUTE — API reviewer when the configured `roleLlm.reviewer` lane is unavailable (off codex). */
 export const ROLE_REVIEWER_FALLBACK_MODEL = 'openrouter/z-ai/glm-5.3';
-export const DEFAULT_REVIEWER_MIX: ReviewerMixSpec = { sol: 1, claude: 1, glm: 1 };
+// GLM is prohibited for reviews; do not schedule it in the default mix.
+export const DEFAULT_REVIEWER_MIX: ReviewerMixSpec = { sol: 1, claude: 1, glm: 0 };
 type ReviewLane = keyof ReviewerMixSpec;
 const REVIEW_LANES: readonly ReviewLane[] = ['sol', 'claude', 'glm'];
 
@@ -126,6 +128,8 @@ export interface SelfReviewCliDeps {
   requestClassification?: typeof requestSecurityClassification;
   /** Explicit repository root for exact-head cited-path checks; absent means unmeasured. */
   reviewRepositoryPath?: string;
+  /** SMART-MERGE ① range-diff runner (tests); default = git in `reviewRepositoryPath` (absent → no range-diff). */
+  reviewGitRun?: GitRun;
   /** `gh` 호출. 실패도 예외 없이 `{status, stdout, stderr}` 로 돌려준다(spawnSync 동형). */
   gh(args: string[], timeoutMs: number): { status: number | null; stdout: string; stderr: string };
   /** ⭐ `git` 호출(선택). 주입되면 리뷰 증거를 **이 PR 이 저작한 변경**으로 좁힌다(아래 참조).
@@ -404,6 +408,20 @@ function readDeltaDiffAtHead(pr: string, base: string, deps: SelfReviewCliDeps):
     excludedMainMergeFiles: authoredDelta.excludedFiles } };
 }
 
+/** SMART-MERGE ①: range-diff of the PR-own change between the reviewed head and the current head (null = unmeasured). */
+export function reviewRangeDelta(reviewedHead: string, currentHead: string, deps: Pick<SelfReviewCliDeps, 'reviewGitRun' | 'reviewRepositoryPath'>):
+  { same: boolean; rangeDiff: string; chars: number } | null {
+  if (!SHA40.test(reviewedHead.toLowerCase()) || !SHA40.test(currentHead.toLowerCase())) return null;
+  const git = deps.reviewGitRun ?? (deps.reviewRepositoryPath ? gitAt(resolve(deps.reviewRepositoryPath), { timeoutMs: 30_000 }) : null);
+  if (!git) return null;
+  if (git(['fetch', '-q', 'origin', 'refs/heads/main:refs/remotes/origin/main']).status !== 0) return null;
+  for (const h of [reviewedHead, currentHead]) {
+    if (git(['cat-file', '-e', `${h}^{commit}`]).status !== 0 && git(['fetch', '-q', 'origin', h]).status !== 0) return null;
+  }
+  const d = deltaSince(git, reviewedHead, currentHead, 'origin/main');
+  return 'error' in d ? null : { same: d.same, rangeDiff: d.rangeDiff, chars: d.chars };
+}
+
 /** Keep PR first-parent segments while excluding only merges whose second parent is on the PR base branch. */
 function deltaDiffWithoutMainMerges(
   pr: string,
@@ -472,6 +490,24 @@ function deltaDiffWithoutMainMerges(
   if (afterMerge.status !== 0) return { error: 'main-merge-pr-segment-unavailable' };
   if (afterMerge.stdout) segments.push(afterMerge.stdout);
   return { diff: segments.join(''), excludedFiles: excludedFiles.size };
+}
+
+/**
+ * REVIEW-ACCEPT-MERGE-MAIN (0.3.38 P0) — the merge-base the PR's own change is measured from.
+ * `compare/<baseOid>...<head>` is the same three-dot compare the full review diff uses, so the
+ * recorded sha is exactly the left side of the reviewed diff. Main-side changes brought in by
+ * merges are below it; conflict resolutions that differ from main stay in head − merge-base.
+ */
+function prMergeBaseCommit(pr: string, head: string, deps: SelfReviewCliDeps): { mergeBase: string } | { error: string } {
+  if (!COMMIT_OID.test(head)) return { error: 'merge-base-head-unknown' };
+  const { baseOid, repo } = prCompareAnchors(pr, deps);
+  if (!baseOid || !repo) return { error: 'merge-base-anchors-unavailable' };
+  const compare = deps.gh(['api', `repos/${repo}/compare/${baseOid}...${head}`], 25_000);
+  if (compare.status !== 0) return { error: 'merge-base-compare-failed' };
+  try {
+    const sha = (JSON.parse(compare.stdout) as { merge_base_commit?: { sha?: unknown } }).merge_base_commit?.sha;
+    return typeof sha === 'string' && COMMIT_OID.test(sha) ? { mergeBase: sha.toLowerCase() } : { error: 'merge-base-compare-invalid' };
+  } catch { return { error: 'merge-base-compare-invalid' }; }
 }
 
 /** GitHub's compare response proves the no-merge case without requiring local objects or a network fetch. */
@@ -2255,7 +2291,8 @@ export async function runSelfReviewCliCommand(
             completedLane = lane;
             break;
           }
-          if (last?.refusal || last?.stale === true || index === lanes.length - 1) break;
+          // A failed Claude review must remain a failure, not silently pass via another lane.
+          if (lane === 'claude' || last?.refusal || last?.stale === true || index === lanes.length - 1) break;
           pendingFallback = { from: lane,
             reason: safeLogText(String(last?.invalid === true ? `invalid-${String(last.invalidReason ?? 'unspecified')}`
               : last?.failureReason ?? last?.error ?? 'reviewed=false'), 400) };
@@ -2340,6 +2377,14 @@ async function runSelfReviewCliCommandPinned(
   }
   // An explicit API model is the caller's reviewer choice even when a default ACP lane supplied both flags.
   const requestedModel = opts.model?.trim() || undefined;
+  // Reject a GLM review before constructing or invoking any reviewer, including ACP model overrides.
+  const forbiddenModel = [requestedModel, opts.acpModel?.trim()].find((id) => id && /(?:^|[/:])(?:glm(?:[-\d.]|$)|z-ai\/glm(?:[-\d.]|$))/i.test(id));
+  if (forbiddenModel) {
+    const message = `GLM 리뷰는 금지되어 있습니다: ${forbiddenModel}`;
+    deps.log('model-rejected', { requestedModel: safeLogText(forbiddenModel), reason: 'glm-review-forbidden' }, { level: 'warn' });
+    deps.error(message);
+    return { results: opts.json ? [{ error: message, requestedModel: forbiddenModel, refusal: 'glm-review-forbidden' }] : [], failed: 1 };
+  }
   const useAcp = opts.acp === true && !requestedModel;
   const acpModel = opts.acpModel?.trim() || undefined;
   const acpBackendResolution = opts.acpBackend
@@ -2505,6 +2550,7 @@ async function runSelfReviewCliCommandPinned(
     let deltaBase: SavedReviewForDelta | undefined;
     let fullDiffForContextualDelta = false;
     let deltaHeal = opts.deltaHeal;
+    let mergeBaseReview: { reviewedDiff: 'merge-base'; mergeBase: string; mergeBaseReason: string } | undefined;
     if (!opts.full) {
       const selected = selectSavedReviewForDelta(pr, opts.sinceReview);
       if ('error' in selected) {
@@ -2547,6 +2593,17 @@ async function runSelfReviewCliCommandPinned(
       failed += 1;
       continue;
     }
+    // SMART-MERGE ①: an over-budget delta is first re-measured as the range-diff of the PR-own change (main merges,
+    // stack rebuilds and rebases compare patch-vs-patch) — the 20,562-char budget applies to that range-diff.
+    if (deltaBase && opts.sinceReview === undefined && 'read' in diffResult && diffResult.read.diff.stdout.length > 20_562) {
+      const rd = reviewRangeDelta(deltaBase.headCommit, diffResult.read.headCommit, deps);
+      if (rd && (rd.same || rd.chars <= 20_562)) {
+        deps.log('review.delta-heal', { pr, cause: 'delta-diff-over-budget', prescription: rd.same ? 'range-diff-empty' : 'range-diff-review',
+          rawChars: diffResult.read.diff.stdout.length, rangeDiffChars: rd.chars, headCommit: diffResult.read.headCommit }, { level: 'info' });
+        diffResult = { read: { ...diffResult.read, diff: { ...diffResult.read.diff, stdout: rd.same ? '' : rd.rangeDiff } } };
+        if (!rd.same) deltaHeal = { cause: 'delta-diff-over-budget', prescription: 'range-diff-review' };
+      }
+    }
     if (deltaBase && opts.sinceReview === undefined && 'read' in diffResult && diffResult.read.diff.stdout.length > 20_562) {
       const message = `PR ${pr}: 델타 diff 가 20,562자 예산을 초과합니다 — 기본 모드는 전체 diff 로 되돌아가지 않고 거부합니다 (delta-diff-over-20562-chars). 전체 검사가 필요하면 --full 을 명시하십시오.`;
       deps.error(message);
@@ -2580,17 +2637,36 @@ async function runSelfReviewCliCommandPinned(
         continue;
       }
       if (NEEDS_CLEAN_BRANCH_DELTA_REFUSALS.has(diffResult.error)) {
-        // A204: a hand-resolved merge never clears on retry — terminal, typed, one author instruction.
-        const outcome = needsCleanBranchOutcome(pr, diffResult.headCommit ?? '', diffResult.error);
-        const message = `PR ${pr}: ${outcome.authorAction} (${diffResult.error}).`;
-        deps.log('review.needs-clean-branch', { pr, head: outcome.headCommit, reason: diffResult.error,
-          terminal: true, retryable: false, modelStarted: false }, { level: 'warn' });
-        deps.error(message);
-        if (opts.json || opts.save !== undefined) results.push({ ...outcome, error: message,
-          deltaOutcome: 'refused', deltaRefusal: diffResult.error });
-        failed += 1;
-        continue;
+        // ⭐ REVIEW-ACCEPT-MERGE-MAIN (0.3.38 P0 · land policy «merge main into the PR branch»):
+        //    a merge with hand-resolved content no longer refuses (was A204 needs-clean-branch).
+        //    Review the PR's own change instead = merge-base(base, head)..head — main-side
+        //    changes brought in by merges are excluded, conflict resolutions that touch PR
+        //    files stay in (they are part of the PR's change). Head binding is unchanged.
+        const refusedDelta = diffResult.error;
+        const read = readDiffAtHead(pr, deps);
+        const anchor = read.headCommitState === 'known' ? prMergeBaseCommit(pr, read.headCommit, deps)
+          : { error: 'merge-base-head-unknown' };
+        if ('error' in anchor || !read.diff.stdout.trim() || read.diff.status !== 0) {
+          const reason = 'error' in anchor ? anchor.error : 'merge-base-diff-unavailable';
+          const message = `PR ${pr}: main 병합 가지의 merge-base 리뷰를 고정하지 못했습니다 (${reason}) — 다시 시도하십시오.`;
+          deps.log('review.merge-base-review', { pr, head: read.headCommit, cause: refusedDelta, result: 'refused', reason },
+            { level: 'warn' });
+          deps.error(message);
+          if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, verdict: null,
+            refusal: 'merge-base-review-unavailable', retryable: true, deltaOutcome: 'refused', deltaRefusal: reason,
+            headCommit: read.headCommit });
+          failed += 1;
+          continue;
+        }
+        deps.log('review.merge-base-review', { pr, head: read.headCommit, cause: refusedDelta,
+          mergeBase: anchor.mergeBase, result: 'admitted' }, { level: 'info' });
+        mergeBaseReview = { reviewedDiff: 'merge-base', mergeBase: anchor.mergeBase, mergeBaseReason: refusedDelta };
+        deltaHeal = { cause: refusedDelta, prescription: 'merge-base-review' };
+        deltaBase = undefined;
+        diffResult = { read };
       }
+    }
+    if ('error' in diffResult) {
       const message = `PR ${pr}: 델타 리뷰를 고정하지 못했습니다 (${diffResult.error}).`;
       deps.error(message);
       if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, verdict: null,
@@ -3199,49 +3275,13 @@ async function runSelfReviewCliCommandPinned(
         }
       }
     }
-    // OP #25981: an explicit ACP claude review that ends without a verdict («Autocompact is thrashing …» ·
-    //   reviewed:false · no JSON) goes once to GLM on the same head — never a claude retry (subscription quota).
-    //   An explicit `--acp-model` is the operator's model choice: it is not silently swapped for GLM.
-    //   GLM that throws or also ends without a verdict keeps the claude result, and says so (`glmReviewed`).
-    // REVIEW-NO-SILENT-GLM-FALLBACK (#38331 · 내부 문서 `MANUAL-user-config` `acp.reviewClaudeGlmFallback`):
-    //   the GLM hop is OFF unless the operator opted in. A failed claude review stays a failed review — loud,
-    //   coded, rc≠0 — and the skip is observed (`claude-fallback-glm-skipped`), never silent.
-    let claudeFallbackGlm: { reason: string; model: string; glmReviewed: boolean; glmFailureReason?: string } | undefined;
+    // Review policy forbids the historical Claude→GLM hop, including legacy opt-ins.
     const claudeAcpFailed = useAcp && !roleReview && canonicalizeBackendId(acpBackend) === 'claude' && review.reviewed !== true;
-    // #38365 Terra r2 mustFix 2 — the reason that actually blocks wins: a reviewer-mix lane and an explicit
-    //   `--acp-model` block the hop whatever the opt-in says, so they are named before `not-opted-in`.
-    const claudeGlmSkipReason = !claudeAcpFailed ? undefined
-      : opts.disableClaudeGlmFallback ? 'reviewer-mix-lane'
-        : acpModel ? 'explicit-acp-model'
-          : opts.claudeGlmFallback !== true ? 'not-opted-in' : undefined;
-    if (claudeAcpFailed && claudeGlmSkipReason) {
+    if (claudeAcpFailed) {
       deps.log('claude-fallback-glm-skipped', {
-        pr: safeLogText(pr), skipReason: claudeGlmSkipReason,
+        pr: safeLogText(pr), skipReason: 'review-policy-forbids-glm',
         failureReason: safeLogText(review.failureReason || 'reviewed=false', 400),
       }, { level: 'warn' });
-    }
-    if (claudeAcpFailed && !claudeGlmSkipReason) {
-      const reason = safeLogText(review.failureReason || 'reviewed=false', 400);
-      debug.log('review.acp', 'claude-fallback-glm', { reason }, { level: 'warn' });
-      fallbackAttempted = true;
-      fallbackTriggerReason = reason;
-      let glmFailureReason: string | undefined;
-      try {
-        const glmReview = await deps.reviewPullRequest(reviewInput, deps.makeApiLlm(ZAI_OPENROUTER_FALLBACK_MODEL, {
-          pinProvider: true,
-          onResolved: (provider, respondedModel) => { responded.provider = provider; responded.model = respondedModel; },
-        }));
-        if (glmReview.reviewed === true) {
-          review = glmReview;
-          selectedModel = ZAI_OPENROUTER_FALLBACK_MODEL;
-          reviewRoute = 'api';
-        } else glmFailureReason = safeLogText(glmReview.failureReason || 'reviewed=false', 400);
-      } catch (error) {
-        glmFailureReason = safeLogText(error instanceof Error ? error.message : String(error), 400);
-      }
-      if (glmFailureReason !== undefined) fallbackFailures.push({ backend: ZAI_OPENROUTER_FALLBACK_MODEL, reason: glmFailureReason });
-      claudeFallbackGlm = { reason, model: ZAI_OPENROUTER_FALLBACK_MODEL, glmReviewed: glmFailureReason === undefined,
-        ...(glmFailureReason !== undefined ? { glmFailureReason } : {}) };
     }
     if (deltaBase && review.reviewed !== true && review.failureReason === NO_VERDICT_LINE_REASON) {
       let retryReview: ReviewResult;
@@ -3413,8 +3453,7 @@ async function runSelfReviewCliCommandPinned(
     //   (`primaryModel`). That default is compared too, so «default API → ACP fallback answered by claude» is invalid.
     //   requestSource labels the row of the request-source × responder-family table in the PR body.
     const answeredByFallback = reviewRoute === 'acp-fallback'
-      || (reviewerSource === 'role-config' && Boolean(opts.roleReviewer) && !roleReview)
-      || claudeFallbackGlm?.glmReviewed === true;
+      || (reviewerSource === 'role-config' && Boolean(opts.roleReviewer) && !roleReview);
     const requestSource: 'explicit' | 'default' | 'fallback' = answeredByFallback ? 'fallback'
       : reviewerSource === 'cli' ? 'explicit' : 'default';
     const engineValidity = review.reviewed === true && landingGateAdmitted
@@ -3455,7 +3494,6 @@ async function runSelfReviewCliCommandPinned(
       ...(fallbackBackend ? { requestedModel: primaryModel, actualBackend: `acp:${fallbackBackend}` } : {}),
       ...(fallbackNotAttemptedReason ? { fallbackNotAttemptedReason } : {}),
       ...(fallbackTriggerReason ? { fallbackTriggerReason } : {}),
-      ...(claudeFallbackGlm ? { claudeFallbackGlm } : {}),
       ...(fallbackFailures.length ? { fallbackFailures } : {}),
       ...(skippedAcpFallbackBackends.length ? { skippedAcpFallbackBackends } : {}),
     };
@@ -3564,7 +3602,7 @@ async function runSelfReviewCliCommandPinned(
       reviewCapPolicy: loopBreakerOutput.reviewCapPolicy ?? loopPolicy, reviewInputChars, reviewDurationMs,
       ...(deltaBase ? deltaReceipt : {}), ...deltaHealOutput, ...(designTransition ? { designTransition } : {}), ...reviewProvenance, ...respondedOutput, ...reviewerSelection,
       ...reviewCwdOutput, ...provenance, ...contextOutput, ...refusalOverride, ...landingGateFields, ...engineValidityFields,
-      ...(mainMergeCapExempt ? { mainMergeOnlyCapExempt: true } : {}),
+      ...(mainMergeCapExempt ? { mainMergeOnlyCapExempt: true } : {}), ...(mergeBaseReview ?? {}),
       findingPathHeadChecks, pathWarnings, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles,
       ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) };
     // Audit the same normalized findings that persistence writes, without changing stdout's findings.

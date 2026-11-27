@@ -1178,6 +1178,8 @@ describe('HARNESS-NEIGHBOR-SWEEP — 수정 라운드 같은 꼴 이웃 주입',
   const site = { file: 'src/b.ts', line: 3, endLine: 3, callee: 'loadLedger', text: "loadLedger('c')" };
   const okSweep = async () => ({ outcome: 'ok' as const, engine: 'ast-grep' as const, hunks: 1, callees: 1, sites: [site], totalSites: 1, truncated: false });
   const failReview = { verdict: 'fail' as const, findings: ['블로커 A'], mustFix: ['블로커 A'] };
+  // 칸 43(SMART-ROUTER-TIER-FULL-WIRE) — neighbor_sweep 은 advanced 전용: 허용 등급 원천 주입(free = off 강등).
+  const advancedMembership = { currentTier: () => 'advanced' };
 
   async function runRounds(neighborSweep: Parameters<typeof buildHarnessSeams>[0]['neighborSweep'], priorReview = failReview) {
     const features: string[] = [];
@@ -1191,6 +1193,7 @@ describe('HARNESS-NEIGHBOR-SWEEP — 수정 라운드 같은 꼴 이웃 주입',
       const seams = buildHarnessSeams({
         seams: fakeSeams({ async implement({ feature, cwd }) { features.push(feature); writeFileSync(join(cwd, 'x.ts'), 'x'); return { ok: true, summary: 'ok' }; } }),
         ...(neighborSweep ? { neighborSweep } : {}),
+        membership: advancedMembership,
       });
       await seams.plan({ objective: 'feat N' });
       await seams.execute({ objective: 'feat N', steps: [], round: 1 });
@@ -1260,6 +1263,7 @@ describe('HARNESS-NEIGHBOR-SWEEP — 수정 라운드 같은 꼴 이웃 주입',
           async gate() { gateCalls++; return gateCalls === 1 ? { passed: false, log: 'typecheck-ratchet: new error' } : { passed: true }; },
         }),
         neighborSweep: wrapped,
+        membership: advancedMembership,
       });
       // 출처: #38276 — 게이트 실패 1 ⊕ 통과 1 = 두 라운드로 끝난다. 상한은 여유 한 칸이며 판정은 rounds 로 한다.
       const result = await runStagedHarness({ objective: 'feat R', seams, maxReviewRounds: 3, autoDrive: 'safe' });

@@ -17,7 +17,8 @@ import {
   buildSeatMemoryIndexBlock, deleteSeatMemory, listSeatMemories, normalizeSeat, pinSeatMemory, readSeatMemoryIndex, rebuildSeatMemoryIndex,
   promoteSeatMemoryToCommon, saveSeatMemory, searchSeatMemories, seatMemoryDir, seatMemoryLedgerRoot, type SeatMemoryEntry,
 } from '../seat-memory/seat-memory.js';
-import { commonMemoryDir, resolveMemoryStore, type MemoryStore } from '../seat-memory/memory-store.js';
+import { commonMemoryDir, resolveMemoryStore, seatFromCwd, type MemoryStore } from '../seat-memory/memory-store.js';
+import { PROXY_SEAT, PROXY_TARGET_SEAT, seatWriteAuthority, syncProxySession } from '../seat-memory/seat-store-write.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { applySeatMemoryImport, planSeatMemoryImport, summarizeSeatMemoryImport, type SeatMemoryImportPlan } from '../seat-memory/seat-memory-import.js';
@@ -35,6 +36,18 @@ function findFileMemory(store: FileStore, key: string): SeatMemoryEntry | null {
   return all.find(e => e.name === key) ?? all.find(e => e.name.startsWith(key)) ?? null;
 }
 const storeTag = (store: FileStore): string => `${store.kind} ${store.label}`;
+/**
+ * SEAT-MEMORY-SYNC — the calling seat: --from, then ELANOUS_TRACK, then a seats/<SEAT> directory. An explicit --from that
+ * is not exactly a seat id is refused (never a silent fallback to another identity).
+ */
+function cliCallerSeat(from?: string): string | null {
+  if (from !== undefined) {
+    const seat = normalizeSeat(from);
+    if (!seat || seat !== from.toUpperCase()) { ui.error(`memory: invalid --from ${JSON.stringify(from)} (a seat id)`); process.exit(1); }
+    return seat;
+  }
+  return normalizeSeat(process.env.ELANOUS_TRACK) ?? seatFromCwd(process.cwd());
+}
 
 export function registerMemoryCommands(program: Command): void {
   const memCmd = program.command('memory').description('Persistent memories injected into every chat turn (user / feedback / project / reference)');
@@ -70,7 +83,9 @@ export function registerMemoryCommands(program: Command): void {
   memCmd
   .command('add <type> <name> [description...]')
   .description('Create a memory (type: user|feedback|project|reference). Body piped via stdin if available.')
-  .action(async (type: string, name: string, descParts: string[]) => {
+  .option('--seat <SEAT>', 'write this seat store (<memoryRoot>/seats/<SEAT>) — your own seat, or OP when you are CLAUDE-OP')
+  .option('--from <SEAT>', 'the calling seat (default: ELANOUS_TRACK, then this directory\'s seat)')
+  .action(async (type: string, name: string, descParts: string[], opts: { seat?: string; from?: string }) => {
     if (!['user', 'feedback', 'project', 'reference'].includes(type)) {
       ui.error(`invalid type "${type}". Use: user | feedback | project | reference`);
       process.exit(1);
@@ -80,6 +95,17 @@ export function registerMemoryCommands(program: Command): void {
     let body = description;
     const pipedBody = await readPipedStdin();   // ★ OBS-T3 — 비-TTY 는 파이프를 뜻하지 않는다(소켓이면 EOF 가 안 온다)
     if (pipedBody) body = pipedBody;
+    // SEAT-MEMORY-SYNC — an explicit seat store through the store's own writer (MEMORY.md index upserted once).
+    if (opts?.seat !== undefined) {
+      const auth = seatWriteAuthority({ target: opts.seat, caller: cliCallerSeat(opts.from) });
+      if (!auth.ok) { ui.error(auth.line); process.exit(1); }
+      const dir = seatMemoryDir(auth.seat);
+      const r = saveSeatMemory({ name, description: description || name, type, body: body || name, ...(auth.via === 'proxy' ? { source: PROXY_SEAT } : {}) },
+        dir, auth.seat, { origin: 'memory-cli.add-seat' });
+      if (!r.ok) { ui.error(r.error); process.exit(1); }
+      ui.info(`saved [${type}] "${r.name}" (${r.action}) → seat ${auth.seat}${auth.via === 'proxy' ? ' (via CLAUDE-OP)' : ''} ${dir}/${r.file}`);
+      return;
+    }
     const fileStore = cliFileStore();
     if (fileStore) {
       const r = saveSeatMemory({ name, description: description || name, type, body: body || name }, fileStore.dir, fileStore.label, { origin: 'memory-cli.add' });
@@ -361,6 +387,30 @@ export function registerMemoryCommands(program: Command): void {
     if (!r.ok) { ui.error(r.error); process.exit(1); }
     ui.info(`promoted "${r.name}" (${r.action}) seat ${fromSeat} → common · ${join(commonDir, r.file)}`);
     console.log(`index line   ${r.indexLine}`);
+  });
+
+  // SEAT-MEMORY-SYNC — Claude OP's daily session summary (CEO requests → status) into the OP seat store.
+  memCmd
+  .command('sync-proxy')
+  .description('Write the CLAUDE-OP session summary into the OP seat store as proxy-session-<YYYY-MM-DD> (same day replaces)')
+  .option('--seat <SEAT>', 'target seat store (only OP)', 'OP')
+  .option('--file <path>', 'summary markdown file')
+  .option('--body <text>', 'summary text, or - to read stdin')
+  .option('--from <SEAT>', 'the calling seat (default: ELANOUS_TRACK, then this directory\'s seat)')
+  .action(async (opts: { seat: string; file?: string; body?: string; from?: string }) => {
+    const auth = seatWriteAuthority({ target: opts.seat, caller: cliCallerSeat(opts.from) });
+    if (!auth.ok) { ui.error(auth.line); process.exit(1); }
+    if (auth.seat !== PROXY_TARGET_SEAT || auth.via !== 'proxy') { ui.error(`memory sync-proxy: only ${PROXY_SEAT} writes the ${PROXY_TARGET_SEAT} session summary`); process.exit(1); }
+    let body = '';
+    if (opts.file !== undefined) {
+      const { readFileSync } = await import('node:fs');
+      try { body = readFileSync(opts.file, 'utf8'); } catch (error) { ui.error(`memory sync-proxy: cannot read ${opts.file}: ${error instanceof Error ? error.message : String(error)}`); process.exit(1); }
+    } else if (opts.body === '-') body = (await readPipedStdin()) ?? '';
+    else body = opts.body ?? '';
+    if (!body.trim()) { ui.error('memory sync-proxy: empty summary — pass --file <path> or --body <text|->'); process.exit(1); }
+    const r = syncProxySession({ body });
+    if (!r.ok) { ui.error(r.error); process.exit(1); }
+    ui.info(`synced "${r.name}" (${r.action}) → seat ${PROXY_TARGET_SEAT} ${seatMemoryDir(PROXY_TARGET_SEAT)}/${r.file}`);
   });
 
   memCmd

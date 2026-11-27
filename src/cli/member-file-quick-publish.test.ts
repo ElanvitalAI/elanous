@@ -14,14 +14,15 @@
 // ② 접근 토큰 저장은 실행별 배타 — 고정 경로 재사용 금지, put 성패 무관 finally 정리(⑲b). ③ 검증 공개 키의 원천을
 //    env/config 덮어쓰기에서 폐지하고 RES 운영 고정 경로(정규 파일·쓰기 비트 0·쓰기 시도 EACCES 증명)만 믿는다(⑳).
 import { describe, expect, test } from 'bun:test';
-import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createHash, createHmac, createPublicKey, generateKeyPairSync, sign as cryptoSign, type KeyObject } from 'node:crypto';
 import { deflateSync } from 'node:zlib';
 import type { ObjectStore } from '../storage/object-store.js';
 import {
-  defaultResolveUploadCredential, defaultResolveUploadIdentity, gcsAdcPrincipalFromIdentityToken,
+  defaultResolveUploadCredential, defaultResolveUploadIdentity,
   MEMBER_FILE_EVIDENCE_PUBKEY_SHA256, MEMBER_FILE_IAM_EVIDENCE_MAX_AGE_MS, MEMBER_FILE_IAM_EVIDENCE_NAME, memberFileIamEvidenceCanonical,
   MEMBER_FILE_MAX_BYTES, MemberFilePublishError, publishMemberFile, type MemberFileIamEvidence,
 } from './member-file-quick-publish.js';
@@ -734,12 +735,9 @@ describe('OP #118856(4차) ① PDF 텍스트 추출 게이트 · OP #119090(5차
     const gcsCfg = { provider: 'gcs' } as Parameters<typeof defaultResolveUploadIdentity>[0];
     // ⑴ ⑧차 ① — gcs 신원은 업로드 자격과 '같은 ADC 인스턴스'에서 나와야 한다(⑲a). 앰비언트 독립 해석은 폐지.
     expect(defaultResolveUploadIdentity(gcsCfg, () => jwt({ email: 'adc-demo@demo.iam', email_verified: true }))).toBeNull();
-    // ⑵-⑸ 토큰 판정(gcsAdcPrincipalFromIdentityToken 은 ⑲a 결속 경로에서 그대로 쓰인다).
-    expect(gcsAdcPrincipalFromIdentityToken(jwt({ email: 'x@demo.iam', email_verified: true }))).toBe('x@demo.iam');
-    expect(gcsAdcPrincipalFromIdentityToken(jwt({ email: 'x@demo.iam', email_verified: false }))).toBeNull();
-    expect(gcsAdcPrincipalFromIdentityToken(jwt({ sub: '1234567890' }))).toBeNull();
-    expect(gcsAdcPrincipalFromIdentityToken('not-a-jwt')).toBeNull();
-    expect(gcsAdcPrincipalFromIdentityToken('')).toBeNull();
+    // FU(OP #122924 처방 1번) — ⑵-⑹ JWT 신원 토큰 판정은 폐지: print-identity-token 은 gcloud(594.0.0) auth application-default
+    // 그룹에 실존하지 않아 런타임이 전부 거부됐다(2026-11-21 e2e 사전점검 RC=1). principal 은 스냅샷 client_email,
+    // 접근 토큰은 실존 명령 print-access-token(⑲a·⑳ 참조).
     // ⑹ local — 신원 해석 없이 'local'.
     expect(defaultResolveUploadIdentity({ provider: 'local' } as Parameters<typeof defaultResolveUploadIdentity>[0], () => { throw new Error('no cli'); })).toBe('local');
     // ⑺ CLI 부재/실패 = fail-closed(null — 게시 경로에서 거부).
@@ -758,47 +756,184 @@ describe('JUD hold(16:0x) ⑧차 mustFix — ① 같은 ADC 자격 인스턴스 
   const gcsCfg = { provider: 'gcs' } as Parameters<typeof defaultResolveUploadCredential>[0];
   const adcDir = mkdtempSync(join(tmpdir(), 'mfq-adc-'));
   const adcPath = join(adcDir, 'application_default_credentials.json');
-  writeFileSync(adcPath, enc.encode('{"type":"authorized_user","refresh_token":"fixture"}'), { mode: 0o600 });
+  writeFileSync(adcPath, enc.encode('{"type":"service_account","client_email":"adc-demo-objectcreator@demo.iam"}'), { mode: 0o600 });
   const ADC_BYTES = readFileSync(adcPath);
 
-  test('⑲a ① 같은 ADC 자격 인스턴스 — ⑴ 두 gcloud 호출이 같은 비공개 스냅샷(CLOUDSDK_CONFIG+GOOGLE_APPLICATION_CREDENTIALS 핀)에서 나온다·스냅샷 본문=원본 ⑵ 신원·토큰 도출 ⑶ 신원 판정 실패 = 토큰 해석 없이 null(호출 1회) ⑷ ADC 원본 부재 = null(호출 0회) ⑸ 비 gcs = null ⑹ 스냅샷 정리', () => {
+  test('⑲a ① 같은 ADC 자격 인스턴스(client_email 결속 · OP #122924 처방 1번) — ⑴ gcloud 호출은 실존 명령 print-access-token 단 1회 ⑵ principal=스냅샷 client_email(JWT 신원 토큰 호출 폐지) ⑶ 호출 핀 경로=실행별 비공개 스냅샷·본문=원본 ADC ⑷ client_email 부재 스냅샷 = null(호출 0회) ⑸ ADC 원본 부재 = null(호출 0회) ⑹ 비 gcs = null ⑺ 스냅샷 정리', () => {
     const seen: Array<{ args: readonly string[]; config: string; gac: string; snapshot: Buffer }> = [];
     const exec = (file: string, args: readonly string[], env: NodeJS.ProcessEnv): string => {
       expect(file).toBe('gcloud');
       seen.push({ args, config: String(env.CLOUDSDK_CONFIG), gac: String(env.GOOGLE_APPLICATION_CREDENTIALS), snapshot: readFileSync(env.GOOGLE_APPLICATION_CREDENTIALS as string) });
-      return args[2] === 'print-identity-token' ? jwt({ email: principal, email_verified: true }) : 'tok-⑲';
+      return args[2] === 'print-access-token' ? 'tok-⑲' : '';
     };
     const out = defaultResolveUploadCredential(gcsCfg, { env: {}, adcCredentialPath: () => adcPath, exec });
-    expect(out?.principal).toBe(principal);
+    expect(out?.principal).toBe(principal); // ⑵ 스냅샷의 client_email — 신원 토큰(JWT) 호출은 폐지
     expect(out?.accessToken).toBe('tok-⑲');
-    expect(seen.length).toBe(2);
-    expect(seen[0]!.args).toEqual(['auth', 'application-default', 'print-identity-token']);
-    expect(seen[1]!.args).toEqual(['auth', 'application-default', 'print-access-token']);
-    // 같은 자격 인스턴스: 두 호출의 핀 경로가 같고 스냅샷 본문이 원본 ADC 와 같다(앰비언트 재해석 금지).
-    expect(seen[0]!.config).toBe(seen[1]!.config);
-    expect(seen[0]!.gac).toBe(seen[1]!.gac);
+    expect(seen.length).toBe(1); // ⑴ gcloud 호출은 print-access-token 단 한 번
+    expect(seen[0]!.args).toEqual(['auth', 'application-default', 'print-access-token']);
+    // ⑶ 같은 자격 인스턴스: 호출의 핀 경로가 실행별 비공개 스냅샷이고 본문이 원본 ADC 와 같다(앰비언트 재해석 금지).
+    expect(seen[0]!.config.startsWith(join(tmpdir(), 'mf-adc-'))).toBe(true);
     expect(seen[0]!.snapshot.equals(ADC_BYTES)).toBe(true);
-    expect(seen[1]!.snapshot.equals(ADC_BYTES)).toBe(true);
-    expect(seen[0]!.config.startsWith(join(tmpdir(), 'mf-adc-'))).toBe(true); // 실행별 비공개 디렉터리(고정 경로 아님)
-    // ⑹ 해석 뒤 스냅샷 디렉터리는 정리된다(자격 복제본이 남지 않는다).
+    // JUD HOLD #123912(OP #123914) mustFix ② — 결속 두 변수는 '같은 스냅샷'을 가리킨다: GAC 경로의 상위 = CLOUDSDK_CONFIG.
+    expect(dirname(seen[0]!.gac)).toBe(seen[0]!.config);
+    // ⑺ 해석 뒤 스냅샷 디렉터리는 정리된다(자격 복제본이 남지 않는다).
     expect(existsSync(seen[0]!.config)).toBe(false);
-    // ⑶ 신원 판정 실패(email_verified=false) = 접근 토큰을 해석하지 않고 null(fail-closed — 호출 1회).
-    const seenBad: Array<readonly string[]> = [];
+    // ⑷ client_email 부재 스냅샷 = 신원 증명 불가 = gcloud 호출 없이 null(fail-closed).
+    const noEmailDir = mkdtempSync(join(tmpdir(), 'mfq-noemail-'));
+    const noEmailPath = join(noEmailDir, 'application_default_credentials.json');
+    writeFileSync(noEmailPath, enc.encode('{"type":"authorized_user","refresh_token":"fixture"}'), { mode: 0o600 });
+    const seenNoEmail: Array<readonly string[]> = [];
     expect(defaultResolveUploadCredential(gcsCfg, {
-      env: {}, adcCredentialPath: () => adcPath,
-      exec: (file, args) => { seenBad.push(args); return jwt({ email: 'x@demo.iam', email_verified: false }); },
+      env: {}, adcCredentialPath: () => noEmailPath,
+      exec: (file, args) => { seenNoEmail.push(args); return 'tok-⑲'; },
     })).toBeNull();
-    expect(seenBad.length).toBe(1);
-    // ⑷ ADC 원본 부재 = null(gcloud 호출 없음).
+    expect(seenNoEmail.length).toBe(0);
+    // ⑸ ADC 원본 부재 = null(gcloud 호출 없음).
     const seenMissing: Array<readonly string[]> = [];
     expect(defaultResolveUploadCredential(gcsCfg, {
       env: {}, adcCredentialPath: () => join(adcDir, 'missing.json'),
       exec: (file, args) => { seenMissing.push(args); return 'x'; },
     })).toBeNull();
     expect(seenMissing.length).toBe(0);
-    // ⑸ 비 gcs(local 등)는 자격 결속 대상이 아니다(null — publishMemberFile 은 gcs 에서만 부른다).
+    // ⑹ 비 gcs(local 등)는 자격 결속 대상이 아니다(null — publishMemberFile 은 gcs 에서만 부른다).
     expect(defaultResolveUploadCredential({ provider: 'local' } as Parameters<typeof defaultResolveUploadCredential>[0], { env: {}, exec: () => 'x' })).toBeNull();
   });
+
+  // JUD HOLD #123912(OP #123914 원문) mustFix ① — 스냅샷 자격 JSON의 type 이 service_account 인 경우만 principal
+  // 결속 표면(client_email)으로 인정한다: authorized_user 등 다른 자격 유형은 client_email 이 있어도 gcloud 호출 0회로
+  // 즉시 거부한다(fail-closed). 다른 유형의 client_email 로 업로드를 서명하게 두면 주체 결속이 자격 유형과 어긋난다.
+  test('⑲c JUD HOLD #123912 mustFix ① type=service_account 강제 — ⑴ authorized_user(client_email 있음) = null·gcloud 0회 ⑵ type 부재(client_email 있음) = null·gcloud 0회 ⑶ service_account 는 통과', () => {
+    const snapshot = (adc: Record<string, unknown>): string => {
+      const dir = mkdtempSync(join(tmpdir(), 'mfq-type-'));
+      const path = join(dir, 'application_default_credentials.json');
+      writeFileSync(path, enc.encode(JSON.stringify(adc)), { mode: 0o600 });
+      return path;
+    };
+    // ⑴ authorized_user — client_email 이 있어도 다른 자격 유형이면 gcloud 호출에 닿기 전에 거부(fail-closed).
+    {
+      const calls: Array<readonly string[]> = [];
+      const out = defaultResolveUploadCredential(gcsCfg, {
+        env: {},
+        adcCredentialPath: () => snapshot({ type: 'authorized_user', client_email: principal, client_id: 'fixture.apps.googleusercontent.com', refresh_token: 'fixture' }),
+        exec: (file, args) => { calls.push(args); return 'tok-⑲c'; },
+      });
+      expect(out).toBeNull();
+      expect(calls.length).toBe(0); // gcloud spawn 0회
+    }
+    // ⑵ type 필드 부재(모양을 알 수 없는 자격 유형) — 마찬가지로 gcloud 없이 거부.
+    {
+      const calls: Array<readonly string[]> = [];
+      const out = defaultResolveUploadCredential(gcsCfg, {
+        env: {},
+        adcCredentialPath: () => snapshot({ client_email: principal, private_key: 'fixture' }),
+        exec: (file, args) => { calls.push(args); return 'tok-⑲c'; },
+      });
+      expect(out).toBeNull();
+      expect(calls.length).toBe(0);
+    }
+    // ⑶ service_account — 통과: principal=스냅샷 client_email · 접근 토큰은 실존 명령 1회 호출로(⑲a 와 같은 경로).
+    {
+      const calls: Array<readonly string[]> = [];
+      const out = defaultResolveUploadCredential(gcsCfg, {
+        env: {},
+        adcCredentialPath: () => snapshot({ type: 'service_account', client_email: principal, private_key: 'fixture' }),
+        exec: (file, args) => { calls.push(args); return 'tok-⑲c'; },
+      });
+      expect(out?.principal).toBe(principal);
+      expect(out?.accessToken).toBe('tok-⑲c');
+      expect(calls).toEqual([['auth', 'application-default', 'print-access-token']]);
+    }
+  });
+
+  // ⑳(r1 게이트 FOCUSED_NEW_FAILURE 계기): 게이트·CI 러너 환경에는 gcloud 가 없다(Executable not found in $PATH — PREGATE-RED/39475-…-224552 focused.raw 원문).
+  // 계약 실측은 gcloud 가 있는 실행 환경(로컬·e2e)에서만 가능하므로, gcloud 부재·호출 실패 시 skip(fail 이 아니다).
+  const gcloudApplicationDefaultHelp: string | null = (() => {
+    try {
+      return execFileSync('gcloud', ['auth', 'application-default', '--help'], { encoding: 'utf8', timeout: 15_000 });
+    } catch {
+      return null; // ENOENT(게이트·CI PATH 부재)·그 외 실패 — 이 환경에서는 계약 실측 불가
+    }
+  })();
+  test.skipIf(gcloudApplicationDefaultHelp === null)(
+    '⑳ 실존 명령 계약(OP #122924 처방 1번) — 이 모듈이 부르는 gcloud 하위명령은 실제 gcloud 도움말에 존재한다. print-identity-token(실존하지 않는 하위명령 — e2e 사전점검 RC=1 거부 계기)은 다시는 안 부른다. gcloud 부재 환경(게이트·CI)에서는 skip — 계약 실측은 gcloud 있는 실행 환경에서만.',
+    () => {
+      const help = gcloudApplicationDefaultHelp as string;
+      expect(help).toContain('print-access-token'); // defaultResolveUploadCredential 이 부르는 유일한 auth 하위명령
+      expect(help).not.toContain('print-identity-token'); // gcloud(594.0.0) auth application-default 그룹에 없다
+    },
+  );
+
+  // JUD HOLD #123912(OP #123914) mustFix ② — ⑳(--help 존재 확인)만으로는 부족하다: '고정 스냅샷에서 실제 토큰을 얻는
+  // 자격 선택 경로'를 증명한다. ⑳b 는 목업 없이 진짜 자식 프로세스(defaultEnvSyncExec → execFileSync)를 띄운다 —
+  // 스텁 gcloud(PATH 우선)가 결속 환경변수(CLOUDSDK_CONFIG=<스냅샷 config dir>·GOOGLE_APPLICATION_CREDENTIALS=<스냅샷 JSON 경로>)
+  // 로 가리킨 파일 원문을 '토큰'으로 돌려주고, 그 토큰이 고정 스냅샷에서 왔음을 본문 대조로 증명한다. gcloud 여부와
+  // 무관(스텁) — 게이트 러너에서도 실행된다.
+  test('⑳b mustFix ② 스냅샷 결속 env 실전 전달 — 스텁 gcloud 자식 프로세스가 고정 스냅샷에서 토큰을 도출(principal=client_email·토큰=스냅샷 원문)', () => {
+    const stubDir = mkdtempSync(join(tmpdir(), 'mfq-stub-'));
+    writeFileSync(join(stubDir, 'gcloud'), [
+      '#!/bin/sh',
+      'set -eu',
+      'cfg="${CLOUDSDK_CONFIG:?CLOUDSDK_CONFIG missing}"', // 스냅샷 config dir 결속
+      'gac="${GOOGLE_APPLICATION_CREDENTIALS:?GOOGLE_APPLICATION_CREDENTIALS missing}"', // 스냅샷 JSON 경로 결속
+      'test -f "$cfg/application_default_credentials.json" || exit 10', // config dir 안 스냅샷 파일 확인
+      'cat "$gac"',
+      '',
+    ].join('\n'), { flag: 'wx', mode: 0o755 });
+    const snapshotJson = JSON.stringify({ type: 'service_account', client_email: principal, private_key: 'fixture' });
+    const snapshotDir = mkdtempSync(join(tmpdir(), 'mfq-snap-'));
+    const snapshotPath = join(snapshotDir, 'application_default_credentials.json');
+    writeFileSync(snapshotPath, enc.encode(snapshotJson), { mode: 0o600 });
+    const realPath = process.env.PATH;
+    process.env.PATH = `${stubDir}${realPath ? ':' : ''}${realPath ?? ''}`; // 진짜 자식 프로세스 해석 — 스텁이 우선. 복구는 finally.
+    try {
+      const out = defaultResolveUploadCredential(gcsCfg, { env: { PATH: process.env.PATH }, adcCredentialPath: () => snapshotPath });
+      expect(out?.principal).toBe(principal);
+      // 자식 프로세스가 결속 변수로 읽어 돌려준 '토큰' 원문 === 고정 스냅샷 파일 원문 — 토큰은 그 스냅샷에서 왔다.
+      expect(out?.accessToken).toBe(snapshotJson);
+    } finally {
+      if (realPath === undefined) delete process.env.PATH; else process.env.PATH = realPath;
+      rmSync(stubDir, { recursive: true, force: true });
+      rmSync(snapshotDir, { recursive: true, force: true });
+    }
+  });
+
+  // JUD HOLD #123912 mustFix ② — 실존 gcloud 자식 프로세스 경로: 결속 환경변수가 실전 gcloud 에 그대로 전달되고
+  // (래핑 exec 가 env 를 기록·실전 execFileSync 로 위임), 실존 gcloud 는 그 고정 스냅샷만 본다 — bogus 개인키
+  // 스냅샷에서는 토큰을 못 얻는다(fail-closed). 실행 환경에 유효한 앰비언트 ADC 가 있어도 쓰지 않는다: 결속이
+  // 없었다면 앰비언트 자격으로 실 토큰이 나왔을 것이므로, null 결과가 곧 '실전에서도 결속이 지켜진다'의 증명이다.
+  // gcloud 부재 환경(게이트 러너)에서는 ⑳ 과 같은 skip 경계.
+  test.skipIf(gcloudApplicationDefaultHelp === null)(
+    '⑳c mustFix ② 실존 gcloud 자격 선택 경로 — 결속 env 실전 전달·고정 스냅샷(bogus 키) = 토큰 없음(fail-closed null)',
+    () => {
+      const fixtureDir = mkdtempSync(join(tmpdir(), 'mfq-real-'));
+      const bogusSnapshotPath = join(fixtureDir, 'application_default_credentials.json');
+      writeFileSync(bogusSnapshotPath, enc.encode(JSON.stringify({
+        type: 'service_account',
+        client_email: 'mfq-fixture-sa@fixture.iam',
+        private_key: '-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----\n',
+      })), { mode: 0o600 });
+      const delivered: Array<{ file: string; args: readonly string[]; config: string | undefined; gac: string | undefined }> = [];
+      const recordAndDelegate = (file: string, args: readonly string[], env: NodeJS.ProcessEnv): string => {
+        delivered.push({ file, args, config: env.CLOUDSDK_CONFIG, gac: env.GOOGLE_APPLICATION_CREDENTIALS });
+        return execFileSync(file, [...args], { encoding: 'utf8', timeout: 15_000, env }); // 실전 자식 프로세스(gcloud)
+      };
+      try {
+        const out = defaultResolveUploadCredential(gcsCfg, { env: process.env, adcCredentialPath: () => bogusSnapshotPath, exec: recordAndDelegate });
+        // ⑴ 결속 환경변수가 실전 gcloud 자식 프로세스에 전달됐다 — GAC 경로의 상위 = CLOUDSDK_CONFIG(스냅샷 config dir).
+        expect(delivered.length).toBe(1);
+        expect(delivered[0]!.file).toBe('gcloud');
+        expect(delivered[0]!.args).toEqual(['auth', 'application-default', 'print-access-token']);
+        expect(typeof delivered[0]!.config).toBe('string');
+        expect(typeof delivered[0]!.gac).toBe('string');
+        expect(dirname(String(delivered[0]!.gac))).toBe(String(delivered[0]!.config));
+        expect(String(delivered[0]!.gac).startsWith(join(tmpdir(), 'mf-adc-'))).toBe(true);
+        // ⑵ 그 고정 스냅샷(bogus 개인키)에서 실존 gcloud 는 토큰을 못 얻는다 → null(fail-closed · 앰비언트 자격 미사용).
+        expect(out).toBeNull();
+      } finally {
+        rmSync(fixtureDir, { recursive: true, force: true });
+      }
+    },
+  );
 
   test('⑲b ② 실행별 배타 토큰 저장 — ⑴ 동시 2 게시 혼선 0(경로 상이·내용 각자·0600·상위 0700·configDir 밖) ⑵ 게시 뒤 임시 정리 ⑶ 자격(토큰) 해석 실패 = 거부·put 0', async () => {
     const dirA = mkdtempSync(join(tmpdir(), 'mfq-fa-'));

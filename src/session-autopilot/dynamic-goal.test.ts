@@ -1,4 +1,4 @@
-// AUTOPILOT-DYNAMIC-GOAL-FEED — literal expectations (fresh temp universe per test · injected clock · injected standing goal).
+// AUTOPILOT-DYNAMIC-GOAL-FEED — literal expectations (fresh temp universe per test · injected clock · no release-derived goal).
 import { afterAll, beforeEach, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,7 +19,7 @@ const T0 = Date.parse('2026-11-25T03:00:00.000Z');
 function harness() {
   const logs: Array<[string, Record<string, unknown>]> = [];
   const pilot = createAutopilot({ file, now: () => T0, coordinator: true, log: (e, d) => { logs.push([e, d]); },
-    standingGoal: () => ({ version: '0.3.36', phase: '개발' }), raiseDecision: () => 'D-x', postProgress: () => {} });
+    raiseDecision: () => 'D-x', postProgress: () => {} });
   pilot.refresh();
   const derived = () => logs.filter(([e]) => e === 'goal-derived').map(([, d]) => d);
   return { pilot, logs, derived };
@@ -28,17 +28,19 @@ function harness() {
 const ordinary = (i: number) => ({ msgId: 100 + i, crownDirective: null, text: `[from TC · request]\nmsg:${100 + i} · PR #${4000 + i} 리뷰 부탁` });
 const crown = { msgId: 200, crownDirective: '777', text: '[from OPC · request · crown]\nmsg:200 · 데모 전 TUI 답변 소멸 결함 먼저 고쳐라\n세부는 칸 참조' };
 
-test('standing goal is the seat goal at start (one goal-derived · tier standing)', () => {
+test('a coordinator starts ON with no goal (NO-RELEASE-GOAL: nothing derived from the release)', () => {
   const h = harness();
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
-  expect(h.derived()).toEqual([{ tier: 'standing', source: 'standing', goal: '0.3.36 개발', reason: 'refresh' }]);
+  expect(h.pilot.state().on).toBe(true);
+  expect(h.pilot.state().goal).toBeUndefined();
+  expect(h.derived()).toEqual([]);
+  expect(h.pilot.goalFeed()).toBeNull();
 });
 
 test('10 ordinary mails → goal changes 0 (no goal-derived, goal untouched)', () => {
   const h = harness();
   for (let i = 0; i < 10; i += 1) expect(h.pilot.observeMail([ordinary(i)])).toBe(false);
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
-  expect(h.derived().length).toBe(1);
+  expect(h.pilot.state().goal).toBeUndefined();
+  expect(h.derived().length).toBe(0);
   expect(readAutopilotState(file)?.firstClass).toBeUndefined();
 });
 
@@ -48,7 +50,6 @@ test('1 crown mail → goal becomes that directive exactly once; the same crown 
   expect(h.pilot.state().goal).toBe('[지시] 데모 전 TUI 답변 소멸 결함 먼저 고쳐라');
   for (let i = 0; i < 3; i += 1) expect(h.pilot.observeMail([crown])).toBe(false);
   expect(h.derived()).toEqual([
-    { tier: 'standing', source: 'standing', goal: '0.3.36 개발', reason: 'refresh' },
     { tier: 'first-class', source: 'crown:777', goal: '[지시] 데모 전 TUI 답변 소멸 결함 먼저 고쳐라', reason: 'crown-mail' },
   ]);
   expect(readAutopilotState(file)?.firstClass?.length).toBe(1);
@@ -62,25 +63,24 @@ test('1 crown mail → goal becomes that directive exactly once; the same crown 
   expect(blocks).toEqual([block, 'els', 'owner']);
 });
 
-test('crown closed → standing goal restored; the re-delivered crown mail does not re-open it', async () => {
+test('crown closed → no goal (nothing standing returns); the re-delivered crown mail does not re-open it', async () => {
   const h = harness();
   h.pilot.observeMail([crown]);
   const closed = await dispatchAutopilotTool('autopilot_set', { goal_done: true }, { cwd: dir, file, now: () => T0 });
-  expect(closed).toEqual({ ok: true, status: '🎯 1급 골 닫힘: [지시] 데모 전 TUI 답변 소멸 결함 먼저 고쳐라 — 지금 골: 0.3.36 개발' });
+  expect(closed).toEqual({ ok: true, status: '🎯 1급 골 닫힘: [지시] 데모 전 TUI 답변 소멸 결함 먼저 고쳐라 — 지금 골: (없음)' });
   h.pilot.refresh();
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
+  expect(h.pilot.state().goal).toBeUndefined();
   expect(h.pilot.observeMail([crown])).toBe(false);
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
-  expect(h.pilot.goalFeed()).toBe('<!-- autopilot-goal-feed -->\n🎯 지금 골: 0.3.36 개발 (상시 골 · standing)\n'
-    + '보통 우편·요청은 골을 바꾸지 않는다 — 약속 원장·체크리스트에 적고 이 골을 향해 간다.');
+  expect(h.pilot.state().goal).toBeUndefined();
+  expect(h.pilot.goalFeed()).toBeNull();
 });
 
 test('explicit hold → the crown is recorded but no goal change is applied to autopilot state; resume applies it', () => {
   const h = harness();
   h.pilot.set({ on: true, hold: true }, 'slash');
   expect(h.pilot.observeMail([crown])).toBe(false);
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
-  expect(h.pilot.state().derived).toEqual({ tier: 'standing', source: 'standing', goal: '0.3.36 개발' });
+  expect(h.pilot.state().goal).toBeUndefined();
+  expect(h.pilot.state().derived).toBeUndefined();
   expect(h.logs.filter(([e]) => e === 'goal-derived-held').length).toBe(1);
   h.pilot.set({ on: true }, 'slash');
   expect(h.pilot.state().goal).toBe('[지시] 데모 전 TUI 답변 소멸 결함 먼저 고쳐라');
@@ -91,7 +91,7 @@ test('keystrokes are irrelevant to the goal', () => {
   h.pilot.observeMail([crown]);
   for (let i = 0; i < 5; i += 1) h.pilot.noteHuman();
   expect(h.pilot.state().goal).toBe('[지시] 데모 전 TUI 답변 소멸 결함 먼저 고쳐라');
-  expect(h.derived().length).toBe(2);
+  expect(h.derived().length).toBe(1);
 });
 
 test('an autonomous turn cannot set the goal (ordinary request handled by the model is refused)', async () => {
@@ -100,7 +100,7 @@ test('an autonomous turn cannot set the goal (ordinary request handled by the mo
   const out = await dispatchAutopilotTool('autopilot_set', { on: true, goal: 'TC 가 부탁한 PR 리뷰' }, { cwd: dir, file, now: () => T0 });
   expect(out).toEqual({ error: '골은 사람·대표 지시만 바꾼다 — 보통 우편·요청은 약속 원장·체크리스트에 적는다' });
   h.pilot.refresh();
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
+  expect(h.pilot.state().goal).toBeUndefined();
 });
 
 test('classification reads only crownDirective: alert / human-origin / request mail without it is not a goal', () => {

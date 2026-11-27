@@ -125,11 +125,15 @@ describe('순수 선택', () => {
     ]);
   });
 
-  test('모드 — 생략·무효는 shadow · on/off 만 명시', () => {
-    expect(resolveNeighborSweepMode(undefined)).toBe('shadow');
-    expect(resolveNeighborSweepMode('ON')).toBe('shadow');
-    expect(resolveNeighborSweepMode('on')).toBe('on');
-    expect(resolveNeighborSweepMode('off')).toBe('off');
+  test('모드 — 생략·무효는 shadow · on/off 만 명시(허용 등급 원천)', () => {
+    // 칸 43 — neighbor_sweep 은 advanced 전용: 게이트를 통과하는 등급 원천으로 모드 원본을 잰다.
+    const advanced = { currentTier: () => 'advanced' };
+    expect(resolveNeighborSweepMode(undefined, advanced)).toBe('shadow');
+    expect(resolveNeighborSweepMode('ON', advanced)).toBe('shadow');
+    expect(resolveNeighborSweepMode('on', advanced)).toBe('on');
+    expect(resolveNeighborSweepMode('off', advanced)).toBe('off');
+    // 칸 43 — free 미달이면 on 요청도 계산 없이 off(fail-closed · 진입점 행렬은 full-wire 시험이 잰다).
+    expect(resolveNeighborSweepMode('on', { currentTier: () => 'free' })).toBe('off');
   });
 
   test('주입 문면 — file:line 한 줄씩 · 이웃이 없으면 빈 문자열', () => {

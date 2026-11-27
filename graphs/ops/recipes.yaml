@@ -39,6 +39,12 @@ machine-sanitize-heavy:
 # Source: loop:silence-watch is shadow-only; observations are injected through graph context and claims persist in the state-root incident ledger.
 silence-watch-shadow:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/supervision/silence-watch.ts" --shadow'
+# Source: loop:seat-stall-watch is shadow-only (TUI-OP-LADDER-SPRINT-1119 #19); seat snapshots are injected through graph context and stall claims persist in the state-root incident ledger.
+seat-stall-watch-shadow:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/supervision/seat-stall-watch.ts" --shadow'
+# Source: loop:op-mail-coverage-watch is shadow-only (SHADOW-SEES-ALL-OP-MAIL 0.3.31 P0); seat snapshots are injected through graph context and no-judgment records persist in the state-root incident ledger.
+op-mail-coverage-watch-shadow:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/supervision/op-mail-coverage-watch.ts" --shadow'
 host-reservation-watch-shadow:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/host-reservation-watch.ts"'
   timeout_ms: 120000 # // Source: LOOP-HOST-RESERVATION-WATCH shadow tick must finish before the next five-minute cron tick.

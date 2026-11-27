@@ -12,6 +12,10 @@ import { debug } from '../debug/log.js';
 import { inspectCodexRotation } from '../oauth/codex-account-store.js';
 import { getUserConfig } from '../user-config.js';
 import type { UserConfig } from '../user-config/schema.js';
+// SMART-ROUTER-TIER-FULL-WIRE(칸 43) — 등급 게이트 원천(실제 원천 스토어 → env → free fail-closed).
+import type { MembershipResolver } from '../plugins/smart-router/consumer.js';
+import { authorizeRouterFeatureAtEntry } from '../plugins/smart-router/full-wire.js';
+import { createMemberTierStore, memberTierResolver } from '../members/tier-store.js';
 import type { AccountCandidate, AccountState } from './orchestration-core.js';
 import { WINDOW_ACCOUNT_EVENT } from './window-account-selector.js';
 
@@ -29,6 +33,8 @@ export interface AccountWindowSnapshotDeps {
   readonly emit?: (category: string, event: string, data: Record<string, unknown>) => void;
   /** 모드를 강제한다(발사가 계정을 바꿀 수 없는 자리 — 명시 자식 LLM·ADVISOR — 는 shadow 로 고정). */
   readonly forceShadow?: boolean;
+  /** SMART-ROUTER-TIER-FULL-WIRE(칸 43) — 등급 원천 주입(시험). 없으면 실제 원천 스토어 → env 폴백 → free. */
+  readonly membership?: MembershipResolver;
 }
 
 const CODEX_PROVIDERS = new Set(['openai-codex', 'codex']);
@@ -43,6 +49,13 @@ export function readAccountWindowSnapshot(provider: string, deps: AccountWindowS
     try { selection = resolveWindowAccountsMode((deps.config ?? getUserConfig)()); } catch (error) {
       observe('snapshot-skip', { provider, reason: 'config-unreadable', error: error instanceof Error ? error.name : 'unknown' });
     }
+  }
+  // SMART-ROUTER-TIER-FULL-WIRE(칸 43) — subscription_window_aware 진입 게이트: `on` 은 등급 원천
+  // (member-tier-store → env → free fail-closed)이 router.subscription_window_aware 를 허용할 때만 산다.
+  // 거부(missing-tier·unknown-tier·denied)면 shadow 로 강등 — 계정을 못 바꾼다(fail-closed · 선택기는 shadow 이벤트만 남긴다).
+  if (selection === 'on') {
+    const grant = authorizeRouterFeatureAtEntry('router.subscription_window_aware', deps.membership ?? memberTierResolver(createMemberTierStore()));
+    if (!grant.allowed) selection = 'shadow';
   }
   if (!CODEX_PROVIDERS.has(provider)) {
     // 이 provider 는 계정별 창 데이터가 아직 없다 — 활성 계정 «모름»으로 내고 선택기가 거절 이벤트를 낸다.

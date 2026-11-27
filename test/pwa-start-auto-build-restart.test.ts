@@ -140,6 +140,31 @@ describe('runPwaStart — auto-build (A)', () => {
     expect(buildCalls).toBe(1);
   });
 
+  test('PWA-RUNTIME-LEAN: installed package with this version\'s prebuilt PWA → no auto-install, no build even when stale or --rebuild', async () => {
+    for (const rebuild of [false, true]) {
+      let installCalls = 0;
+      let buildCalls = 0;
+      await runPwaStart({
+        mode: 'static',
+        autoBuild: true,
+        autoInstall: true,
+        rebuild,
+        resolvePwaCwdFn: () => '/fake/apps/pwa',
+        prebuiltFn: () => ({ kind: 'prebuilt', commit: 'a'.repeat(40) }),
+        stalenessFn: () => ({ stale: true, reason: 'source-newer' }),
+        depsCheckFn: () => ({ ok: false, missing: ['next'] }),
+        installFn: async () => { installCalls += 1; return { exitCode: 0, durationMs: 0 }; },
+        buildFn: async () => { buildCalls += 1; return { exitCode: 0, cwd: '', durationMs: 0 }; },
+        bgLaunchFn: async () => ({ exitCode: 0, pid: 1 }),
+        readShareSwitchFn: () => 'disabled',
+        shareProbeFn: async () => ({ installed: false, alive: false }),
+        registerInstanceFn: () => { /* */ },
+      });
+      expect(installCalls).toBe(0);
+      expect(buildCalls).toBe(0);
+    }
+  });
+
   test('autoInstall=true + deps OK → installFn NOT called', async () => {
     let installCalls = 0;
     let buildCalls = 0;

@@ -23,6 +23,13 @@ import type { WheelRoute } from '../pty-shell/registry.js';
 import { withNewDefaults } from './cli-args.js';
 import type { ElsResult } from './core.js';
 import type { ElsRequest } from './server.js';
+import { closeLayer, emptyStack, focusLayer, focusTop, updateLayer, visibleLayers, type OverlayLayer, type OverlayStack } from './overlay-stack.js';
+import { composeLayers, createLayerPainter, overlayMouse, type LayerRenderer } from './overlay-compose.js';
+import type { KeyAnswer, OpenAnswer } from './elements/element.js';
+import { openCommand, type FilesOpen } from './elements/files-view.js';
+import { createPopupTerm, isPopupRow } from './popup-term-client.js';
+import { POPUP_WS } from './elements/term.js';
+import { resolveRect, shownIn } from './overlay-stack.js';
 import { assignSlots, drawTileFrame, modelOf, parseStageFeed, spaceTile, stageHeader, stageLane, stageRibbon, tileLayout, type StageFeed, moveFocus, tileGrid, MAX_TILES, TILE_REFRESH_MS, type TileFrameInput, type TileGridSpec, type TileInput } from './tile-view.js';
 
 /** ELS-STALE-CLIENT: the one-line hint while this client is older than the server it talks to. */
@@ -79,9 +86,28 @@ export interface AttachAppDeps {
   readonly stageWatch?: (workspaces: readonly string[]) => { readonly key: string; readonly ws: string; readonly readFeed: () => string | undefined } | undefined;
   /** SIDETAB-LOOP-AGENTS-UNDER-SPACE: loop-agent facts for the heartbeat rows (cached registry read; absent = plain rows). */
   readonly loopFacts?: import('./loop-agents.js').LoopFactsSource;
+  /** ELS-ZAXIS S2: the els server's overlay stack, pushed on change (never polled). The client draws it and routes input through
+   *  it but never edits its copy: a click or Esc goes back to the server as an act. Absent = no overlays (an older server, tests). */
+  readonly overlays?: OverlayDeps;
   readonly remote?: { readonly list: () => Promise<ElsResult>; readonly read: (address: string) => Promise<ElsResult>;
     /** REMOTE-PANE-SIZE: set the remote pane's PTY to this viewer's pane area (the remote SIGWINCH). */
     readonly resize?: (address: string, cols: number, rows: number) => Promise<ElsResult> };
+}
+
+/** ELS-ZAXIS S2: what the app needs from the overlay owner (the els server). */
+export interface OverlayDeps {
+  /** Calls `onStack` with the current stack at once and with every newer stack after; `close` ends the stream. */
+  readonly watch: (onStack: (stack: OverlayStack) => void) => { readonly close: () => void };
+  /** Ask the server to change the stack (raise/focus on a click, close on Esc). The answer comes back through `watch`. */
+  /** May answer (the server's reply, or a promise of it): a `frame` answer naming a `pane` = the new tab to move to. */
+  readonly act?: (act: { readonly action: 'close' | 'raise' | 'focus' | 'update' | 'frame' | 'move' | 'resize'; readonly id: string; readonly props?: unknown; readonly frame?: 'next';
+    readonly dx?: number; readonly dy?: number; readonly view?: { readonly cols: number; readonly rows: number } }) => unknown;
+  /** Element renderers by kind (unknown kinds draw a framed box with their kind). */
+  readonly renderers?: Readonly<Record<string, LayerRenderer>>;
+  /** Element key reducers by kind: 'consumed' keeps the key, 'pass' hands it down the focus stack. */
+  readonly keys?: Readonly<Record<string, (layer: OverlayLayer, bytes: string) => KeyAnswer | OpenAnswer>>;
+  /** ELS-POPUP-STYLE: changes when every layer must repaint (the popup style) — part of the paint cache key. */
+  readonly paintKey?: () => string;
 }
 
 export interface AttachApp {
@@ -98,6 +124,7 @@ type Confirm = { readonly what: 'close' | 'close-workspace' | 'quit'; readonly t
 export function createAttachApp(deps: AttachAppDeps): AttachApp {
   const router = createKeyRouter();
   let rows: PaneRow[] = [];                                      // this host's panes, from the owner
+  let popupRows: PaneRow[] = [];                                 // ELS-POPUP-TERM: popup terminal panes (never listed, tabbed or tiled)
   let remoteRows: PaneRow[] = [];                                // other hosts' panes, from the federated list (cached)
   let remoteEmpty: ReturnType<typeof emptyRemoteCoordinators> = [];
   let lastLocal = deps.memory.load().lastPane;                    // the last LOCAL pane: a remote selection is not remembered
@@ -204,14 +231,47 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   // excluded — it has no release) is answered by swallowing its release; a press that went to the pane program is answered by
   // passing its release to the pane too, wherever the pointer is let go — the pane saw the press and waits for the release.
   let pressConsumed = false;
+  // ELS-POPUP-MOVE/RESIZE (대표 11-26 B2): a press on a layer's title row (or its bottom-right corner) and the release at
+  // another cell = a drag. Only the SGR press/release reports the app already receives — no mouse mode is turned on.
+  let layerDrag: { readonly id: string; readonly mode: 'move' | 'resize'; readonly x: number; readonly y: number } | undefined;
+  const layerView = (): { cols: number; rows: number } => ({ cols: deps.size().cols, rows: deps.size().rows - 1 });
   const handleMouse = (report: MouseReport): void => {
     if (report.release) {
       const swallow = pressConsumed;
       pressConsumed = false;
+      const drag = layerDrag;
+      layerDrag = undefined;
+      if (drag && (report.x !== drag.x || report.y !== drag.y)) deps.overlays?.act?.({ action: drag.mode, id: drag.id, dx: report.x - drag.x, dy: report.y - drag.y, view: layerView() });
       if (!swallow && attached) attached.input(report.bytes);
       return;
     }
     const wheel = (report.button & 0x40) !== 0;
+    // ELS-ZAXIS S2: overlay layers are above everything but the status line — z-order hit test first. A click on a layer is the
+    // layer's (asked of the server: raise + focus); outside a blocking layer it is swallowed; otherwise it falls through to
+    // the tabs, the side list and the pane exactly as before. focus:'none' layers (toasts) are always clicked through.
+    if (overlay.layers.length) {
+      const hit = overlayMouse(overlay, { cols: mouseLayout.cols, rows: mouseLayout.rows - 1 }, report.x, report.y, overlayWs());
+      // A wheel over a layer belongs to the layer: three rows up/down for the focused one, swallowed otherwise (it never
+      // scrolls the pane under the popup).
+      if (hit && wheel) {
+        const top = focusTop(overlay, overlayWs());
+        if (hit.kind === 'layer' && top.kind === 'layer' && top.layer.id === hit.layer.id) {
+          if (hit.layer.kind === 'term') popupTerm.scroll((report.button & 1) ? -3 : 3);   // ELS-POPUP-TERM: its own scrollback
+          else overlayKey((report.button & 1) ? '\u001b[B\u001b[B\u001b[B' : '\u001b[A\u001b[A\u001b[A');   // arrows (main: wheel = arrows)
+        }
+        return;
+      }
+      if (hit) {
+        pressConsumed = true;
+        if (hit.kind === 'layer') {
+          baseFocus = false;
+          deps.overlays?.act?.({ action: 'raise', id: hit.layer.id }); deps.overlays?.act?.({ action: 'focus', id: hit.layer.id });
+          if (report.button === 0 && hit.local.y === 0) layerDrag = { id: hit.layer.id, mode: 'move', x: report.x, y: report.y };
+          else if (report.button === 0 && hit.local.x === hit.box.w - 1 && hit.local.y === hit.box.h - 1) layerDrag = { id: hit.layer.id, mode: 'resize', x: report.x, y: report.y };
+        }
+        return;
+      }
+    }
     // ELS-EXIT-BG-BUTTONS: a left click on the bottom line hits ⏏ 백그라운드 / ✕ 종료 (the rest of that line does nothing).
     if (report.y === mouseLayout.rows && mouseLayout.rows > 0) {
       pressConsumed = !wheel;
@@ -319,6 +379,31 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   // ---- ELS-TILE-MODE: the live grid. Screens come from the server's memory (`tile-frame`), ~2 fps, single-flight; the
   // frame writer repaints only changed rows. Tile mode is read-only: arrows/hjkl move the focus, Enter zooms in.
   let tileMode = false;
+  // ELS-ZAXIS S2: the last pushed overlay stack (the server is its only author) and its painter (render cache by layer).
+  let overlay: OverlayStack = emptyStack();
+  let overlayWatch: { close: () => void } | undefined;
+  let overlayServerRev = -1;
+  let baseFocus = false;                                          // A2: ctrl+b Tab gave this view's keys to the pane under the layers
+  // ELS-POPUP-TERM: the popup terminal's attach stream, its renderer (the live screen) and its cursor.
+  const popupTerm = createPopupTerm({
+    attach: (pane, size, handlers) => deps.attach(pane, size, handlers),
+    request: (request) => deps.request(request),
+    render: () => { if (!finished) render(); },
+    popupRows: () => popupRows,
+    act: (one) => deps.overlays?.act?.(one),
+    layerPane: (id) => (overlay.layers.find((one) => one.id === id)?.props as { pane?: string } | undefined)?.pane,
+    create: async () => {
+      const row = current();
+      const input = withNewDefaults({ command: [], ws: POPUP_WS, title: 'popup' }, deps.env, row && !row.remote && row.cwd ? row.cwd : deps.cwd);
+      const made = await deps.request({ op: 'new', ...input });
+      if (made.exitCode !== 0) { note = made.message; return undefined; }
+      const pane = (JSON.parse(made.message) as { pane?: unknown }).pane;
+      await refresh(true);
+      return typeof pane === 'string' ? pane : undefined;
+    },
+    note: (text) => { note = text; render(); },
+  });
+  const paintLayer = createLayerPainter({ ...(deps.overlays?.renderers ?? {}), term: (layer, size, focused) => popupTerm.render(layer, size, focused) }, deps.overlays?.paintKey);
   let tileWs = deps.tile?.ws;
   let tileGridSpec: TileGridSpec = deps.tile?.grid ?? 'auto';
   let stageLayoutSeq = 0;
@@ -440,7 +525,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     const layout = frameLayout(view);
     if (layout.page !== tilePage) { tilePage = layout.page; view = { ...view, page: tilePage }; }
     if (tileFocus >= layout.visible.length) { tileFocus = Math.max(0, layout.visible.length - 1); view = { ...view, focus: tileFocus }; }
-    deps.write(drawTileFrame(view));
+    deps.write(drawTileFrame(view, layerBoxes(view.cols, view.rows)));
   };
   const pollTiles = async (): Promise<void> => {
     if (!tileMode || tileBusy || finished) return;
@@ -519,13 +604,23 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     if (row.pane === selected) { selected = undefined; }
     select(row.pane);
   };
-  const tileKey = (text: string): void => {
+  const tileKey = (keys: string): void => {
+    let text = keys;
+    if (!tileArmed) {                                              // ELS-ZAXIS S2: a focused layer over the grid takes keys first
+      const rest = overlayKey(text);
+      if (rest !== undefined) { if (!rest) return; text = rest; }
+    }
     let rest = text;
     while (rest) {
       if (tileArmed) {
         tileArmed = false;
         const char = rest[0]!; rest = rest.slice(1);
+        if ((char === 'q' || char === '\u001b') && termFocused()) { hideTerm(); continue; }   // ELS-POPUP-TERM over the grid
+        if (char === 'x' && termFocused()) { killTerm(); continue; }
+        if (char === 'm' && termFocused()) { dockTerm(); continue; }   // to a tab: it joins this grid
+        if (char === '`') { toggleTerm(); continue; }
         if (char === 'q') { finish(0, ''); return; }
+        if (char === 'f') { openFiles(); continue; }              // ELS-FILES: over the grid too
         continue;                                               // t (already tiled) and every other prefix key: nothing
       }
       const arrow = /^\u001b(?:\[|O)([ABCD])/.exec(rest);
@@ -557,14 +652,230 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     }
   };
 
+  // ELS-ZAXIS S2: the workspace whose pin:'space' layers show — the tile grid's space, else the selected tab's (or empty space's).
+  const overlayWs = (): string | undefined => tileMode ? tileRows()[0]?.wsId : current()?.wsId ?? selectedEmpty;
+  /** ELS-OBSIDIAN-KEY (대표 11-26): ctrl+b o toggles the Obsidian popup of this view's workspace — close the one shown here,
+   *  else open one owned by this workspace. Both go to the server as acts (the stack's only author). */
+  const toggleObsidian = (): void => {
+    const ws = overlayWs();
+    const shown = visibleLayers(overlay, ws).filter((layer) => layer.kind === 'obsidian').at(-1);
+    void deps.request(shown ? { op: 'overlay', action: 'close', id: shown.id } : { op: 'overlay', action: 'open', kind: 'obsidian', props: {}, ...(ws ? { ws } : {}) }).catch(() => undefined);
+  };
+  /** ELS-POPUP-TERM: the visible term layer (if any) and its box for this view size. */
+  const termLayer = (cols: number, height: number) => {
+    const layer = overlay.layers.find((one) => one.kind === 'term' && shownIn(one, overlayWs()));
+    return layer ? { layer, box: resolveRect(layer.rect, { cols, rows: height - 1 }) } : undefined;
+  };
+  const layerBoxes = (cols: number, height: number) => {
+    if (!overlay.layers.length) { popupTerm.sync(undefined, undefined); return []; }
+    const shownTerm = termLayer(cols, height);
+    popupTerm.sync(shownTerm?.layer, shownTerm?.box);
+    if (shownTerm && !(shownTerm.layer.props as { pane?: string } | undefined)?.pane) popupTerm.materialize(shownTerm.layer);
+    // The paint cache keys on props: a new PTY frame must repaint the term box (local copy only — never sent).
+    const stack = shownTerm ? updateLayer(overlay, shownTerm.layer.id, { props: { ...(shownTerm.layer.props as object ?? {}), frame: popupTerm.frameSeq() } }) : overlay;
+    return composeLayers(stack, { cols, rows: height - 1 }, overlayWs(), paintLayer);
+  };
+  /** ELS-POPUP-TERM: is the popup terminal the focus owner? (then keys, Esc and ctrl-c go to its PTY) */
+  const termFocused = (): boolean => { if (baseFocus || !overlay.layers.length) return false; const top = focusTop(overlay, overlayWs()); return top.kind === 'layer' && top.layer.kind === 'term'; };
+  /** Where the terminal cursor goes: the PTY cursor inside the focused term box, else undefined. */
+  const termCursor = (cols: number, height: number): { x: number; y: number } | undefined => {
+    if (!termFocused()) return undefined;
+    const shown = termLayer(cols, height);
+    const at = popupTerm.cursor();
+    return shown && at ? { x: shown.box.x + at.x, y: shown.box.y + at.y } : undefined;
+  };
+  const cursorProps = (cols: number, height: number) => { const at = termCursor(cols, height); return at ? { cursorAt: at } : overlayFocused() ? { hideCursor: true } : {}; };
+  /** ctrl+b ` : show the popup terminal (reuse the live one, else a new shell) or hide it (the process keeps running). */
+  const toggleTerm = (): void => {
+    const shown = overlay.layers.find((one) => one.kind === 'term' && shownIn(one, overlayWs()));
+    if (shown) { hideTerm(); return; }
+    const live = popupRows.find((row) => row.state !== 'exited');
+    void deps.request({ op: 'overlay', action: 'open', kind: 'term', props: live ? { pane: live.pane } : {} }).then((answer) => {
+      if (answer.exitCode !== 0 && !finished) { note = answer.message; render(); }
+    }, () => undefined);
+  };
+  const hideTerm = (): void => {
+    const layer = overlay.layers.find((one) => one.kind === 'term');
+    if (!layer) return;
+    overlay = closeLayer(overlay, layer.id); deps.overlays?.act?.({ action: 'close', id: layer.id });
+    note = 'Terminal hidden — ctrl+b ` brings it back'; render();
+  };
+  /** ctrl+b x on the popup terminal: close it — the server kills that pane's process (exact pid, through its holder). */
+  const killTerm = (): void => {
+    const layer = overlay.layers.find((one) => one.kind === 'term');
+    const pane = (layer?.props as { pane?: string } | undefined)?.pane;
+    if (layer) { overlay = closeLayer(overlay, layer.id); deps.overlays?.act?.({ action: 'close', id: layer.id }); }
+    // Only that pane — never the els-popup workspace (another `els term` may be running there).
+    if (pane && popupRows.some((row) => row.pane === pane)) {
+      void deps.request({ op: 'close', pane, confirmed: true }).then(async (answer) => {
+        note = answer.exitCode === 0 ? 'Terminal closed' : `Terminal not closed: ${answer.message}`;
+        return refresh();
+      }, () => { note = 'Terminal close outcome unknown'; render(); });
+    }
+    note = 'Closing the terminal…'; render();
+  };
+  /** ctrl+b m on the popup terminal: move it into this space as an ordinary tab (z > 0 → z = 0). */
+  const dockTerm = (): void => {
+    const layer = overlay.layers.find((one) => one.kind === 'term');
+    const row = popupRows.find((one) => one.pane === (layer?.props as { pane?: string } | undefined)?.pane);
+    const target = tileMode ? tileRows().find((one) => !one.remote)?.wsId : current() && !current()!.remote ? current()!.wsId : undefined;
+    if (!layer || !row?.tabId || !target) { note = 'Nothing to move'; render(); return; }
+    overlay = closeLayer(overlay, layer.id); deps.overlays?.act?.({ action: 'close', id: layer.id });
+    void deps.request({ op: 'move-tab', tab: row.tabId, ws: target }).then(async (answer) => {
+      note = answer.exitCode === 0 ? 'Terminal moved to a tab' : answer.message;
+      await refresh();
+      if (answer.exitCode !== 0) { render(); return; }
+      if (!tileMode) { select(row.pane); return; }
+      const at = frameLayout(frameInput()).visible.findIndex((one) => one?.pane === row.pane);   // over the grid: focus its tile
+      if (at >= 0) tileFocus = at;
+      renderTile();
+    }, () => undefined);
+  };
+  /** The prefix actions the popup terminal takes while it has focus (true = handled). */
+  const termAction = (action: KeyAction): boolean => {
+    if (!termFocused()) return false;
+    if (action === 'detach') { hideTerm(); return true; }
+    if (action === 'close') { killTerm(); return true; }
+    if (action === 'move-tab') { dockTerm(); return true; }
+    return false;
+  };
+  // A focused layer reads a lone Esc as «close me»: paste detection would hold it back as a possible paste start.
+  const overlayFocused = (): boolean => !baseFocus && overlay.layers.length > 0 && focusTop(overlay, overlayWs()).kind === 'layer';
+  /** ELS-SIDECHAT-EDGE A2: ctrl+b Tab — the keys go round the visible focusable layers top-down (by z), then the pane under
+   *  them (this view only), then the top again. Focus never moves a layer in z (no raise); toasts (focus:'none') are skipped. */
+  const cycleFocus = (): void => {
+    const ring = [...visibleLayers(overlay, overlayWs()).filter((layer) => layer.focus !== 'none')].reverse();
+    if (!ring.length) { note = 'ctrl+b Tab: no layer to focus'; render(); return; }
+    const top = focusTop(overlay, overlayWs());
+    const slots = ring.some((layer) => layer.blocking) ? ring.length : ring.length + 1;   // a blocking layer keeps the keys: no pane slot
+    const at = baseFocus || top.kind !== 'layer' ? slots - 1 : ring.findIndex((layer) => layer.id === top.layer.id);
+    const next = ring[(at + 1) % slots];
+    if (!next) { baseFocus = true; note = 'keys → pane · ctrl+b Tab back to the layers'; render(); return; }
+    baseFocus = false;
+    note = '';
+    overlay = focusLayer(overlay, next.id);
+    deps.overlays?.act?.({ action: 'focus', id: next.id });
+    render();
+  };
+  /** A key for the focused overlay layer: true = it took the key (nothing else sees it). Esc closes the layer (server act). */
+  /** Keys for the focused overlay layer, one key at a time (a terminal read can carry «jjj» or «k\r» in one chunk). Returns
+   *  undefined when no layer has focus (the normal path), else the bytes the layer passed down (''= it took them all).
+   *  Esc closes the layer (server act). An update is applied to the local copy at once, so the next key in the same chunk
+   *  (and the next frame) sees it; the server's push then confirms it. */
+  const overlayKey = (bytes: string): string | undefined => {
+    if (!overlay.layers.length || baseFocus) return undefined;
+    const top = focusTop(overlay, overlayWs());
+    if (top.kind !== 'layer') return undefined;
+    if (top.layer.kind === 'term') { popupTerm.input(bytes); return ''; }   // ELS-POPUP-TERM: every key (Esc, ctrl-c) to the PTY
+    let layer = top.layer;
+    let passed = '';
+    let changed = false;
+    for (const key of bytes.match(/\u001b\[[0-9;?<>]*[ -\/]*[@-~]|\u001bO[@-~]|[\s\S]/gu) ?? []) {
+      if (key === '\u0014') { followTab(deps.overlays?.act?.({ action: 'frame', id: layer.id, frame: 'next' })); return passed; }   // ELS-ELEMENT-HOST ctrl+t: popup → tile → tab
+      const handled = deps.overlays?.keys?.[layer.kind]?.(layer, key) ?? 'pass';
+      if (typeof handled === 'object' && 'open' in handled) {        // ELS-FILES: the element asks to open something elsewhere
+        overlay = closeLayer(overlay, layer.id); deps.overlays?.act?.({ action: 'close', id: layer.id }); render();
+        void openFromElement(handled.open);
+        return passed;
+      }
+      // Esc closes the layer — unless the element uses it itself (an `update`: e.g. leaving the Obsidian search line) or the
+      // layer holds Esc (ELS-TAKEOUT: props.holdEsc, server-set — a chooser/confirm row cancels instead).
+      if (key === '\u001b' && typeof handled !== 'object' && (layer.props as { holdEsc?: unknown } | undefined)?.holdEsc !== true) { overlay = closeLayer(overlay, layer.id); deps.overlays?.act?.({ action: 'close', id: layer.id }); render(); return passed; }
+      if (typeof handled === 'object') {
+        // Optimistic first, then the act: a server that answers at once (its push lands inside the act) wins over the
+        // local guess instead of being overwritten by it.
+        const props = { ...(layer.props && typeof layer.props === 'object' ? layer.props as object : {}), ...(handled.update && typeof handled.update === 'object' ? handled.update as object : {}) };
+        if (!('note' in (handled.update as object))) delete (props as { note?: unknown }).note;
+        layer = { ...layer, props };
+        overlay = updateLayer(overlay, layer.id, { props });
+        changed = true;
+        deps.overlays?.act?.({ action: 'update', id: layer.id, props: handled.update });
+        layer = overlay.layers.find((one) => one.id === layer.id) ?? layer;
+      // A focused `owns` layer keeps every key it does not use (ctrl-c, arrows, a paste, Korean IME text never reach the pane
+      // under it; ctrl+b actions are routed before this). Only a `participates` layer hands unused keys down; a blocking
+      // layer always keeps them.
+      } else if (handled === 'pass' && layer.focus === 'participates' && !layer.blocking) passed += key;
+    }
+    if (changed) render();
+    return passed;
+  };
+  /** ELS-ELEMENT-HOST-FU ①: the viewer that pressed ctrl+t follows its element into the new tab (other viewers stay). */
+  const followTab = (answer: unknown): void => {
+    void Promise.resolve(answer).then(async (reply) => {
+      const result = reply as { exitCode?: unknown; message?: unknown } | undefined;
+      if (!result || result.exitCode !== 0 || typeof result.message !== 'string') return;
+      let pane: unknown;
+      try { pane = (JSON.parse(result.message) as { frame?: unknown; pane?: unknown }).frame === 'tab' ? (JSON.parse(result.message) as { pane?: unknown }).pane : undefined; } catch { return; }
+      if (typeof pane !== 'string' || finished) return;
+      await refresh();
+      if (finished || !everyRow().some((row) => row.pane === pane)) return;
+      if (tileMode) { tileMode = false; if (tileTimer !== undefined) { deps.clearInterval(tileTimer); tileTimer = undefined; } tileScreens.clear(); }
+      select(pane);
+    }).catch(() => undefined);
+  };
+  // ELS-POPUP-MOVE/RESIZE (대표 11-26 B2): ctrl+b r on a focused layer = a mode where ←↑↓→ / hjkl move it one cell,
+  // ⇧+arrows / HJKL resize it (bottom-right corner), Enter · Esc · r end the mode. Every step is one server act.
+  let layerMoving: string | undefined;
+  const LAYER_MOVE_NOTE = 'Move: ←↑↓→/hjkl move · ⇧←↑↓→/HJKL resize · Enter done';
+  const startLayerMove = (): void => {
+    const top = overlay.layers.length ? focusTop(overlay, overlayWs()) : undefined;
+    if (top?.kind !== 'layer') { note = 'ctrl+b r: no focused popup to move'; render(); return; }
+    layerMoving = top.layer.id; note = LAYER_MOVE_NOTE; render();
+  };
+  const layerMoveKeys = (bytes: string): void => {
+    const id = layerMoving;
+    if (!id || !overlay.layers.some((one) => one.id === id)) { layerMoving = undefined; note = ''; render(); return; }
+    const delta = { move: { dx: 0, dy: 0 }, resize: { dx: 0, dy: 0 } };
+    let done = false;
+    for (const key of bytes.match(/\u001b\[1;2[ABCD]|\u001b\[[ABCD]|\u001bO[ABCD]|[\s\S]/gu) ?? []) {
+      const arrow = /([ABCD])$/.exec(key)?.[1];
+      const shifted = key.startsWith('\u001b[1;2');
+      const dir = arrow && key.length > 1 ? arrow : ({ k: 'A', j: 'B', l: 'C', h: 'D', K: 'A', J: 'B', L: 'C', H: 'D' } as Record<string, string>)[key];
+      if (dir) {
+        const into = shifted || /^[HJKL]$/.test(key) ? delta.resize : delta.move;
+        if (dir === 'A') into.dy--; else if (dir === 'B') into.dy++; else if (dir === 'C') into.dx++; else into.dx--;
+      } else if (key === '\r' || key === '\n' || key === '\u001b' || key === 'r' || key === 'q') done = true;
+    }
+    if (delta.move.dx || delta.move.dy) deps.overlays?.act?.({ action: 'move', id, ...delta.move, view: layerView() });
+    if (delta.resize.dx || delta.resize.dy) deps.overlays?.act?.({ action: 'resize', id, ...delta.resize, view: layerView() });
+    if (done) { layerMoving = undefined; note = ''; render(); }
+  };
+  /** ELS-FILES: ctrl+b f — the file browser over the panes, rooted at the focused pane's cwd. */
+  const openFiles = (): void => {
+    const row = current();
+    const dir = row && !row.remote && row.cwd ? row.cwd : deps.cwd;
+    const ws = overlayWs();
+    void deps.request({ op: 'overlay', action: 'open', kind: 'files', props: { dir }, ...(ws ? { ws } : {}) }).then((answer) => {
+      if (answer.exitCode !== 0 && !finished) { note = answer.message; render(); }
+    }, () => undefined);
+  };
+  /** ELS-FILES: what an element's `open` ask does — a pager/editor tab (argv, no shell), the same as a tile, the sidechat
+   *  with the file as context, or the path typed into the pane under the popup (never sent: the person presses Enter). */
+  const openFromElement = async (open: FilesOpen): Promise<void> => {
+    if (finished) return;
+    const row = current();
+    if (open.how === 'sidechat') { await deps.request({ op: 'overlay', action: 'open', kind: 'sidechat', props: { input: '', ...(open.context ? { edit: { kind: 'type', text: open.context } } : {}) } }).catch(() => undefined); return; }
+    if (open.how === 'attach') {
+      if (!row || row.remote || !attached) { note = 'No local pane to attach the file to'; render(); return; }
+      // ELS-FILES-SSH: a remote file goes in as a «host:path» reference (nothing is downloaded behind the person's back).
+      const full = open.host ? `${open.host}:${open.path}` : open.path;
+      const ref = /\s/.test(full) ? `"${full.replace(/(["\\$`])/g, '\\$1')}"` : full;
+      attached.input(`\u001b[200~${ref} \u001b[201~`);
+      note = `${open.title} → ${tabName(row.title)} input (Enter to send)`; render(); return;
+    }
+    const ws = row && !row.remote ? row.workspace : undefined;
+    const made = await create(ws, { command: openCommand(open, deps.env), title: open.title });
+    if (made === true && open.how === 'tile' && !tileMode) enterTile();
+  };
   const render = (frameOnly = false): void => {
     if (finished) return;
     if (tileMode) { renderTile(); return; }
     const { cols, rows: height } = deps.size();
     if (frameOnly && chrome && chrome.cols === cols && chrome.height === height && !newTab.isOpen() && !movePicker) {
       const kept = chrome;
+      const layers = layerBoxes(cols, height);
       deps.write(composeView({ cols, rows: height, sidebar: kept.sidebar, frame, status: statusText(), buttons: buttonsLayout(cols).text,
-        ...(kept.tabs.line !== undefined ? { tabRow: kept.tabs.line } : {}), ...(kept.overlay ? { overlay: kept.overlay } : {}) }));
+        ...(kept.tabs.line !== undefined ? { tabRow: kept.tabs.line } : {}), ...(kept.overlay ? { overlay: kept.overlay } : {}), ...(layers.length ? { layers } : {}), ...cursorProps(cols, height) }));
       return;
     }
     const width = sidebarWidthFor(cols, sidebarOpen);
@@ -592,8 +903,9 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     mouseLayout = { cols, rows: height, sidebarWidth: width, sidebar: list?.spaces ?? [], ...(list?.newBox ? { sidebarNew: list.newBox } : {}), tabs: tabs.tabs, ...(tabs.plus ? { plus: tabs.plus } : {}),
       ...(list?.scroll ? { sidebarScroll: list.scroll } : {}), ...(list?.spacesScroll ? { spacesScroll: list.spacesScroll } : {}), ...(list?.agentsTop !== undefined ? { agentsTop: list.agentsTop } : {}), ...(tabs.prev ? { tabPrev: tabs.prev } : {}), ...(tabs.next ? { tabNext: tabs.next } : {}) };
     chrome = { cols, height, width, tabs, ...(overlay ? { overlay } : {}), sidebar: list ? list.lines : null };
+    const layers = layerBoxes(cols, height);
     const screen = composeView({ cols, rows: height, sidebar: list ? list.lines : null, frame, status: statusText(), buttons: buttonsLayout(cols).text,
-      ...(tabs.line !== undefined ? { tabRow: tabs.line } : {}), ...(overlay ? { overlay } : {}),
+      ...(tabs.line !== undefined ? { tabRow: tabs.line } : {}), ...(overlay ? { overlay } : {}), ...(layers.length ? { layers } : {}), ...cursorProps(cols, height),
       // ELS-APP-RENDER-SINGLE-FRAME: the dialog is spliced into the same frame — one write, never a second overlay pass.
       ...(newTab.isOpen() ? { dialog: newTab.box(cols, height, width ? width + 1 : 0) } : movePicker ? { dialog: movePicker.picker.box(cols, height, width ? width + 1 : 0) } : {}) });
     deps.write(screen);
@@ -605,6 +917,8 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     escapePending = '';
     deps.clearInterval(timer);
     if (tileTimer !== undefined) { deps.clearInterval(tileTimer); tileTimer = undefined; }
+    overlayWatch?.close(); overlayWatch = undefined;
+    popupTerm.dispose();
     generation++;
     attached?.detach();
     resolveDone({ code, message });
@@ -808,6 +1122,8 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     if (selectedEmpty && selectedEmpty === emptyFocusPending) flushEmptyFocus();
     const before = rows;
     rows = parsePaneRows(answer.message);
+    popupRows = rows.filter(isPopupRow);                         // ELS-POPUP-TERM: the reserved workspace stays out of every view
+    rows = rows.filter((row) => !isPopupRow(row));
     lsAnswer = answer.message;
     staleClient = deps.ownBuild ? clientIsStale(deps.ownBuild, answer.message) : false;
     try {
@@ -1128,15 +1444,29 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
           return;
         }
         if (dropdown && event.kind === 'input') { dropdownKey(event.bytes); return; }
+        if (layerMoving && event.kind === 'input') { layerMoveKeys(event.bytes); return; }   // ELS-POPUP-MOVE: ctrl+b r mode
+        let input = event;                                              // ELS-ZAXIS S2: the focus stack's top layer first
+        if (event.kind === 'input') {
+          const rest = overlayKey(event.bytes);
+          if (rest !== undefined) { if (!rest) return; input = { ...event, bytes: rest }; }
+        }
         if (event.kind === 'mouse') handleMouse(event.report);
         else if (event.kind === 'input') {
-          if (current()?.remote) { note = `⇄${current()!.remote} pane 은 읽기 전용 — 입력은 els do ${current()!.pane} <글>`; render(); } else attached?.input(event.bytes);
+          if (current()?.remote) { note = `⇄${current()!.remote} pane 은 읽기 전용 — 입력은 els do ${current()!.pane} <글>`; render(); } else attached?.input(input.kind === 'input' ? input.bytes : event.bytes);
         }
-        else if (event.kind === 'action') act(event.action, event.n);
+        else if (event.kind === 'action') { if (!termAction(event.action)) act(event.action, event.n); }
         else if (event.key === ':') voice.open();                  // ELS-VOICE-CONTROL-POPUP: say it to els
+        else if (event.key === '/') { const over = current(); void deps.request({ op: 'overlay', action: 'open', kind: 'sidechat', props: over && !over.remote ? { pane: over.pane } : {} }).catch(() => undefined); }   // ELS-SIDECHAT (? = help) · A1: the pane under it, for ctrl+o context
+        else if (event.key === 'o') toggleObsidian();             // ELS-OBSIDIAN-KEY: open/close this workspace's Obsidian popup
+        else if (event.key === '\t') cycleFocus();                 // ELS-SIDECHAT-EDGE A2: focus ring over the layers and the pane
+        else if (event.key === 'M') void deps.request({ op: 'overlay', action: 'open', kind: 'memo', props: {} }).catch(() => undefined);   // ELS-MEMO: the memo pad
+        else if (event.key === 'f') openFiles();                 // ELS-FILES: the file browser popup
+        else if (event.key === '`') toggleTerm();                 // ELS-POPUP-TERM: show / hide the popup terminal
+        else if (event.key === '\u001b') { if (termFocused()) hideTerm(); }   // ctrl+b Esc: hide it (a lone Esc goes to the PTY)
+        else if (event.key === 'r') startLayerMove();             // ELS-POPUP-MOVE/RESIZE: move · resize the focused layer
         else if (event.key === 'Q') quitSpace();                  // ELS-EXIT-BG-BUTTONS: ✕ 종료 by key (ctrl+b q = ⏏ 백그라운드)
         else { note = `ctrl+b ${event.key} 는 아직 없음`; render(); }
-      }, !newTab.isOpen() && !movePicker && !dropdown && !confirm && !voice.isOpen());
+      }, !newTab.isOpen() && !movePicker && !dropdown && !confirm && !voice.isOpen() && !overlayFocused());
       wasSavingAtInput = newTab.isSaving();
   };
 
@@ -1226,6 +1556,10 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
             }
           }).catch((error: unknown) => finish(1, `els: ${error instanceof Error ? error.message : String(error)}`));
         }, deps.pollMs);
+        // ELS-ZAXIS S2: the overlay stack arrives by push; a stack is applied only when its rev differs (replays are no-ops).
+        // The last applied SERVER rev is kept apart from the local copy: optimistic local edits (Esc, key updates) bump the
+        // local rev too, and must never make a newer server push look like a replay.
+        overlayWatch = deps.overlays?.watch((stack) => { if (finished || stack.rev === overlayServerRev) return; overlayServerRev = stack.rev; if (stack.focus.at(-1) !== overlay.focus.at(-1)) baseFocus = false; overlay = stack; render(); });   // A2: a newly focused layer takes the keys back
         await refresh(false, pane);
         // A run already active when this window opened is not «new»: remember it once the workspaces are listed.
         if (deps.stageWatch) { try { stageWatchKey = deps.stageWatch(myWorkspaces())?.key; } catch { /* no runs dir */ } }

@@ -337,3 +337,33 @@ test('fix titles are a single output-only line; git failure leaves them unknown'
     expect(missingFixCommitTitles(f.deps.cliRoot!, old, next, () => ({ status: 1, stdout: '', stderr: 'bad' }))).toContain('판정 불가');
   } finally { f.cleanup(); }
 });
+
+test('trigger hook: normal install and edge rail run once only after success', async () => {
+  for (const edge of [false, true]) {
+    const f = setup();
+    const events: string[] = [];
+    try {
+      f.deps.kickDocsIndex = () => {};
+      f.deps.notice = () => {};
+      f.deps.triggerRegisterRunner = (command, args) => { events.push([command, ...args].join(' ')); return { status: 0 }; };
+      const result = await runUpdateForInstallation(edge ? { auto: true, seat: 'OP', quietWindow: true } : { from: f.deps.cliRoot, dev: true, restart: false }, { cliRoot: f.deps.cliRoot, checkout: f.deps });
+      if (result.exitCode !== 0) throw new Error(JSON.stringify({ edge, result }));
+      expect(events).toEqual(edge ? [`${f.root}/bin/elanous loop trigger register --update`] : []);
+    } finally { f.cleanup(); }
+  }
+});
+
+test('trigger hook: dry run, failed installation and failed edge health do not register', async () => {
+  for (const mode of ['dry', 'fail', 'health'] as const) {
+    const f = setup(); let registrations = 0;
+    try {
+      f.deps.kickDocsIndex = () => {};
+      f.deps.notice = () => {};
+      f.deps.triggerRegisterRunner = () => { registrations++; return { status: 0 }; };
+      if (mode === 'fail') f.setFail();
+      if (mode === 'health') f.deps.verifyRestart = async () => ({ ok: false });
+      await runUpdateForInstallation({ auto: true, seat: 'OP', quietWindow: true, dryRun: mode === 'dry' }, { cliRoot: f.deps.cliRoot, checkout: f.deps });
+      expect(registrations).toBe(0);
+    } finally { f.cleanup(); }
+  }
+});

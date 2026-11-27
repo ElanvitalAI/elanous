@@ -46,3 +46,23 @@ export function cellWaitOf(cellId: string, facts: WaitFacts): CellWait | null {
   if (waits.some((w) => w === null)) return null;
   return waits[0]!;
 }
+
+// PR-DONE (CEO 11-27 07:3x · revised 07:5x OPS-RULES «처리량 정책 개정 11-27» ①②): the land line owns the receipt and the
+// main merge. A hand's «done» is the PR handed off — its branch pushed and its worktree clean (pregate's AUTHOR_TREE_DIRTY
+// rule: an author tree with uncommitted changes means the pushed head is not the author's tree). That is the hand's only
+// closing duty: `eln work next` answers exit 4 with «commit/push or clean» until it holds; a missing receipt or a branch
+// behind main never blocks — the cell is «handed to the land line».
+export interface AuthorTree { readonly path: string; readonly dirty: boolean; readonly unpushed: number }
+
+/** The hand's closing move for this cell, or null (every PR of the cell is pushed from a clean tree — handed off).
+ *  `treeOf(branch)` = the author's local worktree of the PR branch (null = none here / unknown → never blocks). */
+export function prDoneTodo(cellId: string, facts: Pick<WaitFacts, 'prs'>, treeOf: (branch: string) => AuthorTree | null): { readonly pr: number; readonly why: 'dirty' | 'unpushed'; readonly line: string } | null {
+  for (const pr of facts.prs.filter((p) => !p.draft && prNamesCell(p, cellId))) {
+    let tree: AuthorTree | null = null;
+    try { tree = treeOf(pr.branch); } catch { tree = null; }
+    if (!tree) continue;
+    if (tree.dirty) return { pr: pr.number, why: 'dirty', line: `PR #${pr.number}: your worktree ${tree.path} has uncommitted changes — commit and push (or clean it)` };
+    if (tree.unpushed > 0) return { pr: pr.number, why: 'unpushed', line: `PR #${pr.number}: ${tree.unpushed} commit(s) on ${pr.branch} not pushed — git push` };
+  }
+  return null;
+}

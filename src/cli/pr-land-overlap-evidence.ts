@@ -28,6 +28,7 @@ import { createHash } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { debug } from '../debug/log.js';
+import { acceptReviewModel } from '../kit/resource-facts/index.js';
 import type { CmdRunner } from '../autopilot/pr-manager.js';
 import { parseReviewResultOutput } from '../task-agent/review-result-capture.js';
 import { verifyVirtualRebasePatch } from './pr-land-virtual-rebase.js';
@@ -599,7 +600,7 @@ function reviewAttemptHasTerraFailOnPriorHead(input: VerifyOverlapEvidenceInput,
     || failed.reviewed !== true || failed.verdict !== 'fail'
     || !SHA40.test(priorHead) || priorHead === currentHead
     || !priorHead.startsWith(name[1]!.toLowerCase())
-    || !modelFields.includes('gpt-6.1-terra') || findings.length === 0) return undefined;
+    || !modelFields.some((m) => acceptReviewModel(m).ok) || findings.length === 0) return undefined;
   const ancestor = input.run('git', ['merge-base', '--is-ancestor', priorHead, currentHead], { cwd: input.cwd });
   if (!ancestor.ok) return undefined;
   const changed = input.run('git', ['diff', '--name-only', '--no-renames', `${priorHead}..${currentHead}`], { cwd: input.cwd });
@@ -796,13 +797,18 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'> 
       if (mismatch) console.warn(`⚠ overlap-evidence: review provider mismatch — requestedModel=${requested} actualBackend=${actualBackend || 'unmeasured'} model=${model || 'unmeasured'} reviewRoute=${route || 'unmeasured'} respondedProvider=${respondedProvider || 'unmeasured'} respondedModel=${respondedModel || 'unmeasured'} (${e.reviewResult})`);
     }
   }
-  // REVIEW-NO-SILENT-GLM-FALLBACK (#38331): the producer marks requested engine ≠ responded engine as
-  //   `invalid: true` (src/agent-substrate/self-review-cli.ts). Such a verdict is not this PR's review.
-  //   Files written before the field existed carry no `invalid` and keep today's contract.
+  // REVIEW-NO-SILENT-GLM-FALLBACK: older results can contain a completed Claude→GLM
+  // fallback without an invalid flag. Never accept that historical fallback as evidence.
   if (raw?.invalid === true) {
     const invalidReason = typeof raw.invalidReason === 'string' && /^[a-z0-9-]{1,64}$/.test(raw.invalidReason) ? raw.invalidReason : 'unspecified';
     debug.log('pr.land', 'review-invalid-refused', { pr: input.pr, invalidReason, reviewResult: e.reviewResult });
     return { ok: false, reason: `review-invalid-${invalidReason}`, baseTip };
+  }
+  const glmFallback = raw?.claudeFallbackGlm;
+  if (glmFallback && typeof glmFallback === 'object' && !Array.isArray(glmFallback)
+    && (glmFallback as Record<string, unknown>).glmReviewed === true) {
+    debug.log('pr.land', 'review-invalid-refused', { pr: input.pr, invalidReason: 'legacy-claude-glm-fallback', reviewResult: e.reviewResult });
+    return { ok: false, reason: 'review-invalid-legacy-claude-glm-fallback', baseTip };
   }
   if (review.error) return { ok: false, reason: 'review-error', baseTip };
   if (review.reviewed !== true) return { ok: false, reason: 'review-not-reviewed', baseTip };

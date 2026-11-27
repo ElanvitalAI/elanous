@@ -3,7 +3,7 @@ import { openMsgStore } from '../msg/msg-store.js';
 import { judgeNeighbor, type Neighbor } from './neighbors.js';
 import { join } from 'node:path';
 
-export type LoopHealth = 'healthy' | 'degraded';
+import type { LoopHealth } from '../kit/heartbeat/index.js';
 export type NeighborIncident = { observer: string; neighbor: string; state: 'absent'; reason: string; action: Neighbor['onAbsent']['action']; to: string; at: string; lastSeenAt: string | null };
 
 export const SEAT_NEIGHBORS: Record<string, Neighbor[]> = Object.fromEntries(['OP', 'TC', 'MK', 'UX'].map(seat => [seat,
@@ -25,6 +25,7 @@ type Signal = { at: string; health: LoopHealth; ends_at: string | null };
 function withStore<T>(root: string, fn: (store: ReturnType<typeof openMsgStore>) => T): T {
   const store = openMsgStore(join(root, 'msg', 'messages.db'));
   try {
+    // loop_signals is kit/heartbeat's read-only mirror (emitSignal is its only writer); create it so a first read finds it.
     store.db.exec(`CREATE TABLE IF NOT EXISTS loop_signals (loop_id TEXT PRIMARY KEY, at TEXT NOT NULL, health TEXT NOT NULL, ends_at TEXT);
       CREATE TABLE IF NOT EXISTS loop_watches (observer TEXT NOT NULL, neighbor TEXT NOT NULL, first_at TEXT NOT NULL, PRIMARY KEY(observer, neighbor));
       CREATE TABLE IF NOT EXISTS loop_incidents (observer TEXT NOT NULL, neighbor TEXT NOT NULL, signal_at TEXT NOT NULL,
@@ -32,18 +33,6 @@ function withStore<T>(root: string, fn: (store: ReturnType<typeof openMsgStore>)
         PRIMARY KEY(observer, neighbor, signal_at, reason));`);
     return fn(store);
   } finally { store.close(); }
-}
-
-/** Durable signal, independent of chat sessions or the seat work-item ledger. */
-export function emitLoopHeartbeat(root: string, loopId: string, health: LoopHealth, now: Date, endsAt?: string): void {
-  if (!/^[a-z][a-z0-9-]*$/.test(loopId) || !Number.isFinite(now.getTime())) throw new Error('invalid loop heartbeat');
-  if (endsAt && !Number.isFinite(Date.parse(endsAt))) throw new Error('invalid heartbeat end');
-  withStore(root, store => {
-    store.db.query(`INSERT INTO loop_signals(loop_id, at, health, ends_at) VALUES(?, ?, ?, ?)
-      ON CONFLICT(loop_id) DO UPDATE SET at=excluded.at, health=excluded.health, ends_at=excluded.ends_at
-      WHERE loop_signals.at <= excluded.at`).run(loopId, now.toISOString(), health, endsAt ?? null);
-  });
-  debug.log(`loop.${loopId}`, 'heartbeat', { loopId, at: now.toISOString(), health, endsAt: endsAt ?? null });
 }
 
 /** First watch starts the missing-signal clock. Action receipt and message commit atomically. */

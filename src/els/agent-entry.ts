@@ -8,6 +8,8 @@
 //          otherwise — never guessed) · 판단 근거 = the hand title format of #40117 (seat · space · cell · model) ·
 //          수복과 인계 = a missing fact drops its part; the line never invents one.
 
+import { adapterFor } from './runtime-adapters/index.js';
+
 /** Short family label of a model id: gpt-6.1-terra → terra · gpt-6.1 → gpt-6.1 · grok-4.1-fast → grok · claude-opus-5-5 → opus · z-ai/glm-5.3 → glm-5.3. */
 export function modelLabel(model: string | undefined): string | undefined {
   const id = (model ?? '').trim().toLowerCase().split('/').pop()!.replace(/\[.*\]$/, '');
@@ -33,9 +35,9 @@ export function commandModel(command: readonly string[] | undefined): string | u
   return undefined;
 }
 
-/** Runtime word for a non-eln agent; eln (and an unknown pane) says nothing. */
+/** Runtime word for a non-eln agent; eln (and an unknown pane) says nothing. ELS-RUNTIME-ADAPTERS: the word is the adapter's label. */
 export function runtimeLabel(agent: string | undefined): string | undefined {
-  return agent === 'codex' ? 'codex-cli' : agent === 'claude' ? 'claude-code' : agent === 'grok' ? 'grok-cli' : undefined;
+  return adapterFor(agent).label;
 }
 
 /** The hand title of #40117 read back: «<ID> · <SPACE> · <cell> · <model>» or «<ID> · idle · <model>». */

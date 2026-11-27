@@ -12,7 +12,7 @@ import { aggregate, firstRank, recallAt, scoreQuery } from './metrics.js';
 import { queryTerms, termGroups } from './plan.js';
 import { loadStrategies, selectStrategies } from './registry.js';
 import { compareRuns, deterministicView, runBench, scorecardTable } from './runner.js';
-import { exposureTools, llmStrategy, replayStrategy } from './agent-arm.js';
+import { execToolCall, exposureTools, llmStrategy, replayStrategy } from './agent-arm.js';
 import type { SearchStrategy } from './types.js';
 import { resolveRefRepos, resolveRepoSource } from './sources.js';
 import { mkdirSync } from 'node:fs';
@@ -62,6 +62,30 @@ test('metric math: recall@k over min(|expected|, k), first rank, MRR aggregate',
   const r2 = scoreQuery('s', item, ['x', 'docs/conductor/JUDGE-LOAD-REDUCTION.md'], [{ tool: 'Grep', args: 'p', bytes: 300, ms: 1, hits: 2 }, { tool: 'Read', args: 'x', bytes: 100, ms: 1, hits: 1 }], 7);
   const r3 = scoreQuery('s', item, ['node_modules/@decoy/pkg/docs/conductor/JUDGE-LOAD-REDUCTION.md'], [], 0);
   expect(aggregate([r1, r2, r3])).toEqual({ n: 3, recall1: 0.333, recall5: 0.667, mrr: 0.5, calls: 1, bytes: 167, ms: 4, decoy5: 0.33 });
+});
+
+test('agent RunShell arm uses the product search path and never spawns refused argv', async () => {
+  const kit = new SearchKit(ctx);
+  const result = await execToolCall(kit, { tool: 'RunShell', args: { command: ['ast-grep', 'run', '-p', 'a', '--rewrite', 'b', '-U'] } });
+  const parsed = JSON.parse(result);
+  expect(parsed.outcome).toBe('denied');
+  expect(parsed.approvalKey).toBe('rejected:search-flag');
+  expect(parsed.output).toContain('read-only');
+  expect(parsed.stdout).toBe('');
+  expect(kit.trace.map((entry) => entry.tool)).toEqual(['RunShell']);
+});
+
+test('agent RunShell arm parity: accepted rg counts hits and cites corpus paths', async () => {
+  const kit = new SearchKit(ctx);
+  const result = await execToolCall(kit, { tool: 'RunShell', args: { command: ['rg', '--files'] } });
+  const parsed = JSON.parse(result);
+  expect(parsed.outcome).toBe('exit');
+  expect(parsed.exitCode).toBe(0);
+  expect(parsed.search.tool).toBe('rg');
+  expect(parsed.search.hits).not.toBe(0);
+  expect(parsed.output).toContain('search=rg hits=');
+  expect(parsed.stdout).toContain('repo:corpus/');
+  expect(kit.trace[0]!.tool).toBe('RunShell');
 });
 
 test('folding: RunShell keeps a 200 000-byte head and returns the structured result; head/tail and line caps', () => {

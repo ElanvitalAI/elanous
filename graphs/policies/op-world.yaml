@@ -1,0 +1,45 @@
+# OP-WORLD-LENS (CEO 11-27 13:0x «OP 가 보는 세계를 잘 조정 · 관측 툴 · 클린징 · 맥락 기억») — the policy of the
+# OP world card (src/op-world/world-lens.ts): `eln op world` · the OP turn's WORLD block · the OP pulse brief.
+# Read by name; change a value here, not in TS. Missing keys fall back to the defaults in code.
+version: 1
+board:
+  # A yellow/red cell nobody touched for this long is «stale» (re-own it, drop it, or move it).
+  stale_hours: 24
+  # A cell whose evidence/body/title carries one of these markers is «obsolete» (should leave the board, not be worked).
+  obsolete_markers: [obsolete, superseded, "폐기", "대체됨", "무효"]
+mail:
+  # Coordinators whose unacked backlog the card shows (hands are not listed — their inbox is their pull).
+  coordinators: [OP, TC, UX, MK, JUD, REL, RES]
+  # A backlog older than this is flagged ⚠ on the card.
+  oldest_warn_min: 60
+land:
+  # The open-PR set (gh) is cached this long; refusals of closed/merged PRs are dropped from the card.
+  open_prs_cache_min: 10
+supervisors:
+  # A loop agent whose last tick is older than this is flagged «stale tick».
+  stale_tick_min: 30
+lens:
+  # The cached card older than this is refreshed in the background on the next OP turn.
+  cache_max_age_min: 10
+# OP-HELPERS-STABILIZE (CEO 11-27 22:3x «OP 의 조력자부터 안정화») — OP's body helpers; the card prints one line
+# «조력자 건강 ok n/m · failing <id> (why)». A helper is a registered trigger graph (its newest fires: never fired ·
+# latest finished fire = exception · newest fire older than max_age_min) or a JSONL ledger under the instance root (its
+# newest row's at/ts, or the newest row whose fields equal `match`, older than max_age_min). max_age_min = the helper's
+# slowest cadence ⊕ its max wait — op-pulse: night rhythm 90 min ⊕ slack · op-bulletin: max_wait 30 ⊕ slack ·
+# world-sweep: every 15 min ⊕ slack · throughput/next-action: written by every pulse · fed turns: OP turns at all.
+helpers:
+  - { id: op-pulse, trigger: op-pulse, max_age_min: 130 }
+  - { id: op-bulletin, trigger: op-bulletin, max_age_min: 60 }
+  - { id: world-sweep, trigger: world-sweep, max_age_min: 45 }
+  - { id: throughput, ledger: loops/throughput-controller.jsonl, max_age_min: 130 }
+  - { id: next-action, ledger: loops/op-next-action.jsonl, max_age_min: 130 }
+  - { id: fed-turns, ledger: fed-state/facts.jsonl, match: { type: turn, seat: OP }, max_age_min: 180 }
+# The OP cheat lines that ride every card (CLI forms OP misused on 11-27 · copied from the installed `--help`).
+# Full card ⊕ the 11-27 decisions = 내부 문서 `KNOWHOW` K-OP-158. Keep ≤ 8 lines; one command per line.
+cheat:
+  - "board = ALWAYS --version <active> (default is main's package version → the wrong board): eln release checklist list --version <the Board line version> --owner OP --json"
+  - "unassign = eln seat veto <cell> --reason \"<why>\" [--to <seat>] (NOT set --owner \"\") · reassign an owned cell = ELANOUS_TRACK=OP eln release checklist claim <id> --by <seat> --force --reason \"<why>\" --version <v>"
+  - "evidence: append = eln release checklist evidence add <id> \"<line>\" --version <v> · set --evidence OVERWRITES (read, merge, then set) · rename = checklist retitle <id> \"<title>\" (set has no --title)"
+  - "obsolete = eln release checklist set <id> --version <v> --status done --evidence \"<old> ⏎ obsolete: <why>\" (no obsolete verb) · other board: eln release checklist move <ids…> --from <v> --to <v> --reason <r> (all-or-nothing)"
+  - "watch = eln msg wait-for <cond> --commitment <id> [--within 2h] [--auto-close] · cond: time:<dur> pr-merged:<N> review:<N> mail-reply:<M> pregate-receipt:<PR>[@head] cell-status:<id>=green|owner=<seat> seat-idle:<seat> mail-from:<seat>"
+  - "--json exists on (eln …): release checklist list/status/set (set prints the whole board) · seat veto · seat pool · fed kpi · land graph status · commitment list · msg list/count/post"

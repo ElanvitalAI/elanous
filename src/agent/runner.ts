@@ -568,7 +568,7 @@ export async function* runAgent(
   const runPromise = (async () => {
     let text = await runEncapsulated(task, runOnce, stepBuffer);
     while (!task.controller.signal.aborted && hasAgentSteer(task.id)) {
-      const message = buildInterjectionMessage(drainSteerLogged(task, 'after-step'), 'mid-turn');
+      const message = buildInterjectionMessage(drainSteerLogged(task, 'after-step'), 'mid-turn', undefined, null); // a subagent's steer is not the seat's digest (no fold-once claim)
       if (!message) break;
       task.messages.push({ role: 'user', content: message });
       text = await runEncapsulated(task, runOnce, stepBuffer);

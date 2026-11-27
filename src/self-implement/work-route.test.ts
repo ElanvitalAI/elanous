@@ -403,7 +403,8 @@ describe('harness.windowAccounts config (OP #38337 check 2)', () => {
         const config = buildUserConfig(path);
         expect(config.harness?.windowAccounts).toBe(stored);
         expect(resolveWindowAccountsMode(config)).toBe(mode);
-        expect(readAccountWindowSnapshot('anthropic', { config: () => config, emit: () => {} })?.selection).toBe(mode);
+        // 칸 43 — 등급 원천 주입: 허용 등급(pro) 기준으로 재므로 `on` 행이 그대로 on(게이트 단독 단언은 스냅숏 시험 파일).
+        expect(readAccountWindowSnapshot('anthropic', { config: () => config, emit: () => {}, membership: { currentTier: () => 'pro' } })?.selection).toBe(mode);
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

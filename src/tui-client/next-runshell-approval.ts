@@ -1,6 +1,7 @@
 /** RunShell approval wire. The parent alone creates a signing key; a boolean is never a RunShell grant. */
 import { generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto';
 import { runShellArgvHash, runShellApprovalSigningBytes, type RunShellApprovalPayload, type SignedRunShellApproval } from '../shell-primitive/runshell-approval.js';
+import { runShellInvocationHold } from '../shell-primitive/runshell-invocation-hold.js';
 export type { RunShellApprovalPayload, SignedRunShellApproval } from '../shell-primitive/runshell-approval.js';
 
 export const RUNSHELL_PUBLIC_KEY_ENV = 'ELANOUS_RUNSHELL_APPROVAL_PUBLIC_KEY';
@@ -48,7 +49,12 @@ export function createRunShellApprovalIssuer(): {
 
 /** Render unambiguous, escaped argv, not a shell-joined command. */
 export function runShellApprovalCard(request: RunShellApprovalRequest): string {
-  return `RunShell (one execution)\nargv: ${JSON.stringify(request.argv)}\ncwd: ${JSON.stringify(request.cwd)}\nbytes sha256: ${request.bytesSha256}\nseat: ${JSON.stringify(request.callerSeat)}\nsession: ${JSON.stringify(request.sessionId)}`;
+  // Compute from the copied argv in the trusted parent, never from child-supplied labels.
+  const hold = runShellInvocationHold(request.argv[0] ?? '', request.argv.slice(1), request.cwd);
+  const risk = hold
+    ? `WARNING: potential irreversible risk (${hold.class}): ${JSON.stringify(hold.reason)}`
+    : 'Risk: no known irreversible pattern detected (not a safety guarantee)';
+  return `RunShell (one execution)\n${risk}\nargv: ${JSON.stringify(request.argv)}\ncwd: ${JSON.stringify(request.cwd)}\nbytes sha256: ${request.bytesSha256}\nseat: ${JSON.stringify(request.callerSeat)}\nsession: ${JSON.stringify(request.sessionId)}`;
 }
 
 /** Child IPC client: null on denial, missing channel, cancellation, timeout or malformed reply. */

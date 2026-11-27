@@ -4,6 +4,8 @@
  * 짝 off 시험 = seat-turn-cap-inflight-tool.test.ts «Bash(sleep 20)가 상한 틱 뒤 5초 안에 끊긴다» (같은 하니스 꼴).
  */
 import { afterEach, describe, expect, test } from 'bun:test';
+// Must load before the runtime: the spawn gateway captures the trusted key at import (#39630).
+import { installTestRunShellHost } from '../shell-primitive/runshell-test-issuer.js';
 import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,7 +17,6 @@ import { buildReplTools } from '../repl/index.js';
 import { dispatchBashCapsule } from '../skills/tools/index.js';
 import { runShell, setShellApprover } from '../shell-primitive/runtime.js';
 import { _resetApprovalCacheForTesting, commandKey, getCachedDecision } from '../shell-primitive/approval-cache.js';
-import type { ApprovalDecision } from '../shell-primitive/types.js';
 import type { CapsuleEvent } from '../turn-capsule/contract.js';
 import { installShellCapsuleSink, listDetachedShellCapsules, runShellCapsule, shellCapsulePolicy, type ShellCapsuleCall } from '../turn-capsule/shell-capsule.js';
 
@@ -222,33 +223,35 @@ describe('unit — OP #121854: 상한 뒤 늦은 allow·hit↔abort 경쟁 (실 
     _resetApprovalCacheForTesting();
   });
 
-  test('① 실 배선: 상한(abort) signal 위에 늦게 도착한 allow-session — 실행(spawn) 0 · 캐시 0', async () => {
+  test('① 실 배선: 상한(abort) 뒤 늦게 도착한 서명 승인·allow-session — 실행(spawn) 0 · 캐시 0', async () => {
+    // #39630: 비로컬 argv(touch)의 권한은 부모 서명 1회 카드다. 카드가 대기 중일 때 상한이 먼저 발화하고
+    // 서명 승인과 자리 approver 의 allow-session 은 그 뒤에 도착한다.
     const dir = mkdtempSync(join(tmpdir(), 'a2-late-allow-'));
     const marker = join(dir, 'ran-marker');
     const key = commandKey({ command: ['touch', marker], cwd: dir });
     const cap = new AbortController();
-    cap.abort(new SeatTurnCapAbort('wall')); // 상한 — 늦은 allow 보다 먼저 발화
-    let approverSignal: AbortSignal | undefined;
+    let approverCalls = 0;
     let spawnReports = 0;
-    let allowLate!: (decision: ApprovalDecision) => void;
-    setShellApprover((request) => {
-      approverSignal = request.signal; // OP: approver 에게 abort signal 전달
-      return new Promise<ApprovalDecision>((resolve) => { allowLate = resolve; });
-    });
-    const pending = runShell({
-      command: ['touch', marker], cwd: dir, approval: 'always',
-      signal: cap.signal, timeoutMs: 5_000,
-      onSpawn: () => { spawnReports += 1; },
-    });
-    await Bun.sleep(20); // 승인 대기 중 확인
-    allowLate('allow-session'); // 늦은 allow — 상한(abort) 뒤에 도착
-    const result = await pending;
-    expect(approverSignal).toBe(cap.signal); // approver signal 전달
-    expect(spawnReports).toBe(0); // 실행(spawn) 0 — onSpawn 은 spawn 확인 뒤에만 온다
-    expect(existsSync(marker)).toBe(false); // 실 프로세스 부수효과 0
-    expect(getCachedDecision(key)).toBeUndefined(); // allow-session 캐시(rememberDecision) 0
-    expect(result.outcome).toBe('aborted');
-    expect(result.exitCode).toBeNull();
+    setShellApprover(async () => { approverCalls += 1; return 'allow-session'; });
+    const host = installTestRunShellHost({ decide: () => 'hold' });
+    try {
+      const pending = runShell({
+        command: ['touch', marker], cwd: dir, approval: 'always',
+        signal: cap.signal, timeoutMs: 5_000, runShellSessionId: 'a2-late-allow',
+        onSpawn: () => { spawnReports += 1; },
+      });
+      for (let i = 0; i < 50 && host.held.length === 0; i++) await Bun.sleep(2); // 승인 대기 중 확인
+      expect(host.held).toHaveLength(1);
+      cap.abort(new SeatTurnCapAbort('wall')); // 상한 — 늦은 승인보다 먼저 발화
+      host.held[0]!.answer(true); // 늦은 서명 승인 — 상한(abort) 뒤에 도착
+      const result = await pending;
+      expect(spawnReports).toBe(0); // 실행(spawn) 0 — onSpawn 은 spawn 확인 뒤에만 온다
+      expect(existsSync(marker)).toBe(false); // 실 프로세스 부수효과 0
+      expect(getCachedDecision(key)).toBeUndefined(); // allow-session 캐시(rememberDecision) 0
+      expect(approverCalls).toBe(0); // 자리 approver 는 비로컬 argv 에 묻지 않는다
+      expect(result.outcome).toBe('aborted');
+      expect(result.exitCode).toBeNull();
+    } finally { host.restore(); }
   }, 10_000);
 
   test('② hit↔abort 미세작업 경쟁: 상한 히트 뒤 늦은 spawned 보고 — launched=false · 상한 재투척', async () => {

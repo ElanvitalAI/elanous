@@ -1,0 +1,91 @@
+{
+  "schema": 1,
+  "entries": {
+    "smart-merge/SM-STALE-PR-REAP": { "expect": "green", "greenSince": "2026-11-27 STALE-PR-REAP-E4", "reason": "one owner card, one unanswered 24h escalation, no normal PR cards" },
+    "smart-merge/SM-STACK-4DEEP": {
+      "expect": "green",
+      "greenSince": "2026-11-27 smart-merge sim (this PR)",
+      "reason": "squash-land then 4-deep stack: every layer rebuilt onto main with only its own file; all 5 layers on main"
+    },
+    "smart-merge/SM-STACK-MANUAL-MERGE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 smart-merge sim (this PR)",
+      "reason": "stack child with a manual merge-main commit rebuilds to its own file only"
+    },
+    "smart-merge/SM-MAIN-ONLY-MERGE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 smart-merge sim (this PR)",
+      "reason": "main-only merge: range-diff empty, patch-id equal, receipt reused, review delta reused"
+    },
+    "smart-merge/SM-HOT-FILE-5PR": {
+      "expect": "green",
+      "greenSince": "2026-11-27 smart-merge sim (this PR)",
+      "reason": "5 PRs on entry.ts land serially, each re-merged (registry append union), no edit lost"
+    },
+    "smart-merge/SM-LIST-APPEND": {
+      "expect": "green",
+      "greenSince": "2026-11-27 smart-merge sim (this PR)",
+      "reason": "multi-line list append-union + one-line id array inline-insert, both sides kept"
+    },
+    "smart-merge/SM-SEMANTIC-LLM": {
+      "expect": "green",
+      "greenSince": "2026-11-27 smart-merge sim (this PR)",
+      "reason": "semantic conflict deferred to the LLM capsule (fake LLM); tests decide the pushed resolution"
+    },
+    "smart-merge/SM-SECURITY4-SAME-LADDER": {
+      "expect": "green",
+      "greenSince": "2026-11-27 smart-merge sim (this PR)",
+      "reason": "security-4 path conflict resolved by the same ladder (CEO 10:3x), no card"
+    },
+    "smart-merge/SM-REVERT-GUARD": {
+      "expect": "green",
+      "greenSince": "2026-11-27 smart-merge sim (this PR)",
+      "reason": "resolution dropping 500 lines of other PRs refused by the revert guard with evidence; nothing pushed"
+    },
+    "smart-merge/SM-FORCE-PUSHED-UPSTREAM": {
+      "expect": "green",
+      "greenSince": "2026-11-27 smart-merge sim (this PR)",
+      "reason": "force-pushed branch before / during the run: head-moved, author push kept"
+    },
+    "smart-merge/SM-PR-CLOSED-MID": {
+      "expect": "green",
+      "greenSince": "2026-11-27 smart-merge sim (this PR)",
+      "reason": "PR closed mid-run: closed, nothing pushed, no worktree left"
+    },
+    "smart-merge/SM-FETCH-FAIL-MID": {
+      "expect": "green",
+      "greenSince": "2026-11-27 smart-merge sim (this PR)",
+      "reason": "network failure at fetch / before push: error, no partial push, no worktree left"
+    },
+    "smart-merge/SM-RACE-LOCK": {
+      "expect": "green",
+      "greenSince": "2026-11-27 smart-merge sim (this PR)",
+      "reason": "two finishers on one PR: second busy (lock), one resolution pushed"
+    },
+    "smart-merge/SM-REFUSED-BEFORE-INSTALL": {
+      "expect": "green",
+      "greenSince": "2026-11-27 SMART-MERGE-REFRESH-ALL",
+      "reason": "refusal from before the install (pregate pass / plain-merge conflict on the head) is smart-refreshed next tick"
+    },
+    "smart-merge/SM-STACK-AUTO-DISCOVER": {
+      "expect": "green",
+      "greenSince": "2026-11-27 SMART-MERGE-REFRESH-ALL",
+      "reason": "squash-landed parents discovered from the branch commits (commit → merged PR) · child rebuilt with only its own file"
+    },
+    "smart-merge/SM-DECLARED-SUPERSEDE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 REVERT-GUARD-DECLARED-SUPERSEDE",
+      "reason": "content supersede refused until 의도된 삭제 is declared; an own-commit deletion passes without a line"
+    },
+    "smart-merge/SM-RESTRUCTURE-PLUS-INSERT": {
+      "expect": "green",
+      "greenSince": "2026-11-27 SMART-MERGE-REFRESH-ALL",
+      "reason": "restructure vs small insertion: deferred to the LLM capsule with both sides; focused test rejects a resolution that drops theirs"
+    },
+    "smart-merge/SM-REVIEW-OWN-DELTA": {
+      "expect": "green",
+      "greenSince": "2026-11-27 SMART-MERGE-REFRESH-ALL",
+      "reason": "rebuilt branch (Smart-Merge trailer) passes the review preflight; review reads the own delta"
+    }
+  }
+}

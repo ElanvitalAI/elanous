@@ -16,10 +16,11 @@ import { homedir } from 'node:os';
 import { writeStdoutJson } from '../cli/stdout-json.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { appendLoopLog } from './registry.js';
-import { beatSafe } from '../watch/heartbeat.js';
+import { beatSafe } from '../kit/heartbeat/index.js';
 import { defaultConditionProbes, type ConditionProbes } from './trigger-conditions.js';
-import { listFires, listTriggers, openTriggerRegistry, promoteTrigger, readTriggerDecl, registerTrigger, retryWindow, rollbackTrigger,
-  tickTriggers, type TriggerTickDeps } from './trigger-registry.js';
+import { liveOutcomeProbes } from './outcome-alarms.js';
+import { listFires, listOutcomes, listTriggers, openTriggerRegistry, promoteTrigger, readTriggerDecl, registerTrigger, retryWindow, rollbackTrigger,
+  tickTriggers, triggerDeclSha, type TriggerRow, type TriggerTickDeps } from './trigger-registry.js';
 
 /** Marker on the one crontab line that drives every registered trigger. */
 export const TRIGGER_TICK_LOOP_ID = 'graph-trigger-tick';
@@ -69,6 +70,17 @@ export interface TriggerCliDeps {
   cutoverAfterOverride?: () => number | undefined;
   /** Seam: the loop-tabs reconcile after register/promote/rollback. Default = reconcileLoopTabs, skipped under `bun test` (NODE_ENV=test). */
   reconcileTabs?: (root: string, stateRoot: string) => Promise<void>;
+  /** OUTCOME-DONE-ALARMS seam. Default = the live probes (land ledger · release schedules · BULLETIN-NOW.md), skipped under `bun test`. */
+  outcomes?: TriggerTickDeps['outcomes'];
+}
+
+/** OUTCOME-DONE-ALARMS: the live outcome probes for land-graph · release-rocket · op-bulletin. */
+export function liveOutcomes(stateRoot: string, seatState: string): NonNullable<TriggerTickDeps['outcomes']> {
+  return liveOutcomeProbes({ stateRoot, seatState, releases: () => {
+    const { listSchedules } = require('../release-loop/release-schedule.js') as typeof import('../release-loop/release-schedule.js');
+    const { releasedVersion } = require('../release-loop/feature-store.js') as typeof import('../release-loop/feature-store.js');
+    return { released: releasedVersion(), schedules: listSchedules() };
+  } });
 }
 
 /** `loops.trigger.cutoverAfter` from the user config; unreadable or unset → undefined (declarations decide). */
@@ -92,12 +104,33 @@ function triggerGraphFiles(root: string): string[] {
   return readdirSync(dir).filter(f => /\.ya?ml$/.test(f) && f !== 'recipes.yaml' && !f.endsWith('.rhythm.yaml')).map(f => relative(root, join(dir, f))).sort();
 }
 
+/** Report declarations missing from the registry without changing it or stopping the tick. */
+export function triggerRegistrationAnomalies(root: string, rows: readonly Pick<TriggerRow, 'graphId' | 'declSha'>[]): Array<{ file: string; graphId?: string; error?: string }> {
+  const registered = new Map(rows.map(row => [row.graphId, row.declSha]));
+  let files: string[];
+  try { files = triggerGraphFiles(root); }
+  catch (error) { return [{ file: 'graphs/triggers', error: error instanceof Error ? error.message : String(error) }]; }
+  return files.flatMap<{ file: string; graphId?: string; error?: string }>(file => {
+    try {
+      const decl = readTriggerDecl(file, root);
+      if (!registered.has(decl.graphId)) return [{ file, graphId: decl.graphId }];
+      return registered.get(decl.graphId) === triggerDeclSha(decl) ? [] : [{ file, graphId: decl.graphId, error: 'registered declaration differs from source' }];
+    } catch (error) {
+      return [{ file, error: error instanceof Error ? error.message : String(error) }];
+    }
+  });
+}
+
 export function tickDeps(deps: TriggerCliDeps, root: string, stateRoot: string): TriggerTickDeps {
   return {
     now: deps.now ?? (() => new Date()),
     vars: { seatState: seatStateRoot(), stateRoot },
     probes: deps.probes ?? defaultConditionProbes(),
     cutoverAfterOverride: (deps.cutoverAfterOverride ?? configCutoverAfter)(),
+    ...((): Pick<TriggerTickDeps, 'outcomes'> => {
+      const outcomes = deps.outcomes ?? (process.env.NODE_ENV === 'test' ? undefined : liveOutcomes(stateRoot, seatStateRoot()));
+      return outcomes ? { outcomes } : {};
+    })(),
     runGraph: deps.runGraph ?? (async (decl, input, runId) => {
       const { runGraph } = await import('../graph-runner/runner.js');
       const state = await runGraph(resolve(root, decl.file), { input, runId, quiet: true, deps: { root: stateRoot } });
@@ -160,10 +193,8 @@ async function reconcileLoopTabsQuietly(root: string, stateRoot: string): Promis
 export function registerTriggerCommands(loop: Command, deps: TriggerCliDeps = {}): void {
   const trigger = loop.command('trigger').description('Graph trigger registry — one SSOT for cron-fired graphs (dedupe · goal · retry · shadow→live)');
   const roots = (opts: { stateRoot?: string }) => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { repoRoot } = require('../domains/schedule-registry.js') as typeof import('../domains/schedule-registry.js');
-    // The running code's own root (installed `current` or this checkout) — the tick must run the code that registered it.
-    return { root: resolve(deps.root ?? repoRoot()), stateRoot: resolve(opts.stateRoot ?? deps.stateRoot ?? effectiveInstanceRoot()) };
+    // Do not use cronRepoRoot: it can substitute an unrelated checkout for the running package.
+    return { root: resolve(deps.root ?? resolve(import.meta.dir, '../..')), stateRoot: resolve(opts.stateRoot ?? deps.stateRoot ?? effectiveInstanceRoot()) };
   };
   trigger.command('register [files...]').description('Register graph trigger declarations (default: every graphs/triggers/*.yaml)')
     .option('--update', 'Replace a changed declaration').option('--state-root <dir>').option('--json')
@@ -172,8 +203,8 @@ export function registerTriggerCommands(loop: Command, deps: TriggerCliDeps = {}
       const db = openTriggerRegistry(stateRoot);
       try {
         const results = (files.length ? files : triggerGraphFiles(root)).map(file => {
-          const { created, updated, row } = registerTrigger(db, readTriggerDecl(file, root), { update: !!opts.update });
-          return { graphId: row.graphId, created, updated, stage: row.stage, trigger: row.cron ?? 'condition', owner: row.owner };
+          const { created, updated, row, retired } = registerTrigger(db, readTriggerDecl(file, root), { update: !!opts.update });
+          return { graphId: row.graphId, created, updated, stage: row.stage, trigger: row.cron ?? 'condition', owner: row.owner, ...(retired.length ? { retired } : {}) };
         });
         await output(results, !!opts.json);
       } finally { db.close(); }
@@ -253,7 +284,9 @@ export function registerTriggerCommands(loop: Command, deps: TriggerCliDeps = {}
         const db = openTriggerRegistry(stateRoot);
         try {
           const rows = listTriggers(db);
-          const agents = rows.map((row) => ({ id: row.graphId, owner: row.owner, stage: row.stage, lastStatus: row.lastStatus, lastAt: row.lastAt, ...(row.cron ? { cron: row.cron } : {}), ...(row.timeZone ? { timeZone: row.timeZone } : {}) }));
+          const outcomes = listOutcomes(db);
+          const agents = rows.map((row) => { const outcome = outcomes.get(row.graphId); return { id: row.graphId, owner: row.owner, stage: row.stage, lastStatus: row.lastStatus, lastAt: row.lastAt, ...(row.cron ? { cron: row.cron } : {}), ...(row.timeZone ? { timeZone: row.timeZone } : {}),
+            ...(outcome ? { outcome: { summary: outcome.summary, bad: outcome.bad } } : {}) }; });
           const mine = loopsBySeat(agents, loadOrgMap().org.duties).get(seat) ?? [];
           ids = mine.map((agent) => agent.id);
           selected = Math.max(0, Math.min(selected, ids.length - 1));
@@ -326,10 +359,11 @@ export function registerTriggerCommands(loop: Command, deps: TriggerCliDeps = {}
       const db = openTriggerRegistry(stateRoot);
       const at = (deps.now?.() ?? new Date()).toISOString();
       try {
+        const anomalies = triggerRegistrationAnomalies(root, listTriggers(db));
         const events = await tickTriggers(db, tickDeps(deps, root, stateRoot), opts.only ? { only: opts.only } : {});
-        appendLoopLog(TRIGGER_TICK_LOOP_ID, `${JSON.stringify({ at, events })}\n`, stateRoot);
-        beatSafe({ name: 'trigger-tick', saw: events.length, everyMin: 2, last: at });
-        await output({ at, events }, !!opts.json);
+        appendLoopLog(TRIGGER_TICK_LOOP_ID, `${JSON.stringify({ at, events, anomalies })}\n`, stateRoot);
+        beatSafe({ name: 'trigger-tick', saw: events.length, everyMin: 2, last: at, ...(anomalies.length ? { err: `${anomalies.length} unregistered, stale or invalid trigger declaration(s)` } : {}) });
+        await output({ at, events, anomalies }, !!opts.json);
       } catch (error) {
         appendLoopLog(TRIGGER_TICK_LOOP_ID, `${JSON.stringify({ at, error: error instanceof Error ? error.message : String(error) })}\n`, stateRoot);
         beatSafe({ name: 'trigger-tick', saw: 0, everyMin: 2, last: at, err: error instanceof Error ? error.message : String(error) });

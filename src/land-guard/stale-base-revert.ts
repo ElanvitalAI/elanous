@@ -7,12 +7,35 @@
  * squash result with `git merge-tree --write-tree main head`, blame each changed file on main, and flag (file, commit)
  * pairs whose surviving lines are all deleted (≥ minLines). Any hit = refusal card «rebase/merge main first».
  *
- * CLI: bun src/land-guard/stale-base-revert.ts <mainRef> <headRef> [--repo <dir>] [--window-hours 48] [--min-lines 3] [--json]
+ * REVERT-GUARD-DECLARED-SUPERSEDE (11-27 · #40471 deletes route-policy.default.json that #40401 added, on purpose): a PR
+ * body line `의도된 삭제: <path|#PR> (<reason>)` (also `Intended removal:`) excludes that path / that PR's commits from the
+ * wipe check; anything undeclared still refuses. The card suggests the line. A file deleted by the PR's own commit needs
+ * no line (an explicit deletion is intent; a stale copy is lines silently missing).
+ *
+ * CLI: bun src/land-guard/stale-base-revert.ts <mainRef> <headRef> [--repo <dir>] [--window-hours 48] [--min-lines 3] [--pr-body-file <f>] [--json]
  * exit 0 = clean · 1 = refused (card on stdout) · 2 = usage / git error (fail closed: callers treat ≠0 as STOP).
  */
 import { spawnSync } from 'node:child_process';
 
 export interface RevertHit { file: string; commit: string; subject: string; lines: number }
+export interface DeclaredRemovals { paths: string[]; prs: number[] }
+
+/** `의도된 삭제: <path|#PR>[, <path|#PR>…] (<reason>)` lines of a PR body (reason required — an undeclared «why» is no declaration). */
+export function parseDeclaredRemovals(body: string | undefined | null): DeclaredRemovals {
+  const out: DeclaredRemovals = { paths: [], prs: [] };
+  for (const line of (body ?? '').split('\n')) {
+    const m = /^\s*(?:[-*]\s*)?(?:의도된 삭제|Intended removal)\s*[:：]\s*(.+?)\s*\(([^)]+)\)\s*$/i.exec(line);
+    if (!m || !m[2]!.trim()) continue;
+    for (const raw of m[1]!.split(/[,\s]+/).map((x) => x.replace(/^`|`$/g, '')).filter(Boolean)) {
+      const pr = /^#(\d+)$/.exec(raw);
+      if (pr) out.prs.push(Number(pr[1]));
+      else if (/^[\w./@+-]+$/.test(raw)) out.paths.push(raw.replace(/^\.\//, ''));
+    }
+  }
+  return out;
+}
+/** A commit subject carries its PR number as «(#N)» (squash merge). */
+const subjectPr = (subject: string): number | null => { const m = /\(#(\d+)\)\s*$/.exec(subject); return m ? Number(m[1]) : null; };
 export interface StaleRevertResult { ok: boolean; mergeBase: string; hits: RevertHit[]; card?: string }
 
 function git(repo: string, args: string[]): string {
@@ -31,7 +54,7 @@ export function deletedRanges(unifiedZero: string): Array<[number, number]> {
   return out;
 }
 
-export function detectStaleBaseRevert(repo: string, mainRef: string, headRef: string, opts: { windowHours?: number; minLines?: number; minCommitLines?: number; nowSec?: number } = {}): StaleRevertResult {
+export function detectStaleBaseRevert(repo: string, mainRef: string, headRef: string, opts: { windowHours?: number; minLines?: number; minCommitLines?: number; nowSec?: number; declared?: DeclaredRemovals } = {}): StaleRevertResult {
   const windowSec = (opts.windowHours ?? 48) * 3600;
   const minLines = opts.minLines ?? 3;
   const minCommitLines = opts.minCommitLines ?? 10;
@@ -41,8 +64,12 @@ export function detectStaleBaseRevert(repo: string, mainRef: string, headRef: st
   const mergeBase = git(repo, ['merge-base', main, head]).trim();
   const tree = git(repo, ['merge-tree', '--write-tree', main, head]).split('\n')[0]!.trim();
   const ownCommits = new Set(git(repo, ['log', '--format=%H', `${main}..${head}`]).split('\n').filter(Boolean));
+  // A file the PR's own (non-merge) commit deleted is an intended removal (#40444 removing tests #40373 added): only
+  // lines silently missing without an own deletion are a stale copy.
+  const ownDeleted = new Set(git(repo, ['log', '--no-merges', '--diff-filter=D', '--name-only', '--format=', `${main}..${head}`]).split('\n').map((x) => x.trim()).filter(Boolean));
   const counts = new Map<string, RevertHit>();
   for (const file of git(repo, ['diff', '--name-only', '--diff-filter=MD', main, tree]).split('\n').filter(Boolean)) {
+    if (ownDeleted.has(file)) continue;
     const ranges = deletedRanges(git(repo, ['diff', '-U0', main, tree, '--', file]));
     if (ranges.length === 0) continue;
     const deleted = new Set<number>();
@@ -75,14 +102,16 @@ export function detectStaleBaseRevert(repo: string, mainRef: string, headRef: st
   // A small edit of one recent line pair is a refactor; a stale copy wipes a whole PR. Require ≥ minCommitLines per commit.
   const perCommit = new Map<string, number>();
   for (const h of counts.values()) perCommit.set(h.commit, (perCommit.get(h.commit) ?? 0) + h.lines);
-  const hits = [...counts.values()].filter((h) => (perCommit.get(h.commit) ?? 0) >= minCommitLines).sort((a, b) => b.lines - a.lines);
+  const declared = opts.declared ?? { paths: [], prs: [] };
+  const isDeclared = (h: RevertHit) => declared.paths.includes(h.file) || declared.prs.includes(subjectPr(h.subject) ?? -1);
+  const hits = [...counts.values()].filter((h) => (perCommit.get(h.commit) ?? 0) >= minCommitLines && !isDeclared(h)).sort((a, b) => b.lines - a.lines);
   if (hits.length === 0) return { ok: true, mergeBase, hits };
   const rows = hits.map((h) => `  - ${h.file}: ${h.lines} lines from ${h.commit.slice(0, 9)} ${h.subject}`);
   const card = [
     `REFUSE stale-base-revert: landing ${head.slice(0, 12)} would wipe out every line other recent PRs own in these files — a stale copy in the branch (merge-base ${mergeBase.slice(0, 12)}).`,
     ...rows,
     'Fix: rebase/merge main first (git fetch origin main && git merge origin/main), keep their lines, push, then land again.',
-    'Meant to undo that PR on purpose (a revert)? Land with STALE_REVERT_OK=1 and say so in the PR body.',
+    `Meant to remove it on purpose (a supersede / revert)? Add to the PR body: 의도된 삭제: ${hits[0]!.file} (<reason>)${subjectPr(hits[0]!.subject) ? `  — or the whole PR: 의도된 삭제: #${subjectPr(hits[0]!.subject)} (<reason>)` : ''}`,
   ].join('\n');
   return { ok: false, mergeBase, hits, card };
 }
@@ -93,11 +122,14 @@ if (import.meta.main) {
   const repo = flag('--repo') ?? process.cwd();
   const windowHours = Number(flag('--window-hours') ?? 48);
   const minLines = Number(flag('--min-lines') ?? 3);
+  const bodyFile = flag('--pr-body-file');
   const json = argv.includes('--json');
   const [mainRef, headRef] = argv.filter((a) => a !== '--json');
   if (!mainRef || !headRef) { console.error('usage: stale-base-revert.ts <mainRef> <headRef> [--repo dir] [--window-hours 48] [--min-lines 3] [--json]'); process.exit(2); }
   try {
-    const r = detectStaleBaseRevert(repo, mainRef, headRef, { windowHours, minLines });
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const declared = bodyFile ? parseDeclaredRemovals((require('node:fs') as typeof import('node:fs')).readFileSync(bodyFile, 'utf8')) : undefined;
+    const r = detectStaleBaseRevert(repo, mainRef, headRef, { windowHours, minLines, ...(declared ? { declared } : {}) });
     if (json) console.log(JSON.stringify(r));
     else console.log(r.ok ? `OK stale-base-revert: none (merge-base ${r.mergeBase.slice(0, 12)})` : r.card);
     if (!r.ok && process.env.STALE_REVERT_OK === '1') { console.log('WARN STALE_REVERT_OK=1 — intended revert, not refusing'); process.exit(0); }

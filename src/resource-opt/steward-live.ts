@@ -24,7 +24,7 @@ export function parseSeatAssignOutput(stdout: string, exitCode: number | null): 
 export function liveStewardAssign(actor = 'OP'): (row: AssignRow, version?: string) => Promise<StewardAssignResult> {
   return async (row, version) => {
     const { elanousInvocation } = await import('../instance/spawn-elanous.js');
-    const inv = elanousInvocation(['seat', 'assign', row.seat, row.cell, '--from', actor, '--json', ...(version ? ['--version', version] : []),
+    const inv = elanousInvocation(['seat', 'assign', row.seat, row.cell, '--from', actor, '--json', '--caller', 'resource-steward', ...(version ? ['--version', version] : []),
       '--why', `[steward ${row.id}] ${row.priority} ${row.why} · idle ${row.idleMin ?? '?'}m`]);
     return new Promise((resolve) => {
       execFile(inv.command, [...inv.args], { timeout: 60_000, maxBuffer: 4 * 1024 * 1024, env: inv.env }, (error, stdout) => {

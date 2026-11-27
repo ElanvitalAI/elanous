@@ -151,21 +151,48 @@ describe('② patrol run --shadow-cards (fake world: unknown VM gcp3 · no signa
     };
     return { deps, cards, counts: () => ({ reaps, vmRuns }) };
   }
-  test('unknown VM gcp3 → one card to RES, Federation Board row, no actions; the next tick within 30 min stays quiet', async () => {
+  test('unknown VM gcp3 → cards to RES and OP, Federation Board row, no actions; the next tick within 30 min stays quiet', async () => {
     const root = mkdtempSync(join(tmpdir(), 'res-shadow-cards-'));
     try {
       const w = world(root);
       const first = await runResPatrolWith(w.deps, { shadowCards: true });
       expect(first.observeOnly).toBe(true);
-      expect(first.carded).toBe('RES');
-      expect(w.cards).toHaveLength(1);
+      expect(first.carded).toBe('RES,OP');
+      expect(w.cards).toHaveLength(2);
       expect(w.cards[0]!.body).toContain('[수호자 · RES · 그림자] 정책 밖 1건 (critical 0 · warn 1)');
       expect(w.cards[0]!.body).toContain('unknown-vm · gcp3');
       const state = readPatrolState(join(root, 'state', 'state.json'));
       expect(guardianBoardLine(state, plus(1))).toBe('🛡 Guardian (shadow) — 0 critical · 1 warn: unknown-vm gcp3 · last card 10:00Z→RES');
       const second = await runResPatrolWith({ ...w.deps, now: () => plus(5) }, { shadowCards: true });
       expect(second.carded).toBeNull();
-      expect(w.cards).toHaveLength(1);
+      expect(w.cards).toHaveLength(2);
+      expect(w.counts()).toEqual({ reaps: 0, vmRuns: 0 });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  test('partial card delivery keeps findings pending and retries both recipients', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'res-shadow-retry-'));
+    try {
+      const w = world(root);
+      const attempts: string[] = [];
+      const first = await runResPatrolWith({ ...w.deps, postCard: (card) => {
+        attempts.push(card.to);
+        if (card.to === 'OP') throw new Error('temporary failure');
+      } }, { shadowCards: true });
+      expect(first.outcome).toBe('partial');
+      expect(first.carded).toBeNull();
+      expect(readPatrolState(join(root, 'state', 'state.json')).pending?.length).toBe(1);
+      const second = await runResPatrolWith({ ...w.deps, now: () => plus(5), postCard: (card) => { attempts.push(card.to); } }, { shadowCards: true });
+      expect(second.carded).toBe('RES,OP');
+      expect(attempts).toEqual(['RES', 'OP', 'RES', 'OP']);
+      expect(readPatrolState(join(root, 'state', 'state.json')).pending).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  test('shadow findings reach both RES and OP even when RES is active', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'res-shadow-dual-'));
+    try {
+      const w = world(root);
+      await runResPatrolWith(w.deps, { shadowCards: true });
+      expect(w.cards.map((card) => card.to).sort()).toEqual(['OP', 'RES']);
       expect(w.counts()).toEqual({ reaps: 0, vmRuns: 0 });
     } finally { rmSync(root, { recursive: true, force: true }); }
   });

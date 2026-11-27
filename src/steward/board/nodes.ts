@@ -9,14 +9,18 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeF
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
-import { loadFederationLadder } from '../../msg/hand-raise-ladder.js';
+import { appendOnce, loadFederationLadder, spawnHandDecision } from '../../msg/hand-raise-ladder.js';
+import { broadcastHolds, escalationStep, unackedBySeat, unackedLine } from '../../msg/hand-escalation-step.js';
 import { defaultMsgStorePath, openMsgStore } from '../../msg/msg-store.js';
-import { checklistDevVersion, listChecklist, swapOwnerIf } from '../../release-loop/checklist.js';
+import { readHolds as readHoldLedger, unregisteredCards } from '../../hold-ledger/hold-ledger.js';
+import { listChecklist, swapOwnerIf } from '../../release-loop/checklist.js';
+import { activeBoardVersion } from '../../ops-dashboard/current-version.js';
 import { PULSE_PHASES, pulsePaths, readPulseState, writePulseState, type PulsePhase } from '../../loops/op-pulse.js';
 import { cellBlocksPath, openBlocks, readCellBlockRows } from '../space/cell-block.js';
 import { liveSources, parsePanes } from '../space/sources.js';
 import { priorityOrderPath, readPriorityOrder } from '../space/work-next-cli.js';
 import { getUserConfig } from '../../user-config/reader.js';
+import { livePullRequiresDoneWhen } from '../../seat/seat-assign-wip1.js';
 import { BOARD_ACTOR, boardTick, type BoardDeps } from './tick.js';
 import type { BoardCellIn, HandIn } from './model.js';
 
@@ -41,7 +45,7 @@ export function liveBoardDeps(input: { live: boolean; stateRoot: string; seatSta
   const pulseState = pulsePaths(input.seatState, input.stateRoot, now.toISOString().slice(0, 10)).state;
   return {
     dir: input.dir, live: input.live, now: () => now,
-    version: () => safe(() => checklistDevVersion().replace(/-dev.*$/, ''), '0.0.0'),
+    version: () => safe(() => activeBoardVersion().replace(/-dev.*$/, ''), '0.0.0'),
     nextVersion: nextPatch,
     phase: () => { const p = safe(() => readPulseState(pulseState).lastPhase, null); return p && PULSE_PHASES.includes(p) ? p : 'build'; },
     cells: (v) => safe(() => listChecklist(v).items as unknown as BoardCellIn[], [] as BoardCellIn[]),
@@ -56,7 +60,7 @@ export function liveBoardDeps(input: { live: boolean; stateRoot: string; seatSta
     waitingOn: (() => {
       let blocks: Map<string, { on: string }> | null = null;
       return (c: BoardCellIn) => {
-        blocks ??= safe(() => openBlocks(readCellBlockRows(cellBlocksPath(root)), checklistDevVersion()) as Map<string, { on: string }>, new Map());
+        blocks ??= safe(() => openBlocks(readCellBlockRows(cellBlocksPath(root)), activeBoardVersion()) as Map<string, { on: string }>, new Map());
         return blocks.get(c.id)?.on ?? null;
       };
     })(),
@@ -74,7 +78,10 @@ export function liveBoardDeps(input: { live: boolean; stateRoot: string; seatSta
     resetPhase: (phase: PulsePhase) => safe(() => writePulseState(pulseState, { lastPulseAt: null, lastPhase: phase }), undefined),
     returnCell: (v, id, owner) => safe(() => swapOwnerIf(v, id, { expectedOwner: owner, to: null, actor: BOARD_ACTOR, reason: 'WIP-1: extra cell returned to the board' }).outcome === 'swapped', false),
     owner: () => boardOwner(),
-    card: (line, to) => safe(() => { const st = openMsgStore(defaultMsgStorePath()); try { st.append({ from: 'ORCHESTRATOR', to, body: line, kind: 'steward-exception', intent: 'alert', refs: ['board-steward'] }); } finally { st.close(); } }, undefined),
+    requireDoneWhen: livePullRequiresDoneWhen,
+    // ADMIN-RESOLVE-NOT-NAG — a board breach is a fact line, not an ask: steward-space r1 assigns free hands and wakes
+    // holders on their own cells; to OP it rides the 30-min machine digest (SIGNAL-DIET), never as a decision item.
+    card: (line, to) => safe(() => { const st = openMsgStore(defaultMsgStorePath()); try { st.append({ from: 'ORCHESTRATOR', to, body: line, kind: 'board-notice', intent: 'info', refs: ['board-steward'] }); } finally { st.close(); } }, undefined),
   };
 }
 
@@ -88,9 +95,29 @@ export function runBoardNode(ctx: Ctx): Record<string, unknown> {
   const dir = live ? join(effectiveInstanceRoot(), 'steward', 'board') : (input.shadowDir ?? join(stateRoot, 'loops', 'shadow', 'board-steward'));
   const r = boardTick(liveBoardDeps({ live, stateRoot, seatState, dir }));
   const window = input.window ?? 'manual';
+  // FEDERATION MAIL WATCH (CEO 11-26 23:xx) — ✋ escalation past a silent coordinator / OP (live only writes), unacked per
+  // seat, coordinator broadcast holds with frozen hands. Fail-open: the board tick result stands either way.
+  const mail = safe(() => {
+    const ladder = loadFederationLadder();
+    const store = openMsgStore(defaultMsgStorePath());
+    try {
+      const now = Date.now();
+      const escalated = escalationStep(store, { ladder, now: () => now, raiseDecision: spawnHandDecision, live,
+        log: (event, data) => { try { appendFileSync(join(stateRoot, 'loops', 'fed-mail-watch.jsonl'), `${JSON.stringify({ at: new Date(now).toISOString(), event, ...data })}\n`); } catch { /* fail-open */ } } });
+      const unacked = unackedBySeat(store, now);
+      const holds = broadcastHolds(store, { ladder, nowMs: now });
+      // HOLD-AS-LEDGER-OBJECT (eln OP 00:1x): an unscoped broadcast nobody registered → ONE OP card after 30 min (never «void»).
+      const unregistered = safe(() => unregisteredCards(holds, readHoldLedger(stateRoot, new Date(now)), now), [] as ReturnType<typeof unregisteredCards>);
+      if (live) for (const c of unregistered) safe(() => appendOnce(store, c.key, () => ({ from: 'HOLD-LEDGER', to: 'OP', kind: 'request', intent: 'decision', refs: [c.key, `hold-msg:${c.msgId}`], body: c.body })), null);
+      return { escalated: escalated.filter(e => e.fresh).map(e => `#${e.msgId} ${e.hop} ${e.waitedMin}m`), unacked: unackedLine(unacked),
+        holds: holds.map(h => `${h.frozen.length} hands frozen by ${h.coordinator} #${h.msgId}${h.scoped ? '' : ' (no cells · no expiry)'}`),
+        unregisteredHolds: unregistered.map(c => `#${c.msgId}`) };
+    } finally { store.close(); }
+  }, { escalated: [] as string[], unacked: 'unmeasured', holds: [] as string[], unregisteredHolds: [] as string[] });
   const ledger = join(stateRoot, 'loops', 'board-steward.jsonl'); mkdirSync(join(stateRoot, 'loops'), { recursive: true });
-  appendFileSync(ledger, `${JSON.stringify({ goal: 'met', window, live, digest: r.digest })}\n`);
-  return { outcome: r.outcome, owner: r.owner, live, digest: r.digest, cards: r.cards.length, returned: r.returned.length, leaderFlag: r.leaderFlag, cut: r.cut?.counts ?? null, opened: r.opened?.version ?? null };
+  appendFileSync(ledger, `${JSON.stringify({ goal: 'met', window, live, digest: r.digest, mail })}\n`);
+  return { outcome: r.outcome, owner: r.owner, live, digest: r.digest, cards: r.cards.length, needsSpec: r.needsSpec.length, returned: r.returned.length, leaderFlag: r.leaderFlag, cut: r.cut?.counts ?? null, opened: r.opened?.version ?? null,
+    mail };
 }
 
 if (import.meta.main) {

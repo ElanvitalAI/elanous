@@ -22,6 +22,8 @@ import { reviewDiffBudgetObservation, reviewPullRequest, renderReview } from '..
 import { buildReviewSeam, gateEvidenceNote, reviewResultToCritiqueLike, type GateLike, type CritiqueLike } from './review-adapter.js';
 import { buildExecuteProgressJudge } from './execute-progress-judge.js';
 import { NEIGHBOR_SWEEP_DEADLINE_MS, NEIGHBOR_SWEEP_ENV, NEIGHBOR_SWEEP_SHADOW_BUDGET_MS, renderNeighborSection, resolveNeighborSweepMode, sweepWorktreeNeighbors, type NeighborSweepMode, type NeighborSweepResult, type NeighborSweepRunOptions, type NeighborSweepTrigger } from './neighbor-sweep.js';
+// SMART-ROUTER-TIER-FULL-WIRE(칸 43) — 등급 게이트 원천(실제 원천 스토어 → env → free fail-closed).
+import type { MembershipResolver } from '../plugins/smart-router/consumer.js';
 import type { ReviewVerdict, StagedHarnessSeams } from './staged-harness.js';
 import { debug } from '../debug/log.js';
 import { releasePathHold, releasePathHoldComment, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
@@ -130,6 +132,9 @@ export interface HarnessSeamsDeps {
   goalDocument?: string;
   /** postPrReview 의 gh 호출 주입(opt-in). 미지정 시 node:child_process spawnSync. */
   spawnSyncFn?: typeof spawnSync;
+  /** SMART-ROUTER-TIER-FULL-WIRE(칸 43) — 등급 원천 주입(시험). 없으면 실제 원천 스토어 → env 폴백 → free.
+   *  neighbor_sweep(advanced 전용) 진입 게이트가 이 원천으로 on/shadow/off 를 판정한다(free = off fail-closed). */
+  membership?: MembershipResolver;
   /** HARNESS-NEIGHBOR-SWEEP — 수정 라운드(리뷰 must-fix·래칫 게이트 실패 뒤)에 같은 callee 이웃 목록을 만든다.
    *  mode 생략 = env `ELANOUS_HARNESS_NEIGHBOR_SWEEP` · 그것도 없거나 무효 = shadow(계산·개수 사건만 · 주입 0) ·
    *  on = rework 프롬프트에 주입 · off = 계산도 안 함. sweep 생략 = 작업 트리 diff ⊕ ast-grep/TypeScript 엔진.
@@ -329,7 +334,7 @@ export function buildHarnessSeams(deps: HarnessSeamsDeps): StagedHarnessSeams {
   //      env 와 공간 객체의 출처가 동일(`getHarnessRunId`)이라 하중을 지지 않는 중복 인자이고,
   //      "배선돼 있다"는 인상만 만든다(#5484 리뷰 2R). 재발명 0 = SSOT 를 그대로 부른다.
   const { runId, source: runIdSource } = resolveRunIdentity();
-  const neighborSweepMode = resolveNeighborSweepMode(deps.neighborSweep?.mode ?? process.env[NEIGHBOR_SWEEP_ENV]);
+  const neighborSweepMode = resolveNeighborSweepMode(deps.neighborSweep?.mode ?? process.env[NEIGHBOR_SWEEP_ENV], deps.membership);
   // HARNESS-NEIGHBOR-SWEEP — 수정 라운드에서만 부른다. 실패(도구 없음·시한 초과·예외)는 사건만 남기고 '' 를 돌려
   //   수정 라운드를 막지 않는다. 사건은 개수뿐이다(호출 원문·경로 없음). shadow 는 계산하되 주입하지 않는다.
   const neighborSweepSection = async (round: number, review: ReviewVerdict, worktree: string): Promise<string> => {

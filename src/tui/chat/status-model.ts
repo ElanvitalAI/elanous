@@ -1,6 +1,7 @@
 import { explicitTurnTier } from '../../model-tier/turn-tier.js';
 import { getUserConfig } from '../../user-config/reader.js';
 import { getSessionProvider } from '../../tui-client/session-provider.js';
+import { getSessionTierOverride } from '../../model-tier/session-override.js';
 import { PROVIDER_DEFAULT_MODEL } from '../../user-config.js';
 
 /** The provider/model the NEXT request will use, as the TUI knows it without reading credentials or starting a
@@ -35,7 +36,13 @@ export function readNextTuiStatusModel(
 
 /** ELS-SEAT-MODEL-DECLARE: the footer model. A session-scoped choice (`/provider` or launch `--provider`) is what the
  *  next request uses, so it wins over the last route badge — that badge still names the model before the switch. */
-export function nextTuiFooterModel(sessionId: string | undefined, statusModel: string, routeBadge: string | undefined): string {
-  if (sessionId && getSessionProvider(sessionId)) return statusModel;
+/** SEAT-MODEL-SURVIVES-MIGRATION (live 11-27 11:2x): OP's main turns ran on gpt-6.1-sol after `/model deep` while the
+ *  footer still said gpt-6.1-terra — the route badge is the config route, blind to the session tier override. The footer
+ *  now shows the model the main turn uses: a session provider or a session tier override (statusModel already resolves
+ *  both) → statusModel; else the model the last main turn actually answered with (`answered` · the same model the
+ *  llm.usage role:main row records); else the route badge. */
+export function nextTuiFooterModel(sessionId: string | undefined, statusModel: string, routeBadge: string | undefined, answered?: string | null): string {
+  if (sessionId && (getSessionProvider(sessionId) || getSessionTierOverride(sessionId)?.llm)) return statusModel;
+  if (answered) return answered.includes('/') ? answered : `${statusModel.split('/')[0]}/${answered}`;
   return routeBadge || statusModel;
 }

@@ -4,7 +4,7 @@
 import type { BudgetGateMaxUsedPercent, BudgetGateOnShortfall, ChildLlmChainEntry, ChildLlmPreferenceMode, UserConfig } from '../user-config/types.js';
 import { DEFAULT_BUDGET_GATE } from '../user-config.js';
 import { debug } from '../debug/log.js';
-import { fallbackChainForProvider, normalizeFallbackChain } from '../oauth/fallback-chain.js';
+import { fallbackChainForProvider, effectiveFallbackChain } from '../oauth/fallback-chain.js';
 
 /** 체인 한 칸. `codexCredits` = `llm.fallbackChain` 의 `codex-credits` 칸(codex 를 선불 크레딧으로 · 마지막 수단). */
 export type ChildLlmChainSlot = ChildLlmChainEntry & { readonly codexCredits?: true };
@@ -81,10 +81,11 @@ export function resolveChildLlmPreference(config: ChildLlmPreferenceInput): Reso
     chainSource = 'config';
   } else {
     const configuredFallback = config.llm.fallbackChain;
-    const derived = normalizeFallbackChain(configuredFallback, config.llm.provider);
+    const derived = effectiveFallbackChain(configuredFallback, config.llm.provider);
     // Preserve auto's empty preference: the launch gate applies its legacy code
     // default there. An explicitly selected provider gets its own derived chain.
-    const steps = configuredFallback === undefined && !fallbackChainForProvider(config.llm.provider)
+    // LLM-ACCOUNT-POLICY-YAML: a chain decided by the policy pack is never blanked (the policy, not the legacy default).
+    const steps = derived.source !== 'policy-pack' && configuredFallback === undefined && !fallbackChainForProvider(config.llm.provider)
       ? [] : derived.chain;
     chain = chainFromFallbackNames(steps);
     chainSource = 'fallbackChain';

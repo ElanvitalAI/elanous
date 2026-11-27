@@ -156,7 +156,7 @@ function fixture(over: Partial<WakeDeps> = {}, opts: { wrap?: (run: HerdrCliRunn
 test('resolves loop rows from the table, seats by exact pty name, then herdr pane, else unknown none', () => {
   const f = fixture();
   expect(resolveWake('COORDINATOR', f.deps)).toEqual({ wake: 'cron', source: 'loop-table' });
-  expect(resolveWake('GUARDIAN', f.deps)).toEqual({ wake: 'none', source: 'loop-table' });
+  expect(resolveWake('GUARDIAN', f.deps)).toEqual({ wake: 'cron', source: 'loop-table' }); // 수호자 v2 reads its mail each wake
   expect(resolveWake('OPT', f.deps)).toEqual({ wake: 'pty-inject', target: 'tui:1', source: 'seat-registry', host: 'local', optIn: true });
   // `op` is a substring of `opt` — never wake the neighbouring seat.
   expect(resolveWake('OP', f.deps)).toMatchObject({ wake: 'none', source: 'seat-registry', reason: 'registry-wake-disabled' });
@@ -538,7 +538,7 @@ test('an unresolved seat is none plus «모름», a known none says so, and fail
   const f = fixture();
   expect(await wakeRecipient('UX', 1, { from: 'OP' }, f.deps)).toMatchObject({ wake: 'none', source: 'seat-registry', reason: 'registry-wake-disabled', result: 'no-wake' });
   expect(f.warned.at(-1)).not.toContain('모름');
-  expect((await wakeRecipient('GUARDIAN', 2, { from: 'OP' }, f.deps)).result).toBe('no-wake');
+  expect((await wakeRecipient('GUARDIAN', 2, { from: 'OP' }, f.deps)).result).toBe('wake-deferred'); // cron body: its next tick reads it
   expect(f.warned.at(-1)).not.toContain('모름');
   const failing = fixture({ ptyInjector: async () => async () => { throw new Error('denied'); } });
   expect(await wakeRecipient('OPT', 3, { from: 'OP' }, failing.deps)).toMatchObject({ result: 'failed', reason: 'denied' });

@@ -37,7 +37,7 @@ const SCHEMA_COLUMNS: Record<string, readonly string[]> = {
   imported_versions: ['json_hash', 'imported_at'],
   events: ['reason', 'generation'],
   assignments: ['priority', 'predecessors', 'deadline_version', 'ceo_minutes', 'ceo_date', 'accelerator', 'refs', 'dispatch_kind', 'known_issue', 'body', 'done_criterion', 'source'],
-  release_schedules: ['freeze_from', 'freeze_until', 'publish_at'],
+  release_schedules: ['freeze_from', 'freeze_until', 'publish_at', 'rehearsal_at'],
 };
 // RELEASE-CHECKLIST-BULK-MOVE: snapshot() read `events WHERE version = ? ORDER BY seq` over ~59k rows with no index and
 // items() ran one evidence lookup per cell — both full scans. These follow the actual query columns.
@@ -93,17 +93,17 @@ function open(root = releaseLedgerRoot()): Database {
         if (!assignmentColumns.some((column) => column.name === name)) db.exec(`ALTER TABLE assignments ADD COLUMN ${name} ${sql}`);
       }
       const scheduleColumns = db.query('PRAGMA table_info(release_schedules)').all() as Array<{ name: string }>;
-      for (const name of ['freeze_from', 'freeze_until', 'publish_at']) if (!scheduleColumns.some((column) => column.name === name)) db.exec(`ALTER TABLE release_schedules ADD COLUMN ${name} TEXT`);
+      for (const name of ['freeze_from', 'freeze_until', 'publish_at', 'rehearsal_at']) if (!scheduleColumns.some((column) => column.name === name)) db.exec(`ALTER TABLE release_schedules ADD COLUMN ${name} TEXT`);
       for (const sql of Object.values(SCHEMA_INDEXES)) db.exec(sql);
     }).immediate();
     return db;
   } catch (error) { db.close(); throw error; }
 }
 
-export interface ScheduleRow { version: string; cutAt: string; landBy: string | null; freezeFrom?: string | null; freezeUntil?: string | null; publishAt?: string | null; updatedAt: string; updatedBy: string }
-type StoredSchedule = { version: string; cut_at: string; land_by: string | null; freeze_from: string | null; freeze_until: string | null; publish_at?: string | null; updated_at: string; updated_by: string };
+export interface ScheduleRow { version: string; cutAt: string; landBy: string | null; freezeFrom?: string | null; freezeUntil?: string | null; publishAt?: string | null; rehearsalAt?: string | null; updatedAt: string; updatedBy: string }
+type StoredSchedule = { version: string; cut_at: string; land_by: string | null; freeze_from: string | null; freeze_until: string | null; publish_at?: string | null; rehearsal_at?: string | null; updated_at: string; updated_by: string };
 function scheduleRow(row: StoredSchedule): ScheduleRow {
-  return { version: row.version, cutAt: row.cut_at, landBy: row.land_by, ...(row.freeze_from ? { freezeFrom: row.freeze_from } : {}), ...(row.freeze_until ? { freezeUntil: row.freeze_until } : {}), ...(row.publish_at ? { publishAt: row.publish_at } : {}), updatedAt: row.updated_at, updatedBy: row.updated_by };
+  return { version: row.version, cutAt: row.cut_at, landBy: row.land_by, ...(row.freeze_from ? { freezeFrom: row.freeze_from } : {}), ...(row.freeze_until ? { freezeUntil: row.freeze_until } : {}), ...(row.publish_at ? { publishAt: row.publish_at } : {}), ...(row.rehearsal_at ? { rehearsalAt: row.rehearsal_at } : {}), updatedAt: row.updated_at, updatedBy: row.updated_by };
 }
 
 export function readSchedule(version: string, root?: string): ScheduleRow | null {
@@ -130,7 +130,7 @@ export function assignedVersions(root = releaseLedgerRoot()): string[] {
   finally { db.close(); }
 }
 
-export function writeSchedule(version: string, patch: { cutAt?: string; landBy?: string; freezeFrom?: string; freezeUntil?: string; publishAt?: string }, by: string, root?: string): ScheduleRow {
+export function writeSchedule(version: string, patch: { cutAt?: string; landBy?: string; freezeFrom?: string; freezeUntil?: string; publishAt?: string; rehearsalAt?: string }, by: string, root?: string): ScheduleRow {
   validateVersion(version);
   const db = open(root);
   try {
@@ -142,21 +142,23 @@ export function writeSchedule(version: string, patch: { cutAt?: string; landBy?:
       const freezeFrom = patch.freezeFrom ?? previous?.freeze_from ?? null;
       const freezeUntil = patch.freezeUntil ?? previous?.freeze_until ?? null;
       const publishAt = patch.publishAt ?? previous?.publish_at ?? null;
+      const rehearsalAt = patch.rehearsalAt ?? previous?.rehearsal_at ?? null;
+      if (rehearsalAt && Date.parse(rehearsalAt) >= Date.parse(cutAt)) throw new CliUserError('리허설 시각은 컷보다 앞서야 한다');
       if (publishAt && Date.parse(publishAt) <= Date.parse(cutAt)) throw new CliUserError('발행 시각은 컷보다 뒤여야 한다');
       if (Boolean(freezeFrom) !== Boolean(freezeUntil) || (freezeFrom && freezeUntil && Date.parse(freezeFrom) >= Date.parse(freezeUntil))) throw new CliUserError('동결 시작·끝은 함께 주고 시작이 끝보다 앞서야 한다');
-      if (previous && previous.cut_at === cutAt && previous.land_by === landBy && previous.freeze_from === freezeFrom && previous.freeze_until === freezeUntil && (previous.publish_at ?? null) === publishAt) return scheduleRow(previous);
+      if (previous && previous.cut_at === cutAt && previous.land_by === landBy && previous.freeze_from === freezeFrom && previous.freeze_until === freezeUntil && (previous.publish_at ?? null) === publishAt && (previous.rehearsal_at ?? null) === rehearsalAt) return scheduleRow(previous);
       const at = new Date().toISOString();
-      db.query(`INSERT INTO release_schedules (version, cut_at, land_by, freeze_from, freeze_until, publish_at, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(version) DO UPDATE SET cut_at=excluded.cut_at, land_by=excluded.land_by, freeze_from=excluded.freeze_from, freeze_until=excluded.freeze_until, publish_at=excluded.publish_at, updated_at=excluded.updated_at, updated_by=excluded.updated_by`)
-        .run(version, cutAt, landBy, freezeFrom, freezeUntil, publishAt, at, by);
+      db.query(`INSERT INTO release_schedules (version, cut_at, land_by, freeze_from, freeze_until, publish_at, rehearsal_at, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(version) DO UPDATE SET cut_at=excluded.cut_at, land_by=excluded.land_by, freeze_from=excluded.freeze_from, freeze_until=excluded.freeze_until, publish_at=excluded.publish_at, rehearsal_at=excluded.rehearsal_at, updated_at=excluded.updated_at, updated_by=excluded.updated_by`)
+        .run(version, cutAt, landBy, freezeFrom, freezeUntil, publishAt, rehearsalAt, at, by);
       for (const [field, from, to] of [
         ['cut_at', previous?.cut_at ?? null, cutAt], ['land_by', previous?.land_by ?? null, landBy],
         ['freeze_from', previous?.freeze_from ?? null, freezeFrom], ['freeze_until', previous?.freeze_until ?? null, freezeUntil],
-        ['publish_at', previous?.publish_at ?? null, publishAt],
+        ['publish_at', previous?.publish_at ?? null, publishAt], ['rehearsal_at', previous?.rehearsal_at ?? null, rehearsalAt],
       ] as const) {
         if (from !== to) record(db, version, { at, by, id: '@version', field, from, to, released: releasedVersion(root), dev: devVersion() });
       }
-      return { version, cutAt, landBy, ...(publishAt ? { publishAt } : {}), updatedAt: at, updatedBy: by };
+      return { version, cutAt, landBy, ...(publishAt ? { publishAt } : {}), ...(rehearsalAt ? { rehearsalAt } : {}), updatedAt: at, updatedBy: by };
     });
   } finally { db.close(); }
 }

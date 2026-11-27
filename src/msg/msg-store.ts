@@ -1,4 +1,5 @@
 import { recordFact as recordFedFact } from '../fed-state/ledger.js';
+import { V2_AGENT_SEATS } from '../loop-agent/seats.js';
 import { Database } from 'bun:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
@@ -12,6 +13,9 @@ import { appendLedgerEvent } from './ledger-events.js';
 import { ALL_SEAT_BELL, ringSeatBell } from './seat-bell.js';
 import { isLive, mayRetract } from './directive-expiry.js';
 import { appendedBody } from './outbound-coalesce.js';
+import { readMailRoutePolicy } from '../kit/mail-route/policy.js';
+import { readHandRoutes } from '../kit/mail-route/hand-routes.js';
+import { OP_DIGEST_RECIPIENT, OP_DIGEST_SENDER, OP_DIGEST_TOP, needsDecision, opDigestFolds, renderOpDigest, type ParkedItem } from './op-machine-digest.js';
 
 /** ELS-ORCH-TASK-ENVELOPE §1 — one result artifact reference (WU §4-3 `attachments[{path, sha}]` shape). */
 export interface TaskResultArtifact { path: string; sha: string; }
@@ -76,11 +80,17 @@ export interface Message extends MessageEnvelope {
   repeatCount?: number;
   lastRepeatAt?: string;
   repeatReason?: string;
+  /** HAND-RAISE-DOMAIN-ROUTING — on a deduped `post` result: the same ✋ ask (sender · `hand-ask:<root>:<cell>`) was
+   *  posted as this row inside the hand dedupe window; the sender is answered by reference to it, no new row. */
+  handAskRepeat?: true;
   /** SEAT-MAIL #24 — on a sender-entrance `post` result (dedupe on): the original message ID this reply auto-acked
    *  for the replying seat. One per-message ack row; the cursor never moves. Absent when the original is not
    *  addressed to the replying seat (ALL · group · another seat) and on every opted-out entrance (`--no-dedupe`,
    *  programmatic producers). */
   autoAcked?: number;
+  /** SIGNAL-DIET-OP-DIGEST — this machine mail to OP was parked for the 30-min digest (the parked item id). When the
+   *  park itself flushed the digest, the returned row IS the digest mail. */
+  digested?: number;
 }
 
 /** ELS-ORCH-TASK-ENVELOPE §2 — a `collect` result: the chain's replies, per-sender receipt states, and the counts. */
@@ -176,10 +186,19 @@ function derivedOrigin(sender: string): MessageOrigin | undefined {
 }
 
 /** Normalize the public message address syntax while keeping seat IDs backward compatible. */
+/** Loop agents (LOOP-AGENT v2) that read their own mail: `loop:<id>` → seat id. */
+export const LOOP_AGENT_SEATS: Readonly<Record<string, string>> = { 'judge-butler': 'JUDGE-BUTLER', guardian: 'GUARDIAN' };
+
 export function canonicalMessageAddress(value: string): string {
   if (typeof value !== 'string') throw new TypeError('message address must be a string');
   const address = value.trim();
   if (/^seat:/i.test(address)) return canonicalSeatId(address.slice(address.indexOf(':') + 1));
+  // LOOP-AGENT v2 address (ELS-CHANNEL design · until the channel lands): `loop:judge-butler` → its mail seat `JUDGE-BUTLER`.
+  // Only loop agents with a voice are addressable; any other `loop:` name stays invalid.
+  const loopAgent = /^loop:([a-z][a-z0-9-]{0,62})$/i.exec(address);
+  if (loopAgent && Object.hasOwn(LOOP_AGENT_SEATS, loopAgent[1]!.toLowerCase())) return LOOP_AGENT_SEATS[loopAgent[1]!.toLowerCase()]!;
+  // SUPERVISOR-REVIVE-1127: the v2 supervisors on the generic shell (src/loop-agent/seats.ts).
+  if (loopAgent && Object.hasOwn(V2_AGENT_SEATS, loopAgent[1]!.toLowerCase())) return V2_AGENT_SEATS[loopAgent[1]!.toLowerCase()]!;
   if (/^group:/i.test(address)) {
     const name = address.slice(address.indexOf(':') + 1).trim().toLowerCase();
     if (!/^[a-z0-9][a-z0-9_-]{0,62}$/.test(name)) throw new Error('invalid group name');
@@ -549,6 +568,7 @@ export class MsgStore {
   readonly db: Database;
   private readonly dbPath: string;
   private readonly clock: () => Date;
+  private readonly readOnlyStore: boolean;
   private readonly dedupeWindowMs: number;
   /** posted-receipt events held until the outermost write transaction commits (dropped on rollback). */
   private pendingPostedEvents: Array<() => void> = [];
@@ -660,6 +680,7 @@ export class MsgStore {
 
   constructor(path: string = defaultMsgStorePath(), options: { readOnly?: boolean; now?: () => Date; dedupeWindowMs?: number; busyTimeoutMs?: number; archivePath?: string } = {}) {
     this.clock = options.now ?? (() => new Date());
+    this.readOnlyStore = options.readOnly === true;
     this.dbPath = path;
     this.dedupeWindowMs = resolveDedupeWindowMs(options.dedupeWindowMs);
     this.archivePathOption = options.archivePath ?? null;
@@ -825,6 +846,29 @@ export class MsgStore {
     return null;
   }
 
+  /**
+   * HAND-RAISE-DOMAIN-ROUTING — the first row this ✋ repeats: same sender, same `hand-ask:<root>:<cell>` ref, posted inside
+   * hand-routes.yaml `dedupe.windowMinutes`. Only the entrances stamp `hand-ask:` (on a first ✋ — never on a reply or escalation).
+   * Runs inside the post transaction (two concurrent re-asks serialize and the second finds the first).
+   */
+  private findRepeatHandAsk(msg: MessageEnvelope): Message | null {
+    const ask = (msg.refs ?? []).find((r) => r.startsWith('hand-ask:'));
+    if (!ask) return null;
+    let windowMs = 0;
+    try { windowMs = readHandRoutes().dedupeWindowMs; } catch { windowMs = 0; }
+    if (windowMs <= 0) return null;
+    const pattern = `%${JSON.stringify(ask).replace(/[\\%_]/gu, (c) => `\\${c}`)}%`;
+    const row = this.db.query(`SELECT id FROM msg_messages WHERE sender = ? AND created_at >= ? AND refs_json LIKE ? ESCAPE '\\' ORDER BY id ASC LIMIT 1`)
+      .get(canonicalMessageAddress(msg.from), new Date(Date.now() - windowMs).toISOString(), pattern) as { id: number } | null;
+    const first = row === null ? null : this.getMessage(row.id);
+    if (first === null) return null;
+    const repeated = this.recordRepeat(first, windowMs);
+    const minutes = Math.round(windowMs / 60_000);
+    try { debug.log('msg', 'msg.hand-ask.by-reference', { msgId: first.id, from: first.from, to: first.to, ask, repeatCount: repeated.repeatCount }); } catch { /* fail-open */ }
+    return { ...repeated, handAskRepeat: true as const,
+      repeatReason: `same ✋ ask as #${first.id} (×${repeated.repeatCount ?? 2} · ${ask.slice('hand-ask:'.length)} within ${minutes} min) — answered by reference, no new row` };
+  }
+
   /** SEAT-MAIL #16 — a suppressed repeat is not silent: bump the first row's counter and last time, return it with why. */
   private recordRepeat(existing: Message, windowMs: number): Message {
     const at = new Date().toISOString();
@@ -855,6 +899,69 @@ export class MsgStore {
     return this.recordRepeat(newest, HAND_ESCALATION_MAIL_WINDOW_MS);
   }
 
+  /**
+   * SIGNAL-DIET-OP-DIGEST — park a machine sender's non-🚨 mail to OP (see op-machine-digest.ts) and flush the digest
+   * when due. Runs inside the caller's write transaction. Returns null when the mail goes to the inbox as usual.
+   */
+  private parkOpMachineMail(msg: MessageEnvelope, provenanceKey?: string): Message | null {
+    if (!opDigestFolds({ ...msg, replyTo: msg.replyTo ?? null })) return null;
+    this.ensureOpDigestTable();
+    if (provenanceKey) {
+      const prior = this.db.query('SELECT id FROM msg_op_digest_pending WHERE provenance_key = ?').get(provenanceKey) as { id: number } | null;
+      if (prior) return { id: 0, ...msg, createdAt: this.clock().toISOString(), digested: prior.id };
+    }
+    const at = this.clock().toISOString();
+    const res = this.db.query(`INSERT INTO msg_op_digest_pending(recipient, sender, kind, intent, body, refs_json, provenance_key, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(msg.to, msg.from, msg.kind ?? null, msg.intent ?? null, msg.body, msg.refs ? JSON.stringify(msg.refs) : null, provenanceKey ?? null, at);
+    const parkedId = Number(res.lastInsertRowid);
+    try { debug.log('msg.op-digest', 'parked', { from: msg.from, to: msg.to, kind: msg.kind ?? null, parkedId }); } catch { /* fail-open */ }
+    const digest = this.flushOpDigestIfDue();
+    return digest ? { ...digest, digested: parkedId } : { id: 0, ...msg, createdAt: at, digested: parkedId };
+  }
+
+  private opDigestTableReady = false;
+  private ensureOpDigestTable(): void {
+    if (this.opDigestTableReady) return;
+    this.db.exec(`CREATE TABLE IF NOT EXISTS msg_op_digest_pending (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, recipient TEXT NOT NULL, sender TEXT NOT NULL, kind TEXT, intent TEXT, body TEXT NOT NULL,
+      refs_json TEXT, provenance_key TEXT, created_at TEXT NOT NULL, flushed_into INTEGER);
+      CREATE INDEX IF NOT EXISTS idx_msg_op_digest_pending_open ON msg_op_digest_pending(recipient, flushed_into, id);`);
+    this.opDigestTableReady = true;
+  }
+
+  /** Parked machine mail to OP not yet flushed (oldest first). */
+  pendingOpDigest(): ParkedItem[] {
+    const present = this.db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'msg_op_digest_pending'").get();
+    if (!present) return [];
+    return (this.db.query('SELECT id, sender, kind, intent, body, refs_json, created_at FROM msg_op_digest_pending WHERE recipient = ? AND flushed_into IS NULL ORDER BY id')
+      .all(OP_DIGEST_RECIPIENT) as Array<{ id: number; sender: string; kind: string | null; intent: string | null; body: string; refs_json: string | null; created_at: string }>)
+      .map((r) => ({ id: r.id, sender: r.sender, kind: r.kind, intent: r.intent, body: r.body, refs: parseStoredRefs(r.refs_json) ?? [], createdAt: r.created_at }));
+  }
+
+  /**
+   * Flush the OP machine digest when the oldest parked item is one mail-route policy window old (default 30 min) (or `force`): ONE mail from
+   * {@link OP_DIGEST_SENDER}; parked rows point at it and their provenance keys map to it. Returns the digest or null.
+   */
+  flushOpDigestIfDue(opts: { force?: boolean } = {}): Message | null {
+    if (this.readOnlyStore) return null;
+    const run = (): Message | null => {
+      const items = this.pendingOpDigest();
+      if (!items.length) return null;
+      const oldest = Date.parse(items[0]!.createdAt);
+      if (!opts.force && this.clock().getTime() - oldest < readMailRoutePolicy().windowMs) return null;
+      const top = items.filter(needsDecision).sort((a, b) => b.id - a.id).slice(0, OP_DIGEST_TOP);
+      const refs = ['op-digest', ...new Set(top.flatMap((i) => i.refs).slice(0, 6))];
+      const digest = this.insertMessage({ from: OP_DIGEST_SENDER, to: OP_DIGEST_RECIPIENT, kind: 'digest', intent: 'info', needsAck: false, body: renderOpDigest(items), refs });
+      const ids = items.map((i) => i.id);
+      this.db.query(`UPDATE msg_op_digest_pending SET flushed_into = ? WHERE id IN (${ids.map(() => '?').join(',')})`).run(digest.id, ...ids);
+      this.db.query(`INSERT OR IGNORE INTO msg_provenance(provenance_key, message_id) SELECT provenance_key, ? FROM msg_op_digest_pending
+        WHERE flushed_into = ? AND provenance_key IS NOT NULL`).run(digest.id, digest.id);
+      try { debug.log('msg.op-digest', 'flushed', { into: digest.id, items: ids.length, decisions: top.length }); } catch { /* fail-open */ }
+      return digest;
+    };
+    return this.db.inTransaction ? run() : this.withPostedEvents(run);
+  }
+
   append(input: MessageEnvelope): Message { return this.post(input); }
 
   /** Append once for a coordination comment, task failure, or decided notification. */
@@ -879,6 +986,8 @@ export class MsgStore {
       if (msg.to.startsWith('group:') && !this.db.query('SELECT 1 FROM msg_groups WHERE address = ?').get(msg.to)) {
         throw new Error(`group not found: ${msg.to}`);
       }
+      const parked = this.parkOpMachineMail(msg, provenanceKey);
+      if (parked) return parked;
       const folded = this.foldHandEscalation(msg);
       if (folded) {
         this.db.query('INSERT INTO msg_provenance(provenance_key, message_id) VALUES (?, ?)').run(provenanceKey, folded.id);
@@ -1115,8 +1224,16 @@ export class MsgStore {
         return existing === null ? insert(message) : this.recordRepeat(existing, windowMs);
       }
       if (message.to !== 'ALL') {
+        // HAND-RAISE-DOMAIN-ROUTING — the same ✋ ask again inside the window (any recipient: a reroute may differ) is
+        // answered by reference to the first row: no new row, no new wake, no new rung.
+        const sameAsk = options.dedupe === true ? this.findRepeatHandAsk(message) : null;
+        if (sameAsk) return sameAsk;
+        const parked = this.parkOpMachineMail(message);
+        if (parked) return parked;
         const existing = recent();
-        return existing === null ? insert(message) : this.recordRepeat(existing, windowMs);
+        const row = existing === null ? insert(message) : this.recordRepeat(existing, windowMs);
+        if (message.to === OP_DIGEST_RECIPIENT) this.flushOpDigestIfDue();
+        return row;
       }
       // ALL: a retried identical broadcast is the same logical send — it returns the stored row.
       const existing = recent();

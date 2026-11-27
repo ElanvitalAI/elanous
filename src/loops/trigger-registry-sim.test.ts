@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, w
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Database } from 'bun:sqlite';
+import { registerGraphTriggerDispatchBinding } from './graph-trigger-dispatch-lease.js';
 import { listFires, listTriggers, openTriggerRegistry, registerTrigger, tickTriggers, type TriggerDecl, type TriggerRunInput,
   type TriggerTickDeps } from './trigger-registry.js';
 
@@ -65,6 +66,29 @@ beforeEach(() => {
 afterEach(() => { db.close(); rmSync(dir, { recursive: true, force: true }); });
 
 describe('SIM graph trigger registry', () => {
+  for (const graphId of ['op-pulse', 'op-retro']) {
+    test(`${graphId}: concurrent retry after restart skips every occupied binding`, async () => {
+      const stateRoot = join(dir, 'state');
+      registerTrigger(db, bulletin({ graphId, legacy: undefined }));
+      runOutcome = () => 'failed';
+      at('2026-11-25T09:05:00Z'); await tickTriggers(db, deps());
+      const window = '2026-11-25T09:05:00.000Z';
+      const triggerId = `cron:${graphId}`;
+      const opts = { registryRoot: stateRoot, stateRoot };
+      const occupied = [2, 3, 4].map(n => registerGraphTriggerDispatchBinding({ triggerId,
+        dedupeKey: `${window}#2${n === 2 ? '' : `~${n - 1}`}`, graphId }, opts).runId);
+      db.close(); db = openTriggerRegistry(stateRoot);
+      const second = openTriggerRegistry(stateRoot);
+      try {
+        at('2026-11-25T09:06:00Z');
+        await Promise.all([tickTriggers(db, deps()), tickTriggers(second, deps())]);
+        expect(runs.map(r => r.attempt)).toEqual([1, 2]);
+        expect(occupied).not.toContain(runs[1]!.runId);
+        expect(new Set([...occupied, ...runs.map(r => r.runId)]).size).toBe(5);
+        expect(listFires(db, graphId)[0]!.runId).toBe(runs[1]!.runId);
+      } finally { second.close(); }
+    });
+  }
   test('single registration: three registers of one graph leave one row and one run per window', async () => {
     registerTrigger(db, bulletin()); registerTrigger(db, bulletin()); registerTrigger(db, bulletin());
     expect(listTriggers(db).map(r => r.graphId)).toEqual(['sim-bulletin']);

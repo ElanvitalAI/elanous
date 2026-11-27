@@ -47,6 +47,9 @@ export interface CompactSessionOpts {
    *  the context is. Below-threshold histories may still no-op if there is
    *  nothing to summarize. */
   force?: boolean;
+  /** CONTEXT-BUDGET-ROTATION — 요약 모델 명시 오버라이드(«명시 > 셀프»).
+   *  RunCompactOpts.summarizerModel 로 통과한다. */
+  summarizerModel?: string;
   /** Prepare the rewritten session without persisting it until accepted. */
   prepareOnly?: boolean;
   /** Internal — this call is the one retry after the store's prefix changed under a summary. */
@@ -251,6 +254,7 @@ export async function compactSessionHistory(
     provider,
     policy,
     ...(opts.modelId ? { activeModelId: opts.modelId } : {}),
+    ...(opts.summarizerModel ? { summarizerModel: opts.summarizerModel } : {}),
   });
   let overflowRetries = 0;
   const applied = (r: typeof result): boolean =>
@@ -267,6 +271,7 @@ export async function compactSessionHistory(
       provider,
       policy,
       ...(opts.modelId ? { activeModelId: opts.modelId } : {}),
+      ...(opts.summarizerModel ? { summarizerModel: opts.summarizerModel } : {}),
     });
   }
 

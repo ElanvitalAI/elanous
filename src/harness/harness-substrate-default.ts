@@ -61,7 +61,7 @@ export function harnessLaunchPolicyConfig(options: {
     return derived;
   }
   const policy = (config: UserConfig) => ({
-    quota: resolveCodexQuotaPolicy(config.llm).policy,
+    quota: resolveCodexQuotaPolicy(config.llm, undefined, (require('../kit/resource-facts/llm-decide.js') as typeof import('../kit/resource-facts/llm-decide.js')).decidedCodexQuotaPolicy('harness-substrate')).policy,
     accountLimits: config.llm?.codexAccountRotationThresholdPercentByAccount,
     fallbackChain: config.llm?.fallbackChain,
     childLlm: config.tools?.selfImplement?.childLlm,

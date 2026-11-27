@@ -1,0 +1,18 @@
+# Tick shim for the loop agent run-doctor (YAML-SUPERVISORS-RUNTIME). The trigger — wake (cron | condition) · failure · owner (L0
+# by duty) · goal — is defined ONLY in graphs/loop-agents/run-doctor/agent.yaml `wake:`; the trigger registry builds it from there
+# (src/loop-agent/v3/agent-trigger.ts). This file only names the agent and runs one tick. Do not add loop.trigger here.
+graph_id: run-doctor-agent
+version: 1
+loop:
+  from_agent: run-doctor
+entry_node: tick
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: tick
+    kind: agent
+    recipe: 'cmd:run-doctor-agent-tick'
+    max_visits: 1
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }

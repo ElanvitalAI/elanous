@@ -170,6 +170,33 @@ describe('Korean end to end (CEO 11-26)', () => {
     expect(r).toMatchObject({ ok: false, why: 'brief is not in Korean' });
     expect(called).toBe(0);
   });
+  test('Korean brief with inline (https://…) URLs and an English «## 출처» list → spoken in Korean, no URL', async () => {
+    const titles = Array.from({ length: 30 }, (_, i) => `${i + 1}. Firecrawl search — Global markets rally as investors weigh central bank outlook and earnings season ${i} · https://news.example.com/markets/article-${i}?utm_source=feed · 2026-11-26T03:00:00.000Z`).join('\n');
+    const brief = `# 내일 아침 시장 브리핑\n\n- 코스피는 외국인 매도로 하락했습니다 (https://finance.example.com/quote/KS11?range=1d&interval=5m).\n- 원달러 환율은 상승했습니다 (https://www.example.org/markets/currencies/usd-krw-exchange-rate-today).\n- 미국 증시는 기술주 중심으로 올랐습니다 https://www.reuters.example/markets/us/stocks-rally-tech-earnings-2026-11-25/\n\n## 출처\n${titles}\n\n### 출처 없음\n- x-pulse (via Grok search): 출처 확보 실패`;
+    expect(hangulRatio(brief)).toBeLessThan(0.5);
+    const text = speechText(brief);
+    expect(text).not.toMatch(/https?:|www\.|\(\s*\)/u);
+    expect(text).not.toContain('Firecrawl');
+    expect(text).not.toMatch(/ {2}/u);
+    expect(hangulRatio(text)).toBeGreaterThanOrEqual(0.5);
+    expect(text).toBe('내일 아침 시장 브리핑. 코스피는 외국인 매도로 하락했습니다. 원달러 환율은 상승했습니다. 미국 증시는 기술주 중심으로 올랐습니다.');
+    const seen: string[] = [];
+    const r = await runVoice(brief, join(tmp(), 'brief.mp3'), async (t) => { seen.push(t); return new Uint8Array([1]); }, undefined, { language: 'Korean' });
+    expect(r.ok).toBe(true);
+    expect(seen[0]).toBe(text);
+  });
+  test('the source list is cut from any-level «출처» / «Sources» / «References» heading', () => {
+    expect(speechText('코스피 하락.\n### Sources\n- Reuters — Stocks fall')).toBe('코스피 하락.');
+    expect(speechText('코스피 하락.\n# References:\n1. Bloomberg')).toBe('코스피 하락.');
+    expect(speechText('코스피 하락.\n**출처**\n1. Bloomberg')).toBe('코스피 하락.');
+    expect(speechText('## 출처와 방법론 개요\n코스피 하락.')).toBe('출처와 방법론 개요. 코스피 하락.');
+  });
+  test('a genuinely English brief with URLs is still skipped for a Korean goal', async () => {
+    let called = 0;
+    const r = await runVoice('# Market brief\n- KOSPI fell on foreign selling (https://x.example/a).\n- The won weakened.\n\n## Sources\n1. Reuters', join(tmp(), 'brief.mp3'), async () => { called++; return new Uint8Array([1]); }, undefined, { language: 'Korean' });
+    expect(r).toMatchObject({ ok: false, why: 'brief is not in Korean' });
+    expect(called).toBe(0);
+  });
   test('Korean brief → spoken, source notes dropped from speech', async () => {
     const seen: string[] = [];
     const r = await runVoice('**코스피는 하락했습니다.** *(출처: KS11 실시간 시세)*\n- 환율은 올랐습니다.', join(tmp(), 'brief.mp3'), async (t) => { seen.push(t); return new Uint8Array([1]); }, undefined, { language: 'Korean' });

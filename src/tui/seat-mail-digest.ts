@@ -14,6 +14,11 @@
  */
 import { legacyIntent } from '../msg/msg-receipts.js';
 import { isDecisionMail, isUrgentSeatMail } from './seat-mail-priority.js';
+import { alreadyDigestedLine, digestLine, digestLinePrefix, foldMailDigests } from '../kit/mail-route/digest.js';
+import { activeMailFold, type MailFoldLedger } from '../kit/mail-route/fold-once.js';
+
+// KIT mail-route — the line, the block and the fold live in src/kit/mail-route/digest.ts (one builder for TUI · repl · bus).
+export { foldMailDigests };
 
 /** Transport kinds that carry information only — listed in a digest, auto-acked after it, never a turn of their own. */
 export const SEAT_MAIL_INFO_KINDS: readonly string[] = ['info', 'ack', 'receipt', 'receipts', 'retro', 'retro-report'];
@@ -54,16 +59,16 @@ export function isInfoSeatMail(message: SeatMailDigestInput): boolean {
 
 /** One digest line: `#id · from · kind · first 120 body chars` (whitespace folded to single spaces). */
 export function seatMailDigestLine(message: SeatMailDigestInput, maxBody: number = SEAT_MAIL_DIGEST_BODY_CHARS): string {
-  const flat = message.body.replace(/\s+/gu, ' ').trim();
-  const body = flat.length <= maxBody ? flat : `${flat.slice(0, maxBody)}…`;
-  return `${seatMailDigestPrefix(message)}${body}`;
+  return digestLine({ id: message.id, from: message.sender, field: kindField(message), body: message.body }, maxBody);
 }
 
 /** The digest line's head before the body (`#id · from · kind · `) — NOTICE-FOLD-1LINE finds the body by its length. */
 export function seatMailDigestPrefix(message: SeatMailDigestInput): string {
-  const kind = typeof message.kind === 'string' && message.kind.trim() !== '' ? message.kind.trim() : '-';
-  return `#${message.id} · ${message.sender} · ${kind} · `;
+  return digestLinePrefix({ id: message.id, from: message.sender, field: kindField(message) });
 }
+
+const kindField = (message: SeatMailDigestInput): string =>
+  (typeof message.kind === 'string' && message.kind.trim() !== '' ? message.kind.trim() : '-');
 
 /** A notice as it leaves the queue in one bundle (the fields this module reads). */
 export interface SeatMailBundleNotice {
@@ -112,46 +117,23 @@ function digestLines(mail: readonly SeatMailBundleNotice[]): string[] {
  * one line per mail, then the full text of each action mail (info mail is the line only). Other notices follow as they
  * are. A bundle of one action mail and nothing else keeps its plain text (no digest wrapper for a single mail).
  */
-export function seatMailBundleText(notices: readonly SeatMailBundleNotice[]): string {
-  return foldMailDigests(seatMailBundleTextRaw(notices));
+export function seatMailBundleText(notices: readonly SeatMailBundleNotice[], fold: MailFoldLedger | null = activeMailFold()): string {
+  return foldMailDigests(seatMailBundleTextRaw(foldOnce(notices, fold)));
 }
 
-const DIGEST_OPEN = '<mail_digest count="';
-const DIGEST_CLOSE = '</mail_digest>';
-const UNREAD_TAIL = /\n\n\[미읽음 총 (\d+)통\]$/u;
-
 /**
- * MAIL-ENVELOPE-INFO-NOT-ORDER — a turn carries ONE `<mail_digest count=N>` block: every single-mail digest block in the
- * bundle text is merged (one lead note, one line per mail) and the per-mail «[미읽음 총 N통]» tails collapse into one
- * unread count (the latest). Reads only our own block grammar. 순수.
+ * KIT mail-route fold-once — a passive seat mail another digest path (the repl mid-turn digest) already listed for this
+ * seat is not listed again; one «already in an earlier digest» notice names those ids. Action mail is never suppressed.
+ * No active ledger (tests · member chat) = the bundle as it is.
  */
-export function foldMailDigests(text: string): string {
-  const parts = text.split('\n\n');
-  const entries: string[] = [];
-  const kept: string[] = [];
-  let unread: number | undefined;
-  let note: string | undefined;
-  for (let i = 0; i < parts.length; i++) {
-    let part = parts[i]!;
-    const tail = UNREAD_TAIL.exec(`\n\n${part}`);
-    if (tail && part.startsWith('[미읽음 총 ')) { unread = Number(tail[1]); continue; }
-    if (part.startsWith(DIGEST_OPEN)) {
-      // A digest block may span several «\n\n» pieces when a body holds blank lines: join until its close tag.
-      while (!part.includes(DIGEST_CLOSE) && i + 1 < parts.length) part = `${part}\n\n${parts[++i]!}`;
-      const lines = part.split('\n');
-      const m = /unread="(\d+)"/u.exec(lines[0] ?? '');
-      if (m) unread = Number(m[1]);
-      note ??= lines[1];
-      const end = lines.lastIndexOf(DIGEST_CLOSE);
-      entries.push(lines.slice(2, end < 0 ? undefined : end).join('\n'));
-      continue;
-    }
-    kept.push(part);
-  }
-  if (entries.length === 0 && unread === undefined) return text;
-  const block = entries.length === 0 ? [] : [`${DIGEST_OPEN}${entries.length}"${unread === undefined ? '' : ` unread="${unread}"`}>\n${note ?? ''}\n${entries.join('\n')}\n${DIGEST_CLOSE}`];
-  const unreadLine = entries.length === 0 && unread !== undefined ? [`[미읽음 총 ${unread}통]`] : [];
-  return [...kept, ...block, ...unreadLine].join('\n\n');
+function foldOnce(notices: readonly SeatMailBundleNotice[], fold: MailFoldLedger | null): readonly SeatMailBundleNotice[] {
+  if (!fold) return notices;
+  const passive = notices.filter((n) => n.source === 'seat-mail' && n.passive === true && typeof n.msgId === 'number');
+  if (passive.length === 0) return notices;
+  const { repeat } = fold.claim(passive.map((n) => n.msgId!));
+  if (repeat.length === 0) return notices;
+  const kept = notices.filter((n) => !(n.source === 'seat-mail' && n.passive === true && typeof n.msgId === 'number' && repeat.includes(n.msgId)));
+  return [...kept, { text: alreadyDigestedLine(repeat)!, source: 'mail-fold-once' }];
 }
 
 function seatMailBundleTextRaw(notices: readonly SeatMailBundleNotice[]): string {

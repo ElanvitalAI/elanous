@@ -3131,6 +3131,8 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       codexQuotaPolicy: isCodexQuotaPolicy(llm.codexQuotaPolicy) ? llm.codexQuotaPolicy : undefined,
       codexCreditReserve: typeof llm.codexCreditReserve === 'number' && Number.isFinite(llm.codexCreditReserve) && llm.codexCreditReserve >= 0
         ? llm.codexCreditReserve : undefined,
+      codexCreditAccounts: Array.isArray(llm.codexCreditAccounts) && llm.codexCreditAccounts.every((v: unknown) => typeof v === 'string')
+        ? llm.codexCreditAccounts.map((v: string) => v.trim()).filter(Boolean) : undefined,
       grokWeeklyCapPct: typeof llm.grokWeeklyCapPct === 'number' && Number.isFinite(llm.grokWeeklyCapPct)
         && llm.grokWeeklyCapPct >= 0 && llm.grokWeeklyCapPct <= 100 ? llm.grokWeeklyCapPct : LLM_DEFAULTS.grokWeeklyCapPct,
       // ⛔ 타입·파서·재노출 «셋»이 다 있어야 노브가 산다(형제 주석의 실측) — 재노출은 saveUserConfig 의 llm 블록.

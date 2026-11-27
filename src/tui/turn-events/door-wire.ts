@@ -7,6 +7,7 @@
  */
 import { type DoorReservation, type TurnEventOutcome } from '../../turn-capsule/contract.js';
 import type { NextTuiQueueItemKind } from '../core/queue.js';
+import { isIdleDraft } from '../input/draft-idle.js';
 import { createTurnDoor, type OneTurnDoor, type TurnDoorDeps } from './door.js';
 
 /** Same quiet window as the internal-turn gate (`humanQuietMs` default). */
@@ -25,15 +26,22 @@ export interface HumanFirstFacts {
 
 /** The internal-turn gate's «human typing» read, for the door: a person goes first. */
 export function humanFirstDetail(facts: HumanFirstFacts): string | null {
-  if (facts.draft().length > 0) return 'buffer';
-  if (facts.unreadKeys() > 0) return 'unread-keys';
+  const draft = facts.draft();
   const last = facts.lastHumanKeyAt();
+  const now = facts.now();
+  if (draft.length > 0 && !isIdleDraft(draft, last, now)) return 'buffer';
+  if (facts.unreadKeys() > 0) return 'unread-keys';
   const mark = facts.lastHumanTurnKeyAt?.() ?? 0;
-  if (last > 0 && last > mark && facts.now() - last < (facts.quietMs ?? DOOR_HUMAN_QUIET_MS)) return 'quiet-window';
+  if (last > 0 && last > mark && now - last < (facts.quietMs ?? DOOR_HUMAN_QUIET_MS)) return 'quiet-window';
   return null;
 }
 
-/** CAPSULE-C2-FU: who opens the next queued turn — a person's line first (no human-first), then a held notice. */
+/** Mask an idle draft only for the wake gate; never mutate the editor. */
+export function internalWakeBuffer(facts: HumanFirstFacts): string {
+  const draft = facts.draft();
+  return humanFirstDetail({ ...facts, draft: () => draft }) === null ? '' : draft;
+}
+
 export type DoorOpener = 'person' | 'held-notice' | 'queue-notice' | 'none';
 
 export function nextDoorOpener(facts: { readonly headKind: NextTuiQueueItemKind | null; readonly hasHeldNotice: boolean }): DoorOpener {

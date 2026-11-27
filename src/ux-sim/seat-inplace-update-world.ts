@@ -179,6 +179,19 @@ export async function runSeatInPlaceUpdateWorld(seeds: readonly number[] = [1, 2
         rows.push({ case: `s${seed} new build will not start`, expected: 'wait:probe-retry · stay-card · none · 1 card · 0 exits',
           actual: `${a.action}:${'reason' in a ? a.reason : ''} · ${b.action} · ${c.action} · ${s.state.cards.length} card · ${s.state.left.length} exits`, durableDiff: [], turnLost: 0 });
       }
+      // 13 · FU: held (off-queue) notice + in-memory hand-block cap survive the switch
+      {
+        const s = makeSeat(root, 'OP', seed + 800, OLD);
+        const restored: Record<string, number> = {};
+        s.ports = { ...s.ports, heldNotices: () => [{ text: `held notice ${seed} full text` }], caps: () => ({ handBlockPullAt: 900_000 + seed }) };
+        s.state.installed = NEW;
+        seatInPlaceTick(s.ports, memo());
+        const n = reboot(s, NEW);
+        n.ports = { ...n.ports, restoreCaps: (caps) => { Object.assign(restored, caps); } };
+        restoreSeatCarry(n.ports);
+        rows.push({ case: `s${seed} held notice + cap`, expected: `held notice ${seed} full text · handBlockPullAt ${900_000 + seed}`,
+          actual: `${n.state.queue.map((q) => q.text).join('|')} · handBlockPullAt ${restored.handBlockPullAt}`, durableDiff: [], turnLost: 0 });
+      }
       // 12 · pane id unchanged across the launcher relaunch (update exit → same pane env, current build)
       {
         const panes: string[] = []; const codes = [SEAT_UPDATE_EXIT_CODE, 0];

@@ -677,6 +677,14 @@ if ! (cd "$VERSION_DIR" && bun add --no-save --ignore-scripts --offline "$INSTAL
   rm -f "$ADD_LOG"
 fi
 echo "If an optional native feature is unavailable, run 'elanous doctor --fix --yes' for repair guidance. The Bun TUI needs no system Node.js, Python, or compiler." >&2
+# PWA-RUNTIME-LEAN: the package carries the static PWA (apps/pwa/out) built from this commit.
+# Turn it into the .pwa-generations symlink layout so `nexus build` and later swaps work in place
+# without moving it aside, and without installing apps/pwa/node_modules. Never fails the install:
+# on any problem the packaged directory stays as it is and keeps being served.
+PWA_ADOPT="$VERSION_DIR/node_modules/elanous/apps/pwa/scripts/static-generation.ts"
+if [ -f "$PWA_ADOPT" ] && [ -e "$VERSION_DIR/node_modules/elanous/apps/pwa/out" ]; then
+  "${BUN_EXEC:-bun}" "$PWA_ADOPT" adopt-packaged 2>&1 | tail -n 1 >&2 || true
+fi
 ln -sfn "versions/$VERSION_NAME" "$PREFIX/current"
 mkdir -p "$PREFIX/bin"
 # 절대 bun 경로를 설치 때 박고 엔트리는 current 를 거친다 — cron/systemd 의 짧은 PATH 와 판 전환 모두 지원.

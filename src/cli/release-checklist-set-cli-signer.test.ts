@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { listChecklist, setItem } from '../release-loop/checklist.js';
-import { authorizeChecklistGreenSigner, registerReleaseChecklistSetCommand } from './release-checklist-set-cli.js';
+import { authorizeChecklistGreenSigner, registerReleaseChecklistSetCommand, resolveChecklistWriter } from './release-checklist-set-cli.js';
+import { registerHoldCommands } from '../hold-ledger/hold-cli.js';
 
 // CHECKLIST-GREEN-SIGNER-GUARD (OP #133987 · 정정 #134130 · 수리 #134310 ①·②): 체크리스트 칸의 green 전환은
 // 판정자 자리(JUD-*·REVIEW-*)·OP 만 — ①(#134310) 서명자 자리는 인증된 출처(els 서버가 패널 자격 — 패널 토큰
@@ -22,6 +23,7 @@ let output: ReturnType<typeof spyOn>;
 let elsRoot = '';
 let elsServer: ReturnType<typeof createServer> | null = null;
 const savedEls: Record<string, string | undefined> = {
+  ELANOUS_SEAT: undefined,
   ELANOUS_ELS_WS: undefined,
   ELANOUS_ELS_PANE: undefined,
   ELANOUS_ELS_SOCKET: undefined,
@@ -130,7 +132,7 @@ test('(a) 판별부 계약: 손 자리·미확인 green 은 영어 문구 거부
   const unset = authorizeChecklistGreenSigner({ status: 'green', seat: undefined });
   expect(unset.allowed).toBe(false);
   expect(unset.refuse).toBe(
-    'green needs a judge seat (JUD*/REVIEW*) or OP; server-confirmed pane credential (els) required — ELANOUS_TRACK is not authority',
+    'green needs a judge seat (JUD*/REVIEW*) or OP — no seat identity found (els pane seat · ELANOUS_TRACK · ELANOUS_SEAT · seats/<SEAT> folder)',
   );
   expect(authorizeChecklistGreenSigner({ status: 'yellow', seat: 'HAND-TUI-D' }).allowed).toBe(true);
 });
@@ -170,7 +172,7 @@ test('(d) 손 자리의 비-green 갱신은 종전 동작 — 가드는 green �
 
 test('(e) ① 확인 불가(els 문맥 없음)는 fail-closed 로 green 거부 · 비-green 갱신은 종전 동작', async () => {
   seed('0.2.9', ['A1', 'A2']);
-  await expect(run('A1', '--status', 'green', '--version', '0.2.9')).rejects.toThrow('not authority');
+  await expect(run('A1', '--status', 'green', '--version', '0.2.9')).rejects.toThrow('no seat identity found');
   expect(statusOf('0.2.9', 'A1')).toBe('yellow');
   expect(updatedByOf('0.2.9', 'A1')).toBe('OP');
   expect(lines).toEqual([]);
@@ -216,4 +218,57 @@ test('(g) store 가드(#134310): 판정자(JUD*·REVIEW*)·OP·OPC by 는 green 
   expect(statusOf('0.2.9', 'S6')).toBe('green');
   setItem('0.2.9', 'S7', { status: 'red', evidence: 'measured' }, 'HAND-TUI-D');
   expect(statusOf('0.2.9', 'S7')).toBe('red');
+});
+test('light set leaf: --done / --body / --source write the cell (11-26 22:4x «unknown option --done»)', async () => {
+  seed('9.1.1', ['DW-1']);
+  process.env.ELANOUS_TRACK = 'OP';
+  await run('DW-1', '--done', 'bun test x passes', '--body', 'why it exists', '--source', '#185411', '--version', '9.1.1');
+  const item = listChecklist('9.1.1').items.find((i) => i.id === 'DW-1')!;
+  expect(item.doneCriterion).toBe('bun test x passes');
+  expect(item.body).toBe('why it exists');
+  expect(item.source).toBe('#185411');
+  await run('DW-1', '--done', '', '--version', '9.1.1');
+  expect(listChecklist('9.1.1').items.find((i) => i.id === 'DW-1')!.doneCriterion).toBe(undefined);
+});
+
+// JUD-GREEN-CREDENTIAL (#187277 «server-confirmed pane credential 필요 오류로 거부») — the JUD seat runs in seats/JUD with no
+// ELANOUS_TRACK and no els pane seat. Its normal seat identity (the one `eln msg post` uses) writes green · yellow (veto) · HOLD,
+// and the ledger row says by=JUD. No server identity is required (JUDGE-LOAD-REDUCTION §0c). Literals from the cell text.
+test('(i) JUD-GREEN-CREDENTIAL: no els seat, no ELANOUS_TRACK — the seats/JUD folder (or ELANOUS_SEAT) is the writer', async () => {
+  const none = async () => undefined;
+  const jud = await resolveChecklistWriter('green', { env: {}, cwd: '/Users/x/elanous-hq/seats/JUD', confirm: none });
+  expect(jud.verdict.allowed).toBe(true);
+  expect(jud.by).toBe('JUD');
+  expect((await resolveChecklistWriter('yellow', { env: {}, cwd: '/Users/x/elanous-hq/seats/JUD', confirm: none })).by).toBe('JUD');
+  expect((await resolveChecklistWriter('green', { env: { ELANOUS_SEAT: 'JUD-B' }, cwd: '/tmp', confirm: none })).by).toBe('JUD-B');
+  // a hand seat folder still may not sign; no identity at all → refused, non-green stays «cli»
+  const hand = await resolveChecklistWriter('green', { env: {}, cwd: '/Users/x/elanous-hq/seats/TC-H-POOL-2', confirm: none });
+  expect(hand.verdict.allowed).toBe(false);
+  expect(hand.verdict.refuse).toContain('judge-only');
+  expect((await resolveChecklistWriter('green', { env: {}, cwd: '/tmp', confirm: none })).verdict.allowed).toBe(false);
+  expect((await resolveChecklistWriter('red', { env: {}, cwd: '/tmp', confirm: none })).by).toBe('cli');
+  // a server-confirmed seat still wins when there is one (unchanged · (b))
+  expect((await resolveChecklistWriter('green', { env: {}, cwd: '/Users/x/elanous-hq/seats/JUD', confirm: async () => 'HAND-TUI-D' })).verdict.allowed).toBe(false);
+  // an els lookup that throws is «not confirmed», never a crash
+  expect((await resolveChecklistWriter('green', { env: {}, cwd: '/Users/x/elanous-hq/seats/JUD', confirm: async () => { throw new Error('socket gone'); } })).by).toBe('JUD');
+});
+
+test('(j) JUD-GREEN-CREDENTIAL: through the CLI, ELANOUS_SEAT=JUD writes green and a yellow veto as by=JUD; HOLD add defaults to JUD', async () => {
+  seed('0.2.9', ['J1', 'J2']);
+  process.env.ELANOUS_SEAT = 'JUD';
+  await run('J1', '--status', 'green', '--evidence', '#40445 same-head receipt · focused 51/0', '--version', '0.2.9');
+  expect(statusOf('0.2.9', 'J1')).toBe('green');
+  expect(updatedByOf('0.2.9', 'J1')).toBe('JUD');
+  await run('J2', '--status', 'yellow', '--evidence', 'JUD: parent focused ≠ E4 완료선', '--version', '0.2.9');
+  expect(updatedByOf('0.2.9', 'J2')).toBe('JUD');
+  const audit = listChecklist('0.2.9').history.filter((h) => h.id === 'J1' && h.field === 'status');
+  expect(audit.map((h) => [h.by, h.to])).toEqual([['JUD', 'green']]);
+  const holdRoot = mkdtempSync(join(tmpdir(), 'jud-hold-'));
+  const out: string[] = []; const err: string[] = []; const facts: string[] = [];
+  const program = new Command(); program.exitOverride();
+  registerHoldCommands(program, { stateRoot: () => holdRoot, print: (l) => out.push(l), error: (l) => err.push(l), fact: (e) => facts.push(`${e.op}:${e.by}`) });
+  await program.parseAsync(['hold', 'add', '--cells', 'J2', '--reason', 'E4 child only', '--unlock', 'JUD lifts'], { from: 'user' });
+  expect(err).toEqual([]);
+  expect(facts).toEqual(['add:JUD']);
+  rmSync(holdRoot, { recursive: true, force: true });
 });

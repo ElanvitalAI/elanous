@@ -465,6 +465,9 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
       }
     });
 
+  // LLM-ROUTE-BY-GUARDIAN — `usage route ledger|pick|mark|policy`.
+  (require('../llm-route/route-cli.js') as typeof import('../llm-route/route-cli.js')).registerRouteCommands(usage);
+
   usage
     .command('runs')
     .description('저장된 llm-usage 로그를 런·역할·단계·phase·모델·계정별로 집계한다')

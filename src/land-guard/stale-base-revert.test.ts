@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { detectStaleBaseRevert, deletedRanges } from './stale-base-revert.js';
+import { detectStaleBaseRevert, deletedRanges, parseDeclaredRemovals } from './stale-base-revert.js';
 
 function repo(): { dir: string; run: (...a: string[]) => string; write: (f: string, body: string) => void; commit: (msg: string) => string } {
   const dir = mkdtempSync(join(tmpdir(), 'stale-revert-'));
@@ -69,5 +69,45 @@ test('wiped lines older than the window are not counted', () => {
     const future = Math.floor(Date.now() / 1000) + 49 * 3600;
     expect(detectStaleBaseRevert(r.dir, 'main', 'feature', { nowSec: future }).ok).toBe(true);
     expect(detectStaleBaseRevert(r.dir, 'main', 'feature').ok).toBe(false);
+  } finally { rmSync(r.dir, { recursive: true, force: true }); }
+});
+
+// REVERT-GUARD-DECLARED-SUPERSEDE (11-27 · #40471 removes route-policy.default.json that #40401 added, on purpose).
+test('PR-body «의도된 삭제» lines: path / #PR with a reason · no reason = no declaration', () => {
+  expect(parseDeclaredRemovals('intro\n의도된 삭제: src/router/route-policy.default.json (kit 통합으로 대체)\n- 의도된 삭제: #40401, `src/x.ts` (superseded)\nIntended removal: #7 (old)\n의도된 삭제: src/y.ts'))
+    .toEqual({ paths: ['src/router/route-policy.default.json', 'src/x.ts'], prs: [40401, 7] });
+});
+
+test('a declared path or PR is excluded from the wipe check · an undeclared wipe still refuses · the card suggests the line', () => {
+  const r = repo();
+  try {
+    r.write('a.ts', 'base\n'); r.write('b.ts', 'base\n'); r.commit('base');
+    r.run('checkout', '-q', '-b', 'feature'); r.run('checkout', '-q', 'main');
+    r.write('a.ts', `base\n${twelve.join('\n')}\n`); r.commit('feat: policy file (#40401)');
+    r.write('b.ts', `base\n${twelve.map((x) => `${x}-2`).join('\n')}\n`); r.commit('feat: other (#40402)');
+    r.run('checkout', '-q', 'feature'); r.run('merge', '-q', '--no-edit', 'main');
+    r.write('a.ts', 'base\n'); r.write('b.ts', 'base\n'); r.commit('refactor: kit supersedes (#40471)');
+    const none = detectStaleBaseRevert(r.dir, 'main', 'feature');
+    expect(none.hits.map((h) => h.file).sort()).toEqual(['a.ts', 'b.ts']);
+    expect(none.card).toContain('의도된 삭제: ');
+    const byPath = detectStaleBaseRevert(r.dir, 'main', 'feature', { declared: { paths: ['a.ts'], prs: [] } });
+    expect([byPath.ok, byPath.hits.map((h) => h.file)]).toEqual([false, ['b.ts']]);
+    const both = detectStaleBaseRevert(r.dir, 'main', 'feature', { declared: { paths: ['a.ts'], prs: [40402] } });
+    expect(both.ok).toBe(true);
+  } finally { rmSync(r.dir, { recursive: true, force: true }); }
+});
+
+test('a file the PR\'s own commit deleted is intended (no body line) · the same lines missing without a deletion still refuse', () => {
+  const r = repo();
+  try {
+    r.write('a.ts', 'base\n'); r.commit('base');
+    r.run('checkout', '-q', '-b', 'feature'); r.run('checkout', '-q', 'main');
+    r.write('t.test.ts', `${twelve.join('\n')}\n`); r.commit('test: added today (#40373)');
+    r.run('checkout', '-q', 'feature'); r.run('merge', '-q', '--no-edit', 'main');
+    r.run('rm', '-q', 't.test.ts'); r.commit('chore: drop the superseded test (#40444)');
+    expect(detectStaleBaseRevert(r.dir, 'main', 'feature').ok).toBe(true);
+    r.run('checkout', '-q', '-b', 'stale', 'feature~1');
+    r.write('t.test.ts', 'other\n'); r.commit('stale copy');
+    expect(detectStaleBaseRevert(r.dir, 'main', 'stale').ok).toBe(false);
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
 });

@@ -1,3 +1,4 @@
+import { tierModel } from '../../src/llm/model-defaults.js';
 import { describe, expect, test } from 'bun:test';
 import type { spawnSync } from 'node:child_process';
 import { measureTuiRegress, tuiNodeOutput } from './tui-sim-node';
@@ -7,7 +8,7 @@ import { executeTuiNodeCheck, parseTuiRegress, regressWarning, reusableTui, tuiC
 // lines the checks read: the declarative footer (STATUSLINE-WIRE; the check's temp-worktree cwd shows its `…/tail`
 // form), the startup band on the first screen, and the /help guide that replaces the log — «Commands», a /help row,
 // «Keys» — with the input line below. The guide is log content: the after-Esc screen is the guide screen unchanged.
-const footer = 'Turn idle · Model openai-codex/gpt-6-sol · Queue 0 · Bg 0 · …/T/tui-node-1Dc7mS/tree · 0.3.33-dev.0 · dev · 261122_1209';
+const footer = `Turn idle · Model ${tierModel('best', 'openai-codex')} · Queue 0 · Bg 0 · …/T/tui-node-1Dc7mS/tree · 0.3.33-dev.0 · dev · 261122_1209`;
 const first = [
   'elanous',
   '· Chat — ask for anything in plain language',

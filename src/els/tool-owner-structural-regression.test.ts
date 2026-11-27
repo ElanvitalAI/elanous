@@ -71,8 +71,8 @@ test('OP seat tool read and status reach another seat pane', () => fixture(async
   expect((await ask({ op: 'status', pane: foreign })).exitCode).toBe(0);
 }));
 
-test('OP seat read relaxation does not widen snapshot, close or interrupt on another seat pane', () => fixture(async ({ ask, foreign, writes }) => {
-  expect((await ask({ op: 'snapshot', pane: foreign })).exitCode).toBe(1);
+test('OP seat read relaxation: snapshot is observe (COORD-RIGHTS 11-27); close and interrupt on a non-federation pane stay refused', () => fixture(async ({ ask, foreign, writes }) => {
+  expect((await ask({ op: 'snapshot', pane: foreign })).exitCode).toBe(0);
   expect((await ask({ op: 'close', pane: foreign, confirmed: true })).exitCode).toBe(1);
   expect((await ask({ op: 'interrupt', pane: foreign })).exitCode).not.toBe(0);
   expect(writes).toEqual([]);
@@ -100,9 +100,9 @@ test('a hand seat tool still cannot send a line into another seat pane', () => f
   expect(writes).toEqual([]);
 }, 'HAND-A'));
 
-test('tool snapshot must not capture another seat in the same workspace', () => fixture(async ({ ask, foreign }) => {
+test('COORD-RIGHTS: a hand tool still cannot snapshot another seat in the same workspace', () => fixture(async ({ ask, foreign }) => {
   expect((await ask({ op: 'snapshot', pane: foreign })).exitCode).not.toBe(0);
-}));
+}, 'HAND-A'));
 
 test('tool can reorder its own tab to the end using existing aliases', () => fixture(async ({ ask, ownTab }) => {
   expect((await ask({ op: 'reorder', kind: 'tab', id: ownTab, before: '' })).exitCode).toBe(0);

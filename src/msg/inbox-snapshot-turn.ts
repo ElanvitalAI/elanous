@@ -28,6 +28,8 @@ export function seatInboxSnapshotText(seat: string | null | undefined, deps: Inb
   try {
     const now = (deps.now ?? (() => new Date()))();
     store = deps.openStore ? deps.openStore() : (require('./msg-store.js') as typeof import('./msg-store.js')).openMsgStore();
+    // OP-DIGEST-FLUSH-TICK — parked machine mail flushes when due even if nobody wrote to OP since (idempotent).
+    if (seat.toUpperCase() === 'OP') { try { store.flushOpDigestIfDue(); } catch { /* read-only or busy: the TUI tick retries */ } }
     const unread = store.list(seat, store.getCursor(seat), 200);
     const since = new Date(lastSnapshotAt.get(seat) ?? now.getTime() - LAPSED_LOOKBACK_MS);
     const lapsed = store.listLapsed(seat, since, now);

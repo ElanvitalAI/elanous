@@ -41,7 +41,7 @@ test('file creation cannot omit or override host approval and fails closed witho
     expect(existsSync(target)).toBe(false);
   }
   const absent = createPluginRouteAdapter({ pluginRoot, dispatchCore: async () => null });
-  expect(await absent.dispatch('app_create', args)).toEqual({ ok: false, error: 'file artifact creation context required' });
+  expect(await absent.dispatch('app_create', args)).toEqual({ ok: false, error: 'file artifact creation context required: app_create writes only inside a member app_build run (eln member connect).' });
   expect(existsSync(target)).toBe(false);
   const failed = createPluginRouteAdapter({ pluginRoot, dispatchCore: async () => null,
     getDispatchContext: () => { throw new Error('synthetic context failure'); } });
@@ -61,7 +61,7 @@ test('undefined host context cannot be replaced by caller approval', async () =>
   const result = await adapter.dispatch('app_create', {
     root: target, files: [{ path: 'index.html', content: 'synthetic' }], metadata: {},
   }, true, { surface: 'tui', requireApproval: false });
-  expect(result).toEqual({ ok: false, error: 'file artifact creation context required' });
+  expect(result).toEqual({ ok: false, error: 'file artifact creation context required: app_create writes only inside a member app_build run (eln member connect).' });
   expect(existsSync(target)).toBe(false);
 });
 
@@ -90,7 +90,7 @@ test('host owner run and explicit approval are all mandatory before any write', 
     const result = await adapter.dispatch('app_create', {
       root: target, files: [{ path: 'index.html', content: 'synthetic' }], metadata: {},
     }, true, validHost);
-    expect(result).toEqual({ ok: false, error: 'file artifact creation context required' });
+    expect(result).toEqual({ ok: false, error: 'file artifact creation context required: app_create writes only inside a member app_build run (eln member connect).' });
     expect(existsSync(target)).toBe(false);
   }
 });

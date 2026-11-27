@@ -390,6 +390,13 @@ export interface ComposeInput {
   readonly overlay?: readonly string[];
   /** ELS-APP-RENDER-SINGLE-FRAME: a dialog spliced into the rows it covers (the cursor is hidden) — one frame, no overlay write. */
   readonly dialog?: DialogBox;
+  /** ELS-ZAXIS S2: the overlay stack's boxes, bottom → top, spliced over panes and the side list (under the client's own
+   *  dialog). The pane cursor is hidden only when a box covers it. */
+  readonly layers?: readonly DialogBox[];
+  /** ELS-ZAXIS hardening: a focused overlay owns the keys — the pane cursor is hidden while it does (restored after). */
+  readonly hideCursor?: boolean;
+  /** ELS-POPUP-TERM: put the terminal cursor here (0-based view cell) — the focused popup terminal's own cursor. */
+  readonly cursorAt?: { readonly x: number; readonly y: number };
 }
 
 /** One full repaint: sidebar (when it fits) | pane, the status line last, and the terminal cursor put where the pane's is. */
@@ -406,6 +413,10 @@ export function composeView(view: ComposeInput): string {
     lines.push(`${sidebar ? `${fitAnsi(sidebar[row] ?? '', SIDEBAR_COLS)}│` : ''}${centreText}`);
   }
   (view.overlay ?? []).forEach((text, at) => { if (at + 1 < lines.length) lines[at + 1] = fitAnsi(text, view.cols); });
+  for (const layer of view.layers ?? []) layer.lines.forEach((text, at) => {
+    const y = layer.y + at;
+    if (y >= 0 && y < lines.length && layer.x < view.cols) lines[y] = spliceCells(lines[y]!, layer.x, text, Math.min(layer.width, view.cols - layer.x));
+  });
   const box = view.dialog;
   box?.lines.forEach((text, at) => { if (box.y + at < lines.length) lines[box.y + at] = spliceCells(lines[box.y + at]!, box.x, text, Math.min(box.width, view.cols - box.x)); });
   // 출처: seat-state/OP/orders/ELS-FIRST-RUN-UX-1119.md ③ — status 는 리터럴 그대로 (패딩 없이; trimRight 화면 판독과 양립)
@@ -417,8 +428,10 @@ export function composeView(view: ComposeInput): string {
   lines.push(`${REVERSE}${status}${buttons ? `${' '.repeat(room - Bun.stringWidth(status))}${ESC}[0m${buttons}` : ''}${ESC}[0m`);
   const cursorRow = header ? Number(header[1]) + top : -1;
   const cursorCol = header ? Number(header[2]) : -1;
-  const showCursor = !view.overlay && !view.dialog && header !== null && header[3] === 'true' && cursorRow < view.rows - 1 && cursorCol < centre;
-  const place = showCursor ? `${ESC}[${cursorRow + 1};${left + cursorCol + 1}H${ESC}[?25h` : `${ESC}[?25l`;
+  const underLayer = (view.layers ?? []).some((layer) => left + cursorCol >= layer.x && left + cursorCol < layer.x + layer.width && cursorRow >= layer.y && cursorRow < layer.y + layer.lines.length);
+  const showCursor = !view.overlay && !view.dialog && !underLayer && !view.hideCursor && header !== null && header[3] === 'true' && cursorRow < view.rows - 1 && cursorCol < centre;
+  const at = view.cursorAt && !view.dialog && view.cursorAt.y < view.rows - 1 && view.cursorAt.x < view.cols ? view.cursorAt : undefined;
+  const place = at ? `${ESC}[${at.y + 1};${at.x + 1}H${ESC}[?25h` : showCursor ? `${ESC}[${cursorRow + 1};${left + cursorCol + 1}H${ESC}[?25h` : `${ESC}[?25l`;
   return `${ESC}[?25l${ESC}[H${lines.join('\r\n')}${place}`;
 }
 
@@ -451,4 +464,4 @@ export function createAppFrameWriter(write: (text: string) => void): (screen: st
   };
 }
 
-export const SIDEBAR_HELP = 'ctrl+b: m move tab · , rename tab · j/k move · w workspace · 1-9 · c new pane · a Elanous chat · N new workspace · x close · D close workspace · s sidebar · g sort agents · PgUp/PgDn/Home/End list · ←/→ tabs · q detach';
+export const SIDEBAR_HELP = 'ctrl+b: m move tab · , rename tab · j/k move · w workspace · 1-9 · c new pane · a Elanous chat · N new workspace · x close · D close workspace · s sidebar · g sort agents · / sidechat · o Obsidian · PgUp/PgDn/Home/End list · ←/→ tabs · q detach';

@@ -62,7 +62,9 @@ import {
   type BaselineProcessResult, gateBaselineLogLevel, formatGateBaselineNote } from './gate-baseline.js';
 import { runConfigSyntaxGate } from './config-gate.js';
 import { runHarnessPolicyGates } from './harness-policy-gates.js';
-import { runDependencyChangeGate } from './dependency-change-gate.js';
+import { isPwaAppSource, runDependencyChangeGate } from './dependency-change-gate.js';
+import { prDelta } from '../git-smart/delta.js';
+import { gitAt, type GitRun } from '../git-fs/smart-run.js';
 import { pwaReachableSrcFiles } from './pwa-import-graph.js';
 import { stageNonGitDir, stageFile, applyShadowToTarget, applyFileToTarget } from './shadow-stage.js';
 import type { TargetKind } from './target-kind.js';
@@ -100,6 +102,8 @@ import type { ReworkBudgetVerdict } from './run-outcome.js';
 import { pickImplementRoleWithRoute, runHeadlessGoalLoopPty } from './headless-elanous-driver.js';
 import { recordLaunchRoute, workRiskInputFromGoal } from './work-route.js';
 import { failureOracleSectionForImplement, resolveFailureOracleMode } from '../harness/failure-oracle.js';
+// SMART-ROUTER-TIER-FULL-WIRE(칸 43) — 등급 게이트 원천(실제 원천 스토어 → env → free fail-closed).
+import type { MembershipResolver } from '../plugins/smart-router/consumer.js';
 import { isClaudeAcpChild, runClaudeAcpImplement } from './claude-acp-implement.js';
 import { childLlmSelectionEnv } from '../agent/run-context.js';
 import { observeExternalEvent } from '../context-bus/external-events.js';
@@ -402,7 +406,9 @@ async function gitAsync(cwd: string, argv: string[]): Promise<{ ok: boolean; out
   }
 }
 
-/** 기본 브랜치 ref 해석(origin/HEAD → origin/main 등·폴백 main/master). 없으면 null. */
+/** 기본 브랜치 ref 해석(origin/HEAD → origin/main 등·폴백 main/master). 없으면 null.
+ *  선택 순서는 바꾸지 않는다. bare 클론은 refs/remotes/origin/* 가 비어 로컬 main 으로
+ *  떨어지므로, base 동기화(syncBaseWithRemote)가 가져온 tip 을 그 ref 에 강제 기록한다. */
 export function defaultBranchRef(cwd: string): string | null {
   const sym = git(cwd, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']).out.trim();
   if (sym.startsWith('refs/remotes/')) return sym.slice('refs/remotes/'.length);
@@ -493,6 +499,36 @@ export function changedFiles(cwd: string): string[] {
     }
   }
   return [...files];
+}
+
+/**
+ * PWA-GATE-OWN-DELTA-CACHE ① — the files **this PR itself** changes, for gates that must not judge main.
+ *
+ * S: after the pre-PR main sync the dependency/PWA gate re-ran on the integrated tree; any file list that is not anchored
+ *    on the merge with main (e.g. the worktree-cut fallback base) carries main's pulled-in package.json/bun.lock and the
+ *    PR is charged with a PWA build it did not cause (TA canaries cn2/cn3 · #40501 · #40537).
+ * A: the one PR-own definition (`prDelta` · src/git-smart/delta.ts — diff(merge-base(main, HEAD), HEAD)) ⊕ what is not
+ *    committed yet (tracked edits vs that merge-base, untracked). After a sync the merge-base is the synced main tip, so
+ *    main's changes fall out; a conflict resolution stays in (it is part of the PR's tree). Renames list both sides
+ *    (`--no-renames`) — a moved import target must still be seen as deleted.
+ *    `null` when main or the merge-base cannot be read — the caller keeps its wider list (never narrows on unknown).
+ */
+export function prOwnChangedFiles(cwd: string, run: GitRun = gitAt(cwd)): { files: string[]; mergeBase: string } | { files: null; reason: string } {
+  const mainRef = defaultBranchRef(cwd);
+  if (!mainRef) return { files: null, reason: 'default-branch-missing' };
+  const delta = prDelta(run, 'HEAD', mainRef);
+  if ('error' in delta) return { files: null, reason: delta.error };
+  const worktree = run(['diff', '--name-only', '--no-renames', '-z', delta.mergeBase, '--', ...NOT_OUR_OWN_LEAVINGS.slice(1)]);
+  if (worktree.status !== 0) return { files: null, reason: 'worktree diff failed' };
+  const untracked = run(['ls-files', '-z', '--others', '--exclude-standard', '--', ...NOT_OUR_OWN_LEAVINGS.slice(1)]);
+  if (untracked.status !== 0) return { files: null, reason: 'untracked list failed' };
+  const leaving = (file: string): boolean => /^\.elanous-(?:test|skill-artifacts)(?:\/|$)/.test(file);
+  const files = [...new Set([
+    ...delta.files,
+    ...worktree.stdout.split('\0'),
+    ...untracked.stdout.split('\0'),
+  ].map((file) => file.trim()).filter((file) => file && !leaving(file)))];
+  return { files, mergeBase: delta.mergeBase };
 }
 
 /** fork 지점 이후 커밋 제목 원문. 조회 실패면 빈 목록으로 fail-soft 한다. */
@@ -990,10 +1026,10 @@ export function featurePrompt(feature: string, cwd?: string, reviewerContext?: r
 /** HARNESS-FAILURE-ORACLE-GEN — implement seam 이 첫 라운드 프롬프트에 실을 절(골 문서의 구조 칸 → work-risk-router 범주).
  *  shadow(기본)·rework 라운드·위험 없음·오류 = `undefined`(프롬프트 종전 그대로) · 모든 분기가 이벤트를 남긴다. */
 export function implementFailureOracleSection(feature: string, round: { firstRound: boolean; runId?: string },
-  deps: { readConfig?: () => Parameters<typeof resolveFailureOracleMode>[0]; log?: (category: string, event: string, data: Record<string, unknown>) => void } = {}): string | undefined {
+  deps: { readConfig?: () => Parameters<typeof resolveFailureOracleMode>[0]; log?: (category: string, event: string, data: Record<string, unknown>) => void; membership?: MembershipResolver } = {}): string | undefined {
   return failureOracleSectionForImplement({
     firstRound: round.firstRound,
-    readMode: () => resolveFailureOracleMode((deps.readConfig ?? getUserConfig)()),
+    readMode: () => resolveFailureOracleMode((deps.readConfig ?? getUserConfig)(), deps.membership),
     readInput: () => {
       const input = workRiskInputFromGoal(feature);
       return { paths: input.paths, ...(input.declaredCategories ? { declaredCategories: input.declaredCategories } : {}) };
@@ -1113,6 +1149,8 @@ export interface DefaultSeamsOptions {
   runExposeGate?: typeof runExposeGate;
   /** Dependency-wide validation adapter for focused seam tests. */
   runDependencyChangeGate?: typeof runDependencyChangeGate;
+  /** PWA-GATE-OWN-DELTA-CACHE — test seam for the PR-own file list the dependency gate judges. */
+  prOwnChangedFiles?: (cwd: string) => ReturnType<typeof prOwnChangedFiles>;
   /** 워크트리 시험 묶음(없으면 실패 파일)을 base에서 재실행하는 seam. 실패 경로에서만 호출된다. */
   runGateBaseline?: (cwd: string, failedFiles: readonly string[], baseRef?: string) => BaselineProcessResult;
   /** Timeout failure별로 검증된 단일-test 재실행 관측을 수집하는 seam. */
@@ -2442,17 +2480,28 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       debug.log('self-implement', 'gate.policy', {
         passed: policy.passed, failures: policy.failures.map((failure) => failure.gate), skipped: policy.skipped,
       });
-      const dependencyChanged = changedAll.some((file) => ['package.json', 'bun.lock', 'apps/pwa/package.json'].includes(file.replace(/^\.\//, '')));
-      const candidateSrcFiles = changedAll.map((file) => file.replace(/^\.\//, '')).filter((file) => file.startsWith('src/'));
+      // PWA-GATE-OWN-DELTA-CACHE ① — judge the PR's own delta, not main's changes pulled in by the sync.
+      //   Unknown own delta ⇒ the gate's wider list (over-build, never under-build).
+      const ownDelta = (o.prOwnChangedFiles ?? prOwnChangedFiles)(cwd);
+      const dependencyScope = ownDelta.files ?? changedAll;
+      debug.log('self-implement', 'gate.dependency-scope', {
+        source: ownDelta.files ? 'pr-own-delta' : 'gate-changed-files', count: dependencyScope.length,
+        ...(ownDelta.files ? { mergeBase: ownDelta.mergeBase.slice(0, 12) } : { reason: ownDelta.reason }),
+        ...(postsync ? { mode: 'postsync' } : {}),
+      }, ownDelta.files ? undefined : { level: 'warn' });
+      const dependencyChanged = dependencyScope.some((file) => ['package.json', 'bun.lock', 'apps/pwa/package.json'].includes(file.replace(/^\.\//, '')));
+      const candidateSrcFiles = dependencyScope.map((file) => file.replace(/^\.\//, '')).filter((file) => file.startsWith('src/'));
       const reachable = !dependencyChanged && candidateSrcFiles.length > 0 ? pwaReachableSrcFiles(cwd) : new Set<string>();
-      const pwaReachableChanged = candidateSrcFiles.some((file) => reachable.has(file));
+      const pwaReachableChanged = candidateSrcFiles.some((file) => reachable.has(file))
+        || dependencyScope.some((file) => isPwaAppSource(file.replace(/^\.\//, '')));
       const dependencyGate = dependencyChanged || pwaReachableChanged
-        ? (o.runDependencyChangeGate ?? runDependencyChangeGate)({ cwd, changedFiles: changedAll })
+        ? (o.runDependencyChangeGate ?? runDependencyChangeGate)({ cwd, changedFiles: dependencyScope, cacheDir: join(elanousStateRoot(), 'pwa-build-cache') })
         : undefined;
       if (dependencyGate) debug.log('self-implement', 'gate.dependency-change', {
         ran: dependencyGate.ran, passed: dependencyGate.passed,
         failures: dependencyGate.failures.map((failure) => failure.step), skipped: dependencyGate.skipped,
         trigger: dependencyGate.trigger, pwaReachableChanged: dependencyGate.pwaReachableChanged, measured: dependencyGate.measured,
+        ...(dependencyGate.pwaBuildCache ? { pwaBuildCache: dependencyGate.pwaBuildCache, pwaBuildCacheKey: dependencyGate.pwaBuildCacheKey?.slice(0, 16) } : {}),
       });
       // ⛔⭐⭐ **최종 게이트가 통과할 때만** 돈다(리뷰 2R) — 종전엔 `r.passed`(스텝 결과)만 보고
       //   `tc`(변경파일 tsc) **전에** 실행해서, tsc 가 깨져 **최종 게이트가 실패한 런에도**
@@ -2669,9 +2718,12 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       const dependencyUnmeasuredNote = dependencyGate?.measured === false
         ? `\n\n[dependency-change: pwa-build] 못 쟀다 — ${dependencyGate.skipped}; passed=true 는 PWA 빌드 검증을 뜻하지 않는다.`
         : '';
+      const dependencyCacheNote = dependencyGate?.pwaBuildCache === 'hit'
+        ? `\n\n[dependency-change: pwa-build] PASS (cache=hit key=${dependencyGate.pwaBuildCacheKey?.slice(0, 16)}) — 같은 입력으로 성공한 빌드를 재사용했다.`
+        : '';
       return {
         passed: gatePassed,
-        log: `${baseLog}${policyFailureLog}${dependencyFailureLog}${dependencyUnmeasuredNote}${comparisonFailureLog}${baselineNote}${verifyByBreakingNote}${changedTestEvidenceNote}${scopeNote}${uncoveredNote}${pulledInRelatedTestsNote}${callerOverflowNote}${routeLookupNote}${expose.log ? `\n\n${expose.log}` : ''}`,
+        log: `${baseLog}${policyFailureLog}${dependencyFailureLog}${dependencyUnmeasuredNote}${dependencyCacheNote}${comparisonFailureLog}${baselineNote}${verifyByBreakingNote}${changedTestEvidenceNote}${scopeNote}${uncoveredNote}${pulledInRelatedTestsNote}${callerOverflowNote}${routeLookupNote}${expose.log ? `\n\n${expose.log}` : ''}`,
         testStepExecuted: !testStepSkipped && testStep !== undefined && !testStep.skipped,
         scopeReason,
         comparisonBaseStatus: observationChanges.comparisonBaseStatus,

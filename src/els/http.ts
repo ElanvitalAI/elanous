@@ -10,7 +10,8 @@
 // bind address must be loopback or inside the tailnet.
 
 import { remoteResize } from './local-viewer-size.js';
-import { appendFileSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
+import { appendAuditLine } from '../kit/audit-ledger/index.js';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { join } from 'node:path';
 import { parseAddress } from './address.js';
@@ -67,7 +68,7 @@ export function doPolicy(stateRoot: string): ElsDoPolicy {
       } catch { return false; }   // missing or broken list = nobody
     },
     audit(entry) {
-      try { appendFileSync(join(stateRoot, 'els', 'do-audit.jsonl'), `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`, { mode: 0o600 }); }
+      try { appendAuditLine(join(stateRoot, 'els', 'do-audit.jsonl'), `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`, { mode: 0o600 }); }
       catch (error) { process.stderr.write(`els: audit not written: ${error instanceof Error ? error.message : String(error)}\n`); }
     },
   };

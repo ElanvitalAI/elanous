@@ -607,6 +607,10 @@ export interface DispatchDeps {
   log?: (event: string, data: Record<string, unknown>) => void;
   /** Read-only host-resource probe; production reads Pod pool ledgers, tests inject the same measured snapshot. */
   readHostResources?: (host: string) => GateHostResourceReading;
+  /** PREGATE-HOST-BALANCE seam — the guardian's routed host (null = keep gateRemote.host). */
+  routeHost?: () => string | null;
+  /** ALLOCATION-BUDGET seam — meter the placement (who · purpose · host · duration) on the lease ledger; null = off. */
+  allocMeter?: GateAllocMeter | null;
   write?: { out: (data: string | Uint8Array) => void; err: (data: string | Uint8Array) => void };
 }
 
@@ -630,6 +634,21 @@ export function formatReservationStamp(ms: number): string {
   return new Date(ms).toISOString();
 }
 
+/** ALLOCATION-BUDGET — the remote check's host placement as a lease row (metering only: never blocks or reroutes). */
+export interface GateAllocMeter { start(host: string, tool: string): string | null; end(id: string, ms: number | null): void }
+function defaultAllocMeter(): GateAllocMeter {
+  const a = require('../allocation/alloc.js') as typeof import('../allocation/alloc.js');
+  return {
+    start: (host, tool) => { const t = a.meterHost({ host: host.split('@').at(-1)!, consumer: 'pregate', purpose: 'gate', ref: tool, ttlMs: 90 * 60_000 }); return t.status === 'unrecorded' ? null : t.id; },
+    end: (id, ms) => { a.release(id, ms !== null ? { cpuMin: Math.round((ms / 60_000) * 100) / 100 } : null); },
+  };
+}
+
+function defaultRouteHost(): string | null {
+  const { readRoute } = require('../guardian-agent/live.js') as typeof import('../guardian-agent/live.js');
+  return readRoute();
+}
+
 async function loadSettings(): Promise<GateRemoteSettings> {
   try {
     const { getUserConfig } = await import('../user-config.js');
@@ -642,7 +661,13 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
   const settings = deps.settings ?? await loadSettings();
   const env = deps.env ?? process.env;
   const write = deps.write ?? { out: (d: string | Uint8Array) => process.stdout.write(d), err: (d: string | Uint8Array) => process.stderr.write(d) };
-  const flags = opts.tool === 'self-gate' && !opts.flags.local ? { ...opts.flags, remote: opts.flags.remote ?? true } : opts.flags;
+  let flags = opts.tool === 'self-gate' && !opts.flags.local ? { ...opts.flags, remote: opts.flags.remote ?? true } : opts.flags;
+  // PREGATE-HOST-BALANCE (수호자 · 11-27 07:3x node-b 135/32 while minim5/node-c/mbp idled): an unnamed --remote goes to the
+  // guardian's least-loaded local host (<state>/res/route.json, ≤ 15 min old) instead of always gateRemote.host. Fail-open.
+  if (flags.remote === true) {
+    const routed = (() => { try { return (deps.routeHost ?? (deps.runner ? () => null : defaultRouteHost))(); } catch { return null; } })();
+    if (routed && isValidGateHost(routed)) flags = { ...flags, remote: routed };
+  }
   const decision = decideGateDispatch({ flags, settings, load1: deps.load1 ?? loadavg()[0]!, env });
   debug.log('gate.remote', 'decision', { tool: opts.tool, mode: decision.mode, host: decision.host, reason: decision.reason, load1: decision.load1 });
   if (decision.mode === 'local') {
@@ -784,6 +809,8 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
   const logWait = deps.log ?? ((event: string, data: Record<string, unknown>) => debug.log('gate.remote', event, data));
   let waitedForSlot = false;
   debug.log('gate.remote', 'dispatch', { tool: opts.tool, host, reason: decision.reason });
+  const allocMeter = deps.allocMeter !== undefined ? deps.allocMeter : deps.runner ? null : (() => { try { return defaultAllocMeter(); } catch { return null; } })();
+  const allocId = (() => { try { return allocMeter?.start(host, opts.tool) ?? null; } catch { return null; } })();
   let outcome: RemoteRunOutcome;
   for (;;) {
     try {
@@ -807,6 +834,7 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
     await sleep(Math.min(15_000, left));
     if (now() >= deadline) break;
   }
+  if (allocId) { try { allocMeter!.end(allocId, outcome.kind === 'ran' ? outcome.ms : null); } catch { /* metering never fails the check */ } }
   if (waitedForSlot) {
     const resolution = outcome.kind === 'ran' ? 'slot-open' : outcome.kind === 'busy' ? 'deadline-slot-still-busy'
       : `remote-infra: ${outcome.reason}`;

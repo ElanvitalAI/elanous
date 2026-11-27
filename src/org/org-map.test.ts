@@ -168,7 +168,7 @@ describe('sim: org changes mid-run', () => {
     expect(j.duties.brand).toBe('MK');
     expect(j.parents['TC-ADV']).toBe('TC');
     await c.run('org', 'show', '--status-row');
-    expect(c.outs.at(-1)!.startsWith('org · 8 seats · 7 spaces · 19 duties · default')).toBe(true);
+    expect(c.outs.at(-1)!.startsWith('org · 9 seats · 7 spaces · 19 duties · default')).toBe(true);
     expect(existsSync(join(root, 'state'))).toBe(false);
   });
 });

@@ -68,8 +68,9 @@ describe('decide on the read focused result', () => {
   test('readable 0 fail → land', () => {
     expect(decide({ ...facts, focused: { pass: 24, fail: 0 } }).action).toBe('land');
   });
-  test('swept exit 0 → wait (re-run pregate) · swept exit 1 → refuse baseline-failing-focused', () => {
-    expect(decide({ ...facts, focused: { swept: true, exit: 0 } })).toMatchObject({ action: 'wait', cls: 'focused-unreadable', why: 'focused raw swept (receipt step exit 0) — re-run pregate' });
+  test('swept exit 0 → land (JUD-RELAX: the receipt step exit is the 0-fail evidence) · swept exit 1 → refuse baseline-failing-focused', () => {
+    expect(decide({ ...facts, focused: { swept: true, exit: 0 } })).toMatchObject({ action: 'land' });
+    expect(decide({ ...facts, focused: { swept: true, exit: 0 } }).why).toContain('focused step exit 0 (raw swept)');
     expect(decide({ ...facts, focused: { swept: true, exit: 1 } })).toMatchObject({ action: 'refuse', cls: 'baseline-failing-focused', why: 'focused step exit 1 (raw swept)' });
   });
 });

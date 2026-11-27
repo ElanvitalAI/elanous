@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MsgStore, type MessageEnvelope } from '../../msg/msg-store.js';
 import { beaconHands, buildFederationLadder, handClosedOn, openHands, readHandMail } from '../../msg/hand-raise-ladder.js';
-import { handCauseOf, resolveWriterCheck, runWriterCheckResolver, type WriterCheckPorts } from './writer-resolver.js';
+import { handCauseOf, PLAN_LIMIT_AUTO_ANSWER, POLICY_AUTO_ANSWER, resolveWriterCheck, runWriterCheckResolver, type WriterCheckPorts } from './writer-resolver.js';
 import { parseRecentLog, parseWorktreeList } from './writer-resolver-live.js';
 
 const root = mkdtempSync(join(tmpdir(), 'writer-resolver-'));
@@ -38,7 +38,7 @@ function deps(extra: { ports: WriterCheckPorts; live?: boolean }) {
 test('cause comes from structured fields only: ref cause: first, then the block code; CEO-only categories never', () => {
   expect(handCauseOf({ reason: 'HUMAN_DECISION', refs: ['cause:worktree-path'] })).toBe('worktree-path');
   expect(handCauseOf({ reason: 'OWNER_UNKNOWN', refs: [] })).toBe('writer-handover');
-  expect(handCauseOf({ reason: 'DEPENDENCY_WAIT', refs: [] })).toBe('writer-handover');
+  expect(handCauseOf({ reason: 'DEPENDENCY_WAIT', refs: [] })).toBeNull(); // WRITER-CHECK-INTENT-GATE: not a writer question
   expect(handCauseOf({ reason: 'APPROVAL_PENDING', refs: [] })).toBe('res-approval');
   expect(handCauseOf({ reason: 'HUMAN_DECISION', refs: [] })).toBeNull();
   expect(handCauseOf({ reason: 'APPROVAL_PENDING', refs: ['category:money'] })).toBeNull();
@@ -53,10 +53,27 @@ test('writer check ladder: open PR → continue on it · other seat commit → c
     .toEqual({ kind: 'resolve', cause: 'writer-handover', coordinateWith: 'TC-H-CX-6',
       answer: 'TC-H-CX-6 committed abcdef1234 on these files within 2h — one mail to TC-H-CX-6 is sent for you; proceed in 30 min' });
   expect(resolveWriterCheck({ ...h, refs: [] }, ports({ uncommitted: () => ['src/b.ts'] })))
-    .toEqual({ kind: 'resolve', cause: 'writer-handover', answer: 'uncommitted files in /wt/tc-h-cx-1 (src/b.ts) — start a new branch and keep their files untouched' });
+    .toEqual({ kind: 'resolve', cause: 'writer-handover', answer: 'uncommitted files in /wt/tc-h-cx-1 (src/b.ts) — Someone else\'s uncommitted WIP blocking a cell: send its owner one line → no reply in 30 min → keep a preservation copy (branch wip-keep/<seat>-<date>, or `git stash push -u -m <tag>` with the stash SHA recorded) → take it over. WIP untouched for 24 h: take it over at once the same way. Reading and copying WIP is always allowed — never answer «preserve the existing WIP, do not touch it».' });
   expect(resolveWriterCheck(h, ports())).toEqual({ kind: 'resolve', cause: 'writer-handover', answer: 'no open PR and no recent commit on these paths — you are the writer; proceed' });
   // A port that throws is «unknown», not a crash.
-  expect(resolveWriterCheck(h, ports({ openPrs: () => { throw new Error('gh down'); } }))!.kind).toBe('resolve');
+  expect(resolveWriterCheck(h, ports({ openPrs: () => { throw new Error('gh down'); } }))!.kind).toBe('escalate');
+  expect(resolveWriterCheck(h, ports(), { prs: null })!.kind).toBe('escalate');
+  // Nothing to look up (no path: refs · no dirty files) → it climbs; never the generic «you are the writer».
+  expect(resolveWriterCheck({ ...h, refs: [] }, ports())).toEqual({ kind: 'escalate', cause: 'writer-handover',
+    why: 'TC-H-CX-1 named no paths (path: refs) and has no uncommitted files — the writer check has nothing to look up' });
+});
+
+test('handover requires task-path overlap with the actual candidate diff, never a PR number or unrelated dirty file alone', () => {
+  const base = { reason: 'OWNER_UNKNOWN', blockedSeat: 'TC-H-CX-1' };
+  const candidate = { number: 39491, branch: 'unrelated', files: ['src/unrelated.ts'] };
+  const p = ports({ openPrs: () => [candidate], uncommitted: () => ['src/unrelated.ts'] });
+  expect(resolveWriterCheck({ ...base, refs: ['pr:39491', 'path:src/task.ts'] }, p)?.kind).toBe('escalate');
+  expect(resolveWriterCheck({ ...base, refs: ['pr:39491'] }, p)?.kind).toBe('escalate');
+  expect(resolveWriterCheck({ ...base, refs: ['pr:39491', 'path:src/unrelated.ts'] }, p)?.kind).toBe('resolve');
+  expect(resolveWriterCheck({ ...base, refs: ['pr:39491', 'path:src/task.ts'] }, ports({ openPrs: () => [{ ...candidate, files: [] }] }))?.kind).toBe('escalate');
+  const noExplicit = resolveWriterCheck({ ...base, refs: ['path:src/task.ts'] }, p);
+  expect(noExplicit?.kind).toBe('resolve');
+  if (noExplicit?.kind === 'resolve') expect(noExplicit.answer).not.toContain('open PR #39491');
 });
 
 test('worktree-path: found → the path · not found → escalate · slot/RES → policy auto', () => {
@@ -64,13 +81,13 @@ test('worktree-path: found → the path · not found → escalate · slot/RES �
     .toEqual({ kind: 'resolve', cause: 'worktree-path', answer: 'your worktree is /wt/tc-h-cx-1 — proceed there' });
   expect(resolveWriterCheck({ reason: 'HUMAN_DECISION', blockedSeat: 'MOB-1', refs: ['cause:worktree-path'] }, ports())!.kind).toBe('escalate');
   expect(resolveWriterCheck({ reason: 'HUMAN_DECISION', blockedSeat: 'HAND-TUI-D', refs: ['cause:slot-isolation'] }, ports()))
-    .toEqual({ kind: 'resolve', cause: 'slot-isolation', answer: 'policy auto (guardian caps) · RES absorbed — no approval needed; test-universe read-only runs never need one' });
+    .toEqual({ kind: 'resolve', cause: 'slot-isolation', answer: POLICY_AUTO_ANSWER });
 });
 
 test('tick: resolves with owner ⊕ deadline (a real outcome), overrides a leader HOLD and logs it, one digest per leader', () => {
   const store = freshStore();
   setSystemTime(new Date(T0));
-  const raised = store.append(hand('TC-H-CX-6', 'blk-6', 'OWNER_UNKNOWN'));
+  const raised = store.append(hand('TC-H-CX-6', 'blk-6', 'OWNER_UNKNOWN', ['path:src/a.ts'])); // a lookup needs named paths (INTENT-GATE)
   store.append({ from: 'TC', to: 'TC-H-CX-6', kind: 'reply', replyTo: raised.id, body: '기존 writer 인계 확인 전 HOLD 유지' });
   setSystemTime(new Date(T0 + 60_000));
   const { d, logs } = deps({ ports: ports() });
@@ -112,20 +129,20 @@ test('sim 22:4x: 55 ✋ at TC (31 dependency · 14 approval · 2 owner · 3 work
   setSystemTime(new Date(T0 + 2 * 60_000));
   const { d } = deps({ ports: ports({ openPrs: () => [{ number: 40151, branch: 'fix/beacon', files: ['src/msg/hand-raise-ladder.ts'] }] }) });
   const report = runWriterCheckResolver(store, d);
-  expect(report.resolved.length).toBe(47);
-  expect(report.resolved.length / 55).toBeGreaterThanOrEqual(0.8);
-  expect(report.cards.map((c) => [c.cause, c.members.length])).toEqual([['worktree-path', 3]]);
-  // What is left is the HUMAN_DECISION family: the beacon fires it as one card (same leader · seat · reason groups).
+  // WRITER-CHECK-INTENT-GATE (11-26): the 31 dependency waits are not writer questions and the 2 owner ✋ named no paths —
+  // only the 14 approvals are answered; nothing gets the generic «you are the writer; proceed».
+  expect(report.resolved.length).toBe(14);
+  expect(report.resolved.every((r) => r.cause === 'res-approval')).toBe(true);
+  expect(report.cards.map((c) => [c.cause, c.members.length]).sort()).toEqual([['worktree-path', 3], ['writer-handover', 2]]);
+  // What is left at TC (dependency ×31 · human ×5) climbs on the ✋ ladder: the beacon fires per cause group.
   const atTc = (): number => openHands(store, { now: Date.now(), ladder }).filter((h) => h.receiver === 'TC').length;
-  expect(atTc()).toBe(5);
+  expect(atTc()).toBe(36);
   setSystemTime(new Date(T0 + 11 * 60_000));
   const beacon = beaconHands(store, { ...d, dormantSeats: [] });
   expect(beacon.fired.length).toBeGreaterThanOrEqual(1);
   // #40160 beacon cap: ≤3 cards per 10 min — the other causes stay open and go on the next window.
   expect(beacon.fired.length).toBeLessThanOrEqual(3);
-  expect(atTc()).toBeLessThan(5);
-  for (const m of [22, 33]) { setSystemTime(new Date(T0 + m * 60_000)); beaconHands(store, { ...d, dormantSeats: [] }); }
-  expect(atTc()).toBe(0);
+  expect(atTc()).toBeLessThan(36);
 });
 
 test('live parsers: worktree list porcelain and recent log with the seat from the ref name', () => {
@@ -138,11 +155,42 @@ test('live parsers: worktree list porcelain and recent log with the seat from th
 test('live 23:0x: a family ✋ escalated up to CLAUDE-OP (the CEO copy) is still answered and closes', () => {
   const store = freshStore();
   setSystemTime(new Date(T0));
-  const raised = store.append(hand('TC-H-CX-6', 'blk-up', 'DEPENDENCY_WAIT'));
+  const raised = store.append(hand('TC-H-CX-6', 'blk-up', 'OWNER_UNKNOWN', ['path:src/a.ts']));
   store.append({ from: 'OP', to: 'CLAUDE-OP', kind: 'request', intent: 'decision', correlationId: 'blk-up', body: '[✋ ESCALATED · OP → CLAUDE-OP] copy',
-    refs: ['block:blk-up', 'seat:TC-H-CX-6', 'reason:DEPENDENCY_WAIT', `hand-of:${raised.id}`, `hand-escalated-from:${raised.id}`] });
+    refs: ['block:blk-up', 'seat:TC-H-CX-6', 'reason:OWNER_UNKNOWN', 'path:src/a.ts', `hand-of:${raised.id}`, `hand-escalated-from:${raised.id}`] });
   setSystemTime(new Date(T0 + 60_000));
   const report = runWriterCheckResolver(store, deps({ ports: ports() }).d);
   expect(report.resolved.map((r) => [r.leader, r.seat, r.cause])).toEqual([['CLAUDE-OP', 'TC-H-CX-6', 'writer-handover']]);
   expect(openHands(store, { now: Date.now(), ladder }).length).toBe(0);
+});
+
+// HAND-RAISE-DOMAIN-ROUTING (live 11-27 23:0x): «plan-limit» = the TUI auto-continue cap, not an LLM quota. 5–6 hands sat
+// 38 min at GUARDIAN. The 행정관 resumes it; the third hit within an hour goes to the hand's leader as ONE card instead.
+test('plan-limit: the 행정관 resumes the first two in an hour; the third becomes one card to the leader (TC), never HQ', () => {
+  const store = freshStore();
+  setSystemTime(new Date(T0));
+  const limit = (block: string): MessageEnvelope => ({ ...hand('TC-H-CX-1', block, 'HUMAN_DECISION', ['cause:plan-limit']),
+    body: '[✋ NEED HUMAN · TC-H-CX-1] plan-limit · auto-continue cap 10/10 (not an LLM quota) · open steps: run e2e | update receipt' });
+  expect(handCauseOf({ reason: 'HUMAN_DECISION', refs: ['cause:plan-limit'] })).toBe('plan-limit');
+  expect(handCauseOf({ reason: 'HUMAN_DECISION', refs: ['hand-ask:auto-continue:CELL-A'] })).toBe('plan-limit');
+  const { d } = deps({ ports: ports() });
+  const first = store.append(limit('blk-p1'));
+  const r1 = runWriterCheckResolver(store, d);
+  expect(r1.resolved.map((r) => [r.msgId, r.cause, r.answer])).toEqual([[first.id, 'plan-limit', PLAN_LIMIT_AUTO_ANSWER]]);
+  setSystemTime(new Date(T0 + 10 * 60_000));
+  store.append(limit('blk-p2'));
+  expect(runWriterCheckResolver(store, d).resolved.length).toBe(1);
+  setSystemTime(new Date(T0 + 20 * 60_000));
+  const third = store.append(limit('blk-p3'));
+  const r3 = runWriterCheckResolver(store, d);
+  expect(r3.resolved).toEqual([]);
+  expect(r3.cards).toEqual([]); // no HQ card
+  const cards = store.db.query("SELECT sender, recipient, body FROM msg_messages WHERE refs_json LIKE '%plan-limit-card%'").all() as Array<{ sender: string; recipient: string; body: string }>;
+  expect(cards.length).toBe(1);
+  expect(cards[0]!.recipient).toBe('TC');
+  expect(cards[0]!.body).toContain('TC-H-CX-1 hit the auto-continue cap 3× within 1h');
+  expect(cards[0]!.body).toContain('open steps: run e2e | update receipt');
+  expect(cards[0]!.body).toContain(`✋ #${third.id}`);
+  runWriterCheckResolver(store, d);
+  expect((store.db.query("SELECT COUNT(*) AS n FROM msg_messages WHERE refs_json LIKE '%plan-limit-card%'").get() as { n: number }).n).toBe(1); // once
 });

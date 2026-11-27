@@ -1,0 +1,126 @@
+# 행정관 (hand-steward) — LOOP-AGENT v3 YAML definition (YAML-SUPERVISORS-DEF · 대표 11-27 12:0x «감독자들도 다 로직·정책 등을 yaml 로»).
+# Schema: src/loop-agent/v3/agent-yaml.ts · executor: src/loop-agent/v3/supervisor.ts · lint: eln loop agent lint hand-steward
+# Tiers: ① rules / thresholds / routing = this file (policies · body edges) · ② deterministic logic = the node kinds it requires
+# (provides.nodes · their tests and the supervisors sim world are the spec) · ③ fuzzy judgment = the voice block (one LLM turn when spoken to · role router · facts-only fold).
+# The ONE definition (YAML-SUPERVISORS-RUNTIME): the trigger registry reads wake: from here (graphs/triggers/<registered_as>.yaml is only the tick shim) and goal.yaml is GENERATED from this file (eln loop agent gen) — only the fallback when this file is refused.
+apiVersion: elanous/loop-agent@3
+manifest:
+  name: hand-steward
+  version: 1.0.0
+  description: "놀고 있는 손과 주인 없는 준비 칸이 동시에 남아 있지 않다"
+  requires:
+    executor: loop-agent@3
+    kits: [kpi]
+    node_kinds: [hand-steward.observe, loop-agent.act, loop-agent.learn, loop-agent.judge, loop-agent.finish, gate, reflect, plan, learn-knowhow, retro]
+    facts: []
+  provides:
+    agent: hand-steward
+    kpis: [idle_hands_with_ready_cells]
+    nodes: [hand-steward.observe]   # tier ② — src/loop-agent/bodies/hand-steward.ts (+ its tests · sim world supervisors)
+identity:
+  id: hand-steward
+  address: HAND-STEWARD
+  rank: supervisor
+  soul: soul.md
+supervisor:
+  duty: board
+# v2 card fields that live only here — graphs/loop-agents/hand-steward/goal.yaml is GENERATED from this file (eln loop agent gen hand-steward)
+card:
+  name: 행정관
+  role: &purpose 놀고 있는 손과 주인 없는 준비 칸을 짝짓는다 — pull 힌트 ⊕ 난이도별 모델 ⊕ 깨움 한 번
+  temperament: &voice 짧다. 손 이름·칸 id·모델 등급으로 말한다
+  values: &values
+    - 놀고 있는 손 옆에 준비 칸이 남아 있지 않게 한다
+    - pull 이 기본 — 칸을 밀어 넣지 않고 힌트를 건다(손이 eln work next 로 잡는다)
+    - 소총 일에 탱크 금지 — 모델은 칸 난이도대로
+  subject: 연방 손 풀(놀고 있는 구현 손) ⊕ 지금 판 체크리스트의 주인 없는 준비 칸(노랑 · 선행 닫힘 · umbrella/decision 아님) ⊕ priority-order 힌트
+  actions:
+    - assign
+    - unassign
+  wake_events:
+    - 손 유휴(idle-seats 변경)
+    - 체크리스트 칸 상태 변경
+  voice_role: coordinator
+  fallback_seat: OP
+goal: "놀고 있는 손과 주인 없는 준비 칸이 동시에 남아 있지 않다"
+policies:   # tier ① — the only numbers (the body reads them through pv() · change behaviour here, not in code)
+  idle_hands_with_ready_cells_max: 0
+  max_per_tick: 3
+  cooldown_min: 45
+  escalate_after_min: 60
+  heartbeat_every_min: 10
+  subject_lost_ticks: 3   # unreadable subject this many ticks → reattach proposal to the L0
+  # v3 smartness (LOOP-AGENT-V3-SMART-2 · src/loop-agent/v3/smart.ts) — reflect · plan · learn-knowhow · retro read only these
+  act_grace_min: 0   # an action's outcome is known when it returns (acted | failed) — no waiting
+  lesson_repeat_min: 3   # the same action failing 3× in a row on one kind of subject → ONE lesson with the cause
+  reflect_window_min: 60
+  lesson_cap: 12   # active lessons kept (oldest evicted)
+  knowhow_promote_min: 1   # the lesson becomes one knowhow line at once (marker-deduped · plan reads it next tick)
+  knowhow_cap: 5   # learned knowhow lines per agent, total
+  plan_ambiguity_margin: 0   # the shell plan is deterministic (body plan ⊕ knowhow ⊕ fallback)
+  unacted_penalty: 0.25
+  plan_llm_per_hour: 0
+  retro_every_h: 6   # retro (회고): journal ⊕ KPI window → what worked · what failed and why · one change to try
+  cost_act: 0
+kpis:
+  - { name: idle_hands_with_ready_cells, at_most: $policies.idle_hands_with_ready_cells_max, unit: "손" }
+done_when:
+  - "idle_hands_with_ready_cells == 0 for one tick"
+never_auto: &never
+  - "칸 주인 강제 변경(claim --force)"
+  - "판정 손(JUD*)에 구현 칸"
+  - "칸 만들기·쪼개기"
+  - "다른 판 칸 배정"
+  - "umbrella·decision 칸 배정"
+soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan and voice load it · aliases = one definition with the card
+  purpose: *purpose
+  values: *values
+  do_not: *never
+  voice: *voice
+  serves:
+    - "OP (L0)"
+    - "일감을 기다리는 손 자리"
+wake:
+  registered_as: hand-steward-agent
+  trigger:
+    condition:
+      predicate: {"kind":"state-changed","parts":["idle-seats",{"file":"{stateRoot}/release/features.sqlite"}]}
+      cooldown_min: 2
+      max_wait_min: 10
+      on_max_wait: fire
+  failure: { goal_deadline_min: 30, max_attempts: 2, backoff_sec: [60] }   # the registry's goal deadline · attempts · backoff (was graphs/triggers/hand-steward-agent.yaml)
+body:   # tier ① routing — observe outcome → steps (ok · breach · unknown → act; off · error → finish)
+  entry_node: observe
+  terminal_nodes: [done]
+  nodes:
+    - { node_id: observe, kind: hand-steward.observe, max_visits: 1 }
+    - { node_id: act, kind: loop-agent.act, max_visits: 1 }
+    - { node_id: learn, kind: loop-agent.learn, max_visits: 1 }
+    - { node_id: judge, kind: loop-agent.judge, max_visits: 1 }
+    - { node_id: finish, kind: loop-agent.finish, max_visits: 1 }
+    - { node_id: done, kind: gate }
+    - { node_id: reflect, kind: reflect, optional: true }        # v3: did my actions work? same failure N× → a pattern with its cause
+    - { node_id: plan, kind: plan, optional: true }              # v3: the body plan ⊕ learned knowhow → fallback · soul do_not · cited memory
+    - { node_id: learn-knowhow, kind: learn-knowhow, optional: true } # v3: one lesson → one knowhow line
+    - { node_id: retro, kind: retro, optional: true }            # v3: every retro_every_h → retro entry in memory (the voice quotes it)
+  edges:
+    - { from: observe, on: outcome, map: { ok: act, breach: act, unknown: act, off: finish, error: finish } }
+    - { from: act, on: outcome, map: { ok: learn } }
+    - { from: learn, on: outcome, map: { ok: judge } }
+    - { from: judge, on: outcome, map: { ok: finish } }
+    - { from: finish, on: outcome, map: { ok: done } }
+actions:   # v3 plan (LOOP-AGENT-V3-SMART-2): the card rights as plan choices · fallback = what the plan runs once a knowhow line says the action keeps failing
+  - { id: assign, channel: self, target: self, serves: [idle_hands_with_ready_cells], cost: $policies.cost_act, default: true }
+  - { id: unassign, channel: self, target: self, serves: [idle_hands_with_ready_cells], cost: $policies.cost_act }
+voice:   # tier ③ — one LLM turn only when spoken to (role router · coordinator) · facts-only fold over budget
+  channel: loop:hand-steward
+  speak_on: [kpi-breach, kpi-recovered, subject-lost]
+  mail: l0-only
+  per_hour_max: 6
+memory:
+  knowhow: knowhow.md
+budget:
+  llm_turns_per_hour: 6
+levels:
+  start: live
+  values: [live, L1, shadow, off]

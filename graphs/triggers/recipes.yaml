@@ -14,6 +14,9 @@ trigger-pulse-turn:
 trigger-retro-draft:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/trigger-nodes.ts" retro-draft'
   timeout_ms: 600000 # Up to four measure commands (each ≤150 s) and one file append.
+trigger-bulletin-write:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/trigger-nodes.ts" bulletin-write'
+  timeout_ms: 240000 # git rev-list · els ls · one ledger read, one file rewrite, ≤ 8 msg posts (each a short CLI spawn).
 trigger-watchers-check:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/trigger-nodes.ts" watchers-check'
   timeout_ms: 60000 # One ledger read, one msg-store max id, at most one card post.
@@ -74,6 +77,52 @@ space-advisor-tick:
 release-traffic-tick:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/release-traffic.ts"'
   timeout_ms: 1900000 # A few config get/set + one ssh probe; update-all after publish can take ≤30 min.
+guardian-pulse:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop guardian pulse --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # 4 host probes (ssh ≤ 10 s) every pulse; a spawned 임대관/대식세포 adds one ps + exact-PID kills per host.
+guardian-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop guardian tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # 5 hosts × (probe + ps + kill ≤ 60 s) over ssh · ≤10 voice turns.
+judge-butler-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop butler tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # gh pr view per newly merged PR (cached) · receipt focused reads (ssh ≤ 30 s each) · ≤10 voice turns (≤120 s each).
 land-graph-tick:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" land graph tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
   timeout_ms: 2700000 # Live: up to 2 lands × op-direct-land-v2 preflight (~20 min each on minim5).
+land-steward-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" land steward tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 2700000 # The land-graph tick (≤ 2 lands × ~20 min v2 preflight) + KPI from local files + ≤ 4 els channel lines (10 s each).
+land-rail-watch:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" land rail-watch --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 420000 # 4 smokes × ≤ 60 s + one git fetch/log; same-rail ticks return at once.
+macrophage-agent-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent macrophage tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # one v2 tick: observe + ≤max_per_tick actions + ≤5 mail voice turns (≤120 s each).
+watchers-check-agent-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent watchers-check tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # one v2 tick: observe + ≤max_per_tick actions + ≤5 mail voice turns (≤120 s each).
+silence-watch-agent-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent silence-watch tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # one v2 tick: observe + ≤max_per_tick actions + ≤5 mail voice turns (≤120 s each).
+train-manager-agent-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent train-manager tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # one v2 tick: observe + ≤max_per_tick actions + ≤5 mail voice turns (≤120 s each).
+release-rocket-agent-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent release-rocket tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # one v2 tick: observe + ≤max_per_tick actions + ≤5 mail voice turns (≤120 s each).
+hand-steward-agent-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent hand-steward tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # one v2 tick: observe + ≤max_per_tick actions + ≤5 mail voice turns (≤120 s each).
+run-supervisor-agent-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent run-supervisor tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # one v2 tick: observe + ≤max_per_tick actions + ≤5 mail voice turns (≤120 s each).
+run-doctor-agent-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent run-doctor tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # one v2 tick: observe + ≤max_per_tick actions + ≤5 mail voice turns (≤120 s each).
+autopsy-agent-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent autopsy tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # one v2 tick: observe + ≤max_per_tick actions + ≤5 mail voice turns (≤120 s each).
+# WORLD-REGISTRY (src/resource-ledger/world-*.ts) — the guardian's world-ledger sweep (LLM 0 · writes as loop:guardian).
+world-sweep-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" world sweep --by loop:guardian --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # One probe per host (ssh ≤ 25 s each, 6 hosts) + listAllLoops + one els pane list (≤ 15 s).

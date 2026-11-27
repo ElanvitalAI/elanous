@@ -1,4 +1,5 @@
 # SIM-WORLD machine-infra pack (SIM-WORLD-0333-DEVICES): ops-heal failure injection — restart persistence, dead lock holder reclaim, concurrent processes, provider refusal (CX-15 원문 · scenarios SHA 052cd31d…).
+# RF-* (RESOURCE-FACTS-FROM-LEDGER · 대표 11-27): machines routed by the world registry — unhealthy · maintenance · paid-not-approved · ledger down/recovers · all out.
 schema: 1
 world: machine-infra
 scenarios:
@@ -6,3 +7,30 @@ scenarios:
   - { id: OPS-HEAL-DEAD-LOCK, module: src/ux-sim/sim-world/machine-infra/scenarios.ts }
   - { id: OPS-HEAL-CONCURRENT, module: src/ux-sim/sim-world/machine-infra/scenarios.ts }
   - { id: OPS-HEAL-PROVIDER-REFUSE, module: src/ux-sim/sim-world/machine-infra/scenarios.ts }
+  - { id: MAINT-ROTATION, module: src/ux-sim/sim-world/machine-infra/maintenance-scenarios.ts }
+  - { id: MAINT-TIGHT-FORCE, module: src/ux-sim/sim-world/machine-infra/maintenance-scenarios.ts }
+  - { id: MAINT-CUT-WINDOW, module: src/ux-sim/sim-world/machine-infra/maintenance-scenarios.ts }
+  - { id: MAINT-STEP-FAULT, module: src/ux-sim/sim-world/machine-infra/maintenance-scenarios.ts }
+  - { id: MAINT-WORLD-ROW, module: src/ux-sim/sim-world/machine-infra/maintenance-scenarios.ts }
+  - { id: WORLD-UNREGISTERED, module: src/ux-sim/sim-world/machine-infra/world-registry.ts }
+  - { id: WORLD-ZOMBIE, module: src/ux-sim/sim-world/machine-infra/world-registry.ts }
+  - { id: WORLD-UNREACHABLE, module: src/ux-sim/sim-world/machine-infra/world-registry.ts }
+  - { id: WORLD-QUIET, module: src/ux-sim/sim-world/machine-infra/world-registry.ts }
+  - { id: WORLD-CONTROL, module: src/ux-sim/sim-world/machine-infra/world-registry.ts }
+  - { id: WORLD-AUTOREG, module: src/ux-sim/sim-world/machine-infra/world-registry.ts }
+  - { id: HOSTFACTS-ROUTED, module: src/ux-sim/sim-world/machine-infra/host-facts-scenarios.ts }
+  - { id: HOSTFACTS-MAINT-RESERVED, module: src/ux-sim/sim-world/machine-infra/host-facts-scenarios.ts }
+  - { id: HOSTFACTS-LEDGER-FAULT, module: src/ux-sim/sim-world/machine-infra/host-facts-scenarios.ts }
+  - { id: HOSTFACTS-ON-CHANGE, module: src/ux-sim/sim-world/machine-infra/host-facts-scenarios.ts }
+  - { id: RF-UNHEALTHY, module: src/ux-sim/sim-world/machine-infra/resource-facts.ts }
+  - { id: RF-MAINTENANCE, module: src/ux-sim/sim-world/machine-infra/resource-facts.ts }
+  - { id: RF-PAID-NOT-APPROVED, module: src/ux-sim/sim-world/machine-infra/resource-facts.ts }
+  - { id: RF-LEDGER-DOWN, module: src/ux-sim/sim-world/machine-infra/resource-facts.ts }
+  - { id: RF-LEDGER-RECOVERS, module: src/ux-sim/sim-world/machine-infra/resource-facts.ts }
+  - { id: RF-ALL-OUT, module: src/ux-sim/sim-world/machine-infra/resource-facts.ts }
+  - { id: KIT-HB-STALENESS, module: src/ux-sim/sim-world/machine-infra/kit-heartbeat.ts }
+  - { id: KIT-HB-ONE-TRUTH, module: src/ux-sim/sim-world/machine-infra/kit-heartbeat.ts }
+  - { id: KIT-HB-WATCHER-VIEW, module: src/ux-sim/sim-world/machine-infra/kit-heartbeat.ts }
+  - { id: KIT-HB-FAIL-SOFT, module: src/ux-sim/sim-world/machine-infra/kit-heartbeat.ts }
+  - { id: WT-EPHEMERAL-ELIGIBLE, module: src/ux-sim/sim-world/machine-infra/worktree-ephemeral.ts }
+  - { id: WT-EPHEMERAL-ACTIVE-PTY, module: src/ux-sim/sim-world/machine-infra/worktree-ephemeral.ts }

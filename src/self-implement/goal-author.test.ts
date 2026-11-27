@@ -440,7 +440,7 @@ describe('goal author grade', () => {
     expect(authored.document).toContain('- 장치: product-devices');
     expect(authored.document).toContain('시나리오: 신설 초안 (MS-id 후보: MK-GOAL-AUTHOR-FIXTURE-TDD-EVIDENCE-01)');
     expect(authored.document).toContain('«src/self-implement/goal-author-fixture.ts의 동작을 구현한다.»');
-    expect(authored.document).toContain('카탈로그 API·ScenarioV0 형식');
+    expect(authored.document).toContain('참고용 초안이며 요구가 아니다');
     const plan = tddPlanFromGoal(authored.document);
     expect(plan.greenCommand).toBe(`bun test ${testPath}`);
 
@@ -498,6 +498,10 @@ describe('goal author grade', () => {
     ].join('\n'), repositoryRoot);
     expect(pairedLines).toContain(`- 완료 경계 증거 명령: bun test ${pairedSpec}`);
     expect(pairedLines.some((line) => line === `- 검증 계획(TDD): 장치 product-devices · 시나리오 신설 초안 · 기존 시험에 요청 동작 회귀 사례 추가 ${pairedSpec} · 피처 시험 bun test ${pairedSpec}를 구현 전에 RED로 확인한다.`)).toBe(true);
+    const pairedPlan = pairedLines.join('\n');
+    expect(pairedPlan).toContain('EVIDENCE: [tdd-red]');
+    expect(pairedPlan).toContain('EVIDENCE: [tdd-green]');
+    expect(pairedPlan).toContain('RESULT:');
 
     rmSync(join(repositoryRoot, pairedSpec));
     const missingPairedSpecLines = explicitGoalDoneBoundaryLines([

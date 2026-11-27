@@ -21,8 +21,9 @@ const scenarios: Array<{ name: string; snapshot: PlacementSnapshot; llm: unknown
   {
     name: 'local available',
     snapshot: { workKind: 'test', hosts: [host('node-b'), host('minim5'), host('node-c'), host('aws1', { gateProtected: true }), host('unregistered-host')] },
-    llm: { host: 'node-b', workKind: 'test', reason: 'first eligible green local', confidence: 0.94, cloudAction: 'none' },
-    cio: 'node-b', expectedHost: 'node-b', expectedAction: 'none',
+    // RESOURCE-FACTS-FROM-LEDGER: the local order is the registry's test-run order (code defaults: minim5 → node-b → node-c).
+    llm: { host: 'minim5', workKind: 'test', reason: 'first eligible green local', confidence: 0.94, cloudAction: 'none' },
+    cio: 'minim5', expectedHost: 'minim5', expectedAction: 'none',
   },
   {
     name: 'local full; cloud starts only as a shadow recommendation',
@@ -36,8 +37,8 @@ const scenarios: Array<{ name: string; snapshot: PlacementSnapshot; llm: unknown
       host('node-b'), host('minim5'), host('mshq', { load1Pct: 75, load15Pct: 82 }),
       host('aws2', { load15Pct: 5, cloudIdleMinutes: 10, cloudRunning: true }),
     ] },
-    llm: { host: 'node-b', workKind: 'test', reason: 'local capacity replaces idle cloud', confidence: 0.88, cloudAction: 'stop' },
-    cio: 'node-b', expectedHost: 'node-b', expectedAction: 'stop',
+    llm: { host: 'minim5', workKind: 'test', reason: 'local capacity replaces idle cloud', confidence: 0.88, cloudAction: 'stop' },
+    cio: 'minim5', expectedHost: 'minim5', expectedAction: 'stop',
   },
 ];
 
@@ -65,7 +66,8 @@ test.each(scenarios)('placement shadow simulation: $name', async ({ snapshot, ll
     const compared = JSON.parse(String(state.nodes.find(node => node.nodeId === 'placement-compare')?.output));
     expect(filtered.result.candidates.map((candidate: { host: string }) => candidate.host)).not.toContain('aws1');
     expect(filtered.result.candidates.map((candidate: { host: string }) => candidate.host)).not.toContain('mbp');
-    expect(filtered.result.candidates.map((candidate: { host: string }) => candidate.host)).not.toContain('node-c');
+    // the HQ host never runs tests (the old fixed list put mshq into review/test/tsc/train) — RESOURCE-FACTS-FROM-LEDGER
+    expect(filtered.result.candidates.map((candidate: { host: string }) => candidate.host)).not.toContain('mshq');
     expect(validated.result).toMatchObject({ host: expectedHost, workKind: snapshot.workKind, cloudAction: expectedAction });
     expect(compared.result).toMatchObject({ mode: 'shadow', proposedHost: expectedHost, cioHost: cio,
       agrees: expectedHost === cio, cloudAction: expectedAction });
@@ -136,7 +138,7 @@ test('cloud stop proposal is rejected unless local count and every idle-cloud co
     } });
     expectGraphDone(state);
     expect(JSON.parse(String(state.nodes.find(node => node.nodeId === 'placement-validate')?.output))).toMatchObject({
-      result: { host: 'node-b', cloudAction: 'none', reason: 'invalid-model-decision; deterministic pick-host fallback' },
+      result: { host: 'minim5', cloudAction: 'none', reason: 'invalid-model-decision; deterministic pick-host fallback' },
     });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -8,6 +8,7 @@ import {
   buildUniversalPreamble,
   loadProjectAnchor,
   loadProjectAnchorWithMeta,
+  projectAnchorManifest,
   resetUniversalPreambleCache,
   setGlobalAnchorPathForTest,
 } from './universal-preamble.js';
@@ -151,4 +152,85 @@ describe('chat.project-anchor manifest', () => {
       else Reflect.deleteProperty(debug, 'enabled');
     }
   });
+});
+
+it('reports preserved section titles and exact omitted UTF-8 bytes without partial duplication', () => {
+  const section = '<!-- must-carry -->\n## 책임\n끝까지 수행\n<!-- /must-carry -->';
+  const raw = `${'가'.repeat(40_000)}\n${section}\n`;
+  writeFileSync(join(root, 'AGENTS.md'), raw);
+  const result = loadProjectAnchorWithMeta(root);
+  const manifest = projectAnchorManifest(result);
+  const file = (manifest.files as Array<Record<string, unknown>>)[0]!;
+  expect(file.sections).toEqual(['책임']);
+  const retainedPrefix = result.content!.split("=== Project canonical collaboration guide (AGENTS.md) ===\n")[1]!.split("\n…[truncated to fit anchor budget]")[0]!;
+  expect(file.truncatedBytes).toBe(Buffer.byteLength(raw) - Buffer.byteLength(retainedPrefix) - Buffer.byteLength(section));
+  expect(result.content!.split(section).length - 1).toBe(1);
+});
+
+it('preserves first principle and responsibility from a 30KB anchor within 4096 UTF-8 bytes', () => {
+  const first = '## 제1원칙\n관측 → 인지 → 힐링\n';
+  const responsibility = '## 책임\n내가 끝까지 수행한다.\n';
+  const marked = '<!-- must-carry -->\n## 목적\n핵심.\n<!-- /must-carry -->';
+  writeFileSync(join(root, 'AGENTS.md'), `${'x'.repeat(30_000)}\n${first}${responsibility}${marked}\n`);
+  writeFileSync(join(root, 'AGENTS.local.md'), 'l'.repeat(30_000));
+  const result = loadProjectAnchorWithMeta(root);
+  expect(result.content).toContain(first);
+  expect(result.content).toContain(responsibility);
+  expect(result.content).toContain(marked);
+  expect(Buffer.byteLength(first + responsibility + marked)).toBeLessThanOrEqual(4096);
+});
+
+it('retains literal priority passages in a 30KB local file without duplication within 4096 bytes', () => {
+  const local = join(root, 'AGENTS.local.md');
+  const must = '<!-- must-carry -->\n명시적으로 지킬 약속\n<!-- /must-carry -->';
+  const principle = '## 제1원칙\n관측하고 인지하고 고친다.';
+  const responsibility = '## 책임\n끝까지 수행한다.';
+  writeFileSync(local, `${'x'.repeat(30_000)}\n${must}\n${principle}\n${responsibility}\n`);
+  const rendered = loadProjectAnchorWithMeta(root).content!;
+  for (const literal of [must, principle, responsibility]) {
+    expect(rendered.split(literal).length - 1).toBe(1);
+  }
+  const extracted = [
+    rendered.match(/<!-- must-carry -->[\s\S]*?<!-- \/must-carry -->/)?.[0],
+    rendered.match(/^## 제1원칙\n[^\n]*/m)?.[0],
+    rendered.match(/^## 책임\n[^\n]*/m)?.[0],
+  ];
+  expect(extracted.every(Boolean)).toBe(true);
+  expect(Buffer.byteLength(extracted.join(''), 'utf8')).toBeLessThanOrEqual(4096);
+});
+
+it('retains literal must-carry, first-principle and responsibility passages in a 30KB local anchor', () => {
+  const mandatory = '<!-- must-carry -->\n## 운영 안전\n비밀과 다른 사용자의 데이터를 보호한다.\n<!-- /must-carry -->';
+  const principle = '## 제1원칙\n관측하고 인지한 뒤 직접 메운다.';
+  const responsibility = '## 책임\n약속은 증거로 닫는다.';
+  expect(Buffer.byteLength(mandatory + principle + responsibility)).toBeLessThanOrEqual(4096);
+  const raw = `${'x'.repeat(30000)}\n${mandatory}\n${principle}\n${responsibility}\n`;
+  writeFileSync(join(root, 'AGENTS.local.md'), raw);
+  const result = loadProjectAnchorWithMeta(root);
+  expect(result.content).toContain(mandatory);
+  expect(result.content).toContain(principle);
+  expect(result.content).toContain(responsibility);
+  const manifest = projectAnchorManifest(result);
+  const file = (manifest.files as Array<Record<string, unknown>>).find((entry) => entry.layer === 'local')!;
+  expect(file.sections).toEqual(['운영 안전', '제1원칙', '책임']);
+  expect(file.mustCarryBytes as number).toBeLessThanOrEqual(4096);
+});
+
+it('preserves an authoritative UTF-8 local anchor untruncated and counts priority bytes', () => {
+  const priority = '<!-- must-carry -->\n## 책임\n끝까지 수행\n<!-- /must-carry -->';
+  const raw = `${'한'.repeat(10_000)}\n${priority}\n`;
+  writeFileSync(join(root, 'AGENTS.local.md'), raw);
+  const result = loadProjectAnchorWithMeta(root);
+  const file = result.files.find(entry => entry.layer === 'local')!;
+  expect(file.truncated).toBe(false);
+  const body = result.content!.split('=== Directory-local instructions (overrides the shared guide) (AGENTS.local.md) ===\n')[1]!.split('\n=== end AGENTS.local.md ===')[0]!;
+  expect(body).toBe(raw);
+  expect(file.mustCarryBytes).toBe(Buffer.byteLength(priority));
+});
+
+it('recognizes responsibility as a table row in the actual charter form', () => {
+  const raw = `${'z'.repeat(30000)}\n## 1. 제1원칙 — 관측 → 인지 → 힐링\n목표의 구멍을 메운다.\n\n## 여섯 능력\n| 능력 | 뜻 |\n|---|---|\n| 책임 | 한 우편 = 하나의 닫힘 · 요청했습니다로 끝내지 않는다 |\n`;
+  writeFileSync(join(root, 'AGENTS.local.md'), raw);
+  const file = (projectAnchorManifest(loadProjectAnchorWithMeta(root)).files as Array<Record<string, unknown>>).find((entry) => entry.layer === 'local')!;
+  expect(file.sections).toEqual(['1. 제1원칙 — 관측 → 인지 → 힐링', '책임']);
 });

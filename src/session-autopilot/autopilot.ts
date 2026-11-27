@@ -8,8 +8,9 @@
 // Q: where does that live without new switches and without keyword grounding?
 // A: one state file per memory store (seat / project / user) + this controller. The model turns it on/off through the
 //    structured `autopilot_set` tool (session-autopilot/autopilot-tool.ts); `/autopilot on|off|resume|hold` calls the
-//    same `set` directly. Coordinator seats (OP) start ON with a STANDING goal — the release cycle
-//    «<v> 개발 → <v> 컷·발행 → <v+1> 개발 …» — that rolls by itself when <v>/release.json gets its publishedAt.
+//    same `set` directly. Coordinator seats (OP) start ON with no goal. A goal comes only from an explicit ask or a
+//    crown goal (NO-RELEASE-GOAL · CEO 11-27 09:0x: the release-derived goal «<v> 개발 — <top cells> (+N open)» was
+//    rewritten every minute as the open count moved — removed; a stored release goal is dropped on the next refresh).
 //
 // 세 얼굴:
 //   관측 = debug.log('autopilot', on|off|pause|resume|stop|goal-rolled|armed|decided, {reason, goal, …})
@@ -31,7 +32,6 @@ import { BLOCKED_MS, GOAL_DEFAULT_DEADLINE_MS, GOAL_RATE_WINDOW_MS, GOAL_EXPIRE_
   THRASH_REPLACEMENTS, THRASH_WINDOW_MS, FREEZE_MS, blockedDue, burnDue, checklistCheckTrue, clearedLine, crownPinBar, describeCheck, escapeLine, expiredLine, fileCheckTrue,
   goalBarReason, goalDoneRefs, historyLine, lossLine, loopSig, mailCheckTrue, matchGoalRef, parseDoneCheck, pastDueLine, stallDue, supersededLine,
   type DoneCheck, type EscapeKind, type GoalArchive, type GoalKind, type GoalLife, type GoalOutcome } from './goal-clearing.js';
-import { releaseGoalNote, STANDING_TARGETS } from '../ops-dashboard/release-targets.js';
 import { DRIVE_BLOCK_AFTER_UNCHANGED, DRIVE_CONTINUE_PROMPT, DRIVE_HAND_PULL_PROMPT, decideGoalDrive, driveWindow, isTaskGoal, type HandPullInput } from './goal-drive.js';
 import { observeChecklistHighWater, type ChecklistCountObservation } from './goal-progress.js';
 import { autopilotGoalsFile, goalLines, nearestGoalChip, OP_GOAL_SEED, readGoals, seedGoalsIfMissing, takeProgressCardsDue, timeToDue, type AutopilotGoal } from './goals.js';
@@ -59,7 +59,7 @@ export interface AutopilotState {
   /** Epoch ms after which autopilot turns itself off. */
   until?: number;
   since?: number;
-  /** STANDING goal (coordinator release cycle): the goal is re-derived from the release ledger, not typed. */
+  /** Legacy (NO-RELEASE-GOAL) — the removed release-derived goal; dropped on the next refresh, never written. */
   standing?: StandingGoal;
   paused?: { at: number; hold: boolean; lastHumanAt: number };
   /** Legacy (pre-11-24 15:5x) — nothing stops autopilot on volume any more; a cap stop is cleared on load. */
@@ -85,7 +85,7 @@ export interface AutopilotState {
   derived?: DerivedGoal;
   /** AUTOPILOT-HUMAN-GOAL — the first-class goal id that already got its «초안부터» nudge (once per goal). */
   awaitNudged?: string;
-  /** AUTOPILOT-RELEASE-GOAL — the release resolver's version last seen on a tick (a change = a release was published). */
+  /** Legacy (NO-RELEASE-GOAL) — the removed release resolver's last-seen version; dropped on the next refresh. */
   releaseSeen?: string;
   /** AUTOPILOT-TASK-GOAL-PIN — task goals (pins above the input · never the chip) · at most PIN_MAX. */
   pins?: TaskPin[];
@@ -138,26 +138,9 @@ export function writeAutopilotState(file: string, state: AutopilotState): void {
   renameSync(temp, file);
 }
 
-// ── standing goal: the coordinator's release cycle ──────────────────────────────────────────────────────────────────
-/** `note` / `done` are set when a published release moved the goal (AUTOPILOT-RELEASE-GOAL). */
+// ── release cycle (read on demand only — never the autopilot goal · NO-RELEASE-GOAL) ─────────────────────────────────
+/** The version in play and its phase — planners (pulse · retro · next-action) may read it for their own text. */
 export interface StandingGoal { version: string; phase: AutopilotPhase; note?: string; done?: string }
-/** AUTOPILOT-RELEASE-GOAL (owner 11-25 07:1x «버전 발행 후 자동으로 오토파일럿 살아 있으면 골 셋팅») — the next version's goal. */
-// RELEASE-GOAL-FROM-LEDGER (L4): the note is built from targets — the plan's front-matter when it sets them, else the standing OPS targets.
-export const RELEASE_GOAL_NOTE = releaseGoalNote(STANDING_TARGETS);
-export const releaseGoalDone = (version: string): string => `${version} 로스터 초록 · 컷`;
-export const releaseStanding = (s: StandingGoal): StandingGoal => ({ version: s.version, phase: s.phase, note: s.note ?? RELEASE_GOAL_NOTE, done: releaseGoalDone(s.version) });
-const VERSION_IN_TEXT = /(?<![\d.])(\d+)\.(\d+)\.(\d+)(?![\d.])/gu;
-/** The first version a goal text names that is older than `current` (a goal still aimed at a released version). */
-export function staleVersionIn(text: string | undefined, current: string): string | null {
-  const cur = SEMVER.exec(current);
-  if (!text || !cur) return null;
-  for (const m of text.matchAll(VERSION_IN_TEXT)) {
-    const a = [Number(m[1]), Number(m[2]), Number(m[3])]; const b = [Number(cur[1]), Number(cur[2]), Number(cur[3])];
-    const cmp = a[0]! - b[0]! || a[1]! - b[1]! || a[2]! - b[2]!;
-    if (cmp < 0) return m[0];
-  }
-  return null;
-}
 const SEMVER = /^(\d+)\.(\d+)\.(\d+)$/;
 export const nextPatch = (v: string): string => { const m = SEMVER.exec(v)!; return `${m[1]}.${m[2]}.${Number(m[3]) + 1}`; };
 
@@ -191,10 +174,17 @@ export function resolveStandingGoal(input: { hqRoot: string; ledgerRoot: string;
   try {
     const { standingNoteFromPlan } = require('../ops-dashboard/release-goal.js') as typeof import('../ops-dashboard/release-goal.js');
     note = standingNoteFromPlan(input.hqRoot, version);
+    // OP-NEXT-BEST-ACTION 3/3: no plan targets → the note names the version's top open cells, not «로스터 착지 · 초록».
+    if (!note) {
+      const { standingNoteFromCells } = require('../ops-dashboard/release-goal.js') as typeof import('../ops-dashboard/release-goal.js');
+      note = standingNoteFromCells(version, input.ledgerRoot);
+    }
   } catch { note = undefined; }
   return { version, phase: cut ? '컷·발행' : '개발', ...(note ? { note } : {}) };
 }
 
+/** The coordinator's old default goal text (pre NO-RELEASE-GOAL) — dropped with the release goal. */
+const LEGACY_COORDINATOR_GOAL = '다음 판 개발·발행';
 export const standingGoalText = (s: StandingGoal): string => `${s.version} ${s.phase}${s.note && s.phase === '개발' ? ` — ${s.note}` : ''}`;
 
 /** The decision-autonomy paragraph for the turn's volatile (non-cached) context while autopilot is ON. */
@@ -211,8 +201,8 @@ export function autopilotPolicyParagraph(state: AutopilotState | null, goals: re
     + '사람에게는 돈·보안 사고·되돌릴 수 없는 행동·방향 결정만 결정 카드(decisions raise)로 올린다. '
     + '스스로 정한 결정마다 autopilot_set({decided:{kind, criterion}}) 한 번으로 기록한다. '
     + '지금 할 수 있는 다음 단계가 남아 있으면 턴을 끝내지 말고 이 턴에서 이어서 한다 — 완료 기준에 닿거나 진짜 막힘(다른 자리·외부 결과 대기·사람 결정)일 때만 끝낸다. 끝낼 때만 무엇을 기다리는지·다음 점검 시각을 한 줄로 남긴다 — 깨움은 자율주행이 건다. '
-    + '사람의 새 요청·다른 방향·긴급 지시도 그냥 입력이다 — 처리하되 자율주행은 켜진 채로 둔다. 작업 골(📌 핀 · 입력창 위 · 최대 3)은 사람이 «이걸 골로 잡아»처럼 골 설정을 명시할 때만 세운다 — autopilot_set({on:true, goal:"<한 줄>", explicit_ask:"<사람 말 그대로>", done_criterion:"<완료 판정 한 줄>", deadline:"HH:MM", expected_turns:N}). 질문·상태 확인·요청·기한 있는 부탁·우편 답장·후속 확인은 골이 아니다 — 이번 턴에 답하거나 처리한다(추론으로 골을 만들지 않는다). 자율주행 골(🚗 칩)은 바꾸지 않는다(kind:"autopilot" 은 판 골·대표 P0 지시만). 작업 골이 끝나면 autopilot_set({goal_done:true, kind:"task", goal:"<그 줄>"}). 백그라운드 에이전트를 띄웠으면 «아직 없음»으로 끝내지 말고 초안부터 낸다. '
-    + '보통 우편·요청은 골이 아니다(약속 원장·체크리스트) — 골은 사람·대표 지시만 바꾼다. 1급 골(대표 지시)의 일이 끝나면 autopilot_set({goal_done:true})로 닫는다 — 상시 골이 돌아온다. 기한이 지나면 부분 결과로 닫기(outcome:"partial") · 기한 연장({on:true, deadline}) · 포기(outcome:"dropped", reason) 중 하나를 고른다. '
+    + '사람의 새 요청·다른 방향·긴급 지시도 그냥 입력이다 — 처리하되 자율주행은 켜진 채로 둔다. 작업 골(📌 핀 · 입력창 위 · 최대 3)은 사람이 «이걸 골로 잡아»처럼 골 설정을 명시할 때만 세운다 — autopilot_set({on:true, goal:"<한 줄>", explicit_ask:"<사람 말 그대로>", done_criterion:"<완료 판정 한 줄>", deadline:"HH:MM", expected_turns:N}). 질문·상태 확인·요청·기한 있는 부탁·우편 답장·후속 확인은 골이 아니다 — 이번 턴에 답하거나 처리한다(추론으로 골을 만들지 않는다). 자율주행 골(🚗 칩)은 바꾸지 않는다(kind:"autopilot" 은 대표 P0 지시만). 작업 골이 끝나면 autopilot_set({goal_done:true, kind:"task", goal:"<그 줄>"}). 백그라운드 에이전트를 띄웠으면 «아직 없음»으로 끝내지 말고 초안부터 낸다. '
+    + '보통 우편·요청은 골이 아니다(약속 원장·체크리스트) — 골은 사람·대표 지시만 바꾼다. 1급 골(대표 지시)의 일이 끝나면 autopilot_set({goal_done:true})로 닫는다. 기한이 지나면 부분 결과로 닫기(outcome:"partial") · 기한 연장({on:true, deadline}) · 포기(outcome:"dropped", reason) 중 하나를 고른다. '
     + '멈추는 것은 사람이 «이제부터 내가 운전하겠다»(autopilot_set({on:true, hold:true})) 또는 «자율주행 멈춰»(autopilot_set({on:false}))라고 명시할 때뿐이다.' + stack;
 }
 
@@ -225,7 +215,7 @@ export interface AutopilotSetRequest {
   hold?: boolean;
   /** an in-turn autonomous decision to record (no state change). */
   decided?: { kind: string; criterion: string };
-  /** close the open first-class goal (its directive is done) — the standing goal returns. */
+  /** close the open first-class goal (its directive is done). */
   goalDone?: boolean;
   /** with goal — the done criterion (one judgment line); required when the model sets a goal (source 'tool'). */
   doneCriterion?: string;
@@ -272,6 +262,17 @@ export function explicitGoalAskReason(state: Pick<AutopilotState, 'turnOrigin' |
   return quoteNorm(state.turnText).includes(q) ? null : 'explicit-ask-not-in-turn';
 }
 
+/**
+ * COORD-RIGHTS (CEO 11-27 08:0x): a coordinator steering this seat (an `els do` line arrives as «⇢ <from> · text») or a
+ * non-person turn (mail · notice · self) never flips the seat into «사람 운전» PAUSED — that hold is a person's call.
+ * Returns who is driving (the seat name, or `auto` for a non-person turn), or null when the turn is a person's own.
+ */
+export function coordinatorDriver(state: Pick<AutopilotState, 'turnOrigin' | 'turnText'>): string | null {
+  if (state.turnOrigin === 'auto') return 'auto';
+  const marked = /^⇢ ([A-Za-z0-9][A-Za-z0-9_.:-]*) · /.exec(state.turnText ?? '');
+  return marked ? marked[1]! : null;
+}
+
 export interface AutopilotDecisionCard { title: string; reason: string; goal: string | undefined; sessionId: string | undefined }
 
 export interface AutopilotDeps {
@@ -280,13 +281,11 @@ export interface AutopilotDeps {
   log?: (event: string, data: Record<string, unknown>) => void;
   /** Raise the one decision card when a back-off persists 2 h; returns the card id. */
   raiseDecision?: (card: AutopilotDecisionCard) => string | undefined;
-  /** Coordinator seats start ON with the standing goal (once — an explicit off is persisted and kept). */
+  /** Coordinator seats start ON without a goal (once — an explicit off is persisted and kept). */
   coordinator?: boolean;
   /** GOAL-SET-COORD-BY-OP — this session's seat (the receiver of goal mails) and the federation ladder (read lazily). */
   seat?: string | null;
   federationLadder?: () => GoalLadder | null;
-  /** The standing goal source (coordinator release cycle) — production: resolveStandingGoal. */
-  standingGoal?: () => StandingGoal | null;
   sessionId?: string;
   notify?: (line: string) => void;
   /** The one near-due progress card per goal (goal · progress · blocking · ETA go in the card). */
@@ -399,7 +398,7 @@ export function createAutopilot(deps: AutopilotDeps) {
     try { writeAutopilotState(deps.file, state); }
     catch (error) { log('persist-failed', { error: error instanceof Error ? error.message : String(error) }); }
   };
-  /** Re-read the file (the REPL child's autopilot_set writes it) and roll the standing goal. */
+  /** Re-read the file (the REPL child's autopilot_set writes it) and drop a stored release goal. */
   const refresh = (): AutopilotState => {
     const read = readAutopilotState(deps.file);
     if (read) {
@@ -412,56 +411,39 @@ export function createAutopilot(deps: AutopilotDeps) {
         save();
       }
     } else if (deps.coordinator) {
-      // Coordinator default: ON with the standing goal, persisted (an explicit off later is kept).
-      const standing = standingNow();
-      state = { v: 1, on: true, since: now(), by: 'default',
-        ...(standing ? { standing, goal: standingGoalText(standing) } : { goal: '다음 판 개발·발행' }) };
-      log('on', { reason: 'coordinator-default', goal: state.goal });
+      // Coordinator default: ON without a goal, persisted (an explicit off later is kept) — goals come only from an ask or a crown goal.
+      state = { v: 1, on: true, since: now(), by: 'default' };
+      log('on', { reason: 'coordinator-default' });
       save();
     }
     if (deps.coordinator) { try { seedGoalsIfMissing(goalsFile, OP_GOAL_SEED); } catch (error) { log('goals-seed-failed', { error: String(error) }); } }
-    rollStanding();
+    dropReleaseGoal();
     applyDerived('refresh');
     expireDue();
     return state;
   };
-  const standingNow = (): StandingGoal | null => { try { return deps.standingGoal?.() ?? null; } catch { return null; } };
   /**
-   * AUTOPILOT-RELEASE-GOAL — read on every refresh/tick from the cached release resolver (no new polling). A seat in
-   * AUTO whose version moved (a release was published) — or whose goal still names an older version — gets the next
-   * version's goal «<v> 개발 — 로스터 착지 · 초록 +10/h» (done = <v> 로스터 초록 · 컷), logged as
-   * `goal-derived {source:'release', from, to}`. AUTO off → nothing changes (not even the seen version).
+   * NO-RELEASE-GOAL (CEO 11-27 09:0x) — the release-derived goal is gone: a stored one (legacy `standing` / `releaseSeen`,
+   * or a `derived` goal of the standing tier) is dropped once — one `release-goal-cleared` log, no visible line, no turn.
+   * An open first-class goal (ask · crown) is untouched and stays the goal.
    */
-  const rollStanding = (): void => {
-    if (!state.on || !deps.standingGoal) return;
-    const derived = standingNow();
-    if (!derived) return;
-    const seen = state.releaseSeen;
-    const seenChanged = seen !== derived.version;
-    if (seenChanged) state = { ...state, releaseSeen: derived.version };
-    const cur = state.standing;
-    if (cur) {
-      const noteMoved = derived.note !== undefined && derived.note !== cur.note;
-      if (derived.version === cur.version && derived.phase === cur.phase && !noteMoved) { if (seenChanged) save(); return; }
-      const rolled = derived.version !== cur.version;
-      const next = rolled ? releaseStanding(derived) : { ...cur, phase: derived.phase, ...(derived.note !== undefined ? { note: derived.note } : {}) };
-      const from = standingGoalText(cur); const to = standingGoalText(next);
-      state = { ...state, standing: next };
-      log(rolled ? 'goal-rolled' : 'goal-phase', { from, to });
-      deps.notify?.(`🚗 목표 ${from} → ${to}`);
-      if (!applyDerived(rolled ? 'standing-rolled' : 'standing-phase', rolled ? { source: 'release', from: cur.version, to: next.version } : undefined)) save();
-      return;
-    }
-    // A seat without a standing goal: a release moved the version under it, or its goal still names an older version.
-    const stale = staleVersionIn(state.goal, derived.version);
-    const released = seen !== undefined && seenChanged;
-    if (!stale && !released) { if (seenChanged) save(); return; }
-    state = { ...state, standing: releaseStanding(derived) };
-    log('release-goal-set', { from: stale ?? seen, to: derived.version, under: state.derived?.tier ?? 'none' });
-    if (!applyDerived('release', { source: 'release', from: stale ?? seen, to: derived.version })) save();
+  const dropReleaseGoal = (): void => {
+    const standingTier = state.derived?.tier === 'standing';
+    if (!state.standing && !state.releaseSeen && !standingTier) return;
+    const released = new Set<string>([LEGACY_COORDINATOR_GOAL]);
+    if (standingTier && state.derived) released.add(state.derived.goal);
+    if (state.standing) released.add(standingGoalText(state.standing));
+    const { standing: _s, releaseSeen: _r, ...rest } = state;
+    let next: AutopilotState = rest;
+    if (standingTier) { const { derived: _d, ...noDerived } = next; next = noDerived; }
+    const dropped = next.goal !== undefined && next.derived?.tier !== 'first-class' && released.has(next.goal) ? next.goal : undefined;
+    if (dropped !== undefined) { const { goal: _g, ...noGoal } = next; next = noGoal; }
+    log('release-goal-cleared', { goal: dropped ?? '', ...(state.releaseSeen ? { releaseSeen: state.releaseSeen } : {}) });
+    state = next;
+    save();
   };
   /** Goal-tier fields every state rebuild carries over (on/off/until never drop an open directive). */
-  const goalTier = (): Pick<AutopilotState, 'firstClass' | 'closedFirstClass' | 'derived' | 'awaitNudged' | 'releaseSeen' | 'pins' | 'pinExpired'
+  const goalTier = (): Pick<AutopilotState, 'firstClass' | 'closedFirstClass' | 'derived' | 'awaitNudged' | 'pins' | 'pinExpired'
     | 'life' | 'history' | 'goalOpens' | 'pinChanges' | 'replacements' | 'freezeUntil'> => ({
     ...(state.life?.length ? { life: state.life } : {}),
     ...(state.history?.length ? { history: state.history } : {}),
@@ -469,7 +451,6 @@ export function createAutopilot(deps: AutopilotDeps) {
     ...(state.pinChanges?.length ? { pinChanges: state.pinChanges } : {}),
     ...(state.replacements?.length ? { replacements: state.replacements } : {}),
     ...(state.freezeUntil !== undefined ? { freezeUntil: state.freezeUntil } : {}),
-    ...(state.releaseSeen ? { releaseSeen: state.releaseSeen } : {}),
     ...(state.pins?.length ? { pins: state.pins } : {}),
     ...(state.pinExpired ? { pinExpired: state.pinExpired } : {}),
     ...(state.firstClass?.length ? { firstClass: state.firstClass } : {}),
@@ -483,7 +464,7 @@ export function createAutopilot(deps: AutopilotDeps) {
    */
   const applyDerived = (reason: string, logOver?: Record<string, unknown>): boolean => {
     if (!state.on || state.stopped || state.paused?.hold) return false;
-    const d = deriveEffectiveGoal(state.firstClass, state.standing ? standingGoalText(state.standing) : undefined, state.standing?.done);
+    const d = deriveEffectiveGoal(state.firstClass, undefined);
     if (sameDerived(d, state.derived)) return false;
     if (!d) {
       if (state.derived?.tier !== 'first-class') return false;
@@ -1008,7 +989,7 @@ export function createAutopilot(deps: AutopilotDeps) {
       }
       return !sameDerived(before, state.derived);
     },
-    /** Close a first-class goal (its directive is done) — id omitted = the latest. The standing goal returns. */
+    /** Close a first-class goal (its directive is done) — id omitted = the latest. */
     closeFirstClass(id?: string): boolean { refresh(); return closeFirstClass(id, 'close') !== null; },
     /** The structured switch — the autopilot_set tool and `/autopilot` both land here. */
     set(req: AutopilotSetRequest, source: 'tool' | 'slash'): { ok: boolean; text: string } {
@@ -1020,7 +1001,7 @@ export function createAutopilot(deps: AutopilotDeps) {
       }
       if (req.on === false) {
         if (!state.on) return { ok: true, text: '🚗 자율주행 이미 꺼짐' };
-        state = { v: 1, on: false, by: source, ...(state.goal ? { goal: state.goal } : {}), ...(state.standing ? { standing: state.standing } : {}), ...goalTier() };
+        state = { v: 1, on: false, by: source, ...(state.goal ? { goal: state.goal } : {}), ...goalTier() };
         log('off', { reason: source, goal: state.goal });
         save();
         return { ok: true, text: '🚗 자율주행 꺼짐 — 다시 켤 때까지 꺼진 채로 둔다' };
@@ -1130,6 +1111,11 @@ export function createAutopilot(deps: AutopilotDeps) {
       }
       if (req.hold) {
         if (!state.on) return { ok: false, text: '🚗 자율주행이 꺼져 있다 — 먼저 켜라' };
+        const driver = source === 'tool' ? coordinatorDriver(state) : null;
+        if (driver) {
+          log('coordinator-drive', { by: driver, goal: state.goal });
+          return { ok: true, text: `🚗 coordinator drive (${driver}) — a coordinator's line steers this seat; autopilot keeps running (only a person pauses it)` };
+        }
         state = { ...state, paused: { at: state.paused?.at ?? t, hold: true, lastHumanAt: t } };
         log('pause', { reason: 'human-hold', goal: state.goal });
         save();
@@ -1154,7 +1140,7 @@ export function createAutopilot(deps: AutopilotDeps) {
         resume(source);
         return { ok: true, text: api.statusText() };
       }
-      state = { v: 1, on: true, since: t, by: source, ...(state.standing ? { standing: state.standing } : {}), ...goalTier(),
+      state = { v: 1, on: true, since: t, by: source, ...goalTier(),
         ...(goal ? { goal } : state.goal ? { goal: state.goal } : {}), ...(until !== undefined ? { until } : {}),
         ...(state.turnOrigin ? { turnOrigin: state.turnOrigin } : {}), ...(state.turnText ? { turnText: state.turnText } : {}) };
       log('on', { reason: source, goal: state.goal, ...(until !== undefined ? { until } : {}) });
@@ -1184,12 +1170,11 @@ export function createAutopilot(deps: AutopilotDeps) {
     tick(): boolean {
       const t = now();
       if (state.on && state.until !== undefined && t >= state.until) {
-        state = { v: 1, on: false, by: 'until', ...(state.goal ? { goal: state.goal } : {}), ...(state.standing ? { standing: state.standing } : {}), ...goalTier() };
+        state = { v: 1, on: false, by: 'until', ...(state.goal ? { goal: state.goal } : {}), ...goalTier() };
         log('off', { reason: 'until-reached', goal: state.goal });
         save();
         return false;
       }
-      rollStanding();
       if (state.on) clearPass();
       expireDue();
       progressCards();

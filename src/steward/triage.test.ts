@@ -12,7 +12,7 @@ import { debug } from '../debug/log.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { setInProcessOutbound } from '../domains/outbound-alert.js';
 import { DEFAULT_KIND_ROLES, isTradingKind } from '../domains/telegram-kind-route.js';
-import { emitLoopHeartbeat } from '../loops/neighbor-runtime.js';
+import { emitSignal as emitLoopHeartbeat } from '../kit/heartbeat/index.js';
 import { launcherEvidence } from '../loops/checker.js';
 
 // #25512: live launch resolves the registered HQ OP view from the real HOME; tests run from an isolated view instead.

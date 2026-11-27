@@ -241,10 +241,10 @@ test('msg mirror with no configured target or pointer fails closed before openin
 
 test('post warns for recipients without a reply body and leaves loop aliases invalid', async () => {
   const f = fixture();
-  for (const recipient of ['GUARDIAN', 'ORCHESTRATOR', 'STEWARD']) {
+  // ORCHESTRATOR has no live tab — DORMANT-ADDRESS REROUTE sends it to the OP digest (dormant-reroute.test.ts).
+  for (const recipient of ['GUARDIAN', 'STEWARD']) {
     await f.run('post', 'request', '--from', 'UX', '--to', recipient, '--json');
     expect(JSON.parse(f.stdout.at(-1)!).to).toBe(recipient);
-    expect(f.stderr.at(-1)).toContain('이 주소는 읽는 몸이 없다 — 지금은 OP');
   }
   const posted = f.stdout.length;
   await f.run('post', 'request', '--from', 'UX', '--to', 'loop:orchestrator');
@@ -255,9 +255,9 @@ test('post warns for recipients without a reply body and leaves loop aliases inv
   await f.run('post', 'request', '--from', 'UX', '--to', 'loop:ORCHESTRATOR');
   expect(f.stderr.at(-2)).toContain('지금 읽는 주소는 COORDINATOR');
   expect(f.stderr.at(-1)).toContain('invalid seat ID');
-  await f.run('post', 'request', '--from', 'UX', '--to', 'loop:guardian');
-  expect(f.stderr.at(-2)).toContain('GUARDIAN은 읽는 몸이 없다 — 지금은 OP');
-  expect(f.stderr.at(-1)).toContain('invalid seat ID');
+  // 수호자 v2 reads its own mail: GUARDIAN and loop:guardian are addressable
+  await f.run('post', 'request', '--from', 'UX', '--to', 'loop:guardian', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!).to).toBe('GUARDIAN');
 });
 
 test('post wakes the recipient after the durable save; a reply is passed through and a failed wake keeps rc 0', async () => {
@@ -298,9 +298,6 @@ test('post with the real wake warns once for an unresolved seat and stays quiet 
   await f.run('post', 'hello', '--from', 'OP', '--to', 'UX');
   expect(f.exits).toEqual([]);
   expect(f.stderr).toEqual(['이 주소는 깨울 길이 없다 — 받는 몸이 스스로 읽을 때까지 쌓인다 (wake=none · 받는 몸 모름: 등록부·pane 에서 못 찾음 — seat-registry-missing:candidates=0)']);
-  await f.run('post', 'hello', '--from', 'OP', '--to', 'GUARDIAN');
-  expect(f.stderr.at(-1)).toBe('이 주소는 읽는 몸이 없다 — 지금은 OP');
-  expect(f.stderr).toHaveLength(2);
 });
 
 test('route shows reply body and resolved wake for loop and seat addresses', async () => {
@@ -1904,7 +1901,7 @@ describe('MSG-FILTERS-RELAX — msg post accepts and stores instead of refusing'
     const f = fixture();
     await f.run('post', 'hello', '--from', 'OP', '--to', 'TC', '--kind', 'Coord.Reply', '--json');
     expect(f.exits).toEqual([2]);
-    expect(f.stderr.at(-1)).toStartWith('msg: msg post refused (unknown --kind "Coord.Reply"): add --kind <request|question|decision|alert|info|notice|status|report|announce|coord|ack|receipt|goal>');
+    expect(f.stderr.at(-1)).toStartWith('msg: msg post refused (unknown --kind "Coord.Reply"): add --kind <request|question|decision|alert|info|notice|status|report|announce|coord|ack|receipt|goal|consult|coach>');
     await f.run('post', 'hello', '--from', 'OP', '--to', 'TC', '--kind', 'Coord', '--intent', 'Heads-Up', '--json');
     const posted = JSON.parse(f.stdout.at(-1)!);
     expect([posted.id, posted.kind, posted.intent, posted.refs]).toEqual([1, 'coord', 'info', ['intent:heads-up']]);
@@ -1914,11 +1911,11 @@ describe('MSG-FILTERS-RELAX — msg post accepts and stores instead of refusing'
     const f = fixture();
     await f.run('post', 'hello', '--from', 'TC', '--to', 'OP', '--kind', '', '--json');
     expect(f.exits).toEqual([]);
-    expect(f.stderr).toEqual(['msg post warning (no --kind): stored as --kind info (passive · needsReply=false · no turn) — add --kind <request|question|decision|alert|info|notice|status|report|announce|coord|ack|receipt|goal> and --needs-reply when you wait for an answer']);
+    expect(f.stderr).toEqual(['msg post warning (no --kind): stored as --kind info (passive · needsReply=false · no turn) — add --kind <request|question|decision|alert|info|notice|status|report|announce|coord|ack|receipt|goal|consult|coach> and --needs-reply when you wait for an answer']);
     expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ id: 1, kind: 'info', needsAck: false });
     await f.run('post', '⏰ 13:20 check', '--from', 'OP', '--to', 'OP', '--kind', 'notice', '--json');
     expect(JSON.parse(f.stdout.at(-1)!)).toEqual({ diverted: 'self-wake', to: 'OP', kind: 'notice', needsReply: false, line: 'self-mail → scheduled wake for OP (not a mailbox row)' });
-    await f.run('post', 'board', '--from', 'CLAUDE-OP', '--to', 'OP', '--kind', 'info');
+    await f.run('post', 'board', '--from', 'CLAUDE-OP', '--to', 'OP', '--kind', 'coach');
     expect(f.stdout.at(-1)).toBe('msg post: coach injection → coach note for OP (one line per 30 min in its next turn · not mail)');
     await f.run('post', 'decide?', '--from', 'CLAUDE-OP', '--to', 'OP', '--kind', 'decision', '--json');
     expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ id: 2, from: 'CLAUDE-OP', kind: 'decision', needsAck: true });

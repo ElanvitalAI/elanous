@@ -12,10 +12,16 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  acquireLock, readLedger, setHold, tickLand, type Focused, type LandDeps, type Mode, type PrInfo, type Receipt, type RefusalClass,
+  acquireLock, readLedger, setHold, tickLand, type BaselineDiff, type Focused, type LandDeps, type Mode, type PrInfo, type Receipt, type RefusalClass, type TerraReview,
 } from '../land-graph/land-graph.js';
 
-export interface WorldPr extends PrInfo { receiptHead?: string; focused?: Focused | 'none'; security?: string[] }
+export interface WorldPr extends PrInfo {
+  receiptHead?: string; focused?: Focused | 'none'; security?: string[];
+  /** Terra review of the head (security-4 paths). */ terra?: TerraReview | null;
+  /** Baseline failure-name diff receipt (introduced 0). */ baselineDiff?: BaselineDiff | null;
+  /** JUD HOLD verdict on file for the head. */ judHold?: string;
+  /** pregate graded the receipt L0 (focused stage skipped although a focused list is recorded). */ l0?: boolean;
+}
 export interface Hooks {
   /** Before the merge re-read (live) — mutate the world mid-land. */
   onPrNow?: (w: LandWorld, pr: number, call: number) => void;
@@ -34,6 +40,8 @@ export class LandWorld {
   stateRoot = mkdtempSync(join(tmpdir(), 'land-world-'));
   prs = new Map<number, WorldPr>();
   merges = new Map<number, number>();
+  /** ctx the land command got per PR (lane · baseline diff) — the extra.json the golden path receives. */
+  landCtx = new Map<number, { lane?: string; baselineDiff?: BaselineDiff | null }>();
   posts: Array<{ to: string; body: string }> = [];
   records: string[] = [];
   violations: string[] = [];
@@ -68,12 +76,17 @@ export class LandWorld {
       receipt: (n, head) => {
         const p = this.prs.get(n)!;
         if (p.receiptHead !== head || p.focused === undefined) return null;
+        if (p.l0) return { dir: `/r/${n}-${head.slice(0, 12)}-minim5`, head, host: 'minim5', focused: ['test/rules-contract.test.ts'], rawDir: '/raw', grade: 'L0', focusedExit: null };
         return { dir: `/r/${n}-${head.slice(0, 12)}-minim5`, head, host: 'minim5', focused: p.focused === 'none' ? [] : ['x.test.ts'], rawDir: '/raw' };
       },
       olderReceiptHead: (n, head) => { const p = this.prs.get(n)!; return p.receiptHead && p.receiptHead !== head ? p.receiptHead : null; },
       focused: (r: Receipt) => { const p = this.prs.get(Number(r.dir.split('/')[2]!.split('-')[0]))!; return p.focused === 'none' || p.focused === undefined ? 'unreadable' : p.focused; },
       security: n => this.prs.get(n)!.security ?? [],
-      land: async (pr, r) => {
+      terra: n => this.prs.get(n)!.terra ?? null,
+      baselineDiff: n => this.prs.get(n)!.baselineDiff ?? null,
+      judHold: n => { const why = this.prs.get(n)!.judHold; return why ? { reason: why, by: 'JUD' } : null; },
+      land: async (pr, r, _why, ctx) => {
+        if (ctx) this.landCtx.set(pr.number, ctx);
         const p = this.prs.get(pr.number)!;
         const forced = this.hooks.landResult?.(pr.number);
         if (forced) return forced;
@@ -179,9 +192,10 @@ export const SCENARIOS: Scenario[] = [
   { id: 'code-pr-empty-focused', expected: 'refuse no-focused-stage', run: async s => {
     const w = new LandWorld(s); w.add({ number: 23, focused: 'none' }); await w.tick();
     const r = `${w.merges.size ? 'landed' : 'refuse'} ${w.lastClass(23)}`; w.dispose(); return r; } },
-  { id: 'hot-file-entry', expected: 'refuse review-required · card JUD', run: async s => {
+  { id: 'hot-file-entry', expected: 'landed · no JUD review', run: async s => {
+    // JUD-RELAX: a hot file (src/index.ts) is not a security-4 path — no JUD review wait.
     const w = new LandWorld(s); w.add({ number: 24, files: ['src/index.ts'] }); await w.tick();
-    const r = `${w.merges.size ? 'landed' : 'refuse'} ${w.lastClass(24)} · card ${w.cardsTo(24).join(',')}`; w.dispose(); return r; } },
+    const r = `${w.merges.size ? 'landed' : 'not'} · ${w.cardsTo(24).length ? 'card' : 'no JUD review'}`; w.dispose(); return r; } },
   { id: 'focused-fail', expected: 'refuse baseline-failing-focused', run: async s => {
     const w = new LandWorld(s); w.add({ number: 25, focused: { pass: 64, fail: 4 } }); await w.tick();
     const r = `${w.merges.size ? 'landed' : 'refuse'} ${w.lastClass(25)}`; w.dispose(); return r; } },
@@ -210,10 +224,46 @@ export const SCENARIOS: Scenario[] = [
   { id: 'two-prs-one-slot', expected: 'tick1 1 · tick2 1 · double 0', run: async s => {
     const w = new LandWorld(s, {}, 1); w.add({ number: 33 }); w.add({ number: 34 }); await w.tick(); const a = w.merges.size; await w.tick();
     const r = `tick1 ${a} · tick2 ${w.merges.size - a} · double ${[...w.merges.values()].filter(v => v > 1).length}`; w.dispose(); return r; } },
-  { id: 'org-rollback-restores-routing', expected: 'split TC · rollback JUD', run: async s => {
-    const w = new LandWorld(s); w.add({ number: 35, files: ['src/index.ts'] }); await w.tick(); const a = w.cardsTo(35).join(',');
-    w.setOrg('org: {}\n'); w.add({ number: 36, files: ['src/index.ts'] }); await w.tick();
+  { id: 'org-rollback-restores-routing', expected: 'split TC · rollback TC,JUD', run: async s => {
+    const w = new LandWorld(s); w.add({ number: 35, files: ['src/oauth/x.ts'] }); await w.tick(); const a = w.cardsTo(35).join(',');
+    w.setOrg('org: {}\n'); w.add({ number: 36, files: ['src/oauth/y.ts'] }); await w.tick();
     const r = `split ${a} · rollback ${w.cardsTo(36).join(',')}`; w.dispose(); return r; } },
+  // ── JUD-RELAX (0.3.38 P0) ─────────────────────────────────────────────────────────────────────────────────
+  { id: 'swept-raw-exit0-lands', expected: 'landed · no headTestRun counts', run: async s => {
+    const w = new LandWorld(s); w.add({ number: 40, focused: { swept: true, exit: 0 } }); await w.tick();
+    const r = `${w.merges.size ? 'landed' : `not ${w.lastClass(40)}`} · ${w.landCtx.get(40)?.baselineDiff ? 'nd' : 'no headTestRun counts'}`; w.dispose(); return r; } },
+  { id: 'swept-raw-exit1-refused', expected: 'refuse baseline-failing-focused', run: async s => {
+    const w = new LandWorld(s); w.add({ number: 41, focused: { swept: true, exit: 1 } }); await w.tick();
+    const r = `${w.merges.size ? 'landed' : 'refuse'} ${w.lastClass(41)}`; w.dispose(); return r; } },
+  { id: 'baseline-name-diff-ok-lands', expected: 'landed · nd passed to land', run: async s => {
+    const w = new LandWorld(s); w.add({ number: 42, focused: { pass: 60, fail: 1 }, baselineDiff: { receipt: '/nd/42.json', command: 'bun test x', headPass: 60, headFail: 1 } }); await w.tick();
+    const r = `${w.merges.size ? 'landed' : 'not'} · ${w.landCtx.get(42)?.baselineDiff ? 'nd passed to land' : 'no nd'}`; w.dispose(); return r; } },
+  { id: 'l0-receipt-doc-only-lands', expected: 'landed · lane L0-doc-only', run: async s => {
+    // #40244 (11-26): pregate L0 skipped the focused stage but recorded a focused list — was «wait focused-unreadable».
+    const w = new LandWorld(s); w.add({ number: 43, files: ['docs/conductor/A.md', 'docs/conductor/B.md'], l0: true }); await w.tick();
+    const r = `${w.merges.size ? 'landed' : `not ${w.lastClass(43)}`} · lane ${w.landCtx.get(43)?.lane ?? '-'}`; w.dispose(); return r; } },
+  { id: 'l0-receipt-code-refused', expected: 'refuse no-focused-stage', run: async s => {
+    const w = new LandWorld(s); w.add({ number: 44, files: ['src/a.ts'], l0: true }); await w.tick();
+    const r = `${w.merges.size ? 'landed' : 'refuse'} ${w.lastClass(44)}`; w.dispose(); return r; } },
+  { id: 'security4-no-terra-waits', expected: 'wait review-required · card TC', run: async s => {
+    const w = new LandWorld(s); w.add({ number: 45, files: ['src/secret/store.ts'] }); await w.tick();
+    const r = `${w.merges.size ? 'landed' : 'wait'} ${w.lastClass(45)} · card ${w.cardsTo(45).join(',')}`; w.dispose(); return r; } },
+  { id: 'security4-terra-warn-lands', expected: 'landed', run: async s => {
+    const w = new LandWorld(s); w.add({ number: 46, files: ['src/pty/spawn.ts'], terra: { verdict: 'warn', securityFindings: [] } }); await w.tick();
+    const r = w.merges.size ? 'landed' : `not ${w.lastClass(46)}`; w.dispose(); return r; } },
+  { id: 'security4-terra-fail-waits', expected: 'wait review-required', run: async s => {
+    const w = new LandWorld(s); w.add({ number: 47, files: ['src/oauth/token.ts'], terra: { verdict: 'fail', securityFindings: [] } }); await w.tick();
+    const r = `${w.merges.size ? 'landed' : 'wait'} ${w.lastClass(47)}`; w.dispose(); return r; } },
+  { id: 'security4-terra-security-finding', expected: 'refuse security-finding', run: async s => {
+    const w = new LandWorld(s); w.add({ number: 48, files: ['src/disk-steward/sweep.ts'], terra: { verdict: 'pass', securityFindings: ['destructive:rm outside root'] } }); await w.tick();
+    const r = `${w.merges.size ? 'landed' : 'refuse'} ${w.lastClass(48)}`; w.dispose(); return r; } },
+  { id: 'non-security-terra-fail-lands', expected: 'landed', run: async s => {
+    // A Terra FAIL with no security finding on a non-security path does not block (findings → FU).
+    const w = new LandWorld(s); w.add({ number: 49, terra: { verdict: 'fail', securityFindings: [] } }); await w.tick();
+    const r = w.merges.size ? 'landed' : `not ${w.lastClass(49)}`; w.dispose(); return r; } },
+  { id: 'jud-hold-verdict-file-vetoes', expected: 'hold · held', run: async s => {
+    const w = new LandWorld(s); w.add({ number: 50, judHold: 'HOLD verdict hold-50-x' }); await w.tick();
+    const r = `${w.merges.size ? 'landed' : 'hold'} · ${w.lastClass(50)}`; w.dispose(); return r; } },
 ];
 
 export async function runLandWorld(seed: number): Promise<{ results: CaseResult[]; violations: string[] }> {

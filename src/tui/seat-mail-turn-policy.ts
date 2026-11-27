@@ -8,6 +8,7 @@
  * Q: how do we decide «turn now» vs «ride the digest» without reading the prose and without an LLM?
  * A: the default flips to passive. Only these open a turn immediately — everything else rides the 10-min digest:
  *      crown   — a crown directive / crown delegation
+ *      proxy   — a CEO-proxy lane mail (CLAUDE-OP · `lane:proxy` ref stamped by the post gate · budgeted there)
  *      human   — a person's own mail (origin kind human)
  *      hand    — a ✋ HandRaise (`block:` ⊕ `reason:` refs), escalated ones included
  *      question— an explicit question/decision (question · ask · decision kind, intent decision) or the needs-reply flag
@@ -18,6 +19,7 @@
  *                waits on, flows down and starts — kind-less included); a request from a peer or a subordinate is routine and waits for the digest (the coordinator/steward
  *                resolves it by policy) unless it names an HQ-level reason ref (`reason:BUDGET|SECURITY|CROSS_SCOPE|…`).
  *                Ladder unknown → a request still opens a turn (fail-safe: an order is never silenced).
+ *    A kind-`bulletin` mail is passive even from above (reason `bulletin`): info, read on the seat's next idle, no expiry.
  *      delegated-result — SEAT-TURN-FOLLOWUPS ②: mail from below that replies to a mail this seat sent, or carries a
  *                result/pr:/receipt: ref for a cell this seat owns or assigned (class P1 → batched by the 60 s join).
  *    Signals are structured ledger fields only: kind · intent · crownDirective · origin · refs · result · needsAck ·
@@ -28,11 +30,12 @@
  *          인지 = this table · 수복과 인계 = passive mail is never dropped — the digest lists it, the ack follows the digest.
  */
 import { isUrgentSeatMail } from './seat-mail-priority.js';
+import { isProxyLaneMail } from '../msg/proxy-lane.js';
 
 export type SeatMailRoute = 'turn' | 'passive';
 export type SeatMailRouteReason =
-  | 'crown' | 'human' | 'hand' | 'question' | 'needs-reply' | 'alert' | 'failed-result' | 'order' | 'hq-reason' | 'order-unknown-ladder'
-  | 'delegated-result' | 'wait-cancel' | 'routine-request' | 'reply' | 'info' | 'no-kind';
+  | 'crown' | 'proxy' | 'human' | 'hand' | 'question' | 'needs-reply' | 'alert' | 'failed-result' | 'order' | 'hq-reason' | 'order-unknown-ladder'
+  | 'delegated-result' | 'wait-cancel' | 'routine-request' | 'reply' | 'bulletin' | 'info' | 'no-kind';
 
 export interface SeatMailRouteInput {
   readonly kind?: string | null;
@@ -56,6 +59,8 @@ export interface SeatMailRouteInput {
   readonly replyToOwn?: boolean | null;
   /** SEAT-TURN-FOLLOWUPS ② — a `cell:` ref of this mail names a cell this seat owns or assigned (caller-computed). */
   readonly cellDelegated?: boolean | null;
+  /** CLAUDE-OP-PROXY-LANE — the sender seat (a proxy-lane mail = proxy seat ⊕ the gate-stamped `lane:proxy` ref). */
+  readonly fromSeat?: string | null;
 }
 
 /** Ref prefixes that carry a delegated result (with a `cell:` ref the recipient owns or assigned). */
@@ -75,7 +80,7 @@ export function isDelegatedResultMail(input: Pick<SeatMailRouteInput, 'senderAbo
 }
 
 /** Kinds that ask a question someone waits on. */
-export const SEAT_MAIL_QUESTION_KINDS: readonly string[] = ['question', 'ask', 'decision'];
+export const SEAT_MAIL_QUESTION_KINDS: readonly string[] = ['question', 'ask', 'decision', 'consult'];
 /** Kinds that are a P0 alert by themselves. */
 export const SEAT_MAIL_ALERT_KINDS: readonly string[] = ['alert', 'urgent', 'interrupt'];
 /** Kinds that ask for work (a request — a turn only when it flows down the ladder). */
@@ -94,12 +99,18 @@ export function seatMailRoute(input: SeatMailRouteInput): { route: SeatMailRoute
   const turn = (reason: SeatMailRouteReason) => ({ route: 'turn' as const, reason });
   const passive = (reason: SeatMailRouteReason) => ({ route: 'passive' as const, reason });
   if (input.crownDirective || input.origin?.delegatedByCrown) return turn('crown');
+  // CLAUDE-OP-PROXY-LANE — the CEO's proxy: just below crown, above every other mail (its lane is budgeted at post time).
+  if (isProxyLaneMail(input)) return turn('proxy');
   if (input.origin?.kind === 'human' || input.fromKind === 'human') return turn('human');
   if (hasRef(input.refs, 'block:') && hasRef(input.refs, 'reason:')) return turn('hand');
   // #40065 wait-contract cancel notices (intent alert by construction) are bookkeeping for the asker: digest.
   if (hasRef(input.refs, 'wait-cancelled-of:')) return passive('wait-cancel');
   if (intent === 'decision' || SEAT_MAIL_QUESTION_KINDS.includes(kind)) return turn('question');
   if (input.needsAck === true) return turn('needs-reply');
+  // BULLETIN-DELIVERY-WAKE (11-26) — a federal bulletin is info for every coordinator: it never opens a turn of its own
+  // (not even from above — six seats would each drop their work every 15–30 min), it rides the seat's next idle
+  // (PASSIVE-HOLD-WHILE-BUSY flushes the held digest at idle) and it carries no expiry (directive-expiry.ts).
+  if (kind === 'bulletin') return passive('bulletin');
   // From above on the ladder: a work order or the answer this seat waits on — whatever its kind (kind-less included).
   if (input.senderAbove === true) return turn('order');
   if (input.resultState === 'failed') return turn('failed-result');

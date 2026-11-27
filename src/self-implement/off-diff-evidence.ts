@@ -1,5 +1,6 @@
 // ── diff 밖 이행 증거 파싱 (S3 · 2026-07-29) ──────────────────────────────────
 
+import { goalCellKind } from './goal-policy-pack.js';
 import { requirePosixShellCommand } from '../platform/default-shell.js';
 import type * as TS from 'typescript';
 import tsApi from './lazy-typescript.js';
@@ -667,8 +668,7 @@ function tddClaimTag(claim: string): string | undefined {
 }
 
 /** 태그 하나에 대한 자식 기록을 판정한다. RED 는 실패 기록(`0 fail` 없음), GREEN 은 통과 기록이다. */
-function tddRecordFromItems(items: readonly OffDiffEvidenceParse['items'][number][], tag: TddRecordTag): TddEvidenceRecord {
-  const item = items.find((candidate) => tddClaimTag(candidate.claim) === tag);
+function tddRecordFromItem(item: OffDiffEvidenceParse['items'][number] | undefined, tag: TddRecordTag): TddEvidenceRecord {
   if (!item) return { tag, claim: '', verify: undefined, result: undefined, observed: false };
   const verify = item.verify.trim() || undefined;
   const result = item.result?.trim() || undefined;
@@ -677,6 +677,27 @@ function tddRecordFromItems(items: readonly OffDiffEvidenceParse['items'][number
     ? verify !== undefined && result !== undefined && !resultPasses
     : verify !== undefined && result !== undefined && resultPasses;
   return { tag, claim: item.claim, verify, result, observed };
+}
+
+function tddRecordFromItems(items: readonly OffDiffEvidenceParse['items'][number][], tag: TddRecordTag): TddEvidenceRecord {
+  return tddRecordFromItem(items.find((candidate) => tddClaimTag(candidate.claim) === tag), tag);
+}
+
+/**
+ * TDD-SAME-COMMAND-PAIR — a transcript can carry several records of one tag (the harness base/head test prepends its own
+ * RED→GREEN pair; a rework round adds the child's broader GREEN, e.g. the whole neighbouring file). Judging only the FIRST
+ * record of each tag called a proven pair «GREEN missing» when the first GREEN was a different command (11-27 canary
+ * GOAL-PRECHECK-OPTOUT-PATH: base 0/4 → head 4/0 on the planned command, abandoned on «tdd-green missing»).
+ * A same-command pair (observed RED · observed GREEN · identical verify) wins; otherwise the first records, as before.
+ */
+function tddSameCommandPair(items: readonly OffDiffEvidenceParse['items'][number][]): { red: TddEvidenceRecord; green: TddEvidenceRecord } | undefined {
+  const reds = items.filter((item) => tddClaimTag(item.claim) === TDD_RED_TAG).map((item) => tddRecordFromItem(item, TDD_RED_TAG)).filter((r) => r.observed);
+  const greens = items.filter((item) => tddClaimTag(item.claim) === TDD_GREEN_TAG).map((item) => tddRecordFromItem(item, TDD_GREEN_TAG)).filter((g) => g.observed);
+  for (const red of reds) {
+    const green = greens.find((candidate) => candidate.verify === red.verify);
+    if (green) return { red, green };
+  }
+  return undefined;
 }
 
 /**
@@ -688,11 +709,13 @@ function tddRecordFromItems(items: readonly OffDiffEvidenceParse['items'][number
  */
 export function judgeTddEvidence(goal: string, evidence: OffDiffEvidenceParse): TddEvidenceJudgment {
   const plan = tddPlanFromGoal(goal);
-  const red = tddRecordFromItems(evidence.items, TDD_RED_TAG);
-  const green = tddRecordFromItems(evidence.items, TDD_GREEN_TAG);
+  const pair = tddSameCommandPair(evidence.items);
+  const red = pair?.red ?? tddRecordFromItems(evidence.items, TDD_RED_TAG);
+  const green = pair?.green ?? tddRecordFromItems(evidence.items, TDD_GREEN_TAG);
   const sameCommand = red.verify !== undefined && red.verify === green.verify;
   const missing: TddRecordTag[] = [];
-  if (!red.observed) missing.push(TDD_RED_TAG);
+  // POLICY-AWARE-GOAL-AUTHORING — an evidence cell only adds proof tests for shipped code; RED cannot exist, so only GREEN is required.
+  if (!red.observed && goalCellKind(goal) !== 'evidence') missing.push(TDD_RED_TAG);
   if (!green.observed || (red.verify !== undefined && green.verify !== undefined && !sameCommand)) missing.push(TDD_GREEN_TAG);
   return {
     planned: plan.planned,
@@ -1005,6 +1028,39 @@ export function structuralMissingExport(input: { cwd: string; baseCwd: string; t
 }
 
 /** Runs the goal's planned Bun test twice: overlay the changed test on its exact base, then run on head. */
+/**
+ * TDD-RED-MAIN-BASE (11-27 TA canaries) — a rework / supervisor-relaunch run starts on the previous run's head, where the
+ * planned test already passes, so «base RED» can never be observed there (cn2-core · cn2-easy abandoned on
+ * `base-test-did-not-prove-red` with base = their own earlier head, while the same command was RED at the main point).
+ * RED is a fact about the goal's change against main, not against the last commit — when the immediate base does not
+ * prove RED, measure once more at `git merge-base HEAD origin/main`. Same exact command, same head; no new gate.
+ */
+export function runTddBaseHeadTestWithMainBase(input: {
+  readonly cwd: string; readonly baseSha: string; readonly goal: string;
+  readonly run?: (input: { readonly cwd: string; readonly baseSha: string; readonly goal: string }) => TddBaseHeadTestResult;
+  readonly mainBase?: (cwd: string) => string | undefined;
+}): TddBaseHeadTestResult & { readonly baseSha: string; readonly baseSource: 'resolved-base' | 'main-merge-base' } {
+  const run = input.run ?? runTddBaseHeadTest;
+  const first = run({ cwd: input.cwd, baseSha: input.baseSha, goal: input.goal });
+  // Both «already green at base» and «test unchanged since base» mean the immediate base is a previous head of this goal.
+  const relaunchShaped = first.reason === 'base-test-did-not-prove-red' || first.reason === 'no-changed-test-file-matches-planned-command';
+  if (first.accepted || !relaunchShaped) return { ...first, baseSha: input.baseSha, baseSource: 'resolved-base' };
+  const mainBase = (input.mainBase ?? mainMergeBase)(input.cwd);
+  if (!mainBase || mainBase === input.baseSha) return { ...first, baseSha: input.baseSha, baseSource: 'resolved-base' };
+  const second = run({ cwd: input.cwd, baseSha: mainBase, goal: input.goal });
+  return { ...second, baseSha: mainBase, baseSource: 'main-merge-base' };
+}
+
+/** `git merge-base HEAD origin/main` in the worktree; unreadable = undefined (the immediate-base result stands). */
+export function mainMergeBase(cwd: string): string | undefined {
+  for (const ref of ['refs/remotes/origin/main', 'origin/main']) {
+    const r = runGitCommand(cwd, ['merge-base', 'HEAD', ref], { encoding: 'utf8', timeout: 20_000 });
+    const sha = (r.stdout ?? '').trim();
+    if (r.status === 0 && /^[0-9a-f]{40}$/u.test(sha)) return sha;
+  }
+  return undefined;
+}
+
 export function runTddBaseHeadTest(input: { readonly cwd: string; readonly baseSha: string; readonly goal: string }): TddBaseHeadTestResult {
   const command = tddPlanFromGoal(input.goal).greenCommand;
   if (!command) return { accepted: false, reason: 'planned-test-command-missing', command: '' };

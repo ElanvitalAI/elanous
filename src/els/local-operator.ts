@@ -1,6 +1,6 @@
 // Local operator door (CEO 11-24 «불필요한 보안 강화 금지»): same host + same OS user = trusted.
 // No key file, no parent-process check — only the kernel peer UID and one audit line per call.
-import { appendFileSync } from 'node:fs';
+import { appendAuditLine } from '../kit/audit-ledger/index.js';
 import { join } from 'node:path';
 
 export const LOCAL_OPERATOR_OPS: readonly string[] = ['read', 'status', 'send'];
@@ -16,7 +16,7 @@ export type OperatorAuditEvent = { op: string; pane?: string; uid?: number; pid?
 export function auditOperator(dir: string, event: OperatorAuditEvent): void {
   const { op, pane, uid, pid, chars, result } = event;
   try {
-    appendFileSync(join(dir, 'local-operator-audit.jsonl'),
+    appendAuditLine(join(dir, 'local-operator-audit.jsonl'),
       JSON.stringify({ time: new Date().toISOString(), op, ...(pane ? { pane } : {}), uid, pid, ...(chars !== undefined ? { chars } : {}), result }) + '\n',
       { mode: 0o600 });
   } catch { /* audit is a record, not a gate */ }

@@ -58,6 +58,8 @@ export interface SeatMemoryEntry {
   file: string;
   /** MEMORY-TRIAGE-NO-LLM 문 ① — 쓰기 문을 지난 줄에만 있다(머리말 `triage:` JSON 한 줄). */
   triage?: MemoryTriageRecord;
+  /** SEAT-MEMORY-SYNC — who wrote it when not the seat itself (front matter `source:` · e.g. CLAUDE-OP). */
+  source?: string;
 }
 
 export interface SeatMemoryInput {
@@ -66,6 +68,8 @@ export interface SeatMemoryInput {
   type: string;
   body: string;
   links?: readonly string[];
+  /** SEAT-MEMORY-SYNC — front matter `source:` (one seat id). */
+  source?: string;
 }
 
 /** 자리 이름 정규화 — 대문자 자리 id 만 받는다. 아니면 null. */
@@ -120,7 +124,8 @@ export function parseSeatMemoryText(text: string, file: string): SeatMemoryEntry
   if (!name || !(SEAT_MEMORY_TYPES as readonly string[]).includes(type)) return null;
   const body = normalized.slice(close + 4).replace(/^[^\n]*\n/, '').replace(/^\n+/, '').trimEnd();
   const triage = parseTriageRecord(top.triage);
-  return { name, description: (top.description ?? '').trim(), type: type as SeatMemoryType, body, links: extractLinks(body), file, ...(triage ? { triage } : {}) };
+  const source = (top.source ?? '').trim();
+  return { name, description: (top.description ?? '').trim(), type: type as SeatMemoryType, body, links: extractLinks(body), file, ...(triage ? { triage } : {}), ...(source ? { source } : {}) };
 }
 
 function unquote(v: string): string {
@@ -142,7 +147,8 @@ function renderSeatMemoryFile(entry: Omit<SeatMemoryEntry, 'file'>): string {
   const missing = entry.links.filter(link => !entry.body.includes(`[[${link}]]`));
   const body = missing.length > 0 ? `${entry.body.trimEnd()}\n\n관련: ${missing.map(l => `[[${l}]]`).join(' ')}` : entry.body.trimEnd();
   const triage = entry.triage ? [`triage: ${renderTriageRecord(entry.triage)}`] : [];
-  return ['---', `name: ${oneLine(entry.name)}`, `description: ${oneLine(entry.description)}`, `type: ${entry.type}`, ...triage, '---', '', body, ''].join('\n');
+  const source = entry.source ? [`source: ${oneLine(entry.source)}`] : [];
+  return ['---', `name: ${oneLine(entry.name)}`, `description: ${oneLine(entry.description)}`, `type: ${entry.type}`, ...source, ...triage, '---', '', body, ''].join('\n');
 }
 
 // ── 목록·찾기 ─────────────────────────────────────────────────────────
@@ -273,14 +279,18 @@ export function saveSeatMemory(input: SeatMemoryInput, dir: string, seat?: strin
     debug.log('memory', 'save-refused', { seat: seat ?? null, name: redactSecretText(name), reason: 'secret-pattern' });
     return { ok: false, error: '비밀(키·토큰·암호)처럼 보이는 내용은 기억에 저장하지 않는다. 값은 빼고 «어디에 있는지»만 적어라.' };
   }
+  // `$` also matches before a final newline — the length check pins the whole string (no trailing \n).
+  if (input.source !== undefined && !(/^[A-Z][A-Z0-9_-]{0,63}$/.test(input.source) && !/\s/.test(input.source))) return { ok: false, error: 'source 는 자리 id 하나다.' };
   mkdirSync(dir, { recursive: true });
   const existing = findSeatMemory(dir, name);
+  const source = input.source ?? existing?.source;
+  const withSource = source ? { source } : {};
   const origin = gate.origin ?? 'unlabelled';
   // 같은 name ⊕ 같은 문장 ⊕ 같은 설명·종류·링크를 다시 저장하면 «고침»이 아니라 «한 번 더 확인됨»이다 — 쓰기 문이 횟수로 접게 둔다.
   // 설명·종류·링크 중 하나라도 바뀌면 고침(update)이다 — 횟수로 접으면 그 변경이 사라진다.
   const sameText = existing !== null
-    && renderSeatMemoryFile({ name, description, type: type as SeatMemoryType, body, links })
-      === renderSeatMemoryFile({ name: existing.name, description: existing.description, type: existing.type, body: existing.body, links: existing.links });
+    && renderSeatMemoryFile({ name, description, type: type as SeatMemoryType, body, links, ...withSource })
+      === renderSeatMemoryFile({ name: existing.name, description: existing.description, type: existing.type, body: existing.body, links: existing.links, ...(existing.source ? { source: existing.source } : {}) });
   const byFile = new Map<string, SeatMemoryEntry>();
   let outcome: MemoryGateOutcome;
   try {
@@ -314,7 +324,7 @@ export function saveSeatMemory(input: SeatMemoryInput, dir: string, seat?: strin
   const file = existing?.file ?? seatMemoryFileName(name);
   const superseded = outcome.action === 'supersede' ? byFile.get(outcome.target.id) : undefined;
   if (outcome.action === 'supersede' && superseded && superseded.file !== file) {
-    const entry: SeatMemoryEntry = { name, description, type: type as SeatMemoryType, body, links, file, triage: outcome.triage };
+    const entry: SeatMemoryEntry = { name, description, type: type as SeatMemoryType, body, links, file, triage: outcome.triage, ...withSource };
     const text = renderSeatMemoryFile(entry);
     writeFileDurable(join(dir, file), text);
     upsertIndexLine(dir, { ...entry, links: extractLinks(text) });
@@ -328,7 +338,7 @@ export function saveSeatMemory(input: SeatMemoryInput, dir: string, seat?: strin
   }
   const triage = (outcome.action === 'create' || outcome.action === 'supersede' ? outcome.triage : undefined)
     ?? (existing?.triage ? { ...existing.triage, hash: memoryTextHash(body) } : undefined);
-  const entry: SeatMemoryEntry = { name, description, type: type as SeatMemoryType, body, links, file, ...(triage ? { triage } : {}) };
+  const entry: SeatMemoryEntry = { name, description, type: type as SeatMemoryType, body, links, file, ...(triage ? { triage } : {}), ...withSource };
   const text = renderSeatMemoryFile(entry);
   const path = join(dir, file);
   let action: 'created' | 'updated' | 'unchanged' = existing ? 'updated' : 'created';

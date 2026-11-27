@@ -8,7 +8,8 @@
 // 리더 보유 칸·타 스페이스 P0 풀·판정 자리 분리·막힘 칸 재제안이 노크에도 그대로 적용된다.
 // 이 모듈은 그 결과를 TUI 큐·idle 문에 잇는 배선일 뿐이고, 감시 지점(entry.ts idle 문 옆)에서 만들어 idle 마다 부른다.
 
-import { checklistDevVersion, listChecklist } from '../release-loop/checklist.js';
+import { listChecklist } from '../release-loop/checklist.js';
+import { activeBoardVersion } from '../ops-dashboard/current-version.js';
 import { workNext, type WorkNextDeps, type WorkNextResult } from '../steward/space/work-next.js';
 import { liveWorkNextDeps } from '../steward/space/work-next-cli.js';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
@@ -47,7 +48,7 @@ export interface SeatWorkPullDeps {
 /** 현재 판 → WorkCell 매핑(owner 없음=null · priority 없음=P2 · 판 읽기 실패 시 빈 배열). */
 export function checklistCells(): WorkCell[] {
   try {
-    return listChecklist(checklistDevVersion()).items.map((item) => ({
+    return listChecklist(activeBoardVersion()).items.map((item) => ({
       id: item.id,
       title: item.title,
       status: item.status,

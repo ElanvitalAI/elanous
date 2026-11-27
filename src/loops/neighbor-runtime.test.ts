@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openMsgStore } from '../msg/msg-store.js';
-import { checkLoopNeighbors, emitLoopHeartbeat, SEAT_NEIGHBORS } from './neighbor-runtime.js';
+import { checkLoopNeighbors, SEAT_NEIGHBORS } from './neighbor-runtime.js';
+import { emitSignal as emitLoopHeartbeat } from '../kit/heartbeat/index.js';
 
 const start = new Date('2026-10-05T00:00:00Z');
 const at = (minutes: number) => new Date(start.getTime() + minutes * 60_000);

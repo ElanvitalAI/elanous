@@ -28,6 +28,12 @@ export const WIDGETS: readonly WidgetDef[] = [
     command: () => ['elanous', 'demo', 'invest', 'board', '--replay'] },
   { name: 'release-board', aliases: ['release'], description: 'Release Board — the current release graph (read-only)',
     command: () => ['elanous', 'release', 'graph', 'board'] },
+  // ELS-ZAXIS fallback (대표 11-26 «옵시디언 탭 띄워줘»): the vault root comes from config obsidian.vault inside the viewer.
+  { name: 'obsidian', aliases: ['obsidian-viewer', 'vault', '옵시디언'], description: 'Obsidian viewer — note list + markdown of the configured vault (read-only)',
+    command: () => ['elanous', 'side', 'obsidian'] },
+  // ELS-FILES (대표 11-26 18:5x): the read-only file browser as a tab (and so a tile) — rooted at the new pane's cwd.
+  { name: 'files', aliases: ['file-browser', 'browser', '파일', '파일-브라우저'], description: 'File browser — folder list + preview (read-only)',
+    command: () => ['elanous', 'side', 'files'] },
 ];
 
 export const widgetTitle = (name: string): string => `▦ ${name}`;

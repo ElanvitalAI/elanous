@@ -1,7 +1,8 @@
 import { expect, spyOn, test } from 'bun:test';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { acquireLockSync } from '../../storage/file-lock.js';
 import { finishAdvice, finishHistoryPath, finishTrend, measureFinish, recordFinishHistory, type FinishMetrics, type MeasureFinishDeps } from './finish-rate.js';
@@ -405,4 +406,111 @@ test('ORCH-LIVE-1008: a real start beats the incomplete marker in either read or
       expect(log.mock.calls.find(([, e]) => e === 'finish-launch-population')?.[2]).not.toHaveProperty('incomplete');
     } finally { log.mockRestore(); rmSync(root, { recursive: true, force: true }); }
   }
+});
+
+const installGhCwd = realpathSync(resolve(import.meta.dir, '../../..'));
+
+function ghLines(path: string): string[] {
+  return existsSync(path) ? readFileSync(path, 'utf8').split('\n').map(line => line.trim()).filter(Boolean) : [];
+}
+
+/** Isolated PATH so the default runner's `gh` is this script, not an injected runGh and not the real CLI. */
+function withFakeGh(pathMode: 'fake-only' | 'fake-then-system', run: (paths: { root: string; repo: string; log: string; args: string }) => void): void {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'finish-gh-cwd-')));
+  const bin = join(root, 'bin');
+  const repo = join(root, 'dev-repo');
+  const log = join(root, 'gh.log');
+  const args = join(root, 'gh.args');
+  mkdirSync(bin);
+  mkdirSync(repo);
+  const q = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+  writeFileSync(join(bin, 'gh'), `#!/bin/sh\nprintf '%s\\n' "$PWD" >> ${q(log)}\nprintf '%s\\n' "$*" >> ${q(args)}\nprintf '[]\\n'\n`);
+  chmodSync(join(bin, 'gh'), 0o755);
+  const prevPath = process.env.PATH;
+  process.env.PATH = pathMode === 'fake-only' || !prevPath ? bin : `${bin}:${prevPath}`;
+  try {
+    run({ root, repo, log, args });
+  } finally {
+    if (prevPath === undefined) delete process.env.PATH; else process.env.PATH = prevPath;
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test('FINISH-RATE-GH-CWD: THROUGHPUT-GIT-CWD#40332와 같은 resolveDevRepoRoot', () => {
+  withFakeGh('fake-only', ({ repo, log, args }) => {
+    expect(repo).not.toBe(installGhCwd);
+    const metrics = measureFinish({
+      listStarts: () => ({ starts: [start(1)], unreadable: [] }),
+      resolveRepo: () => repo,
+    }, now);
+    const calls = ghLines(log).map(cwd => realpathSync(cwd));
+    expect(calls.length).toBeGreaterThan(0);
+    expect(new Set(calls)).toEqual(new Set([repo]));
+    expect(calls.includes(installGhCwd)).toBe(false);
+    expect(readFileSync(args, 'utf8')).toContain('pr list');
+    expect(metrics.landed).toBe(0);
+    expect(metrics.reasons.landed).toBeUndefined();
+  });
+
+  withFakeGh('fake-only', ({ log }) => {
+    const metrics = measureFinish({
+      listStarts: () => ({ starts: [start(1)], unreadable: [] }),
+      resolveRepo: () => null,
+    }, now);
+    expect(ghLines(log)).toEqual([]);
+    expect(metrics).toMatchObject({
+      launched: 1,
+      landed: null,
+      landingRate: null,
+      staleDrafts: null,
+      conflictRatio: null,
+      unknownMergeable: null,
+    });
+    expect(metrics.landed).not.toBe(0);
+    expect(metrics.staleDrafts).not.toBe(0);
+    expect(metrics.conflictRatio).not.toBe(0);
+    expect(metrics.reasons.landed).toBe('repo unavailable');
+    expect(metrics.reasons.staleDrafts).toBe('repo unavailable');
+    expect(metrics.reasons.conflictRatio).toBe('repo unavailable');
+    expect(metrics.reasons.unknownMergeable).toBe('repo unavailable');
+    expect(metrics.reasons.landingRate).toBe('repo unavailable');
+  });
+
+  withFakeGh('fake-then-system', ({ root, log, args }) => {
+    const realRepo = join(root, 'seat-repo');
+    mkdirSync(realRepo);
+    const git = (...command: string[]) => {
+      const result = spawnSync('git', ['-C', realRepo, ...command], { encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(`${command.join(' ')}: ${result.stderr || result.stdout}`);
+    };
+    git('init', '-q', '-b', 'main');
+    git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'x (#1)');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    const prevRepo = process.env.ELANOUS_REPO;
+    process.env.ELANOUS_REPO = realRepo;
+    try {
+      writeFileSync(log, '');
+      writeFileSync(args, '');
+      const metrics = measureFinish({ listStarts: () => ({ starts: [start(1)], unreadable: [] }) }, now);
+      const calls = ghLines(log).map(cwd => realpathSync(cwd));
+      expect(calls.length).toBeGreaterThan(0);
+      expect(new Set(calls)).toEqual(new Set([realpathSync(realRepo)]));
+      expect(realpathSync(realRepo)).not.toBe(installGhCwd);
+      expect(metrics.reasons.landed).not.toBe('repo unavailable');
+    } finally {
+      if (prevRepo === undefined) delete process.env.ELANOUS_REPO; else process.env.ELANOUS_REPO = prevRepo;
+    }
+  });
+});
+
+test('injected runGh still measures when resolveRepo is null', () => {
+  let calls = 0;
+  const metrics = measureFinish({
+    listStarts: () => ({ starts: [start(1)], unreadable: [] }),
+    resolveRepo: () => null,
+    runGh: () => { calls += 1; return '[]'; },
+  }, now);
+  expect(calls).toBeGreaterThan(0);
+  expect(metrics.landed).toBe(0);
+  expect(metrics.reasons.landed).toBeUndefined();
 });

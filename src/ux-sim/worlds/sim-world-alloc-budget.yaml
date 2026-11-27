@@ -1,0 +1,12 @@
+# SIM-WORLD alloc-budget pack — ALLOCATION-BUDGET (CEO 11-27 11:0x · 11:1x · 11:2x): allocator · metering · budget advisor on
+# a lease ledger inside each scenario universe. Device ALLOC-LEDGER (seeded · LLM 0).
+schema: 1
+world: alloc-budget
+scenarios:
+  - { id: ALLOC-FLOOD, module: src/ux-sim/sim-world/alloc-budget/scenarios.ts }
+  - { id: ALLOC-NEAR-CAP, module: src/ux-sim/sim-world/alloc-budget/scenarios.ts }
+  - { id: ALLOC-CUT-RESERVE, module: src/ux-sim/sim-world/alloc-budget/scenarios.ts }
+  - { id: ALLOC-TTL-RECLAIM, module: src/ux-sim/sim-world/alloc-budget/scenarios.ts }
+  - { id: ALLOC-UNATTRIBUTED, module: src/ux-sim/sim-world/alloc-budget/scenarios.ts }
+  - { id: ALLOC-MODE-SHIFT, module: src/ux-sim/sim-world/alloc-budget/scenarios.ts }
+  - { id: ALLOC-METERING, module: src/ux-sim/sim-world/alloc-budget/scenarios.ts }

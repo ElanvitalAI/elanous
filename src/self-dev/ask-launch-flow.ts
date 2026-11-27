@@ -10,6 +10,8 @@
 //   (바꾸면 이 추출이 회귀인지 개선인지 사후에 못 가른다.)
 // ⛔ 종료(`process.exit`)는 여기가 «안» 한다 — 호출자가 자기 표면에 맞게 끝낸다.
 //   그래서 결과를 «세 값»으로 낸다: 발사 / 저작 전 중단 / 전제 검사 중단.
+import { applyCoreSplit, relaxSecurityOverSpec, renderRubricLines, scoreGoalRubric, type RubricResult } from './goal-rubric.js';
+import { precheckGoalDocument, recordGoalPrecheck } from './goal-precheck.js';
 import { linesOutsideFencedCode, readGoalAuthorGroundingTimebox, type GoalAuthorGroundingTimebox } from '../self-implement/goal-author.js';
 import { declaredNewFilePaths } from '../self-implement/goal-new-paths.js';
 import { existsSync } from 'node:fs';
@@ -38,7 +40,7 @@ import {
   type PriorBlockSample,
   type RecentAuthoringSample,
 } from './launch-preflight.js';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { dirname, isAbsolute as isAbsolutePath, relative as relativePath, resolve as resolvePath, sep } from 'node:path';
 import {
   planClarificationIntake,
@@ -413,6 +415,56 @@ function recordLaunchDecomposition(document: string, record: LaunchDecomposition
   return `${head}${block}${tail}`;
 }
 
+/** PRECHECK-CORE-SIZE — score the goal with the one rubric. A rubric that cannot be read is unmeasured (logged), never a stop. */
+function judgeGoalRubric(document: string, targetPaths: readonly string[], record: LaunchDecompositionRecord, deps: AskLaunchFlowDeps): RubricResult | undefined {
+  try {
+    const pieces = record.state === 'measured' ? [...record.pieces] : undefined;
+    const result = scoreGoalRubric({ document, targetPaths, ...(pieces ? { pieces } : {}), churn: (path) => gitChurn7d(path), dependencyOpen: prDependencyOpen });
+    deps.print(`[ask] ⑷b 골 루브릭 — ${result.verdict} · ${result.reason} · 권장 ${result.tier}`);
+    deps.log('goal-rubric', { verdict: result.verdict, reason: result.reason, tier: result.tier,
+      axes: result.axes.map((a) => ({ id: a.id, score: a.score })), core: result.core ?? null, fu: [...result.fu], relaxedSecurity: result.relaxedSecurity.length }, result.verdict === 'launch' ? 'info' : 'warn');
+    return result;
+  } catch (error) {
+    deps.log('goal-rubric', { outcome: 'unmeasured', error: String((error as { message?: unknown })?.message ?? error) }, 'warn');
+    return undefined;
+  }
+}
+
+/** «선행: #N» — is that PR still unlanded? (MERGED = landed · OPEN/CLOSED = not landed) · other refs / read failure = unmeasured. */
+function prDependencyOpen(ref: string): boolean | undefined {
+  const m = /^#(\d+)$/u.exec(ref.trim());
+  if (!m) return undefined;
+  try {
+    const r = spawnSync('gh', ['pr', 'view', m[1]!, '--json', 'state', '-q', '.state'], { encoding: 'utf8', timeout: 15_000 });
+    if (r.status !== 0) return undefined;
+    const state = r.stdout.trim();
+    // only MERGED is landed — a CLOSED (unmerged) dependency will never land, so the goal waits for a hand (review must-fix)
+    return state === 'MERGED' ? false : state === 'OPEN' || state === 'CLOSED' ? true : undefined;
+  } catch { return undefined; }
+}
+
+/** Commits touching a path in the last 7 days (the rubric's hot-file evidence); unreadable = unmeasured. */
+function gitChurn7d(path: string): number | undefined {
+  try {
+    const r = spawnSync('git', ['log', '--since=7.days', '--format=%h', '--', path], { encoding: 'utf8', timeout: 10_000 });
+    return r.status === 0 ? r.stdout.split('\n').filter(Boolean).length : undefined;
+  } catch { return undefined; }
+}
+
+/** Append the rubric lines under the goal's precheck record (or as its own record when the precheck passed unrecorded). */
+function appendRubricRecord(document: string, rubric: RubricResult): string {
+  const lines = renderRubricLines(rubric).join('\n');
+  const marker = '## 사전 검토(GOAL-PRECHECK)';
+  const at = document.indexOf(marker);
+  if (at >= 0) {
+    const end = document.indexOf('\n\n', at);
+    return end < 0 ? `${document}\n${lines}\n` : `${document.slice(0, end)}\n${lines}${document.slice(end)}`;
+  }
+  const heading = document.search(/^#{1,6} /mu);
+  const block = `${marker}\n- 판정: pass\n${lines}\n\n`;
+  return heading < 0 ? `${block}${document}` : `${document.slice(0, heading)}${block}${document.slice(heading)}`;
+}
+
 function logDecompositionObservation(
   deps: AskLaunchFlowDeps,
   legacyEvent: 'ask-launch-decomposition' | 'ask-launch-decomposition-skipped',
@@ -563,6 +615,80 @@ export async function recommendLaunchDecomposition(
   } finally {
     if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
   }
+}
+
+type GoalPrecheckGate =
+  | { readonly kind: 'continue'; readonly document: string }
+  | { readonly kind: 'stop'; readonly result: Extract<AskLaunchFlowResult, { kind: 'stopped-by-preflight' }> }
+  | { readonly kind: 'read-failed' }
+  | { readonly kind: 'fixed-write-failed' };
+
+/**
+ * GOAL-PRECHECK — 기본 경로와 opt-out 이 «같은» 판정을 쓴다.
+ * needs-rewrite = 기록만 남기고 정지 · fixed = 고친 문서 ⊕ 기록 · pass = 문서 그대로.
+ * 읽기 실패는 종전처럼 발사를 유지한다. 기본 경로는 분해 읽기 실패 문면을, opt-out 은 사전 검토 경고를 남긴다.
+ * opt-out 의 fixed 기록 실패는 관측하고 정상 발사를 막는다 — 파일에 안 남은 수리를 성공처럼 보내지 않는다.
+ */
+async function applyGoalPrecheck(
+  goalFile: string,
+  targetPaths: readonly string[],
+  blockers: LaunchPreflightResult['blockers'],
+  deps: AskLaunchFlowDeps,
+  readFailure: 'decomposition' | 'precheck',
+  persistFixed: boolean,
+): Promise<GoalPrecheckGate> {
+  let document: string;
+  try {
+    document = deps.readFile(goalFile);
+  } catch (error) {
+    const message = String((error as { message?: unknown })?.message ?? error);
+    if (readFailure === 'decomposition') {
+      deps.print(`[ask] ⑷ 발사 전 분해 권고 — ⚠️ 못 쟀다 (골 문서 읽기 실패: ${message})`);
+      logDecompositionObservation(deps, 'ask-launch-decomposition', {
+        goalFile, outcome: 'document-read-failed', unmeasurable: true, error: message,
+      }, 'warn');
+    } else {
+      deps.print(`[ask] ⑶b 골 사전 검토 — ⚠️ 못 읽었다 (골 문서 읽기 실패: ${message})`);
+      deps.log('goal-precheck', { goalFile, verdict: 'read-failed', error: message }, 'warn');
+    }
+    return { kind: 'read-failed' };
+  }
+  const precheck = precheckGoalDocument(document, { targetPaths });
+  deps.print(`[ask] ⑶b 골 사전 검토 — ${precheck.verdict}${precheck.fixes.length ? ` · 자동 수리 ${precheck.fixes.length}` : ''}${precheck.reasons.length ? ` · ${precheck.reasons.join(' · ')}` : ''}`);
+  deps.log('goal-precheck', {
+    goalFile,
+    verdict: precheck.verdict,
+    reasons: [...precheck.reasons],
+    fixes: [...precheck.fixes],
+    path: readFailure === 'precheck' ? 'opt-out' : 'default',
+  }, precheck.verdict === 'needs-rewrite' ? 'warn' : 'info');
+  if (precheck.verdict === 'needs-rewrite') {
+    try { deps.writeFile(goalFile, recordGoalPrecheck(document, precheck)); } catch { /* the record is observation; the stop stands */ }
+    return {
+      kind: 'stop',
+      result: {
+        kind: 'stopped-by-preflight',
+        goalFile,
+        blockers: [...blockers, { kind: 'ask-marker', name: 'GOAL-PRECHECK', checkName: 'goal-precheck', detail: `골 사전 검토 needs-rewrite — ${precheck.reasons.join(' · ')}` }],
+      },
+    };
+  }
+  if (precheck.verdict === 'fixed') {
+    document = recordGoalPrecheck(precheck.document, precheck);
+    if (persistFixed) {
+      try {
+        deps.writeFile(goalFile, document);
+      } catch (error) {
+        const message = String((error as { message?: unknown })?.message ?? error);
+        deps.print(`[ask] ⑶b 골 사전 검토 — ⚠️ 수정 문서 기록 못 남김 (골 문서 쓰기 실패: ${message})`);
+        deps.log('goal-precheck', {
+          goalFile, verdict: 'fixed-write-failed', error: message, path: 'opt-out',
+        }, 'warn');
+        return { kind: 'fixed-write-failed' };
+      }
+    }
+  }
+  return { kind: 'continue', document };
 }
 
 /** 모든 차단 관측이 같은 상세 계약을 쓴다 — 없는 상세는 지어내지 않는다. */
@@ -1327,36 +1453,109 @@ export async function runAskLaunchFlow(
   const launchDecision = decision.shouldLaunch
     ? true
     : await resolveBlockedInteractively(preflight, effectiveGoalFile, deps);
-  // ⛔ 권고는 실제 launch 분기의 입력이 아니다. opt-out은 문서를 읽기 전에 끝내고,
-  // 문서 읽기·분해 실패도 기존 결정을 바꾸지 않는다.
+  // ⛔ 권고는 실제 launch 분기의 입력이 아니다.
+  // opt-out 도 사전 검토는 한 번 읽고, 분해 권고만 하지 않는다.
+  // 문서 읽기·사전 검토·분해 실패도 기존 결정을 바꾸지 않는다 — 경고 후 같은 골 파일로 발사한다.
   if (launchDecision) {
-    if (input.decomposeBeforeLaunch === false) {
-      await recommendLaunchDecomposition(effectiveGoalFile, input, deps);
-    } else {
-      let document: string;
-      let record: LaunchDecompositionRecord;
-      try {
-        document = deps.readFile(effectiveGoalFile);
-        record = await recommendLaunchDecomposition(effectiveGoalFile, input, deps, document)
+    try {
+      const precheck = await applyGoalPrecheck(
+        effectiveGoalFile,
+        preflight.paths,
+        preflight.blockers,
+        deps,
+        input.decomposeBeforeLaunch === false ? 'precheck' : 'decomposition',
+        input.decomposeBeforeLaunch === false,
+      );
+      if (precheck.kind === 'stop') return precheck.result;
+      if (precheck.kind === 'fixed-write-failed') {
+        return {
+          kind: 'stopped-by-preflight',
+          goalFile: effectiveGoalFile,
+          blockers: [...preflight.blockers, {
+            kind: 'ask-marker',
+            name: 'GOAL-PRECHECK',
+            checkName: 'goal-precheck',
+            detail: '골 사전 검토 fixed — 수정 문서 기록 실패',
+          }],
+        };
+      }
+      if (precheck.kind === 'read-failed') {
+        if (input.decomposeBeforeLaunch === false) {
+          await recommendLaunchDecomposition(effectiveGoalFile, input, deps);
+        } else {
+          return { kind: 'launch', goalFile: effectiveGoalFile };
+        }
+      } else if (input.decomposeBeforeLaunch === false) {
+        await recommendLaunchDecomposition(effectiveGoalFile, input, deps);
+        // opt-out skips the decomposer, not the rubric (review must-fix) — behaviors fall back to done-when lines.
+        const rubric = judgeGoalRubric(precheck.document, preflight.paths, { state: 'unmeasurable', outcome: 'failed', reason: '분해 opt-out' }, deps);
+        // A plain launch (nothing relaxed) leaves the opt-out document unchanged — its verdict is in the observation log;
+        // anything the child must read differently (a relaxed demand, a CORE split, a stop) is written.
+        if (rubric && (rubric.verdict !== 'launch' || rubric.relaxedSecurity.length > 0)) {
+          const document = appendRubricRecord(applyCoreSplit(relaxSecurityOverSpec(precheck.document, rubric), rubric), rubric);
+          let written = true;
+          try { deps.writeFile(effectiveGoalFile, document); } catch (error) {
+            written = false;
+            deps.log('goal-rubric', { outcome: 'record-unwritten', verdict: rubric.verdict, error: String((error as { message?: unknown })?.message ?? error) }, 'warn');
+          }
+          const noCore = rubric.verdict === 'split' && !rubric.core;
+          // launch goes on as before (an unwritten record is observation only) · split goes on only with its CORE written
+          if (rubric.verdict !== 'launch' && (rubric.verdict !== 'split' || noCore || !written)) {
+            return {
+              kind: 'stopped-by-preflight',
+              goalFile: effectiveGoalFile,
+              blockers: [...preflight.blockers, { kind: 'ask-marker', name: 'GOAL-RUBRIC', checkName: 'goal-rubric', detail: `골 루브릭 ${rubric.verdict} — ${rubric.reason}${noCore ? ' · CORE 를 만들 수 없다 — 골을 CORE 하나로 다시 써라' : !written && rubric.verdict === 'split' ? ' · CORE 분할을 골 문서에 못 썼다' : ''}` }],
+            };
+          }
+        }
+      } else {
+        let document = precheck.document;
+        const record = await recommendLaunchDecomposition(effectiveGoalFile, input, deps, document)
           ?? { state: 'unmeasurable', outcome: 'failed', reason: '분해 권고 결과가 없다' };
-      } catch (error) {
-        const message = String((error as { message?: unknown })?.message ?? error);
-        deps.print(`[ask] ⑷ 발사 전 분해 권고 — ⚠️ 못 쟀다 (골 문서 읽기 실패: ${message})`);
-        logDecompositionObservation(deps, 'ask-launch-decomposition', {
-          goalFile: effectiveGoalFile, outcome: 'document-read-failed', unmeasurable: true, error: message,
-        }, 'warn');
-        return { kind: 'launch', goalFile: effectiveGoalFile };
+        // PRECHECK-CORE-SIZE — the goal rubric (graphs/policies/goal-precheck-rubric.yaml) turns the decomposer's pieces and
+        //   the goal/repo evidence into a verdict: launch · split (CORE only + FU list) · probe-first · hand.
+        const rubric = judgeGoalRubric(document, preflight.paths, record, deps);
+        if (rubric) {
+          document = applyCoreSplit(relaxSecurityOverSpec(document, rubric), rubric);
+          document = appendRubricRecord(document, rubric);
+          // A split with no buildable CORE must not launch the whole goal (review must-fix) — rewrite it as one CORE.
+          const noCore = rubric.verdict === 'split' && !rubric.core;
+          if (rubric.verdict === 'probe-first' || rubric.verdict === 'hand' || noCore) {
+            try { deps.writeFile(effectiveGoalFile, recordLaunchDecomposition(document, record)); } catch { /* the record is observation; the stop stands */ }
+            return {
+              kind: 'stopped-by-preflight',
+              goalFile: effectiveGoalFile,
+              blockers: [...preflight.blockers, { kind: 'ask-marker', name: 'GOAL-RUBRIC', checkName: 'goal-rubric', detail: noCore
+                ? `골 루브릭 split — ${rubric.reason} · CORE 를 만들 수 없다(조각·완료선 행동 1) — 골을 CORE 하나로 다시 써라`
+                : `골 루브릭 ${rubric.verdict} — ${rubric.reason}` }],
+            };
+          }
+        }
+        // ② ⛔ 기록은 «관측»이지 발사 조건이 아니다 — 쓰기 실패가 발사 흐름을 throw 로 끊으면 안 된다(리뷰 must-fix).
+        try {
+          deps.writeFile(effectiveGoalFile, recordLaunchDecomposition(document, record));
+        } catch (error) {
+          const message = String((error as { message?: unknown })?.message ?? error);
+          deps.print(`[ask] ⑷ 발사 전 분해 권고 — ⚠️ 기록 못 남김 (골 문서 쓰기 실패: ${message})`);
+          logDecompositionObservation(deps, 'ask-launch-decomposition', {
+            goalFile: effectiveGoalFile, outcome: 'document-write-failed', unmeasurable: true, error: message,
+          }, 'warn');
+          // The CORE limit lives in the goal file — if it could not be written the child would build the whole goal.
+          if (rubric?.verdict === 'split') {
+            return {
+              kind: 'stopped-by-preflight',
+              goalFile: effectiveGoalFile,
+              blockers: [...preflight.blockers, { kind: 'ask-marker', name: 'GOAL-RUBRIC', checkName: 'goal-rubric', detail: `골 루브릭 split — CORE 분할을 골 문서에 못 썼다(${message}) · 전체 골을 발사하지 않는다` }],
+            };
+          }
+        }
       }
-      // ② ⛔ 기록은 «관측»이지 발사 조건이 아니다 — 쓰기 실패가 발사 흐름을 throw 로 끊으면 안 된다(리뷰 must-fix).
-      try {
-        deps.writeFile(effectiveGoalFile, recordLaunchDecomposition(document, record));
-      } catch (error) {
-        const message = String((error as { message?: unknown })?.message ?? error);
-        deps.print(`[ask] ⑷ 발사 전 분해 권고 — ⚠️ 기록 못 남김 (골 문서 쓰기 실패: ${message})`);
-        logDecompositionObservation(deps, 'ask-launch-decomposition', {
-          goalFile: effectiveGoalFile, outcome: 'document-write-failed', unmeasurable: true, error: message,
-        }, 'warn');
-      }
+    } catch (error) {
+      const message = String((error as { message?: unknown })?.message ?? error);
+      deps.print(`[ask] ⑷ 발사 전 분해 권고 — ⚠️ 못 쟀다 (${message})`);
+      logDecompositionObservation(deps, 'ask-launch-decomposition', {
+        goalFile: effectiveGoalFile, outcome: 'failed', unmeasurable: true, error: message,
+      }, 'warn');
     }
   }
   return launchDecision

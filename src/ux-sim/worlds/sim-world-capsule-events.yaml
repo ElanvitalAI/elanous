@@ -31,3 +31,5 @@ scenarios:
     module: src/ux-sim/sim-world/capsule-events/c1-harness.ts
   - id: C9-SESSION-SCOPED
     module: src/ux-sim/sim-world/capsule-events/c9-session-scoped.ts
+  - id: A1
+    module: src/ux-sim/sim-world/capsule-events/a1-sample.ts

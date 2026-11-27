@@ -1,3 +1,4 @@
+import { tierModel } from '../../src/llm/model-defaults.js';
 // Stage feed — literal expectations (rule 11): real board events in, els stage snapshots out.
 import { expect, test } from 'bun:test';
 import { stageFeed } from './conductor.js';
@@ -8,7 +9,7 @@ test('stage feed walks prompt → spawn → votes → spotlight → verdict → 
   feed({ t: 0, kind: 'run', phase: 'start' });
   feed({ t: 10, kind: 'tab', id: 'news', title: 'INV·News · omni-crawl' });
   feed({ t: 20, kind: 'node', id: 'mentor-3', phase: 'start' });
-  feed({ t: 30, kind: 'note', id: 'mentor-3', model: 'openai-codex/gpt-6.1-terra', verdict: 'HOLD 4/10' });
+  feed({ t: 30, kind: 'note', id: 'mentor-3', model: tierModel('balanced', 'openai-codex'), verdict: 'HOLD 4/10' });
   feed({ t: 35, kind: 'call', id: 'news', tool: 'omni-crawl', n: 4, ok: true, items: 12, startT: 0, endT: 35, live: true });
   feed({ t: 38, kind: 'market', market: { kospi: { last: 5006.03 } } });
   feed({ t: 40, kind: 'evidence', source: 'news', title: 'a', url: 'https://a.example/x' });

@@ -16,7 +16,7 @@ import { checklistDevVersion, devVersion } from '../release-loop/checklist.js';
 import { readSchedule, readSchedules, releasedVersion, type ScheduleRow } from '../release-loop/feature-store.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 
-export type CurrentVersionSource = 'plan' | 'schedule' | 'package';
+export type CurrentVersionSource = 'graph' | 'plan' | 'schedule' | 'package';
 
 export interface CurrentVersion {
   version: string;
@@ -97,6 +97,16 @@ function currentPlanMark(hqRoot: string): PlanMark | null {
   return best;
 }
 
+/** The plan headline/roster of PLAN-<version>.md whatever its status (null = no such plan). */
+function readPlanMarkAny(hqRoot: string, version: string): Pick<PlanMark, 'theme' | 'rosterCount'> | null {
+  try {
+    const text = readFileSync(join(plansDirFor(hqRoot), `PLAN-${version}.md`), 'utf8');
+    const theme = text.split(/\r?\n/u).map((line) => line.trim()).find((line) => /^#\s+PLAN-\S+\s+[—-]\s+/u.test(line))?.replace(/^#\s+PLAN-\S+\s+[—-]\s+/u, '').trim() || null;
+    const roster = /^##\s*로스터\s*\((\d+)\s*칸/mu.exec(text);
+    return { theme, rosterCount: roster ? Number(roster[1]) : null };
+  } catch { return null; }
+}
+
 /** The newest schedule row strictly newer than the newest published release. */
 function currentScheduleRow(ledgerRoot: string): ScheduleRow | null {
   const published = releasedVersion(ledgerRoot);
@@ -107,10 +117,53 @@ function currentScheduleRow(ledgerRoot: string): ScheduleRow | null {
   return newer ?? null;
 }
 
-/** Resolve the current release: plan `status: current` first, then a not-yet-published schedule, then the package. */
-export function resolveCurrentVersion(input: { hqRoot: string; ledgerRoot?: string; packageVersion?: string }): CurrentVersion {
+// ONE-TARGET (11-27 · SEAT-ASSIGN-GUARD): the resource steward assigned 35 cells of 0.3.37 — PLAN-0.3.37.md still said
+// `status: current` (a hand-edited front-matter mark) while the release graph ran 0.3.38 (`release.graph.version`). Two
+// sources for «the release in play» → every reader now takes `release.graph.version` first; the plan mark, the schedule
+// and the package stay as fallbacks when the graph target is unset.
+// GRAPH-VERSION-FRESH (11-27 · after rail 77 still 10 0.3.37 assigns): `getUserConfig()` builds the typed UserConfig,
+// which has no `release` section — `release.graph.version` always read null, so the off-target guard and this resolver
+// never saw 0.3.38 (and inside a TUI turn the scoped snapshot is frozen at the turn's start anyway). The release graph
+// itself reads the raw config.json; every reader of the target now does the same, from disk, on every call.
+/** `release.graph.version` straight from config.json (the release graph's own read) — null when unset or unreadable. */
+export function readReleaseGraphVersion(readRaw: () => unknown = readRawConfig): string | null {
+  try {
+    const v = (readRaw() as { release?: { graph?: { version?: unknown } } } | null)?.release?.graph?.version;
+    return typeof v === 'string' && PARSED_VERSION.test(v.trim()) ? v.trim() : null;
+  } catch { return null; }
+}
+
+/**
+ * WORK-PULL-RELEASE-VERSION (11-27 12:20): the board «current» readers (work next · hand pool · seat pull · steward board)
+ * stripped main's package version — main stayed 0.3.37-dev.0 after the 0.3.37 release, so every hand read the published
+ * 0.3.37 board («일감 0») while the release in play was 0.3.38. One source: `release.graph.version`, then the package.
+ */
+export function activeBoardVersion(readGraph: () => string | null = readReleaseGraphVersion, fallback: () => string = () => checklistDevVersion()): string {
+  let graph: string | null = null;
+  try { graph = readGraph(); } catch { graph = null; }
+  return graph ?? fallback();
+}
+
+/** The raw config.json (instance override first) — null when absent. Throws on unreadable JSON. */
+export function readRawConfig(): unknown {
+  const { getElanousConfigDirOverride } = require('../elanous-config-dir.js') as typeof import('../elanous-config-dir.js');
+  const { effectiveInstanceRoot } = require('../instance/resolve.js') as typeof import('../instance/resolve.js');
+  const { userConfigPath } = require('../user-config.js') as typeof import('../user-config.js');
+  const path = getElanousConfigDirOverride() ? join(effectiveInstanceRoot(), 'config.json') : userConfigPath();
+  return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : null;
+}
+
+/** Resolve the current release: `release.graph.version` first, then plan `status: current`, then a not-yet-published
+ *  schedule, then the package. `graphVersion` overrides the config read (tests · callers that already hold it). */
+export function resolveCurrentVersion(input: { hqRoot: string; ledgerRoot?: string; packageVersion?: string; graphVersion?: string | null }): CurrentVersion {
   const ledgerRoot = input.ledgerRoot ?? releaseLedgerRoot();
   const plan = currentPlanMark(input.hqRoot);
+  const graph = input.graphVersion !== undefined ? input.graphVersion : readReleaseGraphVersion();
+  if (graph) {
+    const same = plan?.version === graph ? plan : readPlanMarkAny(input.hqRoot, graph);
+    return { version: graph, source: 'graph', theme: same?.theme ?? null, rosterCount: same?.rosterCount ?? null,
+      schedule: scheduleOf(graph, ledgerRoot), published: isPublishedVersion(graph, ledgerRoot) };
+  }
   if (plan) {
     return { version: plan.version, source: 'plan', theme: plan.theme, rosterCount: plan.rosterCount,
       schedule: scheduleOf(plan.version, ledgerRoot), published: isPublishedVersion(plan.version, ledgerRoot) };

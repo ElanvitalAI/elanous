@@ -14,6 +14,8 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { coachNoteText, foldedDigestText } from '../kit/mail-route/digest.js';
+import { MAIL_ROUTE_POLICY_DEFAULTS, readMailRoutePolicy, windowDue } from '../kit/mail-route/policy.js';
 
 export type DivertedLedger = 'self-wake' | 'coach-note' | 'folded' | 'retro-turn';
 
@@ -29,8 +31,8 @@ export interface DivertedEntry {
   dueAt?: string;
 }
 
-/** Coach notes reach a turn at most once per this window. */
-export const COACH_NOTE_WINDOW_MS = 30 * 60_000;
+/** Coach notes reach a turn at most once per this window — the default of the shared mail-route policy. */
+export const COACH_NOTE_WINDOW_MS = MAIL_ROUTE_POLICY_DEFAULTS.windowMs;
 /** Turn stamps kept for G (one hour ⊕ margin). */
 const TURN_STAMP_KEEP_MS = 2 * 60 * 60_000;
 
@@ -91,23 +93,19 @@ export function takeDiverted(ledger: DivertedLedger, seat: string, ready: (e: Di
   return taken;
 }
 
-/** One coach-note line for a turn — null while the 30-min window since the last line has not passed or nothing waits. */
-export function coachNoteLine(entries: readonly DivertedEntry[], nowMs: number, lastLineAtMs: number | null): string | null {
+/**
+ * One coach-note line for a turn — null while the window since the last line has not passed or nothing waits.
+ * KIT mail-route: the window is the shared policy (default 30 min) and the text is the kit's builder.
+ */
+export function coachNoteLine(entries: readonly DivertedEntry[], nowMs: number, lastLineAtMs: number | null, windowMs: number = readMailRoutePolicy().windowMs): string | null {
   if (entries.length === 0) return null;
-  if (lastLineAtMs !== null && nowMs - lastLineAtMs < COACH_NOTE_WINDOW_MS) return null;
-  const latest = entries[entries.length - 1]!;
-  const head = latest.body.replace(/\s+/g, ' ').trim().slice(0, 200);
-  return `[coach note · ${entries.length} since ${entries[0]!.at.slice(11, 16)}Z · no reply needed] ${head}${entries.length > 1 ? ` (+${entries.length - 1} earlier in the coach-note ledger)` : ''}`;
+  if (!windowDue(lastLineAtMs, nowMs, windowMs)) return null;
+  return coachNoteText(entries);
 }
 
-/** One digest line for posts folded while the receiver was saturated. */
+/** One digest line for posts folded while the receiver was saturated (the kit's builder). */
 export function foldedDigestLine(entries: readonly DivertedEntry[]): string | null {
-  if (entries.length === 0) return null;
-  const bySender = new Map<string, number>();
-  for (const e of entries) bySender.set(e.from, (bySender.get(e.from) ?? 0) + 1);
-  const senders = [...bySender].sort((a, b) => b[1] - a[1]).map(([s, n]) => `${s}×${n}`).join(' · ');
-  const heads = entries.slice(-3).map((e) => `${e.from}: ${e.body.replace(/\s+/g, ' ').trim().slice(0, 80)}`).join(' | ');
-  return `[folded digest · ${entries.length} posts while saturated · ${senders}] ${heads}`;
+  return foldedDigestText(entries);
 }
 
 /**
@@ -155,4 +153,14 @@ export function divertedLineCount(ledger: DivertedLedger, seat: string, root: st
 export function divertedSince(ledger: DivertedLedger, seat: string, from: number, root: string = divertedRoot()): { entries: DivertedEntry[]; total: number } {
   const lines = readLines(divertedFile(ledger, seat, root));
   return { entries: lines.slice(Math.max(0, Math.min(from, lines.length))).map(parse).filter((e): e is DivertedEntry => e !== null), total: lines.length };
+}
+
+/** THROTTLE-AUDIT — senders of posts folded/diverted to this seat since `sinceMs` (the tail of the ledger only). */
+export function divertedSendersSince(ledger: DivertedLedger, seat: string, sinceMs: number, root: string = divertedRoot(), tail = 500): Set<string> {
+  const out = new Set<string>();
+  for (const line of readLines(divertedFile(ledger, seat, root)).slice(-tail)) {
+    const e = parse(line);
+    if (e && Date.parse(e.at) >= sinceMs && typeof e.from === 'string' && e.from.trim()) out.add(e.from.trim().toUpperCase());
+  }
+  return out;
 }

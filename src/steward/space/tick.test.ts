@@ -92,6 +92,24 @@ describe('steward space tick', () => {
     expect(existsSync(join(root, 'steward', 'space', 'TC', 'state.live.json'))).toBe(false);
   });
 
+  test('JUD live (JUD-HAND-DISCOVERY): the idle judge gets ONE mail with its whole batch — butler cell first, then the PR', () => {
+    const effects = spy();
+    const withButler = (): SnapshotSources => ({ ...sources(), judgeCells: () => ({ at: ago(5), notSigned: [
+      { cell: 'CELL-T1', why: 'security-4 → JUD/Terra — security-4: auth:src/org/org-map.ts — JUD/Terra signs this one' },
+      { cell: 'CELL-T2', why: 'missing — #299 same-head receipt (pregate --light on 9176db9ff643)' },
+    ] }) });
+    const d: TickDeps = { ...deps(effects, { scopes: { JUD: { mode: 'live' } } }), sources: withButler };
+    expect(runAll(d, { runId: 'run-jud' }).every((r) => r.outcome === 'ok')).toBe(true);
+    const toJudge = effects.mails.filter((m) => m.to === 'JUD-B');
+    expect(toJudge.length).toBe(1);
+    expect(toJudge[0]!.refs).toEqual(['cell:CELL-T1', 'pr:302', 'steward:JUD']);
+    const lines = toJudge[0]!.body.split('\n');
+    expect(lines[0]!.startsWith('[행정관 · JUD] 판정 묶음 2건 — ')).toBe(true);
+    expect(lines[1]!.startsWith('- 칸 CELL-T1 — 보안 4종 — Terra')).toBe(true);
+    expect(lines[2]!.startsWith('- PR #302@444444444444 — ')).toBe(true);
+    expect(Object.keys(readScopeState(root, 'JUD', 'live').judgeAssigned).sort()).toEqual(['302-444444444444', 'cell:CELL-T1']);
+  });
+
   test('live for TC only: TC effects run, JUD/OP (off) are untouched, one TC digest and no TC card', () => {
     const effects = spy();
     const results = runAll(deps(effects, { scopes: { TC: { mode: 'live' } }, pregateHosts: ['minim5', 'node-c'] }), { runId: 'run-live' });
@@ -172,6 +190,18 @@ describe('steward space tick', () => {
       ['TC', ['[행정관 · TC] 예외 카드 1건', '- reject CELL-T1 · TC-H-CX-1 — assign-failed:live-writer:#301 writes src/a.ts']],
     ]);
     expect(readScopeState(root, 'TC', 'live').lastTick?.escalations.map((r) => [r.action, r.target])).toEqual([['reject', 'CELL-T1']]);
+  });
+
+  test('ADMIN-RESOLVE-NOT-NAG: a cell that left the release (unknown-cell / off-target) is a defer row, never an exception card', () => {
+    for (const error of ['unknown-cell:seat assign: no cell CELL-T1 in 0.3.36', 'off-target:seat assign: CELL-T1 is a 0.3.39 cell']) {
+      rmSync(join(root, 'steward'), { recursive: true, force: true });
+      const effects = spy();
+      effects.assignCell = (a) => { effects.assigns.push(`${a.cellId}->${a.seat} refused`); return { ok: false, error }; };
+      runAll(deps(effects, { scopes: { TC: { mode: 'live' } }, pregateHosts: ['minim5', 'node-c'] }), { runId: `run-moved-${error.slice(0, 7)}` });
+      expect(effects.assigns).toEqual(['CELL-T1->TC-H-CX-1 refused']);
+      expect(effects.mails.filter((m) => m.kind === 'steward-exception')).toEqual([]);
+      expect(readScopeState(root, 'TC', 'live').lastTick?.escalations).toEqual([]);
+    }
   });
 
   test('scope input limits the run; an event seat resolves to its scope; unknown input is dropped', () => {

@@ -1,0 +1,363 @@
+// APP-BUILD-LOCAL-PATH — app_build without a member connection builds locally instead of answering «불가능».
+//
+// One plan, one truthful status: the result says up front that the member publish path is unavailable and the
+// app is built here instead (workspace dir in the working directory · local run · tailnet serve), which
+// capabilities resolved to what (capability-resolution.ts), and what still needs a person (numbered card,
+// with the app already running in mock mode for that capability). Nothing is published to the internet.
+//
+// Keys: the workspace holds env NAMES only (eln-app.json). `startLocalApp` reads values at start time and puts
+// them only in the child process env — never in files, tool output or chat.
+
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
+import { dirname, join, resolve } from 'node:path';
+import { appNameFromLine } from '../../plugins/core/app-build-autofill.js';
+import {
+  detectCapabilityNeeds, renderChoiceCard, resolveCapabilities,
+  type AppCapability, type CapabilityChoiceCard, type CapabilityProbe, type CapabilityResolution,
+} from './capability-resolution.js';
+
+export const LOCAL_APP_MANIFEST = 'eln-app.json';
+export const LOCAL_APP_RUN_RECORD = '.eln-run.json';
+const PORT_RANGE = [31500, 31599] as const;
+const HEALTH_PATH = '/health';
+
+export interface LocalAppManifest {
+  schema: 'eln-local-app@1';
+  ask: string;
+  start: string[];
+  healthPath: string;
+  capabilities: Array<Pick<CapabilityResolution, 'capability' | 'status' | 'source' | 'engine' | 'env' | 'key' | 'keyEnv' | 'summary'>>;
+}
+
+export interface LocalRunResult {
+  started: boolean;
+  port?: number;
+  pid?: number;
+  localUrl?: string;
+  tailnetUrl?: string;
+  /** Why the run or the tailnet share did not happen (no key values). */
+  reason?: string;
+  /** Capabilities whose key could not be read at start: they run in mock mode. */
+  mockCapabilities?: string[];
+  stop?: string;
+}
+
+export interface LocalAppBuildOutput {
+  kind: 'app-build';
+  tool: 'app_build';
+  status: 'local-build';
+  mode: 'local';
+  memberConnected: false;
+  buildComplete: boolean;
+  workspace: string;
+  files: string[];
+  capabilities: Array<{ capability: AppCapability; status: CapabilityResolution['status']; summary: string;
+    runMode: 'live' | 'mock' | 'not-running' }>;
+  choices: CapabilityChoiceCard[];
+  run: LocalRunResult;
+  /** The one status line to tell the user — it is the plan, not a refusal. */
+  message: string;
+}
+
+export interface LocalAppBuildDeps {
+  probe?: () => Promise<CapabilityProbe>;
+  start?: (workspace: string) => Promise<LocalRunResult>;
+}
+
+function slugFor(line: string, capabilities: readonly AppCapability[]): string {
+  const ascii = (appNameFromLine(line) ?? '').normalize('NFKD').toLowerCase()
+    .replace(/[^a-z0-9]+/gu, '-').replace(/^-+|-+$/gu, '').slice(0, 32);
+  if (ascii.length >= 3) return ascii;
+  const first = capabilities[0];
+  return first === 'translation' ? 'translator' : first ? `${first}-app` : 'eln-app';
+}
+
+/** Create the workspace atomically: non-recursive mkdir owns the name; EEXIST moves to the next suffix. */
+function createWorkspace(cwd: string, slug: string): string {
+  for (let index = 1; index < 100; index++) {
+    const candidate = resolve(cwd, index === 1 ? slug : `${slug}-${index}`);
+    try { mkdirSync(candidate); return candidate; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+  }
+  throw new Error('LOCAL_WORKSPACE_UNAVAILABLE');
+}
+
+const ADAPTER_TEMPLATE = join(import.meta.dir, 'templates', 'eln-llm.ts');
+
+function entrySource(capabilities: readonly AppCapability[]): string {
+  const routes: string[] = [];
+  if (capabilities.includes('translation')) {
+    routes.push(`  if (request.method === 'POST' && url.pathname === '/api/translate') {
+    const body = await request.json().catch(() => ({})) as { text?: unknown; target?: unknown; source?: unknown };
+    if (typeof body.text !== 'string' || !body.text.trim() || typeof body.target !== 'string' || !body.target.trim())
+      return Response.json({ error: 'text and target are required' }, { status: 400 });
+    return answer(() => elnTranslate(body.text as string, body.target as string, typeof body.source === 'string' ? body.source : 'auto'),
+      elnCapabilityMode('translation'));
+  }`);
+  }
+  if (capabilities.includes('summarization')) {
+    routes.push(`  if (request.method === 'POST' && url.pathname === '/api/summarize') {
+    const body = await request.json().catch(() => ({})) as { text?: unknown };
+    if (typeof body.text !== 'string' || !body.text.trim()) return Response.json({ error: 'text is required' }, { status: 400 });
+    return answer(() => elnSummarize(body.text as string), elnCapabilityMode('summarization'));
+  }`);
+  }
+  return `// Generated by eln app_build (local path). Capability calls go through ./eln-llm.ts; eln injects its env at start.
+import { file } from 'bun';
+import { join } from 'node:path';
+import { ElnLlmUnavailableError, elnCapabilityMode, elnLlmMode, elnSummarize, elnTranslate } from './eln-llm.ts';
+
+const frontend = join(import.meta.dir, '..', 'frontend', 'index.html');
+
+async function answer(run: () => Promise<string>, mode: string): Promise<Response> {
+  try { return Response.json({ result: await run(), mode }); }
+  catch (error) {
+    const status = error instanceof ElnLlmUnavailableError ? 503 : 500;
+    return Response.json({ error: error instanceof Error ? error.message : 'failed' }, { status });
+  }
+}
+
+export async function fetch(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  // pid + nonce let eln prove this answer comes from the process it started before sharing the port.
+  if (url.pathname === '${HEALTH_PATH}') return Response.json({ ok: true, llm: elnLlmMode(), pid: process.pid,
+    nonce: process.env.ELN_RUN_NONCE ?? null,
+    capabilities: { translation: elnCapabilityMode('translation'), summarization: elnCapabilityMode('summarization') } });
+${routes.join('\n')}
+  if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html'))
+    return new Response(file(frontend), { headers: { 'content-type': 'text/html; charset=utf-8' } });
+  return Response.json({ error: 'not found' }, { status: 404 });
+}
+
+if (import.meta.main) {
+  const server = Bun.serve({ hostname: '127.0.0.1', port: Number(process.env.PORT || 31500), fetch });
+  console.log('listening on http://127.0.0.1:' + server.port);
+}
+`;
+}
+
+function testSource(capabilities: readonly AppCapability[]): string {
+  const cases: string[] = [`test('health answers', async () => {
+  const response = await fetch(new Request('http://app${HEALTH_PATH}'));
+  expect(response.status).toBe(200);
+});`];
+  if (capabilities.includes('translation')) {
+    cases.push(`test('translate goes through the eln LLM adapter (mock)', async () => {
+  const response = await fetch(new Request('http://app/api/translate', { method: 'POST',
+    body: JSON.stringify({ text: '안녕하세요', target: 'English' }) }));
+  expect(response.status).toBe(200);
+  expect(((await response.json()) as { result: string }).result).toBe('[mock:auto→English] 안녕하세요');
+});
+test('translate refuses an empty request', async () => {
+  const response = await fetch(new Request('http://app/api/translate', { method: 'POST', body: '{}' }));
+  expect(response.status).toBe(400);
+});`);
+  }
+  if (capabilities.includes('summarization')) {
+    cases.push(`test('summarize goes through the eln LLM adapter (mock)', async () => {
+  const response = await fetch(new Request('http://app/api/summarize', { method: 'POST', body: JSON.stringify({ text: 'abc' }) }));
+  expect(((await response.json()) as { result: string }).result).toBe('[mock:summary] abc');
+});`);
+  }
+  return `import { expect, test } from 'bun:test';
+process.env.ELN_LLM_MOCK = '1';
+const { fetch } = await import('./entry.ts');
+
+${cases.join('\n')}
+`;
+}
+
+function primaryOf(capabilities: readonly AppCapability[]): string {
+  return capabilities.includes('translation') ? 'translation' : capabilities.includes('summarization') ? 'summarization' : 'llm';
+}
+
+function frontendSource(title: string, capabilities: readonly AppCapability[]): string {
+  const translate = capabilities.includes('translation');
+  const summarize = capabilities.includes('summarization');
+  const control = translate
+    ? `<label>대상 언어 <select id="target"><option>English</option><option>Korean</option><option>Japanese</option><option>Chinese</option><option>Spanish</option><option>French</option><option>German</option></select></label>
+<button id="go">번역</button>`
+    : summarize ? '<button id="go">요약</button>' : '<button id="go">실행</button>';
+  const call = translate
+    ? `fetch('/api/translate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: input.value, target: target.value }) })`
+    : summarize ? `fetch('/api/summarize', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: input.value }) })`
+      : `fetch('/health')`;
+  return `<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem}textarea{width:100%;min-height:8rem;font:inherit}
+output{display:block;white-space:pre-wrap;border:1px solid #ccc;border-radius:6px;padding:.75rem;min-height:4rem;margin-top:1rem}
+.row{display:flex;gap:.75rem;align-items:center;margin:.75rem 0}#mode{color:#777;font-size:.85rem}</style></head>
+<body><h1>${title}</h1>
+<textarea id="input" placeholder="텍스트를 입력하세요"></textarea>
+<div class="row">${control}</div>
+<output id="out"></output><p id="mode"></p>
+<script>
+const input = document.getElementById('input'); const out = document.getElementById('out');
+const target = document.getElementById('target'); const mode = document.getElementById('mode');
+fetch('/health').then(r => r.json()).then(h => { const m = h.capabilities?.[${JSON.stringify(primaryOf(capabilities))}] ?? h.llm; mode.textContent = m === 'mock' ? '모의 응답 모드 — 엔진 연결 전' : m === 'live' ? 'LLM 연결됨' : 'LLM 미연결'; });
+document.getElementById('go').addEventListener('click', async () => {
+  out.textContent = '…';
+  const response = await ${call};
+  const body = await response.json();
+  out.textContent = body.result ?? body.error ?? JSON.stringify(body);
+});
+</script></body></html>
+`;
+}
+
+/** Scaffold the workspace. Returns written relative paths. No key value is written. */
+export function writeLocalScaffold(workspace: string, ask: string, resolutions: readonly CapabilityResolution[]): string[] {
+  const capabilities = resolutions.map(resolution => resolution.capability);
+  const title = appNameFromLine(ask) ?? (capabilities.includes('translation') ? '번역 서비스' : 'eln app');
+  const manifest: LocalAppManifest = {
+    schema: 'eln-local-app@1', ask, start: ['bun', 'backend/entry.ts'], healthPath: HEALTH_PATH,
+    capabilities: resolutions.map(({ capability, status, source, engine, env, key, keyEnv, summary }) =>
+      ({ capability, status, source, engine, env, key, ...(keyEnv ? { keyEnv } : {}), summary })),
+  };
+  const files: Array<[string, string]> = [
+    [LOCAL_APP_MANIFEST, `${JSON.stringify(manifest, null, 2)}\n`],
+    ['backend/entry.ts', entrySource(capabilities)],
+    ['backend/entry.test.ts', testSource(capabilities)],
+    ['frontend/index.html', frontendSource(title, capabilities)],
+    ['backend/eln-llm.ts', readFileSync(ADAPTER_TEMPLATE, 'utf8')],
+    ['ARCHITECTURE.md', `# ${title}\n\n요청: ${ask}\n\n- backend/entry.ts — Bun HTTP 서버 (${HEALTH_PATH} · API · 정적 프론트)\n`
+      + `- backend/eln-llm.ts — 서버측 LLM 어댑터 (키는 eln 이 실행 때 env 로 주입 · 코드·파일에 없음)\n`
+      + `- frontend/index.html — 화면\n\n## 능력\n${resolutions.map(resolution => `- ${resolution.summary}`).join('\n')}\n\n`
+      + `## 실행\n\`eln app run-local ${workspace}\` — 빈 31500~31599 포트에서 띄우고 tailnet 에 그 포트만 공유합니다.\n`
+      + `시험: \`bun test\` (ELN_LLM_MOCK=1 · 네트워크 없음)\n`],
+  ];
+  for (const [path, content] of files) {
+    const target = join(workspace, path);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, content, { flag: 'wx' });
+  }
+  return files.map(([path]) => path).sort();
+}
+
+export function readLocalManifest(workspace: string): LocalAppManifest {
+  const parsed = JSON.parse(readFileSync(join(workspace, LOCAL_APP_MANIFEST), 'utf8')) as LocalAppManifest;
+  if (parsed?.schema !== 'eln-local-app@1' || !Array.isArray(parsed.start) || parsed.start[0] !== 'bun'
+    || typeof parsed.start[1] !== 'string' || !/^backend\/[A-Za-z0-9._/-]+\.tsx?$/u.test(parsed.start[1]) || parsed.start[1].includes('..')
+    || !Array.isArray(parsed.capabilities)) throw new Error('LOCAL_APP_MANIFEST_INVALID');
+  return parsed;
+}
+
+/** First port at or after `from` that is free right now (a hint only: the child's own bind decides). */
+async function freePort(from: number): Promise<number | undefined> {
+  for (let port = from; port <= PORT_RANGE[1]; port++) {
+    const free = await new Promise<boolean>(done => {
+      const server = createServer();
+      server.once('error', () => done(false));
+      server.listen(port, '127.0.0.1', () => server.close(() => done(true)));
+    });
+    if (free) return port;
+  }
+  return undefined;
+}
+
+export interface StartLocalAppDeps {
+  runEnv?: typeof import('./capability-probe.js').capabilityRunEnv;
+  share?: (port: number) => Promise<{ url?: string; reason?: string }>;
+  healthTimeoutMs?: number;
+  /** Spawn seam for tests (default: detached bun child). */
+  spawnApp?: (entry: string, options: SpawnOptions) => ChildProcess;
+}
+
+async function shareOnTailnet(port: number): Promise<{ url?: string; reason?: string }> {
+  const { mountTailscaleServe } = await import('../../cli/tailscale-serve.js');
+  const quiet = { log: () => {}, error: () => {} };
+  const result = await mountTailscaleServe({ mode: { kind: 'tls-tcp', port }, upstreamPort: port, urlPath: '/', useSudo: false, out: quiet });
+  return result.ok && result.url ? { url: result.url } : { reason: `tailnet 공유 안 됨(${result.reason ?? 'unknown'})` };
+}
+
+/** Start the app detached on a 31500–31599 port with only PATH/HOME/TMPDIR/LANG/PORT/ELN_RUN_NONCE and the capability
+ *  env. Bind ownership: the child binds the port itself; a child that exits (EADDRINUSE) moves to the next port, and
+ *  /health must answer with THIS child's pid and nonce — a different service already on the port is never shared.
+ *  Only then that one port is shared on the tailnet (no public internet, no serve reset). */
+export async function startLocalApp(workspace: string, deps: StartLocalAppDeps = {}): Promise<LocalRunResult> {
+  const manifest = readLocalManifest(workspace);
+  const runEnv = deps.runEnv ?? (await import('./capability-probe.js')).capabilityRunEnv;
+  const { env, missing } = await runEnv(manifest.capabilities);
+  const mock = missing.length ? { mockCapabilities: missing } : {};
+  const spawnApp = deps.spawnApp ?? ((entry: string, options: SpawnOptions) => spawn(process.execPath, [entry], options));
+  let from: number = PORT_RANGE[0];
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const port = await freePort(from);
+    if (port === undefined) break;
+    from = port + 1;
+    const nonce = randomUUID();
+    const childEnv: NodeJS.ProcessEnv = { NODE_ENV: 'production', PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? workspace,
+      TMPDIR: process.env.TMPDIR ?? '/tmp', LANG: process.env.LANG ?? 'en_US.UTF-8', ...env, PORT: String(port), ELN_RUN_NONCE: nonce };
+    // Own process group (detached) so a Ctrl-C in the eln session does not take the app down.
+    const child = spawnApp(manifest.start[1]!, { cwd: workspace, env: childEnv, detached: true, stdio: 'ignore' });
+    child.unref();
+    let exited = false;
+    child.once('exit', () => { exited = true; });
+    const deadline = Date.now() + (deps.healthTimeoutMs ?? 10_000);
+    let owned = false;
+    while (Date.now() < deadline && !exited) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}${manifest.healthPath}`, { signal: AbortSignal.timeout(1_000) });
+        const body = response.ok ? await response.json() as { pid?: unknown; nonce?: unknown } : {};
+        owned = body.nonce === nonce && body.pid === child.pid;
+      } catch { owned = false; }
+      if (owned) break;
+      await Bun.sleep(200);
+    }
+    if (!owned) {
+      try { if (child.pid && !exited) process.kill(child.pid); } catch { /* already gone */ }
+      if (exited) continue; // lost the bind (or crashed): try the next port; a timeout is a real failure
+      return { started: false, port, ...(child.pid ? { pid: child.pid } : {}), ...mock,
+        reason: 'health check failed — run `bun test` and `bun backend/entry.ts` in the workspace to see why' };
+    }
+    const localUrl = `http://127.0.0.1:${port}/`;
+    const shared = await (deps.share ?? shareOnTailnet)(port);
+    const stop = `kill ${child.pid}${shared.url ? ` && tailscale serve --tls-terminated-tcp ${port} off` : ''}`;
+    const result: LocalRunResult = { started: true, port, pid: child.pid!, localUrl, ...mock,
+      ...(shared.url ? { tailnetUrl: shared.url } : {}), ...(shared.reason ? { reason: shared.reason } : {}), stop };
+    writeFileSync(join(workspace, LOCAL_APP_RUN_RECORD), `${JSON.stringify({ ...result, startedAt: new Date().toISOString() }, null, 2)}\n`);
+    return result;
+  }
+  return { started: false, ...mock, reason: 'no port in 31500-31599 could be bound (app exited on start each time) — run `bun backend/entry.ts` in the workspace to see why' };
+}
+
+/** The local path end to end: resolve capabilities → scaffold → start → one truthful status. */
+export async function runLocalAppBuild(args: { ask: string; capabilities?: unknown; cwd: string }, deps: LocalAppBuildDeps = {}): Promise<LocalAppBuildOutput> {
+  const line = args.ask.split('[host-filled · not user text]')[0]!.trim();
+  const needs = detectCapabilityNeeds(line, args.capabilities);
+  const probe = deps.probe ? await deps.probe() : await (await import('./capability-probe.js')).probeElnCapabilities();
+  const resolutions = resolveCapabilities(needs, probe);
+  const workspace = createWorkspace(args.cwd, slugFor(line, needs));
+  const files = writeLocalScaffold(workspace, line, resolutions);
+  let run: LocalRunResult;
+  try { run = await (deps.start ?? startLocalApp)(workspace); }
+  catch (error) { run = { started: false, reason: error instanceof Error ? error.message : String(error) }; }
+  const choices = resolutions.flatMap(resolution => resolution.card ? [resolution.card] : []);
+  const where = run.tailnetUrl ?? run.localUrl;
+  const mockedAtRun = new Set(run.mockCapabilities ?? []);
+  // The status names the mode the app actually runs in: a key that could not be read at start means mock, said so.
+  const summaryOf = (resolution: CapabilityResolution): string => mockedAtRun.has(resolution.capability)
+    ? `${resolution.summary} → 실행 때 키(${resolution.key.kind === 'secret' ? resolution.key.name : resolution.key.kind === 'provider' ? `${resolution.key.provider} 공급자 키` : '없음'})를 읽지 못해 지금은 모의 응답`
+    : resolution.summary;
+  const message = [
+    `회원 연결이 없어 공개 게시 대신 이 기기에서 로컬로 만들었습니다: ${workspace}`,
+    ...resolutions.map(resolution => `- ${summaryOf(resolution)}`),
+    ...(mockedAtRun.size ? [`- 모의 응답으로 도는 능력: ${[...mockedAtRun].join(', ')}`] : []),
+    run.started ? `- 실행 중: ${where}${run.tailnetUrl ? ' (tailnet 전용 · 공개 인터넷 아님)' : ` (이 기기 전용${run.reason ? ` · ${run.reason}` : ''})`} · 멈추기: ${run.stop}`
+      : `- 아직 실행 안 됨: ${run.reason ?? 'unknown'} · 다시 띄우기: eln app run-local ${workspace}`,
+    ...choices.map(card => renderChoiceCard(card)),
+    '다음: 이 폴더의 backend/entry.ts·frontend/index.html 을 요청에 맞게 다듬고 `bun test` 뒤 `eln app run-local` 로 다시 띄우세요. 공개 게시는 eln member connect 뒤 app_build.',
+  ].join('\n');
+  return {
+    kind: 'app-build', tool: 'app_build', status: 'local-build', mode: 'local', memberConnected: false,
+    buildComplete: run.started, workspace, files,
+    capabilities: resolutions.map(resolution => ({ capability: resolution.capability, status: resolution.status,
+      summary: summaryOf(resolution), runMode: !run.started ? 'not-running' as const
+        : resolution.status === 'needs-choice' || mockedAtRun.has(resolution.capability) ? 'mock' as const : 'live' as const })),
+    choices, run, message,
+  };
+}

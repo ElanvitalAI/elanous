@@ -94,6 +94,10 @@ export interface DecomposedTask {
   status: 'queued' | 'active' | 'done' | 'cancelled' | 'superseded';
   /** 대체(superseded)됐을 때 이 자리를 차지한 작업 id — 원문은 둘 다 보존. */
   supersededBy?: string;
+  /** PLAN-STALE-ON-BOOT (11-26): how many TUI boots re-queued this item while it stayed active (expires past the cap). */
+  bootOffers?: number;
+  /** PLAN-STALE-ON-BOOT: when a turn on this item last ended answered (epoch ms) — only an answered item counts boot offers. */
+  answeredAt?: number;
   /** 완료 근거(불변식 9) — done 전이에 필수. 시험 결과·영수증 참조 한 줄. 없으면 done 이 될 수 없다. */
   doneEvidence?: string;
   /** 이 작업이 가리키는 대상(PR «#N» · 칸 «ELN-…») — 정정 판별(대체·취소)용. 원문 보존은 sourceText 몫. */

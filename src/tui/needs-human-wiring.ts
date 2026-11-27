@@ -5,6 +5,9 @@ import { requestEls } from '../els/client.js';
 import { canonicalMessageAddress, defaultMsgStorePath, openMsgStore, type MsgStore } from '../msg/msg-store.js';
 import { resolveSeatRetroSeat } from '../seat/seat-retro-seat.js';
 import { debug } from '../debug/log.js';
+import { cheapHandClassifier } from '../kit/mail-route/hand-classifier.js';
+import { liveHandCellLookups } from '../kit/mail-route/hand-cells.js';
+import { handAskAnswer } from '../kit/mail-route/hand-dedupe.js';
 import type { NeedsHumanDeps, NeedsHumanHandledBy } from './needs-human-push.js';
 
 /**
@@ -40,6 +43,15 @@ export function createNeedsHumanDeps(input: { cwd: string; resumeWith: (text: st
     seat: () => { try { return resolveSeatRetroSeat(input.cwd, env); } catch { return null; } },
     paneId: () => env[ENV_EVENT_PANE]?.trim() ?? '',
     coordinatorOf: () => coordinator,
+    // KIT mail-route hand-route — an unstructured ✋ line asks Jev (decision model) once for its root (YAML threshold · 30 s cap · never blocks).
+    classifyHand: (text) => cheapHandClassifier(text),
+    // HAND-RAISE-DOMAIN-ROUTING — the seat's claimed cell (✋ ask identity · `cell-owner` route) and the by-reference answer.
+    cellOf: (seat) => liveHandCellLookups()?.claimedCellOf(seat) ?? null,
+    cellOwnerOf: (cell) => liveHandCellLookups()?.cellOwnerOf(cell) ?? null,
+    answerOf: (msgId, seat) => {
+      const store = openMsgStore(defaultMsgStorePath());
+      try { return handAskAnswer(store, msgId, seat)?.body ?? null; } finally { store.close(); }
+    },
     postMail: (envelope) => {
       const store = openMsgStore(defaultMsgStorePath());
       try { return store.post(envelope, { dedupe: true }).id; } finally { store.close(); }

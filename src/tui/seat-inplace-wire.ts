@@ -32,6 +32,11 @@ export interface SeatInPlacePorts {
   /** Leave the loop so the exit path relaunches (`requestTuiSelfRestart('seat-inplace-update:<id>')` + seat-stop key). */
   readonly leave: (sessionId: string) => void;
   readonly card: (body: string) => void;
+  /** FU: notices held off-queue (CAPSULE-C2 FIFO · superseded steers) — carried as queue notices. */
+  readonly heldNotices?: () => readonly { readonly text: string; readonly source?: string }[];
+  /** FU: in-memory caps to carry (epoch ms) and where the new build puts them back. */
+  readonly caps?: () => Record<string, number>;
+  readonly restoreCaps?: (caps: Readonly<Record<string, number>>) => void;
   readonly now?: () => number;
   readonly log?: (event: string, data: Record<string, unknown>) => void;
 }
@@ -69,7 +74,9 @@ export function seatInPlaceTick(ports: SeatInPlacePorts, memo: { failed: Set<str
       ...(provider ? { provider } : {}),
       draft: ports.draft(),
       queuedPersonLines: items.filter((item) => item.kind === 'user').map((item) => item.text),
-      notices: items.filter((item) => item.kind !== 'user').map((item) => ({ text: item.text, source: item.source ?? 'carry' })),
+      notices: [...(ports.heldNotices?.() ?? []).map((n) => ({ text: n.text, source: n.source ?? 'held' })),
+        ...items.filter((item) => item.kind !== 'user').map((item) => ({ text: item.text, source: item.source ?? 'carry' }))],
+      ...(ports.caps ? { caps: ports.caps() } : {}),
       durable: snapshotDurable(files), durableFiles: files,
     };
     try {
@@ -97,6 +104,7 @@ export function restoreSeatCarry(ports: SeatInPlacePorts): { restored: boolean; 
   if (plan.draft) ports.setDraft(plan.draft);
   for (const line of plan.personLines) ports.enqueuePerson(line);
   for (const notice of plan.notices) ports.enqueueNotice(notice.text, notice.source);
+  if (carry.caps) ports.restoreCaps?.(carry.caps);
   log('carry-restored', { from: carry.fromCommit, to: carry.toCommit, running: ports.runningCommit, draftChars: plan.draft.length,
     personLines: plan.personLines.length, notices: plan.notices.length, lost: plan.lost });
   if (plan.lost.length > 0) ports.card(inPlaceCardBody(carry.seat, 'durable-diff', `changed across the switch: ${plan.lost.join(', ')}`).replace('stayed on the old build', 'moved to the new build'));

@@ -88,3 +88,31 @@ test('route adapter fills the built-in app_build route before confirmation and k
   const tool = adapter.hostTools([]).find(item => item.name === 'app_build');
   expect((tool?.parameters as { required?: string[] }).required).toEqual(['ask']);
 });
+
+test('APP-BUILD-LOCAL-PATH: a local host opt-in turns the missing member into a local build, never a confirmation or graph run', async () => {
+  const calls: unknown[] = [];
+  const local: Array<Record<string, unknown>> = [];
+  const adapter = createPluginRouteAdapter({ pluginRoot, dispatchCore: async () => null,
+    requestConfirmation: async () => { calls.push('confirm'); return true; },
+    dispatchGraph: async () => { calls.push('graph'); return { status: 'done' }; },
+    localAppBuild: async args => { local.push(args); return { status: 'local-build', workspace: '/tmp/translator' }; } });
+  const out = await adapter.dispatch('app_build', { ask: '번역 서비스 만들어줘', capabilities: ['translation'] }, false, { surface: 'tui' });
+  expect(out).toEqual({ ok: true, result: { status: 'local-build', workspace: '/tmp/translator' } });
+  expect(local).toEqual([{ ask: '번역 서비스 만들어줘', capabilities: ['translation'] }]);
+  expect(calls).toEqual([]);
+  // A connected member still takes the member graph, not the local path.
+  await adapter.dispatch('app_build', { ask: '번역 서비스 만들어줘' }, false, { surface: 'tui', ...member });
+  expect(local.length).toBe(1);
+  expect(calls).toEqual(['confirm', 'graph']);
+  const tool = adapter.hostTools([]).find(item => item.name === 'app_build');
+  expect(Object.keys((tool?.parameters as { properties: Record<string, unknown> }).properties)).toContain('capabilities');
+});
+
+test('APP-BUILD-LOCAL-PATH: app_create refusal names the local path only where the host offers it', async () => {
+  const local = createPluginRouteAdapter({ pluginRoot, dispatchCore: async () => null, localAppBuild: async () => ({}) });
+  const withLocal = await local.dispatch('app_create', { root: '/tmp/x', files: [], metadata: {} }, false, { surface: 'tui' });
+  expect((withLocal as { error: string }).error).toContain('call app_build — it builds in a local workspace');
+  const daemon = createPluginRouteAdapter({ pluginRoot, dispatchCore: async () => null });
+  const withoutLocal = await daemon.dispatch('app_create', { root: '/tmp/x', files: [], metadata: {} }, false, { surface: 'tui' });
+  expect((withoutLocal as { error: string }).error).toBe('file artifact creation context required: app_create writes only inside a member app_build run (eln member connect).');
+});

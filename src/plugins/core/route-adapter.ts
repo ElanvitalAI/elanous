@@ -68,6 +68,9 @@ export function createPluginRouteAdapter(options: {
   requestConfirmation?: (prompt: string) => Promise<boolean>;
   dispatchAppDeploy?: (args: Record<string, unknown>, context?: ToolRuntimeContext) => Promise<unknown>;
   getDispatchContext?: () => Partial<ToolRuntimeContext> | Promise<Partial<ToolRuntimeContext>>;
+  /** APP-BUILD-LOCAL-PATH — host opt-in (local TUI/CLI only, never the daemon): app_build without a member
+   *  connection builds in a local workspace instead of ending at needs_connection. */
+  localAppBuild?: (args: Record<string, unknown>) => Promise<unknown>;
 }): PluginRouteAdapter {
   const tools = loadNativeRouteTools(options.pluginRoot);
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
@@ -114,6 +117,10 @@ export function createPluginRouteAdapter(options: {
         // ONE-LINE-INTENT-CONTEXT-AUTOFILL: slot, handle source and data needs come from the verified
         // member context and the line, before any confirmation; a missing binding stays needs_connection.
         const filled = autofillAppBuildArgs(args, context);
+        if (filled.status === 'needs_connection' && options.localAppBuild && typeof args.ask === 'string' && args.ask.trim()) {
+          try { return { ok: true as const, result: await options.localAppBuild(args) }; }
+          catch (error) { return { ok: false as const, error: `local app build failed: ${String(error)}` }; }
+        }
         if (filled.status !== 'filled') return { ok: false as const, error: filled.error, code: filled.code };
         graphArgs = filled.args;
       }
@@ -148,7 +155,10 @@ export function createPluginRouteAdapter(options: {
       let hostContext: Partial<ToolRuntimeContext> | undefined;
       try { hostContext = await options.getDispatchContext?.(); }
       catch { return { ok: false as const, error: 'file artifact creation context unavailable' }; }
-      if (!isValidHostContext(hostContext)) return { ok: false as const, error: 'file artifact creation context required' };
+      // The hint names only what this host actually offers: the local path exists only where the host opted in.
+      if (!isValidHostContext(hostContext)) return { ok: false as const, error: options.localAppBuild
+        ? 'file artifact creation context required: app_create writes only inside a member app_build run. Without a member connection call app_build — it builds in a local workspace and returns the folder to edit with Write.'
+        : 'file artifact creation context required: app_create writes only inside a member app_build run (eln member connect).' };
       // A caller cannot supply missing host authority or downgrade its approval requirement.
       const effectiveContext = { ...hostContext, ...context };
       const approvalRequired = hostContext?.requireApproval === true || effectiveContext.requireApproval === true;

@@ -1,0 +1,27 @@
+# CELLLESS-PR-AUTO-CELL (0.3.38 P1 · OP 11-27) — policy of the land steward's cell-link sub-agent (src/land-graph/auto-cell.ts).
+# A merge to main that matches no cell of the release in play gets one auto-registered cell, so the 판정 집사 can green it.
+# Read by name; change a value here, not in TS. There is no on/off switch — scope is what the rules below leave in.
+version: 1
+scope:
+  # A PR is left out only when EVERY changed file starts with one of these prefixes. Empty = every PR (OP 11-27 «all PRs»).
+  exclude_paths: []
+  # Head-branch first segments that are never auto-celled (e.g. release/*). Empty = none.
+  exclude_branch_prefixes: []
+cell:
+  priority: P2
+  # ops = the seat dispatcher never launches a coding task for it: the work already landed, only the green is left.
+  dispatch_kind: ops
+  id_min_len: 6
+  id_max_len: 48
+  # Machine-made head branches (goal hashes) — the cell id is slugged from the PR title instead.
+  title_slug_branch_prefixes: [self-impl, app, dependabot, renovate]
+  # «대상 경로:» line of the cell body = the PR's changed files, at most this many.
+  max_target_paths: 30
+owner:
+  default: OP
+  # Head branch first segment → seat (op/land-cell-link-always → OP). Lower-case keys.
+  branch_prefix: { op: OP, tc: TC, ux: UX, mk: MK, jud: JUD, res: RES, rel: REL, opc: OPC, opt: OPT }
+  # «자리: TC» · «Seat: TC» · «Owner: TC» lines in the PR body (commit trailers copied into the body count too).
+  body_line_keys: [자리, seat, owner, 담당]
+digest:
+  to: OP

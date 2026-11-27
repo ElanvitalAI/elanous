@@ -6,7 +6,7 @@
  *
  *   Time        — TimeSlotManager.currentSlot() · per-slot policy
  *   Resource    — ResourceScheduler.tryReserve()
- *   Priority    — TOX graph's priority order + myelin boost (D6 hook)
+ *   Priority    — TOX graph's priority order
  *   Concurrency — surface-level cap (deferred to caller)
  *
  * The launcher is pure orchestration — it never touches the LLM or

@@ -47,6 +47,9 @@ export interface ReceiptView { readonly pr: number; readonly head12: string; rea
 export interface VerdictView { readonly pr: number; readonly head12: string; readonly kind: 'jud' | 'judb' | 'hold'; readonly verdict: string; readonly atMs: number }
 export interface HostView { readonly host: string; readonly load1: number | null; readonly ncpu: number | null; readonly stopped: boolean }
 export interface MergedView { readonly number: number; readonly branch: string; readonly mergedAtMs: number }
+/** JUD-HAND-DISCOVERY: a 🟡 cell the judge-butler refused with «JUD signs this one» (security-4 · a veto that stands) — merged
+ *  PR ⊕ receipt, so only a judge hand can turn it green. From the butler's last tick (sources.ts parseButlerJudgeCells). */
+export interface JudgeCellView { readonly cell: string; readonly kind: 'security-4' | 'veto'; readonly why: string; readonly prs: readonly number[] }
 /** An open ✋: `sender` raised (or forwarded) it, `blockedSeat` is waiting on its outcome — neither is woken meanwhile. */
 export interface OpenHandView { readonly receiver: string; readonly waitedMs: number; readonly sender?: string; readonly blockedSeat?: string }
 
@@ -74,6 +77,8 @@ export interface Snapshot {
   readonly wakes?: Readonly<Record<string, { readonly by: string; readonly atMs: number }>>;
   /** federation.yaml seat roles (seat → role) — absent = prefix rules only. */
   readonly roles?: Readonly<Record<string, string>>;
+  /** Cells only a judge can sign (judge-butler «JUD signs this one») — absent = none known (R3 judges open PRs only). */
+  readonly judgeCells?: readonly JudgeCellView[];
   readonly sourceErrors: readonly string[];
 }
 
@@ -385,9 +390,29 @@ export function planMatch(snap: Snapshot, input: MatchInput): { rows: Row[]; idl
   }
   // Pull nudges go only to hands the push did not take; a nudged hand is not lent to another scope this tick.
   const assigned = new Set(rows.filter((r) => r.action === 'assign').map((r) => r.seat));
-  const nudged = wake.nudges.filter((r) => !assigned.has(r.seat));
+  // ADMIN-RESOLVE-NOT-NAG (0.3.38 P0 · CEO «land 10/h»): «idle 16m — 보드에 일감이 있습니다 · eln work next» mails were
+  // read and not acted on. A free hand the push did not take now gets the best board cell assigned directly (same
+  // `eln seat assign` door as the push: owner ⊕ assignment mail to the hand ⊕ wake · MODEL-BY-DIFFICULTY on assign).
+  // The board = yellow · unowned / reclaimed / held by this scope's coordinator · not waiting · same side (maker ≠ judge).
+  // Only when no cell fits does the hand keep the pull nudge.
+  const taken = new Set(rows.filter((r) => r.action === 'assign').map((r) => r.target));
+  const boardCells = snap.cells
+    .filter((c) => c.status === 'yellow' && (UNOWNED(c.owner) || reclaimed.has(c.id) || ownerSeat(c.owner) === scope.scope))
+    .filter((c) => !cellWaitOf(c.id, snap) && !wake.held.has(c.id) && !within(state.assigned[c.id]?.at, snap.nowMs, D.cooldownMinutes))
+    .sort(cellOrder);
+  const nudged: Row[] = [];
+  for (const nudge of wake.nudges) {
+    if (assigned.has(nudge.seat)) continue;
+    // A cell whose lease just ran out on this hand goes to another hand, not straight back.
+    const cell = boardCells.find((c) => !taken.has(c.id) && judgeSide(snap, nudge.seat!) === judgeCell(snap, c)
+      && !reclaim.some((r) => r.target === c.id && ownerSeat(r.owner ?? r.seat) === nudge.seat));
+    if (!cell) { nudged.push(nudge); continue; }
+    taken.add(cell.id);
+    rows.push({ node: 'r1', scope: scope.scope, action: 'assign', target: cell.id, seat: nudge.seat!, ...(cell.priority ? { priority: cell.priority } : {}), mode,
+      reason: `pull-for-idle:${nudge.reason}` });
+  }
   rows.push(...nudged);
-  const nudgedSeats = new Set(nudged.map((r) => r.seat));
+  const nudgedSeats = new Set([...nudged.map((r) => r.seat), ...rows.filter((r) => r.reason.startsWith('pull-for-idle:')).map((r) => r.seat)]);
   return { rows, idleLeft: hands.filter((h) => h.from === undefined && !nudgedSeats.has(h.seat)).map((h) => h.seat), wanting, wake };
 }
 
@@ -451,28 +476,60 @@ const GREEN = /PASS/;
 /** The four security classes that still need a security verdict (OPS 11-23 완화 — 비밀·자격 · members · 원격 노출). */
 const SECURITY_PATH = /^(src\/oauth\/|src\/members\/|scripts\/[^/]*deploy)|(secret|credential|cred[-_/]|oauth)/;
 
+/** The R3 key of an item: `<pr>-<head12>` for an open PR, `cell:<ID>` for a cell (state.judgeAssigned · tick.ts). */
+export const judgeKey = (row: Pick<Row, 'target' | 'head12'>): string => (row.target.startsWith('#') ? `${row.target.slice(1)}-${row.head12}` : `cell:${row.target}`);
+
+/** Why no judge hand took an item: none in scope at all, or how the scope's judge hands are occupied (observation face). */
+function noJudgeHandReason(snap: Snapshot, scope: string, state: ScopeState): string {
+  const judges = snap.seats.filter((s) => isHand(snap, s.seat) && scopeOf(snap, s.seat) === scope && judgeSide(snap, s.seat));
+  if (!judges.length) return 'no-judge-hand';
+  const idle = judges.filter((s) => s.activity === 'idle' && s.idleForMs !== null);
+  const cooling = idle.filter((s) => within(state.seatCooldown[s.seat], snap.nowMs, D.cooldownMinutes)).length;
+  const fresh = idle.filter((s) => (s.idleForMs ?? 0) < D.idleMinMinutes * MIN && !within(state.seatCooldown[s.seat], snap.nowMs, D.cooldownMinutes)).length;
+  return `no-free-judge-hand:cooling=${cooling},fresh=${fresh},busy=${judges.length - idle.length}`;
+}
+
+/** R3 — JUD-HAND-DISCOVERY (11-28): the queue is ① cells only a judge can sign (judge-butler «security-4 → JUD/Terra» ·
+ *  «veto stands»: merged ⊕ receipt, the green blocker) then ② open PRs with a GREEN receipt and no verdict 30 min+ (security-4
+ *  first). Idle JUDGE-side hands of the scope take it round-robin, each up to `judgeBatch` items (one mail per hand · tick.ts);
+ *  `caps.judge` = hands per tick. */
 export function planJudge(snap: Snapshot, input: { scope: ResolvedScope; state: ScopeState }): Row[] {
   const { scope, state } = input;
   const mode = scope.mode === 'live' ? 'live' : 'shadow';
   const rows: Row[] = [];
-  const hands = idleHands(snap, scope.scope, state);
-  let budget = scope.caps.judge;
-  const queue = snap.prs.filter((pr) => !pr.draft).flatMap((pr) => {
+  const hands = idleHands(snap, scope.scope, state).filter((h) => judgeSide(snap, h.seat));
+  const yellow = new Set(snap.cells.filter((c) => c.status === 'yellow').map((c) => c.id));
+  type Item = { target: string; head12?: string; reason: string; rank: number; waited: number; key: string };
+  const cells: Item[] = (snap.judgeCells ?? []).filter((c) => yellow.has(c.cell))
+    // A judge's answer on a cell (a veto that still stands) is not re-asked every hour: one ask per cardRepeatMinutes.
+    .filter((c) => !within(state.judgeAssigned[`cell:${c.cell}`]?.at, snap.nowMs, D.cardRepeatMinutes))
+    .map((c) => ({ target: c.cell, reason: `cell-${c.kind}`, rank: c.kind === 'security-4' ? 0 : 1, waited: 0, key: c.cell }));
+  const prs: Item[] = snap.prs.filter((pr) => !pr.draft).flatMap((pr) => {
     const head12 = pr.head.slice(0, 12);
     const receipt = snap.receipts.filter((r) => r.pr === pr.number && r.head12 === head12 && GREEN.test(r.status)).sort((a, b) => a.atMs - b.atMs)[0];
     if (!receipt || snap.nowMs - receipt.atMs < D.judgeWaitMinutes * MIN) return [];
     if (snap.verdicts.some((v) => v.pr === pr.number && v.head12 === head12)) return [];
     if (within(state.judgeAssigned[`${pr.number}-${head12}`]?.at, snap.nowMs, D.cooldownMinutes * 2)) return [];
-    return [{ pr, head12, waited: snap.nowMs - receipt.atMs, security: (pr.files ?? []).some((f) => SECURITY_PATH.test(f)) }];
-  }).sort((a, b) => b.waited - a.waited || a.pr.number - b.pr.number);
+    const security = (pr.files ?? []).some((f) => SECURITY_PATH.test(f));
+    return [{ target: `#${pr.number}`, head12, reason: security ? 'green-no-verdict:security-4' : 'green-no-verdict', rank: security ? 2 : 3,
+      waited: snap.nowMs - receipt.atMs, key: String(pr.number).padStart(9, '0') }];
+  });
+  const queue = [...cells, ...prs].sort((a, b) => a.rank - b.rank || b.waited - a.waited || a.key.localeCompare(b.key));
+  const pool = hands.slice(0, Math.max(0, scope.caps.judge));
+  const load = new Map<string, number>();
+  const noHand = hands.length ? '' : noJudgeHandReason(snap, scope.scope, state);
+  let next = 0;
   for (const item of queue) {
-    const target = `#${item.pr.number}`;
-    const reason = item.security ? 'green-no-verdict:security-4' : 'green-no-verdict';
-    if (budget <= 0) { rows.push({ node: 'r3', scope: scope.scope, action: 'defer', target, head12: item.head12, reason: 'tick-cap', mode }); continue; }
-    const hand = hands.shift();
-    if (!hand) { rows.push({ node: 'r3', scope: scope.scope, action: 'defer', target, head12: item.head12, reason: 'no-judge-hand', mode }); continue; }
-    budget--;
-    rows.push({ node: 'r3', scope: scope.scope, action: 'judge-assign', target, head12: item.head12, seat: hand.seat, reason, mode });
+    const base = { node: 'r3', scope: scope.scope, target: item.target, ...(item.head12 ? { head12: item.head12 } : {}), mode } as const;
+    if (noHand) { rows.push({ ...base, action: 'defer', reason: noHand }); continue; }
+    let hand: SeatView | undefined;
+    for (let k = 0; k < pool.length; k++) {
+      const h = pool[(next + k) % pool.length]!;
+      if ((load.get(h.seat) ?? 0) < D.judgeBatch) { hand = h; next = (next + k + 1) % pool.length; break; }
+    }
+    if (!hand) { rows.push({ ...base, action: 'defer', reason: 'tick-cap' }); continue; }
+    load.set(hand.seat, (load.get(hand.seat) ?? 0) + 1);
+    rows.push({ ...base, action: 'judge-assign', seat: hand.seat, reason: item.reason });
   }
   return rows;
 }
@@ -650,7 +707,8 @@ export function exceptionCard(scope: string, hq: string, rows: readonly Row[], s
   const title = `[행정관 · ${scope}] 예외 카드 ${fresh.length}건`;
   const lines = fresh.slice(0, CARD_MAX_LINES).map((r) => `- ${r.action} ${r.target}${r.head12 ? `@${r.head12}` : ''}${r.seat ? ` · ${r.seat}` : ''}${r.lentFrom ? ` (from ${r.lentFrom})` : ''} — ${r.reason}`);
   const more = fresh.length > CARD_MAX_LINES ? [`… 외 ${fresh.length - CARD_MAX_LINES}건 (eln steward space status --scope ${scope})`] : [];
-  return { to: scope, title, body: [title, ...lines, ...more, '결정은 보드에 적으면 다음 틱이 집행합니다.'].join('\n'), keys: fresh.map(rowKey) };
+  const due = new Date(nowMs + 30 * MIN).toISOString();
+  return { to: scope, title, body: [title, ...lines, ...more, `담당: ${scope} · 기한: ${due}`, '다음 행동: 각 예외를 해결하거나 담당자와 기한을 정해 보드에 인계하세요. 결정은 다음 틱이 집행합니다.'].join('\n'), keys: fresh.map(rowKey) };
 }
 
 export function profileUses(profile: StewardSpaceProfile, node: string, nodes: Record<StewardSpaceProfile, ReadonlySet<string>>): boolean {

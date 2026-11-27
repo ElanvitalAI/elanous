@@ -1,0 +1,55 @@
+# PRECHECK-CORE-SIZE (0.3.38 P1 · 대표 11-27 «판단의 루브릭이나 원칙이 없는 거 아닐까요?») — the ONE goal rubric.
+# Read by src/self-dev/goal-rubric.ts (loadGoalRubric) and used by: the pre-launch goal precheck (ask-launch-flow),
+# the run supervisor's decomposition stop (run-supervisor.ts · same CORE/FU naming) and the post-first-impl revise
+# (goal-revise.ts · verification-cost FU line). Change a value here, not in TS. There is no on/off switch.
+#
+# Principle: a goal launches when it is ONE observable behavior (CORE) with a contained blast radius, a known cause,
+# affordable verification, a modest size and no unlanded dependency. Anything else is split (CORE + FU list),
+# probed first, or handed to a hand/human. Deterministic scoring first; the LLM judgment node is the pre-launch
+# decomposer (its pieces are the evidence for the behaviors axis — the same proposer the supervisor uses later).
+version: 1
+axes:
+  behaviors:
+    # CORE = exactly one behavior. Evidence: the decomposer's pieces; pieces whose target paths stay inside one
+    # module (src/<dir>) are steps of one behavior. Without a decomposition: done-when lines minus non-behavior lines.
+    max_core: 1
+    non_behavior_markers: ['회귀 0', '종전', '그대로', '불변', '실패 시', '읽기 실패']
+  blast_radius:
+    # distinct top-level modules (src/<dir>, scripts, docs …) among the target paths
+    max_modules: 2
+    # a target file with this many commits in the last 7 days is a hot file (+1)
+    hot_file_commits_7d: 8
+  uncertainty:
+    # root cause unknown / design decision pending → probe cell first
+    markers: ['원인 후보', '원인 미상', '재현 안 됨', '추정', '결정 대기', '설계 결정 필요']
+  verification_cost:
+    # needs live infra or a new sim world → a separate E4 evidence cell (FU)
+    markers: ['실 PTY', '실물', '운영 우주', '라이브', '새 시뮬 월드', '신설 시뮬']
+  size:
+    max_target_paths: 8
+    max_new_files: 3
+  dependencies:
+    # «선행: #N» / «선행 칸 <ID>» lines; an open PR or a non-green cell there = wait (hand)
+    markers: ['선행:', '선행 칸']
+  security_over_spec:
+    # 대표 11-27 «보안 요구사항도 과하게 넣지 마라» — security default = relaxed. A goal (or a reviewer) demanding hardening
+    # OUTSIDE the security-4 paths (graphs/policies/security4-paths.yaml) is over-spec: the demand is relaxed with a reason,
+    # never a verdict blocker. On a security-4 path the demand stays.
+    markers: ['승인 게이트', '승인 단계', '추가 확인', '서명 검증', '서명 요구', 'fail-closed', '실패 시 닫', '인증 추가', '권한 검사 추가', 'approval gate', 'confirmation step', '보안 경로로 분류']
+    # post-round: the ONLY review finding removed deterministically — a demand to widen the security-4 path list itself
+    # (the list is the policy). Everything else is a recorded candidate; the reflection step (LLM) decides with the pack.
+    scope_widening_markers: ['보안 경로로 분류', '보안 경로에 포함', '보안 4종 경로에 추가', 'security path']
+    # a line that names a real security-4 risk (secret/credential · other users' data · remote exposure · destructive delete)
+    # or a defect is never relaxed, whatever the path — and never moved to FU as an «edge» either
+    keep_markers: ['비밀', '자격', '토큰', '키 노출', '다른 사용자', '타인', '원격 노출', '외부 노출', '공개', '파괴', '삭제', '유출', '노출', '취약', '우회', '주입', 'secret', 'credential', 'token', 'leak', 'bypass', 'injection', 'destructive', 'crash', '깨진다', '실패한다', '결함', '버그', '누구나', '권한 없이', '관리자', '무단', 'anyone', 'unauthorized', 'privilege',
+      # an observed consequence (something goes wrong) is a defect, not a hardening demand
+      '발생', '중복', '누락', '손실', '잘못', '오동작', '틀린', '멈춘다', '사라진다', '덮어쓴다', 'duplicate', 'lost', 'wrong']
+  edges:
+    # a review finding that itself says it is OUT OF SCOPE (not the CORE behavior) moves to a FU cell instead of another
+    # rework round. «엣지 케이스»·«추가로» alone are not enough — an edge-case regression is still a defect (review must-fix).
+    markers: ['범위 밖', 'out of scope', 'FU 로 미뤄', '후속 칸']
+verdict_order: [hand, probe-first, split, launch]
+tier:
+  # sum of axis scores (each 0..2) → child model tier recommendation
+  luna_max: 2
+  terra_max: 5

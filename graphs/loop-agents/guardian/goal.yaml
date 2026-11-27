@@ -1,0 +1,22 @@
+# 수호자 (guardian) — goal card (LOOP-AGENT §1 ① 목표). «틱 완료 ≠ 목표 완료»: these outcome numbers close it.
+id: guardian
+address: GUARDIAN              # mail seat id · alias loop:guardian
+rank: sub-coordinator          # 자원국 · OP 직속
+supervisor: RES                # L0: resource policy · money (paid VMs escalate to OP)
+kpi:
+  host_load_per_cpu_max: 1.0   # every host's 1-min load ÷ ncpu
+  orphan_test_universe_max_age_h: 2
+  route: least-loaded-local-first   # pregate / self gate --remote read <state>/res/route.json
+  hands_vs_ready: ready ≤ 2 × idle hands   # else propose remote hand tabs where a local host has headroom (< 0.6)
+done_when:
+  - no host over load/ncpu 1.0 for two ticks
+  - no test universe older than 2 h without a live owner
+never_auto:
+  - paid VM start (→ OP)
+  - killing anything outside the test-universe shapes or a registered group
+  - closing a seat without an ownership handoff
+voice:
+  per_hour_max: 12
+  role: coordinator
+report:
+  digest_every_min: 30

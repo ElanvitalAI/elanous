@@ -210,7 +210,8 @@ export function buildUpdatePlanTool(): LLMToolSpec {
                 enum: [...HAND_CAUSES],
                 description: 'For `blocked`, when it fits: writer-handover = unsure who owns the files or an earlier writer\'s work, '
                   + 'worktree-path = the worktree or file path is unknown, slot-isolation = waiting for a free root / slot / write scope, '
-                  + 'res-approval = waiting for an RES approval to run. The steward answers these itself.',
+                  + 'res-approval = waiting for an RES approval to run (the steward answers these four itself), '
+                  + 'hold = a HOLD on this work (does it apply, who lifts it), cell-scope = what a cell covers or who decides its assignment.',
               },
               wake: {
                 type: 'object',

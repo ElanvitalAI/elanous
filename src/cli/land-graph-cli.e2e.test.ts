@@ -89,7 +89,7 @@ describe('land graph · test universe (real CLI · scratch remote · fake gh)', 
     expect(d2.decisions.find(d => d.pr === 2)).toMatchObject({ action: 'refuse', cls: 'isolation-gate' });
 
     const t3 = await cli('graph', 'tick', '--json'); expect(t3.status).toBe(0);
-    expect(ledger().filter(r => r.pr === 5 && r.event === 'refused').map(r => r.cls)).toEqual(['stale-base-revert']) // pr 5 would erase pr 4's shared.ts line — the guard refuses before the merge;
+    expect(ledger().filter(r => r.pr === 5 && r.event === 'refused').map(r => r.cls)).toEqual(['merge-conflict']); // pr 5 conflicts with pr 4 on shared.ts — the guard's merge-tree fails before the merge (GUARD-ERROR: a conflict, not a stale-base revert)
     expect(prs()['3']!.state).toBe('OPEN');
     expect(git(join(T, 'work'), 'log', 'origin/main', '--format=%s').split('\n').filter(s => s.startsWith('pr ')).sort()).toEqual(['pr 1', 'pr 4']);
 

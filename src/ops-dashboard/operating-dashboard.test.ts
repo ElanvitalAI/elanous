@@ -51,7 +51,8 @@ describe('OP-CEO-ALLOCATION-LOOP operating dashboard', () => {
       throw new Error('Connection timed out');
     };
     const r = await hostsProbe({ ...ctx({ run }), metrics: {} } as ProbeContext);
-    expect(r.value).toBe('local 0.50/core · node-b 0.30/core · minim5 unmeasured(Connection timed out) · mbp unmeasured(Connection timed out)');
+    // the probe list is the registry's pregate hosts (code defaults when no ledger: minim5 · mbp · node-b · node-c)
+    expect(r.value).toBe('local 0.50/core · minim5 unmeasured(Connection timed out) · mbp unmeasured(Connection timed out) · node-b 0.30/core · node-c unmeasured(Connection timed out)');
   });
 
   test('last decisions: decisions appended since the previous snapshot with before→after numbers', async () => {

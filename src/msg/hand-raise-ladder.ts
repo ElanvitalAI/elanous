@@ -24,6 +24,7 @@
 //   인지 = isHandRaiseMail (refs block: ⊕ reason:) · handClosedOn (outcome / escalation / reply rows) · federation ladder
 //   수복과 인계 = auto-escalation one level per 10 min up to the CEO card · bulk same-rule item · wait preemption
 
+import { liveWipTakeoverRule } from '../seat/seat-assign-wip1.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { canonicalMessageAddress, type Message, type MessageEnvelope, type MsgStore } from './msg-store.js';
@@ -340,6 +341,8 @@ export interface HandOutcomeResult {
   readonly to: string;
   readonly mailId: number | null;
   readonly output: string;
+  /** The seat that gave the outcome (FED-FACT-OP-ACTIONS: the decision fact's by). */
+  readonly by?: string;
 }
 
 const minutes = (ms: number): number => Math.max(0, Math.floor(ms / 60_000));
@@ -375,9 +378,9 @@ export function appendOnce(store: MsgStore, key: string, envelope: () => Message
 }
 
 /** Forward ✋ `hand` to `to` exactly once (provenance `hand-escalate:<id>`). Returns the forward and whether this call wrote it. */
-function forwardOnce(store: MsgStore, hand: HandMail, to: string, text: string, auto: boolean, waitedMs: number, deps: HandLadderDeps, members?: readonly HandMail[]): { mail: Message; fresh: boolean } {
+export function forwardOnce(store: MsgStore, hand: HandMail, to: string, text: string, auto: boolean, waitedMs: number, deps: HandLadderDeps, members?: readonly HandMail[], extraRefs: readonly string[] = []): { mail: Message; fresh: boolean } {
   const key = `hand-escalate:${hand.id}`;
-  const also = (members ?? []).filter((m) => m.id !== hand.id).map((m) => `hand-escalated-from:${m.id}`);
+  const also = [...(members ?? []).filter((m) => m.id !== hand.id).map((m) => `hand-escalated-from:${m.id}`), ...extraRefs];
   if (to !== HAND_CEO) return appendOnce(store, key, () => { const env = escalationEnvelope(store, hand, to, text, auto, waitedMs); return { ...env, refs: [...(env.refs ?? []), ...also] }; });
   const root = rootOf(store, hand);
   const written = appendOnce(store, key, () => ({
@@ -418,7 +421,7 @@ export function applyHandOutcome(store: MsgStore, input: { msgId: number; action
     const to = deps.ladder.parentOf(hand.receiver);
     const { mail } = forwardOnce(store, hand, to, text, false, deps.now() - hand.createdAtMs, deps);
     safeLog(deps, 'needhuman.escalated', { msgId: hand.id, from: hand.receiver, to, mailId: mail.id, auto: false });
-    return { action: 'escalate', msgId: hand.id, to, mailId: mail.id,
+    return { action: 'escalate', msgId: hand.id, to, mailId: mail.id, by,
       output: to === HAND_CEO ? `✋ #${hand.id} escalated to the CEO (decision card) · copy #${mail.id} to ${HAND_CEO_COPY_TO}` : `✋ #${hand.id} escalated to ${to} as #${mail.id}` };
   }
   const root = rootOf(store, hand);
@@ -450,7 +453,7 @@ export function applyHandOutcome(store: MsgStore, input: { msgId: number; action
     } catch { /* the outcome row is the fact; the copy is a courtesy */ }
   }
   safeLog(deps, input.action === 'resolve' ? 'needhuman.resolved' : 'needhuman.rejected', { msgId: hand.id, rootId: root.id, seat: by, to: root.sender, mailId: mail.id });
-  return { action: input.action, msgId: hand.id, to: root.sender, mailId: mail.id, output: `✋ #${hand.id} ${input.action === 'resolve' ? 'resolved' : 'rejected'} → ${root.sender} #${mail.id}` };
+  return { action: input.action, msgId: hand.id, to: root.sender, mailId: mail.id, by, output: `✋ #${hand.id} ${input.action === 'resolve' ? 'resolved' : 'rejected'} → ${root.sender} #${mail.id}` };
 }
 
 // ── the timer (stateless sweep) ───────────────────────────────────────────────────────────────
@@ -774,7 +777,9 @@ export const beaconLine = (r: Pick<BeaconReport, 'open' | 'oldestMin' | 'escalat
 export const HAND_STANDARD_ANSWERS: readonly string[] = [
   'continue on top of PR #<n> (owner = the blocked seat · deadline = now+30m)',
   'coordinate: send ONE mail to the current writer, then proceed in 30 min whatever the answer',
-  'new branch from origin/main — keep the uncommitted files, do not touch them',
+  // WIP1-ASSIGN-GUARD (OP 11-27): was «keep the uncommitted files, do not touch them» — TC sent 45 of those, overriding the
+  // OPS-RULES takeover rule. Now the answer states the takeover rule (values: graphs/policies/seat-assign.yaml).
+  `uncommitted WIP in the way: ${liveWipTakeoverRule()}`,
   'policy: auto — RES/REL are absorbed (eln res policy), never wait for them',
 ];
 

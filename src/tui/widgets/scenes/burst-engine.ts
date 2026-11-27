@@ -19,7 +19,8 @@ export const BOARD_LANES = [
   { label: 'Hands', lanes: ['hands', 'remote'] as PlannerLane[], pressureLane: 'hands' as PlannerLane },
   { label: 'Review', lanes: ['review'] as PlannerLane[], pressureLane: 'review' as PlannerLane },
   { label: 'Pregate', lanes: ['pregate'] as PlannerLane[], pressureLane: 'pregate' as PlannerLane },
-  { label: 'Judge', lanes: ['judge'] as PlannerLane[], pressureLane: 'judge' as PlannerLane },
+  // JUD-RELAX (CEO 11-26): JUD keeps the veto only — the lane shows active vetoes (holds), never a judgement wait.
+  { label: 'Veto', lanes: ['judge'] as PlannerLane[], pressureLane: 'judge' as PlannerLane },
   { label: 'Land', lanes: ['land'] as PlannerLane[], pressureLane: 'land' as PlannerLane },
 ] as const;
 

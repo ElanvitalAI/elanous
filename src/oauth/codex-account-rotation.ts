@@ -121,6 +121,9 @@ interface RotationInput {
   /** SUBSCRIPTION-EXHAUST-REROUTE (`llm.codexCreditReserve`) — 크레딧 잔액이 이 값 «이하»면 크레딧을 쓰지 않는다.
    *  ⛔ 없으면 종전(잔액 > 0 이면 쓴다). 잔액을 «모르면» 이 값으로 막지 않는다(fail-open). */
   readonly creditReserve?: number;
+  /** CODEX-CREDIT-ACCOUNTS (`llm.codexCreditAccounts` · resource facts `creditAccounts.openai-codex`) — 유료 크레딧을 쓸 수 있는
+   *  계정만. 목록 밖 계정은 구독 전용(창이 차면 멈춘다 · 크레딧으로 머물지 않는다). 없으면 종전(잔액 확인된 모든 계정). */
+  readonly creditAccounts?: readonly string[];
 }
 
 /**
@@ -271,7 +274,7 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
     if (input.creditPace?.active) {
       const self = input.candidates.find((candidate) => candidate.name === input.current.name);
       const eligible = (name: string, balance: number | undefined, hasCredits: boolean | undefined, home: string | undefined): boolean =>
-        !!home?.trim() && typeof balance === 'number' && Number.isFinite(balance) && balance > 0
+        codexCreditAccountAllowed(name, input.creditAccounts) && !!home?.trim() && typeof balance === 'number' && Number.isFinite(balance) && balance > 0
         && hasCredits !== false && accountThresholds.some((row) => row.name === name
           && (row.status === 'reached' || row.status === 'threshold-reached'));
       const currentBalance = input.currentCreditBalance ?? self?.creditBalance;
@@ -292,19 +295,23 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
       const reserve = typeof input.creditReserve === 'number' && Number.isFinite(input.creditReserve) && input.creditReserve >= 0
         ? input.creditReserve : undefined;
       const floor = reserve ?? 0;
+      // CODEX-CREDIT-ACCOUNTS — 목록 밖 계정은 크레딧 후보가 아니다(구독 전용).
+      const allowed = (name: string): boolean => codexCreditAccountAllowed(name, input.creditAccounts);
       const richest = otherCandidates
-        .filter((c) => c.home.length > 0 && c.hasCredits !== false && typeof c.creditBalance === 'number' && c.creditBalance > floor)
+        .filter((c) => allowed(c.name) && c.home.length > 0 && c.hasCredits !== false && typeof c.creditBalance === 'number' && c.creditBalance > floor)
         .sort((a, b) => (b.creditBalance! - a.creditBalance!) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))[0];
       // 지금 계정 신호를 귀속할 수 없을 때(기본 계정 `source=default`)는 후보 목록의 같은 이름 줄을 쓴다 —
       //   후보는 같은 홈 해석으로 신호를 읽었다(09-28 운영: default 가 «사용=? · 찼나=모름»이라 잔액을 못 봐 머물렀다).
       const self = input.candidates.find((c) => c.name === input.current.name);
       const cur = input.currentCreditBalance ?? self?.creditBalance;
       const curHas = input.currentHasCredits ?? self?.hasCredits;
-      const currentDry = !currentHealthy || curHas === false || (typeof cur === 'number' && cur <= floor);
+      const currentAllowed = allowed(input.current.name);
+      const currentDry = !currentHealthy || !currentAllowed || curHas === false || (typeof cur === 'number' && cur <= floor);
       if (richest && (currentDry || (typeof cur === 'number' && richest.creditBalance! > cur * 1.2))) {
         return { reason: 'rotated', candidateCount, accountThresholds, to: richest, creditEntry: true };
       }
-      if (!currentHealthy) return { reason: 'no-candidate', candidateCount, accountThresholds };
+      // 목록 밖 지금 계정에 머물면 서버가 그 계정 크레딧으로 넘긴다 — 갈 곳이 없으면 «후보 없음»(폴백 체인이 정한다).
+      if (!currentHealthy || !currentAllowed) return { reason: 'no-candidate', candidateCount, accountThresholds };
       // 🩸 10-11: 크레딧이 0 이 돼도 여기 머물러 codex 로 계속 쐈다. 잔액이 «알려져 있고» 예비분 이하이며
       //   예비분을 넘는 다른 계정도 없으면 «갈 곳 없음» — 폴백 체인이 다음 칸을 정한다. 모르면 종전대로 머문다.
       if (reserve !== undefined && typeof cur === 'number' && Number.isFinite(cur) && cur <= reserve) {
@@ -322,13 +329,18 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
  *  여기 두는 이유: Pod 계획(pod-account-broker)이 store 를 끌어오지 않고 같은 값을 쓴다. */
 export const CODEX_CREDIT_RESERVE_DEFAULT = 2000;
 
+/** CODEX-CREDIT-ACCOUNTS — 이 계정이 유료 크레딧을 쓸 수 있나. 목록이 없으면 예(종전). 목록 해석은 `codex-credit-accounts.ts`. */
+export function codexCreditAccountAllowed(name: string, allow: readonly string[] | undefined): boolean {
+  return allow === undefined || allow.includes(name);
+}
+
 /** CODEX-CREDITS-STEP — 크레딧 잔액이 «확인된» 후보(잔액 > 예비분 · 보유 ≠ false · 홈을 안다)를 잔액 많은 순으로.
  *  잔액을 모르면 넣지 않는다(돈 · fail-closed). 회전 수집기와 Pod 계획이 «같은 자»를 쓴다. */
-export function creditCandidatesByBalance(candidates: readonly RotationCandidate[], reserve = 0): RotationCandidate[] {
+export function creditCandidatesByBalance(candidates: readonly RotationCandidate[], reserve = 0, allow?: readonly string[]): RotationCandidate[] {
   // SUBSCRIPTION-EXHAUST-REROUTE — 잔액이 예비분(`llm.codexCreditReserve`) «초과»인 계정만(0 = 종전 > 0).
   const floor = Number.isFinite(reserve) && reserve >= 0 ? reserve : 0;
   return candidates
-    .filter((c) => c.home.length > 0 && c.hasCredits !== false
+    .filter((c) => codexCreditAccountAllowed(c.name, allow) && c.home.length > 0 && c.hasCredits !== false
       && typeof c.creditBalance === 'number' && Number.isFinite(c.creditBalance) && c.creditBalance > floor)
     .sort((a, b) => (b.creditBalance! - a.creditBalance!) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }

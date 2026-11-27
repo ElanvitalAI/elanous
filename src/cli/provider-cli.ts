@@ -255,6 +255,7 @@ export function registerProviderCommands(program: Command): void {
       if (opts.json) {
         await writeStdoutJson(JSON.stringify({
           policy: { value: s.policy.policy, source: s.policy.source },
+          creditAccounts: s.creditAccounts ?? null,
           creditPlan,
           universe: {
             instanceRoot, signalDir, authStore: authStorePath(),
@@ -301,6 +302,11 @@ export function registerProviderCommands(program: Command): void {
       const policySource = s.policy.source === 'legacy-credits' ? ' · 옛 codexCreditsAllowed 에서'
         : s.policy.source === 'default' ? ' · 기본값' : '';
       console.log(`정책      ${s.policy.policy} (${CODEX_QUOTA_POLICY_LABEL[s.policy.policy]} · llm.codexQuotaPolicy)${policySource}`);
+      // CODEX-CREDIT-ACCOUNTS — 크레딧을 쓸 수 있는 계정(목록 밖은 구독 전용 · 창이 차면 멈춘다).
+      const ca = s.creditAccounts;
+      console.log(ca?.names === undefined
+        ? '크레딧계정 (제한 없음 — 잔액 확인된 모든 계정 · llm.codexCreditAccounts)'
+        : `크레딧계정 ${ca.names.length ? ca.names.join(' · ') : '(없음 — 모두 구독 전용)'}  (${ca.source === 'policy-pack' ? 'policy pack llm-accounts (eln policy explain llm-accounts)' : ca.source === 'resource-facts' ? 'resource facts creditAccounts.openai-codex' : ca.source === 'read-error' ? '판독 실패 → 크레딧 ✗(fail-closed)' : 'llm.codexCreditAccounts'} · 나머지는 구독 전용)`);
       for (const line of formatCodexCreditPlan(creditPlan)) console.log(line);
       console.log(`지금 계정 ${s.current.name}  (source=${s.current.source})`);
       console.log(`          홈=${s.currentHome ?? '(모름)'}  사용=${s.currentUsedPercent ?? '?'}%  찼나=${s.currentReached ?? '모름'}  신호=${ageOf(s.currentHome)}  크레딧=${creditText(s.currentCreditBalance, s.currentHasCredits)}`);

@@ -1,6 +1,7 @@
 import { realpathSync, statSync } from 'node:fs';
 import { isAbsolute, extname, relative, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
+import { resolveDevRepoRoot } from '../loops/throughput-controller-live.js';
 import { notifyMissionDocument, notifyMissionOrigin } from '../autopilot/mission-notify.js';
 import type { MissionOrigin } from '../autopilot/mission-origin.js';
 import { redactSecrets } from '../task-cards/card-store.js';
@@ -16,6 +17,8 @@ export interface OutcomeNotifyDeps {
   document?: typeof notifyMissionDocument;
   message?: typeof notifyMissionOrigin;
   worktreeCommand?: (args: string[]) => { exitCode: number; stdout: string };
+  /** Development-repo resolver. Default is resolveDevRepoRoot. Injected commands skip this lookup. */
+  resolveRepo?: () => string | null;
 }
 
 const EXTENSIONS = new Set(['.md', '.pdf', '.png', '.jpg', '.csv', '.txt', '.html', '.json']);
@@ -25,10 +28,17 @@ function localArtifact(outcome: LaunchEntry, deps: OutcomeNotifyDeps): string | 
   const ref = outcome.artifactRef;
   const branch = outcome.artifactBranch;
   if (!ref || !branch || isAbsolute(ref) || !EXTENSIONS.has(extname(ref).toLowerCase())) return null;
-  const command = deps.worktreeCommand ?? ((args: string[]) => {
-    const result = Bun.spawnSync(args, { cwd: resolve(import.meta.dir, '../..'), stdout: 'pipe', stderr: 'pipe' });
-    return { exitCode: result.exitCode, stdout: result.stdout.toString() };
-  });
+  let command = deps.worktreeCommand;
+  if (!command) {
+    let repo: string | null = null;
+    try { repo = (deps.resolveRepo ?? resolveDevRepoRoot)(); } catch { repo = null; }
+    if (!repo) return null;
+    const cwd = repo;
+    command = (args: string[]) => {
+      const result = Bun.spawnSync(args, { cwd, stdout: 'pipe', stderr: 'pipe' });
+      return { exitCode: result.exitCode, stdout: result.stdout.toString() };
+    };
+  }
   try {
     const result = command(['git', 'worktree', 'list', '--porcelain']);
     if (result.exitCode !== 0) return null;

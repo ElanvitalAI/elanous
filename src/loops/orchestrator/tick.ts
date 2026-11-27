@@ -12,7 +12,7 @@ import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { getUserConfig, ORCHESTRATOR_DEFAULTS, resolveConfiguredAgentRoleLlm, type OrchestratorLoopConfig } from '../../user-config.js';
 import { rubricPriority } from '../../release-loop/rubric.js';
 import { debug, debugLogDir } from '../../debug/log.js';
-import { emitLoopHeartbeat } from '../neighbor-runtime.js';
+import { emitSignal } from '../../kit/heartbeat/index.js';
 import { ConsensusEngine } from '../consensus.js';
 import { listSelfDevRuns, runSummaryLine, selfDevRunsDir } from '../../self-dev/run-store.js';
 import { planAction, runSeatLoopOnce, type SeatDeps, type SeatItem } from '../../seat-loop/seat-loop.js';
@@ -557,8 +557,8 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
   const configured = deps.mode ?? orchestratorConfig?.mode;
   const mode: Mode = configured === 'off' || configured === 'live' ? configured : 'shadow';
   const pulse = (health: 'healthy' | 'degraded', at: Date): void => {
-    try { emitLoopHeartbeat(root, 'orchestrator', health, at,
-      new Date(nextOrchestratorWindowAt(at).getTime() + ORCHESTRATOR_LEASE_GRACE_MS).toISOString()); }
+    try { emitSignal(root, 'orchestrator', health, at,
+      new Date(nextOrchestratorWindowAt(at).getTime() + ORCHESTRATOR_LEASE_GRACE_MS).toISOString(), 60); }
     catch (error) { debug.log('loop.orchestrator', 'heartbeat-failed', { error: String(error).slice(0, 200) }, { level: 'warn' }); }
   };
   if (mode !== 'off') pulse('healthy', now);

@@ -3,7 +3,9 @@ import type { UserConfig } from '../../user-config/types.js';
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 type JsonObject = { [key: string]: JsonValue };
-type SnapshotSource = 'host-effective' | 'runtime';
+/** `host-resource-facts` / `host-read-error` — CODEX-CREDIT-ACCOUNTS: the host's effective credit list came from its
+ *  resource facts (or failed closed), not from its config — the Pod has no policy file, so the value is carried here. */
+type SnapshotSource = 'host-effective' | 'runtime' | 'host-resource-facts' | 'host-read-error';
 type Allowlist = { readonly [key: string]: true | Allowlist };
 
 const ROLE = { provider: true, tier: true, model: true, effort: true } as const;
@@ -11,7 +13,7 @@ const ROLE = { provider: true, tier: true, model: true, effort: true } as const;
 const POD_CONFIG_ALLOWLIST = {
   llm: {
     provider: true, model: true, streamIdleTimeoutMs: true,
-    codexAccountRotation: true, codexQuotaPolicy: true, codexCreditReserve: true,
+    codexAccountRotation: true, codexQuotaPolicy: true, codexCreditReserve: true, codexCreditAccounts: true,
     grokWeeklyCapPct: true, fallbackChain: true,
     zaiCodingPlan: { overage: true, maxConcurrent: true },
     openrouter: { fallbackModel: true },
@@ -76,6 +78,12 @@ export function buildPodConfigSnapshot(config: UserConfig, runtime: {
   steps: readonly string[];
   overage: 'stop' | 'balance' | 'openrouter';
   worktreeAddTimeoutSec: number;
+  /** CODEX-CREDIT-ACCOUNTS — the host's EFFECTIVE credit allow list (resource facts ⊕ config · fail-closed on read error).
+   *  When given it replaces the config value, so the child applies the same list as the host. */
+  creditAccounts?: { readonly names: readonly string[] | undefined; readonly source: 'policy-pack' | 'resource-facts' | 'config' | 'absent' | 'read-error' };
+  /** LLM-ACCOUNT-POLICY-YAML — the policy revision and phase the host decided with (evidence in the envelope; the Pod
+   *  applies the effective values carried in `keys`, never a pack of its own). */
+  policyStamp?: { readonly revision: string | null; readonly phase: string };
 }): {
   version: 1;
   keys: JsonObject & { llm: JsonObject; harness: JsonObject };
@@ -110,14 +118,22 @@ export function buildPodConfigSnapshot(config: UserConfig, runtime: {
   zai.overage = runtime.overage;
   keys.llm.zaiCodingPlan = zai;
   keys.harness.worktreeAddTimeoutSec = runtime.worktreeAddTimeoutSec;
+  if (runtime.creditAccounts) {
+    if (runtime.creditAccounts.names === undefined) delete keys.llm.codexCreditAccounts;
+    else keys.llm.codexCreditAccounts = [...runtime.creditAccounts.names];
+  }
   const canonicalKeys = canonical(keys) as JsonObject & { llm: JsonObject; harness: JsonObject };
   const sources: Record<string, SnapshotSource> = {};
   sourcesOf(canonicalKeys, '', sources);
   sources['llm.fallbackChain'] = 'runtime';
   sources['llm.zaiCodingPlan.overage'] = 'runtime';
   sources['harness.worktreeAddTimeoutSec'] = 'runtime';
+  if (runtime.creditAccounts?.names !== undefined) {
+    sources['llm.codexCreditAccounts'] = runtime.creditAccounts.source === 'resource-facts' || runtime.creditAccounts.source === 'policy-pack' ? 'host-resource-facts'
+      : runtime.creditAccounts.source === 'read-error' ? 'host-read-error' : 'host-effective';
+  }
   const version = 1 as const;
-  const body = { version, keys: canonicalKeys, sources };
+  const body = { version, keys: canonicalKeys, sources, ...(runtime.policyStamp ? { policy: { pack: 'llm-accounts', ...runtime.policyStamp } } : {}) };
   const hash = createHash('sha256').update(JSON.stringify(body)).digest('hex');
   return { ...body, hash, envelopeJson: JSON.stringify({ ...body, hash }), configJson: JSON.stringify(canonicalKeys), keyCount: Object.keys(sources).length };
 }

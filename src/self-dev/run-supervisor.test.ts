@@ -852,7 +852,7 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     expect(d.action).toBe('stop');
     expect(d.stopReason).toBe('decomposable-no-progress');
     expect(d.stopReason).not.toBe('no-progress');
-    expect(d.why).toBe('2라운드 연속 제자리지만 분해 제안이 있다 — 결제 흐름을(를) 조각 2개로: API 분리 · UI 분리');
+    expect(d.why).toBe('2라운드 연속 제자리지만 분해 제안이 있다 — 결제 흐름을(를) 조각 2개로: API 분리 · UI 분리 · CORE(루브릭 행동 묶음 1): API 분리 · FU: UI 분리');
   });
 
   test('수리 조각만 있으면 taskId를 직접 보존하고 add-repair-task로 판정한다', () => {

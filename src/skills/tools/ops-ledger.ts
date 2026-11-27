@@ -1,3 +1,6 @@
+import { isProxySeat } from '../../msg/proxy-lane.js';
+import { routeAtEntrance } from '../../kit/mail-route/entrance.js';
+import { handAskReference } from '../../kit/mail-route/hand-dedupe.js';
 import { randomUUID } from 'node:crypto';
 import type { LLMToolSpec } from '../../llm/tool-spec.js';
 import { parseApplyField, recordAnnounceApply } from '../../msg/announce.js';
@@ -232,12 +235,16 @@ export function buildMsgListTool(): LLMToolSpec {
     description:
       'List durable seat-addressed messages for one recipient WITHOUT acknowledging them — the same SQLite ledger as `elanous msg list`, in-process (no CLI startup). ' +
       'Reading never advances the acknowledgement cursor; pass an explicit `after` to page beyond it. `ALL` recipients also see broadcast messages. ' +
+      'ONE CALL RETURNS AT MOST `limit` MESSAGES (coordinator seats: 10) — it is a page, not the whole inbox. The result carries `total` (messages in this view, ' +
+      'by default «unacked in inbox»), `hasMore` and `nextCursor`: returned < total means more remain — call again with `cursor: nextCursor` (a history view read with `after`: `after: nextCursor`) to read the next page. ' +
+      'The TUI footer «📩 N held in TUI queue» counts a different thing (mail waiting inside this TUI until the current work finishes) — never compare it with `total`. ' +
       'Pair with MsgPost to reply and MsgAck to advance the cursor.',
     parameters: {
       type: 'object',
       properties: {
         to: { type: 'string', description: 'Recipient seat: OP · MK · TC · UX · ALL or another canonical seat id.' },
         after: { type: 'integer', description: 'Exclusive message ID to page beyond; leave out (or 0) to start at the recipient’s acknowledged cursor.' },
+        cursor: { type: 'integer', description: 'Continue the SAME view from a previous result’s `nextCursor` (keeps the unacked-only filter, unlike `after`).' },
         includeAcknowledged: { type: 'boolean', description: 'true = start from the first message, including ones already acknowledged.' },
         limit: { type: 'integer', description: 'Maximum messages to return, 1–1000 (default 100).' },
       },
@@ -253,8 +260,17 @@ export interface MsgListResult extends Record<string, unknown> {
   recipient: string;
   after: number;
   count: number;
+  /** Messages in this view from `after` on (lower bound when `totalCapped`) — `count < total` means more remain. */
+  total: number;
+  totalCapped: boolean;
+  hasMore: boolean;
+  /** Pass as `cursor` to read the next page of the same view (as `after` for a history view read with `after`); null when nothing remains. */
+  nextCursor: number | null;
   messages: Message[];
 }
+
+/** Upper bound of one counting scan; a view this large reports `totalCapped`. */
+const MSG_LIST_COUNT_SCAN = 1000;
 
 export async function dispatchMsgList(rawArgs: Record<string, unknown>, deps: MsgLedgerDeps = {}): Promise<MsgListResult> {
   // MSG-FILTERS-RELAX: any seat's mailbox (sub-seat · pane · session included) can be read — reading never acks.
@@ -265,18 +281,35 @@ export async function dispatchMsgList(rawArgs: Record<string, unknown>, deps: Ms
   const after = rawArgs.after === undefined || rawArgs.after === null || rawArgs.after === 0
     ? undefined
     : integerArg(rawArgs.after, 'after', 1, Number.MAX_SAFE_INTEGER);
+  // `cursor` continues the same view (a page boundary); unlike `after` it never switches to the history view.
+  const cursor = rawArgs.cursor === undefined || rawArgs.cursor === null || rawArgs.cursor === 0
+    ? undefined
+    : integerArg(rawArgs.cursor, 'cursor', 1, Number.MAX_SAFE_INTEGER);
   const store = deps.openStore?.() ?? openMsgStore();
   try {
-    const start = after ?? (rawArgs.includeAcknowledged === true ? 0 : store.getCursor(to));
+    const includeAcked = rawArgs.includeAcknowledged === true || after !== undefined;
+    const start = cursor ?? after ?? (rawArgs.includeAcknowledged === true ? 0 : store.getCursor(to));
     // includeAcknowledged or an explicit `after` reads history: per-message acks — now also written by MsgAck's «seen» (§4c) —
     // must not hide it. The default (from the cursor) still shows only what is not acknowledged.
-    const messages = store.list(to, start, limit, { includeAcked: rawArgs.includeAcknowledged === true || after !== undefined });
+    // OP 11-26: a 10-message page was read as «the whole inbox» — one scan counts the view so the page says what remains.
+    const view = store.list(to, start, Math.max(limit, MSG_LIST_COUNT_SCAN), { includeAcked });
+    const messages = view.slice(0, limit);
+    const total = view.length;
+    const totalCapped = total >= MSG_LIST_COUNT_SCAN && limit < total;
+    const hasMore = total > messages.length;
+    const nextCursor = hasMore ? messages[messages.length - 1]!.id : null;
+    const noun = includeAcked ? 'message(s)' : 'unacked in inbox';
+    const more = hasMore ? ` — ${totalCapped ? `${MSG_LIST_COUNT_SCAN}+` : total - messages.length} more remain: call again with ${after !== undefined && cursor === undefined ? 'after' : 'cursor'}=${nextCursor}` : ' — that is all';
     return {
-      output: `MsgList ${to}: ${messages.length} message(s) after #${start}`,
+      output: `MsgList ${to}: ${messages.length} of ${totalCapped ? `${MSG_LIST_COUNT_SCAN}+` : total} ${noun} after #${start}${more}`,
       ok: true,
       recipient: to,
       after: start,
       count: messages.length,
+      total,
+      totalCapped,
+      hasMore,
+      nextCursor,
       messages,
     };
   } finally {
@@ -355,6 +388,12 @@ export async function dispatchMsgPost(rawArgs: Record<string, unknown>, deps: Ms
   if (envelope.from.toUpperCase() === 'OP' && envelope.intent === 'request' && watch === undefined && waitForPr === undefined)
     throw new Error("OP request needs 'watch' (the done-when outcome: cell-status:<id>=<status> · pr-merged:<n> · pregate-receipt:<n> · seat-idle:<SEAT> · file-exists:<path>) — a sent request or a reply is not the outcome");
   if (watch !== undefined) envelope.body = withWatchFooter(envelope.body, watch);
+  // DORMANT-ADDRESS REROUTE — an address with no live tab (RES · REL · REVIEW-2 · JUD-2 · ORCHESTRATOR) → its live reader.
+  // KIT mail-route entrance — ✋ hand routing by root, then dormant reroute with the live probe (LA-R2 · #191271).
+  const moves = await routeAtEntrance(envelope);
+  for (const move of moves) {
+    try { debug.log(move.kind === 'hand-route' ? 'msg.hand-route' : 'msg.dormant-reroute', 'rerouted', { from: envelope.from, to: move.to, into: move.into, ...(move.digest === undefined ? {} : { digest: move.digest }), ...(move.root ? { root: move.root } : {}) }); } catch { /* fail-open */ }
+  }
   // #38516 r2 MF3: recovery names THIS attempt's commit by its token — never an older identical row.
   const attemptToken = randomUUID();
   const store = deps.openStore?.() ?? openMsgStore();
@@ -370,23 +409,30 @@ export async function dispatchMsgPost(rawArgs: Record<string, unknown>, deps: Ms
     // MAIL-ANTI-FLOOD E·F·G — tag kind ⊕ needsReply from structure, divert self-mail / coach injections, fold into a
     // saturated receiver's digest. A diverted post writes no row.
     const needsReply = typeof rawArgs.needsReply === 'boolean' ? rawArgs.needsReply : undefined;
-    const gate = gatePost({ envelope: threaded, entrance: 'tool', ...(needsReply === undefined ? {} : { needsReply }), ...senderAboveOf(threaded.from, threaded.to) },
+    // CLAUDE-OP-PROXY-LANE — the MsgPost tool runs inside an eln seat, never in the proxy's process: a proxy sender
+    // claimed here is not the proxy (proxyVerified false → coach note, no lane).
+    const gate = gatePost({ envelope: threaded, entrance: 'tool', ...(needsReply === undefined ? {} : { needsReply }), ...senderAboveOf(threaded.from, threaded.to),
+      ...(isProxySeat(threaded.from) ? { proxyVerified: false } : {}) },
       storeGateDeps(store, deps.divertedRoot ?? divertedRootForStore(store.storePath)));
     if (gate.action === 'refuse') throw new Error(gate.error);
     if (gate.action === 'divert') return { output: `MsgPost ${threaded.from} → ${threaded.to} · ${gate.line}`, ok: true, diverted: gate.ledger };
     threaded.kind = gate.envelope.kind;
     envelope.kind = gate.envelope.kind;
     if (gate.envelope.needsAck !== undefined) threaded.needsAck = gate.envelope.needsAck;
+    if (gate.envelope.refs !== undefined) threaded.refs = gate.envelope.refs;
     // ELN-MSG-POST-IDEMPOTENT: the sender idempotency key — a retried identical post returns the stored message.
-    try { posted = store.post(threaded, { dedupe: true, attemptToken }); }
+    try { posted = store.post(threaded, { dedupe: true, attemptToken }); gate.laneCommit?.(); }
     catch (error) {
       // Ambiguous write (lock/I-O around COMMIT): read by the key before calling it a failure. A validation refusal
       // stored nothing — rethrow it unread.
-      if (!/database is locked|SQLITE_BUSY|SQLITE_IOERR|disk I\/O|database is busy/i.test(error instanceof Error ? error.message : String(error))) throw error;
+      if (!/database is locked|SQLITE_BUSY|SQLITE_IOERR|disk I\/O|database is busy/i.test(error instanceof Error ? error.message : String(error))) { gate.laneCancel?.(); throw error; }
       const landed = (() => { try { return store.findPostByAttempt(attemptToken); } catch { return null; } })();
-      if (landed === null) throw error;
+      if (landed === null) { gate.laneCancel?.(); throw error; }
+      gate.laneCommit?.();
       posted = landed;
     }
+    // HAND-RAISE-DOMAIN-ROUTING — the same ✋ ask inside the window: the model reads the first row's answer (or «still open»).
+    if (posted.handAskRepeat) applyNote += ` · ${handAskReference(store, posted).line}`;
     // ANNOUNCE-UPTAKE — the reply's apply field is the seat's «applied» event (fail-open: the reply is stored).
     if (apply !== null && posted.replyTo !== undefined) {
       try { if (recordAnnounceApply(store.db, { seat: posted.from, messageId: posted.replyTo, line: apply, viaMessageId: posted.id }) === null) applyNote = ` · apply ignored: #${posted.replyTo} is not an announce`; }
@@ -396,13 +442,13 @@ export async function dispatchMsgPost(rawArgs: Record<string, unknown>, deps: Ms
     try { store.close(); } catch { /* the write already committed or already failed; closing never changes that */ }
   }
   let followUp: MsgPostResult['followUp'];
-  if (watch !== undefined || envelope.intent === 'request' || envelope.intent === 'decision') {
+  if (posted.id !== 0 && (watch !== undefined || envelope.intent === 'request' || envelope.intent === 'decision')) {
     try { followUp = await (deps.followUp ?? armMessageFollowUp)(posted, waitForPr, undefined, watch === undefined ? undefined : formatWaitCondition(watch)); }
     catch (error) { followUp = { error: error instanceof Error ? error.message : String(error) }; }
   }
   const suggestedWatch = watch === undefined ? suggestWatch({ kind: envelope.kind, waitForPr }) ?? undefined : undefined;
   return {
-    output: `MsgPost #${posted.id} ${posted.from} → ${posted.to}${posted.deduped ? ' · deduped: already stored, no new row' : ''}${followUp ? 'error' in followUp ? ' · follow-up failed; retry or schedule manually' : ` · ${followUp.watch ? 'watch' : 'follow-up'} ${followUp.condition}` : ''}${suggestedWatch ? ` · suggest watch ${suggestedWatch} (outcome instead of a reply)` : ''}${applyNote}`,
+    output: `${moves.map((move) => `${move.note} · `).join('')}${posted.digested !== undefined && posted.id === 0 ? `MsgPost ${posted.from} → OP · parked for the 30-min digest (item ${posted.digested})` : `MsgPost #${posted.id} ${posted.from} → ${posted.to}`}${posted.deduped ? ' · deduped: already stored, no new row' : ''}${followUp ? 'error' in followUp ? ' · follow-up failed; retry or schedule manually' : ` · ${followUp.watch ? 'watch' : 'follow-up'} ${followUp.condition}` : ''}${suggestedWatch ? ` · suggest watch ${suggestedWatch} (outcome instead of a reply)` : ''}${applyNote}`,
     ok: true,
     message: posted,
     ...(followUp ? { followUp } : {}),

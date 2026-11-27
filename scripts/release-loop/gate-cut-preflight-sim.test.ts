@@ -103,7 +103,7 @@ test('synthetic cut commit routes a non-TypeScript diff through full-radius inva
   expect(roster.shards).toHaveLength(81);
   const shards = roster.shards;
   const tests = [...new Set(shards.flatMap((shard) => shard.files))].sort();
-  expect(tests).toHaveLength(6611);
+  expect(tests).toHaveLength(6608);
   const replayShards = shards;
   const replayTests = tests;
   const temp = mkdtempSync(join(tmpdir(), 'release-cut-production-replay-'));
@@ -235,8 +235,8 @@ export function sameGateTestedFileHashes(a?: Record<string, string>, b?: Record<
     expect(reused).toBe(0);
     expect(invalidated).toBe(81);
     const dispatchedFiles = dispatchedFilesByShard.flat();
-    expect(dispatchedFiles).toHaveLength(6611);
-    expect(new Set(dispatchedFiles).size).toBe(6611);
+    expect(dispatchedFiles).toHaveLength(6608);
+    expect(new Set(dispatchedFiles).size).toBe(6608);
     expect([...dispatchedFiles].sort()).toEqual(tests);
     console.log(`CUT-RADIUS-REPLAY ${priorCommit.slice(0, 8)}..${incidentCommit.slice(0, 8)} reason=changed-runtime-environment-input changedNonTs=${nonTs.length} tests=${tests.length} dispatchTests=${replayTests.length} receiptsReused=${reused}/81 radiusInvalidated=${invalidated}/81`);
   } finally {

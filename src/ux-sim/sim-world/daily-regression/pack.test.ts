@@ -12,9 +12,9 @@ const roots: string[] = [];
 const root = (prefix: string) => { const dir = mkdtempSync(join(tmpdir(), prefix)); roots.push(dir); return dir; };
 afterAll(() => { for (const dir of roots) rmSync(dir, { recursive: true, force: true }); });
 
-test('pack lists DR01–DR08, DR11, DR12, DR14, DR15, DR16, DR17 and DR18 as scenarios and DR01b/DR09/DR10 as pending (skip with reason)', () => {
-  expect(dailyRegressionScenarios.map((row) => row.id)).toEqual(['DR01', 'DR02', 'DR03', 'DR04', 'DR05', 'DR06', 'DR07', 'DR08', 'DR11', 'DR12', 'DR14', 'DR15', 'DR16', 'DR17', 'DR18']);
-  expect(dailyRegressionPending.map((row) => row.id)).toEqual(['DR01b', 'DR09', 'DR10']);
+test('pack lists DR01–DR08, DR11, DR12, DR14, DR15, DR16, DR17, DR18 and DR19 as scenarios and DR01b/DR09/DR10/DR13 as pending (skip with reason)', () => {
+  expect(dailyRegressionScenarios.map((row) => row.id)).toEqual(['DR01', 'DR02', 'DR03', 'DR04', 'DR05', 'DR06', 'DR07', 'DR08', 'DR11', 'DR12', 'DR14', 'DR15', 'DR16', 'DR17', 'DR18', 'DR19']);
+  expect(dailyRegressionPending.map((row) => row.id)).toEqual(['DR01b', 'DR09', 'DR10', 'DR13']);
 });
 
 for (const scenario of dailyRegressionScenarios) {
@@ -52,6 +52,13 @@ test('runner: pending rows print SKIP with the reason and do not fail the run', 
   const receipt = await runSimRegressionPack({ pack: 'daily-regression', stateRoot: root('dr-skip-'), only: 'DR09', runId: 'r3' });
   expect([receipt.ok, receipt.counts, formatSimRegressionLine(receipt.rows[0]!)]).toEqual([true, { pass: 0, fail: 0, skip: 1 },
     'SKIP DR09     0.0s  baton auto on restart: TC first, never both down, 3 mails during the gap not lost — #39942 not merged']);
+});
+
+test('DR13 (tab → space coordinator → OP chain) is pending with the gap named, and does not fail the run', async () => {
+  const receipt = await runSimRegressionPack({ pack: 'daily-regression', stateRoot: root('dr-dr13-'), only: 'DR13', runId: 'r13' });
+  expect(receipt.ok).toBe(true);
+  expect(receipt.rows.map((row) => [row.id, row.verdict])).toEqual([['DR13', 'SKIP']]);
+  expect(receipt.rows[0]!.detail).toContain('never by mail, doorbell or needs-person paths');
 });
 
 test('CLI door: unknown pack and pack+file are refused (exit 2); a pending-only run exits 0 with the receipt line', async () => {

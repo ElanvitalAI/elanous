@@ -53,7 +53,7 @@ export type AppBuildOutput = {
    *  needs_connection = 멤버 게이트(회원 연결·슬롯 없음 — 원문 code 보존). awaiting-approval = 승인 보류
    *  (세션-생존/재개 기계 없이 정직한 홀드 상태). rejected = 확인 거절·인자·원점 거부. failed = 실행 실패
    *  (실행기 부재 포함). started 는 이제 없다 — 실행 없이 «시작됨»을 위조하지 않는다. */
-  status: 'planned' | 'published' | 'needs_connection' | 'awaiting-approval' | 'rejected' | 'failed';
+  status: 'planned' | 'published' | 'needs_connection' | 'awaiting-approval' | 'rejected' | 'failed' | 'local-build';
   pluginId: string;
   graphId?: string;
   buildComplete: boolean;
@@ -62,6 +62,9 @@ export type AppBuildOutput = {
   needsConnection?: boolean;
   approvalHold?: string;
   error?: string;
+  /** APP-BUILD-LOCAL-PATH — local-build: the one truthful status line and the local run (workspace · URL · choices). */
+  message?: string;
+  local?: import('../graph-runner/app-build/local-build.js').LocalAppBuildOutput;
 };
 
 /** 시험·호스트 주입 실행기 — route adapter 의 dispatchGraph seam 과 같은 서명(재사용). */
@@ -70,6 +73,9 @@ export interface AppBuildDeps {
     context?: ToolRuntimeContext) => Promise<unknown>;
   /** 확인 주입(시험). 결과는 requestConfirmation 과 같은 형태(boolean 또는 {answer}) — 정규화해 읽는다. */
   requestConfirmation?: (opts: Parameters<typeof confirmOnChannels>[0]) => Promise<unknown>;
+  /** APP-BUILD-LOCAL-PATH — local hosts (agent CLI) only: app_build without a member connection builds locally
+   *  instead of ending at needs_connection. The daemon never passes it. */
+  localAppBuild?: (args: Record<string, unknown>) => Promise<import('../graph-runner/app-build/local-build.js').LocalAppBuildOutput>;
 }
 
 /** graph id 는 manifest handler(graph:app-build · graph:app-build-plan)에서 유도한다 — src 하드코딩은
@@ -195,6 +201,14 @@ export async function runAppBuild(
   // 멤버 게이트 — needs_connection 명시 상태. app_build 는 route adapter 와 같은 autofill 게이트
   // 전체(소유자·슬롯·ask), app_build_plan 은 그래프 라우트 공통 게이트(검증 소유자)를 쓴다.
   const owner = effectiveOwner(context);
+  if (!owner?.id && toolName === 'app_build' && deps?.localAppBuild) {
+    try {
+      const local = await deps.localAppBuild(args);
+      return { ...base, status: 'local-build', buildComplete: local.buildComplete, message: local.message, local };
+    } catch (error) {
+      return { ...base, status: 'failed', buildComplete: false, error: `local app build failed: ${String(error)}` };
+    }
+  }
   if (!owner?.id) {
     return needsConnection(
       toolName === 'app_build'

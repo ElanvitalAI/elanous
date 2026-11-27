@@ -38,10 +38,11 @@ import { createMeasuredTurnUsage, type MeasuredTurnUsage } from './turn-usage.js
 import { shouldFireTurnStartCompact, TURN_COMPACT_HISTORY_TOKENS } from './long-session-compact.js';
 import { compactSessionHistory } from './compact-session.js';
 import { resolveModelContextWindow } from '../models/context-window.js';
-import { KEEP_HUMAN_TURNS, isHumanSourceRow, resolveTurnInputCap, shouldCompactForWindow, trimKeepingRecentHumans, type TurnInputCap } from './turn-budget.js';
+import { applyBudgetFloor, KEEP_HUMAN_TURNS, isHumanSourceRow, resolveTurnInputCap, shouldCompactForWindow, stubTurnToolPayloads, trimKeepingRecentHumans, type TurnInputCap } from './turn-budget.js';
 import { CHAT_DEFAULTS } from '../user-config/chat.js';
 import type { CompactProvider } from '../compact/provider.js';
 import { clearNoOpBackoff, compactRegrowHeld, noOpBackoffHeld, recordCompactRegrowHold, recordNoOpBackoff } from '../compact/auto-state.js';
+import { attemptSessionRotation, recordNoOpRotation } from './session-rotation.js';
 import {
   buildTerminalCapableTurn,
   isTerminalCapableTurn,
@@ -604,12 +605,57 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     ? { cap: opts.maxTokens, prefixTokens: prefixTokensOf(wire), historyAllowance: Math.max(0, opts.maxTokens - prefixTokensOf(wire)), window: turnWindow }
     : resolveTurnInputCap({ window: turnWindow, prefixTokens: prefixTokensOf(wire), outputTokens });
   let turnInputCap = capFor(buildTurnWire(effectiveSystemPrompt)).cap;
+  // TURN-REQUEST-SIZE-LOSS (0.3.38 P0) — the window is in TOKENS, the Codex TUI wire has a hard CHARACTER cap
+  //   (`chat.requestSize.maxChars`). The two disagree by 2–4× (ASCII ≈ 4 chars a token), so a window trimmed to tokens
+  //   went out at 401–406k chars and the turn was refused (`request-size-limit-blocked`, 11-27: OP 7 · POOL-3 4 · …).
+  //   The trim measures the stricter of the two: wire characters scaled onto the token cap, against a char budget of
+  //   maxChars × trimTargetRatio minus the tool catalog (images are outside the text cap, as in llm.ts).
+  const requestCharBudget = meta.source === 'tui' && provider.name === 'openai-codex' && opts.maxTokens === undefined
+    ? (() => {
+        const policy = opts.userConfig.chat?.requestSize ?? CHAT_DEFAULTS.requestSize;
+        const toolChars = opts.tools && opts.tools.length > 0 ? JSON.stringify(opts.tools).length : 0;
+        return Math.max(1, Math.floor(policy.maxChars * policy.trimTargetRatio) - toolChars);
+      })()
+    : undefined;
+  const rowChars = new WeakMap<LLMMessage, number>();
+  const wireCharsOf = (row: LLMMessage): number => {
+    let chars = rowChars.get(row);
+    if (chars === undefined) {
+      chars = typeof row.content === 'string' ? JSON.stringify(row.content).length + 32
+        : row.content.reduce((sum, block) => sum + (block.type === 'image' || block.type === 'audio' || block.type === 'video' ? 0 : JSON.stringify(block).length), 32);
+      rowChars.set(row, chars);
+    }
+    return chars;
+  };
+  const budgetMeasure = (capTokens: number): ((rows: LLMMessage[]) => number) => requestCharBudget === undefined
+    ? estimateMessagesTokens
+    : (rows) => {
+        let chars = 0;
+        for (const row of rows) chars += wireCharsOf(row);
+        return Math.max(estimateMessagesTokens(rows), Math.ceil(chars * capTokens / requestCharBudget));
+      };
   // ⭐ ELN-COMPACT-REAL(OP #135458 §4-4①) — turn-start auto-compaction fires before the trim on
   //   the RECORD only (fixed prefix excluded): history 16k OR the whole measured input 60k,
   //   whichever comes first. The old request-as-sent basis (ratio × min(window, budget), clamped
   //   to the input cap) fired every turn on a large fixed prefix alone (audit W3). A caller with
   //   an explicit opts.maxTokens keeps its trim-only contract (no storage rewrite).
   const autoCompactCfg = opts.userConfig.chat?.autoCompact ?? CHAT_DEFAULTS.autoCompact;
+  // ★ CONTEXT-BUDGET-ROTATION(0.3.34) — 턴 경계 교대 시도(설계: 요청 조립 직전에만 발동).
+  //   이 지점은 현 턴의 provider 호출 전 경계다: 사람 행으로 열린 턴이면 attemptSessionRotation
+  //   이 'human-turn-open' 으로 자체 보류하고, 기계 발화(알림) 턴이며 no-op streak 2회
+  //   또는 턴수 상한이면 HANDOFF 문서로 새 세션을 시드한다. 현 턴은 구세션에서 마무리
+  //   (mid-turn 스왑 금지) — 한 세션은 한 번만 교대한다('already-rotated' 가드).
+  const rotation = await attemptSessionRotation({
+    sessionId: opts.sessionId,
+    turnInFlight: false,
+    modelId: llmOpts?.model ?? provider.defaultModel,
+    ...(autoCompactCfg.summarizerModel ? { summarizerModel: autoCompactCfg.summarizerModel } : {}),
+  });
+  if (rotation.rotated) {
+    debug.log('session.rotation', 'turn-boundary', {
+      sessionId: opts.sessionId, to: rotation.newSessionId, handoffTokens: rotation.handoffTokens,
+    }, { level: 'info' });
+  }
   let compactedThisTurn = false;
   if (autoCompactCfg.enabled && opts.maxTokens === undefined) {
     const turnModelId = llmOpts?.model ?? provider.defaultModel;
@@ -639,6 +685,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
             config: autoCompactCfg,
             force: true,
             modelId: turnModelId,
+            ...(autoCompactCfg.summarizerModel ? { summarizerModel: autoCompactCfg.summarizerModel } : {}),
             ...(opts.compactProvider ? { provider: opts.compactProvider } : {}),
           });
           debug.log('compact.session', 'turn-start', {
@@ -659,6 +706,9 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
             recordCompactRegrowHold(opts.sessionId, estimateMessagesTokens(toLLM([...messages, userMsg])));
           } else if (result.reason === 'no-op') {
             recordNoOpBackoff(opts.sessionId, historyUsedTokens); // 출처: #135458 §4-4③
+            // ★ CONTEXT-BUDGET-ROTATION(0.3.34) — no-op 1회 가계만 남긴다. 교대 시도는
+            //   위 턴 경계 지점에서만 한다(여기서 시도하면 turnInFlight 로 항상 차단되는 죽은 호출).
+            recordNoOpRotation(opts.sessionId);
           }
         } catch (error) {
           debug.log('compact.session', 'turn-start-error', {
@@ -671,11 +721,47 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   // After a compaction the request is measured again: if it is still over the cap the oldest rows go
   // first, but the system rows, the anchor and the latest user turn always stay; if even those do not
   // fit, the turn fails with ✗ before any provider call.
-  const assembleTurnMessages = (systemPrompt?: string, history = messages): { kept: LLMMessage[]; dropped: number; used: number } => {
-    const wire = buildTurnWire(systemPrompt, history);
+  const measureTurn = (systemPrompt?: string, history = messages, keepHumans = KEEP_HUMAN_TURNS, keepToolResults?: number) => {
+    const built = buildTurnWire(systemPrompt, history);
+    const wire = keepToolResults === undefined ? built : stubTurnToolPayloads(built, keepToolResults).wire;
+    // humanWire holds the built rows; a stubbed row is a new object, so map human-ness by position.
+    const human = (i: number) => humanWire.has(built[i]!);
     const capInfo = capFor(wire);
     turnInputCap = capInfo.cap;
-    const trimmed = trimKeepingRecentHumans(wire, turnInputCap, estimateMessagesTokens, i => humanWire.has(wire[i]!), KEEP_HUMAN_TURNS);
+    return { capInfo, trimmed: trimKeepingRecentHumans(wire, turnInputCap, budgetMeasure(turnInputCap), human, keepHumans) };
+  };
+  const assembleTurnMessages = (systemPrompt?: string, history = messages): { kept: LLMMessage[]; dropped: number; used: number } => {
+    let { capInfo, trimmed } = measureTurn(systemPrompt, history);
+    // TURN-BUDGET-FLOOR (11-26 23:3x · 13 OP turns lost in 60 min): the protected rows themselves (the last human turns ·
+    // everything since this turn's user row) were over the cap. Give protections up in order — fewer kept human turns, then
+    // the current turn's older tool results stubbed — before the newest-turn shrink below; the turn fails only past all of it.
+    if (trimmed.overBudget) {
+      const built = buildTurnWire(systemPrompt, history);
+      const floor = applyBudgetFloor(built, turnInputCap, budgetMeasure(turnInputCap), i => humanWire.has(built[i]!));
+      if (floor) {
+        trimmed = floor.trimmed;
+        debug.log('session.budget-floor', 'applied', { sessionId: opts.sessionId, step: floor.step, stubbed: floor.stubbed, used: trimmed.used, capTokens: turnInputCap }, { level: 'warn' });
+        opts.onStatusLine?.(`⚠ turn over the context budget — ${floor.step.startsWith('tool') ? `${floor.stubbed} older tool result(s) of this turn held back` : 'fewer past turns kept'} (${floor.step})`);
+      }
+    }
+    // TURN-SHRINK (11-26 21:41 · 22:45): an automatic turn whose own text is over the budget is shrunk — optional sections
+    // first, then cut with a note naming the held-back mail ids — instead of failing whole. A person's turn is never shrunk.
+    if (trimmed.overBudget && opts.from?.kind !== 'human') {
+      const { shrinkSteps } = require('./turn-shrink.js') as typeof import('./turn-shrink.js');
+      const original = userMsg.content;
+      for (const candidate of shrinkSteps(original)) {
+        userMsg.content = candidate.text;
+        const retry = measureTurn(systemPrompt, history, 0, 0);
+        if (!retry.trimmed.overBudget) {
+          ({ capInfo, trimmed } = retry);
+          debug.log('session.shrink', 'applied', { sessionId: opts.sessionId, step: candidate.step, charsBefore: original.length, charsAfter: candidate.text.length,
+            heldIds: candidate.heldIds, used: trimmed.used, capTokens: turnInputCap }, { level: 'warn' });
+          opts.onStatusLine?.(`⚠ turn over the context budget — shrunk (${candidate.step}${candidate.heldIds.length ? ` · ${candidate.heldIds.length} mail(s) held back` : ''})`);
+          break;
+        }
+      }
+      if (trimmed.overBudget) userMsg.content = original;
+    }
     if (trimmed.dropped > 0) {
       debug.log('session.trim', 'dropped', {
         sessionId: opts.sessionId, dropped: trimmed.dropped, keptHumanTurns: trimmed.keptHumanTurns,

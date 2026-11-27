@@ -29,7 +29,7 @@ import { answerHarnessAskUserCall, HARNESS_ASK_USER_IPC_ENV, isHarnessAskUserCal
 import { getSessionTierOverride } from '../model-tier/session-override.js';
 import { serializeTurnPayload, shouldReleasePinForGoalLoop, shouldReleasePinAfterAnsweredTurn, type GoalCompletionVia } from './local-chat-turn-goalpin-wire.js';
 import { releasePinnedGoal, resolvePinnedObjective, sessionGoalPinStore } from '../core-turn/human-goal-pin.js';
-import { configForSessionProviderTurn, getSessionProvider, sessionProviderChildEnv } from './session-provider.js';
+import { configForSessionProviderTurn, getSessionProvider, sessionProviderChildEnv, setSessionProvider } from './session-provider.js';
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawnElanousBun } from '../instance/spawn-elanous.js';
@@ -663,6 +663,22 @@ class LocalChatSession {
   }
 }
 
+/** MODEL-BY-DIFFICULTY: a seat directive newer than the last applied (this session) becomes the session's provider
+ *  selection — the in-session switch `/provider use` makes; same tab, no relaunch. Seat = ELANOUS_TRACK. */
+const seatModelAppliedAt = new Map<string, string>();
+export function applySeatModelForSession(sessionId: string, seat = process.env.ELANOUS_TRACK?.trim()): void {
+  if (!seat) return;
+  try {
+    const { applySeatModelDirective } = require('../seat/model-by-difficulty.js') as typeof import('../seat/model-by-difficulty.js');
+    const d = applySeatModelDirective({ root: effectiveInstanceRoot(), seat, sessionId, lastAppliedAt: seatModelAppliedAt.get(sessionId) ?? null,
+      select: (id, sel) => setSessionProvider(id, sel as Parameters<typeof setSessionProvider>[1]) });
+    if (d) {
+      seatModelAppliedAt.set(sessionId, d.at);
+      debug.log('seat', 'seat.model-applied', { seat, sessionId, cell: d.cell, tier: d.tier, model: `${d.provider}/${d.model}` });
+    }
+  } catch { /* routing never blocks a turn */ }
+}
+
 const sessions = new Map<string, LocalChatSession>();
 /** Model the child last answered with, per session — sizes the next pre-turn compaction check. */
 const lastModels = new Map<string, string>();
@@ -870,6 +886,13 @@ async function runLocalChatTurnOnce(
     const { zaiCodingPlanAvailable } = await import('../llm/zai-coding-plan.js');
     (await import('./next-auth-preflight.js')).preflightNextTuiGlmAuth('glm', () => zaiCodingPlanAvailable());
   }
+  // SEAT-MODEL-SURVIVES-MIGRATION: a new session of a seat (boot · update-all migration) gets the seat's last /model back.
+  try {
+    const restored = (require('../tui/slash/model.js') as typeof import('../tui/slash/model.js')).restoreSeatTier(sessionId);
+    if (restored) debug.log('seat', 'seat.tier-restored', { seat: restored.seat, sessionId, tier: restored.tier, choice: restored.choice, at: restored.at });
+  } catch { /* routing never blocks a turn */ }
+  // MODEL-BY-DIFFICULTY: before the child check, so a model switch from the seat directive is a normal provider switch.
+  applySeatModelForSession(sessionId);
   // A resumed session id may be selected in another test universe. Its sticky
   // child must not keep reading or writing memory in the previous universe.
   const existing = sessions.get(sessionId);

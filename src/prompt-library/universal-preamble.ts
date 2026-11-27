@@ -311,8 +311,11 @@ export interface ProjectAnchorMeta {
   path?: string;
   /** 예산 때문에 잘려 나간 문자 수(잘렸을 때만). */
   truncatedChars?: number;
+  truncatedBytes?: number;
+  sections?: string[];
   /** 이 파일의 must-carry 절 문자 수(있을 때만). */
   mustCarryChars?: number;
+  mustCarryBytes?: number;
 }
 
 /** ELN-PROMPT-MUST-CARRY — 앵커 파일 안 `<!-- must-carry -->` … `<!-- /must-carry -->` 절은 예산에서 먼저 확보하고
@@ -321,6 +324,35 @@ export const PROJECT_ANCHOR_MUST_CARRY_MAX_CHARS = 4 * 1024;
 export const MUST_CARRY_OPEN = '<!-- must-carry -->';
 export const MUST_CARRY_CLOSE = '<!-- /must-carry -->';
 interface MustCarrySection { start: number; end: number }
+function sectionTitles(raw: string, sections: MustCarrySection[]): string[] {
+  return sections.map((s) => { const text = raw.slice(s.start, s.end); return text.match(/^#{1,6}\s+(.+)$/m)?.[1]?.trim() ?? text.match(/^\|\s*(책임|responsibility)\s*\|/im)?.[1] ?? 'must-carry'; });
+}
+/** Merge explicit markers with named principle/responsibility headings, without double-counting overlap. */
+function extractPrioritySections(raw: string): MustCarrySection[] {
+  const sections = extractMustCarrySections(raw);
+  const headings = [...raw.matchAll(/^(#{1,6})[ \t]+([^\n]+)\n?/gm)];
+  for (let i = 0; i < headings.length; i++) {
+    const h = headings[i]!;
+    if (sections.some(section => h.index! >= section.start && h.index! < section.end)) continue;
+    if (!/(?:제\s*1\s*원칙|제일원칙|책임|first[ -]principle|responsibility)/i.test(h[2]!)) continue;
+    let end = raw.length;
+    for (let j = i + 1; j < headings.length; j++) {
+      if (headings[j]![1]!.length <= h[1]!.length) { end = headings[j]!.index!; break; }
+    }
+    sections.push({ start: h.index!, end });
+  }
+  for (const row of raw.matchAll(/^\|\s*(?:책임|responsibility)\s*\|[^\n]*(?:\n|$)/gim)) {
+    if (!sections.some(section => row.index! >= section.start && row.index! < section.end)) sections.push({ start: row.index!, end: row.index! + row[0].length });
+  }
+  sections.sort((a, b) => a.start - b.start);
+  const merged: MustCarrySection[] = [];
+  for (const section of sections) {
+    const last = merged.at(-1);
+    if (last && section.start < last.end) last.end = Math.max(last.end, section.end);
+    else merged.push({ ...section });
+  }
+  return merged;
+}
 /** 표시 짝의 [시작, 끝) — 여는 표시부터 닫는 표시 끝까지. 닫는 표시 없는 여는 표시는 무시. */
 export function extractMustCarrySections(raw: string): MustCarrySection[] {
   const out: MustCarrySection[] = [];
@@ -771,6 +803,7 @@ export function loadProjectAnchorWithMeta(cwd: string): ProjectAnchorResult {
 
   const localRaw = new Map<string, string>();
   let mustCarryUsed = 0;
+  let mustCarryUsedBytes = 0;
   // ④ 로컬 — 먼저 읽고 자르지 않는다. 디렉터리마다 하나(AGENTS.local.md 가 이기고 CLAUDE.local.md 는 shadowed).
   const LOCAL_ORDER_BASE = 1_000_000;
   let localUsed = 0;
@@ -786,15 +819,29 @@ export function loadProjectAnchorWithMeta(cwd: string): ProjectAnchorResult {
       slots.push({ order: LOCAL_ORDER_BASE + index * 10, skip: { filename: chosen.filename, relDir, reason: 'read-failed' } });
       return;
     }
-    localUsed += raw.length;
     localRaw.set(path, raw);
-    const localMustCarry = extractMustCarrySections(raw).reduce((sum, section) => sum + section.end - section.start, 0);
+    const localSections: MustCarrySection[] = [];
+    let sectionBytes = 0;
+    for (const section of extractPrioritySections(raw)) {
+      const bytes = Buffer.byteLength(raw.slice(section.start, section.end));
+      if (mustCarryUsedBytes + sectionBytes + bytes <= PROJECT_ANCHOR_MUST_CARRY_MAX_CHARS) {
+        localSections.push(section);
+        sectionBytes += bytes;
+      } else {
+        debug.log('chat.project-anchor', 'must-carry-over-cap', { cwd, path, overCapBytes: bytes, capBytes: PROJECT_ANCHOR_MUST_CARRY_MAX_CHARS });
+      }
+    }
+    const localMustCarry = localSections.reduce((sum, section) => sum + section.end - section.start, 0);
     mustCarryUsed += localMustCarry;
+    mustCarryUsedBytes += sectionBytes;
+    // Local files are authoritative and must remain untruncated.
+    const content = raw;
+    localUsed += content.length;
     const scope = relDir === '' ? '' : ` @ ${relDir}`;
     slots.push({
       order: LOCAL_ORDER_BASE + index * 10,
-      text: fence(chosen.label, chosen.filename, scope, raw),
-      meta: { filename: chosen.filename, chars: raw.length, truncated: false, relDir, local: true, layer: 'local', path, ...(localMustCarry > 0 ? { mustCarryChars: localMustCarry } : {}) },
+      text: fence(chosen.label, chosen.filename, scope, content),
+      meta: { filename: chosen.filename, chars: content.length, truncated: false, relDir, local: true, layer: 'local', path, sections: sectionTitles(raw, localSections), ...(localMustCarry > 0 ? { mustCarryChars: localMustCarry, mustCarryBytes: sectionBytes } : {}) },
     });
   });
   // ⑤ 지난 세션 — TUI 소유 파일. 로컬 지시 «뒤»(가장 안쪽 · 가장 최근 맥락). «cwd 의 자리 루트»(/seats/<자리>) 하나만 읽는다 —
@@ -863,15 +910,18 @@ export function loadProjectAnchorWithMeta(cwd: string): ProjectAnchorResult {
   const sharedRaw = new Map<Want, string | null | undefined>(); // undefined = 없음 · null = 읽기 실패
   const sharedMustCarry = new Map<Want, MustCarrySection[]>();
   let mustCarryReserved = 0;
+  let mustCarryReservedBytes = 0;
   let mustCarryOverCap = 0;
   for (const want of wants) {
     if (!existsSync(want.path)) { sharedRaw.set(want, undefined); continue; }
     const raw = readRaw(want.path);
     sharedRaw.set(want, raw);
     const honored: MustCarrySection[] = [];
-    for (const section of raw === null ? [] : extractMustCarrySections(raw)) {
+    for (const section of raw === null ? [] : extractPrioritySections(raw)) {
       const size = section.end - section.start;
-      if (mustCarryUsed + mustCarryReserved + size > PROJECT_ANCHOR_MUST_CARRY_MAX_CHARS) { mustCarryOverCap += size; continue; }
+      const bytes = Buffer.byteLength(raw!.slice(section.start, section.end));
+      if (mustCarryUsedBytes + mustCarryReservedBytes + bytes > PROJECT_ANCHOR_MUST_CARRY_MAX_CHARS) { mustCarryOverCap += size; continue; }
+      mustCarryReservedBytes += bytes;
       mustCarryReserved += size;
       honored.push(section);
     }
@@ -897,9 +947,15 @@ export function loadProjectAnchorWithMeta(cwd: string): ProjectAnchorResult {
     if (raw === null) { skip('read-failed'); continue; }
     const truncated = raw.length > remaining;
     let content = raw;
+    let truncatedBytes = 0;
     if (truncated) {
-      const sliceLen = Math.max(0, remaining - TRUNCATION_MARKER.length - mustCarryChars - mustCarry.length);
-      const kept = mustCarry.filter((section) => section.end > sliceLen).map((section) => raw.slice(section.start, section.end));
+      let sliceLen = Math.max(0, remaining - TRUNCATION_MARKER.length - mustCarryChars - mustCarry.length);
+      const crossing = mustCarry.find((section) => section.start < sliceLen && section.end > sliceLen);
+      if (crossing) sliceLen = crossing.start;
+      const keptSections = mustCarry.filter((section) => section.end > sliceLen);
+      const kept = keptSections.map((section) => raw.slice(section.start, section.end));
+      const sourceBytes = Buffer.byteLength(raw.slice(0, sliceLen), 'utf8') + kept.reduce((sum, text) => sum + Buffer.byteLength(text, 'utf8'), 0);
+      truncatedBytes = Buffer.byteLength(raw, 'utf8') - sourceBytes;
       content = `${raw.slice(0, sliceLen)}${TRUNCATION_MARKER}${kept.map((text) => `\n${text}`).join('')}`;
     }
     sharedUsed += content.length;
@@ -909,8 +965,9 @@ export function loadProjectAnchorWithMeta(cwd: string): ProjectAnchorResult {
       text: fence(want.label, want.filename, want.scope, content),
       meta: {
         filename: want.filename, chars: content.length, truncated, relDir: want.relDir, layer: want.layer, path: want.path,
-        ...(truncated ? { truncatedChars: Math.max(0, raw.length - content.length) } : {}),
-        ...(mustCarryChars > 0 ? { mustCarryChars } : {}),
+        ...(truncated ? { truncatedChars: Math.max(0, raw.length - content.length), truncatedBytes } : {}),
+        sections: sectionTitles(raw, mustCarry),
+        ...(mustCarryChars > 0 ? { mustCarryChars, mustCarryBytes: mustCarry.reduce((sum, section) => sum + Buffer.byteLength(raw.slice(section.start, section.end)), 0) } : {}),
       },
     });
   }
@@ -1064,11 +1121,15 @@ export function projectAnchorManifest(result: ProjectAnchorResult): Record<strin
       layer: file.layer ?? null,
       chars: file.chars,
       truncatedChars: file.truncatedChars ?? 0,
+      truncatedBytes: file.truncatedBytes ?? 0,
+      sections: file.sections ?? [],
       mustCarryChars: file.mustCarryChars ?? 0,
+      mustCarryBytes: file.mustCarryBytes ?? 0,
     })),
     skipped: result.skipped,
     totalChars: result.totalChars,
     truncatedChars: result.files.reduce((sum, file) => sum + (file.truncatedChars ?? 0), 0),
+    truncatedBytes: result.files.reduce((sum, file) => sum + (file.truncatedBytes ?? 0), 0),
     mustCarryChars: result.mustCarryChars ?? 0,
     mustCarryCapChars: PROJECT_ANCHOR_MUST_CARRY_MAX_CHARS,
     umbrellaPointerChars: result.umbrellaPointer ? result.umbrellaPointer.length : 0,

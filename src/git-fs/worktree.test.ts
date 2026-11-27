@@ -1204,11 +1204,12 @@ describe('syncBaseWithRemote — 실패 분기 (seam)', () => {
   const fail = (stderr = 'boom'): ReturnType<GitRunner> => ({ status: 1, stdout: '', stderr });
 
   /** 기본 응답을 주고 필요한 것만 덮는다 — 대역이 "요청한 것만" 답하게 유지한다. */
-  function runner(over: Partial<Record<'showRef' | 'lsRemote' | 'fetch' | 'fetchHead' | 'localRev', ReturnType<typeof ok>>> = {}): GitRunner {
+  function runner(over: Partial<Record<'showRef' | 'lsRemote' | 'fetch' | 'fetchHead' | 'localRev' | 'updateRef', ReturnType<typeof ok>>> = {}): GitRunner {
     return (args) => {
       if (args[0] === 'show-ref') return over.showRef ?? fail();
       if (args[0] === 'ls-remote') return over.lsRemote ?? ok(`${REMOTE}\trefs/heads/feat\n`);
       if (args[0] === 'fetch') return over.fetch ?? ok();
+      if (args[0] === 'update-ref') return over.updateRef ?? ok();
       if (args[0] === 'rev-parse' && args[2] === 'FETCH_HEAD^{commit}') return over.fetchHead ?? ok(`${REMOTE}\n`);
       if (args[0] === 'rev-parse') return over.localRev ?? ok(`${LOCAL}\n`);
       return fail();
@@ -1238,6 +1239,39 @@ describe('syncBaseWithRemote — 실패 분기 (seam)', () => {
       return base(args);
     };
   }
+
+  test('HARNESS-BARE-REPO-BASE-REF: fetch 생략 시에도 원격 추적 ref를 광고된 tip으로 갱신한다', () => {
+    const root = mkdtempSync(join(tmpdir(), 'bare-ref-skip-'));
+    const repo = join(root, 'repo');
+    try {
+      git(root, 'init', '-q', '-b', 'main', repo);
+      git(repo, 'config', 'user.email', 't@t.co');
+      git(repo, 'config', 'user.name', 'T');
+      writeFileSync(join(repo, 'README.md'), 'base\n');
+      git(repo, 'add', 'README.md');
+      git(repo, 'commit', '-q', '-m', 'base');
+      const tip = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).stdout.trim();
+      const seen: string[][] = [];
+      const r = syncBaseWithRemote(repo, 'main', false, (args) => {
+        seen.push([...args]);
+        if (args[0] === 'show-ref') return fail();
+        if (args[0] === 'ls-remote') return ok(`${tip}\trefs/heads/main\n`);
+        if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return ok('false\n');
+        if (args[0] === 'cat-file') return ok();
+        if (args[0] === 'update-ref') return spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+        return fail();
+      });
+      expect(r).toEqual({ checkout: tip, freshness: 'remote-synced' });
+      expect(seen.some((a) => a[0] === 'fetch')).toBe(false);
+      expect(seen.filter((a) => a[0] === 'update-ref')).toEqual([['update-ref', '--no-deref', 'refs/remotes/origin/main', tip]]);
+      const recorded = spawnSync('git', ['rev-parse', 'refs/remotes/origin/main'], { cwd: repo, encoding: 'utf8' }).stdout.trim();
+      const localMain = spawnSync('git', ['rev-parse', 'refs/heads/main'], { cwd: repo, encoding: 'utf8' }).stdout.trim();
+      expect(recorded).toBe(tip);
+      expect(localMain).toBe(tip);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   test('⭐ 얕은 저장소면 base fetch 에 --depth=50 을 붙인다 (Pod --depth 50 클론 · 무제한이면 SIGTERM)', () => {
     const seen: string[][] = [];
@@ -1452,6 +1486,7 @@ describe('syncBaseWithRemote — 원격 SHA fetch 생략·합치기', () => {
       if (args[0] === 'cat-file') return { status: objectPresent ? 0 : 1, stdout: '', stderr: '' };
         if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return { status: 0, stdout: 'false\n', stderr: '' };
       if (args[0] === 'fetch') { fetches++; objectPresent = true; return { status: 0, stdout: '', stderr: '' }; }
+      if (args[0] === 'update-ref') return { status: 0, stdout: '', stderr: '' };
       if (args[0] === 'rev-parse' && args[2] === 'FETCH_HEAD^{commit}') return { status: 0, stdout: `${REMOTE}\n`, stderr: '' };
       return { status: 1, stdout: '', stderr: '' };
     };
@@ -1527,6 +1562,7 @@ describe('syncBaseWithRemote — 원격 SHA fetch 생략·합치기', () => {
       if (args[0] === 'ls-remote') return { status: 0, stdout: `${existingSha}\trefs/heads/feat\n`, stderr: '' };
         if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return { status: 0, stdout: 'false\n', stderr: '' };
       if (args[0] === 'cat-file') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'update-ref') return { status: 0, stdout: '', stderr: '' };
       return { status: 1, stdout: '', stderr: '' };
     };
     expect(syncBaseWithRemote(fixture.repo, 'feat', false, hasObjectRunner)).toEqual({ checkout: existingSha, freshness: 'remote-synced' });
@@ -1539,6 +1575,7 @@ describe('syncBaseWithRemote — 원격 SHA fetch 생략·합치기', () => {
       if (args[0] === 'ls-remote') return { status: 0, stdout: `${REMOTE}\trefs/heads/feat\n`, stderr: '' };
       if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return { status: 0, stdout: 'false\n', stderr: '' };
       if (args[0] === 'fetch') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'update-ref') return { status: 0, stdout: '', stderr: '' };
       if (args[0] === 'rev-parse' && args[2] === 'FETCH_HEAD^{commit}') return { status: 0, stdout: `${REMOTE}\n`, stderr: '' };
       return { status: 1, stdout: '', stderr: '' };
     };
@@ -1559,6 +1596,7 @@ describe('syncBaseWithRemote — 원격 SHA fetch 생략·합치기', () => {
         if (args[0] === 'ls-remote') return { status: 0, stdout: `${existingSha}\trefs/heads/feat\n`, stderr: '' };
       if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return { status: 0, stdout: 'false\n', stderr: '' };
         if (args[0] === 'cat-file') return { status: 0, stdout: '', stderr: '' };
+        if (args[0] === 'update-ref') return { status: 0, stdout: '', stderr: '' };
         return { status: 1, stdout: '', stderr: '' };
       });
       expect(r).toEqual({ checkout: existingSha, freshness: 'remote-synced' });
@@ -1575,6 +1613,7 @@ describe('syncBaseWithRemote — 원격 SHA fetch 생략·합치기', () => {
       if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return { status: 0, stdout: 'true\n', stderr: '' };
       if (args[0] === 'cat-file') return { status: 0, stdout: '', stderr: '' };
       if (args[0] === 'fetch') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'update-ref') return { status: 0, stdout: '', stderr: '' };
       if (args[0] === 'rev-parse' && args[2] === 'FETCH_HEAD^{commit}') return { status: 0, stdout: `${REMOTE}\n`, stderr: '' };
       return { status: 1, stdout: '', stderr: '' };
     });
@@ -1630,6 +1669,7 @@ describe('syncBaseWithRemote — 원격 SHA fetch 생략·합치기', () => {
       if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return { status: 0, stdout: 'false\n', stderr: '' };
       if (args[0] === 'cat-file') return { status: 0, stdout: '', stderr: '' };
       if (args[0] === 'fetch') { fetches++; return { status: 0, stdout: '', stderr: '' }; }
+      if (args[0] === 'update-ref') return { status: 0, stdout: '', stderr: '' };
       if (args[0] === 'rev-parse' && args[2] === 'FETCH_HEAD^{commit}') return { status: 0, stdout: `${REMOTE}\n`, stderr: '' };
       return { status: 1, stdout: '', stderr: '' };
     });
@@ -1650,6 +1690,7 @@ describe('syncBaseWithRemote — hex 이름 모호성 (2차 리뷰 must-fix)', (
       if (args[0] === 'show-ref') return fail();                      // 로컬엔 아무 ref 도 없다
       if (args[0] === 'ls-remote') return ok('x\trefs/heads/abc1234\n');  // ⭐ 원격엔 있다
       if (args[0] === 'fetch') return ok();
+      if (args[0] === 'update-ref') return ok();
       if (args[0] === 'rev-parse' && args[2] === 'FETCH_HEAD^{commit}') return ok(`${REMOTE}\n`);
       if (args[0] === 'rev-parse') return ok('deadbee\n');            // 커밋으로도 풀린다(모호)
       return fail();

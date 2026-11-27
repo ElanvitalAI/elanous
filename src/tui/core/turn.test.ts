@@ -99,6 +99,9 @@ test('automatic continuation waits for queued or draft input and stops at goal c
   expect(decideNextTuiAutoContinue(completed, 0, '')).toBe('check');
   expect(decideNextTuiAutoContinue(completed, 1, '')).toBe('yield');
   expect(decideNextTuiAutoContinue(completed, 0, 'draft')).toBe('yield');
+  expect(decideNextTuiAutoContinue(completed, 0, 'draft', true)).toBe('check');
+  expect(decideNextTuiAutoContinue(completed, 1, 'draft', true)).toBe('yield');
+  expect(decideNextTuiAutoContinue({ ...completed, kind: 'cancelled' }, 0, 'draft', true)).toBe('none');
   expect(decideNextTuiAutoContinue({ ...completed, goalComplete: true }, 1, 'draft')).toBe('complete');
   expect(decideNextTuiAutoContinue({ ...completed, kind: 'failed' }, 0, '')).toBe('check');
 });

@@ -4,6 +4,7 @@ import { homedir, platform, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { decideRestartNeeded, type RestartNeededResult } from './nexus-restart-needed.js';
 import { debug } from '../debug/log.js';
+import { readPwaBuildMarkerCommit, staticExportProblem } from './pwa-build.js';
 import { envLiteral } from '../platform/env-literal.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { getUserConfig } from '../user-config/reader.js';
@@ -48,7 +49,23 @@ export interface SelfUpdateOptions {
   canaryRunId?: string;
 }
 
+export type TriggerRegisterRunner = (command: string, args: string[]) => { status: number | null; stderr?: string };
+
+/** Best effort: updating the binary must not be rolled back because registration failed. */
+export function registerTriggersAfterUpdate(prefix: string, runner: TriggerRegisterRunner = (command, args) => {
+  const r = spawnSync(command, args, { encoding: 'utf8', timeout: 30_000 });
+  return { status: r.status, stderr: r.error?.message ?? r.stderr ?? '' };
+}, out: { error: (text: string) => void } = console): void {
+  try {
+    const r = runner(join(prefix, 'bin', 'elanous'), ['loop', 'trigger', 'register', '--update']);
+    if (r.status !== 0) out.error(`trigger registration failed: ${r.stderr || r.status}`);
+  } catch (error) { out.error(`trigger registration failed: ${String(error)}`); }
+}
+
 export interface SelfUpdateDeps {
+  triggerRegisterRunner?: TriggerRegisterRunner;
+  /** Internal: the enclosing edge/catch-up rail owns the post-health hook. */
+  suppressTriggerRegistration?: boolean;
   cliRoot?: string;
   /** 설치 성공 직후 문서 색인 따라잡기 킥(분리 자식 · 기다리지 않음). 기본 = `<prefix>/bin/elanous docs index`. */
   kickDocsIndex?: (prefix: string) => void | Promise<void>;
@@ -764,7 +781,9 @@ export interface ReleaseUpdateOptions {
 }
 
 export interface ReleaseUpdateDeps {
+  triggerRegisterRunner?: TriggerRegisterRunner;
   packageRoot?: string;
+  verifyRestart?: (expectedCommit: string) => Promise<VerifyRestartResult>;
   /** 설치 성공 직후 문서 색인 따라잡기 킥 — SelfUpdateDeps.kickDocsIndex 와 같다. */
   kickDocsIndex?: (prefix: string) => void | Promise<void>;
   exists?: (path: string) => boolean;
@@ -818,7 +837,20 @@ function installedBuild(metadata: unknown): string {
 /** A release update never packs the checkout: the downloaded installer verifies its own release tarball. */
 export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps: ReleaseUpdateDeps = {}): Promise<SelfUpdateResult> {
   const kicks: Promise<void>[] = [];
-  return settleDocsIndexKicks(kicks, await runReleaseUpdateCore(options, deps, kicks));
+  const prefix = installPrefixForCliRoot(resolve(deps.packageRoot ?? resolve(import.meta.dir, '../..')), deps.exists ?? existsSync);
+  const readBuild = (): { identity: string; commit: string } => {
+    try { const record = JSON.parse(readFileSync(join(prefix!, 'install.json'), 'utf8')); return { identity: installedBuild(record), commit: typeof record.commit === 'string' ? record.commit : '' }; }
+    catch { return { identity: '', commit: '' }; }
+  };
+  const before = prefix ? readBuild() : { identity: '', commit: '' };
+  const result = await settleDocsIndexKicks(kicks, await runReleaseUpdateCore(options, deps, kicks));
+  const after = prefix ? readBuild() : { identity: '', commit: '' };
+  if (prefix && result.exitCode === 0 && result.restarted && result.installedVersion && !result.rolledBackTo
+    && before.identity && after.identity && before.identity !== after.identity && after.commit) {
+    const health: VerifyRestartResult = await (deps.verifyRestart ?? defaultVerifyRestart)(after.commit).catch(() => ({ ok: false }));
+    if (health.ok && health.daemonSha && (after.commit.startsWith(health.daemonSha) || health.daemonSha.startsWith(after.commit))) registerTriggersAfterUpdate(prefix, deps.triggerRegisterRunner, deps.out);
+  }
+  return result;
 }
 
 async function runReleaseUpdateCore(options: ReleaseUpdateOptions, deps: ReleaseUpdateDeps, kicks: Promise<void>[]): Promise<SelfUpdateResult> {
@@ -1126,7 +1158,7 @@ export async function runEdgeRailUpdate(options: SelfUpdateOptions, deps: SelfUp
   if (!deps.restartEdgeRail && liveRestartBlocked()) return emit({ exitCode: 2, installedVersion: null, decision: null, restarted: false, reason: 'live restart blocked' });
   const installer = deps.installEdgeRail ?? ((next: SelfUpdateOptions, injected: SelfUpdateDeps) => runUpdateForInstallation(next, { cliRoot: injected.cliRoot, checkout: injected }));
   // The existing --from dev installer checks entry existence and restores current even when install.sh fails after relinking.
-  const installed = await installer({ from: checkout, dev: true, restart: false }, { ...deps, notice: () => {}, out: { log: () => {}, error: () => {} } });
+  const installed = await installer({ from: checkout, dev: true, restart: false }, { ...deps, suppressTriggerRegistration: true, notice: () => {}, out: { log: () => {}, error: () => {} } });
   if (installed.exitCode !== 0) return emit(installed);
   const nextRecord = readInstallRecord(root);
   const nextName = versionDirName(nextRecord?.versionDir);
@@ -1158,6 +1190,7 @@ export async function runEdgeRailUpdate(options: SelfUpdateOptions, deps: SelfUp
   } else if (state?.mainCommit === mainCommit && plan.decision === 'promote-all') {
     saveEdgeRailState(stateFile, { ...state, promoted: true });
   }
+  if (installed.installedVersion && !installed.rolledBackTo && installedBuild(record) && installedBuild(nextRecord) && installedBuild(record) !== installedBuild(nextRecord)) registerTriggersAfterUpdate(root, deps.triggerRegisterRunner, out);
   return emit({ ...installed, restarted: true });
 }
 
@@ -1223,7 +1256,13 @@ export async function runUpdateForInstallation(
 
 export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfUpdateDeps = {}): Promise<SelfUpdateResult> {
   const kicks: Promise<void>[] = [];
-  return settleDocsIndexKicks(kicks, await runSelfUpdateCore(options, deps, kicks));
+  const root = deps.installRoot ?? defaultInstallRoot();
+  const before = installedBuild(readInstallRecord(root));
+  const result = await settleDocsIndexKicks(kicks, await runSelfUpdateCore(options, deps, kicks));
+  const after = installedBuild(readInstallRecord(root));
+  if (before && after && before !== after && !deps.suppressTriggerRegistration && !options.dryRun && !options.rollback && result.exitCode === 0 && result.restarted && result.health === 'ok' && result.installedVersion && !result.rolledBackTo)
+    registerTriggersAfterUpdate(deps.installRoot ?? defaultInstallRoot(), deps.triggerRegisterRunner, deps.out);
+  return result;
 }
 
 async function runSelfUpdateCore(options: SelfUpdateOptions, deps: SelfUpdateDeps, kicks: Promise<void>[]): Promise<SelfUpdateResult> {
@@ -1283,12 +1322,37 @@ async function runSelfUpdateCore(options: SelfUpdateOptions, deps: SelfUpdateDep
     if (dirty.status !== 0) return reject(dirty.status === 1 ? '추적 파일 변경: 체크아웃이 더러움' : `git diff 실패: ${dirty.stderr}`);
 
     if (options.dev) {
-      if (!options.skipPwaBuild && !existsSync(join(checkout, 'apps/pwa/out/index.html'))) {
+      // PWA-RUNTIME-LEAN: the package must carry THIS commit's PWA so the
+      // installed copy never builds in place (~750MB apps/pwa/node_modules).
+      // An out whose build marker names another commit is rebuilt here, not
+      // only a missing one — rail edges packed a days-old PWA. An out without
+      // a marker predates markers: kept as before (the installed copy then
+      // falls back to its in-place build, reason=marker-missing).
+      const pwaOut = join(checkout, 'apps/pwa/out');
+      const presentPwaOut = existsSync(join(pwaOut, 'index.html'));
+      const pwaMarker = presentPwaOut ? readPwaBuildMarkerCommit(pwaOut) : '';
+      const stalePwaOut = presentPwaOut && pwaMarker !== '' && pwaMarker !== head.stdout.trim();
+      // Only a servable export may be shipped as the stale fallback; a stub
+      // (no _next, error shell) counts as missing.
+      const hadPwaOut = stalePwaOut && staticExportProblem(pwaOut) === undefined;
+      if (!options.skipPwaBuild && (!presentPwaOut || stalePwaOut)) {
         const commit = head.stdout.trim().slice(0, 12);
         const started = Date.now();
         let ok = false;
         let tail = '';
         try {
+          // A real-directory out (older checkouts) cannot take an atomic swap;
+          // adopt it into .pwa-generations first. Never throws; a failed adopt
+          // leaves the directory and the build reports why.
+          if (hadPwaOut && !lstatSync(pwaOut).isSymbolicLink()) {
+            const adopted = run('bun', ['apps/pwa/scripts/static-generation.ts', 'adopt-packaged'], checkout, { timeout: 5 * 60_000 });
+            try { debug.log('self-update', 'pwa-adopt', { commit, verdict: (adopted.stderr || adopted.stdout || '').trim().split(/\r?\n/).at(-1) ?? '' }); } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
+          } else if (stalePwaOut && !hadPwaOut && !lstatSync(pwaOut).isSymbolicLink()) {
+            // Not servable and blocks the atomic publish: set it aside, build as if missing.
+            const aside = `${pwaOut}.invalid-${Date.now()}`;
+            renameSync(pwaOut, aside);
+            try { debug.log('self-update', 'pwa-invalid-out-aside', { commit, aside }); } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
+          }
           const build = run('bun', ['bin/elanous.mjs', 'nexus', 'build'], checkout, { timeout: 15 * 60_000 });
           ok = build.status === 0;
           const output = build.stderr?.trim() || build.stdout?.trim() || '';
@@ -1297,10 +1361,15 @@ async function runSelfUpdateCore(options: SelfUpdateOptions, deps: SelfUpdateDep
           tail = selfUpdateOutputTail(String(error));
         }
         try {
-          debug.log('self-update', 'pwa-build', { ok, commit, ms: Date.now() - started, rail: 'dev' });
+          debug.log('self-update', 'pwa-build', { ok, commit, ms: Date.now() - started, rail: 'dev', reason: presentPwaOut ? (hadPwaOut ? 'stale-marker' : 'invalid-out') : 'missing' });
           if (!ok) debug.log('self-update', 'build-failed', { stage: 'pwa-build', commit, tail: tail || '출력 없음' });
         } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
-        if (!ok || !existsSync(join(checkout, 'apps/pwa/out/index.html'))) {
+        if (!ok && hadPwaOut && existsSync(join(pwaOut, 'index.html'))) {
+          // An older PWA still exists: install with it rather than block the rail. The installed
+          // `nexus build` sees the marker mismatch and falls back to the in-place build.
+          out.error(`pwa.lean fallback=stale-out reason=checkout-build-failed commit=${commit}`);
+          try { debug.log('self-update', 'pwa-lean-fallback', { fallback: 'stale-out', reason: 'checkout-build-failed', commit, tail: tail || '출력 없음' }); } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
+        } else if (!ok || !existsSync(join(checkout, 'apps/pwa/out/index.html'))) {
           return emit({ exitCode: 1, installedVersion: null, decision: null, restarted: false, reason: `PWA 빌드 실패: ${selfUpdateReasonTail(tail) || 'apps/pwa/out/index.html 없음'} — current 를 바꾸지 않음` });
         }
       }

@@ -262,7 +262,7 @@ export function createMailTriageLedger(options: MailTriageLedgerOptions = {}): M
       const routed = seatMailRoute({ kind: input.kind ?? null, intent: input.intent ?? null, crownDirective: input.crownDirective ?? null,
         origin: input.origin ?? null, refs: input.refs ?? null, replyTo: input.replyTo ?? null, resultState: input.resultState ?? null,
         needsAck: input.needsAck ?? null, priority: input.priority ?? null, doneWhen: input.doneWhen ?? null, deadlineAt: input.deadlineAt ?? null,
-        senderAbove: input.senderAbove ?? null, replyToOwn: input.replyToOwn ?? null, cellDelegated: input.cellDelegated ?? null,
+        senderAbove: input.senderAbove ?? null, replyToOwn: input.replyToOwn ?? null, cellDelegated: input.cellDelegated ?? null, fromSeat: input.from,
         ...(input.body === undefined ? {} : { body: input.body }) });
       let task: MailTriageTask;
       let merged = false;

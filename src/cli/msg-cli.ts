@@ -1,3 +1,5 @@
+import { routeAtEntrance } from '../kit/mail-route/entrance.js';
+import { handAskReference } from '../kit/mail-route/hand-dedupe.js';
 import { randomUUID } from 'node:crypto';
 import { goalSetterRefusal, goalSetterVerdict } from '../session-autopilot/crown-goal-apply.js';
 import type { Command } from 'commander';
@@ -135,6 +137,10 @@ export interface MsgCliDeps {
   /** MSG-FILTERS-RELAX: the seat actually running this CLI (default: ELANOUS_TRACK). A different `--from` is stored with
    *  this seat in `origin.seat`, never refused. */
   callerSeat?: () => string | null;
+  /** KIT mail-route hand-route — the classifier for an unstructured ✋ line (default: the router's cheap model · null = codes only). */
+  classifyHand?: import('../kit/mail-route/hand-route.js').HandRootClassifier | null;
+  /** KIT mail-route hand-route — the ✋ cell lookups (claimed cell · cell owner); default: the live checklist (none under bun test). */
+  handCells?: import('../kit/mail-route/hand-cells.js').HandCellLookups | null;
   /** Working directory for the `--from` default (seat folder). */
   cwd?: () => string;
   /** MSG-FILTERS-RELAX bulk-ack digest saver (default: the `eln memory add` store). */
@@ -681,6 +687,17 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         ...(opts.needsAck ? { needsAck: true } : {}),
         ...(opts.crownDirective === undefined ? {} : { crownDirective: opts.crownDirective }),
         ...(opts.goal === undefined ? {} : { goal: opts.goal }) };
+      // DORMANT-ADDRESS REROUTE — a post to an address with no live tab (RES · REL · REVIEW-2 · JUD-2 · ORCHESTRATOR)
+      // goes to the live reader instead (JUD · OP digest) unless the wake resolver finds a live reader for it (KIT
+      // mail-route · LA-R2); the sender gets one line. A keyed relay is never rerouted.
+      if (opts.originKey === undefined) {
+        // KIT mail-route entrance — ✋ hand routing by root (WIP → TC · JUD verdict → JUDGE-BUTLER · env → GUARDIAN), then dormant.
+        for (const move of await routeAtEntrance(envelope, { ...(deps.wakeDeps ? { wakeDeps: deps.wakeDeps } : {}), ...(deps.classifyHand !== undefined ? { classifyHand: deps.classifyHand } : {}),
+          ...(deps.handCells !== undefined ? { cells: deps.handCells } : {}) })) {
+          debug.log(move.kind === 'hand-route' ? 'msg.hand-route' : 'msg.dormant-reroute', 'rerouted', { from, to: move.to, into: move.into, ...(move.digest === undefined ? {} : { digest: move.digest }), ...(move.root ? { root: move.root } : {}) });
+          out.error(`msg post: ${move.note}`);
+        }
+      }
       // #38516 r2 MF3: a per-attempt token goes into this INSERT, so recovery after an ambiguous write can name THIS
       // attempt's commit — an older identical row (`--no-dedupe`, or outside the window) never stands in for a send that
       // was not stored. MF4: the `--origin-key` path is idempotent by its provenance key instead (explicit contract:
@@ -713,8 +730,16 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
           gate = gatePost({ envelope, entrance: 'cli', ...(opts.needsReply === undefined ? {} : { needsReply: opts.needsReply }), ...(senderAbove === undefined ? {} : { senderAbove }) },
             storeGateDeps(store, deps.divertedRoot ?? divertedRootForStore(store.storePath)));
           if (gate.action !== 'post') return null;
-          Object.assign(envelope, { kind: gate.envelope.kind, needsAck: gate.envelope.needsAck });
-          return store.post(envelope, { dedupe: opts.dedupe !== false, attemptToken });
+          // CLAUDE-OP-PROXY-LANE — the gate owns the `lane:proxy` ref (stamped on a lane post · dropped from any other).
+          Object.assign(envelope, { kind: gate.envelope.kind, needsAck: gate.envelope.needsAck, refs: gate.envelope.refs });
+          const laneCancel = gate.laneCancel;
+          const laneCommit = gate.laneCommit;
+          try { const row = store.post(envelope, { dedupe: opts.dedupe !== false, attemptToken }); laneCommit?.(); return row; }
+          catch (error) {
+            // A validation refusal stored nothing: release the proxy-lane slot now (an ambiguous storage error is settled below).
+            if (!/database is locked|SQLITE_BUSY|SQLITE_IOERR|disk I\/O|database is busy/i.test(error instanceof Error ? error.message : String(error))) laneCancel?.();
+            throw error;
+          }
         });
       } catch (error) {
         // Only an ambiguous STORAGE error (lock / busy / I-O around COMMIT) can hide a commit. A validation refusal
@@ -727,7 +752,13 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
             ? store.findPostByAttempt(attemptToken)
             : store.findByProvenanceKeyFor(opts.originKey, envelope)); // r3 MF2: same sender → recipient only
         } catch { /* still unknown: report the write error */ }
-        if (landed === null) throw error;
+        if (landed === null) {
+          // CLAUDE-OP-PROXY-LANE — the row was not written: release the lane slot so a retry is not its own duplicate.
+          const g = gate as ReturnType<typeof gatePost> | null;
+          if (g?.action === 'post') g.laneCancel?.();
+          throw error;
+        }
+        { const g = gate as ReturnType<typeof gatePost> | null; if (g?.action === 'post') g.laneCommit?.(); }
         debug.log('msg.post', 'recovered-after-error', { msgId: landed.id, from, to, by: opts.originKey === undefined ? 'attempt' : 'origin-key',
           error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
         stored = landed;
@@ -758,6 +789,17 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       }
       // The human line names the stored id without echoing the body: a caller that scans the output for an error word
       // must not find it inside its own message (11-18: a report quoting «database is locked» was re-sent 13 times).
+      if (posted.digested !== undefined && posted.id === 0) {
+        emit(posted, opts.json, () => out.log(`msg post: parked for the OP 30-min digest (item ${posted.digested})`));
+        return;
+      }
+      // HAND-RAISE-DOMAIN-ROUTING — the same ✋ ask inside the window: the sender reads the first row's answer (or «still open»).
+      if (posted.handAskRepeat) {
+        const ref = withStore(store => handAskReference(store, posted));
+        debug.log('msg.hand-ask', 'by-reference', { from, firstId: ref.firstId, to: ref.to, answered: ref.answer?.id ?? null });
+        emit({ ...posted, byReference: { firstId: ref.firstId, to: ref.to, answerId: ref.answer?.id ?? null, answer: ref.answer?.body ?? null } }, opts.json, () => out.log(`msg post: ${ref.line}`));
+        return;
+      }
       emit(posted, opts.json, () => out.log(`${postedLine(posted)}${announce === null ? '' : ` · announce ${announce.id} (${announce.scope})`}`));
       // COND-WATCH — arm the outcome watch (after the commit; a failure is a warning with the stored id, never a resend).
       if (watch !== null) {

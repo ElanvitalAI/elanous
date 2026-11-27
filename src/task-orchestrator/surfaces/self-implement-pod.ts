@@ -182,7 +182,7 @@ import type { ReadBudgetInputsDeps } from '../../self-implement/budget-gate.js';
 import { envLiteral } from '../../platform/env-literal.js';
 import { LLM_TIER_MAP_BY_PROVIDER, lookupLlmTierSpec, type LlmTierProvider } from '../../model-tier/llm-tier-map.js';
 import { parseSelfImplementJson, type SelfImplementDisposition, type SelfImplementJobDone, type SelfImplementJobSpawn } from './self-implement.js';
-import { normalizeFallbackChain, type FallbackStep } from '../../oauth/fallback-chain.js';
+import { effectiveFallbackChain, type FallbackStep } from '../../oauth/fallback-chain.js';
 import { goalTypeOf, type GoalType } from '../../../scripts/measure-pod-memory-by-goal.js';
 import { declaredGoalType, type GoalType as DeclaredGoalType } from '../../self-implement/goal-author.js';
 import { readPodMemoryAdvice, type PodMemoryAdvice } from '../../cli/pod-memory-advice.js';
@@ -2957,7 +2957,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const hostKey = (k: string): string | undefined => k === 'OPENROUTER_API_KEY' && openrouterCredentialNeeded ? openrouterKey : k === 'OPENGATEWAY_API_KEY' && openGateway ? openGatewayKey : k === 'ANTHROPIC_API_KEY' && anthropic ? anthropicKey : env[k] ?? (options.readKeyCache ?? defaultReadKeyCache)(k);
         const hostFallbackNames = hostConfig.llm.fallbackChain;
         const zaiOverage = zaiLaunchOverage ?? zaiSettingsFromConfig(hostConfig.llm).overage;
-        const normalizedFallback = normalizeFallbackChain(hostFallbackNames, hostConfig.llm.provider);
+        const normalizedFallback = effectiveFallbackChain(hostFallbackNames, hostConfig.llm.provider);
         let fallbackSteps = normalizedFallback.chain;
         let zaiFallbackSpec: ZaiPodSpec | undefined;
         const codexChild = !openrouter && (options.provider === undefined || options.provider === 'openai-codex');
@@ -2994,6 +2994,10 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const configSnapshot = buildPodConfigSnapshot(hostConfig, {
           steps: fallbackChain.steps, overage: zaiOverage,
           worktreeAddTimeoutSec: worktreeAddTimeoutSec(hostConfig.harness?.worktreeAddTimeoutSec) ?? 1200,
+          // CODEX-CREDIT-ACCOUNTS — the host's effective list (resource facts override config); the Pod has no policy file.
+          creditAccounts: (await import('../../oauth/codex-credit-accounts.js')).readCodexCreditAccounts(() => hostConfig.llm),
+          // LLM-ACCOUNT-POLICY-YAML — stamp the revision/phase the host decided with (also its applied report `pod-snapshot`).
+          policyStamp: (await import('../../kit/resource-facts/llm-decide.js')).decidedSnapshotStamp(),
         });
         debug.log('self-implement.pod', 'config-snapshot', { job: name, hash: configSnapshot.hash, keyCount: configSnapshot.keyCount });
         debug.log('self-implement.pod', 'fallback-chain-carried', {

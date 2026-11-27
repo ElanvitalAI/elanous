@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-LLM-POLICY-PANEL-SIM-TS",
+  "path": "src/ux-sim/llm-policy-panel-sim.ts",
+  "boundary": "Drives the real nexus /v1/llm/policy GET/PUT routes over a temporary config dir with fake bearer tokens only; no real key, token, network or host is touched",
+  "deviceIds": ["LLM-POLICY-PANEL-SIM"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

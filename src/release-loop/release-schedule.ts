@@ -133,7 +133,7 @@ export function kstDay(utc: string): string {
   return new Date(Date.parse(utc) + 9 * 3_600_000).toISOString().slice(0, 10);
 }
 
-function utcIso(input: string): string {
+export function utcIso(input: string): string {
   const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(Z|([+-])(\d{2}):(\d{2}))$/.exec(input);
   if (!match) throw new CliUserError(`시각에는 ISO 오프셋 필요: ${input}`);
   const hours = Number(match[6] ?? 0), minutes = Number(match[7] ?? 0);
@@ -164,7 +164,7 @@ export function listSchedules(root?: string): ReleaseSchedule[] {
   return schedules;
 }
 
-export function setSchedule(version: string, patch: { cutAt?: string; landBy?: string; freezeFrom?: string; freezeUntil?: string; publishAt?: string }, by: string, root?: string): ReleaseSchedule {
+export function setSchedule(version: string, patch: { cutAt?: string; landBy?: string; freezeFrom?: string; freezeUntil?: string; publishAt?: string; rehearsalAt?: string }, by: string, root?: string): ReleaseSchedule {
   const landing = patch.landBy !== undefined ? utcIso(patch.landBy) : undefined;
   if (landing !== undefined) {
     const previous = readSchedule(version, root);
@@ -177,6 +177,7 @@ export function setSchedule(version: string, patch: { cutAt?: string; landBy?: s
     ...(patch.freezeFrom !== undefined ? { freezeFrom: utcIso(patch.freezeFrom) } : {}),
     ...(patch.freezeUntil !== undefined ? { freezeUntil: utcIso(patch.freezeUntil) } : {}),
     ...(patch.publishAt !== undefined ? { publishAt: utcIso(patch.publishAt) } : {}),
+    ...(patch.rehearsalAt !== undefined ? { rehearsalAt: utcIso(patch.rehearsalAt) } : {}),
   }, by, root);
   debug.log('release.schedule', 'set', { version, cutAt: schedule.cutAt, landBy: schedule.landBy });
   return schedule;
@@ -190,5 +191,6 @@ export function formatSchedule(schedule: ReleaseSchedule): string {
   const publish = schedule.publishAt ? formatKst(schedule.publishAt) : null;
   const publishSameDay = schedule.publishAt && new Date(Date.parse(schedule.publishAt) + 9 * 60 * 60_000).toISOString().slice(0, 10)
     === new Date(Date.parse(schedule.cutAt) + 9 * 60 * 60_000).toISOString().slice(0, 10);
-  return `${schedule.version} 컷 ${cut}${deadline ? ` · 착지 마감 ${sameDay ? deadline.split(' ')[1] : deadline}` : ''}${publish ? ` · 발행 ${publishSameDay ? publish.split(' ')[1] : publish}` : ''}`;
+  const rehearsal = schedule.rehearsalAt ? formatKst(schedule.rehearsalAt) : null;
+  return `${schedule.version} 컷 ${cut}${deadline ? ` · 착지 마감 ${sameDay ? deadline.split(' ')[1] : deadline}` : ''}${rehearsal ? ` · 리허설 ${rehearsal}` : ''}${publish ? ` · 발행 ${publishSameDay ? publish.split(' ')[1] : publish}` : ''}`;
 }

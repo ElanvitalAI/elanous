@@ -6,7 +6,7 @@ import { planCatchUp, shaMatches, type CatchUpPlan } from '../nexus/host-registr
 import { desiredSha as readDesiredSha } from '../nexus/host-registry/desired-sha.js';
 import { spawnElanousSync } from '../instance/spawn-elanous.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { defaultInstallRoot, defaultVerifyRestart, readInstallRecord, restartEdgeRail, runUpdateForInstallation, type SelfUpdateDeps, type SelfUpdateOptions, type SelfUpdateResult } from './self-update.js';
+import { defaultInstallRoot, defaultVerifyRestart, readInstallRecord, registerTriggersAfterUpdate, restartEdgeRail, runUpdateForInstallation, type SelfUpdateDeps, type SelfUpdateOptions, type SelfUpdateResult } from './self-update.js';
 
 export interface CatchUpDeps extends SelfUpdateDeps {
   host?: string;
@@ -283,7 +283,7 @@ async function runCatchUpLocked(options: SelfUpdateOptions, deps: CatchUpDeps): 
     let installed: SelfUpdateResult;
     try {
       installed = await (deps.installEdgeRail ?? ((next, injected) => runUpdateForInstallation(next, { cliRoot: injected.cliRoot, checkout: injected })))(
-        { from: checkout, dev: true, restart: false }, { ...deps, notice: () => {}, out: { log: () => {}, error: () => {} } });
+        { from: checkout, dev: true, restart: false }, { ...deps, suppressTriggerRegistration: true, notice: () => {}, out: { log: () => {}, error: () => {} } });
     } catch (e) { installed = { exitCode: 1, installedVersion: null, decision: null, restarted: false, reason: String(e).slice(0, 200) }; }
     const restored = git(checkout, origBranch ? ['checkout', '--quiet', origBranch] : ['checkout', '--quiet', '--detach', origSha]).status === 0;
     if (!restored) return gate(`checkout could not be restored to ${origBranch || origSha.slice(0, 12)}`);
@@ -299,5 +299,6 @@ async function runCatchUpLocked(options: SelfUpdateOptions, deps: CatchUpDeps): 
   const health = await verify(desired);
   if (!health.ok || !health.daemonSha || !shaMatches(health.daemonSha, desired)) return done(1, 'restarted build health not confirmed; gate stays closed', true);
   if (!openGate(health.daemonSha)) return refuse(1, 'desired sha changed during catch-up (or installed/daemon sha disagrees); will retry');
+  if (!installedMatches) registerTriggersAfterUpdate(root, deps.triggerRegisterRunner, out);
   return done(0, `caught up to ${desired.slice(0, 12)}; gate open`, true);
 }

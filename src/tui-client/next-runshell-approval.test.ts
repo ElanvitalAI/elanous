@@ -16,6 +16,16 @@ describe('parent RunShell approval wire', () => {
     expect(verify(null, runShellApprovalSigningBytes({ ...first.payload, cwd: '/' }), issuer.publicKey, Buffer.from(first.signature, 'base64'))).toBe(false);
     expect(runShellApprovalCard(request)).toContain(JSON.stringify(request.argv));
   });
+  test('card classifies actual argv in the parent, including sandbox wrappers', () => {
+    const destructive = { ...request, cwd: '/srv', argv: ['/bin/rm', '-rf', '/srv/data'], destructive: false };
+    const card = runShellApprovalCard(destructive);
+    expect(card).toContain('WARNING: potential irreversible risk (destructive)');
+    expect(card).toContain(JSON.stringify(destructive.argv));
+    expect(runShellApprovalCard(request)).toContain('no known irreversible pattern detected');
+    const wrapped = { ...destructive, argv: ['/usr/bin/bwrap', '--ro-bind', '/', '/', '--bind', '/srv', '/srv', '--tmpfs', '/tmp', '--proc', '/proc', '--dev', '/dev', '--die-with-parent', '--new-session', ...destructive.argv] };
+    expect(runShellApprovalCard(wrapped)).toContain('(destructive)');
+    expect(runShellApprovalCard({ ...request, argv: ['/usr/bin/bwrap', '--unknown'] })).toContain('WARNING:');
+  });
   test('parent disconnect denies promptly and removes listeners', async () => {
     const events = new EventEmitter();
     const proc = Object.assign(events, { connected: true, send: (_message: unknown) => true });

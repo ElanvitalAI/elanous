@@ -24,10 +24,11 @@ import { lastTurnAt } from '../../msg/diverted-mail.js';
 import { getUserConfig } from '../../user-config/reader.js';
 import { PROFILE_NODES, resolveScope, STEWARD_SPACE_DEFAULTS as D, type ResolvedScope, type StewardSpaceConfig } from './config.js';
 import {
-  digestCounts, digestDue, emptyScopeState, EXCEPTION_ACTIONS, exceptionCard, poolImbalanceLine, exceptionRows, planHandoff, planJudge, planMatch, planReceipts, planWatch,
+  digestCounts, digestDue, emptyScopeState, EXCEPTION_ACTIONS, exceptionCard, poolImbalanceLine, exceptionRows, judgeKey, planHandoff, planJudge, planMatch, planReceipts, planWatch,
   rollupLine, scopeOf, scopesOf, type Row, type ScopeState, type Snapshot,
 } from './model.js';
 import { buildSnapshot, liveSources, missingFor, type SnapshotSources } from './sources.js';
+import { filterRoutable, hostsFor } from '../../kit/resource-facts/index.js';
 
 export const STEWARD_SPACE_NODES = ['r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'x'] as const;
 export type StewardSpaceNode = typeof STEWARD_SPACE_NODES[number];
@@ -215,12 +216,16 @@ export function runStewardSpaceNode(node: StewardSpaceNode, input: TickInput, de
         if (!live) return row;
         const why = `[행정관 · ${scope.scope}] ${row.reason}${row.lentFrom ? ` · lent from ${row.lentFrom}` : ''}`;
         const result = deps.effects.assignCell({ version: snap.version, cellId: row.target, seat: row.seat!, actor: scope.scope, why });
-        return result.ok ? { ...row, done: true } : { ...row, action: 'reject' as const, reason: `assign-failed:${result.error}`.slice(0, 160), done: false };
+        if (result.ok) return { ...row, done: true };
+        // ADMIN-RESOLVE-NOT-NAG — the cell left this release (unknown in both its release and the default one, or now
+        // off-target): deterministic, nothing to decide → a defer row (no exception card); the board drops it next tick.
+        if (/^(unknown-cell|off-target):/u.test(result.error)) return { ...row, action: 'defer' as const, reason: `cell-moved:${result.error}`.slice(0, 160), done: false };
+        return { ...row, action: 'reject' as const, reason: `assign-failed:${result.error}`.slice(0, 160), done: false };
       });
     } else if (node === 'r2') {
       const marks = markers(deps.root, now.getTime(), snap);
       const dispatched = new Set([...marks.all, ...Object.entries(state.dispatched).map(([pr, d]) => `${pr}-${d.head12}`)]);
-      rows = planReceipts(snap, { scope, state, hosts: deps.config?.pregateHosts ?? D.pregateHosts, hostSlots: deps.config?.hostSlots ?? D.hostSlots,
+      rows = planReceipts(snap, { scope, state, hosts: deps.config?.pregateHosts ? filterRoutable(deps.config.pregateHosts, 'pregate') : hostsFor('pregate'), hostSlots: deps.config?.hostSlots ?? D.hostSlots,
         maxLoadPerCore: deps.config?.maxLoadPerCore ?? D.maxLoadPerCore, dispatchedAnywhere: dispatched, inflightByHost: marks.inflight })
         .map((row) => {
           if (row.action !== 'dispatch') return row;
@@ -236,15 +241,34 @@ export function runStewardSpaceNode(node: StewardSpaceNode, input: TickInput, de
           return { ...row, done: true };
         });
     } else if (node === 'r3') {
+      // JUD-HAND-DISCOVERY: one mail per judge hand carrying its whole batch (cells first) — not one PR per hand per 30 min.
       rows = planJudge(snap, { scope, state }).map((row) => {
         if (row.action !== 'judge-assign') return row;
-        state.judgeAssigned[`${row.target.slice(1)}-${row.head12}`] = { seat: row.seat!, at };
+        state.judgeAssigned[judgeKey(row)] = { seat: row.seat!, at };
         state.seatCooldown[row.seat!] = at;
-        if (!live) return row;
-        deps.effects.mail({ to: row.seat!, kind: 'assign', intent: 'request', refs: [`pr:${row.target.slice(1)}`, `head:${row.head12}`, `steward:${scope.scope}`],
-          body: `[행정관 · ${scope.scope}] 판정 요청 ${row.target}@${row.head12} — 같은 head GREEN 영수, 판정 파일 없음 ${D.judgeWaitMinutes}분+${row.reason.endsWith('security-4') ? ' · 보안 4종 경로(보안 판정 포함)' : ''}. 결과 = review-results/judb-${row.target.slice(1)}-${row.head12}.json` });
-        return { ...row, done: true };
+        return live ? { ...row, done: true } : row;
       });
+      if (live) {
+        const bySeat = new Map<string, Row[]>();
+        for (const row of rows) if (row.action === 'judge-assign') bySeat.set(row.seat!, [...(bySeat.get(row.seat!) ?? []), row]);
+        const cellWhy = new Map((snap.judgeCells ?? []).map((c) => [c.cell, c]));
+        for (const [seat, batch] of bySeat) {
+          const lines = batch.map((row) => {
+            if (row.target.startsWith('#')) {
+              const pr = row.target.slice(1);
+              return `- PR ${row.target}@${row.head12} — 같은 head GREEN 영수, 판정 파일 없음 ${D.judgeWaitMinutes}분+${row.reason.endsWith('security-4') ? ' · 보안 4종 경로(보안 판정 포함)' : ''} · 결과 = review-results/judb-${pr}-${row.head12}.json`;
+            }
+            const c = cellWhy.get(row.target);
+            const how = c?.kind === 'security-4'
+              ? `보안 4종 — Terra 리뷰(eln self review <PR>) PASS/WARN·보안 지적 0 확인 뒤 서명`
+              : `거부권 섰음 — 거부 근거가 아직 맞는지 판정(맞으면 이유 한 줄 회신 · 풀렸으면 서명)`;
+            return `- 칸 ${row.target}${c?.prs.length ? ` (${c.prs.map((n) => `#${n}`).join(' ')})` : ''} — ${how} · 판정 집사: ${(c?.why ?? '').slice(0, 140)}`;
+          });
+          deps.effects.mail({ to: seat, kind: 'assign', intent: 'request',
+            refs: [...batch.map((row) => (row.target.startsWith('#') ? `pr:${row.target.slice(1)}` : `cell:${row.target}`)), `steward:${scope.scope}`],
+            body: [`[행정관 · ${scope.scope}] 판정 묶음 ${batch.length}건 — 칸 서명 = \`eln release checklist set <칸> --status green --evidence '<현재 근거>⏎JUD ${seat} 판정 …'\`(--evidence 는 덮어쓰기 · 현재 값과 합친다)`, ...lines].join('\n') });
+        }
+      }
     } else if (node === 'r4') {
       // Hand-off only: the existing chain poller/train lands PASS heads. Non-judge profiles count, judge carries rows.
       const handoff = planHandoff(snap, { scope });
@@ -427,17 +451,37 @@ export function liveEffects(config: StewardSpaceConfig | undefined): StewardEffe
       const ladder = ladderModule.loadFederationLadder();
       const store = openMsgStore(defaultMsgStorePath());
       try {
+        const watchModule = require('../../kit/mail-route/dormant-watch.js') as typeof import('../../kit/mail-route/dormant-watch.js');
+        // GUARDIAN-HAND-SLA — before the beacon: ✋ open at a loop-agent address past its SLA go back to their domain owner
+        // (hand-routes.yaml loopHands); what is left for HQ is carded by the beacon below.
+        let loopLine = '';
+        try {
+          const sla = watchModule.sweepLoopHandSla(store, { live, hq: ladder.hq, log: (event, data) => { try { debug.log('msg', event, data); } catch { /* fail-open */ } } });
+          if (sla.moved.length > 0) loopLine = ` · ${sla.line}`;
+        } catch (error) { try { debug.log('msg', 'msg.loop-hand-sla', { phase: 'sweep-failed', error: String(error).slice(0, 200) }); } catch { /* fail-open */ } }
         const report = ladderModule.beaconHands(store, { ladder, now: () => Date.now(), raiseDecision: ladderModule.spawnHandDecision, live,
           dormantSeats: liveDormantSeats(), log: (event, data) => { try { debug.log('needhuman', event, data); } catch { /* fail-open */ } } });
-        return { line: ladderModule.beaconLine(report), fired: report.fired };
+        // DORMANT-SEAT-ROUTE — the same tick: mail rerouted from a dormant seat with no answer in 10 min → one OP card.
+        let dormantLine = loopLine;
+        try {
+          const watch = watchModule.sweepDormantUnanswered(store, { live, log: (event, data) => { try { debug.log('msg', event, data); } catch { /* fail-open */ } } });
+          if (watch.overdue.length > 0) dormantLine = ` · ${watch.line}`;
+        } catch (error) { try { debug.log('msg', 'msg.dormant-watch', { phase: 'sweep-failed', error: String(error).slice(0, 200) }); } catch { /* fail-open */ } }
+        return { line: `${ladderModule.beaconLine(report)}${dormantLine}`, fired: report.fired };
       } finally { store.close(); }
     },
     assignCell: ({ version, cellId, seat, actor, why }) => {
       // `eln seat assign` (#40072 · writer check ⊕ coordinator check ⊕ structured mail ⊕ wake) — the same call and parse as
       // the resource-opt steward (#40084): a refusal is the only exception row; «not installed» falls back below.
-      const viaSeatAssign = spawnElanousSync(['seat', 'assign', seat, cellId, '--from', actor, '--steward', '--json', '--why', why], { encoding: 'utf8', timeout: 60_000 });
-      const parsed = parseSeatAssignOutput(String(viaSeatAssign.stdout ?? ''), viaSeatAssign.status);
-      if (parsed.ok) return { ok: true, via: 'seat-assign' };
+      const seatAssign = (v: string | undefined) => {
+        const r = spawnElanousSync(['seat', 'assign', seat, cellId, '--from', actor, '--steward', '--json', '--why', why, ...(v ? ['--version', v] : [])], { encoding: 'utf8', timeout: 60_000 });
+        return parseSeatAssignOutput(String(r.stdout ?? ''), r.status);
+      };
+      // ADMIN-RESOLVE-NOT-NAG — assign in the snapshot's release; «unknown-cell» there means the cell moved release →
+      // follow it once (seat assign's default release) instead of raising an «assign-failed:unknown-cell» card.
+      const followed = assignFollowingCell(version, seatAssign);
+      const parsed = followed.parsed;
+      if (parsed.ok) return { ok: true, via: followed.followed ? 'seat-assign-followed' : 'seat-assign' };
       if (parsed.code !== STEWARD_UNAVAILABLE) return { ok: false, error: `${parsed.code ?? 'refused'}:${parsed.reason}` };
       const set = spawnElanousSync(['release', 'checklist', 'set', cellId, '--owner', seat, '--version', version], { encoding: 'utf8', timeout: 60_000, env: { ...process.env, ELANOUS_TRACK: actor } });
       if (set.status !== 0) return { ok: false, error: String(set.stderr ?? '').trim().split('\n').pop() ?? 'checklist set failed' };
@@ -472,6 +516,14 @@ export function liveEffects(config: StewardSpaceConfig | undefined): StewardEffe
 }
 
 /** Seats whose answer can never come: absorbed kingdoms (res.dormant → RES · ELANOUS_DORMANT_SEATS extra, comma list). */
+/** Pure: assign in `version`; on «unknown-cell» retry once in seat assign's default release (the cell moved release). */
+export function assignFollowingCell<P extends { ok: boolean; code?: string | null }>(version: string, run: (version: string | undefined) => P): { parsed: P; followed: boolean } {
+  const first = run(version);
+  if (first.ok || first.code !== 'unknown-cell') return { parsed: first, followed: false };
+  const again = run(undefined);
+  return { parsed: again.ok ? again : first, followed: again.ok };
+}
+
 export function liveDormantSeats(): string[] {
   const out: string[] = [];
   try { if ((getUserConfig() as { res?: { dormant?: boolean } }).res?.dormant === true) out.push('RES'); } catch { /* none */ }

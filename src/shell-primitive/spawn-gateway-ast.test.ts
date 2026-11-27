@@ -52,23 +52,40 @@ function productionFiles(dir: string, base = root): string[] {
   });
 }
 
+// #39630 moved the signed-approval check into the gateway, so it now holds policy code
+// (imports, helpers, statements). The invariant stays: one child_process value import
+// (`spawn`), used only as the `spawnFn` default, and exactly one process call — the
+// final `return spawnFn(command, args, options);` of the exported spawnGateway.
 function gatewayShape(text: string): string[] {
   const sf = ts.createSourceFile(gateway, text, ts.ScriptTarget.Latest, true);
   const imports = sf.statements.filter(ts.isImportDeclaration);
-  const functions = sf.statements.filter(ts.isFunctionDeclaration);
-  const imp = imports[0];
-  const fn = functions[0];
-  const bindings = imp?.importClause?.namedBindings;
+  const cpImports = imports.filter(i => ts.isStringLiteral(i.moduleSpecifier) && processModules.has(i.moduleSpecifier.text));
+  const cp = cpImports[0];
+  const bindings = cp?.importClause?.namedBindings;
   const values = bindings && ts.isNamedImports(bindings) ? bindings.elements.filter(e => !e.isTypeOnly).map(e => `${e.propertyName?.text ?? e.name.text}:${e.name.text}`) : [];
-  const call = fn?.body?.statements[0];
-  const expression = call && ts.isReturnStatement(call) ? call.expression : undefined;
-  const ok = imports.length === 1 && ts.isStringLiteral(imp!.moduleSpecifier) && imp!.moduleSpecifier.text === 'node:child_process'
-    && values.join(',') === 'spawn:spawn' && functions.length === 1 && fn?.name?.text === 'spawnGateway'
-    && fn.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword) && fn.parameters.length === 4
+  const functions = sf.statements.filter(ts.isFunctionDeclaration);
+  const fn = functions.find(f => f.name?.text === 'spawnGateway');
+  const statements = fn?.body?.statements ?? ts.factory.createNodeArray();
+  const last = statements[statements.length - 1];
+  const expression = last && ts.isReturnStatement(last) ? last.expression : undefined;
+  let spawnValueRefs = 0;
+  let spawnFnCalls = 0;
+  const visit = (node: ts.Node) => {
+    if (ts.isIdentifier(node) && node.text === 'spawn' && !ts.isImportSpecifier(node.parent) && !ts.isTypeQueryNode(node.parent)
+      && !(ts.isPropertyAccessExpression(node.parent) && node.parent.name === node)) spawnValueRefs++;
+    if (ts.isCallExpression(node) && node.expression.getText(sf) === 'spawnFn') spawnFnCalls++;
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  const withoutSeamImport = cp ? text.slice(0, cp.getStart(sf)) + text.slice(cp.getEnd()) : text;
+  const ok = cpImports.length === 1 && cp!.importClause?.name === undefined && values.join(',') === 'spawn:spawn'
+    && fn !== undefined && fn.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword) === true
     && fn.parameters[3]?.name.getText(sf) === 'spawnFn' && fn.parameters[3]?.initializer?.getText(sf) === 'spawn'
-    && fn.body?.statements.length === 1 && expression && ts.isCallExpression(expression)
-    && expression.expression.getText(sf) === 'spawnFn' && expression.arguments.map(a => a.getText(sf)).join(',') === 'command,args,options'
-    && sf.statements.every(s => ts.isImportDeclaration(s) || ts.isTypeAliasDeclaration(s) || ts.isFunctionDeclaration(s));
+    && expression !== undefined && ts.isCallExpression(expression) && expression.expression.getText(sf) === 'spawnFn'
+    && expression.arguments.map(a => a.getText(sf)).join(',') === 'command,args,options'
+    && spawnFnCalls === 1 && spawnValueRefs === 1 && violations(withoutSeamImport, gateway).length === 0
+    && sf.statements.every(st => ts.isImportDeclaration(st) || ts.isTypeAliasDeclaration(st) || ts.isInterfaceDeclaration(st)
+      || ts.isFunctionDeclaration(st) || ts.isVariableStatement(st));
   return ok ? [] : ['gateway seam changed: review its sole spawn call and update this ratchet'];
 }
 
@@ -130,5 +147,10 @@ describe('RunShell AST process boundary', () => {
     expect(gatewayShape(good)).toEqual([]);
     expect(gatewayShape(good + `\nexport function bypass() { return Bun.spawn(['x']); }`)).not.toEqual([]);
     expect(gatewayShape(good.replace('return spawnFn(command, args, options);', `spawn('x'); return spawnFn(command, args, options);`))).not.toEqual([]);
+    // A second call through the injected seam, or the approval check moved after the spawn, is a new seam.
+    expect(gatewayShape(good.replace('return spawnFn(command, args, options);', `spawnFn('x', [], options); return spawnFn(command, args, options);`))).not.toEqual([]);
+    expect(gatewayShape(good.replace('return spawnFn(command, args, options);', `const child = spawnFn(command, args, options); return child;`))).not.toEqual([]);
+    expect(gatewayShape(good.replace("import { spawn, type SpawnOptions, type ChildProcess } from 'node:child_process';", "import { spawn, execFile, type SpawnOptions, type ChildProcess } from 'node:child_process';"))).not.toEqual([]);
+    expect(gatewayShape(good + `\nconst launch = spawn;`)).not.toEqual([]);
   });
 });

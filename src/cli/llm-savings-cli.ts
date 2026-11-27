@@ -19,6 +19,9 @@ import {
 } from '../model-tier/router-savings.js';
 import { LogStore, logsDbPath, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
 import { decideGuardedRoute, type GuardedRouteDecision } from '../llm/route-quality-guard.js';
+import { ROUTER_SAVINGS_HISTORY_DAYS, isSmartRouterTier, type MembershipResolver } from '../plugins/smart-router/consumer.js';
+import { authorizeRouterFeatureAtEntry } from '../plugins/smart-router/full-wire.js';
+import { createMemberTierStore, memberTierResolver } from '../members/tier-store.js';
 
 /** 원장 행 최소 형태(LogStoreRow 와 구조 호환 — 시험 주입용). `ts` 는 ISO 문자열(원장 실측 계약). */
 export interface SavingsLedgerRow {
@@ -292,6 +295,8 @@ export interface LlmSavingsDeps {
   readonly priceOf?: SavingsPriceOf;
   readonly out?: (line: string) => void;
   readonly now?: () => number;
+  /** SMART-ROUTER-TIER-FULL-WIRE(칸 43) — 등급 원천 주입(시험). 없으면 실제 원천 스토어 → env 폴백 → free. */
+  readonly membership?: MembershipResolver;
 }
 
 export interface LlmSavingsResult {
@@ -335,10 +340,23 @@ export async function runLlmSavings(opts: LlmSavingsOpts, deps: LlmSavingsDeps =
     return { error: '--premium-model <모델 id> 필요 — «강 단독» 기준 모델을 지정해야 절감 비율을 계산한다.' };
   }
   const now = deps.now ? deps.now() : Date.now();
+  // SMART-ROUTER-TIER-FULL-WIRE(칸 43) — savings_receipt 진입 게이트: 등급 원천(member-tier-store → env → free
+  // fail-closed)이 표 판정을 내리고, 거부(missing-tier·unknown-tier·denied)면 영수 대신 거부 안내(fail-closed).
+  const membership = deps.membership ?? memberTierResolver(createMemberTierStore());
+  const savingsGrant = authorizeRouterFeatureAtEntry('router.savings_receipt', membership);
+  if (!savingsGrant.allowed) {
+    return { error: `⛔ 절감 영수를 내지 못했다 — router.savings_receipt:${savingsGrant.reason} (${savingsGrant.entry} · ${savingsGrant.tierSource})` };
+  }
   const minutes = opts.minutes ?? DEFAULT_WINDOW_MINUTES;
+  // SMART-ROUTER-TIER-FULL-WIRE — unlimited_history 집행: 등급별 기록 보존 상한(ROUTER_SAVINGS_HISTORY_DAYS ·
+  // 출처: consumer.ts PRODUCT-SMART-ROUTER-TIERS-1117 «등급» 표 — free 7일 · pro 30일 · advanced 무제한).
+  // 요청 창(minutes)이 등급 상한보다 크면 상한으로 잘라 읽는다(등급 상향 우회 금지 · fail-closed).
+  const tierNow = membership.currentTier();
+  const daysCap = isSmartRouterTier(tierNow) ? ROUTER_SAVINGS_HISTORY_DAYS[tierNow] : ROUTER_SAVINGS_HISTORY_DAYS.free;
+  const minutesCap = daysCap === Number.POSITIVE_INFINITY ? minutes : Math.min(minutes, daysCap * 24 * 60);
   const calls = deps.rows !== undefined
     ? deps.rows
-    : savingsCallsFromLedger(readLedgerWindow(), { now, sinceMs: minutes * 60_000, runId: opts.runId });
+    : savingsCallsFromLedger(readLedgerWindow(), { now, sinceMs: minutesCap * 60_000, runId: opts.runId });
   const priceOf = deps.priceOf ?? defaultPriceOf;
   const receipt = summarizeRouterSavings({ calls, premiumModel: opts.premiumModel, premiumModels: opts.premiumModels, priceOf });
   // 일일 재계산(--daily): UTC 일 버킷 표를 영수에 함께 실는다 — 가격은 비공개(비율만).

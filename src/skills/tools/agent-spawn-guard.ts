@@ -13,6 +13,8 @@
 //                      same goal that is still running.
 //   concurrency-cap  — at most 3 agents running per seat in the long lane, 8 in
 //                      the short lane (CAPSULE-POOL-SHORT-LANE · lanes count apart).
+//                      A coordinator seat (OP · the HQ / space coordinators of the
+//                      federation ladder) gets 8 in the long lane (COORD-RIGHTS · CEO 11-27).
 //   key-busy         — short lane: one live capsule per subject key.
 //
 // Short lane (CAPSULE-POOL-SHORT-LANE · 0.3.36): a capsule for one triaged mail
@@ -32,6 +34,25 @@ import { formatTokens, type AgentSpend } from '../../tui/chat/tool-activity.js';
 export { formatTokens };
 
 export const AGENT_SPAWN_MAX_RUNNING = 3;
+/** COORD-RIGHTS (CEO 11-27 08:0x «조율자 권한부터 더 주라»): running long-lane agents per COORDINATOR seat. */
+export const AGENT_SPAWN_COORDINATOR_MAX_RUNNING = 8;
+
+/** A coordinator seat: OP, the coordinator role in the seat ledger, or the HQ / a space coordinator of the live federation
+ *  ladder. Any lookup failure = not a coordinator (the hand cap applies). */
+export function defaultIsCoordinator(seat: string): boolean {
+  const id = seat.trim().toUpperCase();
+  if (!id) return false;
+  if (id === 'OP') return true;
+  try {
+    const { isCoordinatorSeat } = require('../../seat/seat-role.js') as typeof import('../../seat/seat-role.js');
+    if (isCoordinatorSeat(id)) return true;
+  } catch { /* ledger unreadable */ }
+  try {
+    const { loadFederationLadder } = require('../../msg/hand-raise-ladder.js') as typeof import('../../msg/hand-raise-ladder.js');
+    const depth = loadFederationLadder().depthOf(id);
+    return depth === 1 || depth === 2;   // 1 = HQ · 2 = space coordinator (0 = CEO · 3 = hand)
+  } catch { return false; }
+}
 /** CAPSULE-POOL-SHORT-LANE — running short-lane capsules per seat (counted apart from the long lane's 3). */
 export const AGENT_SPAWN_SHORT_LANE_MAX_RUNNING = 8;
 /** Short-lane capsule wall-clock limit. */
@@ -169,6 +190,10 @@ export interface AgentSpawnGuardOpts {
   now?: () => number;
   taskState?: TaskStateLookup;
   maxRunning?: number;
+  /** Long-lane cap for a coordinator seat (default AGENT_SPAWN_COORDINATOR_MAX_RUNNING). */
+  maxCoordinatorRunning?: number;
+  /** Is this seat a coordinator (default: defaultIsCoordinator). */
+  isCoordinator?: (seat: string) => boolean;
   maxShortRunning?: number;
   windowMs?: number;
   shortTtlMs?: number;
@@ -185,6 +210,8 @@ export class AgentSpawnGuard {
   private readonly now: () => number;
   private readonly taskState: TaskStateLookup;
   private readonly maxRunning: number;
+  private readonly maxCoordinatorRunning: number;
+  private readonly isCoordinator: (seat: string) => boolean;
   private readonly maxShortRunning: number;
   private readonly windowMs: number;
   private readonly shortTtlMs: number;
@@ -199,6 +226,8 @@ export class AgentSpawnGuard {
       return task ? { state: task.state, finishedAt: task.finishedAt, tokens: estimateTaskTokens(task) } : undefined;
     });
     this.maxRunning = opts.maxRunning ?? AGENT_SPAWN_MAX_RUNNING;
+    this.maxCoordinatorRunning = opts.maxCoordinatorRunning ?? AGENT_SPAWN_COORDINATOR_MAX_RUNNING;
+    this.isCoordinator = opts.isCoordinator ?? defaultIsCoordinator;
     this.windowMs = opts.windowMs ?? AGENT_SPAWN_DEDUPE_WINDOW_MS;
     this.maxShortRunning = opts.maxShortRunning ?? AGENT_SPAWN_SHORT_LANE_MAX_RUNNING;
     this.shortTtlMs = opts.shortTtlMs ?? AGENT_SHORT_LANE_TTL_MS;
@@ -352,7 +381,9 @@ export class AgentSpawnGuard {
       }
     }
     const laneLive = live.filter(entry => entry.lane === lane);
-    const cap = lane === 'short' ? this.maxShortRunning : this.maxRunning;
+    let coordinator = false;
+    if (lane === 'long') { try { coordinator = this.isCoordinator(attempt.seat); } catch { coordinator = false; } }
+    const cap = lane === 'short' ? this.maxShortRunning : coordinator ? Math.max(this.maxRunning, this.maxCoordinatorRunning) : this.maxRunning;
     if (laneLive.length >= cap) {
       return {
         allowed: false,

@@ -8,6 +8,8 @@
 
 import { streamLLM, type LLMMessage } from '../llm.js';
 import { redactSecretText, redactSecrets } from '../debug/secret-redaction.js';
+import { truncateProportional } from './truncate-proportional.js';
+import { requestSizePolicy } from '../session/request-size-guard.js';
 
 const COMPACT_SYSTEM_PROMPT = `
 You are performing a CONTEXT CHECKPOINT COMPACTION for another agent
@@ -128,6 +130,14 @@ export function buildCompactTranscript(
     .join('\n\n');
 }
 
+/** TURN-REQUEST-SIZE-LOSS — the transcript the summarizer is sent, held to `chat.requestSize.summaryInputMaxChars`
+ *  (head 20 % · tail 80 % · the middle replaced by a marker). An unbounded 855k-char transcript timed out or overflowed
+ *  the model's window (11-27 OP session: `compact summarise timed out` / `context_length_exceeded`), so compaction
+ *  never landed and the record kept growing until the turn itself hit the request cap. */
+export function boundedCompactTranscript(history: readonly LLMMessage[]): string {
+  return truncateProportional({ text: buildCompactTranscript(history), maxChars: requestSizePolicy().summaryInputMaxChars });
+}
+
 export function stripCompactScratchpad(text: string): string {
   return text.replace(/<analysis>[\s\S]*?<\/analysis>\s*/gi, '').trim();
 }
@@ -145,7 +155,7 @@ async function compactHistorySlice(
     return { summary: '', sourceTurns: 0 };
   }
 
-  const textTurns = buildCompactTranscript(history);
+  const textTurns = boundedCompactTranscript(history);
   const req: LLMMessage[] = [
     { role: 'system', content: COMPACT_SYSTEM_PROMPT },
     { role: 'user', content: `Transcript to summarise:\n\n${textTurns}` },
@@ -154,8 +164,10 @@ async function compactHistorySlice(
   let text = '';
   const deadline = Date.now() + (opts.timeoutMs ?? 45_000);
   try {
+    // usageSite = upkeep: a spend-policy stop never blocks compaction (contexts would grow without bound).
     text = await streamLLM(req, () => { /* no live echo */ }, {
       ...(opts.model ? { model: opts.model } : {}),
+      usageSite: 'compact-summary',
     });
   } catch (err) {
     throw new Error(`compact summarise failed: ${err instanceof Error ? err.message : String(err)}`);

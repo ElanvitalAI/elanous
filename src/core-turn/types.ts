@@ -175,6 +175,26 @@ export interface CoreTurnContext {
   /** Optional provider request-size hook. Only providers with a measured
    *  serializer consume it; all others retain their existing request path. */
   requestSizeGuard?: LLMOpts['requestSizeGuard'];
+  /**
+   * ⭐ CAPSULE-A1-POLICY scenario-scoped turn-config injection (terra r10 mustFix[0] · JUD-B
+   * #128595): the raw `turn` config section shape (e.g. `{ syncCapMs }`). When this is an
+   * object it REPLACES the process-global user-config read for THIS one turn only — a
+   * sim-world scenario pins its own cap without swapping the process-global config dir, so
+   * concurrently running real turns keep their own config and rows. Omitted/not an object →
+   * the pinned-file read (`capsulePolicyTurnConfigPath`) or the pre-existing global read
+   * stands (fail-open).
+   */
+  capsulePolicyTurnConfig?: unknown;
+  /**
+   * ⭐ CAPSULE-A1-POLICY real-loading seam (terra r10 mustFix[1]): a caller-pinned path to a
+   * user-config-shaped JSON file for THIS turn only. When set (and no object injection above),
+   * the REAL `readUserConfigObject` loader reads THIS file — scenario verification then
+   * covers the actual settings-loading path (file read → JSON parse → `.turn` extraction)
+   * with no process-global override, so a config-loading regression flips the row instead of
+   * hiding behind an injected object. Fixture-only (JUD #123019): never a copy of an
+   * operational config. Read failures stay fail-open (default cap).
+   */
+  capsulePolicyTurnConfigPath?: string;
   /** Optional per-turn reasoning effort; high/xhigh/max also opts into the default deep Bloom frame. */
   reasoningEffort?: LLMOpts['reasoningEffort'];
   /** Tool catalog the model may call this turn. Empty array means

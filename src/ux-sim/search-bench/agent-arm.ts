@@ -30,7 +30,9 @@ export async function execToolCall(kit: SearchKit, call: TranscriptCall): Promis
     case 'RunShell': {
       const argv = Array.isArray(a.command) ? a.command.map(String) : [];
       if (argv.length === 0) return 'error: command required';
-      return kit.exec('RunShell', argv, { kind: 'runshell' }).visible;
+      // 'via RunShell' (RUNSHELL-SEARCH-PARITY): the seat's RunShell search path — policy deny, roots,
+      // citations, hit count — not a bare exec fold. Model-visible text = the structured dispatch result.
+      return kit.runshell(argv);
     }
     default: kit.note(`unknown:${call.tool}`, JSON.stringify(a)); return `unknown tool ${call.tool}`;
   }

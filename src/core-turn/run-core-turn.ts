@@ -31,6 +31,11 @@ import type { LLMMessage, StreamWithToolsHandlers } from '../llm.js';
 import { debug, redactSecretText, withAmbientSessionScope } from '../debug/log.js';
 import { emitTurnLife } from '../debug/turn-life.js';
 import { applyDeferredTools } from '../session-runtime/tier-flip.js';
+import { capsulePolicyKindForTool, capsuleRequestedBackground, createCapsulePolicy } from './capsule-policy.js';
+// CAPSULE-A1-POLICY — the junction policy reads the same raw `turn.syncCapMs` source as the A2
+// capsule host wirings (skills/tools/index.ts · skills/tools/shell.ts), fail-open when unreadable.
+import { readUserConfigObject } from '../user-config/read.js';
+import { userConfigPath } from '../nexus/config/paths.js';
 import { resolveTurnRoutePin } from '../plugins/core/turn-route-pin.js';
 import { isOrderedLinearIssueStep, isOrderedLinearResearchWorkflow, isOrderedNonResearchWorkflow, isResearchAgentIntent } from '../tool-hints/signals.js';
 import { buildResearchDateSystemMessage, resolveSessionSurfaceProfile } from '../session-runtime/index.js';
@@ -572,6 +577,34 @@ export async function runCoreTurn(
       };
     };
 
+    // CAPSULE-A1-POLICY — the dispatch junction judgment policy (observability-only). One policy per
+    // turn; every capsule-family tool dispatched through this turn asks it at the junction below, so
+    // no isolation axis of a held turn (shell · agent · harness · graph · mcp — the 11-18 46-minute
+    // «Responding» sample) crosses the junction without a turn-life:capsule-policy judgment row.
+    // Judgment-only: the decision never detaches anything at this junction; the behavioral detach
+    // stays inside each capsule host (A2 shell wiring), which keeps its own policy of the same source.
+    const capsulePolicy = createCapsulePolicy({
+      // terra r9 mustFix[0] — scenario-scoped turn-config injection: a caller (sim-world scenario) pins
+      // THIS turn's boundary via ctx.capsulePolicyTurnConfig (the raw `turn` config section shape, e.g.
+      // { syncCapMs }) instead of the process-global user config. The injection REPLACES the global read
+      // for this one turn when it is an object; the process-global config dir is never swapped here, so a
+      // concurrently running real turn keeps its own config and its own rows. Omitted/not an object → the
+      // pinned-file read below (or the pre-existing global read) stands (injection is fail-open).
+      // terra r10 mustFix[1] — real-loading seam: ctx.capsulePolicyTurnConfigPath pins a user-config-shaped
+      // FILE for this one turn, so scenario verification runs the ACTUAL settings-loading path
+      // (readUserConfigObject: file read → JSON parse → `.turn` extraction) instead of bypassing it with
+      // an already-parsed object — a config-loading regression then flips the reflection row, not just
+      // the cap.
+      turnConfig: () => {
+        const injected = ctx.capsulePolicyTurnConfig;
+        if (typeof injected === 'object' && injected !== null) return injected;
+        const pinnedPath = ctx.capsulePolicyTurnConfigPath;
+        return readUserConfigObject(typeof pinnedPath === 'string' && pinnedPath
+          ? pinnedPath
+          : userConfigPath())?.turn;
+      },
+      correlation: { sessionId: ctx.sessionId },
+    });
     const handlers: StreamWithToolsHandlers = {
     onText: (delta, full) => {
       accumulatedText = full;
@@ -614,15 +647,34 @@ export async function runCoreTurn(
       } catch {
         // Observability must not prevent the selected tool from dispatching.
       }
-      // OBSERVE-TURN-EVENT-LIFECYCLE — 캡슐 진입(Agent/Task=agent · mcp__=mcp · Bash/Shell/Terminal=bash · 나머지=other).
+      // OBSERVE-TURN-EVENT-LIFECYCLE — 캡슐 진입(Agent/Task=agent · mcp__=mcp · Bash/Shell/Terminal=bash ·
+      // 하니스형(RunDevHarness/DevHarness/Harness*)=harness · 그래프형(GraphRun/RunGraph/Graph*)=graph · 나머지=other).
       try {
         emitTurnLife('turn-life:capsule-enter', {
           tool: name,
           callId: c?.callId ?? '',
           capsule: name === 'Agent' || name === 'Task' ? 'agent'
             : name.startsWith('mcp__') ? 'mcp'
-            : /^(Bash|Shell|WebTerminal|Terminal)/.test(name) ? 'bash' : 'other',
+            : /^(Bash|Shell|WebTerminal|Terminal)/.test(name) ? 'bash'
+            : /^(RunDevHarness|DevHarness|Harness)/.test(name) ? 'harness'
+            : /^(GraphRun|RunGraph|Graph)/.test(name) ? 'graph' : 'other',
         });
+      } catch { /* observability is fail-open */ }
+
+      // CAPSULE-A1-POLICY — the junction judgment row (observability-only, fail-open): every
+      // capsule-family tool asks the one switchless policy before it dispatches; a non-capsule
+      // tool (kind null) emits no row. The decision is logged, never enforced here. JUD-B #128197
+      // contract (terra r8 mustFix[1]): the row states the args ACTUALLY HANDED TO THE DISPATCHER —
+      // constrainResearchToolArgs runs once here and both the judgment and the dispatch consume the
+      // same object, so a research-constrained Agent (run_in_background forced to false) records
+      // sync, matching execution. The per-kind EXPLICIT background request is threaded through
+      // (JUD-B #128143: agent run_in_background:true · shell mode:'bg' · 나머지 fail-open) — a
+      // hardcoded false mislabelled backgrounded calls as sync; behavioral detach stays in the
+      // A2 shell host wiring.
+      const dispatchArgs = constrainResearchToolArgs(name, args);
+      try {
+        const kind = capsulePolicyKindForTool(name);
+        if (kind !== null) capsulePolicy.decide({ tool: name, kind, requestedBackground: capsuleRequestedBackground(name, dispatchArgs) });
       } catch { /* observability is fail-open */ }
 
       let success = false;
@@ -648,7 +700,7 @@ export async function runCoreTurn(
         } else {
           result = await ctx.dispatchTool(
             name,
-            constrainResearchToolArgs(name, args),
+            dispatchArgs,
           // Image-pipeline followup #1 (2026-05-05) — forward sessionId so
           // the dispatcher can auto-inject into session-keyed tool calls
           // (WebTerminal* etc.) when the LLM didn't supply one. `c` may

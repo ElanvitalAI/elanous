@@ -1,0 +1,94 @@
+# LLM-ACCOUNT-POLICY-YAML (0.3.38 P1 · OP · 대표 11-27 16:2x «크레딧 허용 여부 등도 정책 YAML 로 한 번에 — 고정값이 아니니까»
+# · 16:3x «라이브 상태(구독 잔량·크레딧 잔액·주간 한도)의 트리거 레벨이 행동을 정한다 · 사용자 개입과 자동 둘 다»).
+#
+# ONE policy pack for every LLM account decision: subscription caps, who may spend credits, route order, weekly caps,
+# fallback chain, trigger levels (watermarks + hysteresis + dwell) and named phases. Read ONLY through kit/resource-facts
+# (src/kit/resource-facts/llm-accounts.ts · llm-decide.ts) — router, codex rotation, credit allow list, Pod snapshot and
+# the budget gate all ask `decideLlmAccounts()`; none keeps its own copy.
+#
+# Layers (lowest → highest): code defaults < legacy config keys (llm.codexQuotaPolicy · llm.codexCreditAccounts ·
+# llm.codexAccountRotationThresholdPercentByAccount · llm.grokWeeklyCapPct · llm.openrouter.fallbackModel — read only
+# when this file is absent or invalid) < THIS FILE (versioned) < the live overlay <state>/resource-facts/llm-accounts.yaml
+# (same shape, partial · OP/guardian edit it; takes effect on the next read, no restart) — then, per decision:
+# phase & levels (guardian 연료관 ledger fact `llm-state`) and overrides (ledger `llm-override`, ranked CEO > safety >
+# OP > guardian auto; each one expires). `eln policy show|lint|explain llm-accounts` · `eln policy override set|ls|clear`.
+#
+# Values below = the live values of 11-27 16:2x (migrated from config: codexQuotaPolicy=credits · codexCreditAccounts
+# [default] · rotation 100/100/100 · order team→third→default · grokWeeklyCapPct 70 · fallbackChain [openrouter]).
+version: 1
+providers:
+  # Every provider says the same things, per account (= one subscription window or one prepaid balance):
+  #   subscription_cap_percent  rotate away at this used % of the window (null = no window — prepaid only)
+  #   credits                   go on with paid credits once the window is full? true | false | until_reset
+  #                             (until_reset = yes, but only while the window stays full — back to subscription at reset)
+  #   daily_credit_budget       SAFETY: spent today ≥ this → credits stop (credit level L2) — in the provider's unit
+  #   credit_floor              SAFETY: balance ≤ this → credits stop (credit level L3) — in the provider's unit
+  #   uses                      what it may serve (implementation · review · judge · chat) — absent = everything
+  # per provider: order (who is used first) · credit_order (by_balance_desc = most credit left first · listed = order)
+  openai-codex:                      # unit: codex credits
+    order: [team, third, default]
+    credit_order: by_balance_desc
+    accounts:
+      team: { subscription_cap_percent: 100, credits: false, daily_credit_budget: 30000, credit_floor: 2000 }
+      third: { subscription_cap_percent: 100, credits: false, daily_credit_budget: 30000, credit_floor: 2000 }
+      default: { subscription_cap_percent: 100, credits: true, daily_credit_budget: 30000, credit_floor: 2000 }
+  grok:                              # weekly subscription window
+    # The weekly window counts as full at this used % (CEO 11-11: grok fallback is not used at ≥ 70 %).
+    weekly_cap_percent: 70
+    accounts:
+      default: { subscription_cap_percent: 70, credits: false }
+  zai:                               # GLM coding plan: a 5-hour and a weekly window
+    accounts:
+      plan-5h: { subscription_cap_percent: 95, credits: false, uses: { review: false } }
+      plan-week: { subscription_cap_percent: 100, credits: false, uses: { review: false } }
+  openrouter:                        # unit: US dollars (prepaid · auto top-up)
+    fallback_model: openrouter/openai/gpt-6-luna
+    accounts:
+      default: { subscription_cap_percent: null, credits: true, daily_credit_budget: 50, credit_floor: 5 }
+# The fallback chain after the codex rotation (steps of src/oauth/fallback-chain.ts FALLBACK_STEPS), in order. codex-credits
+# = an account allowed above goes on with paid credits before anything external (dropped while no account may).
+# Live 11-27: llm.fallbackChain [openrouter] with codexQuotaPolicy=credits — the same order, now stated in one place.
+fallback: [codex-credits, openrouter]
+levels:
+  # A resource stays at least this long in a level before it may move again (no flapping around a watermark).
+  dwell_min: 15
+  # Watermarks on the REMAINING share of the subscription window (cap − used). Enter a level when remaining drops
+  # below `below`; leave it only once remaining is back at or above `exit_at` (exit_at > below = hysteresis).
+  # L3 = exhausted (remaining ≤ 0 or the provider said quota reached).
+  watermarks:
+    L1: { below: 30, exit_at: 35 }
+    L2: { below: 10, exit_at: 15 }
+    L3: { exit_at: 5 }
+  # Actions per level of a subscription account: demote (route later) · skip (not routed) · tier_down (one model tier
+  # down for new cells) · credits_deny · credits_allow · fallback:<n> (start the fallback chain at step n) · mode:<phase>.
+  actions:
+    L1: [demote]
+    L2: [demote, tier_down]
+    L3: [skip]
+  # Actions per level of a credit balance (<provider>:<account>:credits). These are the safety hard stops.
+  credit_actions:
+    L2: [credits_deny]
+    L3: [credits_deny]
+# Named phases (modes). The guardian 연료관 evaluates them top → bottom on every tick and usage event; the first whose
+# `when` all hold wins (dwell_min applies to phase changes too); none = normal. `set` = what the phase changes.
+# requires_ceo: entering it spends money no YAML budget bounds → a decision card to 대표, never automatic.
+phases:
+  - name: maintenance
+    when: [maintenance_window]
+    set: { implementation: throttled }
+    why: guardian maintenance window — review/judging only, implementation throttled
+  - name: fallback-openrouter
+    when: ['openai-codex:team>=L3', 'openai-codex:third>=L3', 'openai-codex:default>=L3', 'openai-codex:default:credits>=L2']
+    set: { skip: ['openai-codex:team', 'openai-codex:third', 'openai-codex:default'], fallback_index: 1 }
+    why: every codex subscription full and default credits at budget/floor — OpenRouter carries the work
+  - name: credits-default
+    when: ['openai-codex:team>=L3', 'openai-codex:third>=L3', 'openai-codex:default>=L3']
+    set: { credits: { 'openai-codex:default': true } }
+    why: every codex subscription full — default goes on with paid credits (bounded by its daily budget and floor)
+  - name: subscription-tight
+    when: ['openai-codex:team>=L3', 'openai-codex:third>=L3']
+    set: {}
+    why: team and third full — default carries codex work on its subscription
+overrides:
+  # An override without `until` expires after this many hours (or at its `until_event`, e.g. reset:openai-codex:team).
+  default_hours: 24

@@ -202,8 +202,19 @@ export function renderFailureOracleSection(skeletons: readonly FailureSkeleton[]
 export type FailureOracleMode = 'shadow' | 'on';
 export const FAILURE_ORACLE_EVENT = 'harness.failure-oracle';
 
-/** 생략·무효값 = shadow. `on` 만 주입한다. */
-export function resolveFailureOracleMode(config: { harness?: { failureOracle?: unknown } } | undefined): FailureOracleMode {
+/** SMART-ROUTER-TIER-FULL-WIRE(칸 43) — 등급 원천 기본값: 실제 원천 스토어 → env 폴백 → free(fail-closed). */
+import { authorizeRouterFeatureAtEntry } from '../plugins/smart-router/full-wire.js';
+import { createMemberTierStore, memberTierResolver } from '../members/tier-store.js';
+import type { MembershipResolver } from '../plugins/smart-router/consumer.js';
+
+/** 생략·무효값 = shadow. `on` 만 주입한다. 등급 게이트(router.failure_oracle_gen · advanced 전용) 미달이면
+ *  주입 없음(shadow)으로 강등 — 프롬프트를 못 바꾼다(fail-closed). 원천 미주입 시 실제 회원 등급 원천으로 판정. */
+export function resolveFailureOracleMode(
+  config: { harness?: { failureOracle?: unknown } } | undefined,
+  membership: MembershipResolver = memberTierResolver(createMemberTierStore()),
+): FailureOracleMode {
+  const grant = authorizeRouterFeatureAtEntry('router.failure_oracle_gen', membership);
+  if (!grant.allowed) return 'shadow';
   return config?.harness?.failureOracle === 'on' ? 'on' : 'shadow';
 }
 

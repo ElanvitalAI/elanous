@@ -6,7 +6,19 @@ import type { LogStore, LogStoreRow } from '../mss/logging/log-store.js';
 import { SELF_IMPLEMENT_PROGRESS_STAGES } from './orchestrator.js';
 import { debug } from '../debug/log.js';
 import { assessLingeringLaunchParents, assessRunningRuns, buildRunProgressRows, collectObservedRunPhases, distinctPhysicalLedgerDirectories, isPartialRunningRuns, queryRunningRuns, renderRunProgressTable, renderRunningRuns, type RunningRunsQueryObservation } from './running-runs.js';
-import { appendRunLedgerEntry, queryFederatedUnfinishedRunLedgers, recordNonBlockingRunPending, recordNonBlockingRunResult, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery } from './run-ledger.js';
+import { appendRunLedgerEntry, queryFederatedUnfinishedRunLedgers, recordNonBlockingRunPending, recordNonBlockingRunResult, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery, type RunLedgerEntry } from './run-ledger.js';
+
+test('HARNESS-PROGRESS-SEAT-TURN-FILTER: 순수 분류는 child-first 첫 이벤트와 하니스 단계 부재를 요구한다', async () => {
+  const { isSeatTurnLedger } = await import('./running-runs.js');
+  const entry = (event: string): RunLedgerEntry => ({ runId: 'run-seat-turn', event, data: {} });
+
+  expect(isSeatTurnLedger([entry('child-first-llm-call')])).toBe(true);
+  expect(isSeatTurnLedger([entry('child-first-tool-call')])).toBe(true);
+  expect(isSeatTurnLedger([])).toBe(false);
+  expect(isSeatTurnLedger([entry('start'), entry('child-first-llm-call')])).toBe(false);
+  expect(isSeatTurnLedger([entry('child-first-llm-call'), entry('pipeline-node-entry')])).toBe(false);
+  expect(isSeatTurnLedger([entry('child-first-llm-call'), entry('phase')])).toBe(false);
+});
 
 const ledger = (
   runId: string,
@@ -1102,6 +1114,51 @@ const progressDeps = (overrides: Partial<FederatedUnfinishedRunLedgerQuery> = {}
   ], targetCount: 1, unreadableTargets: [] }),
 });
 
+test('HARNESS-PROGRESS-SEAT-TURN-FILTER: 자리 턴 원장 두 개는 행에서 빠지고 하니스 원장은 남으며 헤더에 제외 수를 표시한다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-seat-turn-'));
+  const runIds = ['seat-one', 'seat-two', 'harness-one'];
+  try {
+    appendRunLedgerEntry({ runId: runIds[0]!, event: 'child-first-llm-call', data: {} }, root);
+    appendRunLedgerEntry({ runId: runIds[1]!, event: 'child-first-tool-call', data: {} }, root);
+    appendRunLedgerEntry({ runId: runIds[2]!, event: 'pipeline-node-entry', data: { node: 'investigate' } }, root);
+    const result = queryRunningRuns({}, {
+      queryLedgers: () => progressLedgerQuery({
+        entries: runIds.map((runId) => ledger(runId, 'live', root)),
+        ledgerDirectories: [root],
+      }),
+      ptyTargets: () => [],
+      listPtyRefs: () => ({ refs: runIds.map((runId) => ({ instance: 'prod', id: `pty-${runId}`, kind: 'shell' as const, alive: true, runId })), unreadable: [] }),
+      readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }),
+    });
+
+    expect(buildRunProgressRows(result).map((row) => row.runId)).toEqual(['harness-one']);
+    expect(renderRunProgressTable(result).split('\n')[0]).toBe('도는 런 1 (확인 1 · 추정 0) · 자리 턴 2 제외');
+    expect(JSON.stringify(buildRunProgressRows(result))).not.toContain('seat-one');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('HARNESS-PROGRESS-SEAT-TURN-FILTER: queryRunningRuns의 실제 phase 관측은 child-first 원장을 하니스 행으로 보존한다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-seat-turn-phase-'));
+  const runId = 'child-first-with-phase';
+  try {
+    appendRunLedgerEntry({ runId, event: 'child-first-llm-call', data: {} }, root);
+    const result = queryRunningRuns({}, {
+      queryLedgers: () => progressLedgerQuery({ entries: [ledger(runId, 'live', root)], ledgerDirectories: [root] }),
+      ptyTargets: () => [],
+      listPtyRefs: () => ({ refs: [{ instance: 'prod', id: 'pty-phase', kind: 'shell', alive: true, runId }], unreadable: [] }),
+      readRunPhases: () => ({ events: [{ runId, phase: 'implementing', observedAt: '2026-09-12T07:05:07.000Z' }], targetCount: 1, unreadableTargets: [] }),
+    });
+
+    expect(result.entries).toEqual([expect.objectContaining({ runId, phaseObservation: 'observed', lastPhase: 'implementing' })]);
+    expect(buildRunProgressRows(result).map((row) => row.runId)).toEqual([runId]);
+    expect(renderRunProgressTable(result).split('\n')[0]).toBe('도는 런 1 (확인 1 · 추정 0) · 자리 턴 0 제외');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('deps가 runIds를 무시해도 queryRunningRuns는 요청한 ID만 결과에 남긴다', () => {
   const unscoped = queryRunningRuns({}, progressDeps());
   const scoped = queryRunningRuns({ runIds: ['run-a'] }, progressDeps());
@@ -1142,7 +1199,7 @@ test('renderRunProgressTable emits one line per run with phase, entry time, last
   const lines = renderRunProgressTable(result, nowMs).split('\n');
 
   expect(lines).toHaveLength(3);
-  expect(lines[0]).toBe('도는 런 2 (확인 2 · 추정 0)');
+  expect(lines[0]).toBe('도는 런 2 (확인 2 · 추정 0) · 자리 턴 0 제외');
   expect(lines[1]).toBe('run-a · running · 단계 implementing · 진입 2026-09-12T07:05:07.000Z · 마지막 진전 2026-09-12T07:00:00.000Z (경과 1h2m) · pty prod:pty-a');
   expect(lines[2]).toBe('run-b · running · 단계 미관측 · 진입 미관측 · 마지막 진전 미관측 · pty prod:pty-b');
   expect(lines.some((line) => line.includes('부분 관측'))).toBe(false);

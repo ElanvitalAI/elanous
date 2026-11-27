@@ -1,3 +1,4 @@
+import { tierModel } from '../src/llm/model-defaults.js';
 // Run explicitly on a disposable machine/state root. No production tools are dispatched.
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -15,7 +16,7 @@ const value = (flag: string) => { const i = args.indexOf(flag); return i < 0 ? u
 const output = value('--output');
 const promptPath = value('--prompt-file');
 const emitPrompt = value('--emit-prompt');
-const model = value('--model') ?? 'gpt-6.1-terra';
+const model = value('--model') ?? tierModel('balanced');
 if (args.includes('--resume') && !promptPath) throw new Error('--resume requires the original --prompt-file');
 for (const name of ['ELANOUS_STATE_DIR', 'ELANOUS_CONFIG_DIR']) {
   const path = process.env[name];

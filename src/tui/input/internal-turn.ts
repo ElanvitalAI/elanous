@@ -84,6 +84,22 @@ export const EXTERNAL_EVENT_ORIGINS: ReadonlySet<InternalTurnOrigin> = new Set([
  */
 export const ALARM_ORIGINS: ReadonlySet<InternalTurnOrigin> = new Set(['scheduled']);
 
+/**
+ * WAKE-PRIORITY (CEO 11-26 22:2x · OP «Retro missed (Cap)» · «Resource optimize missed (Cap)» at 22:15): scheduled loop
+ * wakes — retro, resource-optimize and other armed alarms (`scheduled`), the pulse — are owed a slot at a fixed time.
+ * They are exempt from pacing (min-interval and run cap) and only wait for NotIdle / HumanTyping with their own bounded
+ * retry. While one of them is waiting (it was refused NotIdle/HumanTyping), `goal-continue` yields: it is refused with
+ * `Cap · pacing:yield-scheduled` so the next idle slot goes to the scheduled wake.
+ */
+export const SCHEDULED_LOOP_ORIGINS: ReadonlySet<InternalTurnOrigin> = new Set(['scheduled', 'retro', 'pulse']);
+/** Origins that give way to a waiting scheduled loop wake. */
+export const YIELDING_ORIGINS: ReadonlySet<InternalTurnOrigin> = new Set(['goal-continue']);
+// 출처: SEAT_RETRO_DEFER_MAX_MS (src/seat/seat-retro.ts, 30 min) — the longest a scheduled wake retries; a claim older
+// than that has given up, so goal-continue stops yielding to it.
+export const SCHEDULED_CLAIM_MAX_MS = 30 * 60_000;
+// 출처: SEAT_RETRO_RETRY_MS / RESOURCE_OPT_RETRY_MS (60 s) — the waiting wake comes back within this; retry goal-continue after.
+export const YIELD_RETRY_MS = 60_000;
+
 // Source: #38096 — the classic autowake minimum gap (DEFAULT_AUTOWAKE_MIN_GAP_MS · plan «30~60s»); one value for both paths.
 export const DEFAULT_PACING_MIN_INTERVAL_MS = 45_000;
 // Source: #38049 — DEFAULT_SEAT_CAP_CONTINUE_LIMIT: automatic continues before a person is needed; the same run length.
@@ -154,6 +170,8 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
   /** #38210 REVIEW-2: the rest is measured from when the automatic turn ENDED (classic autowake does the same). */
   let lastAutoEndedAt: number | null = null;
   let consecutiveSelfStarted = 0;
+  /** WAKE-PRIORITY: since when a scheduled loop wake has been waiting for an idle slot (null = none waiting). */
+  let scheduledClaimSince: number | null = null;
 
   /** 열었지만 실행되지 않은 내부 턴을 거둔다 — 사람이 먼저다. */
   const withdrawPending = (detail: string): void => {
@@ -171,6 +189,10 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
     detail?: string,
     retryAt?: number,
   ): StartTurnIfIdleResult => {
+    if (SCHEDULED_LOOP_ORIGINS.has(origin) && (reason === 'NotIdle' || reason === 'HumanTyping') && scheduledClaimSince === null) {
+      scheduledClaimSince = now();
+      log('tui.autoturn', 'scheduled-claim', { origin, reason });
+    }
     log('tui.autoturn', 'rejected', { origin, reason, turnId: null, ...(detail ? { detail } : {}), ...(retryAt === undefined ? {} : { retryAt }) });
     return { opened: false, reason, ...(detail ? { detail } : {}), ...(retryAt === undefined ? {} : { retryAt }) };
   };
@@ -179,6 +201,10 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
   const pacingRejection = (origin: InternalTurnOrigin, ownLimit = false): StartTurnIfIdleResult | null => {
     const pacing = deps.pacing;
     if (!pacing) return null;
+    // WAKE-PRIORITY: a scheduled loop wake owes nobody a rest — it opens as soon as the seat is idle.
+    if (SCHEDULED_LOOP_ORIGINS.has(origin)) return null;
+    if (scheduledClaimSince !== null && now() - scheduledClaimSince > SCHEDULED_CLAIM_MAX_MS) scheduledClaimSince = null;
+    if (scheduledClaimSince !== null && YIELDING_ORIGINS.has(origin)) return reject(origin, 'Cap', 'pacing:yield-scheduled', now() + YIELD_RETRY_MS);
     const external = EXTERNAL_EVENT_ORIGINS.has(origin);
     if (!external && !ownLimit && !ALARM_ORIGINS.has(origin) && consecutiveSelfStarted >= pacing.maxConsecutive) {
       return reject(origin, 'Cap', `pacing:run-cap ${consecutiveSelfStarted}/${pacing.maxConsecutive}`);
@@ -257,6 +283,7 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
       lastId = turnId;
       idUnclaimed = true;
       lastAutoOpenedAt = now();
+      if (SCHEDULED_LOOP_ORIGINS.has(origin)) scheduledClaimSince = null;
       if (EXTERNAL_EVENT_ORIGINS.has(origin)) consecutiveSelfStarted = 0;
       else if (!ALARM_ORIGINS.has(origin) && opts.ownLimit !== true) consecutiveSelfStarted += 1;
       log('tui.autoturn', 'opened', { origin, reason: opts.reason ?? null, turnId, ...(deps.pacing ? { run: consecutiveSelfStarted } : {}) });

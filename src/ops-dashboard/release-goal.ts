@@ -81,7 +81,7 @@ function readPlan(hqRoot: string, version: string): Record<string, string> {
 export function deriveReleaseGoal(input: { hqRoot: string; ledgerRoot?: string; packageVersion?: string; current?: CurrentVersion }): ReleaseGoal {
   const current = input.current ?? resolveCurrentVersion({ hqRoot: input.hqRoot, ...(input.ledgerRoot ? { ledgerRoot: input.ledgerRoot } : {}),
     ...(input.packageVersion ? { packageVersion: input.packageVersion } : {}) });
-  const front = current.source === 'plan' ? readPlan(input.hqRoot, current.version) : {};
+  const front = current.source === 'plan' || current.source === 'graph' ? readPlan(input.hqRoot, current.version) : {};
   return {
     version: current.version, versionSource: current.source, published: current.published,
     publishAt: current.schedule?.publishAt ?? planReleaseAt(front),
@@ -119,4 +119,19 @@ export function releaseGoalLine(goal: ReleaseGoal, now: number): string {
 export function standingNoteFromPlan(hqRoot: string, version: string): string | undefined {
   const targets = planTargets(readPlan(hqRoot, version));
   return targets.source === 'plan' ? releaseGoalNote(targets) : undefined;
+}
+
+/**
+ * OP-NEXT-BEST-ACTION 3/3 — the standing note from the version's actual top open cells («UX-12 · TC-3 · OP-NBA (+40 open)»)
+ * instead of the generic «로스터 착지 · 초록». Undefined when the checklist cannot be read or has no open cell (the caller
+ * keeps its default). Lazy: the checklist store loads only when called.
+ */
+export function standingNoteFromCells(version: string, ledgerRoot: string): string | undefined {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { listChecklist } = require('../release-loop/checklist.js') as typeof import('../release-loop/checklist.js');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { goalNoteFromCells } = require('../loops/op-next-action.js') as typeof import('../loops/op-next-action.js');
+    return goalNoteFromCells(listChecklist(version, ledgerRoot).items) ?? undefined;
+  } catch { return undefined; }
 }

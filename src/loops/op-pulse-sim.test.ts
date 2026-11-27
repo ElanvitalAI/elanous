@@ -48,8 +48,8 @@ describe('SIM pulse runner', () => {
     m = { ...green(), landedPerH: 6, spaces: [{ space: 'UX', landedPerH: 1, greenPerH: 0, hands: 3, idleWithWork: 5, readyCells: 1, blockedCells: 2 }] };
     const r = await run('w2');
     expect(r.outcome).toBe('turn');
-    expect(r.brief!.split('\n')[0]).toBe('[pulse w2] 국면: build · 리듬: 60분 · 착지 20/h · 초록 10/h · 판정 대기 ≤30m · 손잡이 reprioritize, lend-hands, judge-relief, vm-ask, burst-propose');
-    expect(r.brief).toContain('- FED · landed/h = 6 (목표 ≥ 20)');
+    expect(r.brief!.split('\n')[0]).toBe('[pulse w2] 국면: build · 리듬: 60분 · 착지 10/h · 초록 10/h · 손잡이 reprioritize, lend-hands, vm-ask, burst-propose');
+    expect(r.brief).toContain('- FED · landed/h = 6 (목표 ≥ 10)');
     expect(r.brief).toContain('- UX · idle-with-work = 5 (목표 ≤ 3)');
     const out = deliverPulseTurn({ ...io(), window: 'w2', stage: 'live', brief: r.brief!, runId: 'run-1', now: clock, shadowDir: join(dir, 'shadow') });
     expect(out.delivered).toBe('inbox');

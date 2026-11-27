@@ -369,17 +369,49 @@ export function registerSeatBootCommands(command: Command, options: { home?: () 
     .option('--json', 'print the result as JSON')
     .option('--p0', 'P0/demo push past a live scope 행정관 (otherwise hands pull with `eln work next`)')
     .option('--steward', 'internal: the scope 행정관 itself (it already holds the shared wake claim)')
-    .action(async (rawSeat: string, cellId: string, flags: { why?: string; from?: string; version?: string; json?: boolean; p0?: boolean; steward?: boolean }) => {
+    .option('--force', 'a human override: past the target-release and assign-rate guards (loops never pass it)')
+    .option('--caller <name>', 'who is calling (logged): resource-steward · next-action · … (default: cli:<parent pid>)')
+    .action(async (rawSeat: string, cellId: string, flags: { why?: string; from?: string; version?: string; json?: boolean; p0?: boolean; steward?: boolean; force?: boolean; caller?: string }) => {
       const { resolveSeatId } = await import('../tui/seat-mail-boot.js');
-      const actor = (flags.from ?? process.env.ELANOUS_TRACK ?? resolveSeatId(process.cwd()) ?? '').trim().toUpperCase();
+      let actor = (flags.from ?? process.env.ELANOUS_TRACK ?? resolveSeatId(process.cwd()) ?? '').trim().toUpperCase();
+      // CLAUDE-OP-PROXY-IDENTITY — a claimed CLAUDE-OP assigns as OP only from the verified proxy session (audited · noticed).
+      if (actor === 'CLAUDE-OP') {
+        const { resolveProxyActor } = await import('../proxy/proxy-identity.js');
+        const r = resolveProxyActor({ claimed: actor, op: 'seat-assign', target: `${rawSeat.toUpperCase()} ${cellId}` });
+        if (r.kind !== 'proxy') { console.error(r.kind === 'refused' ? `seat assign: ${r.line}` : 'seat assign: proxy refused'); process.exitCode = 2; return; }
+        actor = r.actor;
+      }
       const { seatAssign } = await import('../seat/seat-assign.js');
       const { liveSeatAssignDeps } = await import('../seat/seat-assign-live.js');
       const result = await seatAssign({ seat: rawSeat, cellId, actor, ...(flags.why ? { why: flags.why } : {}), ...(flags.version ? { version: flags.version } : {}),
-        ...(flags.p0 ? { p0: true } : {}), ...(flags.steward ? { steward: true } : {}) }, liveSeatAssignDeps());
+        ...(flags.p0 ? { p0: true } : {}), ...(flags.steward ? { steward: true } : {}), ...(flags.force ? { force: true } : {}),
+        caller: flags.caller?.trim() || `cli:${process.ppid}` }, liveSeatAssignDeps());
+      // FED-FACT-OP-ACTIONS — the assignment is the actor's action (a repeat within 30 min is not a new one). Fail-open.
+      if (result.ok && !result.already) (await import('../fed-state/actions.js')).recordAction({ kind: 'assign', by: actor, cell: result.cellId, to: result.seat, ref: result.version, ...(flags.why ? { why: flags.why } : {}), source: 'seat-assign' });
       if (flags.json) console.log(JSON.stringify(result));
       else if (result.ok) for (const line of result.lines) console.log(line);
       else console.error(result.reason);
       if (!result.ok) process.exitCode = result.code === 'live-writer' || result.code === 'pool-empty' ? 1 : 2;
+    });
+  // OP-DIRECT-ASSIGN (CEO 11-26) — the scope steward's veto over a direct assignment: reason-bound, audited, mailed to OP.
+  command.command('veto <cellId>').description('Steward veto: unassign (or --to reassign) a cell in your scope · reason required · audited (checklist history) · mailed to OP')
+    .requiredOption('--reason <line>', 'one line: why the assignment is wrong')
+    .option('--to <seat>', 'reassign to this seat (default: unassign — back to the board)')
+    .option('--from <seat>', 'the vetoing steward seat (default: ELANOUS_TRACK, then this directory\'s seat)')
+    .option('--version <v>', 'release checklist version (default: the current release)')
+    .option('--json', 'print the result as JSON')
+    .action(async (cellId: string, flags: { reason: string; to?: string; from?: string; version?: string; json?: boolean }) => {
+      const { resolveSeatId } = await import('../tui/seat-mail-boot.js');
+      const actor = (flags.from ?? process.env.ELANOUS_TRACK ?? resolveSeatId(process.cwd()) ?? '').trim().toUpperCase();
+      const { seatVeto } = await import('../seat/seat-veto.js');
+      const { liveSeatVetoDeps } = await import('../seat/seat-assign-live.js');
+      const result = seatVeto({ cellId, actor, reason: flags.reason, ...(flags.to ? { to: flags.to } : {}), ...(flags.version ? { version: flags.version } : {}) }, liveSeatVetoDeps());
+      // FED-FACT-OP-ACTIONS — veto (unassign) or reassign (--to) is the vetoing seat's action. Fail-open.
+      if (result.ok) (await import('../fed-state/actions.js')).recordAction({ kind: result.to ? 'reassign' : 'veto', by: actor, cell: result.cellId, ...(result.to ? { to: result.to } : {}), ref: result.version, why: flags.reason, source: 'seat-veto' });
+      if (flags.json) console.log(JSON.stringify(result));
+      else if (result.ok) for (const line of result.lines) console.log(line);
+      else console.error(result.reason);
+      if (!result.ok) process.exitCode = result.code === 'lost' ? 1 : 2;
     });
   command.command('wake-claim <seat>').description('Shared wake ledger: claim the 20-min wake window for a seat (any waker — steward · assign · idle-nudge · coach) · exit 5 = already woken · exit 6 = 2 wakes unanswered (raise ✋ instead)')
     .requiredOption('--by <who>', 'the waker (seat or script name)')

@@ -148,9 +148,11 @@ test('the coordinator report connects open PR collection to the OP message ledge
     });
     const store = openMsgStore(join(root, 'msg', 'messages.db'));
     try {
-      const messages = store.list('OP');
+      // SIGNAL-DIET-OP-DIGEST — machine mail to OP waits for the 30-min digest (parked, not an inbox row).
+      expect(store.list('OP')).toHaveLength(0);
+      const messages = store.pendingOpDigest();
       expect(messages).toHaveLength(1);
-      expect(messages[0]).toMatchObject({ from: 'ORCHESTRATOR', kind: 'report' });
+      expect(messages[0]).toMatchObject({ sender: 'ORCHESTRATOR', kind: 'report' });
       expect(messages[0]?.body).toContain('#35482');
       expect(messages[0]?.body).toContain('scripts/release-loop/gate-node.ts');
     } finally { store.close(); }
@@ -320,14 +322,16 @@ test('an unreadable active goal appears as unknown instead of disappearing', () 
     .toEqual([{ kind: 'goal', ref: 'goal.md', seat: null, files: [], cells: [], reason: 'unreadable-goal' }]);
 });
 
-test('the production audit posts the list to the OP inbox', () => {
+test('the production audit parks the list for the OP machine digest', () => {
   const root = mkdtempSync(join(tmpdir(), 'sim-impact-mail-'));
   try {
     runSimImpactAudit('08', root, { work: () => [pr] });
     const store = openMsgStore(join(root, 'msg', 'messages.db'));
     try {
-      expect(store.list('OP')).toMatchObject([{ from: 'ORCHESTRATOR', to: 'OP', kind: 'report' }]);
-      expect(store.list('OP')[0]?.body).toContain('시뮬 월드 미고려');
+      expect(store.pendingOpDigest()).toMatchObject([{ sender: 'ORCHESTRATOR', kind: 'report' }]);
+      expect(store.pendingOpDigest()[0]?.body).toContain('시뮬 월드 미고려');
+      expect(store.flushOpDigestIfDue({ force: true })).toMatchObject({ from: 'SIGNAL-DIGEST', to: 'OP', kind: 'digest' });
+      expect(store.list('OP')).toHaveLength(1);
     } finally { store.close(); }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

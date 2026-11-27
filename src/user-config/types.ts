@@ -141,6 +141,10 @@ export interface LLMConfig {
   /** SUBSCRIPTION-EXHAUST-REROUTE (0.2.24) — codex 선불 크레딧 «예비분». 잔액이 이 값 이하로 «알려지면» 크레딧을 쓰지 않고
    *  회전이 `no-candidate` 를 내 폴백(우선 openrouter)으로 넘긴다. 잔액을 모르면 종전. 없으면 2000(`DEFAULT_CODEX_CREDIT_RESERVE`). */
   codexCreditReserve?: number;
+  /** CODEX-CREDIT-ACCOUNTS (대표 11-27 15:1x) — 유료 크레딧을 쓸 수 있는 codex 계정만(예 `["default"]`). 목록 밖 계정은 구독 전용
+   *  (창이 차면 멈춘다). 없으면 종전(잔액 확인된 모든 계정). resource facts `creditAccounts.openai-codex` 가 있으면 그것이 먼저다.
+   *  ⛔ 크레딧의 문은 여전히 `codexQuotaPolicy` 다 — 이 목록은 그 안에서 좁히기만 한다. */
+  codexCreditAccounts?: string[];
   /** Grok weekly launch usage ceiling (percent); defaults to 80. */
   grokWeeklyCapPct?: number;
   /** 대표 2026-10-11 ZAI-CODING-PLAN-PROVIDER — `glm` 직결(Z.ai 코딩 엔드포인트 · `ZAI_API_KEY` 가 있을 때만 선다).

@@ -11,7 +11,8 @@ import { openSurfaceEventsDb, recordEvent, surfaceEventsDbPath } from '../domain
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { installedCliArgv, resolveHqLaunchSeat } from '../hq/seats.js';
 import { judgeNeighbor } from '../loops/neighbors.js';
-import { checkLoopNeighbors, emitLoopHeartbeat, SEAT_NEIGHBORS } from '../loops/neighbor-runtime.js';
+import { checkLoopNeighbors, SEAT_NEIGHBORS } from '../loops/neighbor-runtime.js';
+import { emitSignal } from '../kit/heartbeat/index.js';
 import { addHarnessQueue, harnessQueueIdForKey, harnessQueueOutcome, listHarnessQueue } from '../harness/harness-queue.js';
 import { isRescueAllowedAction } from '../steward/rescue.js';
 import { DecisionLedger, type DecisionEntry, type DecisionOption, type Recommendation } from '../decisions/decision-ledger.js';
@@ -1265,7 +1266,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   const heartbeatEveryMs = (SEAT_NEIGHBORS[seat]?.find((peer) => peer.id !== 'orchestrator')?.heartbeat.everyMinutes ?? 15) * 60_000;
   const leaseMs = heartbeatEveryMs * 2;
   const pulse = (health: 'healthy' | 'degraded', at: Date): void => {
-    try { emitLoopHeartbeat(stateRoot, loopId, health, at, new Date(at.getTime() + leaseMs).toISOString()); }
+    try { emitSignal(stateRoot, loopId, health, at, new Date(at.getTime() + leaseMs).toISOString(), heartbeatEveryMs / 60_000); }
     catch (error) { observe('neighbor-runtime-failed', { seat, error: String(error).slice(0, 200) }); }
   };
   pulse('healthy', (deps.now ?? (() => new Date()))());

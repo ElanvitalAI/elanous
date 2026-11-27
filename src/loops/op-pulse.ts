@@ -68,7 +68,8 @@ export interface Rhythm { detection: PhaseDetection; rows: Map<PulsePhase, Rhyth
 
 /** Code defaults (used when the yaml omits a field). Source: FEATURE-SHIP-ACCELERATION §1a · JUDGE-LOAD-REDUCTION §지표. */
 export const DEFAULT_DETECTION: PhaseDetection = { preCutHours: 4, releaseAfterPublishMin: 30, postReleaseHours: 2, night: { from: 1, to: 6 }, freezes: [] };
-export const DEFAULT_TARGETS: PulseTargets = { landedPerH: 20, greenPerH: 10, judgeWaitMedianMin: 30, idleWithWorkMax: 3, readyPerHand: 2 };
+// JUD-RELAX (CEO 11-26): no judge-wait target — JUD keeps the veto only, so a merged+receipt cell is not a JUD wait.
+export const DEFAULT_TARGETS: PulseTargets = { landedPerH: 20, greenPerH: 10, judgeWaitMedianMin: null, idleWithWorkMax: 3, readyPerHand: 2 };
 
 const num = (v: unknown, at: string): number | null => {
   if (v === null) return null;
@@ -191,6 +192,8 @@ export interface PulseMeasure {
   spaces: SpaceMeasure[];
   /** Probes that could not measure (never read as zero). */
   unmeasured: string[];
+  /** WORLD-REGISTRY one-liner (세계: live · zombie · unregistered · no-owner) — absent/null = unread. */
+  world?: string | null;
 }
 
 export interface PulseGap { metric: 'landed/h' | 'green/h' | 'judge-wait' | 'idle-with-work' | 'ready-cells'; space: string; value: number; target: string }
@@ -244,6 +247,7 @@ export function renderPulseTable(m: PulseMeasure, phase: PhaseResult, row: Rhyth
     ...m.spaces.map(s => `| ${s.space} | ${cell(s.landedPerH)} | ${cell(s.greenPerH)} | ${cell(s.hands)} | ${mark(s.space, 'idle-with-work', s.idleWithWork)} | ${mark(s.space, 'ready-cells', s.readyCells)} | ${cell(s.blockedCells)} |`),
     '',
     `예산 여유: ${m.budget.length ? m.budget.join(' · ') : '?'}`,
+    ...(m.world !== undefined ? [m.world ?? '세계: ? (lease ledger unread)'] : []),
     ...(m.unmeasured.length ? [`못 잰 것: ${m.unmeasured.join(', ')}`] : []),
   ];
   return `${lines.join('\n')}\n`;
@@ -260,12 +264,15 @@ export const LEVER_MENU: Record<PulseLever, string> = {
 };
 
 /** The one OP turn's brief: phase + rhythm first, then the gap table, levers and the contract. */
-export function renderPulseBrief(input: { window: string; phase: PhaseResult; row: RhythmRow; gaps: readonly PulseGap[]; table: string; phaseChanged: string | null; tablePath: string }): string {
+export function renderPulseBrief(input: { window: string; phase: PhaseResult; row: RhythmRow; gaps: readonly PulseGap[]; table: string; phaseChanged: string | null; tablePath: string;
+  /** OP-WORLD-LENS — the world card (world-lens.ts renderLensLines): OP reads these numbers instead of assembling them. */
+  world?: readonly string[] | null }): string {
   const { row } = input;
   const leaders = [...new Set(input.gaps.map(g => g.space === 'FED' ? 'TC' : g.space))].sort();
   return [
     `[pulse ${input.window}] 국면: ${input.phase.phase} · 리듬: ${rhythmLine(row)}`,
     ...(input.phaseChanged ? [`국면 전환: ${input.phaseChanged} — 모든 리더에게 새 비트를 보낸다.`] : []),
+    ...(input.world && input.world.length ? ['', ...input.world, '(숫자는 이 카드에서 인용한다 — 손으로 다시 모으지 않는다 · 의심되면 줄 끝 [src] 명령을 다시 돌린다)'] : []),
     '',
     `격차표 (전문 ${input.tablePath}):`,
     ...input.gaps.map(g => `- ${g.space} · ${g.metric} = ${g.value} (목표 ${g.target})`),
@@ -340,6 +347,7 @@ export const pulsePaths = (seatState: string, stateRoot: string, date: string) =
   inbox: join(seatState, 'OP', 'pulse', 'inbox.json'),
   consumed: join(seatState, 'OP', 'pulse', 'inbox.consumed'),
   ledger: join(stateRoot, 'loops', 'op-pulse.jsonl'),
+  nextLedger: join(stateRoot, 'loops', 'op-next-action.jsonl'),
   burst: join(seatState, 'OP', 'pulse', 'burst.json'),
   burstLedger: join(seatState, 'OP', 'pulse', 'burst-receipts.jsonl'),
 });

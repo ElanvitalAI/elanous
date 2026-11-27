@@ -5,7 +5,8 @@
  * - needs-clean-branch: a PR whose base..head carries a merge with hand-resolved
  *   content cannot be reviewed as a delta (`main-merge-has-resolution-changes`).
  *   Before 11-17 the runner refused and was re-launched again and again (#38029).
- *   The outcome is now terminal, typed and carries one author instruction.
+ *   Since REVIEW-ACCEPT-MERGE-MAIN (0.3.38 P0) such a PR is reviewed as merge-base..head
+ *   (the PR's own change, resolutions included) — the land policy merges main into PRs.
  * - identity freeze: head + body sha are frozen when a review starts; a mismatch at
  *   the end names exactly which side changed (#38047 body edited mid-review).
  * - one review-slot ledger: OP and RES launches share the existing
@@ -30,7 +31,7 @@ const OID = /^[0-9a-f]{40}$/i;
 export const NEEDS_CLEAN_BRANCH_AUTHOR_ACTION =
   '병합 커밋 없는 깨끗한 가지 필요 — 현재 main 위에 새 가지로 다시 쌓고 새 PR 로 대체';
 
-/** Delta refusals that only a re-stacked branch can clear; retrying the same head never helps. */
+/** Delta refusals the review CLI answers with a merge-base..head review (REVIEW-ACCEPT-MERGE-MAIN), never a refusal. */
 export const NEEDS_CLEAN_BRANCH_DELTA_REFUSALS: ReadonlySet<string> = new Set([
   'main-merge-has-resolution-changes',
 ]);
@@ -59,17 +60,19 @@ export function needsCleanBranchOutcome(pr: string, headCommit: string, reason: 
 
 export type MergePreflight =
   | { status: 'clean'; mergeCommits: string[] }
+  /** REVIEW-ACCEPT-MERGE-MAIN: hand-resolved main merges are reviewed as merge-base..head, never refused. */
+  | { status: 'clean'; mergeCommits: string[]; reviewedDiff: 'merge-base'; mergeBase: string; resolutionMerges: string[]; smartMerges?: string[] }
   | { status: 'unmeasured'; reason: string }
   | NeedsCleanBranchOutcome;
 
 /**
  * Inspect merge-base(baseTip, head)..head before any reviewer is admitted.
- * A merge whose remerge-diff is non-empty (hand-resolved content) is the case the
- * delta reviewer refuses — return needs-clean-branch (terminal for that PR+head).
+ * REVIEW-ACCEPT-MERGE-MAIN (0.3.38 P0): the land policy merges main into PR branches, so a
+ * merge whose remerge-diff is non-empty (hand-resolved content) is reviewable — the reviewer
+ * reads the PR's own change merge-base..head (resolutions included, main-side changes not).
+ * It is `clean` with `reviewedDiff: 'merge-base'`; it no longer returns needs-clean-branch.
  * A remerge-diff that cannot be computed (timeout · old git · missing object) is
- * NOT proof of resolution: it is `unmeasured` with `main-merge-resolution-unknown`,
- * matching the delta path (self-review-cli `main-merge-resolution-unknown`, non-terminal).
- * Clean merges stay reviewable (the delta path already excludes them).
+ * `unmeasured` with `main-merge-resolution-unknown` (non-terminal).
  * Git failures before merges are known are `unmeasured`: the caller keeps its old path.
  */
 export function preflightMergeHistory(input: { pr: string; head: string; baseTip: string; git: GitRunner }): MergePreflight {
@@ -88,8 +91,13 @@ export function preflightMergeHistory(input: { pr: string; head: string; baseTip
     if (remerge.status !== 0) { unknown = true; continue; }
     if (remerge.stdout.trim()) resolved.push(merge);
   }
-  // Proven resolution wins over an unmeasured sibling merge; an unmeasured merge alone never refuses.
-  if (resolved.length > 0) return needsCleanBranchOutcome(pr, head, 'main-merge-has-resolution-changes', resolved);
+  // Proven resolution wins over an unmeasured sibling merge: the merge-base diff covers both.
+  if (resolved.length > 0) {
+    // SMART-MERGE: merges git-smart wrote carry a `Smart-Merge:` trailer (rebuild / merge + ladder steps) — same rule as a
+    // hand-resolved merge (review the PR-own delta merge-base..head), only labelled.
+    const smart = resolved.filter(m => /^Smart-Merge:/m.test(git(['show', '-s', '--format=%B', m]).stdout));
+    return { status: 'clean', mergeCommits, reviewedDiff: 'merge-base', mergeBase: base.toLowerCase(), resolutionMerges: resolved, ...(smart.length ? { smartMerges: smart } : {}) };
+  }
   if (unknown) return { status: 'unmeasured', reason: 'main-merge-resolution-unknown' };
   return { status: 'clean', mergeCommits };
 }
@@ -194,6 +202,12 @@ export interface SlotOwner {
  */
 // 출처: OP A204 #38060 Claude r1 MF — 종단 기록에 만료 길 · 발행 하루 주기(06:00 컷)와 같은 하루
 export const TERMINAL_REFUSAL_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Reasons a terminal record may still carry. Empty since REVIEW-ACCEPT-MERGE-MAIN (0.3.38 P0):
+ * hand-resolved main merges are reviewed as merge-base..head, so any older record is cleared.
+ */
+export const TERMINAL_REFUSAL_REASONS: ReadonlySet<string> = new Set<string>();
 
 export interface LedgerDeps {
   root: string;
@@ -407,8 +421,9 @@ export class ReviewSlotLedger {
 
   /**
    * The recorded refusal for PR+head, or undefined. A record past TERMINAL_REFUSAL_TTL_MS, an
-   * unreadable one, or one whose reason is not proven resolution (older unknown-as-terminal
-   * records) is removed and read as absent — the next preflight measures again.
+   * unreadable one, or one whose reason is not in TERMINAL_REFUSAL_REASONS is removed and read
+   * as absent — the next preflight measures again. REVIEW-ACCEPT-MERGE-MAIN: older
+   * `main-merge-has-resolution-changes` records are no longer terminal (merge-base review).
    */
   terminalRefusal(pr: string, head: string): Record<string, unknown> | undefined {
     const path = this.terminalPath(pr, head);
@@ -417,7 +432,7 @@ export class ReviewSlotLedger {
     try { record = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>; } catch { record = undefined; }
     const recordedAt = typeof record?.recordedAt === 'number' ? record.recordedAt : Number.NaN;
     const valid = record !== undefined
-      && record.reason === 'main-merge-has-resolution-changes'
+      && typeof record.reason === 'string' && TERMINAL_REFUSAL_REASONS.has(record.reason)
       && Number.isFinite(recordedAt)
       && this.deps.now() - recordedAt < TERMINAL_REFUSAL_TTL_MS;
     if (valid) return record;

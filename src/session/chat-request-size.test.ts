@@ -18,6 +18,8 @@ type FetchCapture = { body: Record<string, unknown>; wireJson: string };
 let root = '';
 let fetchDevice: FakeFetchDevice | undefined;
 let captures: FetchCapture[] = [];
+/** TURN-REQUEST-SIZE-LOSS sims — per-call SSE override (call index → SSE text); undefined = the default success stream. */
+let sseFor: ((call: number) => string | undefined) | undefined;
 const envKeys = ['HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'ELANOUS_SESSION_ROOT', 'ELANOUS_TEST_FAKE_LLM'] as const;
 let savedEnv: Partial<Record<typeof envKeys[number], string>> = {};
 let restoreCodexWorld: (() => void) | undefined;
@@ -43,7 +45,7 @@ beforeEach(async () => {
     let body: Record<string, unknown> = {};
     try { body = JSON.parse(wireJson) as Record<string, unknown>; } catch { /* non-JSON fetches are still captured */ }
     captures.push({ body, wireJson });
-    const sse = [
+    const sse = sseFor?.(captures.length - 1) ?? [
       'data: {"type":"response.output_text.delta","delta":"compact summary"}',
       '',
       'data: {"choices":[{"delta":{"content":"compact summary"}}]}',
@@ -71,6 +73,7 @@ afterEach(() => {
     try { device?.restore(); }
     finally {
       resetAutoCompactStateForTest();
+      sseFor = undefined;
       restoreCodexWorld?.();
       restoreCodexWorld = undefined;
       for (const key of envKeys) {
@@ -698,6 +701,184 @@ describe.serial('Codex TUI request-size compact', () => {
       skipMemoryInjection: true,
       provider,
     })).rejects.toThrow('Codex request remains over the 100-character limit');
+    expect(captures).toHaveLength(0);
+  });
+});
+
+// ── TURN-REQUEST-SIZE-LOSS (0.3.38 P0 · 11-27 15:27) — sims, seeds 1–5 ──────────────────────────────────────────────────
+// Measured: OP 7 · TC-H-POOL-3 4 · CC-1 3 · POOL-1 3 · POOL-2 3 · CX-6 2 · TUI-D 1 · CC-2 1 turns lost in 60 m to
+// `llm.request request-size-limit-blocked` (401–406k chars vs 400k · reason compaction-no-op / still-over-cap:archive-tool-
+// result). The wire was hundreds of small messages: no rung could take anything off. Expect: the oldest whole messages go
+// (archived, pair-safe), the request is sent under the cap, and a provider size refusal is retried once after a trim.
+
+function simRng(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+
+/** A seat record: mail notices, short replies and small tool pairs (outputs under the floor's 600-char minimum). */
+function seatRecord(seed: number, targetChars: number): import('../llm.js').LLMMessage[] {
+  const r = simRng(seed);
+  const out: import('../llm.js').LLMMessage[] = [{ role: 'system', content: 'SIM seat instructions' }];
+  let i = 0;
+  while (JSON.stringify(out).length < targetChars) {
+    const k = i % 5;
+    if (k === 0 || k === 2) out.push({ role: 'user', content: `[seat-mail m${seed}-${i} from TC] 우편 ${i} ${'mail body '.repeat(30 + Math.floor(r() * 120))}` });
+    else if (k === 1 || k === 3) out.push({ role: 'assistant', content: `reply ${i} ${'ok '.repeat(30 + Math.floor(r() * 200))}` });
+    else {
+      out.push({ role: 'assistant', content: [{ type: 'tool_use', id: `call_${seed}_${i}`, name: 'Bash', input: { command: `eln msg list ${i}` } }] });
+      out.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: `call_${seed}_${i}`, content: `row ${i} `.repeat(20 + Math.floor(r() * 40)) }] });
+    }
+    i++;
+  }
+  return out;
+}
+
+function assertPairsWhole(input: Array<{ type?: string; call_id?: string }>): void {
+  const calls = new Set(input.filter(item => item.type === 'function_call').map(item => item.call_id));
+  const outputs = new Set(input.filter(item => item.type === 'function_call_output').map(item => item.call_id));
+  for (const id of outputs) expect(calls.has(id)).toBe(true);
+  for (const id of calls) expect(outputs.has(id)).toBe(true);
+}
+
+const contextWindowError = [
+  'data: {"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","param":"input","message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}',
+  '',
+  '',
+].join('\n');
+
+describe.serial('SIM TURN-REQUEST-SIZE-LOSS — seeds 1–5', () => {
+  for (const seed of [1, 2, 3, 4, 5]) {
+    test(`seed ${seed}: a record of many small messages 1–3 % over the cap — oldest trimmed, request sent, turn kept`, async () => {
+      const messages = seatRecord(seed, 404_000 + Math.floor(simRng(seed * 7)() * 8_000));
+      messages.push({ role: 'user', content: `current turn ${seed} — answer this` });
+      const archiveDir = join(root, 'archive');
+      const log = spyOn(debug, 'log');
+      let persisted: number | undefined;
+      const guard = createRequestSizeGuard({
+        compactOptions: () => ({ sessionId: `trim-${seed}`, archiveEnabled: true, archiveDir }),
+        onCompacted: (compacted) => { persisted = compacted.length; },
+      });
+      try {
+        for await (const _ of PROVIDERS['openai-codex']!.streamChat!(messages, { model: 'gpt-5.6-terra', requestSizeGuard: guard })) { /* consume */ }
+        expect(captures).toHaveLength(1);
+        const wire = captures[0]!.wireJson;
+        expect(wire.length).toBeLessThanOrEqual(280_000); // maxChars 400 000 × trimTargetRatio 0.7
+        expect(wire).toContain(`current turn ${seed} — answer this`);
+        expect(String(captures[0]!.body.instructions)).toContain('SIM seat instructions');
+        expect(wire).toContain('[Earlier conversation held back — over the request size cap · ');
+        assertPairsWhole(captures[0]!.body.input as Array<{ type?: string; call_id?: string }>);
+        expect(persisted).toBe(messages.length); // the trimmed list went back to the caller (persisted history)
+        const trim = log.mock.calls.find(call => call[0] === 'llm.request' && call[1] === 'request-size-trim-oldest');
+        expect(trim).toBeDefined();
+        expect(log.mock.calls.some(call => call[0] === 'llm.request' && call[1] === 'request-size-limit-blocked')).toBe(false);
+        // Recoverable: the dropped messages are in the archive the marker names.
+        const record = JSON.parse(readFileSync(join(archiveDir, `trim-${seed}.jsonl`), 'utf8').trim().split('\n').at(-1)!);
+        expect(record.content).toContain(`[seat-mail m${seed}-0 from TC]`);
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    test(`seed ${seed}: one oversized tool output in the current turn — archived stub, request sent`, async () => {
+      const r = simRng(seed);
+      const size = 410_000 + Math.floor(r() * 40_000);
+      const messages: import('../llm.js').LLMMessage[] = [
+        { role: 'system', content: 'SIM seat instructions' },
+        { role: 'user', content: `read the log ${seed}` },
+        { role: 'assistant', content: [{ type: 'tool_use', id: `big_${seed}`, name: 'Bash', input: { command: 'cat big.log' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: `big_${seed}`, content: `line ${seed}\n${'log '.repeat(size / 4)}` }] },
+      ];
+      const guard = createRequestSizeGuard({ compactOptions: () => ({ sessionId: `big-${seed}`, archiveEnabled: true, archiveDir: join(root, 'archive') }) });
+      for await (const _ of PROVIDERS['openai-codex']!.streamChat!(messages, { model: 'gpt-5.6-terra', requestSizeGuard: guard })) { /* consume */ }
+      expect(captures).toHaveLength(1);
+      expect(captures[0]!.wireJson.length).toBeLessThanOrEqual(400_000);
+      expect(captures[0]!.wireJson).toContain(`read the log ${seed}`);
+      assertPairsWhole(captures[0]!.body.input as Array<{ type?: string; call_id?: string }>);
+    });
+
+    test(`seed ${seed}: a provider size refusal before any output — trimmed below what was refused and sent once more`, async () => {
+      // Under our cap (no pre-send trim), but the provider refuses it.
+      const messages = seatRecord(seed, 270_000 + Math.floor(simRng(seed * 11)() * 20_000));
+      messages.push({ role: 'user', content: `retry turn ${seed}` });
+      sseFor = (call) => (call === 0 ? contextWindowError : undefined);
+      const log = spyOn(debug, 'log');
+      const guard = createRequestSizeGuard({ compactOptions: () => ({ sessionId: `retry-${seed}`, archiveEnabled: true, archiveDir: join(root, 'archive') }) });
+      try {
+        for await (const _ of PROVIDERS['openai-codex']!.streamChat!(messages, { model: 'gpt-5.6-terra', requestSizeGuard: guard })) { /* consume */ }
+        expect(captures).toHaveLength(2);
+        expect(captures[1]!.wireJson.length).toBeLessThan(captures[0]!.wireJson.length);
+        expect(captures[1]!.wireJson.length).toBeLessThanOrEqual(Math.floor(captures[0]!.wireJson.length * 0.7)); // × trimTargetRatio
+        expect(captures[1]!.wireJson).toContain(`retry turn ${seed}`);
+        assertPairsWhole(captures[1]!.body.input as Array<{ type?: string; call_id?: string }>);
+        const retry = log.mock.calls.find(call => call[0] === 'llm.request' && call[1] === 'request-size-retry');
+        expect(retry?.[2]).toMatchObject({ retried: true });
+      } finally {
+        log.mockRestore();
+      }
+    });
+  }
+
+  for (const seed of [1, 2, 3, 4, 5]) {
+    test(`seed ${seed}: root — a TUI seat session of many small rows is windowed to the CHAR budget, not just tokens`, async () => {
+      // 11-27: the token window kept ~190k tokens of mostly-ASCII rows = 401–406k chars on the wire. Now the window
+      // measures the stricter of tokens and chars (maxChars × trimTargetRatio), so the guard never has to fire.
+      const model = 'gpt-5.6-terra';
+      const session = createSession({ provider: 'openai-codex', model, source: 'tui' });
+      const r = simRng(seed);
+      let chars = 0;
+      for (let i = 0; chars < 600_000 + r() * 60_000; i++) {
+        const content = i % 2 === 0
+          ? `[seat-mail m${seed}-${i} from TC] ${'mail body '.repeat(40 + Math.floor(r() * 120))}`
+          : `reply ${i} ${'ok '.repeat(40 + Math.floor(r() * 200))}`;
+        chars += content.length;
+        appendMessage(session.id, { role: i % 2 === 0 ? 'user' : 'assistant', content, ts: new Date().toISOString() });
+      }
+      const log = spyOn(debug, 'log');
+      try {
+        await runTurn({
+          userConfig: {
+            llm: { provider: 'openai-codex', model, memoryJudge: { enabled: false, crossRecall: false } },
+            chat: {
+              autoCompact: { enabled: false, triggerRatio: 0.9, preserveLastN: 2, preserveFirstN: 0, partial: true, workingBudgetTokens: 256_000 },
+              compact: { archiveEnabled: true },
+            },
+          } as never,
+          sessionId: session.id,
+          userText: `seat turn ${seed}`,
+          systemPrompt: 'SIM seat system prompt',
+          skipMemoryInjection: true,
+          provider: PROVIDERS['openai-codex']!,
+        });
+        expect(captures).toHaveLength(1); // no summarizer call, no retry: the window alone was enough
+        expect(captures[0]!.wireJson.length).toBeLessThanOrEqual(400_000 * 0.85);
+        expect(captures[0]!.wireJson).toContain(`seat turn ${seed}`);
+        expect(log.mock.calls.some(call => call[0] === 'llm.request' && call[1] === 'request-size-limit-blocked')).toBe(false);
+        expect(log.mock.calls.some(call => call[0] === 'session.trim' && call[1] === 'dropped')).toBe(true);
+      } finally {
+        log.mockRestore();
+      }
+    });
+  }
+
+  test('a second size refusal is not retried again — one retry, then the error surfaces', async () => {
+    const messages = seatRecord(9, 280_000);
+    messages.push({ role: 'user', content: 'still refused' });
+    sseFor = () => contextWindowError;
+    const guard = createRequestSizeGuard({ compactOptions: () => ({ sessionId: 'retry-twice', archiveEnabled: true, archiveDir: join(root, 'archive') }) });
+    const send = async () => { for await (const _ of PROVIDERS['openai-codex']!.streamChat!(messages, { model: 'gpt-5.6-terra', requestSizeGuard: guard })) { /* consume */ } };
+    await expect(send()).rejects.toThrow('exceeds the context window');
+    expect(captures).toHaveLength(2);
+  });
+
+  test('archive disabled — nothing is dropped, the request fails closed as before', async () => {
+    const messages = seatRecord(3, 410_000);
+    messages.push({ role: 'user', content: 'no archive' });
+    const before = structuredClone(messages);
+    const guard = createRequestSizeGuard({ compactOptions: () => ({ sessionId: 'no-archive', archiveEnabled: false }) });
+    const send = async () => { for await (const _ of PROVIDERS['openai-codex']!.streamChat!(messages, { model: 'gpt-5.6-terra', requestSizeGuard: guard })) { /* consume */ } };
+    await expect(send()).rejects.toThrow('Codex request remains over');
+    expect(messages).toEqual(before);
     expect(captures).toHaveLength(0);
   });
 });

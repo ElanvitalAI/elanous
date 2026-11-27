@@ -19,18 +19,18 @@ const T0 = Date.parse('2026-11-24T06:00:00.000Z');
 const MIN = 60_000;
 const hhmm = (ms: number): string => { const d = new Date(ms); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
 
-function harness(opts: { coordinator?: boolean; ledger?: boolean; installed?: string; packageVersion?: string } = {}) {
+function harness(opts: { coordinator?: boolean } = {}) {
   let t = T0;
   const cards: AutopilotDecisionCard[] = [];
   const logs: Array<[string, Record<string, unknown>]> = [];
   const progress: string[] = [];
+  const lines: string[] = [];
   const make = () => createAutopilot({ file, now: () => t, log: (e, d) => { logs.push([e, d]); },
     raiseDecision: (card) => { cards.push(card); return `D-${cards.length}`; },
     postProgress: (goal, due) => { progress.push(`${goal.title} · ${due}`); },
-    ...(opts.coordinator ? { coordinator: true } : {}),
-    ...(opts.ledger ? { standingGoal: () => resolveStandingGoal({ hqRoot: dir, ledgerRoot: dir, packageVersion: opts.packageVersion ?? '0.3.34-dev.0', now: t,
-      ...(opts.installed ? { installedVersion: opts.installed } : {}) }) } : {}) });
-  return { make, cards, logs, progress, advance: (ms: number) => { t += ms; }, now: () => t };
+    notify: (line) => { lines.push(line); },
+    ...(opts.coordinator ? { coordinator: true } : {}) });
+  return { make, cards, logs, progress, lines, advance: (ms: number) => { t += ms; }, now: () => t };
 }
 
 /** A fake model: for each person message it emits exactly the tool call scripted for it (the test asserts tool → state). */
@@ -103,6 +103,22 @@ test('a submitted human turn → AUTO after it ends, wake armed; under hold the 
   pilot.set({ on: true, hold: true }, 'tool');
   pilot.noteHuman();
   expect(pilot.turnEnded({ selfInitiated: false, failed: false })).toEqual({ arm: null });
+  expect(pilot.statusText()).toBe('🚗 PAUSED · you are driving');
+});
+
+test('COORD-RIGHTS: a coordinator line («⇢ OP · …») or a non-person turn asking hold → coordinator drive, autopilot keeps running; a person\'s own line still pauses', () => {
+  const h = harness();
+  const pilot = h.make();
+  pilot.set({ on: true, goal: 'g' }, 'slash');
+  pilot.noteTurnStart('human', '⇢ OP · 이제부터 내가 운전한다 — 이 칸 먼저');
+  expect(pilot.set({ on: true, hold: true }, 'tool')).toEqual({ ok: true, text: '🚗 coordinator drive (OP) — a coordinator\'s line steers this seat; autopilot keeps running (only a person pauses it)' });
+  expect(pilot.statusText()).toBe('🚗 AUTO · g');
+  expect(h.logs.at(-1)).toEqual(['coordinator-drive', { by: 'OP', goal: 'g' }]);
+  pilot.noteTurnStart('auto');
+  expect(pilot.set({ on: true, hold: true }, 'tool').text).toBe('🚗 coordinator drive (auto) — a coordinator\'s line steers this seat; autopilot keeps running (only a person pauses it)');
+  expect(pilot.statusText()).toBe('🚗 AUTO · g');
+  pilot.noteTurnStart('human', '이제 내가 운전할게');
+  pilot.set({ on: true, hold: true }, 'tool');
   expect(pilot.statusText()).toBe('🚗 PAUSED · you are driving');
 });
 
@@ -234,15 +250,15 @@ function releaseLedger(published: string[]): void {
   mkdirSync(join(rel, '9.9.97'), { recursive: true }); // a ledger dir without release.json is not published
 }
 
-test('OP (coordinator) session start → ON with the standing goal; hand seat start → OFF', () => {
+test('OP (coordinator) session start → ON with no goal (NO-RELEASE-GOAL); hand seat start → OFF', () => {
   releaseLedger(['0.3.33', '0.3.34']);
-  const op = harness({ coordinator: true, ledger: true }).make();
+  const op = harness({ coordinator: true }).make();
   op.refresh();
   expect(op.state().on).toBe(true);
-  expect(op.state().goal).toBe('0.3.35 개발');
-  expect(op.statusText().startsWith('🚗 AUTO · 0.3.35 개발')).toBe(true);
+  expect(op.state().goal).toBeUndefined();
+  expect(op.statusText()).not.toContain('0.3.35');
   file = join(dir, 'hand', 'state.json');
-  const hand = harness({ ledger: true }).make();
+  const hand = harness().make();
   hand.refresh();
   expect(hand.state().on).toBe(false);
   expect(hand.statusText()).toBe('');
@@ -250,27 +266,63 @@ test('OP (coordinator) session start → ON with the standing goal; hand seat st
 
 test('coordinator «자율주행 꺼» is persisted — the next start stays OFF', () => {
   releaseLedger(['0.3.34']);
-  const h = harness({ coordinator: true, ledger: true });
+  const h = harness({ coordinator: true });
   h.make().set({ on: false }, 'tool');
   const again = h.make();
   again.refresh();
   expect(again.state().on).toBe(false);
 });
 
-test('release cycle: cut prepared → «컷·발행»; publish-verified 0.3.35 → goal rolls to «0.3.36 개발» with one goal-rolled log', () => {
-  releaseLedger(['0.3.34']);
-  const h = harness({ coordinator: true, ledger: true });
+test('NO-RELEASE-GOAL: a release is published and the open count moves → no goal change and no 🚗 line', () => {
+  releaseLedger(['0.3.37']);
+  const h = harness({ coordinator: true });
   const pilot = h.make();
   pilot.refresh();
-  expect(pilot.state().goal).toBe('0.3.35 개발');
-  mkdirSync(join(dir, 'release', '0.3.35', 'prepared'), { recursive: true });
+  for (let i = 0; i < 5; i += 1) { h.advance(MIN); pilot.tick(); }
+  mkdirSync(join(dir, 'release', '0.3.38', 'prepared'), { recursive: true });
+  writeFileSync(join(dir, 'release', '0.3.38', 'release.json'), JSON.stringify({ version: '0.3.38', prerelease: false, publishedAt: '2026-11-24T06:03:00.000Z' }));
+  for (let i = 0; i < 5; i += 1) { h.advance(MIN); pilot.tick(); pilot.refresh(); }
+  expect(pilot.state().on).toBe(true);
+  expect(pilot.state().goal).toBeUndefined();
+  expect(pilot.state().derived).toBeUndefined();
+  expect(h.lines).toEqual([]);
+  expect(h.logs.filter(([e]) => e === 'goal-derived' || e === 'goal-rolled' || e === 'goal-phase' || e === 'release-goal-set')).toEqual([]);
+  expect(pilot.turnEnded({ selfInitiated: true, failed: false, fingerprint: 'idle' })?.drive).toBeUndefined();
+});
+
+test('NO-RELEASE-GOAL: a stored release goal is dropped on the next refresh — one log line, no visible line', () => {
+  mkdirSync(join(dir, '.autopilot'), { recursive: true });
+  const churn = '0.3.38 개발 — CLAUDE-OP-PROXY-BUS · JUD-GREEN-CREDENTIAL · SPLIT-TO-GREEN (+155 open)';
+  writeFileSync(file, JSON.stringify({ v: 1, on: true, by: 'default', goal: churn, releaseSeen: '0.3.38',
+    standing: { version: '0.3.38', phase: '개발', note: 'CLAUDE-OP-PROXY-BUS · JUD-GREEN-CREDENTIAL · SPLIT-TO-GREEN (+155 open)' },
+    derived: { tier: 'standing', source: 'standing', goal: churn } }));
+  const h = harness({ coordinator: true });
+  const pilot = h.make();
+  pilot.refresh();
+  pilot.refresh();
   pilot.tick();
-  expect(pilot.state().goal).toBe('0.3.35 컷·발행');
-  writeFileSync(join(dir, 'release', '0.3.35', 'release.json'), JSON.stringify({ version: '0.3.35', prerelease: false, publishedAt: '2026-11-25T21:00:00.000Z' }));
-  pilot.tick();
-  expect(pilot.state().goal).toBe('0.3.36 개발 — 로스터 착지 · 초록 +10/h');
-  expect(pilot.statusText().startsWith('🚗 AUTO · 0.3.36 개발')).toBe(true);
-  expect(h.logs.filter(([e]) => e === 'goal-rolled')).toEqual([['goal-rolled', { from: '0.3.35 컷·발행', to: '0.3.36 개발 — 로스터 착지 · 초록 +10/h' }]]);
+  expect(pilot.state().on).toBe(true);
+  expect(pilot.state().goal).toBeUndefined();
+  expect(pilot.statusText()).not.toContain('0.3.38');
+  expect(h.logs.filter(([e]) => e === 'release-goal-cleared')).toEqual([['release-goal-cleared', { goal: churn, releaseSeen: '0.3.38' }]]);
+  expect(h.logs.filter(([e]) => e === 'goal-derived')).toEqual([]);
+  expect(h.lines).toEqual([]);
+  const stored = readAutopilotState(file)!;
+  expect([stored.goal, stored.standing, stored.releaseSeen, stored.derived]).toEqual([undefined, undefined, undefined, undefined]);
+});
+
+test('NO-RELEASE-GOAL: an open crown goal stays when the legacy release fields are dropped', () => {
+  mkdirSync(join(dir, '.autopilot'), { recursive: true });
+  writeFileSync(file, JSON.stringify({ v: 1, on: true, goal: '[지시] 회원 가입 안정화', releaseSeen: '0.3.38', standing: { version: '0.3.38', phase: '개발' },
+    firstClass: [{ id: 'crown:9', source: 'crown', text: '[지시] 회원 가입 안정화', at: 1 }],
+    derived: { tier: 'first-class', source: 'crown:9', goal: '[지시] 회원 가입 안정화' } }));
+  const h = harness({ coordinator: true });
+  const pilot = h.make();
+  pilot.refresh();
+  expect(pilot.state().goal).toBe('[지시] 회원 가입 안정화');
+  expect(pilot.state().derived).toEqual({ tier: 'first-class', source: 'crown:9', goal: '[지시] 회원 가입 안정화' });
+  expect(h.logs.filter(([e]) => e === 'release-goal-cleared')).toEqual([['release-goal-cleared', { goal: '', releaseSeen: '0.3.38' }]]);
+  expect(h.lines).toEqual([]);
 });
 
 test('goals: the person adds a mid goal → paragraph + status; due within 48 h → one progress card', async () => {
@@ -304,7 +356,7 @@ test('autopilot cannot create a goal without the person — an autonomous turn y
 
 test('coordinator first start seeds the goal stack once (source=seed · deletable)', async () => {
   releaseLedger(['0.3.34']);
-  const pilot = harness({ coordinator: true, ledger: true }).make();
+  const pilot = harness({ coordinator: true }).make();
   pilot.refresh();
   expect(pilot.goals().map((g) => `${g.level}|${g.title}|${g.source}`)).toEqual([
     'mid|11-26 20:00 AI&B demo|seed', 'mid|Free membership opens December|seed', 'long|2027 Q1 paid launch prep|seed', 'long|Paid launch in April|seed']);
@@ -323,11 +375,9 @@ test('decided → one «decided» log, no state change', () => {
   expect(pilot.state().on).toBe(true);
 });
 
-test('installed 0.3.34 (published, but this host\'s ledger has no release.json for it) → standing goal 0.3.35 개발', () => {
+test('release resolver (read on demand): installed 0.3.34 with no release.json for it on this host → 0.3.35 개발', () => {
   releaseLedger(['0.3.33']);
-  const pilot = harness({ coordinator: true, ledger: true, installed: '0.3.34', packageVersion: '0.3.34-dev.0' }).make();
-  pilot.refresh();
-  expect(pilot.state().goal).toBe('0.3.35 개발');
+  expect(resolveStandingGoal({ hqRoot: dir, ledgerRoot: dir, installedVersion: '0.3.34', packageVersion: '0.3.34-dev.0' })).toEqual({ version: '0.3.35', phase: '개발' });
 });
 
 test('a stale plan «status: current» for a published release → the next version', () => {

@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "entries": {
+    "ta/TA-GP1": {
+      "expect": "green",
+      "greenSince": "2026-11-27 goal-policy sim (#40390 #40391 #40393 #40400)",
+      "reason": "evidence-only E4 cell: CellKind evidence header · policy pack evidence kind · no wiring criterion · GREEN alone passes (6 seeded variants)"
+    },
+    "ta/TA-GP2": {
+      "expect": "green",
+      "greenSince": "2026-11-27 goal-policy sim (#40390 #40391 #40393 #40400)",
+      "reason": "goal over 8 target paths → needs-rewrite «CORE 먼저 · 나머지 FU»; the CORE-only split passes (6 seeded variants)"
+    },
+    "ta/TA-GP3": {
+      "expect": "green",
+      "greenSince": "2026-11-27 goal-policy sim (#40390 #40391 #40393 #40400)",
+      "reason": "catalog duty marked reference-only · «### 검증 예산» noted (never waives evidence) · E4 CellKind added · record written · fixed doc passes again (6 seeded variants)"
+    },
+    "ta/TA-GP4": {
+      "expect": "green",
+      "greenSince": "2026-11-27 goal-policy sim (#40390 #40391 #40393 #40400)",
+      "reason": "GREEN present + only RED missing → RED recommended and recorded; no GREEN / failed implementation → nothing relaxed (6 seeded variants)"
+    },
+    "ta/TA-GP5": {
+      "expect": "green",
+      "greenSince": "2026-11-27 goal-policy sim (#40390 #40391 #40393 #40400)",
+      "reason": "implement cell: policy pack · no CellKind header · no catalog duty · RED still required (6 seeded variants)"
+    },
+    "ta/TA-GP6": {
+      "expect": "green",
+      "greenSince": "2026-11-27 goal-policy sim (#40371 HARNESS-BARE-REPO-BASE-REF E4)",
+      "reason": "real git: bare clone with a stale local main — base sync records refs/remotes/origin/main at the fetched tip, local main untouched, changedFiles = the child file only (3 seeded variants · 2~6 stale commits)"
+    },
+    "ta/TA-GP7": {
+      "expect": "green",
+      "greenSince": "2026-11-27 TDD-SAME-COMMAND-PAIR",
+      "reason": "a same-command RED→GREEN pair passes even when an earlier broader GREEN of another command comes first; a different-command GREEN alone still needs repair (6 seeded variants)"
+    },
+    "ta/TA-GP8": {
+      "expect": "green",
+      "greenSince": "2026-11-27 TDD-PROVEN-CARRY",
+      "reason": "a rework round inherits the run's proven same-command RED→GREEN pair; without a proven pair or after a failed implementation nothing is relaxed (6 seeded variants)"
+    },
+    "ta/TA-GP9": {
+      "expect": "green",
+      "greenSince": "2026-11-27 PRECHECK-CORE-SIZE",
+      "reason": "rubric calibration on the 11-27 canaries: hard → split (CORE = informational-notice branch) · easy/medium/BUTLER-SEC4-SCOPE → launch"
+    },
+    "ta/TA-GP10": {
+      "expect": "green",
+      "greenSince": "2026-11-27 PRECHECK-CORE-SIZE",
+      "reason": "security over-spec: approval gate outside security-4 relaxed · on a security-4 path kept (hand)"
+    },
+    "ta/TA-GP11": {
+      "expect": "green",
+      "greenSince": "2026-11-27 PRECHECK-CORE-SIZE",
+      "reason": "round corrections (a) security-path widening relaxed · (b) under-spec tighten · (c) out-of-scope recorded as FU, kept · (d) open dependency held at launch · real defects kept (6 seeded variants)"
+    },
+    "ta/TA-GP12": {
+      "expect": "green",
+      "greenSince": "2026-11-27 PRECHECK-CORE-SIZE",
+      "reason": "canary replay: medium rework keeps the proven pair · hard supervisor stop names the rubric CORE/FU split"
+    }
+  }
+}

@@ -1,0 +1,41 @@
+graph_id: guardian
+version: 1
+loop:
+  title: 수호자 (guardian) — thin resident body · 1-min LLM-0 pulse · spawns 7 sub-agents (맥박 · 임대관 · 연료관 · 열쇠지기 · 대식세포 · 순찰대 · 우체국) · voice
+  root: 수호자
+  managed_by: trigger-registry
+  description: >-
+    Super loop agent v2 (GUARDIAN-CHARTER-1127 · FEDERATION-ORG-SYSTEM-1127 v2 · L0 = RES). The thin body pulses every
+    trigger tick (≤ 2 min, LLM 0): aggregates host load/ncpu and every supervisor's heartbeat (trigger registry ⊕ watcher
+    beats), keeps the sub-agent KPI table, spawns sub-agents on events or cadence (one spawn line each, parent reaps past
+    TTL): 맥박 restarts dead supervisors / proposes reattach to L0 · 임대관 load switching, hand-scale proposals, paid VM → OP ·
+    대식세포 reaps orphaned test universes by exact PID · 연료관 accounts ≥ 90 % → OP; the body makes the final route decision
+    (<state>/res/route.json → self gate --remote). Voice: GUARDIAN / loop:guardian. Demote: eln loop demote guardian --to L1.
+  owner: OP # sub-coordinator rank = OP 직속 (failure cards → OP); its L0 supervisor RES is in goal.yaml
+  trigger:
+    condition:
+      predicate:
+        kind: state-changed
+        parts:
+          - { file: '{stateRoot}/res/reaper/registry.jsonl' }
+      cooldown_min: 1
+      max_wait_min: 1
+      on_max_wait: fire
+  goal:
+    kind: file-mtime
+    path: '{stateRoot}/loop-agents/guardian/last-pulse.json'
+  failure:
+    goal_deadline_min: 10
+    max_attempts: 2
+    backoff_sec: [120]
+entry_node: tick
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: tick
+    kind: agent
+    recipe: 'cmd:guardian-pulse'
+    max_visits: 1
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }

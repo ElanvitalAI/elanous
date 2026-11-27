@@ -31,3 +31,12 @@ The installed package contains `graphs/train/` and `scripts/train/`; run the sam
 ## Measured baseline dependencies
 
 On minim5, 2026-11-12 08:1x KST: Python 3.9.6 with `argparse`, `fcntl`, `sqlite3`, and `subprocess` available; `python3`, `git`, `gh`, `bun`, `zsh`, `ssh`, `scp`, and `eln` all resolve on PATH. The graph run uses the installed Elanous CLI and its package dependencies. The Python train still relies on operational queue and helper shell scripts at the paths above. This measurement is a host inventory, not a full live landing proof.
+
+## LAND-STEWARD (11-27) — the train manager is a sub-loop agent of 착지 집사
+
+The land graph replaced the batch path. The train manager now owns order, hot-file lanes and slot advice inside the
+land-steward body (`src/land-steward/train.ts` · knowhow `graphs/loop-agents/land-steward/knowhow.md`). The launchd slot
+`com.elanous.train-manager` runs `scripts/train/train-manager-heartbeat.py --interval 60` from the installed package: no
+train work, one heartbeat file `<state>/loop-agents/land-steward/train-manager.heartbeat.json` pointing at the body, one log
+line when the steward's last tick goes stale or recovers. `manager-node.py` (graph `train-manager`) is the same heartbeat.
+The legacy managers stay on disk and are not run.

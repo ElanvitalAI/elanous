@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recordFact, readFacts } from './ledger.js';
 import { computeFedKpi, fedKpi, hqBlockLines, parseGitLandLog } from './kpi.js';
-import { turnOpenerOf } from './turn-writer.js';
+import { fedSeat, turnOpenerOf } from './turn-writer.js';
 
 const at = (m: number) => new Date(Date.UTC(2026, 10, 25, 20, m)).toISOString();
 
@@ -64,6 +64,14 @@ describe('fed-state TUI writers', () => {
     expect(turnOpenerOf('queue-notice', 'wakeup')).toBe('wake');
     expect(turnOpenerOf('internal', 'scheduled')).toBe('wake');
     expect(turnOpenerOf('internal', 'self-pull')).toBe('internal');
+  });
+  test('OP-HELPERS-STABILIZE: the seat of an els pane comes from its seats/<SEAT> cwd (no ELANOUS_TRACK there)', () => {
+    expect(fedSeat({ ELANOUS_ELS_WS: 'OP' }, '/Users/x/elanous-hq/seats/OP')).toBe('OP');
+    expect(fedSeat({}, '/Users/x/elanous-hq/seats/tc-h-cx-1/sub')).toBe('TC-H-CX-1');
+    expect(fedSeat({ ELANOUS_TRACK: 'jud' }, '/Users/x/elanous-hq/seats/OP')).toBe('JUD');
+    // a workspace alone is not a seat (a hand pane in workspace TC is not TC) · a non-seat cwd writes nothing
+    expect(fedSeat({ ELANOUS_ELS_WS: 'TC' }, '/Users/x/elanous-hq/repo.git/.claude/wt/a')).toBe(null);
+    expect(fedSeat({}, '/tmp')).toBe(null);
   });
   test('idle hand without a flag counts until work next says empty', () => {
     const k = computeFedKpi([

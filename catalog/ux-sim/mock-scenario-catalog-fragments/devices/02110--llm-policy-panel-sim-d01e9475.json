@@ -1,0 +1,39 @@
+{
+  "id": "LLM-POLICY-PANEL-SIM",
+  "name": "Nexus LLM policy panel simulation device",
+  "checklistCells": ["NEXUS-LLM-POLICY-PANEL"],
+  "implementation": [
+    "src/ux-sim/llm-policy-panel-sim.ts",
+    "src/nexus/api/llm-policy-panel.ts",
+    "src/policy/llm-policy.ts"
+  ],
+  "tests": [
+    "src/ux-sim/llm-policy-panel-sim.test.ts"
+  ],
+  "target": "Owner-gated /v1/llm/policy panel GET/PUT over a temporary config dir, driven through the real routes and the real validateLlmPolicy/loadLlmPolicy",
+  "inputs": [
+    "owner and stranger bearer tokens",
+    "a valid default-derived policy document",
+    "an invalid schema document (wrong version, unknown field)",
+    "two concurrent valid PUT bodies",
+    "an empty config dir with no policy file"
+  ],
+  "observations": [
+    "401 on non-owner PUT with the previous file byte-for-byte preserved",
+    "400 with non-empty rejection reasons on invalid schema, previous policy preserved",
+    "both concurrent PUTs return 200 and the file settles on one atomic write",
+    "missing-file GET returns the default policy with filePresent=false"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/llm-policy-panel-sim.test.ts"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": ["ux.sim.llm-policy-panel/case"],
+  "recentUse": null,
+  "audience": "internal",
+  "defaultProfile": {
+    "credentials": "fake-only",
+    "network": "loopback-only",
+    "storage": "temporary"
+  }
+}

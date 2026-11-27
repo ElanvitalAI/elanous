@@ -144,3 +144,20 @@ describe('OP-CURRENT-VERSION-AWARE current-version resolver', () => {
     expect(compareVersions('0.3.35', '0.3.35')).toBe(0);
   });
 });
+
+// ONE-TARGET (11-27 · SEAT-ASSIGN-GUARD): PLAN-0.3.37.md still said `status: current` while release.graph.version was 0.3.38,
+// so the resource steward assigned 35 cells of 0.3.37. The graph target now wins; the plan mark is the fallback.
+describe('release.graph.version is the one target', () => {
+  test('graph 0.3.38 beats a stale plan 0.3.37 «current»; unset graph → the plan mark still decides', () => {
+    const hq = mkdtempSync(join(tmpdir(), 'cv-graph-'));
+    try {
+      const plans = join(hq, 'seat-state', 'OP', 'plans'); mkdirSync(plans, { recursive: true });
+      writePlan(plans, '0.3.37', 'current', 'old theme', 40);
+      writePlan(plans, '0.3.38', 'draft', 'graph foundation', 31);
+      const ledger = join(hq, 'ledger');
+      expect(resolveCurrentVersion({ hqRoot: hq, ledgerRoot: ledger, graphVersion: '0.3.38' })).toMatchObject({ version: '0.3.38', source: 'graph', theme: 'graph foundation', rosterCount: 31 });
+      expect(resolveCurrentVersion({ hqRoot: hq, ledgerRoot: ledger, graphVersion: null })).toMatchObject({ version: '0.3.37', source: 'plan', theme: 'old theme' });
+      expect(resolveCurrentVersion({ hqRoot: hq, ledgerRoot: ledger, graphVersion: '0.3.39' })).toMatchObject({ version: '0.3.39', source: 'graph', theme: null, rosterCount: null });
+    } finally { rmSync(hq, { recursive: true, force: true }); }
+  });
+});

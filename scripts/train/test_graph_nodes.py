@@ -263,6 +263,23 @@ class TrainGraphNodeTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertEqual(json.loads(result.stdout)['outcome'], 'fail')
 
+    def test_manager_tick_is_a_land_steward_heartbeat(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / 'land-graph').mkdir()
+            (root / 'land-graph' / 'last-tick.json').write_text(json.dumps({'at': '2020-01-01T00:00:00.000Z'}))
+            ctx = root / 'context.json'
+            ctx.write_text(json.dumps({'graphId': 'train-manager', 'nodeId': 'tick', 'input': {'op_watching': True}}))
+            result = subprocess.run([sys.executable, str(HERE / 'manager-node.py')],
+                                    env={**os.environ, 'ELANOUS_GRAPH_CONTEXT': str(ctx), 'ELANOUS_STATE_DIR': raw},
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            beat = json.loads((root / 'loop-agents' / 'land-steward' / 'train-manager.heartbeat.json').read_text())
+            self.assertEqual(beat['stewardLastTick'], '2020-01-01T00:00:00.000Z')
+            self.assertTrue(beat['stale'])
+            self.assertIn('land steward tick', beat['body'])
+            self.assertEqual(json.loads(result.stdout.splitlines()[-1])['outcome'], 'ok')
+
     def test_versioned_manager_loads_with_host_python(self):
         result = subprocess.run([sys.executable, str(HERE / 'legacy/train-manager.py'), '--help'],
                                 text=True, capture_output=True)

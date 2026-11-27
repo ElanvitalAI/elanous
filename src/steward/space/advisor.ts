@@ -199,12 +199,28 @@ function record(deps: AdvisorDeps, e: AdvisorEvent): void {
   appendFileSync(deps.eventsPath, `${JSON.stringify(e)}\n`);
 }
 
+// HAND-RESOLVE-CROSSTALK (11-27 P0 · TC «✋ RESOLVED» #186198 · #186225 · #186264 carried answers addressed to OTHER
+// hands): a coordinator resolve body reads «owner <SEAT> · by <ISO> · <answer>», and learnFromCoordinator kept the whole
+// body as the precedent's template — so applying precedent tc-186177 to TC-H-CX-5's ✋ wrote «owner TC-H-CX-5 · by … ·
+// owner TC-H-POOL-1 · by … · <POOL-1's answer>». A precedent keeps only the answer: the owner/deadline header and the
+// advisor trailer («· next: … · (… precedent …)») are stripped, and the original ✋'s seat becomes {seat}.
+const OWNER_BY = /^(?:owner\s+\S+\s*·\s*by\s+\S+\s*·\s*)+/u;
+const ADVISOR_TRAILER = /\s*·\s*next:\s.*?·\s*\([^()]*precedent [^()]*\)\s*$/u;
+
+/** The answer part of a resolve body (header «[✋ …]», owner/by prefixes and the advisor trailer removed). */
+export function answerOfResolve(body: string, originalSeat?: string): string {
+  let text = body.replace(/^\[✋[^\]]*\]\s*/u, '').replace(OWNER_BY, '').replace(ADVISOR_TRAILER, '').trim();
+  if (originalSeat) text = text.split(originalSeat).join('{seat}');
+  return text;
+}
+
 function resolveWith(store: MsgStore, hand: OpenHand, p: Precedent, deps: AdvisorDeps, via: string): void {
   const owner = p.owner === '{seat}' ? hand.blockedSeat : p.owner;
   const deadline = new Date(deps.now() + p.deadlineMin * 60_000).toISOString();
   applyHandOutcome(store, {
     msgId: hand.id, action: 'resolve', owner, deadline,
-    text: `${fillTemplate(p.answer, hand)} · next: ${fillTemplate(p.next, hand)} · (${via} · precedent ${p.id})`,
+    // Older ledger rows still hold a whole body: sanitize at use too, so no other hand's owner/deadline is ever re-sent.
+    text: `${fillTemplate(answerOfResolve(p.answer), hand)} · next: ${fillTemplate(p.next, hand)} · (${via} · precedent ${p.id})`,
   }, deps);
 }
 
@@ -226,7 +242,7 @@ export interface RecommendationOption { readonly label: string; readonly precede
 /** Options for a card: the matched precedent (if any) first, then hold-with-owner, then escalate. */
 export function recommendationOptions(hand: OpenHand, match: Precedent | null): RecommendationOption[] {
   const opts: RecommendationOption[] = [];
-  if (match) opts.push({ label: `apply precedent ${match.id}: ${fillTemplate(match.answer, hand)}`, precedent: match });
+  if (match) opts.push({ label: `apply precedent ${match.id}: ${fillTemplate(answerOfResolve(match.answer), hand)}`, precedent: match });
   opts.push({ label: `hold — ${hand.blockedSeat} keeps the cell, ${ADVISOR_DEFAULT_DEADLINE_MIN}m deadline, TC names the next step` });
   opts.push({ label: 'escalate to OP (cross-space / budget / policy)' });
   return opts;
@@ -330,8 +346,10 @@ export function learnFromCoordinator(store: MsgStore, deps: Pick<AdvisorDeps, 'c
     let handRefs: string[] = [];
     try { handRefs = JSON.parse(handRow.refs_json) as string[]; } catch { continue; }
     const reason = handRefs.find((r) => r.startsWith('reason:'))?.slice('reason:'.length) ?? '';
-    const text = row.body.replace(/^\[✋[^\]]*\]\s*/, '');
-    if (text.includes('precedent ')) continue; // the advisor's own resolves (written as the coordinator) are not new precedents
+    if (row.body.includes('precedent ')) continue; // the advisor's own resolves (written as the coordinator) are not new precedents
+    const originalSeat = handRefs.find((r) => r.startsWith('seat:'))?.slice('seat:'.length);
+    const text = answerOfResolve(row.body, originalSeat);
+    if (!text) continue;
     const p: Precedent = {
       id, cause: causeOfReason(reason), keys: handContextKeys(handRefs), answer: text, owner: '{seat}',
       deadlineMin: ADVISOR_DEFAULT_DEADLINE_MIN, next: '{seat} continues', source: 'coordinator-decision', at: row.created_at,

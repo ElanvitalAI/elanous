@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "entries": {
+    "alloc-budget/ALLOC-FLOOD": {
+      "expect": "green",
+      "greenSince": "2026-11-27 ALLOCATION-BUDGET sim (this PR)",
+      "reason": "a seat flooding a scarce codex account is stepped down after its share passes 40%; its P0 request is still granted on codex"
+    },
+    "alloc-budget/ALLOC-NEAR-CAP": {
+      "expect": "green",
+      "greenSince": "2026-11-27 ALLOCATION-BUDGET sim (this PR)",
+      "reason": "codex at >= 95% steps down to openrouter; with openrouter dry work queues with the window refill ETA; P0 and cut are overridden"
+    },
+    "alloc-budget/ALLOC-CUT-RESERVE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 ALLOCATION-BUDGET sim (this PR)",
+      "reason": "KST 03:00-06:30 leaves 20% reserve: work steps down (LLM) or queues (host); the cut gets the whole cap; no reserve by day"
+    },
+    "alloc-budget/ALLOC-TTL-RECLAIM": {
+      "expect": "green",
+      "greenSince": "2026-11-27 ALLOCATION-BUDGET sim (this PR)",
+      "reason": "a lease past TTL still holds capacity until reclaimExpired; never reclaimed early; capacity comes back after the reclaim"
+    },
+    "alloc-budget/ALLOC-UNATTRIBUTED": {
+      "expect": "green",
+      "greenSince": "2026-11-27 ALLOCATION-BUDGET sim (this PR)",
+      "reason": "an empty-context caller is granted as unattributed/unspecified and counted in the KPI and the summary line"
+    },
+    "alloc-budget/ALLOC-MODE-SHIFT": {
+      "expect": "green",
+      "greenSince": "2026-11-27 ALLOCATION-BUDGET sim (this PR)",
+      "reason": "advisor: tight LLM -> maintenance mode; free -> build mode; VM card only when every local host is saturated; repair for unreachable host and dead supervisor"
+    },
+    "alloc-budget/ALLOC-METERING": {
+      "expect": "green",
+      "greenSince": "2026-11-27 ALLOCATION-BUDGET sim (this PR)",
+      "reason": "identity chain seat->capsule->ta-card, inferred purposes, KST hour, usage from llm-proxy-call rows, wall-clock cpu-min, reconcile drift alert"
+    }
+  }
+}

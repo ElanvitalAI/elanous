@@ -105,7 +105,7 @@ export type SeatMailPlanWireOptions = Readonly<{
 export type PlanItemSnapshot = Readonly<{ id: string; status: string }>;
 export type PlanSnapshot = Readonly<{ active: number; open: number; items: readonly PlanItemSnapshot[]; /** Queue depth's oldest wait (ms) — WORK-QUEUE. */ oldestWaitMs: number | null }>;
 /** Why the plan changed — a structural cause, never read from text. */
-export type PlanRevisedReason = 'mail-absorbed' | 'item-done' | 'turn-done';
+export type PlanRevisedReason = 'mail-absorbed' | 'item-done' | 'turn-done' | 'stale-on-boot';
 /** ELN-PLAN-WIRE-SEAT `plan.revised` (ELN-STEER-AND-TOOL-WATCHDOG §156): emitted only when the plan actually changed. */
 export type PlanRevisedEvent = Readonly<{
   seat: string;
@@ -138,6 +138,18 @@ export type SeatPlanRuntime = {
 };
 
 const CLOSED: ReadonlySet<string> = new Set(['done', 'superseded', 'cancelled']);
+
+// PLAN-STALE-ON-BOOT (CEO 11-26 23:3x · hands re-delivered #88540 · #89009 · #88550 from 11-18…11-26 on every TUI boot and
+// spent turns answering «this is a repeat notice»): the seat plan's ONE active item is queued again at each boot and closes
+// only on a turn that ends with a finished update_plan — an item whose mail was simply answered stayed active forever and
+// starved 93–245 items queued behind it. At boot an open item now expires (cancelled · evidence names why) when:
+//   • its mail is older than PLAN_ITEM_MAX_AGE_MS (출처: two working days — a request older than that is history), or
+//   • its mail id is at or below the seat's ack cursor (the seat lineage acked it), or
+//   • a turn already answered it and it has been re-offered on more than PLAN_ITEM_MAX_BOOT_OFFERS boots without closing
+//     (출처: 11-22 TC-H-CC-2's stale #38547 was hand-closed after repeating — an answered item re-offered twice is a repeat).
+// The first boot on a build with this rule is the one-time sweep; each expiry is one `plan.revised` (reason stale-on-boot).
+export const PLAN_ITEM_MAX_AGE_MS = 48 * 60 * 60_000;
+export const PLAN_ITEM_MAX_BOOT_OFFERS = 2;
 const isClosed = (task: SeatPlanItem): boolean => CLOSED.has(task.status);
 
 /** Header piece «계획 k/m»: k = active items (≤ MAX_ACTIVE_PLAN_ITEMS), m = items still open. */
@@ -340,8 +352,37 @@ export function wireSeatMailToPlan(queue: SeatPlanQueuePort, options: SeatMailPl
     if (!Number.isSafeInteger(mailId) || mailId <= 0) return;
     receipts([{ messageId: mailId, recipient: seat, state: 'seen', source: 'plan', queueItemId: noticeItemId }]);
     mailAdapter.settle('plan', [mailId], 'responded');
+    // PLAN-STALE-ON-BOOT: remember the item was answered — a later boot that re-offers it counts toward its expiry.
+    const at = (options.now ?? Date.now)();
+    items = items.map(item => (item.id === task!.id ? { ...item, answeredAt: at } : item));
+    persist();
   };
 
+  // PLAN-STALE-ON-BOOT — expire what a boot must not offer again, then promote the next item.
+  {
+    const before = snapshot();
+    const nowMs = (options.now ?? Date.now)();
+    const cursor = (() => { try { return ledger.getCursor?.(seat) ?? 0; } catch { return 0; } })();
+    const expired: string[] = [];
+    items = items.map(task => {
+      if (isClosed(task)) return task;
+      const mailId = Number(task.sourceRequestId.replace(/^mail#/, ''));
+      const age = typeof task.receivedAt === 'number' ? nowMs - task.receivedAt : 0;
+      // A re-offer counts only for an item a turn already answered (a long task still being worked is answered too, but a
+      // first-time item that never got its turn is not «repeated»).
+      const offers = task.status === 'active' && task.answeredAt !== undefined ? (task.bootOffers ?? 0) + 1 : (task.bootOffers ?? 0);
+      const why = age > PLAN_ITEM_MAX_AGE_MS ? `expired on boot: mail older than ${PLAN_ITEM_MAX_AGE_MS / 3_600_000}h`
+        : Number.isSafeInteger(mailId) && mailId > 0 && mailId <= cursor ? `expired on boot: mail #${mailId} already acked by ${seat}`
+          : offers > PLAN_ITEM_MAX_BOOT_OFFERS ? `expired on boot: re-offered on ${offers} boots without closing` : null;
+      if (why) { expired.push(task.id); return { ...task, status: 'cancelled' as const, doneEvidence: why }; }
+      return offers !== (task.bootOffers ?? 0) ? { ...task, bootOffers: offers } : task;
+    });
+    if (expired.length > 0) {
+      items = promoteNextActive(orderPlanTasks(items));
+      persist();
+      revised(before, 'stale-on-boot', { itemId: expired.join(',') });
+    } else if (items.some(task => task.bootOffers !== undefined)) persist();
+  }
   // A restart starts with an empty prompt queue: the saved active item is queued again, nothing else.
   syncQueueWithPlan();
   return { absorb, status, plan: () => items, complete, noteTurnOutcome, noteTurnAnswered };

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { createEntryTurnDoor, doorOutcomeOf, humanFirstDetail, nextDoorOpener, runDoorTurn } from './door-wire.js';
+import { createEntryTurnDoor, doorOutcomeOf, humanFirstDetail, internalWakeBuffer, nextDoorOpener, runDoorTurn } from './door-wire.js';
+import { createNextTuiCoreInput } from '../core/input.js';
 
 const facts = (over: Partial<{ draft: string; unread: number; last: number; now: number }> = {}) => ({
   draft: () => over.draft ?? '',
@@ -15,6 +16,77 @@ describe('humanFirstDetail — a person goes first', () => {
     expect(humanFirstDetail(facts({ last: 95_000, now: 100_000 }))).toBe('quiet-window');
     expect(humanFirstDetail(facts({ last: 90_000, now: 100_000 }))).toBeNull();
     expect(humanFirstDetail(facts())).toBeNull();
+  });
+});
+
+describe('idle draft door boundary', () => {
+  test('empty editor after backspace releases the automatic door when the quiet window expires', () => {
+    let now = 1_000;
+    const state = { draft: () => '', unreadKeys: () => 0, lastHumanKeyAt: () => 1_000, now: () => now };
+    const holder = createEntryTurnDoor({ humanFirst: () => humanFirstDetail(state), onOffer: () => {}, now: () => now });
+    expect(holder.reserveAuto()).toBeNull();
+    now = 10_999;
+    expect(holder.reserveAuto()).toBeNull();
+    now = 11_000;
+    const reservation = holder.reserveAuto();
+    expect(reservation).not.toBeNull();
+    expect(holder.beginTurn()).toBe(true);
+    holder.endTurn('completed');
+    expect(holder.door.state()).toBe('idle');
+  });
+
+  test('an idle draft yields at two minutes, but an unread key still takes priority', () => {
+    expect(humanFirstDetail(facts({ draft: 'unsent', last: 1_000, now: 120_999 }))).toBe('buffer');
+    expect(humanFirstDetail(facts({ draft: 'unsent', last: 1_000, now: 121_000 }))).toBeNull();
+    expect(humanFirstDetail(facts({ draft: 'unsent', unread: 1, last: 1_000, now: 121_000 }))).toBe('unread-keys');
+  });
+
+  test('wake gate sees idle draft as empty without modifying the live editor', () => {
+    const editor = { text: 'unsent draft', cursor: 4, pasted: true };
+    let unread = 0;
+    const state = { draft: () => editor.text, unreadKeys: () => unread,
+      lastHumanKeyAt: () => 1_000, now: () => 121_000 };
+    expect(internalWakeBuffer(state)).toBe('');
+    expect(editor).toEqual({ text: 'unsent draft', cursor: 4, pasted: true });
+    unread = 1;
+    expect(internalWakeBuffer(state)).toBe('unsent draft');
+    expect(editor).toEqual({ text: 'unsent draft', cursor: 4, pasted: true });
+  });
+
+  test('gate masking preserves real editor cursor and folded paste for later submission', () => {
+    const input = createNextTuiCoreInput();
+    const originalPaste = 'one\ntwo\nthree';
+    const token = input.foldPaste(originalPaste);
+    input.setEditor({ text: `prefix ${token} suffix`, cursor: 3 });
+    const before = { ...input.editor };
+    expect(input.heldPasteCount).toBe(1);
+    expect(internalWakeBuffer({ draft: () => input.editor.text, unreadKeys: () => 0,
+      lastHumanKeyAt: () => 1_000, now: () => 121_000 })).toBe('');
+    expect(input.editor).toEqual(before);
+    expect(input.heldPasteCount).toBe(1);
+    expect(input.expandSubmission(input.editor.text, [])).toBe(`prefix ${originalPaste} suffix`);
+  });
+
+  test('a new human key after an idle wake restores priority without changing the draft', () => {
+    const editor = { text: 'unsent', cursor: 3 };
+    let last = 1_000;
+    let now = 121_000;
+    const state = { draft: () => editor.text, unreadKeys: () => 0,
+      lastHumanKeyAt: () => last, now: () => now };
+    expect(internalWakeBuffer(state)).toBe('');
+    last = now;
+    expect(internalWakeBuffer(state)).toBe('unsent');
+    now += 119_999;
+    expect(internalWakeBuffer(state)).toBe('unsent');
+    now += 1;
+    expect(internalWakeBuffer(state)).toBe('');
+    expect(editor).toEqual({ text: 'unsent', cursor: 3 });
+  });
+
+  test('unknown or future key timestamps do not release the draft', () => {
+    expect(humanFirstDetail(facts({ draft: 'unsent', last: 0, now: 121_000 }))).toBe('buffer');
+    expect(humanFirstDetail(facts({ draft: 'unsent', last: 122_000, now: 121_000 }))).toBe('buffer');
+    expect(humanFirstDetail(facts({ draft: 'unsent', last: NaN, now: 121_000 }))).toBe('buffer');
   });
 });
 

@@ -11,7 +11,10 @@ loop:
     L-0 (green ship · yellow waive/defer · critical hold) · L-8 publish → next board (carry-over ⊕ new) ⊕ pulse phase
     reset. (3) health: ready vs idle hands per space (≥2×) · blocked · WIP-1 returns. (4) one digest row per tick ·
     OP card only on breach (≤3/10 min). Shadow = files under the shadow dir only.
+    Absorbed op-idle-triage (LOOP-AUDIT-APPLY 11-26 · 0 fires in 24 h): health (3) already measures ready vs idle hands
+    per space and cards OP on a breach, so the separate idle-with-yellow-cell wake is retired.
   owner: OP
+  absorbs: [op-idle-triage]
   trigger:
     cron: '*/10 * * * *'
   goal:

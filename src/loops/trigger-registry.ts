@@ -25,6 +25,7 @@ import { debug } from '../debug/log.js';
 import { previousLoopFire } from './schedule-due.js';
 import { registerGraphTriggerDispatchBinding } from './graph-trigger-dispatch-lease.js';
 import { evaluatePredicate, parsePredicate, parseWhen, type ConditionProbes, type Predicate } from './trigger-conditions.js';
+import type { OutcomeProbe } from './outcome-alarms.js';
 
 export type TriggerStage = 'shadow' | 'live' | 'retired';
 export type FireStatus = 'running' | 'dispatched' | 'retry-wait' | 'done' | 'exception' | 'stale-skipped';
@@ -70,6 +71,12 @@ export interface TriggerDecl {
   cutoverAfter: number;
   /** A due window older than this is not fired (restart catch-up fires only the latest window). */
   staleAfterMin: number;
+  /**
+   * Triggers this graph took over (LOOP-AUDIT-APPLY 11-26): registering this declaration retires each listed graph id
+   * (stage `retired` — never ticked, not shown under «↻ loops (N)»). Its yaml is deleted in the same change, so
+   * `register` without files cannot bring it back; the legacy path (marker / schedule) stays as it is.
+   */
+  absorbs?: string[];
 }
 
 export interface TriggerRow extends TriggerDecl {
@@ -113,6 +120,10 @@ export interface TriggerTickDeps {
   probes?: ConditionProbes;
   /** Global `loops.trigger.cutoverAfter` override; 0 = cut over on the first tick after register (no shadow run). */
   cutoverAfterOverride?: number;
+  /** OUTCOME-DONE-ALARMS: outcome probe per graph id, read every tick (src/loops/outcome-alarms.ts). */
+  outcomes?: Readonly<Record<string, OutcomeProbe>>;
+  /** Who else hears an outcome alarm besides the graph owner (default OP). */
+  outcomeCc?: string;
 }
 
 export interface TriggerRunInput {
@@ -130,7 +141,7 @@ export interface TickEvent {
   graphId: string;
   window?: string;
   event: 'fired' | 'deduped' | 'stale-skipped' | 'done' | 'retry-scheduled' | 'exception' | 'cutover' | 'cutover-failed' | 'goal-pending'
-    | 'cooldown-held' | 'max-wait-card' | 'condition-error';
+    | 'cooldown-held' | 'max-wait-card' | 'condition-error' | 'outcome-alarm';
   detail?: string;
 }
 
@@ -179,10 +190,62 @@ export function openTriggerRegistry(stateRoot: string): Database {
     last_met INTEGER,
     last_evidence TEXT
   )`);
+  // OUTCOME-DONE-ALARMS: the latest outcome reading per graph ⊕ the episode it is in ⊕ the last alarm (dedupe).
+  db.exec(`CREATE TABLE IF NOT EXISTS graph_trigger_outcomes (
+    graph_id TEXT PRIMARY KEY,
+    at TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    bad INTEGER NOT NULL,
+    bad_since TEXT,
+    alarm_key TEXT,
+    alarm_card TEXT,
+    alarm_at TEXT
+  )`);
   return db;
 }
 
+export interface OutcomeRow { graphId: string; at: string; summary: string; bad: boolean; badSince: string | null; alarmKey: string | null; alarmCard: string | null; alarmAt: string | null }
+
+export function listOutcomes(db: Database): Map<string, OutcomeRow> {
+  const out = new Map<string, OutcomeRow>();
+  for (const r of db.query('SELECT * FROM graph_trigger_outcomes').all() as Record<string, unknown>[])
+    out.set(String(r.graph_id), { graphId: String(r.graph_id), at: String(r.at), summary: String(r.summary), bad: Number(r.bad) === 1,
+      badSince: (r.bad_since as string | null) ?? null, alarmKey: (r.alarm_key as string | null) ?? null, alarmCard: (r.alarm_card as string | null) ?? null, alarmAt: (r.alarm_at as string | null) ?? null });
+  return out;
+}
+
+/**
+ * OUTCOME-DONE-ALARMS: read the graph's outcome probe, keep the bad episode's start, and — bad for the probe's hold —
+ * post ONE card to the owner and the cc (OP) per episode key. A recovered reading closes the episode (the key resets).
+ */
+async function outcomeStep(db: Database, row: TriggerRow, probe: OutcomeProbe, deps: TriggerTickDeps, events: TickEvent[]): Promise<void> {
+  const now = deps.now(); const at = now.toISOString();
+  let reading: ReturnType<OutcomeProbe>;
+  try { reading = probe(now); } catch (error) { debug.log('loops.trigger-registry', 'outcome-probe-error', { graphId: row.graphId, error: String(error).slice(0, 200) }); return; }
+  if (!reading) return;
+  const prev = listOutcomes(db).get(row.graphId);
+  const badSince = reading.bad ? (prev?.bad && prev.badSince ? prev.badSince : at) : null;
+  db.query(`INSERT INTO graph_trigger_outcomes (graph_id, at, summary, bad, bad_since, alarm_key, alarm_card, alarm_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(graph_id) DO UPDATE SET at = excluded.at, summary = excluded.summary, bad = excluded.bad, bad_since = excluded.bad_since`)
+    .run(row.graphId, at, reading.summary, reading.bad ? 1 : 0, badSince, prev?.alarmKey ?? null, prev?.alarmCard ?? null, prev?.alarmAt ?? null);
+  if (!reading.bad || !badSince) return;
+  if (now.getTime() - Date.parse(badSince) < reading.holdMin * 60_000) return;
+  const key = reading.key ?? `episode:${badSince}`;
+  if (prev?.alarmKey === key) return;
+  // Claim the key first (guarded) so two concurrent ticks post one card.
+  const claimed = db.query(`UPDATE graph_trigger_outcomes SET alarm_key = ?, alarm_at = ? WHERE graph_id = ? AND alarm_key IS ?`).run(key, at, row.graphId, prev?.alarmKey ?? null).changes === 1;
+  if (!claimed) return;
+  const body = `[graph-outcome alarm] ${row.graphId}: the loop reports done but its outcome is ${reading.summary} — ${reading.detail}`;
+  const to = [...new Set([row.owner.toUpperCase(), (deps.outcomeCc ?? 'OP').toUpperCase()])];
+  const cards: string[] = [];
+  for (const seat of to) cards.push(`${seat}:${await safeCard(deps, seat, body)}`);
+  db.query('UPDATE graph_trigger_outcomes SET alarm_card = ? WHERE graph_id = ?').run(cards.join(' '), row.graphId);
+  events.push({ graphId: row.graphId, event: 'outcome-alarm', detail: `${reading.summary} → ${cards.join(' ')}` });
+  debug.log('loops.trigger-registry', 'outcome-alarm', { graphId: row.graphId, key, summary: reading.summary, cards });
+}
+
 function sha(text: string): string { return new Bun.CryptoHasher('sha256').update(text).digest('hex').slice(0, 16); }
+export function triggerDeclSha(decl: TriggerDecl): string { return sha(JSON.stringify(decl)); }
 
 function num(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
@@ -193,7 +256,15 @@ export function readTriggerDecl(file: string, root: string): TriggerDecl {
   const path = resolve(root, file);
   const doc = parseYaml(readFileSync(path, 'utf8')) as Record<string, unknown> | null;
   if (!doc || typeof doc.graph_id !== 'string' || !SAFE_ID.test(doc.graph_id)) throw new Error(`trigger graph has no safe graph_id: ${file}`);
-  const loop = (doc.loop ?? {}) as Record<string, unknown>;
+  let loop = (doc.loop ?? {}) as Record<string, unknown>;
+  // YAML-SUPERVISORS-RUNTIME: a loop-agent shim (`loop: { from_agent: <id> }`) has no trigger of its own — the agent's
+  // agent.yaml `wake:` block is the one definition (src/loop-agent/v3/agent-trigger.ts). A shim that also carries
+  // loop.trigger is two definitions → refused.
+  if (typeof loop.from_agent === 'string') {
+    if (loop.trigger !== undefined) throw new Error(`trigger ${doc.graph_id}: a from_agent shim must not declare loop.trigger (the wake lives only in agent.yaml)`);
+    const { agentTriggerLoop } = require('../loop-agent/v3/agent-trigger.js') as typeof import('../loop-agent/v3/agent-trigger.js');
+    loop = agentTriggerLoop(path, loop.from_agent);
+  }
   const trigger = (loop.trigger ?? {}) as Record<string, unknown>;
   const goal = loop.goal as Record<string, unknown> | undefined;
   const failure = (loop.failure ?? {}) as Record<string, unknown>;
@@ -223,6 +294,12 @@ export function readTriggerDecl(file: string, root: string): TriggerDecl {
     else if (legacy.kind === 'marker' && typeof legacy.path === 'string') legacyDecl = { kind: 'marker', path: legacy.path };
     else throw new Error(`trigger ${doc.graph_id}: loop.legacy must be {kind: schedule, id} or {kind: marker, path}`);
   }
+  let absorbs: string[] | undefined;
+  if (loop.absorbs !== undefined) {
+    if (!Array.isArray(loop.absorbs) || !loop.absorbs.every(id => typeof id === 'string' && SAFE_ID.test(id) && id !== doc.graph_id))
+      throw new Error(`trigger ${doc.graph_id}: loop.absorbs must be a list of other graph ids`);
+    absorbs = [...new Set(loop.absorbs as string[])].sort();
+  }
   const backoff = Array.isArray(failure.backoff_sec) && failure.backoff_sec.every(v => typeof v === 'number' && v >= 0)
     ? failure.backoff_sec as number[] : [...DEFAULT_POLICY.backoffSec];
   return {
@@ -235,6 +312,7 @@ export function readTriggerDecl(file: string, root: string): TriggerDecl {
     ...(legacyDecl ? { legacy: legacyDecl } : {}),
     cutoverAfter: Math.max(1, Math.floor(num(loop.cutover_after, DEFAULT_POLICY.cutoverAfter))),
     staleAfterMin: num(trigger.stale_after_min, DEFAULT_POLICY.staleAfterMin),
+    ...(absorbs?.length ? { absorbs } : {}),
   };
 }
 
@@ -252,7 +330,7 @@ function rowFrom(raw: Record<string, unknown>, db: Database): TriggerRow {
  * already registered graph is refused unless `update` is set — two writers cannot silently overwrite each other.
  * New triggers start in `shadow` when they declare a legacy path, otherwise `live`.
  */
-export function registerTrigger(db: Database, decl: TriggerDecl, options: { now?: Date; update?: boolean } = {}): { created: boolean; updated: boolean; row: TriggerRow } {
+export function registerTrigger(db: Database, decl: TriggerDecl, options: { now?: Date; update?: boolean } = {}): { created: boolean; updated: boolean; row: TriggerRow; retired: string[] } {
   const json = JSON.stringify(decl);
   const declSha = sha(json);
   const at = (options.now ?? new Date()).toISOString();
@@ -269,10 +347,14 @@ export function registerTrigger(db: Database, decl: TriggerDecl, options: { now?
       db.query('UPDATE graph_trigger_registry SET decl_json = ?, decl_sha = ?, updated_at = ? WHERE graph_id = ?').run(json, declSha, at, decl.graphId);
       updated = true;
     }
+    // Absorbed triggers retire in the same transaction as the absorber's registration: one writer per job, never two.
+    const retired: string[] = [];
+    for (const id of decl.absorbs ?? [])
+      if (db.query(`UPDATE graph_trigger_registry SET stage = 'retired', updated_at = ? WHERE graph_id = ? AND stage != 'retired'`).run(at, id).changes === 1) retired.push(id);
     db.exec('COMMIT');
     const row = rowFrom(db.query('SELECT * FROM graph_trigger_registry WHERE graph_id = ?').get(decl.graphId) as Record<string, unknown>, db);
-    debug.log('loops.trigger-registry', 'register', { graphId: decl.graphId, created, updated, stage: row.stage });
-    return { created, updated, row };
+    debug.log('loops.trigger-registry', 'register', { graphId: decl.graphId, created, updated, stage: row.stage, retired });
+    return { created, updated, row, retired };
   } catch (error) {
     if (db.inTransaction) db.exec('ROLLBACK');
     throw error;
@@ -341,7 +423,7 @@ async function dispatch(db: Database, row: TriggerRow, window: string, attempt: 
   // retry landing on an old key): the graph runner refuses an existing run id, so bind a fresh one (11-25 op-pulse).
   for (let n = 2; !binding.created; n++)
     binding = registerGraphTriggerDispatchBinding({ triggerId, dedupeKey: `${window}#${attempt}~${n}`, graphId: row.graphId }, bindOpts);
-  setFire(db, row.graphId, window, { run_id: binding.runId }, at);
+  if (!setFire(db, row.graphId, window, { run_id: binding.runId }, at, { status: 'running', attempt })) return;
   const reason = (db.query('SELECT reason FROM graph_trigger_fires WHERE graph_id = ? AND window = ?').get(row.graphId, window) as { reason: string | null } | null)?.reason;
   const input: TriggerRunInput = { graphId: row.graphId, window, stage: row.stage, attempt,
     shadowDir: join(deps.vars.stateRoot, 'loops', 'shadow', row.graphId), vars: deps.vars, ...(reason ? { reason } : {}) };
@@ -351,7 +433,7 @@ async function dispatch(db: Database, row: TriggerRow, window: string, attempt: 
   const after = deps.now().toISOString();
   if (result.status === 'done') {
     const checkAt = new Date(deps.now().getTime() + row.goalDeadlineMin * 60_000).toISOString();
-    setFire(db, row.graphId, window, { status: 'dispatched', dispatched_at: after, check_at: checkAt, error: null }, after);
+    if (!setFire(db, row.graphId, window, { status: 'dispatched', dispatched_at: after, check_at: checkAt, error: null }, after, { status: 'running', attempt })) return;
     events.push({ graphId: row.graphId, window, event: 'fired', detail: `attempt ${attempt} run ${binding.runId}` });
     return;
   }
@@ -363,18 +445,18 @@ async function fail(db: Database, row: TriggerRow, window: string, attempt: numb
   const at = now.toISOString();
   if (attempt < row.maxAttempts) {
     const backoff = row.backoffSec[Math.min(attempt - 1, row.backoffSec.length - 1)] ?? 60;
-    setFire(db, row.graphId, window, { status: 'retry-wait', next_retry_at: new Date(now.getTime() + backoff * 1000).toISOString(), error: why }, at);
+    if (!setFire(db, row.graphId, window, { status: 'retry-wait', next_retry_at: new Date(now.getTime() + backoff * 1000).toISOString(), error: why }, at, { status: 'running', attempt })) return;
     events.push({ graphId: row.graphId, window, event: 'retry-scheduled', detail: `attempt ${attempt}/${row.maxAttempts} failed (${why}); retry in ${backoff}s` });
     debug.log('loops.trigger-registry', 'retry-scheduled', { graphId: row.graphId, window, attempt, why });
     return;
   }
-  setFire(db, row.graphId, window, { status: 'exception', error: why }, at);
+  if (!setFire(db, row.graphId, window, { status: 'exception', error: why }, at, { status: 'running', attempt })) return;
   const body = `[graph-trigger exception] ${row.graphId} window ${window} (${row.stage}) failed ${attempt}/${row.maxAttempts} attempts: ${why}. `
     + `Goal: ${row.goal.kind} ${row.goal.path}. Re-run: eln loop trigger retry ${row.graphId} --window ${window}`;
   let card: string;
   try { card = await deps.postCard(row.owner, body); }
   catch (error) { card = `card-post-failed: ${error instanceof Error ? error.message : String(error)}`; }
-  setFire(db, row.graphId, window, { card }, at);
+  setFire(db, row.graphId, window, { card }, at, { status: 'exception', attempt });
   events.push({ graphId: row.graphId, window, event: 'exception', detail: `${why} → card ${card} to ${row.owner}` });
   debug.log('loops.trigger-registry', 'exception', { graphId: row.graphId, window, attempt, why, card });
 }
@@ -517,7 +599,9 @@ async function conditionStep(db: Database, row: TriggerRow, cond: ConditionDecl,
   if (state.max_wait_done === waitKey) return;
   db.query('UPDATE graph_trigger_conditions SET max_wait_done = ? WHERE graph_id = ? AND max_wait_done IS ?').run(waitKey, row.graphId, state.max_wait_done);
   const evidence = result?.evidence ?? 'predicate could not be measured';
-  if (cond.onMaxWait === 'fire') { await fire(waitKey, `max-wait: ${evidence}`); return; }
+  // LA-B1 (sim #40379): a max-wait fire on an unchanged, already-met state keeps that state key as the fired edge —
+  // writing the wait key there made the same state look «new» and re-fire one cooldown later ([1,11,13,23,25] min).
+  if (cond.onMaxWait === 'fire') { await fire(result?.met ? result.key : waitKey, `max-wait: ${evidence}`); return; }
   const card = await safeCard(deps, row.owner, `[graph-trigger max-wait] ${row.graphId}: condition not met by ${deadline} — not running it. Evidence: ${evidence}`);
   events.push({ graphId: row.graphId, event: 'max-wait-card', detail: `card ${card}: ${evidence}` });
 }
@@ -530,8 +614,10 @@ async function safeCard(deps: TriggerTickDeps, owner: string, body: string): Pro
 /** One tick over every registered trigger. Safe to run concurrently: every state change is a guarded update. */
 export async function tickTriggers(db: Database, deps: TriggerTickDeps, options: { only?: string } = {}): Promise<TickEvent[]> {
   const events: TickEvent[] = [];
-  for (const row of listTriggers(db)) {
-    if (row.stage === 'retired' || (options.only && options.only !== row.graphId)) continue;
+  // Independent graphs must not wait for another graph's runner or card I/O. Each row still
+  // processes its own windows in order; allSettled keeps the DB alive even on an unexpected error.
+  const rows = listTriggers(db).filter(row => row.stage !== 'retired' && (!options.only || options.only === row.graphId));
+  const results = await Promise.allSettled(rows.map(async row => {
     const now = deps.now();
     const at = now.toISOString();
     // 0. threshold already met (e.g. global cutoverAfter 0): cut over before firing, so this window runs live.
@@ -581,6 +667,14 @@ export async function tickTriggers(db: Database, deps: TriggerTickDeps, options:
         await dispatch(db, { ...current, stage: String(raw.stage) as TriggerStage }, w, attempt + 1, deps, events);
       }
     }
+  }));
+  const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (rejected) throw rejected.reason;
+  // OUTCOME-DONE-ALARMS: after the fire/goal bookkeeping, measure what each probed loop actually produced.
+  for (const row of listTriggers(db)) {
+    const probe = deps.outcomes?.[row.graphId];
+    if (!probe || row.stage === 'retired' || (options.only && options.only !== row.graphId)) continue;
+    await outcomeStep(db, row, probe, deps, events);
   }
   debug.log('loops.trigger-registry', 'tick', { events: events.length, kinds: events.map(e => e.event) });
   return events;

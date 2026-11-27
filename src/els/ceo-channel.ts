@@ -16,7 +16,8 @@
 // Fail-soft everywhere: a refused ledger, a dead adapter or a throwing bridge never refuses a CEO message —
 // it is logged (one line) and the queue keeps it.
 import { Database } from 'bun:sqlite';
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
+import { appendAuditLine } from '../kit/audit-ledger/index.js';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import type { MessageEnvelope } from '../msg/msg-store.js';
@@ -205,7 +206,7 @@ export function createCeoChannel(opts: CeoChannelOpts): CeoChannel {
 
   const keyOf = (inbound: CeoInbound | ReturnType<typeof inboundOf>): CeoKey => ({ source: inbound.source, chatId: inbound.chatId, messageId: inbound.messageId });
   const audit = (event: string, data: Record<string, unknown>): void => {
-    try { appendFileSync(join(stateDir, 'ceo-channel-audit.jsonl'), `${JSON.stringify({ at: now(), event, ...data })}\n`); }
+    try { appendAuditLine(join(stateDir, 'ceo-channel-audit.jsonl'), `${JSON.stringify({ at: now(), event, ...data })}\n`); }
     catch { /* the audit must not break the door */ }
     log(event, data);
   };

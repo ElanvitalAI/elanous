@@ -17,7 +17,7 @@ import { seatMailTrustFor } from '../../msg/seat-mail-trust.js';
 
 /** 큐에서 생산자가 쓰는 표면만 — 단위시험은 가짜 없이 진짜 큐를 그대로 쓴다. */
 export interface ChildNoticeQueue {
-  enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta?: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string; mailClass?: 'P0' | 'P1' | 'P2'; mailIntent?: string; mailKind?: string; replyTo?: number; mail?: NextTuiQueueMailSpan; triage?: NextTuiQueueTriageMeta }): NextTuiQueueItem;
+  enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta?: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string; mailClass?: 'P0' | 'P1' | 'P2'; mailRank?: 0 | 1; mailIntent?: string; mailKind?: string; replyTo?: number; mail?: NextTuiQueueMailSpan; triage?: NextTuiQueueTriageMeta }): NextTuiQueueItem;
   enqueueCapsuleDoneNotice?(text: string, capsuleId: string, status: string, occurredAt?: number, wake?: boolean): NextTuiQueueItem | null;
   readonly items: readonly NextTuiQueueItem[];
 }
@@ -198,7 +198,7 @@ export function createChildNoticeProducers(queue: ChildNoticeQueue) {
       const occurredAt = message.createdAt === undefined ? undefined : Date.parse(message.createdAt);
       // Only the ledger arrival watcher feeds this producer (seat-mail-arrival.ts) — the authenticated source.
       const notice = seatMessageNoticeParts(message, undefined, true);
-      const routed = seatMailRoute({ ...message, origin: message.origin ?? null });
+      const routed = seatMailRoute({ ...message, origin: message.origin ?? null, fromSeat: message.fromSeat ?? message.sender });
       const passive = routed.route === 'passive';
       // SEAT-TURN-FOLLOWUPS ② — a delegated result is P1: it joins open work after the 60 s window (several results → one turn).
       const delegatedResult = routed.reason === 'delegated-result';
@@ -211,7 +211,10 @@ export function createChildNoticeProducers(queue: ChildNoticeQueue) {
         digest: seatMailDigestLine(message, passive ? SEAT_MAIL_PASSIVE_DIGEST_BODY_CHARS : SEAT_MAIL_DIGEST_BODY_CHARS),
         // QUEUE-FINISH-FIRST — the class rides the item from the structured ledger fields (never the body).
         mailClass: delegatedResult ? 'P1' : classifySeatMail({ intent: message.intent ?? legacyIntent(message.kind), fromKind: message.fromKind ?? null,
-          crownDirective: message.crownDirective ?? null, ...(message.origin ? { origin: message.origin } : {}) }),
+          crownDirective: message.crownDirective ?? null, ...(message.origin ? { origin: message.origin } : {}),
+          ...(routed.reason === 'proxy' ? { proxyLane: true } : {}) }),
+        // CLAUDE-OP-PROXY-LANE — crown / a person first, the proxy right after, then the rest.
+        ...(routed.reason === 'crown' || routed.reason === 'human' ? { mailRank: 0 as const } : routed.reason === 'proxy' ? { mailRank: 1 as const } : {}),
         mailIntent: message.intent ?? legacyIntent(message.kind),
         ...(message.kind ? { mailKind: message.kind } : {}),
         ...(message.replyTo === undefined ? {} : { replyTo: message.replyTo }),

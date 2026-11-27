@@ -1,0 +1,26 @@
+# SIM-WORLD llm-route pack — LLM-ROUTE-BY-GUARDIAN under edge events (CEO 11-27 10:2x). Device LLM-ROUTE-FAKE-PROVIDERS
+# (fake usage snapshot · fake clock · mail sink · LLM 0). Each scenario runs five sub-seeds (seed … seed+4).
+schema: 1
+world: llm-route
+scenarios:
+  - { id: LR-CLAUDE-DOWN-TERRA, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-TERRA-OVERLOAD-GROK, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-TERRA-OVERLOAD-GROK-HOT, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-TERRA-ALL-UNAVAILABLE-GROK, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-GROK-70-NEVER, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-GLM-NEVER-REVIEW, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-CODEX-95-DEFAULT, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-ALL-CODEX-95-OPENROUTER, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-POLICY-FIXED-VALUE, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-EXPIRED-AUTH-REPAIR, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-NO-LEASE-NEVER-STALL, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-NO-HOST-PIN, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-FLAP-HYSTERESIS, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-STALE-USAGE-REFRESH, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-ALL-DOWN-ALARM-ONCE, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-REVIEW-MERGE-BASE, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-REVIEW-DELTA-OVER, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-REVIEW-HEAD-MOVED, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-REVIEW-GIT-MERGE-BASE, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-REVIEW-GIT-RANGE-DIFF, module: src/ux-sim/sim-world/llm-route/scenarios.ts }
+  - { id: LR-REVIEW-GIT-HEAD-MOVED, module: src/ux-sim/sim-world/llm-route/scenarios.ts }

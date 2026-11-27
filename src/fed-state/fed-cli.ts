@@ -25,7 +25,7 @@ export function runFedShowCli(id: string, opts: { limit?: string; json?: boolean
   const rows = showFed(id, { limit: Number(opts.limit ?? 20) });
   if (opts.json) { console.log(JSON.stringify(rows)); return 0; }
   if (!rows.length) { console.log(`fed show ${id}: no facts`); return 0; }
-  for (const f of rows) console.log(`${f.ts} ${f.type}${f.state ? `:${f.state}` : ''}${f.seat ? ` seat=${f.seat}` : ''}${f.cell ? ` cell=${f.cell}` : ''}${f.from ? ` ${f.from}→${f.to}` : ''}${f.kind ? ` kind=${f.kind}` : ''}${f.ref ? ` #${f.ref}` : ''}`);
+  for (const f of rows) console.log(`${f.ts} ${f.type}${f.state ? `:${f.state}` : ''}${f.seat ? ` seat=${f.seat}` : ''}${f.decidedBy && f.decidedBy !== f.seat ? ` decidedBy=${f.decidedBy}` : ''}${f.doneBy ? ` doneBy=${f.doneBy}` : ''}${f.supervisedBy ? ` supervisedBy=${f.supervisedBy}` : ''}${f.cell ? ` cell=${f.cell}` : ''}${f.from ? ` ${f.from}→${f.to}` : ''}${f.kind ? ` kind=${f.kind}` : ''}${f.ref ? ` #${f.ref}` : ''}`);
   return 0;
 }
 

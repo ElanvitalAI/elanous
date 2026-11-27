@@ -145,6 +145,11 @@ export async function dispatchScheduleManage(args: Record<string, unknown>): Pro
         const created = listSchedules(sdb).find(r => r.raw === line.trim());
         if (created) { setScheduleMission(sdb, created.id, autopilotId); mission = autopilotId; }
       }
+      // WORLD-REGISTRY: a cron line made through the schedule CRUD is registered on the lease ledger (fail-open).
+      try {
+        const made = listSchedules(sdb).find(r => r.raw === line.trim());
+        if (made) (require('../resource-ledger/world-register.js') as typeof import('../resource-ledger/world-register.js')).registerCronQuietly({ scheduleId: made.id, cron, name: made.name, command });
+      } catch { /* fail-open */ }
       return { created: line, backup, ...(mission ? { autopilotId: mission } : {}),
         note: '크론 추가됨(백업 완료). 다음 발화부터 적용.' };
     }

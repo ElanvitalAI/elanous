@@ -1,14 +1,19 @@
 import { emitTurnLife } from '../debug/turn-life.js';
 import {
   CAPSULE_SYNC_CAP_MS,
-  type CapsuleDecision, type CapsuleDecisionInput, type CapsulePolicy,
+  type CapsuleDecision, type CapsuleDecisionInput, type CapsuleKind, type CapsulePolicy,
 } from '../turn-capsule/contract.js';
 
 export interface CapsulePolicyOptions {
   /** The raw `turn` config section (for `syncCapMs`); read failures are undefined. */
   readonly turnConfig: () => unknown;
   /** Correlation supplied by the caller for this turn or capsule. */
-  correlation?: { turnId?: string; capsuleId?: string; eventId?: string };
+  correlation?: {
+    turnId?: string;
+    capsuleId?: string;
+    eventId?: string;
+    sessionId?: string;
+  };
   /** Optional observer; failures must not affect the decision. */
   log?: (event: string, data: Record<string, unknown>) => void;
   /** RUNSHELL-BG-ENDS-TURN — a tool family's own cap: `turn[capKey]` (else `defaultCapMs`) replaces `turn.syncCapMs`;
@@ -59,4 +64,39 @@ export function createCapsulePolicy(options: CapsulePolicyOptions): CapsulePolic
       return decision;
     },
   };
+}
+
+/** Map a dispatched tool name to its contract CapsuleKind (CAPSULE-A1, judgment-only): the §1.5 capsule families —
+ *  긴 Bash(shell) · Agent 서브에이전트(agent) · 하니스 자식(harness) · MCP(mcp) — plus graph runs (graph).
+ *  A tool name outside these families is not a capsule: the junction returns null and emits no policy row. */
+export function capsulePolicyKindForTool(name: string): CapsuleKind | null {
+  if (name === 'Agent' || name === 'Task') return 'agent';
+  if (name.startsWith('mcp__')) return 'mcp';
+  if (/^(Bash|Shell|RunShell|WebTerminal|Terminal)/.test(name)) return 'shell';
+  if (/^(RunDevHarness|DevHarness|Harness)/.test(name)) return 'harness';
+  if (/^(GraphRun|RunGraph|Graph)/.test(name)) return 'graph';
+  return null;
+}
+
+/** Strict per-kind predicate for the EXPLICIT background-request keys the tool's own family actually
+ *  supports (CAPSULE-A1 judgment fidelity · JUD-B #128143 → terra r8 mustFix[1] · JUD-B #128197): the
+ *  dispatch junction threads this through to decide() so the judgment row states the args actually
+ *  dispatched. Interpretation is per-kind, never tool-agnostic — agent family(Agent/Task) reads
+ *  `run_in_background` (W1.3 AgentSpawn · agent/types.ts · agent-cli.ts), shell family
+ *  (Bash/Shell/RunShell/WebTerminal/Terminal) reads `mode: 'bg'` (skills/tools/shell.ts · shell-runner
+ *  dispatch, A2 병렬 탈착 축 §3.6 C3:805; the REAL Bash schema carries only command+timeout —
+ *  skills/tools/index.ts buildBashTool — so it can never produce a background key), and
+ *  mcp·harness·graph families have NO official background key at this junction — fail-open false.
+ *  mcp/server.ts `run_in_background ?? true` is the inbound MCP-surface Agent only and never crosses
+ *  this junction, so a business `mode:'bg'`·`run_in_background` on an outbound mcp__* tool must NOT
+ *  be misread as a background request. Fail-open: 인자가 없거나·읽을 수 없거나·다른 값이면 요청이
+ *  아니다(문자열 'true'/'bg' 등 truthy 오판 없이 엄격 일치만). */
+export function capsuleRequestedBackground(tool: string, args: unknown): boolean {
+  const kind = capsulePolicyKindForTool(tool);
+  if (kind === null) return false;
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return false;
+  const a = args as Record<string, unknown>;
+  if (kind === 'agent') return a.run_in_background === true;
+  if (kind === 'shell') return a.mode === 'bg';
+  return false; // mcp·harness·graph: 이 접합부에 공식 배경 키 없음 — fail-open
 }

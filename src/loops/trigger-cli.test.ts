@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { Command } from 'commander';
 import { registerTriggerCommands, triggerTickCommand } from './trigger-cli.js';
 
@@ -45,4 +45,16 @@ test('install without --yes only previews', async () => {
   await program([], calls).parseAsync(['loop', 'trigger', 'install'], { from: 'user' });
   expect(calls.map(c => c.action)).toEqual(['list']);
   expect(logs.at(-1)).toContain('"dryRun": true');
+});
+
+
+test('default package root ignores cwd and schedule-registry fallback checkout', async () => {
+  const calls: Array<Record<string, unknown>> = [];
+  const p = new Command().exitOverride();
+  registerTriggerCommands(p.command('loop'), { stateRoot: dir, configDir: '/cfg/u1', scheduleManage: async args => {
+    calls.push(args); return args.action === 'list' ? { schedules: [] } : { created: 'line' };
+  } });
+  await p.parseAsync(['loop', 'trigger', 'install', '--yes'], { from: 'user' });
+  const cmd = String(calls.find(c => c.action === 'create')?.command);
+  expect(cmd).toContain(`cd ${resolve(import.meta.dir, '../..')} &&`);
 });

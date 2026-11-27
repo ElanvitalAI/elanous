@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   bodySha256, DEFAULT_STALE_AFTER_MS, NEEDS_CLEAN_BRANCH_AUTHOR_ACTION, preflightMergeHistory, ReviewSlotLedger,
-  TERMINAL_REFUSAL_TTL_MS,
   type RunResult,
 } from './review-runner-guard.js';
 import { runReviewRunnerGuardCli } from '../../scripts/review-runner-guard.js';
@@ -69,12 +69,11 @@ function cliDeps(o: { gh?: (args: string[]) => RunResult; git?: (args: string[])
   };
 }
 
-describe('A204 needs-clean-branch', () => {
-  test('a merge with hand-resolved content is terminal before any reviewer is admitted', () => {
+describe('REVIEW-ACCEPT-MERGE-MAIN — a hand-resolved main merge is reviewed as merge-base..head', () => {
+  test('a merge with hand-resolved content is clean with reviewedDiff merge-base, never needs-clean-branch', () => {
     const result = preflightMergeHistory({ pr: '38029', head: HEAD, baseTip: BASE, git: fakeGit(ok('diff --git a/x b/x\n+resolved\n')) });
-    expect(result).toMatchObject({ refusal: 'needs-clean-branch', reviewed: false, verdict: null, modelStarted: false,
-      terminal: true, retryable: false, authorAction: NEEDS_CLEAN_BRANCH_AUTHOR_ACTION,
-      reason: 'main-merge-has-resolution-changes', mergeCommits: [MERGE] });
+    expect(result).toEqual({ status: 'clean', mergeCommits: [MERGE], reviewedDiff: 'merge-base', mergeBase: MERGE_BASE,
+      resolutionMerges: [MERGE] });
   });
 
   test('a clean merge stays reviewable', () => {
@@ -82,24 +81,124 @@ describe('A204 needs-clean-branch', () => {
       .toEqual({ status: 'clean', mergeCommits: [MERGE] });
   });
 
-  test('CLI preflight records a terminal refusal; begin then refuses without freezing or commenting', () => {
+  test('CLI preflight on a resolved merge exits 0, writes no terminal record, and begin admits', () => {
     const { root, capFile } = fixture('2');
-    const clock = { now: Date.UTC(2026, 10, 17) };
-    const ghCalls: string[][] = [];
-    const gh = fakeGh({ head: HEAD, body: 'body' }, ghCalls);
+    const clock = { now: Date.UTC(2026, 10, 27) };
     const pre = cliDeps({ git: fakeGit(ok('+resolved\n')), clock, pid: 101 });
-    const common = ['--ledger-root', root, '--cap-file', capFile];
-    expect(runReviewRunnerGuardCli(['preflight', '38029', '--head', HEAD, ...common], pre.deps)).toBe(3);
-    expect(pre.last()).toMatchObject({ refusal: 'needs-clean-branch', authorAction: NEEDS_CLEAN_BRANCH_AUTHOR_ACTION });
-    // A second launch of the same PR+head returns the recorded refusal without touching git again.
-    const again = cliDeps({ clock, pid: 102 });
-    expect(runReviewRunnerGuardCli(['preflight', '38029', '--head', HEAD, ...common], again.deps)).toBe(3);
-    expect(again.last()).toMatchObject({ refusal: 'needs-clean-branch', source: 'ledger-terminal' });
-    const begin = cliDeps({ gh, clock, pid: 103 });
-    expect(runReviewRunnerGuardCli(['begin', '38029', '--seat', 'RES', '--engine', 'claude-acp', ...common], begin.deps)).toBe(3);
-    expect(begin.last()).toMatchObject({ status: 'terminal-refusal' });
-    expect(ghCalls.filter((args) => args[1] === 'comment')).toEqual([]);
-    expect(readdirSync(root).filter((name) => name.endsWith('.d') && !name.startsWith('.'))).toEqual([]);
+    const common = ['--ledger-root', root, '--cap-file', capFile, '--no-marker'];
+    expect(runReviewRunnerGuardCli(['preflight', '38029', '--head', HEAD, ...common], pre.deps)).toBe(0);
+    expect(pre.last()).toMatchObject({ status: 'clean', reviewedDiff: 'merge-base', mergeBase: MERGE_BASE });
+    expect(pre.last().refusal).toBeUndefined();
+    expect(existsSync(join(root, 'terminal'))).toBe(false);
+    const begin = cliDeps({ gh: fakeGh({ head: HEAD, body: 'body' }, []), clock, pid: 103, alive: new Set([103]) });
+    expect(runReviewRunnerGuardCli(['begin', '38029', '--seat', 'RES', '--engine', 'terra', ...common], begin.deps)).toBe(0);
+    expect(begin.last()).toMatchObject({ status: 'acquired' });
+  });
+
+  test('an older needs-clean-branch terminal record is read as absent and removed', () => {
+    const { root, capFile } = fixture('2');
+    const clock = { now: Date.UTC(2026, 10, 27) };
+    const ledger = new ReviewSlotLedger({ root, capFile, now: () => clock.now, host: 'test-host', pid: 104, pidAlive: () => false });
+    mkdirSync(join(root, 'terminal'), { recursive: true });
+    writeFileSync(ledger.terminalPath('39824', HEAD), JSON.stringify({ refusal: 'needs-clean-branch',
+      reason: 'main-merge-has-resolution-changes', authorAction: NEEDS_CLEAN_BRANCH_AUTHOR_ACTION, recordedAt: clock.now }));
+    expect(ledger.terminalRefusal('39824', HEAD)).toBeUndefined();
+    expect(existsSync(ledger.terminalPath('39824', HEAD))).toBe(false);
+    const calls: string[][] = [];
+    const run = cliDeps({ git: fakeGit(ok('+resolved\n'), calls), clock, pid: 105 });
+    expect(runReviewRunnerGuardCli(['preflight', '39824', '--head', HEAD, '--ledger-root', root, '--cap-file', capFile], run.deps)).toBe(0);
+    expect(calls.some((args) => args.includes('--remerge-diff'))).toBe(true);
+  });
+});
+
+describe('REVIEW-ACCEPT-MERGE-MAIN — real temp git repository', () => {
+  function realRepo() {
+    const dir = mkdtempSync(join(tmpdir(), 'review-merge-main-'));
+    roots.push(dir);
+    const git = (args: string[]): RunResult => {
+      const r = spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8',
+        env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t',
+          GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
+      return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+    };
+    const must = (args: string[]): string => {
+      const r = git(args);
+      if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+      return r.stdout.trim();
+    };
+    const write = (name: string, body: string) => writeFileSync(join(dir, name), body);
+    const commit = (message: string) => { must(['add', '-A']); must(['commit', '-q', '-m', message]); return must(['rev-parse', 'HEAD']); };
+    must(['init', '-q', '-b', 'main']);
+    write('shared.txt', 'line1\nline2\nline3\n');
+    write('main-only.txt', 'm0\n');
+    const root = commit('root');
+    return { dir, git, must, write, commit, root };
+  }
+
+  test('clean branch: no merges, nothing to exclude', () => {
+    const r = realRepo();
+    r.must(['checkout', '-q', '-b', 'pr']);
+    r.write('pr.txt', 'pr change\n');
+    const head = r.commit('pr');
+    r.must(['checkout', '-q', 'main']);
+    r.write('main-only.txt', 'm1\n');
+    const baseTip = r.commit('main moves');
+    expect(preflightMergeHistory({ pr: '1', head, baseTip, git: r.git })).toEqual({ status: 'clean', mergeCommits: [] });
+  });
+
+  test('branch with main merged cleanly: reviewable, merge-base diff excludes main-side changes', () => {
+    const r = realRepo();
+    r.must(['checkout', '-q', '-b', 'pr']);
+    r.write('pr.txt', 'pr change\n');
+    r.commit('pr');
+    r.must(['checkout', '-q', 'main']);
+    r.write('main-only.txt', 'm1\n');
+    const baseTip = r.commit('main moves');
+    r.must(['checkout', '-q', 'pr']);
+    r.must(['merge', '-q', '--no-edit', 'main']);
+    const head = r.must(['rev-parse', 'HEAD']);
+    const result = preflightMergeHistory({ pr: '2', head, baseTip, git: r.git });
+    expect(result).toEqual({ status: 'clean', mergeCommits: [head] });
+    const mergeBase = r.must(['merge-base', baseTip, head]);
+    expect(mergeBase).toBe(baseTip);
+    const reviewed = r.must(['diff', `${mergeBase}..${head}`]);
+    expect(reviewed).toContain('pr change');
+    expect(reviewed).not.toContain('main-only.txt');
+  });
+
+  test('conflict-resolution merge: reviewed as merge-base..head with the resolution hunk, without main-only changes', () => {
+    const r = realRepo();
+    r.must(['checkout', '-q', '-b', 'pr']);
+    r.write('shared.txt', 'line1\nPR line2\nline3\n');
+    r.commit('pr edits shared');
+    r.must(['checkout', '-q', 'main']);
+    r.write('shared.txt', 'line1\nMAIN line2\nline3\n');
+    r.write('main-only.txt', 'm1\n');
+    const baseTip = r.commit('main edits shared');
+    r.must(['checkout', '-q', 'pr']);
+    expect(r.git(['merge', '-q', '--no-edit', 'main']).status).not.toBe(0);
+    r.write('shared.txt', 'line1\nRESOLVED PR+MAIN line2\nline3\n');
+    r.must(['add', 'shared.txt']);
+    r.must(['commit', '-q', '--no-edit']);
+    const head = r.must(['rev-parse', 'HEAD']);
+    const result = preflightMergeHistory({ pr: '3', head, baseTip, git: r.git });
+    expect(result).toEqual({ status: 'clean', mergeCommits: [head], reviewedDiff: 'merge-base', mergeBase: baseTip,
+      resolutionMerges: [head] });
+    const reviewed = r.must(['diff', `${baseTip}..${head}`]);
+    expect(reviewed).toContain('+RESOLVED PR+MAIN line2');
+    expect(reviewed).toContain('-MAIN line2');
+    expect(reviewed).not.toContain('main-only.txt');
+    // CLI on the same real repo: exit 0, no terminal record.
+    const { root, capFile } = fixture('2');
+    const fetchless = (args: string[]): RunResult => (args[0] === 'fetch' ? ok() : r.git(args));
+    const cli = cliDeps({ git: (args) => {
+      // No remote in the temp repo: answer fetch and point FETCH_HEAD at main.
+      if (args[0] === 'rev-parse' && args.includes('FETCH_HEAD^{commit}')) return ok(`${baseTip}\n`);
+      return fetchless(args);
+    }, clock: { now: Date.UTC(2026, 10, 27) }, pid: 302 });
+    expect(runReviewRunnerGuardCli(['preflight', '3', '--head', head, '--ledger-root', root, '--cap-file', capFile], cli.deps)).toBe(0);
+    expect(cli.last()).toMatchObject({ status: 'clean', reviewedDiff: 'merge-base', mergeBase: baseTip });
+    expect(existsSync(join(root, 'terminal'))).toBe(false);
   });
 });
 
@@ -121,35 +220,16 @@ describe('A204 #38060 r1 MF — an uncomputable remerge-diff is not proof of res
     expect(existsSync(join(root, 'terminal'))).toBe(false);
   });
 
-  test('a terminal record expires: past the TTL the next preflight measures again', () => {
+  test('clear removes a terminal record by PR+head', () => {
     const { root, capFile } = fixture('2');
     const clock = { now: Date.UTC(2026, 10, 17) };
-    const common = ['--ledger-root', root, '--cap-file', capFile];
-    const first = cliDeps({ git: fakeGit(ok('+resolved\n')), clock, pid: 202 });
-    expect(runReviewRunnerGuardCli(['preflight', '38060', '--head', HEAD, ...common], first.deps)).toBe(3);
-    clock.now += TERMINAL_REFUSAL_TTL_MS;
-    const calls: string[][] = [];
-    const later = cliDeps({ git: fakeGit(ok(''), calls), clock, pid: 203 });
-    expect(runReviewRunnerGuardCli(['preflight', '38060', '--head', HEAD, ...common], later.deps)).toBe(0);
-    expect(later.last()).toMatchObject({ status: 'clean' });
-    expect(calls.some((args) => args.includes('--remerge-diff'))).toBe(true);
-  });
-
-  test('clear removes a terminal record; an older unknown-as-terminal record is read as absent', () => {
-    const { root, capFile } = fixture('2');
-    const clock = { now: Date.UTC(2026, 10, 17) };
-    const common = ['--ledger-root', root, '--cap-file', capFile];
-    const first = cliDeps({ git: fakeGit(ok('+resolved\n')), clock, pid: 204 });
-    expect(runReviewRunnerGuardCli(['preflight', '38060', '--head', HEAD, ...common], first.deps)).toBe(3);
-    const clear = cliDeps({ clock, pid: 205 });
-    expect(runReviewRunnerGuardCli(['clear', '38060', '--head', HEAD, ...common], clear.deps)).toBe(0);
-    expect(clear.last()).toMatchObject({ cleared: true });
     const ledger = new ReviewSlotLedger({ root, capFile, now: () => clock.now, host: 'test-host', pid: 206, pidAlive: () => false });
-    expect(ledger.terminalRefusal('38060', HEAD)).toBeUndefined();
     mkdirSync(join(root, 'terminal'), { recursive: true });
-    writeFileSync(ledger.terminalPath('38060', HEAD_2), JSON.stringify({ refusal: 'needs-clean-branch', reason: 'merge-resolution-unknown', recordedAt: clock.now }));
-    expect(ledger.terminalRefusal('38060', HEAD_2)).toBeUndefined();
-    expect(existsSync(ledger.terminalPath('38060', HEAD_2))).toBe(false);
+    writeFileSync(ledger.terminalPath('38060', HEAD), JSON.stringify({ refusal: 'needs-clean-branch', reason: 'merge-resolution-unknown', recordedAt: clock.now }));
+    const clear = cliDeps({ clock, pid: 205 });
+    expect(runReviewRunnerGuardCli(['clear', '38060', '--head', HEAD, '--ledger-root', root, '--cap-file', capFile], clear.deps)).toBe(0);
+    expect(clear.last()).toMatchObject({ cleared: true });
+    expect(existsSync(ledger.terminalPath('38060', HEAD))).toBe(false);
   });
 });
 

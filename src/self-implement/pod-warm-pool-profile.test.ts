@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { withSimClock } from '../ux-sim/fake-clock.js';
+import { resolveFacts } from '../kit/resource-facts/facts.js';
 import {
   deriveWarmPoolPhaseRatios,
   isWarmPoolProfile,
@@ -36,6 +37,19 @@ describe('warm-pool profile', () => {
     expect(resolveWarmPoolQuota('fixed', 'mbp', 'standard')).toBe(0);
     expect(resolveWarmPoolQuota('fixed', 'node-c', 'lite')).toBe(0);
     expect(resolveWarmPoolQuota('fixed', 'unknown-host', 'standard')).toBe(0);
+  });
+
+  test('uses resource policy quotas and refuses HQ even when a quota is configured', () => {
+    const facts = resolveFacts({ actors: null, policy: { warmPoolQuotas: {
+      'node-b': { standard: 3 }, 'mshq': { standard: 99 }, 'bad': { standard: -1 },
+    } } });
+    const ratios = { gate: 1, landing: 0, feature: 0 };
+    expect(resolveWarmPoolQuota('fixed', 'node-b', 'standard', ratios, facts)).toBe(3);
+    expect(resolveWarmPoolQuota('fixed', 'mshq', 'standard', ratios, facts)).toBe(0);
+    expect(resolveWarmPoolQuota('fixed', 'bad', 'standard', ratios, facts)).toBe(0);
+    expect(resolveWarmPoolQuota('fixed', 'node-c', 'standard', ratios, facts)).toBe(4);
+    expect(resolveWarmPoolQuota('fixed', 'elangram-wsl', 'standard', ratios, facts)).toBe(5);
+    expect(resolveWarmPoolQuota('fixed', 'unregistered', 'standard', ratios, facts)).toBe(0);
   });
 
   test('simulates the 0.3.6 cut-ledger phase share before applying it to quotas', async () => {

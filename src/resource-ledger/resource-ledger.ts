@@ -7,6 +7,9 @@ import { acquireLockSync } from '../storage/file-lock.js';
 import { evaluateHostLeasePolicy, HOST_LEASE_ALTERNATIVE_HOSTS } from '../guardian/host-lease-policy.js';
 import { debug } from '../debug/log.js';
 import { isRecord } from '../primitives/guards.js';
+import { validWorldLedgerEvent, WORLD_LEDGER_EVENT_TYPES, type WorldLedgerEvent } from './world-ledger-events.js';
+import { LLM_POLICY_EVENT_TYPES, OVERRIDE_RANK, validLlmPolicyEvent, type LlmPolicyLedgerEvent } from './llm-policy-events.js';
+import { ALLOC_LEDGER_EVENT_TYPES, validAllocLedgerEvent, type AllocLedgerEvent } from '../allocation/alloc-events.js';
 
 export const RESOURCE_LANES = ['gate', 'train', 'ta', 'hand', 'warm', 'bench', 'unknown'] as const;
 export type ResourceLane = typeof RESOURCE_LANES[number];
@@ -213,7 +216,12 @@ export type ResourceLedgerEvent =
   | { event: 'train-worker-policy'; at: string; policy: TrainWorkerPolicy }
   | { event: 'guardian-cost-snapshot'; at: string; snapshot: GuardianCostSnapshot }
   | { event: 'host-readiness-heartbeat'; at: string; heartbeat: HostReadinessHeartbeat }
-  | { event: 'res-decision'; at: string; row: ResDecisionRow };
+  | { event: 'res-decision'; at: string; row: ResDecisionRow }
+  // WORLD-REGISTRY — actors and sweeps ride the lease ledger (world-ledger-events.ts).
+  | WorldLedgerEvent
+  | LlmPolicyLedgerEvent
+  // ALLOCATION-BUDGET — reserve→grant→release of LLM and host allocations ride the lease ledger (allocation/alloc-events.ts).
+  | AllocLedgerEvent;
 
 export interface ResourceMeasurement {
   host: string;
@@ -347,6 +355,9 @@ const KNOWN_RESOURCE_LEDGER_EVENT_TYPES = new Set([
   'lease.requested', 'lease.granted', 'lease.queued', 'lease.denied', 'lease.released', 'lease.expired', 'lease.violation',
   'guardian-host-lease', 'guardian-host-lease-conflict', 'guardian-host-lease-admitted', 'guardian-host-lease-admission-denied',
   'train-worker-policy', 'guardian-cost-snapshot', 'host-readiness-heartbeat', 'slot-capacity-policy', 'res-decision',
+  ...WORLD_LEDGER_EVENT_TYPES,
+  ...LLM_POLICY_EVENT_TYPES,
+  ...ALLOC_LEDGER_EVENT_TYPES,
 ]);
 
 export function parseResourceLedgerEvents(text: string): ResourceLedgerEvent[] {
@@ -542,6 +553,12 @@ function parseResourceLedgerEventsWithObservations(text: string): {
         || !validHost(String(policyRow.host ?? '')) || !Number.isSafeInteger(policyRow.capacity) || Number(policyRow.capacity) < 0)
         throw new Error(`resource ledger invalid slot capacity policy at line ${index + 1}`);
     }
+    if ((WORLD_LEDGER_EVENT_TYPES as readonly string[]).includes(eventType) && !validWorldLedgerEvent(row))
+      throw new Error(`resource ledger invalid world event at line ${index + 1}`);
+    if ((LLM_POLICY_EVENT_TYPES as readonly string[]).includes(eventType) && !validLlmPolicyEvent(row))
+      throw new Error(`resource ledger invalid LLM policy event at line ${index + 1}`);
+    if ((ALLOC_LEDGER_EVENT_TYPES as readonly string[]).includes(eventType) && !validAllocLedgerEvent(row))
+      throw new Error(`resource ledger invalid alloc event at line ${index + 1}`);
     if (eventType === 'guardian-cost-snapshot' && !validGuardianCostSnapshot(row.snapshot))
       throw new Error(`resource ledger invalid Guardian cost snapshot at line ${index + 1}`);
     events.push(value as ResourceLedgerEvent);
@@ -1049,6 +1066,45 @@ function withLedgerLock(path: string, action: () => void): void {
 
 function appendEvent(event: ResourceLedgerEvent, path: string): void {
   appendFileSync(path, `${JSON.stringify(event)}\n`, { encoding: 'utf8', flag: 'a' });
+}
+
+/** WORLD-REGISTRY — append world events (validated first) under one ledger lock. */
+export function recordWorldEvents(events: readonly WorldLedgerEvent[], path = resourceLedgerPath()): void {
+  if (events.length === 0) return;
+  const lines = events.map(event => JSON.stringify(event)).join('\n') + '\n';
+  parseResourceLedgerEvents(lines);
+  withLedgerLock(path, () => appendFileSync(path, lines, { encoding: 'utf8', flag: 'a' }));
+}
+
+/** LLM-ACCOUNT-POLICY — append one override / guardian state fact (validated first) under the ledger lock. */
+export function recordLlmPolicyEvent(event: LlmPolicyLedgerEvent, path = resourceLedgerPath()): void {
+  const line = `${JSON.stringify(event)}\n`;
+  parseResourceLedgerEvents(line);
+  withLedgerLock(path, () => {
+    // A clear names an existing override and ranks at or above its setter — checked on every append path.
+    if (event.event === 'llm-override' && event.op === 'clear') {
+      const target = (existsSync(path) ? readResourceLedger(path) : []).reverse()
+        .find((e): e is Extract<LlmPolicyLedgerEvent, { op: 'set' }> => e.event === 'llm-override' && (e as { op?: string }).op === 'set' && (e as { id?: string }).id === event.id);
+      if (!target) throw new Error(`llm-override clear: no override ${event.id}`);
+      if (OVERRIDE_RANK[event.by] < OVERRIDE_RANK[target.by]) throw new Error(`llm-override clear: ${event.by} cannot clear a ${target.by} override (${event.id})`);
+    }
+    appendFileSync(path, line, { encoding: 'utf8', flag: 'a' });
+  });
+}
+
+/** ALLOCATION-BUDGET — read the ledger, build alloc rows from it, validate and append them, all under one ledger lock
+ *  (a grant decides against the rows it saw; two callers never decide on the same snapshot). Returns what was appended. */
+export function recordAllocEventsWith(path: string, build: (events: ResourceLedgerEvent[]) => readonly AllocLedgerEvent[]): AllocLedgerEvent[] {
+  let appended: AllocLedgerEvent[] = [];
+  withLedgerLock(path, () => {
+    const lines = build(readResourceLedger(path));
+    if (lines.length === 0) return;
+    const text = lines.map(event => JSON.stringify(event)).join('\n') + '\n';
+    parseResourceLedgerEvents(text);
+    appendFileSync(path, text, { encoding: 'utf8', flag: 'a' });
+    appended = [...lines];
+  });
+  return appended;
 }
 
 /** Persist one admitted proxy invocation before the response is returned. */

@@ -28,12 +28,26 @@ export function hangulRatio(text: string): number {
 /** The language the result must be written and spoken in: Korean when the goal is Korean. */
 export const goalLanguage = (goal: string): 'Korean' | undefined => hangulRatio(goal) >= 0.3 ? 'Korean' : undefined;
 
-/** Markdown brief → plain sentences for speech, cut at a sentence end near `max` characters. Source notes are dropped. */
+/** A «출처» / «Sources» / «References» heading (any level, or a bare/bold label line): everything from it on is source list. */
+const SOURCES_HEADING = /^[ \t]*(?:#{1,6}[ \t]*[*_]*[ \t]*(?:출처|sources?|references?)(?![\p{L}])[^\n]*|[*_]*[ \t]*(?:출처|sources?|references?)[ \t]*:?[ \t]*[*_]*[ \t]*)$/imu;
+/** The brief with its source list cut off (from the first sources heading to the end). */
+export function cutSourcesSection(markdown: string): string {
+  const m = SOURCES_HEADING.exec(markdown);
+  return m ? markdown.slice(0, m.index).trimEnd() : markdown;
+}
+/** Inline URLs are never read aloud: «(https://…)», <https://…> and bare http(s) URLs go, then any parens left empty. */
+function withoutUrls(line: string): string {
+  return line.replace(/\(\s*<?https?:\/\/[^\s)>]*>?\s*\)/giu, '').replace(/<?https?:\/\/[^\s)\]>]+>?/giu, '')
+    .replace(/\(\s*[,;:·\-–—]*\s*\)/gu, '').replace(/\[\s*\]/gu, '');
+}
+
+/** Markdown brief → plain sentences for speech, cut at a sentence end near `max` characters. Source notes, the source
+ * list (from a «출처»/«Sources»/«References» heading on) and every URL are dropped. */
 export function speechText(markdown: string, max = VOICE_MAX_CHARS): string {
-  const lines = markdown.split('\n')
-    .map((l) => l.replace(/[*_]*\((?:출처|source|sources)\s*:[^)]*\)[*_]*/giu, '').replace(/!\[[^\]]*\]\([^)]*\)/gu, '').replace(/\[([^\]]+)\]\([^)]*\)/gu, '$1')
-      .replace(/^\s*(#{1,6}|[-*+]|\d+[.)]|>)\s+/u, '').replace(/[*_`~|]/gu, '').replace(/\s+/gu, ' ').trim())
-    .filter((l) => l && !/^-{3,}$/u.test(l));
+  const lines = cutSourcesSection(markdown).split('\n')
+    .map((l) => withoutUrls(l.replace(/[*_]*\((?:출처|source|sources)\s*:[^)]*\)[*_]*/giu, '').replace(/!\[[^\]]*\]\([^)]*\)/gu, '').replace(/\[([^\]]+)\]\([^)]*\)/gu, '$1'))
+      .replace(/^\s*(#{1,6}|[-*+]|\d+[.)]|>)\s+/u, '').replace(/[*_`~|]/gu, '').replace(/\s+([,.!?:;])/gu, '$1').replace(/\s+/gu, ' ').trim())
+    .filter((l) => /[\p{L}\p{N}]/u.test(l));
   const text = lines.map((l) => (/[.!?。…:]$/u.test(l) ? l : `${l}.`)).join(' ');
   if (text.length <= max) return text;
   const cut = text.slice(0, max);
@@ -81,6 +95,7 @@ export async function elevenLabsTts(env: NodeJS.ProcessEnv = process.env): Promi
 
 /** The voice node. Never throws: every failure is a skipped voice with a reason. */
 export async function runVoice(brief: string, outFile: string, tts: Tts | undefined, signal?: AbortSignal, opts: { language?: 'Korean' } = {}): Promise<VoiceResult> {
+  // The Korean check below measures this cleaned speech text only (no URLs, no source list).
   const text = speechText(brief);
   if (!text) return { ok: false, chars: 0, why: 'empty brief' };
   // A Korean goal is spoken in Korean only — an English brief is skipped rather than narrated in English.

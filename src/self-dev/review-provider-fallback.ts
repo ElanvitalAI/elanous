@@ -308,6 +308,10 @@ export function planReviewProviderAttempts(
   options: { skipUnavailableProviders?: boolean; allowedProviderNames?: readonly string[]; isAvailable?: (provider: LLMProvider) => boolean } = {},
 ): ReviewProviderAttemptPlan {
   const model = resolveReviewModelAlias(primary.model);
+  // GLM must not be invoked as a reviewer, including when selected explicitly.
+  if (/(?:^|[/:])glm(?:[-_.\d]|$)/i.test(model)) {
+    throw new Error(`review fallback: GLM review is prohibited (${model})`);
+  }
   const inferred = inferProviderFromModel(model);
   const supported = Boolean(inferred && (inferred !== 'local' || model.startsWith('local:') || model.startsWith('local-llm:')));
   let selectedProvider: LLMProvider | undefined;
@@ -370,6 +374,7 @@ export function planReviewProviderAttempts(
   for (const f of fallbacks) {
     if (!f.model.trim()) continue;
     const fallbackModel = resolveReviewModelAlias(f.model);
+    if (/(?:^|[/:])glm(?:[-_.\d]|$)/i.test(fallbackModel)) continue;
     if (seen.has(fallbackModel)) continue;
     const fallbackInference = inferProviderFromModel(fallbackModel);
     if (!fallbackInference || (fallbackInference === 'local' && !fallbackModel.startsWith('local:') && !fallbackModel.startsWith('local-llm:'))) {
@@ -447,9 +452,24 @@ export async function runReviewWithFallback(
     /** Maximum real provider calls; an availability skip does not spend this budget. */
     maxCalls?: number;
     shouldFallback?: (attempt: ReviewProviderAttempt, reason: ReviewFailureReason) => boolean;
+    /** Reviews fail closed except for two Terra overloads followed by Grok. */
+    terraOverloadOnly?: boolean;
   } = {},
 ): Promise<{ text: string; used: ReviewProviderAttempt; attemptIndex: number }> {
   if (attempts.length === 0) throw new Error('review fallback: no attempts configured');
+  // Callers can invoke the runner without the planner; enforce the same prohibition here.
+  for (const attempt of attempts) {
+    const model = resolveReviewModelAlias(attempt.model);
+    if (/(?:^|[/:])glm(?:[-_.\d]|$)/i.test(model)) {
+      throw new Error(`review fallback: GLM review is prohibited (${model})`);
+    }
+  }
+  if (options.terraOverloadOnly) {
+    const primary = attempts[0]!;
+    const terra = /(?:^|[/:])gpt-[\w.-]*terra$/i.test(resolveReviewModelAlias(primary.model));
+    const grok = attempts.slice(1).find((a) => inferProviderFromModel(resolveReviewModelAlias(a.model)) === 'grok');
+    attempts = terra ? [primary, primary, ...(grok ? [grok] : [])] : [primary];
+  }
   let lastError: unknown;
   let lastReason: ReviewFailureReason | undefined;
   const unavailableAtCall: ReviewProviderCandidateSkip[] = [];
@@ -469,6 +489,10 @@ export async function runReviewWithFallback(
         ...(attempt.provider ? { provider: attempt.provider.name } : {}), why: 'availability-check-failed' };
     }
     if (unavailable) {
+      if (options.terraOverloadOnly) {
+        if (lastError) throw lastError;
+        throw noUsableReviewProviderError([...(options.preSkipped ?? []), unavailable]);
+      }
       unavailableAtCall.push(unavailable);
       lastReason = 'credentials-unavailable';
       const errorMessage = `review provider credentials unavailable: ${unavailable.provider ?? unavailable.label}=${unavailable.why}`;
@@ -483,6 +507,7 @@ export async function runReviewWithFallback(
       const reason: ReviewFailureReason = 'unknown-model-provider';
       lastReason = reason;
       const errorMessage = `review fallback: unable to infer provider for model ${attempt.model}`;
+      if (options.terraOverloadOnly) throw new Error(errorMessage);
       const isLast = i === attempts.length - 1;
       try { observe(isLast ? 'exhausted' : 'fallback', { ...base, afterReason: reason, errorMessage }); } catch { /* fail-soft */ }
       continue;
@@ -505,7 +530,8 @@ export async function runReviewWithFallback(
       const reason = classifyReviewProviderFailure(errorMessage);
       const resolved = resolvedProvider ? { resolvedProvider } : {};
       // ⛔ 제공자 가용성 오류만 다음 시도로 넘긴다. 다른 실패도 유한 사유·원문을 남긴다.
-      if (!isReviewFallbackReason(reason) || options.shouldFallback?.(attempt, reason) === false) {
+      if ((options.terraOverloadOnly && (i >= 2 || reason !== 'overloaded'))
+        || !isReviewFallbackReason(reason) || options.shouldFallback?.(attempt, reason) === false) {
         try { observe('exhausted', { ...base, ...resolved, afterReason: reason, errorMessage }); } catch { /* fail-soft */ }
         throw error;
       }

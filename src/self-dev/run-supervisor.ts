@@ -1,5 +1,6 @@
 // ── 런 슈퍼바이저 — 「끝까지 돌린다」를 «판정»으로 만든다 ───────────────────────
 
+import { rubricSplitLine } from './goal-rubric.js';
 import { hasDelivered, resumeKey, triageRun, type FailureClassification } from './orchestrate.js';
 import { createHash } from 'node:crypto';
 import type { DeployVerifyFinding } from '../harness/browser-verify.js';
@@ -861,7 +862,7 @@ function decideNextRunCore(input: DecideNextRunInput): SupervisorDecision {
           ...base,
           action: 'stop',
           stopReason: 'decomposable-no-progress',
-          why: withGoalPlanRevisionObservation(`${stallRounds}라운드 연속 제자리지만 분해 제안이 있다 — ${decomposableResult.feature}을(를) 조각 ${pieces.length}개로: ${pieces.map((piece) => piece.feature).join(' · ')}`),
+          why: withGoalPlanRevisionObservation(`${stallRounds}라운드 연속 제자리지만 분해 제안이 있다 — ${decomposableResult.feature}을(를) 조각 ${pieces.length}개로: ${pieces.map((piece) => piece.feature).join(' · ')} · ${rubricSplitLine(pieces.map((piece) => piece.feature))}`),
         };
       }
       // 🩸 2026-09-24 🅕: 결말을 가른 것은 공급자 오류 수가 아니라 «리뷰가 시간 안에 판정을 냈나»였다(n=3 · step-timeout 0·1·2

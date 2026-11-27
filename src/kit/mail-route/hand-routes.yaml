@@ -1,0 +1,114 @@
+# KIT mail-route · routing table (HAND-RAISE-DOMAIN-ROUTING · DORMANT-SEAT-ROUTE · 0.3.38 P0)
+#
+# S: 11-27 a hand's ✋ went to TC 32–77/h. The echo pairs (POOL-1↔TC 56 mails · CX-7↔TC 25 · CX-1↔TC 19 · MVP-B↔TC 18)
+#    were hands re-asking TC about things only another owner decides: a dormant RES for a lease/isolation path, a HOLD,
+#    a cell's scope. TC read each one and forwarded it.
+# A: a ✋ goes ONCE to the owner with decision rights (this table). TC / OP keep only what nobody else owns (fallback).
+#    The same ✋ (same seat · same root · same cell) inside `dedupe.windowMinutes` is answered by reference, not re-sent.
+#    Mail to a dormant seat goes to its live reader (`dormant.routes`); unanswered for `dormant.unansweredMinutes` → one
+#    OP card.
+#
+# This file is the routing policy: change it here, not in TypeScript. An override at `<state>/msg/hand-routes.yaml`
+# (same shape · any key it names replaces the built-in one) is read when present. A missing / broken table keeps every
+# ✋ on its old rung — routing never blocks a hand.
+version: 1
+
+# A ✋ addressed to one of these rungs is moved to its root's owner. A ✋ to any other rung (JUD · a space lead) keeps it.
+relievedRungs: [OP, TC]
+
+# root → who decides it. owner = an address · `keep` = the old rung (TC/OP fallback) · `cell-owner` = the checklist owner
+# of the ✋'s cell (`cell:` ref, else the seat's claimed yellow cell); not resolvable / the asking seat itself → `else`.
+roots:
+  wip-handoff:     { owner: TC, attach: wip-takeover-rule }
+  jud-verdict:     { owner: JUDGE-BUTLER }
+  hold:            { owner: JUDGE-BUTLER }
+  env:             { owner: GUARDIAN }
+  cell-scope:      { owner: cell-owner, else: keep }
+  # the TUI's own auto-continue cap («Plan still has open steps after 10 automatic continues»). Not a guardian matter: the
+  # ✋ stays at the hand's leader and the 행정관 (space steward · writer-check resolver) answers «재개» on its tick.
+  auto-continue:   { owner: keep }
+  design-decision: { owner: keep }
+
+# Structured codes decide first (no text rules · standing rule 11-20): the ✋'s `cause:` ref, then its `reason:` code.
+causes:
+  writer-handover: wip-handoff
+  worktree-path:   wip-handoff
+  slot-isolation:  env
+  res-approval:    env
+  hold:            hold
+  cell-scope:      cell-scope
+  plan-limit:      auto-continue
+reasons:
+  HUMAN_DECISION:   design-decision
+  OWNER_UNKNOWN:    wip-handoff
+  TOOL_DENIED:      env
+  PROVIDER_ERROR:   env
+  APPROVAL_PENDING: env   # an approval / policy cap / RES approval — the guardian owns the policy (2130 replay: CX-3 ×2)
+
+# Reason codes that are only a default: Jev may refine the root from the line. 2130 replay: hands sent
+# HUMAN_DECISION for «plan-limit» and for an approval-policy ask — neither is a coordinator's design call.
+refineReasons: [HUMAN_DECISION]
+
+# An unstructured line asks Jev (Typesafe System One — the decision model, 대표 22:1x) ONE multi-choice question over these
+# words and gets a probability per word. `means` is Jev's whole guide — widen it with the words hands really write (2130
+# window texts), never with code. The top word routes only at ≥ classifierMinProbability; below it → ambiguous → TC.
+classifier:
+  wip:      { root: wip-handoff,     means: "someone else's uncommitted work or files (미커밋 변경·작성자 인계·겹침), file ownership, writer handover, which worktree/branch to use" }
+  jud:      { root: jud-verdict,     means: "a judge/review verdict (PARTIAL/FAIL), an independent verdict (독립 판정), same-HEAD receipts, raw outputs, seeds, baselines or run IDs a judge must see (원출력·원영수·영수·baseline)" }
+  hold:     { root: hold,            means: "a HOLD / freeze / 보류 on the work: whether it applies, its original text or scope (HOLD 원문·범위), who lifts it, when it expires, returning a cell because of it" }
+  guardian: { root: env,             means: "host, disk, environment, path, network, credentials or auth trust boundary (인증 주체·신뢰 경계), tool or provider failure, an LLM provider's usage/rate quota, spend/lease/budget, VM or resource, a run record or exit receipt kept by RES (발사 기록·종료 영수) — never the TUI's own «plan-limit»" }
+  autocontinue: { root: auto-continue, means: "the TUI's own auto-continue cap: the bare word «plan-limit» or «seat-cap-limit», «Plan still has open steps after N automatic continues», a hand waiting on its own background process — NOT an LLM plan, quota or rate limit; resuming the hand fixes it" }
+  approval: { root: env,             means: "an approval or approval policy: a single-use run approval, an authorized scope, RES approval, policy caps (승인·단일 사용 승인·권한 있는 범위·승인 우회 불가)" }
+  cell:     { root: cell-scope,      means: "the scope or assignment of a checklist cell: what is in or out, who owns it, whether to take or return it, a missing parent PR/path the cell depends on" }
+  decision: { root: design-decision, means: "a product or design choice only a coordinator can make (which design/approach), nothing else above fits" }
+# plan-limit (auto-continue cap): resumed automatically; the same hand hitting it this many times in an hour → a card to
+# its leader with the plan's open steps instead (live 11-27 23:0x: 5–6 hands sat 38 min at GUARDIAN on «plan-limit»).
+autoContinueCap:
+  cardAfterHitsPerHour: 3
+# Top Jev probability needed to route (below → ambiguous → the old rung, TC).
+classifierMinProbability: 0.5
+# Upper bound on one Jev call before the ✋ goes to its old rung (Jev answers in ~1 s; the cap is for a stalled network).
+classifierTimeoutSeconds: 30
+
+# The same ✋ (seat · root · cell) inside this window is answered by reference to the first one (its answer, or «still
+# open at X»); no new row, no new wake.
+dedupe:
+  windowMinutes: 30
+
+dormant:
+  # address with no live tab → its live reader. A probe that finds a live tab for the address always wins.
+  # `OP` = the OP 30-min machine digest «잠든 수신처» (🚨 → OP inbox at once).
+  routes:
+    RES: GUARDIAN
+    RES-INFRA: GUARDIAN
+    REL: OP
+    ORCHESTRATOR: OP
+    REVIEW-2: JUD
+    JUD-2: JUD
+  # when the first reader IS the sender, the next one in line (never back to the sender).
+  alternates:
+    GUARDIAN: [OP]
+    JUD: [OP]
+    OP: []
+  # resource addresses: a live RES-INFRA reads RES mail before the guardian does.
+  resourceAddresses: [RES, RES-INFRA]
+  # rerouted mail its reader has not handled (reply · ack · receipt) after this long → one OP card.
+  unansweredMinutes: 10
+  cardTo: OP
+  # rerouted mail older than this is not swept (a card persists on its own).
+  sweepWindowMinutes: 120
+
+# GUARDIAN-HAND-SLA (0.3.38 P0) — a ✋ moved to a loop-agent address is read by no tab there: the guardian's voice skips
+# ✋ and its ladder parent is HQ, whose timer never mails OP. Live 11-27/28: #198743 (TC-H-POOL-3 · DEPENDENCY_WAIT) and
+# peers sat at GUARDIAN 25–53 min. Unanswered for `slaMinutes` → re-routed ONCE (it closes as escalated, the new ✋ climbs
+# the normal ladder) by its reason code: `routed-from` = back to the rung this table moved it from (the hand's leader ·
+# the domain owner of a dependency / design wait) · an address = there · the HQ seat (OP) = the HQ beacon card on the
+# same steward tick. A reason not named → `else`.
+loopHands:
+  receivers: [GUARDIAN]
+  slaMinutes: 10
+  byReason:
+    DEPENDENCY_WAIT: routed-from
+    HUMAN_DECISION:  routed-from
+    OWNER_UNKNOWN:   routed-from
+  else: OP

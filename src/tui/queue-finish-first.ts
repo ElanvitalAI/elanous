@@ -91,6 +91,8 @@ export interface SeatMailClassInput {
   readonly origin?: { readonly kind?: string; readonly delegatedByCrown?: boolean } | null;
   readonly crownDirective?: string | null;
   readonly fromKind?: string | null;
+  /** CLAUDE-OP-PROXY-LANE — the caller computed isProxyLaneMail (proxy seat ⊕ gate-stamped lane ref). */
+  readonly proxyLane?: boolean;
 }
 
 /**
@@ -102,6 +104,8 @@ export function classifySeatMail(m: SeatMailClassInput): SeatMailClass {
   if (m.origin?.kind === 'human' || m.origin?.delegatedByCrown === true || m.fromKind === 'human') return 'P0';
   if (typeof m.crownDirective === 'string' && m.crownDirective.trim() !== '') return 'P0';
   if (m.intent === 'alert') return 'P0';
+  // CLAUDE-OP-PROXY-LANE — the CEO's proxy wakes like crown mail (P0 · budgeted to 6/h at the post gate).
+  if (m.proxyLane === true) return 'P0';
   if (m.intent === 'request' || m.intent === 'decision') return 'P1';
   return 'P2';
 }
@@ -120,6 +124,8 @@ export interface QueueClassItem {
   readonly occurredAt?: number;
   readonly digest?: string;
   readonly mailClass?: SeatMailClass;
+  /** CLAUDE-OP-PROXY-LANE — 0 = crown / a person · 1 = the CEO's proxy · absent = the rest (order inside a class). */
+  readonly mailRank?: 0 | 1;
   readonly mailIntent?: string;
   /** The ledger `kind` of a seat mail (structured; `release-stop` is P0 in the OP batch). */
   readonly mailKind?: string;
@@ -335,8 +341,9 @@ export function personQueuedCount(items: readonly Pick<QueueClassItem, 'kind'>[]
 export function orderReleased<T extends QueueClassItem>(items: readonly T[], waits: WorkWaits = NO_WAITS, opBatch = false): T[] {
   const classOf = opBatch ? classifyOpBatchItem : classifyQueueItem;
   const rank = (c: QueueHoldClass): number => (c === 'P0' ? 0 : c === 'related' ? 1 : c === 'P1' ? 2 : 3);
-  return items.map((item, index) => ({ item, index, r: rank(classOf(item, waits)) }))
-    .sort((a, b) => a.r - b.r || a.index - b.index)
+  const sub = (item: T): number => (item.kind === 'user' || item.source === 'ceo-ingress' ? 0 : item.mailRank ?? 2);
+  return items.map((item, index) => ({ item, index, r: rank(classOf(item, waits)), s: sub(item) }))
+    .sort((a, b) => a.r - b.r || a.s - b.s || a.index - b.index)
     .map((x) => x.item);
 }
 
@@ -372,9 +379,9 @@ export function relatedJoinBlock(related: readonly QueueClassItem[]): string | n
   return [`[joined to current work · ${related.length} related]`, ...related.map((item) => item.text)].join('\n\n');
 }
 
-/** Status chip while mail is held. Empty when nothing is held. */
+/** Status chip while mail is held — «held in TUI queue» (this TUI’s own wait line), not the inbox ledger’s «unacked in inbox» (MsgList `total`). Empty when nothing is held. */
 export function heldChip(count: number): string {
-  return count > 0 ? `📩 ${count} held` : '';
+  return count > 0 ? `📩 ${count} held in TUI queue` : '';
 }
 
 export interface QueueFinishFirstLog {

@@ -5,8 +5,9 @@
 //     (argv, no shell, 30 s timeout, 200 000-byte head capture shared by stdout+stderr, the structured result the
 //     model receives); other profiles reproduce external agents' documented caps.
 // One kit per (strategy, query): the trace is per query. Indexes are shared per corpus (built once, cost reported).
-import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { spawnElanousSync } from '../../instance/spawn-elanous.js';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { dispatchGlob } from '../../skills/tools/glob.js';
@@ -15,6 +16,7 @@ import { dispatchRead } from '../../skills/tools/read.js';
 import { resetSearchLoopGuardForTest } from '../../skills/tools/search-loop-guard.js';
 import { DEFAULT_TIMEOUT_MS, SHELL_MAX_OUTPUT } from '../../shell-primitive/index.js';
 import { dispatchDocsSearch } from '../../skills/tools/docs-search.js';
+import { parseRunShellSearch, planRunShellSearch, finishRunShellSearch, type RunShellSearchDeps } from '../../skills/tools/run-shell-search.js';
 import type { SearchSourceConfig } from '../../knowledge/search-roots.js';
 import { buildCorpusIndex, buildStage0, buildStage1, type CorpusIndex, type DocsHit, type DocsIndex } from './docs-index.js';
 import { buildRelationGraph, graphRelationScorer, type RelationGraph, type RelationScorer } from './relation-graph.js';
@@ -235,6 +237,58 @@ export class SearchKit {
     const error = r.error ? String(r.error.message) : undefined;
     this.record({ tool, args: argv.join(' '), bytes: folded.bytes, ms: performance.now() - t, hits: folded.visible ? folded.visible.split('\n').filter(Boolean).length : 0, ...(error ? { error } : {}) });
     return { visible: folded.visible, exit: r.status, rawBytes: enc(stdout), truncated: folded.truncated };
+  }
+
+  /** The seat's RunShell search path — the 'via RunShell' arm (RUNSHELL-SEARCH-PARITY): product plan
+   *  (policy deny · roots · stale-cwd hints) → head-captured run (fold 'runshell') → parity finish
+   *  (repo:/ref: citations · hit count). Refused argv never spawns — the model receives the same structured
+   *  denied result the seat's dispatchRunShell returns; accepted searches get the `search=… hits=…` summary. */
+  runshell(argv: readonly string[]): string {
+    const t = performance.now();
+    const deps: RunShellSearchDeps = {
+      staleCwd: () => null, // a bench corpus root is created for the run — never stale
+      sources: (scope) => this.ctx.sources.filter((s) => scope === 'both' || s.type === scope).map((s) => ({ id: s.id, type: s.type, path: s.path })),
+      exists: existsSync,
+      log: () => {}, // the sim scores what the model receives; debug-side miss/summary logs stay product-side
+    };
+    const parsed = parseRunShellSearch(argv);
+    if (parsed?.refused) {
+      const result = {
+        output: `RunShell refused a search flag: ${parsed.refused}. Search argv is read-only (rg · git grep · ast-grep run|scan · eln docs search).`,
+        exitCode: null, outcome: 'denied', elapsedMs: 0, stdout: '', stderr: parsed.refused, truncated: false, approvalKey: 'rejected:search-flag',
+      };
+      const visible = JSON.stringify(result);
+      this.record({ tool: 'RunShell', args: argv.join(' '), bytes: enc(visible), ms: performance.now() - t, hits: 0 });
+      return visible;
+    }
+    const plan = planRunShellSearch(argv, this.root, deps);
+    const runArgv = plan ? plan.argv : argv;
+    const opts = {
+      cwd: this.root, encoding: 'utf8' as const, timeout: DEFAULT_TIMEOUT_MS, maxBuffer: 512 * 1024 * 1024,
+      ...(plan?.parsed.tool === 'docs' ? { env: { ...process.env, ELANOUS_SOURCES: JSON.stringify(this.ctx.sources) } } : {}), // corpus-bound `eln docs search`
+    };
+    const r = plan?.parsed.tool === 'docs'
+      ? spawnElanousSync(runArgv.slice(1), { ...opts, executable: runArgv[0] }) as SpawnSyncReturns<string>
+      : spawnSync(runArgv[0]!, runArgv.slice(1), opts);
+    const out = Buffer.from(r.stdout ?? '', 'utf8');
+    const keptOut = out.subarray(0, SHELL_MAX_OUTPUT); // fold 'runshell': stdout then stderr share one byte budget
+    const err = Buffer.from(r.stderr ?? '', 'utf8').subarray(0, Math.max(0, SHELL_MAX_OUTPUT - keptOut.length));
+    const truncated = out.length > keptOut.length || enc(r.stderr ?? '') > err.length;
+    let stdoutVisible = keptOut.toString('utf8');
+    let hits = stdoutVisible ? stdoutVisible.split('\n').filter(Boolean).length : 0;
+    let output = `exit ${r.status ?? 'null'}`;
+    let extra: { searchRawBytes?: number; search?: { tool: string; hits: number; rawBytes: number; returnedBytes: number; addedRoots: number } } = {};
+    if (plan) {
+      const finished = finishRunShellSearch(plan, { stdout: stdoutVisible, exitCode: r.status, outcome: 'exit' }, this.root, deps);
+      stdoutVisible = finished.stdout;
+      hits = finished.hits;
+      output = `${output} search=${plan.parsed.tool} hits=${finished.hits}${plan.addedRoots.length ? ` roots+${plan.addedRoots.length}` : ''}`;
+      extra = { searchRawBytes: finished.rawBytes, search: { tool: plan.parsed.tool, hits: finished.hits, rawBytes: finished.rawBytes, returnedBytes: finished.returnedBytes, addedRoots: plan.addedRoots.length } };
+    }
+    const result = { output, exitCode: r.status, outcome: 'exit', elapsedMs: Math.round(performance.now() - t), stdout: stdoutVisible, stderr: err.toString('utf8'), truncated, ...extra };
+    const visible = JSON.stringify(result);
+    this.record({ tool: 'RunShell', args: argv.join(' '), bytes: enc(visible), ms: performance.now() - t, hits, ...(r.error ? { error: String(r.error.message) } : {}) });
+    return visible;
   }
 
   /** Account for work done without a tool call (e.g. a pipe stage that costs no model bytes). */

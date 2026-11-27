@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { runGraph, type GraphRunOptions, type GraphRunState } from '../graph-runner/runner.js';
+import { hostsFor, hqHosts, paidHostsFor, type RoutePurpose } from '../kit/resource-facts/index.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -50,15 +51,17 @@ export interface PlacementCandidate extends PlacementHostFacts {
   readonly grade: 'green' | 'yellow';
 }
 
-const localOrder: Record<PlacementWorkKind, readonly string[]> = {
-  review: ['node-b', 'mshq', 'minim5'],
-  test: ['node-b', 'minim5', 'mshq'],
-  tsc: ['node-b', 'minim5', 'mshq'],
-  tab: ['mshq', 'node-b', 'minim5', 'node-c'],
-  train: ['node-b', 'mshq', 'minim5'],
+// RESOURCE-FACTS-FROM-LEDGER (CEO 11-27): orders come from the world registry by role ⊕ health — no fixed lists. The old
+// fixed lists put the HQ host (mshq) first for review/test/tsc/train; the registry never routes heavy work there.
+const KIND_PURPOSE: Record<PlacementWorkKind, RoutePurpose> = { review: 'review', test: 'test-run', tsc: 'tsc', tab: 'hand-placement', train: 'full-gate' };
+// Seat tabs live on the HQ host first (the HQ host takes no heavy work, only tabs).
+const localOrder = (kind: PlacementWorkKind): readonly string[] => {
+  const order = hostsFor(KIND_PURPOSE[kind]);
+  if (kind !== 'tab') return order;
+  const hq = hqHosts().filter(h => order.includes(h));
+  return [...hq, ...order.filter(h => !hq.includes(h))];
 };
-const cloudOrder = ['aws2', 'gcp2'] as const;
-const localHosts = ['node-b', 'mshq', 'minim5', 'node-c'] as const;
+const cloudOrder = (kind: PlacementWorkKind): readonly string[] => paidHostsFor(KIND_PURPOSE[kind]);
 const requiredTools: Record<PlacementWorkKind, readonly string[]> = {
   review: ['repo', 'bun', 'codex'], test: ['bun', 'node_modules'], tsc: ['bun', 'node_modules'],
   tab: ['repo', 'codex'], train: ['repo', 'bun'],
@@ -108,15 +111,15 @@ function uniquePlacementHostFacts(snapshot: PlacementSnapshot): PlacementHostFac
 
 /** Excludes hard-invalid hosts before the language model sees candidates. */
 export function filterPlacementCandidates(snapshot: PlacementSnapshot): PlacementCandidate[] {
-  const facts = uniquePlacementHostFacts(snapshot).filter(host => (localHosts.includes(host.host as typeof localHosts[number]) || cloudOrder.includes(host.host as typeof cloudOrder[number])) &&
-    (snapshot.workKind === 'tab' || host.host !== 'node-c') &&
-    ((localHosts.includes(host.host as typeof localHosts[number])) || typeof host.cloudRunning === 'boolean') &&
+  const local = localOrder(snapshot.workKind); const cloud = cloudOrder(snapshot.workKind);
+  const facts = uniquePlacementHostFacts(snapshot).filter(host => (local.includes(host.host) || cloud.includes(host.host)) &&
+    (local.includes(host.host) || typeof host.cloudRunning === 'boolean') &&
     host.ssh && !host.maintenance && !host.gateProtected &&
     requiredTools[snapshot.workKind].every(tool => host.tools.includes(tool)));
   return facts.flatMap(host => {
     const hostGrade = grade(host);
     if (hostGrade === 'red') return [];
-    const tier = host.host === 'aws2' || host.host === 'gcp2' ? 'cloud' as const : 'local' as const;
+    const tier = cloud.includes(host.host) ? 'cloud' as const : 'local' as const;
     const candidate = { ...host, tier, grade: hostGrade };
     if (hostGrade === 'yellow') {
       const load = host.runningByKind?.[snapshot.workKind];
@@ -124,8 +127,9 @@ export function filterPlacementCandidates(snapshot: PlacementSnapshot): Placemen
     }
     return [candidate];
   }).sort((a, b) => {
-    const aIndex = a.tier === 'local' ? localOrder[snapshot.workKind].indexOf(a.host) : localOrder[snapshot.workKind].length + cloudOrder.indexOf(a.host as typeof cloudOrder[number]);
-    const bIndex = b.tier === 'local' ? localOrder[snapshot.workKind].indexOf(b.host) : localOrder[snapshot.workKind].length + cloudOrder.indexOf(b.host as typeof cloudOrder[number]);
+    const order = localOrder(snapshot.workKind); const clouds = cloudOrder(snapshot.workKind);
+    const aIndex = a.tier === 'local' ? order.indexOf(a.host) : order.length + clouds.indexOf(a.host);
+    const bIndex = b.tier === 'local' ? order.indexOf(b.host) : order.length + clouds.indexOf(b.host);
     return aIndex - bIndex;
   });
 }
@@ -135,11 +139,11 @@ function candidateFor(hostName: string, candidates: readonly PlacementCandidate[
 }
 
 function preferredCandidate(snapshot: PlacementSnapshot, candidates: readonly PlacementCandidate[]): PlacementCandidate | undefined {
-  const localGreen = localOrder[snapshot.workKind]
+  const localGreen = localOrder(snapshot.workKind)
     .map(hostName => candidateFor(hostName, candidates))
     .find(item => item?.grade === 'green');
   if (localGreen) return localGreen;
-  const localYellow = localOrder[snapshot.workKind]
+  const localYellow = localOrder(snapshot.workKind)
     .map(hostName => candidateFor(hostName, candidates))
     .find(item => {
       const load = item?.runningByKind?.[snapshot.workKind];
@@ -147,7 +151,7 @@ function preferredCandidate(snapshot: PlacementSnapshot, candidates: readonly Pl
         Number.isSafeInteger(load.running) && Number.isSafeInteger(load.max) && load.running > 0 && load.running < load.max; // Source: brief local-first rule permits one additional same-kind workload only below the host cap.
     });
   if (localYellow) return localYellow;
-  return cloudOrder.map(hostName => candidateFor(hostName, candidates)).find(item => item?.grade === 'green');
+  return cloudOrder(snapshot.workKind).map(hostName => candidateFor(hostName, candidates)).find(item => item?.grade === 'green');
 }
 
 export function isValidPlacementDecision(proposed: unknown, snapshot: PlacementSnapshot): proposed is PlacementDecision {
@@ -166,7 +170,7 @@ export function isValidPlacementDecision(proposed: unknown, snapshot: PlacementS
   const localGreenExists = candidates.some(item => item.tier === 'local' && item.grade === 'green');
   const uniqueGreenLocals = new Set(candidates.filter(item => item.tier === 'local' && item.grade === 'green').map(item => item.host));
   const canStopIdleCloud = uniqueGreenLocals.size >= 2 &&
-    uniquePlacementHostFacts(snapshot).some(item => cloudOrder.includes(item.host as typeof cloudOrder[number]) && item.ssh && !item.maintenance && !item.gateProtected &&
+    uniquePlacementHostFacts(snapshot).some(item => cloudOrder(snapshot.workKind).includes(item.host) && item.ssh && !item.maintenance && !item.gateProtected &&
       item.cloudRunning === true && (item.cloudIdleMinutes ?? 0) >= 5 && item.load15Pct < 10 && item.tabCount === 0 && item.trainRows === 0 && item.warmPoolPods === 0); // Source: seat-state/OP/BRIEF-LOCAL-FIRST-PLACEMENT-1111.md, two-green-local + five-minute cloud idle stop rule.
   const actionMatchesHostState = host === 'wait'
     ? requestedCloudAction === 'none'

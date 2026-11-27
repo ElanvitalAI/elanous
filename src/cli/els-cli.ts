@@ -18,7 +18,7 @@ import { homedir } from 'node:os';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 import { createLoopFactsSource } from '../els/loop-agents.js';
 import { spawnElanous } from '../instance/spawn-elanous.js';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve as resolvePath } from 'node:path';
 import type { Command } from 'commander';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { createAttachApp, type AttachAppDeps } from '../els/attach-app.js';
@@ -31,17 +31,22 @@ import type { FederatedHost } from '../els/hosts.js';
 import { createLineDecoder } from '../els/wire.js';
 import { guardLeave, realProcess } from '../els/attach-leave.js';
 import { sidebarWidthFor } from '../els/attach-view.js';
+import { watchOverlays } from '../els/overlay-watch-client.js';
+import { elementKeys, elementRenderers } from '../els/elements/index.js';
+import { configPopupStyleSource } from '../els/popup-style.js';
+import { parseStack } from '../els/overlay-stack.js';
 import { buildBadge, changedRowsPaint, createAppFrameWriter, createPaneViewMouse, createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, fitCells, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from '../els/attach-view.js';
 import { attachRemote } from '../els/remote-attach-client.js';
 import { parseTileGrid, TILE_GRIDS } from '../els/tile-view.js';
 import { requestEls } from '../els/client.js';
 import { stateDirSourceForChild } from '../agent/identity-env.js';
-import { AUTO_ACTING_SEAT } from '../els/baton.js';
+import { AUTO_ACTING_FALLBACKS, AUTO_ACTING_SEAT } from '../els/baton.js';
 import { readPipedStdin } from './piped-stdin.js';
 import { grepScreens, type GrepHit, type GrepScreen } from '../els/pane-grep.js';
 import type { ElsResult } from '../els/core.js';
 import { tabBadge } from '../els/tab-badge.js';
-import { updateAllElsTabs, updateResultsTable, updatePreview, updateSummary, updateInstallProgress } from '../els/update-all.js';
+import { proxyAwareSender } from '../proxy/proxy-identity.js';
+import { updateAllElsTabs, updateAllReasonText, updateResultsTable, updatePreview, updateSummary, updateInstallProgress } from '../els/update-all.js';
 import { runRemoteUpdate } from '../els/remote-update.js';
 import { runSeatControl } from './seat-control-cli.js';
 import { detectSeatTui } from '../seat/seat-boot-preamble.js';
@@ -52,7 +57,7 @@ import { requestRemotePtyControl } from '../pty-shell/pty-control-ipc.js';
 import { desiredSha } from '../nexus/host-registry/desired-sha.js';
 import { readInstalledIdentity } from './self-update.js';
 import type { PaneState } from '../els/space.js';
-import { askHitlOnTerminal, controlledDo, controlledInput, journalControl, registerFanoutCommands } from '../els/control-cli.js';
+import { askHitlOnTerminal, controlledDo, controlledInput, journalControl, registerChannelCommands, registerFanoutCommands } from '../els/control-cli.js';
 import { prepareOpUpdate, readStandingApproval, revokeStandingApproval, standingApprovalPath, writeStandingApproval } from '../els/update-all-op-approval.js';
 import { debug } from '../debug/log.js';
 import { mcpHitlAsk } from '../els/mcp-hitl.js';
@@ -218,6 +223,16 @@ export function peekDeps(): PeekDeps {
     },
     readScreen: async (address) => { const read = await fed.read(address); return { ok: read.exitCode === 0, text: read.message }; },
   };
+}
+
+/** FED-OBSERVE: the whole `els ls` answer (panes ⊕ workspaces) for `eln fed snapshot|chatlog` — null when unreadable. */
+export async function federationListing(): Promise<{ panes: Record<string, unknown>[]; workspaces: Record<string, unknown>[] } | null> {
+  try {
+    const answer = await federation().list();
+    if (answer.exitCode !== 0) return null;
+    const parsed = JSON.parse(answer.message) as { panes?: Record<string, unknown>[]; workspaces?: Record<string, unknown>[] };
+    return { panes: parsed.panes ?? [], workspaces: parsed.workspaces ?? [] };
+  } catch { return null; }
 }
 
 export async function federationPanesForPool(): Promise<readonly { seat?: unknown; status?: unknown }[] | null> {
@@ -606,7 +621,7 @@ export function registerElsCommands(program: Command): void {
       // WATCHER-HEARTBEAT — «👁 Watchers — n ok · DEAD …» (fail-soft: no beats → no line).
       let watchers: string | null = null;
       try {
-        const hb = await import('../watch/heartbeat.js');
+        const hb = await import('../kit/heartbeat/index.js');
         const { defaultSourceHead } = await import('./watch-cli.js');
         watchers = hb.watchersBoardLine(hb.judgeWatchers(hb.readBeats(), new Date(), defaultSourceHead()));
       } catch { watchers = null; }
@@ -621,7 +636,8 @@ export function registerElsCommands(program: Command): void {
     .action(async (seat: string, opts: { inPlace?: boolean }) => {
       if (!opts.inPlace) { process.stderr.write('els update-seat: pass --in-place (the pane is never closed)\n'); process.exitCode = 2; return; }
       const result = await runSeatControl(seat.toUpperCase(), 'migrate', {
-        sender: () => detectSeatTui(process.cwd())?.seat ?? null,
+        // CLAUDE-OP-PROXY-IDENTITY — ELANOUS_TRACK=CLAUDE-OP from the verified proxy session acts as OP (audited · noticed).
+        sender: proxyAwareSender('update-seat', seat.toUpperCase(), () => detectSeatTui(process.cwd())?.seat ?? null),
         rows: listPtyManifestRowsStrict,
         send: (id, action, payload, options) => requestRemotePtyControl(id, action, payload, options),
       });
@@ -636,7 +652,9 @@ export function registerElsCommands(program: Command): void {
     .option('--grant-standing [note]', 'one-time policy: after one terminal approval, OP migrations no longer ask once the published build is installed on this host')
     .option('--revoke-standing', 'remove the standing approval; OP migrations ask on the terminal again')
     .action(async (opts: { localOnly?: boolean; json?: boolean; expectedDesired?: string; grantStanding?: string | boolean; revokeStanding?: boolean }) => {
-      const sender = () => detectSeatTui(process.cwd())?.seat ?? null;
+      // CLAUDE-OP-PROXY-IDENTITY — ELANOUS_TRACK=CLAUDE-OP from the verified proxy session acts as OP (audited · noticed).
+      const sender = opts.revokeStanding || opts.grantStanding !== undefined ? () => detectSeatTui(process.cwd())?.seat ?? null
+        : proxyAwareSender('update-all', opts.localOnly ? 'local' : 'all hosts', () => detectSeatTui(process.cwd())?.seat ?? null);
       const standingPath = standingApprovalPath(elanousStateRoot());
       if (opts.revokeStanding) {
         revokeStandingApproval(standingPath);
@@ -731,8 +749,9 @@ export function registerElsCommands(program: Command): void {
           // ELS-BATON-AUTO-ON-RESTART: acting seat first, hand OP → TC, then OP; the server returns it when the new OP registers.
           baton: {
             acting: AUTO_ACTING_SEAT,
-            hand: async (reason, exclude) => {
-              const reply = await requestEls(elsSocketPath(), { op: 'baton', action: 'auto-hand', reason, exclude });
+            fallbacks: AUTO_ACTING_FALLBACKS,
+            hand: async (reason, exclude, acting) => {
+              const reply = await requestEls(elsSocketPath(), { op: 'baton', action: 'auto-hand', reason, exclude, acting });
               return reply.exitCode === 0 ? { ok: true } : { ok: false, reason: reply.message };
             },
             giveBack: async (memo) => (await requestEls(elsSocketPath(), { op: 'baton', action: 'auto-return', handoff: memo })).exitCode === 0
@@ -747,7 +766,7 @@ export function registerElsCommands(program: Command): void {
         });
         if (!opts.json && installStatus) process.stderr.write(`${updateInstallProgress(installStatus, result.requested)}\n`);
         if (opts.json) process.stdout.write(`ELS_UPDATE_ALL_RESULT=${JSON.stringify({ ...result, desired: desiredSha(), installed: readInstalledIdentity().installedCommit })}\n`);
-        else process.stdout.write(`${result.reason ? `els update-all: ${result.reason}\n` : ''}${updateSummary(result.rows)}\n${updateResultsTable(result.rows)}\n`);
+        else process.stdout.write(`${result.reason ? `els update-all: ${updateAllReasonText(result.reason, sender(), process.cwd())}\n` : ''}${updateSummary(result.rows)}\n${updateResultsTable(result.rows)}\n`);
         if (!result.ok) process.exitCode = 1;
       } catch (error) {
         process.exitCode = 1;
@@ -782,11 +801,162 @@ export function registerElsCommands(program: Command): void {
     .argument('[command...]', 'command after -- (default: $SHELL)')
     .action((command: string[] = [], opts: { ws?: string; cwd?: string; title?: string; raw?: boolean; host?: string }) => createPane(opts, command, false));
   registerFanoutCommands(side, { emit, stateRoot: elanousStateRoot, childStateEnv: (root) => ({ ELANOUS_STATE_DIR: root, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(root) }), close: (pane) => federation().close(pane, process.env.ELANOUS_TRACK || process.env.ELANOUS_SEAT || 'unknown') });
+  // ELS-CHANNEL P0: typed messages between tiles (the server stamps the sender from the pane credential).
+  registerChannelCommands(side, { emit });
   // RELEASE-BOARD: `els open release-board [<v>]` opens the board in a new pane of this workspace.
   side.command('open <board> [version]').description('Open a board in a new pane: release-board')
     .action((board: string, version: string | undefined) => {
       if (board !== 'release-board') { emit({ exitCode: 2, message: `els open: unknown board «${board}» — one of: release-board` }); return; }
       return createPane({ title: 'Release Board' }, ['elanous', 'release', 'graph', 'board', ...(version ? [version] : [])], false);
+    });
+  // ELS-ZAXIS: z-axis overlays (floating elements over the els screen) — open obsidian|toast · close · ls.
+  const overlayCmd = side.command('overlay').description('Floating elements over the els screen: open <element> · close <element|id> · ls');
+  overlayCmd.command('ls').description('The overlay stack as JSON').action(() => ask({ op: 'overlay', action: 'list' }));
+  overlayCmd.command('open <element> [text...]').description('Open obsidian (vault viewer), sidechat (quick LLM question popup), memo (note pad), files [dir] (file browser), term (popup terminal) or toast <text> over the screen')
+    .option('--ws <workspace>', 'owner workspace id or name (default: shown in every workspace)')
+    .option('--ttl <ms>', 'lifetime in ms (toast default 5000)')
+    .option('--level <level>', 'toast level: info · success · warning · error')
+    .action((element: string, text: string[], opts: { ws?: string; ttl?: string; level?: string }) => ask({ op: 'overlay', action: 'open', kind: element,
+      ...(opts.ws ? { ws: opts.ws } : {}), ...(opts.ttl ? { ttlMs: Number(opts.ttl) } : {}),
+      props: element === 'toast' ? { text: text.join(' '), ...(opts.level ? { level: opts.level } : {}) }
+        : element === 'files' ? { dir: resolvePath(text[0] ?? process.cwd()) } : {} }));
+  // ELS-POPUP-TERM: `els term [command...]` — a popup terminal over the screen running the person's shell (or this command),
+  // through the normal `new` door (pane in the reserved workspace els-popup), shown as the `term` layer.
+  side.command('term [command...]').description('Popup terminal over the els screen: your shell, or a command (ctrl+b ` toggles · ctrl+b Esc hides · ctrl+b x closes)')
+    .action(async (command: string[]) => {
+      const { POPUP_WS } = await import('../els/elements/term.js');
+      const input = withNewDefaults({ command: command ?? [], ws: POPUP_WS, title: command?.length ? command.join(' ').slice(0, 40) : 'popup' }, process.env, process.cwd());
+      const made = await requestEls(elsSocketPath(), { op: 'new', ...input });
+      if (made.exitCode !== 0) { emit(made); return; }
+      const pane = (JSON.parse(made.message) as { pane?: string }).pane;
+      // A popup that cannot be shown (refused, or the request failed) must not leave an invisible process: close the pane
+      // just made (that one only) and say so.
+      let shown: Awaited<ReturnType<typeof requestEls>>;
+      try { shown = await requestEls(elsSocketPath(), { op: 'overlay', action: 'open', kind: 'term', props: { pane } }); }
+      catch (error) { shown = { exitCode: 1, message: `els term: could not show the popup (${error instanceof Error ? error.message : String(error)})` }; }
+      if (shown.exitCode !== 0 && pane) {
+        const closed = await requestEls(elsSocketPath(), { op: 'close', pane, confirmed: true }).catch((): { exitCode: number; message: string } => ({ exitCode: 1, message: 'unknown' }));
+        shown = { exitCode: shown.exitCode, message: `${shown.message}${closed.exitCode === 0 ? ' — the started pane was closed' : ` — close the pane ${pane} by hand (${closed.message})`}` };
+      }
+      emit(shown);
+    });
+  overlayCmd.command('close <target>').description('Close the top layer of an element kind (obsidian · toast) or a layer id (ov…)')
+    .action((target: string) => ask({ op: 'overlay', action: 'close', ...(/^ov\d+$/.test(target) ? { id: target } : { kind: target }) }));
+  // ELS-POPUP-MOVE/RESIZE: nudge a layer by whole cells in a view of --cols × --rows (default: this terminal).
+  for (const verb of ['move', 'resize'] as const) overlayCmd.command(`${verb} <target> <dx> <dy>`)
+    .description(verb === 'move' ? 'Move a layer (element kind or ov id) by dx dy cells' : 'Grow/shrink a layer (bottom-right corner) by dw dh cells')
+    .option('--cols <n>', 'view width (default: this terminal)').option('--rows <n>', 'view height without the status line (default: this terminal - 1)')
+    .action((target: string, dx: string, dy: string, opts: { cols?: string; rows?: string }) => ask({ op: 'overlay', action: verb, dx: Number(dx), dy: Number(dy),
+      view: { cols: Number(opts.cols ?? (process.stdout.columns || 120)), rows: Number(opts.rows ?? ((process.stdout.rows || 31) - 1)) },
+      ...(/^ov\d+$/.test(target) ? { id: target } : { kind: target }) }));
+  overlayCmd.command('key <id> <keys>').description('Send navigation keys to a layer (test/drive: j k enter back)')
+    .action(async (id: string, keys: string) => {
+      const listed = await requestEls(elsSocketPath(), { op: 'overlay', action: 'list' });
+      const stack = listed.exitCode === 0 ? parseStack(JSON.parse(listed.message)) : undefined;
+      const layer = stack?.layers.find((one) => one.id === id);
+      if (!layer) { emit({ exitCode: 1, message: `els overlay key: no layer ${id}` }); return; }
+      const reducer = elementKeys()[layer.kind];
+      const named: Record<string, string> = { enter: '\r', back: '\u007f', esc: '\u001b', down: 'j', up: 'k', space: ' ' };
+      let current = layer;
+      for (const word of keys.split(/[\s,]+/).filter(Boolean)) {
+        const answer = reducer?.(current, named[word] ?? word);
+        if (!answer || typeof answer !== 'object' || !('update' in answer)) continue;
+        const done = await requestEls(elsSocketPath(), { op: 'overlay', action: 'update', id, props: answer.update });
+        if (done.exitCode !== 0) { emit(done); return; }
+        const next = parseStack(JSON.parse((await requestEls(elsSocketPath(), { op: 'overlay', action: 'list' })).message))?.layers.find((one) => one.id === id);
+        if (next) current = next;
+      }
+      emit({ exitCode: 0, message: JSON.stringify({ id, props: current.props }) });
+    });
+  // ELS-ELEMENT-HOST (대표 11-26): any element (obsidian · sidechat · memo · …) as popup, tile or tab through ONE host.
+  const elementCmd = side.command('element').description('Elements as popup · tile · tab: open <kind> [--as] · frame <kind|id> <frame> · workbench · host');
+  elementCmd.command('open <kind>').description('Open an element (no --as = by terminal width: wide → tile, narrow → popup, very narrow → tab)')
+    .option('--as <frame>', 'popup · tile · tab')
+    .option('--ws <workspace>', 'owner workspace id or name (default: shown in every workspace)')
+    .option('--key <key>', 'instance key (default: one per kind)')
+    .action((kind: string, opts: { as?: string; ws?: string; key?: string }) => {
+      const view = callerView();
+      return ask({ op: 'overlay', action: 'open', kind, props: {}, ...(opts.as ? { frame: opts.as } : {}), ...(!opts.as && view ? { view } : {}),
+        ...(opts.ws ? { ws: opts.ws } : {}), ...(opts.key ? { key: opts.key } : {}) });
+    });
+  elementCmd.command('frame <target> <frame>').description('Switch an open element (kind or ov id) to popup · tile · tab · next — its state is kept')
+    .action((target: string, frame: string) => ask({ op: 'overlay', action: 'frame', frame, ...(/^ov\d+$/.test(target) ? { id: target } : { kind: target }) }));
+  elementCmd.command('workbench').description('Workbench preset: obsidian · files · terminal · sidechat as a 2x2 tile grid on the right (eln stays on the left)')
+    .option('--ws <workspace>', 'owner workspace id or name')
+    .action((opts: { ws?: string }) => ask({ op: 'overlay', action: 'workbench', ...(opts.ws ? { ws: opts.ws } : {}) }));
+  elementCmd.command('close <target>').description('Close an element (kind or ov id), whatever its frame')
+    .action((target: string) => ask({ op: 'overlay', action: 'close', ...(/^ov\d+$/.test(target) ? { id: target } : { kind: target }) }));
+  elementCmd.command('host <kind> [key]').description('(internal) draw an element in the tab frame full-pane — the server runs this in a host tab')
+    .action(async (kind: string, key: string | undefined) => {
+      const { createElementHost, ENTER_HOST, LEAVE_HOST } = await import('../els/element-host.js');
+      const socket = elsSocketPath();
+      let acts: Promise<unknown> = Promise.resolve();
+      const style = configPopupStyleSource();                     // ELS-POPUP-STYLE: the tab host is dressed like the popup
+      const host = createElementHost({ kind, key: key ?? 'default', style: style.get, write: (text) => { process.stdout.write(text); },
+        size: () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 }),
+        act: (act) => { acts = acts.then(() => requestEls(socket, { op: 'overlay', ...act })).catch(() => undefined); } });
+      const decode = createKeyDecoder();
+      process.stdout.write(ENTER_HOST);
+      await new Promise<void>((resolve) => {
+        const stop = (): void => { watch.close(); process.stdout.off('resize', onResize); resolve(); };
+        const onResize = (): void => { process.stdout.write('\u001b[2J'); host.paint(); };
+        const watch = watchOverlays(socket, (stack) => { if (host.stack(stack)) stop(); });
+        process.stdout.on('resize', onResize);
+        if (process.stdin.isTTY) { process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on('data', (chunk: Buffer) => host.key(decode(chunk))); }
+      });
+      await acts;
+      try { process.stdin.setRawMode(false); } catch { /* not a TTY */ }
+      process.stdout.write(LEAVE_HOST);
+      process.exit(0);
+    });
+  // ELS-ZAXIS fallback: the read-only Obsidian viewer in this pane (vault = config obsidian.vault) — the widget «obsidian» runs it.
+  side.command('obsidian').description('Read-only Obsidian viewer in this pane: note list + markdown (vault = config obsidian.vault) · j/k Enter ⌫ · n new note · q quit')
+    .option('--file <md>', 'show one markdown file read-only instead of the vault (a sidechat answer taken out to a tab)')
+    .action(async (opts: { file?: string }) => {
+      const { createObsidianTab, ENTER_TAB, LEAVE_TAB } = await import('../els/obsidian-tab.js');
+      const { getUserConfig } = await import('../user-config.js');
+      const vault = (): string | undefined => { try { return getUserConfig().obsidian?.vault; } catch { return undefined; } };
+      const { requestElnAttach, attachToast } = await import('../els/eln-attach.js');
+      const attach = async (rel: string): Promise<string> => attachToast(await requestElnAttach((r) => requestEls(elsSocketPath(), r as ElsRequest), { path: rel, source: 'obsidian' })).text;
+      const tab = createObsidianTab({ vault, attach, backupDir: () => join(dirname(elsJournalPath()), 'obsidian-backup'), ...(opts.file ? { file: opts.file } : {}), write: (text) => { process.stdout.write(text); }, size: () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 }) });
+      const decode = createKeyDecoder();
+      process.stdout.write(ENTER_TAB);
+      tab.paint();
+      if (!process.stdin.isTTY) { process.stdout.write(LEAVE_TAB); return; }
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+      await new Promise<void>((resolve) => {
+        const onResize = (): void => { process.stdout.write(`${'\u001b'}[2J`); tab.paint(); };
+        process.stdout.on('resize', onResize);
+        process.stdin.on('data', (chunk: Buffer) => { if (tab.key(decode(chunk))) { process.stdout.off('resize', onResize); resolve(); } });
+      });
+      try { process.stdin.setRawMode(false); } catch { /* not a TTY any more */ }
+      process.stdout.write(LEAVE_TAB);
+      process.exit(0);
+    });
+  // ELS-FILES: the read-only file browser in this pane (popup twin: ctrl+b f) — the widget «files» runs it.
+  side.command('files [dir]').description('Read-only file browser in this pane: list + preview · j/k Enter ⌫ . / · Enter = $PAGER · q quit')
+    .action(async (dir: string | undefined) => {
+      const { createFilesTab, ENTER_FILES_TAB, LEAVE_FILES_TAB } = await import('../els/files-tab.js');
+      const { resolve } = await import('node:path');
+      const { spawnSync } = await import('node:child_process');
+      const tab = createFilesTab({ dir: resolve(dir ?? process.cwd()), env: process.env, write: (text) => { process.stdout.write(text); },
+        size: () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 }),
+        run: (argv) => { try { process.stdin.setRawMode(false); } catch { /* not a TTY */ } spawnSync(argv[0]!, argv.slice(1), { stdio: 'inherit' }); try { process.stdin.setRawMode(true); } catch { /* not a TTY */ } } });
+      const decode = createKeyDecoder();
+      process.stdout.write(ENTER_FILES_TAB);
+      tab.paint();
+      if (!process.stdin.isTTY) { process.stdout.write(LEAVE_FILES_TAB); return; }
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+      await new Promise<void>((done) => {
+        const onResize = (): void => { process.stdout.write('\u001b[2J'); tab.paint(); };
+        process.stdout.on('resize', onResize);
+        process.stdin.on('data', (chunk: Buffer) => { if (tab.key(decode(chunk))) { process.stdout.off('resize', onResize); done(); } });
+      });
+      try { process.stdin.setRawMode(false); } catch { /* not a TTY any more */ }
+      process.stdout.write(LEAVE_FILES_TAB);
+      process.exit(0);
     });
   // BURST-BOARD-GENERAL: `els widget add <name> [--ws W]` — a read-only board as a tab «▦ <name>» (journaled: back after restart).
   const widget = side.command('widget').description('Read-only board widgets as tabs: add <name> [--ws W] · ls');
@@ -1189,6 +1359,17 @@ export function viewerTerminal(): { cols: number; rows: number } | undefined {
     return process.stdin.isTTY && Number.isInteger(cols) && Number.isInteger(rows) && cols > 0 && rows > 0 ? { cols, rows } : undefined;
   } catch { return undefined; }
 }
+/** ELS-ELEMENT-HOST size rule input: this caller's terminal. Inside an els pane stdout is the pane area, so the side list
+ *  and separator are added back (the terminal width whose pane area is this width). */
+export function callerView(): { cols: number; rows: number } | undefined {
+  const own = viewerTerminal();
+  if (!own || !process.env.ELANOUS_ELS_PANE) return own;
+  for (let cols = own.cols; cols <= own.cols + 80; cols++) {
+    const left = sidebarWidthFor(cols, true);
+    if (cols - (left ? left + 1 : 0) >= own.cols) return { cols, rows: own.rows + 2 };
+  }
+  return own;
+}
 export function viewerPaneArea(terminal: { cols: number; rows: number }, sidebarOpen = true): { cols: number; rows: number } {
   const left = sidebarWidthFor(terminal.cols, sidebarOpen);
   return { cols: Math.max(10, terminal.cols - (left ? left + 1 : 0)), rows: Math.max(3, terminal.rows - 2) };
@@ -1220,6 +1401,8 @@ export function orchestrationStageWatch(workspaces: readonly string[]): { key: s
 function runAppView(sidebar: boolean | undefined, initialPane?: string, tile?: AttachAppDeps['tile']): Promise<number> {
   const decodeKeys = createKeyDecoder();
   const hosts = federation();                                    // the other hosts' panes (registered els hosts + herdr), read-only
+  let overlayActs: Promise<void> = Promise.resolve();            // ELS-ZAXIS: overlay acts, serialized
+  const popupStyle = configPopupStyleSource();                   // ELS-POPUP-STYLE: config els.popupStyle, live (next poll repaint)
   const app = createAttachApp({
     // SIDETAB-LOOP-AGENTS-UNDER-SPACE: the side list's heartbeat rows read the trigger registry (cached ≥10 s, read-only).
     loopFacts: createLoopFactsSource(`${effectiveInstanceRoot()}/graph-trigger-registry.db`),
@@ -1229,6 +1412,20 @@ function runAppView(sidebar: boolean | undefined, initialPane?: string, tile?: A
       resize: (address, cols, rows) => hosts.resize(address, cols, rows, process.env.ELANOUS_TRACK || process.env.ELANOUS_SEAT || 'unknown') },
     request: (request) => requestEls(elsSocketPath(), request),
     attach: (pane, size, handlers) => attachEls(elsSocketPath(), pane, size, handlers),
+    // ELS-ZAXIS: the server's overlay stack by push; clicks/Esc/keys go back as overlay acts; elements render here.
+    overlays: {
+      watch: (onStack) => watchOverlays(elsSocketPath(), onStack),
+      // Acts go out ONE at a time, in key order: separate connections could land out of order («jjj» ending on row 2).
+      act: (act) => {
+        const sent = overlayActs.then(() => requestEls(elsSocketPath(), { op: 'overlay', action: act.action, id: act.id, ...(act.props !== undefined ? { props: act.props } : {}), ...(act.frame ? { frame: act.frame } : {}),
+          ...(act.dx !== undefined ? { dx: act.dx } : {}), ...(act.dy !== undefined ? { dy: act.dy } : {}), ...(act.view ? { view: act.view } : {}) }));
+        overlayActs = sent.then(() => undefined, () => undefined);
+        return sent.catch(() => undefined);                       // ELS-ELEMENT-HOST-FU ①: the frame answer names the new tab
+      },
+      renderers: elementRenderers(popupStyle.get),
+      keys: elementKeys(),
+      paintKey: popupStyle.get,
+    },
     // ELS-FIRST-RUN-FU3 ② · ELS-APP-RENDER-SINGLE-FRAME: an unchanged screen writes nothing; otherwise only the changed
     // rows, as one write inside a DEC 2026 synchronized update.
     write: createAppFrameWriter((text) => { process.stdout.write(text); }),

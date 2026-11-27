@@ -444,15 +444,29 @@ function recoverDependencyStoreLock(
   }
 }
 
+/**
+ * Where a dependency tree lives inside the shared store. The last segment must stay `node_modules`: Bun/Node resolve a
+ * package by walking up from its REAL path looking for directories named `node_modules`, so a flat
+ * `apps__pwa__node_modules` store dir hid every sibling package (11-27 TA: `next build` → «Cannot find module
+ * 'styled-jsx/package.json'» on every harness main-sync PWA build). `apps/pwa/node_modules` → `apps__pwa/node_modules`.
+ */
+export function sharedDependencyStoreEntry(relativePath: string): string {
+  const parts = relativePath.split('/').filter(Boolean);
+  const last = parts.pop() ?? relativePath;
+  return parts.length ? join(parts.join('__'), last) : last;
+}
+
 function isManagedDependencyLink(target: string, repoRoot: string, relativePath: string, storeRoot: string): boolean {
   try {
     if (!lstatSync(target).isSymbolicLink()) return false;
     const link = readlinkSync(target);
     const resolved = resolve(dirname(target), link);
     const direct = resolve(repoRoot, relativePath);
-    if (resolved === direct || resolved === resolve(storeRoot, worktreeDependencyRepoScope(repoRoot), createHash('sha256').update(readFileSync(dependencyLockfile(repoRoot, relativePath))).digest('hex'), relativePath.replaceAll('/', '__'))) return true;
+    if (resolved === direct || resolved === resolve(storeRoot, worktreeDependencyRepoScope(repoRoot), createHash('sha256').update(readFileSync(dependencyLockfile(repoRoot, relativePath))).digest('hex'), sharedDependencyStoreEntry(relativePath))) return true;
     const scopePrefix = `${resolve(storeRoot, worktreeDependencyRepoScope(repoRoot))}${sep}`;
-    return resolved.startsWith(scopePrefix) && basename(resolved) === relativePath.replaceAll('/', '__');
+    // the legacy flat name (apps__pwa__node_modules) is still ours — it is detached and replaced, never preserved
+    return resolved.startsWith(scopePrefix)
+      && (resolved.endsWith(`${sep}${sharedDependencyStoreEntry(relativePath)}`) || basename(resolved) === relativePath.replaceAll('/', '__'));
   } catch { return false; }
 }
 
@@ -476,6 +490,8 @@ function withWorktreeDependencyStoreLock<T>(
 ): T {
   const lockPath = `${storePath}.lock`;
   const recoveryPath = `${lockPath}.recovery`;
+  // a nested store entry (apps__pwa/node_modules) needs its parent before the lock dir can be created
+  mkdirSync(dirname(storePath), { recursive: true });
   const deadline = Date.now() + (testHooks.lockWaitMs ?? WORKTREE_DEPENDENCY_LOCK_WAIT_MS);
   const token = randomUUID();
   for (;;) {
@@ -705,7 +721,7 @@ export function linkWorktreeDependencies(
       if (!result.skippedUnshareableSource.includes(relativePath)) result.skippedLockMismatch.push(relativePath);
       continue;
     }
-    const source = sharedStore ? join(sharedStore, relativePath.replaceAll('/', '__')) : directSource;
+    const source = sharedStore ? join(sharedStore, sharedDependencyStoreEntry(relativePath)) : directSource;
     if (sharedStoreError) {
       try { if (!detachManaged()) result.failed.push({ path: relativePath, reason: 'existing dependency symlink is not managed; preserving it' }); }
       catch (error) { result.failed.push({ path: relativePath, reason: String(error) }); }
@@ -819,7 +835,7 @@ export function prepareWorktreeDependencies(repoRoot: string, worktreePath: stri
           const sourceLock = readFileSync(dependencyLockfile(repoRoot, relativePath));
           const targetLock = readFileSync(dependencyLockfile(worktreePath, relativePath));
           linkedToCurrentStore = isManagedDependencyLink(target, repoRoot, relativePath, storeRoot)
-            && linkedTo === resolve(storeRoot, worktreeDependencyRepoScope(repoRoot), createHash('sha256').update(targetLock).digest('hex'), relativePath.replaceAll('/', '__'))
+            && linkedTo === resolve(storeRoot, worktreeDependencyRepoScope(repoRoot), createHash('sha256').update(targetLock).digest('hex'), sharedDependencyStoreEntry(relativePath))
             && sourceLock.equals(targetLock);
         } catch { /* missing lockfiles make an old store link stale */ }
         const linkedToCurrentDirect = linkedTo === resolve(source) && locksMatch;
@@ -1022,6 +1038,24 @@ function gitHasCommit(git: (...args: string[]) => ReturnType<GitRunner>, sha: st
   return git('cat-file', '-e', `${sha}^{commit}`).status === 0;
 }
 
+/** Force the fetched (or already-local) tip onto the remote-tracking ref.
+ *  Local `refs/heads/*` stays untouched — a diverged clone keeps its own main.
+ *  `--no-deref` is required: a symbolic `refs/remotes/origin/<branch>` that
+ *  points at `refs/heads/<branch>` would otherwise rewrite the local branch.
+ *  Failure is not success: the caller must not check out a tip that comparison
+ *  code (`defaultBranchRef`) cannot see. */
+function recordRemoteTrackingRef(
+  git: (...args: string[]) => ReturnType<GitRunner>,
+  remoteBranch: string,
+  sha: string,
+): void {
+  const ref = `refs/remotes/origin/${remoteBranch}`;
+  const updated = git('update-ref', '--no-deref', ref, sha);
+  if (updated.status !== 0) {
+    throw new Error(`git worktree base sync failed — could not record ${ref} at ${sha}: status=${updated.status}, signal=${updated.signal ?? 'none'}, stdout=${JSON.stringify((updated.stdout || '').trim().slice(0, 200))}, stderr=${JSON.stringify((updated.stderr || '').trim().slice(0, 200))}`);
+  }
+}
+
 export function resolveDefaultBranchBase(repoRoot: string): string | null {
   const run = (...args: string[]) => spawnSync('git', args, { cwd: repoRoot, encoding: 'utf8', timeout: GIT_TIMEOUT_MS });
   const exists = (candidate: string): boolean => run('rev-parse', '--verify', '--quiet', `${candidate}^{commit}`).status === 0;
@@ -1129,6 +1163,7 @@ export function syncBaseWithRemote(
         } else if (gitHasCommit(git, advertisedSha)) {
           const recent = recentBaseFetch(paths.marker, remoteBranch, advertisedSha, Date.now());
           logFetchSkip(recent.recent ? 'coalesced' : 'sha-present', recent.ageMs);
+          recordRemoteTrackingRef(git, remoteBranch, advertisedSha);
           return { checkout: advertisedSha, freshness: 'remote-synced' };
         }
         // Serialize cache misses across linked worktrees/processes, then recheck after the lock.
@@ -1141,6 +1176,7 @@ export function syncBaseWithRemote(
           } else if (markerPath && gitHasCommit(git, advertisedSha)) {
               const recent = recentBaseFetch(paths.marker, remoteBranch, advertisedSha, Date.now());
               logFetchSkip(recent.recent ? 'coalesced' : 'sha-present', recent.ageMs);
+              recordRemoteTrackingRef(git, remoteBranch, advertisedSha);
               releaseFetchLock();
               releaseFetchLock = null;
               return { checkout: advertisedSha, freshness: 'remote-synced' };
@@ -1192,6 +1228,9 @@ export function syncBaseWithRemote(
       throw new Error(`git worktree base sync failed — fetched origin/${base} but FETCH_HEAD is unreadable`);
     }
     const remoteSha = fetchedTip.stdout.trim();
+    // FETCH_HEAD alone is invisible to defaultBranchRef (origin/HEAD → origin/<branch> → local).
+    // A bare clone has no refs/remotes/origin/*, so comparison would fall through to a stale local branch.
+    recordRemoteTrackingRef(git, remoteBranch, remoteSha);
     if (markerPath && releaseFetchLock && remoteSha === advertisedSha) {
       try { writeBaseFetchMarker(markerPath, { branch: remoteBranch, sha: remoteSha, fetchedAt: Date.now() }); }
       catch { debug.log('git-fs.worktree', 'base.fetch-marker-write-failed', { base, sha: remoteSha }, { level: 'warn' }); }

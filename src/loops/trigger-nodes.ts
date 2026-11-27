@@ -5,13 +5,16 @@
  *   wake        — post one wake request to a seat. Stage `shadow` (or a manual run without a trigger window)
  *                 writes a shadow receipt instead and posts nothing, so shadow runs alongside the legacy path
  *                 without a duplicate effect.
- *   retro-draft — the measured half of a seat retro, done by the graph itself (11-25 OP retro loss: three wake paths
+ *   retro-draft — (input `every: hour` = once per clock hour, the op-pulse node) the measured half of a seat retro, done by the graph itself (11-25 OP retro loss: three wake paths
  *                 — watchdog self-mail, CLAUDE-OP mail, this graph's old `wake` — all relied on OP choosing to write the
  *                 file, and the wake path folded or capped them away). Runs the declared measure commands, appends one
  *                 draft section (once per window) to the retro file, then — live only — appends ONE `retro-turn` entry
  *                 the seat's TUI opens as an internal turn (origin retro · not a wake, so no cap/fold) asking only for
  *                 «원인 가설 1줄 + 다음 손잡이 1줄» under the draft. Shadow writes the draft and a receipt of the turn.
- *   watchers-check — judge every watcher heartbeat (src/watch/heartbeat.ts); stage `live` posts one deduped card to
+ *   bulletin-write — the federal bulletin's facts written by the graph (bulletin-write.ts · BULLETIN-NOW-STALE 11-26):
+ *                 BULLETIN-NOW.md rewritten (old one → BULLETIN-LOG) · kind-bulletin mail to every coordinator · ONE
+ *                 internal OP turn (retro-turn ledger) for the two judgement lines.
+ *   watchers-check — judge every watcher heartbeat (src/kit/heartbeat/index.ts); stage `live` posts one deduped card to
  *                 CLAUDE-OP, other stages judge only.
  *   idle-probe  — decide idle/busy for a seat from the newest mtime of its activity files and append one
  *                 triage ledger line for the window (the idle-triage goal predicate reads that line).
@@ -23,12 +26,16 @@
  *
  * Each prints one JSON line `{ outcome, ... }` the runner routes on.
  */
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { spawnElanousSync } from '../instance/spawn-elanous.js';
 import { appendDiverted, type DivertedEntry } from '../msg/diverted-mail.js';
 import { expandTemplate, type TriggerRunInput } from './trigger-registry.js';
+import { fedStatePath, readFacts } from '../fed-state/ledger.js';
+import { classifyTurns, turnOutcomeLines } from './op-turn-outcome.js';
+import { enforcePaths, enforceRetroLines } from './op-turn-enforce.js';
 
 interface NodeContext { graphId?: string; runId?: string; input?: Partial<TriggerRunInput>; nodeInput?: Record<string, unknown> }
 
@@ -46,7 +53,7 @@ function str(value: unknown, name: string): string {
 }
 
 function vars(input: Partial<TriggerRunInput>): TriggerRunInput['vars'] {
-  const stateRoot = input.vars?.stateRoot ?? process.env.ELANOUS_STATE_DIR ?? process.cwd();
+  const stateRoot = input.vars?.stateRoot ?? process.env.ELANOUS_STATE_DIR ?? effectiveInstanceRoot(); // never process.cwd() (#40570 class)
   return { stateRoot, seatState: input.vars?.seatState ?? join(process.env.HOME ?? '', 'elanous-hq', 'seat-state') };
 }
 
@@ -104,6 +111,27 @@ export function retroTurnPrompt(file: string, marker: string): string {
   ].join('\n');
 }
 
+/**
+ * OP-NEXT-BEST-ACTION 3/3 — turn-end outcome lines for the retro draft (node input `turn_outcome: true`): the last hour of
+ * the seat's turns from the fed-state ledger under the run's state root; request-only turns are flagged. Fail-open.
+ */
+export function retroTurnOutcome(seat: string, stateRoot: string, now: Date): string[] {
+  try {
+    const since = new Date(now.getTime() - 3_600_000);
+    const { facts } = readFacts({ since, until: now, path: fedStatePath(stateRoot) });
+    return [...turnOutcomeLines(classifyTurns(facts, { seat, since, until: now })), ...enforceRetroLines(enforcePaths(stateRoot).ledger, since, now)];
+  } catch (error) {
+    return [`- 턴 결과: (측정 실패 · ${(error instanceof Error ? error.message : String(error)).slice(0, 120)})`];
+  }
+}
+
+/** The local clock hour a retro belongs to, «2026-11-26T19» (the retro file is per local date). */
+export function retroHourKey(now: Date, timeZone?: string): string {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23', ...(timeZone ? { timeZone } : {}) })
+    .formatToParts(now).map((p) => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}`;
+}
+
 export function retroDraft(ctx: NodeContext, deps: { run?: RunMeasure; now?: () => Date; enqueueTurn?: (entry: DivertedEntry) => void } = {}): Record<string, unknown> {
   const input = ctx.input ?? {};
   const node = ctx.nodeInput ?? {};
@@ -113,9 +141,12 @@ export function retroDraft(ctx: NodeContext, deps: { run?: RunMeasure; now?: () 
   const window = input.window ?? now.toISOString();
   const file = expandTemplate(str(node.file, 'file'), v, window);
   const run = deps.run ?? defaultRun;
-  const marker = `op-retro window=${window}`;
+  // `every: hour` (op-pulse absorbed op-retro · LOOP-AUDIT-APPLY 11-26): the pulse fires every 15–90 min, the retro stays
+  // once per clock hour — the first pulse of the hour drafts it, later ones in that hour skip.
+  const hourly = node.every === 'hour';
+  const marker = hourly ? `op-retro hour=${retroHourKey(now)}` : `op-retro window=${window}`;
   if (existsSync(file) && readFileSync(file, 'utf8').includes(`<!-- ${marker} -->`)) {
-    return { outcome: 'ok', drafted: false, file, why: 'draft for this window already in the file' };
+    return { outcome: 'ok', drafted: false, file, why: hourly ? 'draft for this hour already in the file' : 'draft for this window already in the file' };
   }
   const lines: string[] = [];
   for (const m of measures(node.measures)) {
@@ -126,6 +157,7 @@ export function retroDraft(ctx: NodeContext, deps: { run?: RunMeasure; now?: () 
     if (out.status === 0 && text.length) lines.push(`- ${m.label}: ${text[0]}`, ...text.slice(1).map((l) => `  ${l}`));
     else lines.push(`- ${m.label}: (측정 실패 · exit ${out.status ?? 'none'} · ${out.stderr.trim().split('\n')[0]?.slice(0, 160) ?? ''})`);
   }
+  if (node.turn_outcome === true) lines.push(...retroTurnOutcome(seat, v.stateRoot, now));
   const clock = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false }).format(now);
   const section = [
     '', `## ${clock} 매시 회고 초안 (graph ${ctx.graphId ?? '?'} · ${input.stage ?? 'manual'})`, `<!-- ${marker} -->`,
@@ -176,7 +208,7 @@ function rhythmPathOf(node: Record<string, unknown>): string {
 export async function pulseMeasure(ctx: NodeContext, probes?: import('./op-pulse-run.js').PulseProbes): Promise<Record<string, unknown>> {
   const input = ctx.input ?? {}; const v = vars(input);
   const { runPulse } = await import('./op-pulse-run.js');
-  const p = probes ?? (await import('./op-pulse-live.js')).livePulseProbes();
+  const p = probes ?? (await import('./op-pulse-live.js')).livePulseProbesWithPlanner({ stateRoot: v.stateRoot, seatState: v.seatState });
   const result = await runPulse(p, { rhythmPath: rhythmPathOf(ctx.nodeInput ?? {}), seatState: v.seatState, stateRoot: v.stateRoot, window: input.window ?? 'manual', stage: input.stage ?? 'manual' });
   if (result.brief) {
     const dir = join(v.stateRoot, 'loops', 'op-pulse-briefs'); mkdirSync(dir, { recursive: true });
@@ -188,6 +220,8 @@ export async function pulseMeasure(ctx: NodeContext, probes?: import('./op-pulse
     try {
       const w = await import('../op-world/op-world.js');
       const now = new Date(); const path = w.worldNowPath(v.seatState, 'OP');
+      // OP-WORLD-LENS — refresh the world card cache first so WORLD-NOW.md and the next OP turn read this pulse's numbers.
+      try { await (await import('../op-world/world-lens.js')).freshLensLines('OP', now); } catch { /* card stays cached */ }
       w.writeWorldNow(path, w.renderWorldBlock(w.collectWorldFacts({ now, seat: 'OP' }), now), now); world = path;
     } catch { world = null; }
   }
@@ -221,6 +255,7 @@ if (import.meta.main) {
     else if (command === 'pulse-measure') emit(await pulseMeasure(ctx));
     else if (command === 'pulse-turn') emit(await pulseTurn(ctx));
     else if (command === 'retro-draft') emit(retroDraft(ctx));
+    else if (command === 'bulletin-write') emit(await (await import('./bulletin-write.js')).bulletinWrite(ctx));
     else if (command === 'watchers-check') emit(await watchersCheck(ctx));
     else { emit({ outcome: 'error', error: `unknown trigger node: ${command}` }); process.exitCode = 2; }
   } catch (error) {

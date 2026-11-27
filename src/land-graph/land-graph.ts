@@ -6,6 +6,13 @@
  *   ① same-head pregate receipt (RES/evidence/PREGATE-GREEN/<PR>-<head12>-<host>/) whose focused raw says 0 fail
  *   ② ratchet · tsc · isolation preflight on the merge result (op-direct-land-v2.sh — the SAME command, not a copy)
  *   ③ Terra findings: only the security-4 classes bind (real bugs fixed by the author, edges → FU)
+ *
+ * JUD-RELAX (CEO 11-21…11-26 · 0.3.38 P0) — the land rule, exactly:
+ *   land ⇔ same-head receipt ∧ (focused 0 fail ∨ baseline-name-diff introduced 0 ∨ L0 doc-only)
+ *          ∧ no JUD veto (hold) ∧ (path ∉ security-4 ∨ Terra PASS/WARN on this head with no security finding)
+ *   - focused 0 fail is also proven by the receipt's own focused step exit 0 when the host swept the raw (bun exits 0 ⇔ 0 fail).
+ *   - no per-PR JUD «functional judgement» wait and no hot-file JUD review: JUD keeps the veto only (holds · JUD HOLD verdicts).
+ *   - pregate's generic «security REVIEW_REQUIRED» is a warning; only the security-4 paths need a Terra review.
  *   ④ land (--match-head-commit) + post-notice to OP + COACH-ACTIONS ledger row
  * Every refusal is a typed class with one card to the PR author carrying the exact fix.
  *
@@ -19,14 +26,27 @@
  */
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { security4Hits } from '../judge-butler/done-when.js';
+import { isDocOnly, noFocusedStage as noFocusedStageOf, preexistingOnly as preexistingOnlyOf } from './receipt-rules.js';
 import { evaluateLandVetoes, landRefusalRecipient, type VetoKind, type VetoMark } from '../org/land-authority.js';
 import type { OrgDeps } from '../org/org-map.js';
+import type { CellMatch } from './cell-link.js';
+import { finishKindFor, readBook, runFinisher, settle, stalePrs, writeBook, type FinishDeps, type FinishKind, type FinishOutcome } from './finisher.js';
+import { guardErrorClass, legacyGuardError, nextAction, redVerdict, TSC_LAND_RETRIES, tscUnmeasured, type NextAction } from './red-receipt.js';
 
 export type Mode = 'shadow' | 'live';
 
 export interface PrInfo {
   number: number; head: string; base: string; draft: boolean; state: 'OPEN' | 'CLOSED' | 'MERGED';
   title: string; author: string; files: string[];
+  /** Head branch name (same-repo PRs) — the finisher merges fresh main into it. */
+  headRef?: string;
+  /** true = head lives in a fork; the finisher never pushes there. */
+  crossRepo?: boolean;
+  /** ISO creation time — STALE-PR-24H. */
+  createdAt?: string;
+  /** PR body — LAND-CELL-LINK reads its «칸: ID» line. */
+  body?: string;
 }
 export interface Receipt {
   dir: string; head: string; host: string; focused: string[]; rawDir: string;
@@ -34,7 +54,21 @@ export interface Receipt {
   focusedExit?: number | null;
   /** rawSha256['focused.raw'] of the receipt — a local raw copy counts only when its SHA matches. */
   focusedSha?: string;
+  /** pregate grade (L0 · L1 · L1d · L2 · L3); L0 = comment-or-doc-only, which runs no focused stage. */
+  grade?: string;
+  /** pregate A244 ③ focused-vs-main on the same host: failures of the head that also fail on main (newFailures = head-only names). */
+  focusedBaseline?: { mine: number; onMain: number; newFailures: string[] };
+  /** PATCHID-1127: patch-id of the PR-own change (diff merge-base(main, head)..head) the receipt was taken on. */
+  patchId?: string;
+  /** Set when this receipt was taken on an older head with the same patch-id (only main was merged since). */
+  reusedFrom?: string;
+  /** LAND-STEWARD RED-RECEIPT: the receipt came from PREGATE-RED — its failed steps (src/land-graph/red-receipt.ts). */
+  red?: { failed: Array<{ name: string; exit: number }>; failure?: string };
 }
+/** A baseline failure-name diff receipt (land-name-diff-check.py format) for this head: every head failure also fails on main. */
+export interface BaselineDiff { receipt: string; command: string; headPass: number; headFail: number }
+/** The Terra review of this exact head (review-results/pr-<PR>-<head12>.json). */
+export interface TerraReview { verdict: string; securityFindings: string[] }
 /** Parsed bun summary of the focused raw · or `swept`: the raw is gone (pregate rawDir is a host temp dir) and only the receipt's step exit is left. */
 export type Focused = { pass: number; fail: number } | { swept: true; exit: number } | 'unreadable';
 export const focusedCounts = (f: Focused | null): { pass: number; fail: number } | null => (f && typeof f === 'object' && 'pass' in f ? f : null);
@@ -42,18 +76,23 @@ export const focusedCounts = (f: Focused | null): { pass: number; fail: number }
 export type RefusalClass =
   | 'no-receipt' | 'stale-head' | 'focused-unreadable' | 'baseline-failing-focused' | 'no-focused-stage'
   | 'isolation-gate' | 'test-interference' | 'tsc' | 'merge-conflict' | 'base-not-main' | 'review-disposition'
-  | 'security-finding' | 'review-required' | 'held' | 'stale-base-revert' | 'head-moved' | 'main-moved-overlap' | 'gh-error' | 'land-error';
+  | 'security-finding' | 'review-required' | 'held' | 'stale-base-revert' | 'head-moved' | 'main-moved-overlap' | 'gh-error' | 'land-error'
+  | 'needs-finisher' | 'tsc-timeout' | 'pregate-red';
 
 export type Action = 'land' | 'refuse' | 'wait' | 'hold' | 'skip';
 export interface Decision { action: Action; cls?: RefusalClass; why: string; lane?: 'L0-doc-only' | 'normal'; card?: Card }
 export interface Card { to: string[]; body: string }
 
-/** Files whose change needs a JUD review before autonomy lands it (L3 hot files). */
-export const HOT_FILES = ['src/index.ts', 'src/entry.ts', 'bin/elanous.mjs', 'package.json'];
 /** Terra finding categories that bind (memory rule 11-25: only security-4 bind; other findings → FU). */
 export const SECURITY4 = ['secret', 'auth', 'injection', 'sandbox'];
 
-export const isDocOnly = (files: string[]) => files.length > 0 && files.every(f => /\.md$/i.test(f) || f.startsWith('docs/'));
+/** Security-4 paths: ONE shared table with the judge-butler's green function (GREEN-DEFINITION-ONE · src/judge-butler/done-when.ts) —
+ *  executable code only (tests · fixtures · docs never count) and the land path's authority boundary only. */
+export { SECURITY4_PATHS, security4Hits } from '../judge-butler/done-when.js';
+/** Terra review verdicts that clear a security-4 path (with no security finding). */
+const TERRA_CLEAR = ['pass', 'warn'];
+
+export { isDocOnly } from './receipt-rules.js'; // one definition with the judge-butler (BUTLER-SIGN-MERGED-PATCHID)
 
 /** The exact fix each refusal class asks of the author (or the owner seat). */
 export function fixFor(cls: RefusalClass, pr: PrInfo, extra = ''): { to: 'author' | 'JUD' | 'RES' | 'OP'; fix: string } {
@@ -71,13 +110,16 @@ export function fixFor(cls: RefusalClass, pr: PrInfo, extra = ''): { to: 'author
     case 'base-not-main': return { to: 'author', fix: `base is ${extra} (stacked PR) — land the base PR first or retarget to main` };
     case 'review-disposition': return { to: 'author', fix: 'Terra same-head findings lack dispositions — answer each finding (fixed-in-this-head / out-of-scope-followup …) in the waiver' };
     case 'security-finding': return { to: 'author', fix: `Terra security-4 finding(s) open: ${extra} — fix them (these bind); other findings stay FU` };
-    case 'review-required': return { to: 'JUD', fix: `L3 hot file changed (${extra}) — JUD review verdict needed before autonomy lands it` };
+    case 'review-required': return { to: 'author', fix: `security-4 path changed (${extra}) — needs a Terra PASS/WARN with no security finding on this head: \`elanous self review ${pr.number} --model gpt-6.1-terra\`` };
     case 'held': return { to: 'OP', fix: `held: ${extra} — \`eln land unhold ${pr.number}\` when cleared` };
     case 'stale-base-revert': return { to: 'author', fix: `the merge result wipes out recent main commits (${extra}) — \`git fetch && git merge origin/main\`, keep their lines, push, re-run pregate` };
     case 'head-moved': return { to: 'author', fix: 'head moved during the land — the graph re-evaluates the new head after its pregate receipt' };
     case 'main-moved-overlap': return { to: 'OP', fix: 'another PR touching the same files landed this tick — re-preflight on the new main next tick' };
     case 'gh-error': return { to: 'OP', fix: `GitHub API error (${extra}) — retried next tick` };
     case 'land-error': return { to: 'OP', fix: `land command failed (${extra}) — read the land log` };
+    case 'tsc-timeout': return { to: 'RES', fix: `tsc did not finish (timeout / unmeasured${extra ? ` · ${extra}` : ''}) — the land graph re-ran it on another host and it still did not finish; free a host or raise LAND_TSC_TIMEOUT` };
+    case 'pregate-red': return { to: 'author', fix: `pregate RED at ${extra} — fix it, push, the graph re-pregates the new head` };
+    case 'needs-finisher': return { to: 'author', fix: `the land graph could not finish this PR itself (${extra}) — resolve it by hand (merge origin/main, fix, push); the graph re-pregates the new head` };
   }
 }
 
@@ -97,6 +139,10 @@ export interface Facts {
   focused: Focused | null;
   hold: string | null;
   security: string[];
+  /** Terra review of this head (only read for security-4 paths); null = none on file. */
+  terra?: TerraReview | null;
+  /** Baseline failure-name diff for this head (focused has failures that already fail on main). */
+  baselineDiff?: BaselineDiff | null;
   landedBefore: boolean;
   cardSeat?: string;
   org?: OrgDeps;
@@ -115,24 +161,53 @@ export function decide(f: Facts): Decision {
     if (f.olderReceiptHead) return { action: 'refuse', cls: 'stale-head', why: `receipt ${f.olderReceiptHead.slice(0, 12)} ≠ head ${pr.head.slice(0, 12)}`, card: c('stale-head', f.olderReceiptHead.slice(0, 12)) };
     return { action: 'wait', cls: 'no-receipt', why: 'no same-head receipt', card: c('no-receipt') };
   }
+  // RED-RECEIPT: a PREGATE-RED receipt counts only when its red steps are focused (+ baseline) and/or a tsc timeout.
+  const red = redVerdict(f.receipt);
+  if (red?.kind === 'other') return { action: 'refuse', cls: 'pregate-red', why: `pregate RED: ${red.other.join(', ')}`.slice(0, 200), card: c('pregate-red', red.other.join(', ')) };
   let lane: Decision['lane'] = 'normal';
-  if (f.receipt.focused.length === 0) {
+  let focusedTxt = '';
+  const swept = f.focused && typeof f.focused === 'object' && 'swept' in f.focused ? f.focused : null;
+  const nd = f.baselineDiff ?? null;
+  const ndTxt = nd ? `baseline-name-diff introduced 0 (${nd.headFail} fail also on main)` : '';
+  // BASELINE-FAIL-NONBLOCK (CEO 11-27): pregate's same-host focused-vs-main found no head-only failure name → not a block.
+  // The why carries no «N fail» / «baseline fail» words: the land command's name-diff check reads them as a waiver claim.
+  const fb = f.receipt.focusedBaseline;
+  const preexistingOnly = preexistingOnlyOf(fb);
+  const fbTxt = fb ? `focused preexisting-only: name diff new 0 · ${fb.mine} also red on main (${fb.onMain})` : '';
+  // L0 doc-only: the receipt ran no focused stage (empty focused set, or pregate graded it L0 and skipped the stage).
+  const noFocusedStage = noFocusedStageOf({ focusedCount: f.receipt.focused.length, grade: f.receipt.grade, focusedExit: f.receipt.focusedExit });
+  if (noFocusedStage) {
     if (!isDocOnly(pr.files)) return { action: 'refuse', cls: 'no-focused-stage', why: 'empty focused set on a code PR', card: c('no-focused-stage') };
-    lane = 'L0-doc-only';
+    lane = 'L0-doc-only'; focusedTxt = 'doc-only L0';
+  } else if (swept) {
+    // The host swept the raw: the receipt's focused step exit is the evidence (bun test exits 0 ⇔ 0 fail).
+    if (swept.exit === 0) focusedTxt = 'focused step exit 0 (raw swept)';
+    else if (nd) focusedTxt = ndTxt;
+    else if (preexistingOnly) focusedTxt = fbTxt;
+    else return { action: 'refuse', cls: 'baseline-failing-focused', why: `focused step exit ${swept.exit} (raw swept)`, card: c('baseline-failing-focused', `exit ${swept.exit}`) };
   } else {
-    if (f.focused && typeof f.focused === 'object' && 'swept' in f.focused) {
-      if (f.focused.exit !== 0) return { action: 'refuse', cls: 'baseline-failing-focused', why: `focused step exit ${f.focused.exit} (raw swept)`, card: c('baseline-failing-focused', `exit ${f.focused.exit}`) };
-      return { action: 'wait', cls: 'focused-unreadable', why: 'focused raw swept (receipt step exit 0) — re-run pregate', card: c('focused-unreadable', `${f.receipt.host} temp rawDir swept`) };
-    }
     if (f.focused === null || f.focused === 'unreadable') return { action: 'wait', cls: 'focused-unreadable', why: 'focused raw unreadable', card: c('focused-unreadable', f.receipt.host) };
-    if (f.focused.fail > 0 || f.focused.pass === 0) return { action: 'refuse', cls: 'baseline-failing-focused', why: `focused ${f.focused.pass} pass ${f.focused.fail} fail`, card: c('baseline-failing-focused', `${f.focused.fail} fail`) };
+    const fc = f.focused as { pass: number; fail: number };
+    if (fc.fail > 0 && nd) focusedTxt = ndTxt;
+    else if (fc.fail > 0 && preexistingOnly) focusedTxt = fbTxt;
+    else if (fc.fail > 0 || fc.pass === 0) return { action: 'refuse', cls: 'baseline-failing-focused', why: `focused ${fc.pass} pass ${fc.fail} fail`, card: c('baseline-failing-focused', `${fc.fail} fail`) };
+    else focusedTxt = `focused ${fc.pass}/0`;
   }
+  // TSC-TIMEOUT: focused is fine but changed-tsc never finished on that host — the finisher re-runs pregate elsewhere.
+  if (red?.tscTimeout) return { action: 'wait', cls: 'tsc-timeout', why: `pregate changed-tsc timeout on ${f.receipt.host} · ${focusedTxt}`, card: c('tsc-timeout', f.receipt.host) };
   if (f.security.length) return { action: 'refuse', cls: 'security-finding', why: f.security.join(','), card: c('security-finding', f.security.join(', ')) };
-  const hot = pr.files.filter(x => HOT_FILES.includes(x));
-  if (hot.length) return { action: 'refuse', cls: 'review-required', why: `hot ${hot.join(',')}`, card: c('review-required', hot.join(', ')) };
-  const counts = focusedCounts(f.focused);
-  const focusedTxt = counts ? `focused ${counts.pass}/0` : 'doc-only L0';
-  return { action: 'land', lane, why: `same-head receipt ${f.receipt.dir.split('/').pop()} · ${focusedTxt}` };
+  // Security-4 paths only: a Terra PASS/WARN on this head with no security finding. Everything else needs no review.
+  const sec4 = security4Hits(pr.files);
+  let terraTxt = '';
+  if (sec4.length) {
+    const t = f.terra ?? null;
+    const hit = sec4.slice(0, 3).join(', ');
+    if (t && t.securityFindings.length) return { action: 'refuse', cls: 'security-finding', why: `terra ${t.verdict}: ${t.securityFindings.join(',')}`.slice(0, 200), card: c('security-finding', t.securityFindings.join(', ')) };
+    if (!t || !TERRA_CLEAR.includes(t.verdict.toLowerCase())) return { action: 'wait', cls: 'review-required', why: `security-4 ${hit} · terra ${t ? t.verdict : 'none'}`, card: c('review-required', hit) };
+    terraTxt = ` · security-4 terra ${t.verdict.toLowerCase()}`;
+  }
+  const reuse = f.receipt.reusedFrom ? ` · receipt reused via patch-id from ${f.receipt.reusedFrom.slice(0, 12)}` : '';
+  return { action: 'land', lane, why: `same-head receipt ${f.receipt.dir.split('/').pop()}${reuse} · ${focusedTxt}${terraTxt}` };
 }
 
 /** op-direct-land-v2.sh / coach-land.sh exit code + output → refusal class (the STOP lines of 11-25). */
@@ -144,6 +219,7 @@ export function classifyLandExit(rc: number, text: string): RefusalClass | null 
   if (/STOP 같은 head|pregate 영수 없음/.test(text)) return 'no-receipt';
   if (/STOP focused/.test(text)) return /[1-9]\d* fail/.test(text) ? 'baseline-failing-focused' : 'no-focused-stage';
   if (/baseline failure-name diff|baseline-name-diff/.test(text)) return 'baseline-failing-focused';
+  if (tscUnmeasured(text)) return 'tsc-timeout';
   switch (rc) {
     case 4: return /REFUSE base=/.test(text) ? 'base-not-main' : 'no-focused-stage';
     case 5: return 'review-disposition';
@@ -163,6 +239,10 @@ export interface LedgerRow {
   at: string; pr: number; head: string; mode: Mode;
   event: 'decision' | 'landing' | 'landed' | 'noticed' | 'refused' | 'card' | 'stall';
   action?: Action; cls?: RefusalClass; why?: string; to?: string[]; body?: string; synthetic?: boolean;
+  /** `landed` rows: the real merge time (`at` is the tick start · a tick with live lands runs tens of minutes). */
+  doneAt?: string;
+  /** NEXT-ACTION: who acts next on a non-land decision / refusal (the graph itself or a seat). */
+  next?: NextAction;
 }
 
 export const landHome = (stateRoot: string) => join(stateRoot, 'land-graph');
@@ -195,17 +275,30 @@ export function setHold(stateRoot: string, pr: number, reason: string, by: strin
   const h = readHolds(stateRoot); h[String(pr)] = { reason, by, at: now.toISOString() };
   mkdirSync(landHome(stateRoot), { recursive: true }); writeFileSync(holdsPath(stateRoot), JSON.stringify(h, null, 2));
 }
-export function clearHold(stateRoot: string, pr: number): boolean {
+export function clearHold(stateRoot: string, pr: number, only?: (hold: { reason: string; by: string; at: string }) => boolean): boolean {
   const h = readHolds(stateRoot); if (!h[String(pr)]) return false;
+  if (only && !only(h[String(pr)]!)) return false;
   delete h[String(pr)]; writeFileSync(holdsPath(stateRoot), JSON.stringify(h, null, 2)); return true;
 }
 
 /** Single tick lock (O_EXCL); a lock older than 60 min (file-system clock · > one live land of ≤ 40 min) is stale (crashed tick) and is taken over. */
-export function acquireLock(stateRoot: string, nowMs = Date.now()): (() => void) | null {
+/** kit/trigger-lock (DUPLICATION-MAP §1-2): a lock whose writer pid is gone is a dead tick's lock — take it over now, not after
+ *  60 min. A live pid (or EPERM = alive, not ours) keeps it; an unreadable pid falls back to the 60-min age rule. */
+export function lockHolderAlive(raw: string, isAlive: (pid: number) => boolean = pidAlive): boolean | null {
+  const pid = Number(raw.trim());
+  return Number.isInteger(pid) && pid > 0 ? isAlive(pid) : null;
+}
+const pidAlive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; } };
+
+export function acquireLock(stateRoot: string, nowMs = Date.now(), isAlive: (pid: number) => boolean = pidAlive): (() => void) | null {
   mkdirSync(landHome(stateRoot), { recursive: true });
   const p = join(landHome(stateRoot), 'tick.lock');
   try {
-    if (existsSync(p) && nowMs - statSync(p).mtimeMs > 60 * 60_000) rmSync(p, { force: true });
+    if (existsSync(p)) {
+      let holder: boolean | null = null;
+      try { holder = lockHolderAlive(readFileSync(p, 'utf8'), isAlive); } catch { holder = null; }
+      if (holder === false || nowMs - statSync(p).mtimeMs > 60 * 60_000) rmSync(p, { force: true });
+    }
     const fd = openSync(p, 'wx'); writeFileSync(fd, String(process.pid)); closeSync(fd);
     return () => rmSync(p, { force: true });
   } catch { return null; }
@@ -225,8 +318,14 @@ export interface LandDeps {
   olderReceiptHead(pr: number, head: string): string | null;
   focused(r: Receipt): Focused;
   security(pr: number, head: string): string[];
+  /** Terra review of this exact head (security-4 paths); absent dep = none on file. */
+  terra?(pr: number, head: string): TerraReview | null;
+  /** Baseline failure-name diff receipt for this head (only asked when focused has failures). */
+  baselineDiff?(pr: number, head: string): BaselineDiff | null;
+  /** JUD veto verdicts on file for this head (JUD HOLD review results) — a veto like a hold. */
+  judHold?(pr: number, head: string): { reason: string; by: string } | null;
   /** Live only: the golden-path land command (op-direct-land-v2.sh with the coach extra.json). */
-  land(pr: PrInfo, r: Receipt, why: string): Promise<{ rc: number; text: string }>;
+  land(pr: PrInfo, r: Receipt, why: string, ctx?: { lane?: Decision['lane']; baselineDiff?: BaselineDiff | null; tscAttempt?: number }): Promise<{ rc: number; text: string }>;
   post(to: string, body: string): void;
   /** COACH-ACTIONS ledger row (live landed). */
   record(line: string): void;
@@ -238,16 +337,90 @@ export interface LandDeps {
   dry?: boolean;
   /** Synthetic shadow injection: every row is tagged so it is never read as a real land. */
   synthetic?: boolean;
+  /** LAND-OWNS-RECEIPT finisher (src/land-graph/finisher.ts): launches / pushes only in live mode; plan and shadow report «would-run». */
+  finisher?: Omit<FinishDeps, 'now' | 'hasReceipt'>;
+  /**
+   * SMART-MERGE (src/git-smart): squash-landed heads the finisher may find inside a branch (stack parents) — wired =
+   * stale-base-revert refusals are refreshed by the finisher too, and a retargeted stack child is rebuilt onto main.
+   */
+  smartMerge?: { mergedHeads(): readonly string[]; mergedBaseHead(pr: PrInfo): string | null };
+  /** STACK-AUTO-RETARGET: the base branch's PR is merged (or the base is contained in main). */
+  baseMerged?(pr: PrInfo): boolean;
+  retargetToMain?(pr: PrInfo): { ok: boolean; why?: string };
+  /** STALE-PR-24H reap: the PR's whole diff is already in main (merge-tree of head into main = main's tree). */
+  superseded?(pr: PrInfo): boolean;
+  closePr?(pr: PrInfo, comment: string): { ok: boolean; why?: string };
+  /** LAND-CELL-LINK: the cell of the release in play this PR belongs to · null = none · undefined = no release/checklist (skip). */
+  cellLink?(pr: PrInfo): CellMatch | null | undefined;
+  /** Live, right before the merge: `checklist evidence add <cell> '#PR'`. */
+  attachCell?(cell: string, pr: PrInfo): { ok: boolean; why?: string };
+  /** `plan --reap`: 'dry' lists would-close · 'apply' closes. */
+  reap?: 'dry' | 'apply';
+  /** LAND-STEWARD train manager (src/land-steward/train.ts): land order over the open PRs · default landOrder. */
+  order?(prs: readonly PrInfo[], rows: readonly LedgerRow[], nowMs: number): PrInfo[];
+  /** LAND-STEWARD «세 평면»: the steward is the terminal owner of land refusals — no mail to the landing owner / OP
+   *  (cards cc, seat cards, stall, post-land notice) except policy exceptions (security-4). Rows still record everything. */
+  terminalOwner?: string;
+}
+/** Refusal classes that stay mail even under a terminal owner (policy: security-4 binds a human). */
+export const POLICY_MAIL_CLASSES: RefusalClass[] = ['security-finding', 'review-required'];
+
+export interface TickResult {
+  mode: Mode; locked: boolean; decisions: Array<{ pr: number; head: string; action: Action; cls?: RefusalClass; why: string; next?: NextAction }>; landed: number[]; error?: string;
+  /** «ready to land» count this tick (every gate passes for the head). */
+  ready?: number;
+  finisher?: FinishOutcome[];
+  stale?: Array<{ pr: number; ageH: number; reason: string }>;
+  reaped?: Array<{ pr: number; action: 'would-close' | 'closed' | 'close-failed'; why: string }>;
+  /** LAND-CELL-LINK per ready PR · `landed-no-cell` = no current-release cell matched. */
+  cells?: Array<{ pr: number; cell: string | null; basis?: string; action: 'linked' | 'would-attach' | 'attached' | 'attach-failed' | 'landed-no-cell'; why?: string }>;
 }
 
-export interface TickResult { mode: Mode; locked: boolean; decisions: Array<{ pr: number; head: string; action: Action; cls?: RefusalClass; why: string }>; landed: number[]; error?: string }
-
 const STALL_MIN = 30;
-const TRANSIENT: RefusalClass[] = ['head-moved', 'gh-error', 'main-moved-overlap', 'held', 'land-error'];
+const TRANSIENT: RefusalClass[] = ['head-moved', 'gh-error', 'main-moved-overlap', 'held', 'land-error', 'tsc-timeout'];
+const tscTries = (rows: readonly LedgerRow[], pr: number, head: string) => rows.filter(x => x.pr === pr && x.head === head && x.event === 'refused' && x.cls === 'tsc-timeout').length;
 
 function lastFor(rows: LedgerRow[], pr: number, head: string, event: LedgerRow['event']): LedgerRow | undefined {
   for (let i = rows.length - 1; i >= 0; i--) if (rows[i]!.pr === pr && rows[i]!.head === head && rows[i]!.event === event) return rows[i];
   return undefined;
+}
+
+/** The JUD veto on a PR: a holds.json mark by the veto owner, else a JUD HOLD verdict on file for this head. */
+function vetoFor(d: LandDeps, holds: Record<string, { reason: string; by: string }>, pr: PrInfo): string | null {
+  const own = holdVerdict(holds[String(pr.number)], d.org).block;
+  if (own) return own;
+  const jud = (() => { try { return d.judHold?.(pr.number, pr.head) ?? null; } catch { return null; } })();
+  return jud ? holdVerdict(jud, d.org).block : null;
+}
+
+/** Refusal classes that mean «another PR on the same files moved main under this one» (hot-file churn). */
+export const CHURN_REFUSALS: RefusalClass[] = ['stale-base-revert', 'merge-conflict', 'main-moved-overlap'];
+const CHURN_WINDOW_MS = 2 * 3_600_000;
+
+/**
+ * Land order (THROUGHPUT-CONTROLLER · hot-file lanes · 11-26: #40285 refused 5× in one evening): a PR refused for churn
+ * on an OLDER head in the last 2 h has since merged main — it is the freshest PR in its lane. It lands first, before a
+ * lane-mate makes it stale again. The others keep PR-number order. The same-files overlap guard still lands one PR per
+ * file per tick.
+ */
+export function landOrder(prs: readonly PrInfo[], rows: readonly LedgerRow[], nowMs: number): PrInfo[] {
+  const refreshed = churnVictims(prs, rows, nowMs);
+  return [...prs].sort((a, b) => (refreshed.get(b.number) ?? 0) - (refreshed.get(a.number) ?? 0) || a.number - b.number);
+}
+/** PR → churn refusals in the window, for PRs refused for churn on an OLDER head and not on the current one (fresh in their lane). */
+export function churnVictims(prs: readonly PrInfo[], rows: readonly LedgerRow[], nowMs: number): Map<number, number> {
+  const victims = new Map<number, number>();
+  for (const r of rows) {
+    if (r.event !== 'refused' || !r.cls || !CHURN_REFUSALS.includes(r.cls) || nowMs - Date.parse(r.at) > CHURN_WINDOW_MS) continue;
+    victims.set(r.pr, (victims.get(r.pr) ?? 0) + 1);
+  }
+  const out = new Map<number, number>();
+  for (const p of prs) {
+    if (!victims.has(p.number)) continue;
+    if (rows.some(r => r.event === 'refused' && r.pr === p.number && r.head === p.head && r.cls && CHURN_REFUSALS.includes(r.cls))) continue;
+    out.set(p.number, victims.get(p.number)!);
+  }
+  return out;
 }
 
 export async function tickLand(d: LandDeps): Promise<TickResult> {
@@ -263,14 +436,21 @@ export async function tickLand(d: LandDeps): Promise<TickResult> {
       if (!d.dry) appendLedger(d.stateRoot, full);
       rows.push(full);
     };
+    const owner = landRefusalRecipient(d.org);
+    // «세 평면»: under a terminal owner the landing owner / OP get no land mail (policy exceptions aside).
+    // The PR author always keeps its own card (even when the author IS TC/OP); only the landing-owner / OP copies go.
+    const authors = new Map<number, string>();
+    const mailable = (to: string[], cls?: RefusalClass, author?: string) => (!d.terminalOwner || (cls && POLICY_MAIL_CLASSES.includes(cls)) ? to
+      : to.filter(t => t === author || (t !== owner && t !== 'OP')));
     const sendCard = (pr: number, head: string, c: Card, key: RefusalClass) => {
       // One card per (PR, head, class): no flood on every tick.
       if (rows.some(x => x.event === 'card' && x.pr === pr && x.head === head && x.cls === key)) return;
-      if (!d.dry && (d.mode === 'live' || d.cardSeat)) for (const to of c.to) d.post(to, d.mode === 'shadow' ? `[shadow] ${c.body}` : c.body);
-      row({ pr, head, event: 'card', cls: key, to: c.to, body: c.body });
+      const to = mailable(c.to, key, authors.get(pr));
+      if (!d.dry && (d.mode === 'live' || d.cardSeat)) for (const t of to) d.post(t, d.mode === 'shadow' ? `[shadow] ${c.body}` : c.body);
+      row({ pr, head, event: 'card', cls: key, to, body: c.body, ...(d.terminalOwner && to.length < c.to.length ? { why: `terminal owner ${d.terminalOwner} keeps ${c.to.filter(t => !to.includes(t)).join(',')}` } : {}) });
     };
     const notice = (p: PrInfo, why: string) => {
-      d.post(d.cardSeat ?? landRefusalRecipient(d.org), `[land-graph 착지 후통보] #${p.number} «${p.title}» @${p.head.slice(0, 12)} MERGED · ${why}`);
+      if (!d.terminalOwner) d.post(d.cardSeat ?? landRefusalRecipient(d.org), `[land-graph 착지 후통보] #${p.number} «${p.title}» @${p.head.slice(0, 12)} MERGED · ${why}`);
       d.record(`${at.slice(11, 16)} · #${p.number} «${p.title.slice(0, 60)}» · ${p.head.slice(0, 12)} · rc=0 · MERGED · land-graph · ${why}`);
       row({ pr: p.number, head: p.head, event: 'noticed' });
     };
@@ -290,39 +470,99 @@ export async function tickLand(d: LandDeps): Promise<TickResult> {
     }
 
     let prs: PrInfo[];
-    try { prs = await d.listPrs(); } catch (e) {
+    try { prs = await d.listPrs(); for (const p of prs) authors.set(p.number, p.author); } catch (e) {
       out.error = `gh-error: ${e instanceof Error ? e.message : String(e)}`; return out;
     }
     const holds = readHolds(d.stateRoot);
     const landedPrs = new Set(rows.filter(r => r.event === 'landed').map(r => r.pr));
     const touched = new Set<string>(); let used = 0;
-    for (const pr of prs.sort((a, b) => a.number - b.number)) {
+    const readyPrs = new Set<number>();
+    const live = d.mode === 'live' && !d.dry && !d.synthetic;
+    const reasons = new Map<number, string>();
+    const cands: Array<{ pr: PrInfo; kind: FinishKind; need: 'receipt' | 'baseline'; avoidHost?: string; parentHeads?: readonly string[] }> = [];
+    let mergedHeadsMemo: readonly string[] | null = null;
+    const parentHeads = (extra: readonly string[] = []): readonly string[] | undefined => {
+      if (!d.smartMerge) return extra.length ? extra : undefined;
+      if (mergedHeadsMemo === null) { try { mergedHeadsMemo = d.smartMerge.mergedHeads(); } catch { mergedHeadsMemo = []; } }
+      const all = [...new Set([...extra, ...mergedHeadsMemo])];
+      return all.length ? all : undefined;
+    };
+    const finOut: FinishOutcome[] = [];
+    const cells: NonNullable<TickResult['cells']> = [];
+    for (const pr0 of (d.order ?? landOrder)(prs, rows, now.getTime())) {
+      let pr = pr0;
+      // STACK-AUTO-RETARGET: a stacked PR whose base already merged is retargeted to main, then treated as normal.
+      if (pr.base !== 'main' && pr.state === 'OPEN' && !pr.draft && d.baseMerged) {
+        const merged = (() => { try { return d.baseMerged!(pr); } catch { return false; } })();
+        if (merged) {
+          const r = live && d.retargetToMain ? d.retargetToMain(pr) : null;
+          if (!live || r?.ok) {
+            finOut.push({ pr: pr.number, head: pr.head, kind: 'retarget', state: live ? 'retargeted' : 'would-run', why: `base ${pr.base} merged → main` });
+            if (live) row({ pr: pr.number, head: pr.head, event: 'decision', action: 'wait', why: `retargeted ${pr.base} → main (base merged)` });
+            // SMART-MERGE: the child still carries the parent's original commits — rebuild only its own onto main.
+            if (d.smartMerge && d.finisher && !pr.crossRepo && pr.headRef) {
+              const ph = (() => { try { return d.smartMerge!.mergedBaseHead(pr); } catch { return null; } })();
+              cands.push({ pr: { ...pr, base: 'main' }, kind: 'rebuild', need: 'receipt', ...(parentHeads(ph ? [ph] : []) ? { parentHeads: parentHeads(ph ? [ph] : []) } : {}) });
+              // The old head still carries the parent's commits: never land it — the rebuilt head is judged next tick.
+              reasons.set(pr.number, 'wait · rebuild after retarget');
+              out.decisions.push({ pr: pr.number, head: pr.head, action: 'wait', why: 'rebuild onto main after retarget', next: { owner: 'land-graph', action: 'finisher rebuild' } });
+              continue;
+            }
+            pr = { ...pr, base: 'main' };
+          } else finOut.push({ pr: pr.number, head: pr.head, kind: 'retarget', state: 'busy', why: `retarget failed: ${r?.why ?? 'no retarget dep'}` });
+        }
+      }
       const receipt = d.receipt(pr.number, pr.head);
+      const focused = receipt && receipt.focused.length && !(receipt.grade === 'L0' && receipt.focusedExit == null) ? d.focused(receipt) : null;
+      const failing = !!focused && typeof focused === 'object' && ('swept' in focused ? focused.exit !== 0 : focused.fail > 0);
       const facts: Facts = {
-        pr, receipt, olderReceiptHead: receipt ? null : d.olderReceiptHead(pr.number, pr.head),
-        focused: receipt && receipt.focused.length ? d.focused(receipt) : null,
-        hold: holdVerdict(holds[String(pr.number)], d.org).block, security: d.security(pr.number, pr.head), ...(d.org ? { org: d.org } : {}),
+        pr, receipt, olderReceiptHead: receipt ? null : d.olderReceiptHead(pr.number, pr.head), focused,
+        hold: vetoFor(d, holds, pr), security: d.security(pr.number, pr.head), ...(d.org ? { org: d.org } : {}),
+        ...(receipt && d.terra && security4Hits(pr.files).length ? { terra: d.terra(pr.number, pr.head) } : {}),
+        ...(failing && d.baselineDiff ? { baselineDiff: d.baselineDiff(pr.number, pr.head) } : {}),
         landedBefore: landedPrs.has(pr.number) && d.mode === 'live', ...(d.cardSeat ? { cardSeat: d.cardSeat } : {}),
       };
       let dec = decide(facts);
+      // OUTCOME-DONE-ALARMS: «ready to land» = every gate passes for this head (before slots / overlap / in-flight waits).
+      if (dec.action === 'land') readyPrs.add(pr.number);
+      let cellRow: NonNullable<TickResult['cells']>[number] | null = null;
+      if (dec.action === 'land' && d.cellLink) {
+        const m = (() => { try { return d.cellLink!(pr); } catch { return undefined; } })();
+        if (m !== undefined) {
+          cellRow = m === null ? { pr: pr.number, cell: null, action: 'landed-no-cell' }
+            : { pr: pr.number, cell: m.id, basis: m.basis, action: m.basis === 'already' ? 'linked' : 'would-attach' };
+          cells.push(cellRow);
+        }
+      }
       // A gate refusal on this head sticks until a new head (no preflight re-run every tick); transient ones retry.
-      const gateRefusal = rows.filter(x => x.pr === pr.number && x.head === pr.head && x.event === 'refused' && x.cls && !TRANSIENT.includes(x.cls)).pop();
+      const gateRefusal = rows.filter(x => x.pr === pr.number && x.head === pr.head && x.event === 'refused' && x.cls && !legacyGuardError(x.cls, x.why)
+        && (!TRANSIENT.includes(x.cls) || (x.cls === 'tsc-timeout' && tscTries(rows, pr.number, pr.head) >= TSC_LAND_RETRIES))).pop();
       const inFlight = rows.some(x => x.pr === pr.number && x.head === pr.head && x.event === 'landing')
         && !rows.some(x => x.pr === pr.number && x.head === pr.head && (x.event === 'landed' || x.event === 'refused'));
       if (dec.action === 'land' && inFlight && d.mode === 'live') dec = { action: 'wait', why: 'land in flight' };
       if (dec.action === 'land' && gateRefusal) dec = { action: 'refuse', cls: gateRefusal.cls!, why: `gate refused this head: ${gateRefusal.why ?? ''}` };
       if (dec.action === 'land' && pr.files.some(f => touched.has(f))) dec = { action: 'wait', cls: 'main-moved-overlap', why: 'same files landed this tick' };
       if (dec.action === 'land' && used >= d.slots) dec = { action: 'wait', why: `slots ${d.slots} full` };
+      reasons.set(pr.number, `${dec.action}${dec.cls ? ` ${dec.cls}` : ''} · ${dec.why}`);
       if (dec.action === 'skip') continue;
-      out.decisions.push({ pr: pr.number, head: pr.head, action: dec.action, ...(dec.cls ? { cls: dec.cls } : {}), why: dec.why });
+      // LAND-OWNS-RECEIPT: the graph finishes mechanical last miles itself; the author card is only for what it cannot.
+      const fk = d.finisher ? finishKindFor(dec.cls, { noBaselineInReceipt: !!receipt && !receipt.focusedBaseline, ...(pr.crossRepo || !pr.headRef ? { crossRepo: true } : {}) }) : null;
+      if (fk && !cands.some(c => c.pr.number === pr.number && c.kind === 'rebuild')) { // a rebuild moves the head first
+        const ph = fk === 'refresh' ? parentHeads() : undefined;
+        cands.push({ pr, kind: fk, need: receipt && !receipt.red ? 'baseline' : 'receipt', ...(fk === 'pregate-retry' && receipt ? { avoidHost: receipt.host } : {}), ...(ph ? { parentHeads: ph } : {}) });
+      }
+      const next: NextAction | null = dec.action === 'land' ? null : dec.cls
+        ? nextAction(dec.cls, pr, { finisher: fk, landingOwner: landRefusalRecipient(d.org), fixTo: fixFor(dec.cls, pr).to })
+        : { owner: 'land-graph', action: 'retry next tick' }; // slots full · land in flight
+      out.decisions.push({ pr: pr.number, head: pr.head, action: dec.action, ...(dec.cls ? { cls: dec.cls } : {}), why: dec.why, ...(next ? { next } : {}) });
       const prev = lastFor(rows, pr.number, pr.head, 'decision');
-      if (!prev || prev.action !== dec.action || prev.cls !== dec.cls) row({ pr: pr.number, head: pr.head, event: 'decision', action: dec.action, ...(dec.cls ? { cls: dec.cls } : {}), why: dec.why });
-      if (dec.card && dec.cls) sendCard(pr.number, pr.head, dec.card, dec.cls);
+      if (!prev || prev.action !== dec.action || prev.cls !== dec.cls) row({ pr: pr.number, head: pr.head, event: 'decision', action: dec.action, ...(dec.cls ? { cls: dec.cls } : {}), why: dec.why, ...(next ? { next } : {}) });
+      if (dec.card && dec.cls && !fk) sendCard(pr.number, pr.head, dec.card, dec.cls);
       // Stall: ready to land but not landed for 30 min → JUD + OP once.
       const firstReady = rows.find(x => x.pr === pr.number && x.head === pr.head && x.event === 'decision' && x.action === 'land');
       if (dec.action !== 'land' && firstReady && now.getTime() - Date.parse(firstReady.at) > STALL_MIN * 60_000 && !lastFor(rows, pr.number, pr.head, 'stall')) {
         row({ pr: pr.number, head: pr.head, event: 'stall', why: dec.why });
-        if (!d.dry && (d.mode === 'live' || d.cardSeat)) for (const to of d.cardSeat ? [d.cardSeat] : [landRefusalRecipient(d.org)]) d.post(to, `[land-graph · stall] #${pr.number} ready ${STALL_MIN}+ min, not landed: ${dec.why}`);
+        if (!d.dry && (d.mode === 'live' || d.cardSeat)) for (const to of mailable(d.cardSeat ? [d.cardSeat] : [owner])) d.post(to, `[land-graph · stall] #${pr.number} ready ${STALL_MIN}+ min, not landed: ${dec.why}`);
       }
       if (dec.action !== 'land') continue;
       used++; pr.files.forEach(f => touched.add(f));
@@ -333,35 +573,99 @@ export async function tickLand(d: LandDeps): Promise<TickResult> {
       if (!fresh) { row({ pr: pr.number, head: pr.head, event: 'refused', cls: 'gh-error', why: 'pr re-read failed' }); continue; }
       if (fresh.state !== 'OPEN' || fresh.draft) { row({ pr: pr.number, head: pr.head, event: 'refused', why: `flipped to ${fresh.draft ? 'draft' : fresh.state} mid-run` }); continue; }
       if (fresh.head !== pr.head) { row({ pr: pr.number, head: pr.head, event: 'refused', cls: 'head-moved', why: `head → ${fresh.head.slice(0, 12)}` }); continue; }
-      const holdNow = holdVerdict(readHolds(d.stateRoot)[String(pr.number)], d.org).block;
+      const holdNow = vetoFor(d, readHolds(d.stateRoot), pr);
       if (holdNow) { row({ pr: pr.number, head: pr.head, event: 'refused', cls: 'held', why: holdNow }); continue; }
       // Stale-base revert guard before every merge (fail closed: a throwing guard refuses).
-      const sr = (() => { try { return d.staleRevert ? d.staleRevert(fresh) : { ok: true }; } catch (e) { return { ok: false, why: `guard error: ${String(e).slice(0, 120)}` }; } })();
-      if (!sr.ok) {
-        row({ pr: pr.number, head: pr.head, event: 'refused', cls: 'stale-base-revert', why: sr.why ?? 'stale-base revert' });
-        sendCard(pr.number, pr.head, card('stale-base-revert', pr, sr.why ?? '', d.cardSeat, d.org), 'stale-base-revert');
+      const sr = (() => { try { return d.staleRevert ? d.staleRevert(fresh) : { ok: true }; } catch (e) { return { ok: false, why: `guard error: ${String(e).slice(0, 300)}` }; } })();
+      // GUARD-ERROR: a guard that could not run is not a stale-base revert — conflict → merge-conflict (finisher refresh) · else transient.
+      const ge = sr.ok ? null : guardErrorClass(sr.why ?? '');
+      if (ge) {
+        row({ pr: pr.number, head: pr.head, event: 'refused', cls: ge, why: (sr.why ?? '').slice(0, 200) });
+        if (ge === 'merge-conflict' && d.finisher && !pr.crossRepo && pr.headRef) { const ph = parentHeads(); cands.push({ pr, kind: 'refresh', need: 'receipt', ...(ph ? { parentHeads: ph } : {}) }); }
         continue;
       }
+      if (!sr.ok) {
+        row({ pr: pr.number, head: pr.head, event: 'refused', cls: 'stale-base-revert', why: sr.why ?? 'stale-base revert' });
+        // SMART-MERGE: the finisher rebuilds / merges main itself (its revert guard decides); the card only without it.
+        if (d.smartMerge && d.finisher && !pr.crossRepo && pr.headRef) { const ph = parentHeads(); cands.push({ pr, kind: 'refresh', need: 'receipt', ...(ph ? { parentHeads: ph } : {}) }); }
+        else sendCard(pr.number, pr.head, card('stale-base-revert', pr, sr.why ?? '', d.cardSeat, d.org), 'stale-base-revert');
+        continue;
+      }
+      // LAND-CELL-LINK: attach the PR to its cell before the merge (never blocks the land).
+      if (cellRow?.action === 'would-attach' && cellRow.cell && d.attachCell) {
+        const a = (() => { try { return d.attachCell!(cellRow!.cell!, pr); } catch (e) { return { ok: false, why: String(e).slice(0, 120) }; } })();
+        cellRow.action = a.ok ? 'attached' : 'attach-failed';
+        if (a.why) cellRow.why = a.why;
+      }
       row({ pr: pr.number, head: pr.head, event: 'landing' });
-      let res = await d.land(pr, receipt!, dec.why).catch(e => ({ rc: 99, text: String(e) }));
+      const ctx = { ...(dec.lane ? { lane: dec.lane } : {}), baselineDiff: facts.baselineDiff ?? null, tscAttempt: tscTries(rows, pr.number, pr.head) };
+      let res = await d.land(pr, receipt!, dec.why, ctx).catch(e => ({ rc: 99, text: String(e) }));
       let cls = classifyLandExit(res.rc, res.text);
       let after = await d.prNow(pr.number).catch(() => null);
       // Base changed mid-merge → retry once on the new main (the land command re-merges), then refuse with a card.
+      // A JUD veto that arrived during the (long) land command stops the retry too.
+      const holdRetry = cls === 'merge-conflict' && after?.state !== 'MERGED' ? vetoFor(d, readHolds(d.stateRoot), pr) : null;
+      if (holdRetry) { row({ pr: pr.number, head: pr.head, event: 'refused', cls: 'held', why: holdRetry }); continue; }
       if (cls === 'merge-conflict' && after?.state !== 'MERGED' && after?.head === pr.head) {
         row({ pr: pr.number, head: pr.head, event: 'decision', action: 'land', why: 'base changed mid-merge · retry once' });
-        res = await d.land(pr, receipt!, `${dec.why} · retry`).catch(e => ({ rc: 99, text: String(e) }));
+        res = await d.land(pr, receipt!, `${dec.why} · retry`, ctx).catch(e => ({ rc: 99, text: String(e) }));
         cls = classifyLandExit(res.rc, res.text);
         after = await d.prNow(pr.number).catch(() => null);
       }
       if (cls && after?.state !== 'MERGED') {
         row({ pr: pr.number, head: pr.head, event: 'refused', cls, why: res.text.split('\n').filter(l => /STOP|REFUSE/.test(l)).pop() ?? `rc=${res.rc}` });
-        sendCard(pr.number, pr.head, card(cls, pr, `rc=${res.rc}`, d.cardSeat, d.org), cls);
+        // SMART-MERGE: a land-time conflict with main is the finisher's — smart refresh this tick (resolved push or a
+        // needs-finisher card with the hunks), no author card.
+        if ((cls === 'merge-conflict' || cls === 'stale-base-revert') && d.smartMerge && d.finisher && !pr.crossRepo && pr.headRef) {
+          if (!cands.some(c => c.pr.number === pr.number && (c.kind === 'refresh' || c.kind === 'rebuild'))) { const ph = parentHeads(); cands.push({ pr, kind: 'refresh', need: 'receipt', ...(ph ? { parentHeads: ph } : {}) }); }
+          continue;
+        }
+        // TSC-TIMEOUT at land time: retried next tick on the next host; the RES card only once the retries are spent.
+        if (cls !== 'tsc-timeout' || tscTries(rows, pr.number, pr.head) >= TSC_LAND_RETRIES) sendCard(pr.number, pr.head, card(cls, pr, `rc=${res.rc}`, d.cardSeat, d.org), cls);
         continue;
       }
-      row({ pr: pr.number, head: pr.head, event: 'landed', why: dec.why }); out.landed.push(pr.number);
+      row({ pr: pr.number, head: pr.head, event: 'landed', why: dec.why, doneAt: d.now().toISOString() }); out.landed.push(pr.number);
       notice(pr, dec.why);
     }
-    if (!d.dry && !d.synthetic) writeFileSync(join(landHome(d.stateRoot), 'last-tick.json'), JSON.stringify({ at, mode: d.mode, decisions: out.decisions.length, landed: out.landed }));
+    // Finisher pass: settle running pregates, then launch / refresh this tick's candidates (bounded · deduped by head).
+    if (d.finisher) {
+      const book = readBook(d.stateRoot);
+      const fd: FinishDeps = { ...d.finisher, now: d.now, hasReceipt: (n, h) => { try { const r = d.receipt(n, h); return r ? { baseline: !!r.focusedBaseline, tscTimeout: !!redVerdict(r)?.tscTimeout } : null; } catch { return null; } } };
+      const cur = new Map(prs.map(p => [p.number, p] as const));
+      for (const j of settle(book, { ...fd, headNow: n => cur.get(n)?.head })) {
+        const p = cur.get(j.pr);
+        if (j.state !== 'failed' || !p || p.head !== j.head) continue;
+        if (j.kind === 'refresh' || j.kind === 'rebuild') sendCard(p.number, p.head, card('needs-finisher', p, j.why ?? 'LLM capsule failed', d.cardSeat, d.org), 'needs-finisher');
+        else if (j.kind === 'pregate-retry') sendCard(p.number, p.head, card('tsc-timeout', p, `${j.avoidHost ?? '?'} and the retry host`, d.cardSeat, d.org), 'tsc-timeout');
+        else sendCard(p.number, p.head, card('needs-finisher', p, j.why ?? 'pregate failed', d.cardSeat, d.org), 'needs-finisher');
+      }
+      for (const o of runFinisher(book, cands, fd, live)) {
+        finOut.push(o);
+        const p = cur.get(o.pr);
+        if ((o.state === 'conflict' || o.state === 'failed') && p) sendCard(p.number, p.head, card('needs-finisher', p, o.why, d.cardSeat, d.org), 'needs-finisher');
+      }
+      if (live) writeBook(d.stateRoot, book);
+    }
+    out.finisher = finOut;
+    out.cells = cells;
+    out.ready = readyPrs.size;
+    // STALE-PR-24H: every open PR older than 24 h with its reason · reap only what is provably already in main.
+    out.stale = stalePrs(prs, reasons, now.getTime());
+    if (d.reap && d.superseded) {
+      out.reaped = [];
+      const byNo = new Map(prs.map(p => [p.number, p] as const));
+      for (const s of out.stale) {
+        const p = byNo.get(s.pr)!;
+        const sup = (() => { try { return d.superseded!(p); } catch { return false; } })();
+        if (!sup) continue;
+        const why = `open ${s.ageH}h · its whole diff is already in main (superseded)`;
+        if (d.reap !== 'apply' || !d.closePr) { out.reaped.push({ pr: s.pr, action: 'would-close', why }); continue; }
+        const r = d.closePr(p, `[land-graph · STALE-PR-24H] closing: ${why}. Reopen if something is missing.`);
+        out.reaped.push({ pr: s.pr, action: r.ok ? 'closed' : 'close-failed', why: r.ok ? why : `${why} · ${r.why ?? ''}` });
+      }
+    }
+    if (!d.dry && !d.synthetic) writeFileSync(join(landHome(d.stateRoot), 'last-tick.json'), JSON.stringify({ at, mode: d.mode, decisions: out.decisions.length, landed: out.landed,
+      ready: readyPrs.size, readyNotLanded: [...readyPrs].filter(pr => !out.landed.includes(pr)).length }));
     return out;
   } finally { release(); }
 }

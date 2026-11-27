@@ -305,6 +305,7 @@ import {
 import { handleLlmModels } from "./llm-models.js";
 import { handleLlmHostsConfig } from "./llm-hosts-config.js";
 import { handleLlmRotationGet, handleLlmRotationNext } from "./llm-rotation.js";
+import { handleLlmPolicyGet, handleLlmPolicyPut } from "./llm-policy-panel.js";
 import { handleSetupClaim } from "./setup-claim.js";
 import {
   handleCredentialRegistrationClaim,
@@ -5034,6 +5035,29 @@ export async function routeRequest(
     if (pathname === "/v1/llm/rotation" && method === "OPTIONS") {
       return handleLlmRotationGet(req);
     }
+    // NEXUS-LLM-POLICY-PANEL (0.3.33 · UX) — policy/llm.yaml 보기·고치기.
+    // PUT here in the mutation block (feedback_post_route_must_be_in_method_block);
+    // GET + OPTIONS sibling in the GET-only block below. Owner-only: checkAuth +
+    // setup bearer scope (same gate as /v1/credentials/slots).
+    if (
+      pathname === "/v1/llm/policy" &&
+      (method === "PUT" || method === "OPTIONS")
+    ) {
+      if (method === "PUT") {
+        if (
+          !opts.metaApi ||
+          !checkAuth(req, opts.metaApi) ||
+          setupBearerScopeDenied(req, opts.metaApi)
+        )
+          return jsonResponse({ error: "unauthorized" }, 401);
+      }
+      return handleLlmPolicyPut(req, {
+        authorizeOwner: (request) =>
+          !!opts.metaApi &&
+          checkAuth(request, opts.metaApi) &&
+          !setupBearerScopeDenied(request, opts.metaApi),
+      });
+    }
     // The one-use link is verified by the claim handler, not by the owner bearer.
     if (
       pathname === "/v1/setup/claim" &&
@@ -6190,6 +6214,22 @@ export async function routeRequest(
   // POST sibling lives in the mutation block above.
   if (pathname === "/v1/llm/rotation") {
     return handleLlmRotationGet(req);
+  }
+  // NEXUS-LLM-POLICY-PANEL (0.3.33 · UX) — GET sibling of the mutation-block
+  // PUT. Owner-only (same gate shape as the PUT).
+  if (pathname === "/v1/llm/policy" && method === "GET") {
+    if (
+      !opts.metaApi ||
+      !checkAuth(req, opts.metaApi) ||
+      setupBearerScopeDenied(req, opts.metaApi)
+    )
+      return jsonResponse({ error: "unauthorized" }, 401);
+    return handleLlmPolicyGet(req, {
+      authorizeOwner: (request) =>
+        !!opts.metaApi &&
+        checkAuth(request, opts.metaApi) &&
+        !setupBearerScopeDenied(request, opts.metaApi),
+    });
   }
   // PWA `/setup` wizard Phase 1 (2026-05-19) — provider catalog 표시.
   // POST sibling (`/v1/setup/llm-provider`) 는 위 mutation 블록.

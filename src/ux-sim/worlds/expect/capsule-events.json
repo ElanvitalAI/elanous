@@ -81,6 +81,11 @@
       "expect": "green",
       "greenSince": "ELN-CAPSULE-COMPLETION-SCOPED",
       "reason": "C9 session scope: two seat sessions built from the tree REPL tools run background RunShell capsules at once and each drain takes only its own completion; an idle seat's supplement Agent completion becomes one queued notice and opens no turn. The shared persisted queue file across REPL processes stays unmeasured (FU)."
+    },
+    "capsule-events/A1": {
+      "expect": "green",
+      "greenSince": "2026-11-21 (pool4-capsule-a1-sample branch wiring commit · base 3ac94594af)",
+      "reason": "A1 structural-synthesis sample (NOT a verbatim replay of the 11-18 46-minute turn): the audit directly observed only the Bash·Agent axes — the harness·MCP axes are structural-synthesis probes built on the audit's capsule-family structure, dispatched in ONE main turn to measure the junction; every axis lands a turn-life:capsule-policy judgment row (tool·kind·mode·syncCapMs·reason); judgment-only, the behavioral detach stays in the A2 shell host wiring"
     }
   }
 }

@@ -312,7 +312,15 @@ export async function runResPatrolWith(deps: PatrolRunDeps, opts: { dryRun?: boo
   let cardFailed = false;
   if (card && !opts.dryRun) {
     const key = `res-patrol:${createHash('sha256').update(batched ? card.body : result.fresh.map((f) => f.key).sort().join('\n')).digest('hex').slice(0, 16)}:${now.toISOString().slice(0, 16)}`;
-    try { deps.postCard(card, key); carded = card.to; } catch (error) { cardFailed = true; unmeasured.push(`card: ${String(error)}`); }
+    // Shadow findings are visible to both seats even when RES is active.
+    // Retry the whole batch if either delivery fails rather than losing findings.
+    const recipients = batched ? ['RES', 'OP'] : [card.to];
+    const delivered: string[] = [];
+    for (const to of recipients) {
+      try { deps.postCard({ ...card, to }, `${key}:${to}`); delivered.push(to); }
+      catch (error) { cardFailed = true; unmeasured.push(`card ${to}: ${String(error)}`); }
+    }
+    if (!cardFailed) carded = delivered.join(',');
     if (batched && carded) debug.log('res.patrol', 'shadow-card', { to: carded, findings: card.body.split('\n').length - 2, forcedShadow });
   }
   for (const finding of result.fresh) debug.log('res.patrol', 'finding', { rule: finding.rule, subject: finding.subject, severity: finding.severity, detail: finding.detail }, { level: finding.severity === 'critical' ? 'warn' : 'info' });

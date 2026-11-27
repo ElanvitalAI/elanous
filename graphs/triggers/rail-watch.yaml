@@ -1,0 +1,33 @@
+graph_id: rail-watch
+version: 1
+loop:
+  title: Post-rail regression watch (JUD-RELAX safety net)
+  root: 판정국
+  managed_by: trigger-registry
+  description: >-
+    Every 10 min read the installed commit (install.json). On the first tick after a new rail, run a small read-only smoke
+    set against that build (version · land graph status · loop trigger list · decisions list). A smoke that passed on the
+    previous rail and fails now raises ONE card to the landing owner and OP naming the PRs landed between the two rails,
+    each with a ready revert command. Never reverts by itself. Done-when = land-graph/rail-watch.json rewritten.
+  owner: TC # org duty «landing» — a revert PR goes through the normal land path
+  trigger:
+    cron: '*/10 * * * *'
+  goal:
+    kind: file-mtime
+    path: '{stateRoot}/land-graph/rail-watch.json'
+  failure:
+    goal_deadline_min: 8
+    max_attempts: 2
+    backoff_sec: [60]
+  cutover_after: 2
+entry_node: watch
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: watch
+    kind: agent
+    recipe: 'cmd:land-rail-watch'
+    max_visits: 1
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: watch, on: outcome, map: { ok: done, fail: failed, error: failed } }

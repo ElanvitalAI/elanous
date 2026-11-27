@@ -16,7 +16,7 @@ import {
   TEST_FAKE_LLM_DELAY_MS_ENV, TEST_FAKE_LLM_DELAY_WHEN_ENV, TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_RESPONSE_ENV, TEST_FAKE_LLM_SCRIPT_ENV, TEST_FAKE_LLM_SCRIPT_SKIP_WHEN_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV,
 } from './fake-llm.js';
 
-export const NEXT_TUI_SCENARIOS = ['next-new-session', 'next-clear-session', 'next-compact', 'next-resume', 'next-queue', 'next-wakeup', 'next-tool-fold', 'next-tool-fold-read', 'next-esc-confirm-long-shell', 'next-goal-continue', 'next-goal-interim', 'next-proactive-continue', 'next-paste', 'next-at-picker', 'next-context-area-clear', 'next-dock-long-stream', 'next-subagent-e4', 'next-seat-turn-cap', 'next-core-harden'] as const;
+export const NEXT_TUI_SCENARIOS = ['next-new-session', 'next-clear-session', 'next-compact', 'next-resume', 'next-queue', 'next-wakeup', 'next-idle-draft-wakeup', 'next-empty-backspace-wakeup', 'next-tool-fold', 'next-tool-fold-read', 'next-esc-confirm-long-shell', 'next-goal-continue', 'next-goal-interim', 'next-proactive-continue', 'next-paste', 'next-at-picker', 'next-context-area-clear', 'next-dock-long-stream', 'next-subagent-e4', 'next-seat-turn-cap', 'next-core-harden'] as const;
 export type NextTuiScenario = (typeof NEXT_TUI_SCENARIOS)[number];
 // TODO(R-TICKET): read ELANOUS_NEXT_TUI_COMPACT_HEIGHT once its setting lands.
 const NEXT_TUI_DOCK_PIN_MIN_ROWS = 24;
@@ -680,6 +680,8 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
   if (spec.scenario === 'next-queue') return runNextQueueScenario(spec, root, base, reply, done);
   if (spec.scenario === 'next-proactive-continue') return runNextProactiveContinueScenario(spec, root, base);
   if (spec.scenario === 'next-wakeup') return runNextWakeupScenario(spec, root, base, reply, done);
+  if (spec.scenario === 'next-idle-draft-wakeup') return runNextIdleDraftWakeupScenario(spec, root, base, done);
+  if (spec.scenario === 'next-empty-backspace-wakeup') return runNextEmptyBackspaceWakeupScenario(spec, root, base, done);
   if (spec.scenario === 'next-paste') return runNextPasteScenario(spec, root, base, reply);
   if (spec.scenario === 'next-goal-continue') return runNextGoalContinueScenario(spec, root, base);
   if (spec.scenario === 'next-goal-interim') return runNextGoalInterimScenario(spec, root, base);
@@ -806,7 +808,7 @@ export function queueWakeInterrupted(events: LogEvent[], users: string[]): boole
 export function queueWakeResponseShown(screen: string, reply: string): boolean {
   const lines = screen.split('\n');
   const composer = lines.reduce((last, line, index) => line.startsWith('❯') ? index : last, -1);
-  const queued = lines.findIndex((line) => /^(?:›|>)\s+다섯째\s*$/.test(line));
+  const queued = lines.findIndex((line) => /^(?:❯|›|>)\s+다섯째\s*$/.test(line));
   return composer >= 0 && lines[composer]!.trim() === '❯ 미전송 초안'
     && queued >= 0 && queued < composer && lines.slice(queued + 1, composer).join('\n').includes(reply)
     && !/응답 중단 확인|Confirm stopping turn/.test(screen);
@@ -857,7 +859,7 @@ async function runNextQueueScenario(spec: NextTuiScenarioSpec, root: string, bas
     queueShownWhileBusy: /(대기 2|2 queued|2 steer pending)/.test(frame('busy with two queued')) || (frame('busy with two queued').includes('1 steer pending') && frame('busy with two queued').includes('1 queued')), // #38392
     userTurnsInOrder: JSON.stringify(store.user.slice(0, 3)) === JSON.stringify([`첫 질문 ${slow}`, '둘째 질문', '셋째 질문']),
     threeReplies: count(frame('after settle'), reply) === 3,
-    draftKept: (frame('after settle').split('\n').find((line) => line.startsWith('❯')) ?? '').includes('쓰던 초안'), // #38392 footer moves below composer
+    draftKept: (frame('after settle').split('\n').filter((line) => line.startsWith('❯')).at(-1) ?? '').includes('쓰던 초안'), // The composer is the last prompt, after prior user turns.
     escWakesQueuedTurn: queueWakeInterrupted(events, store.user) && queueWakeResponseShown(escFrame, reply)
       && store.user.some((u) => u.endsWith('다섯째')) && count(escFrame, reply) >= 1, // 큐 문장이 다음 턴의 사용자 콘텐츠로 보존 — 유실 없음(중단 문맥 노트가 앞에 붙어도 문장은 꼬리로 남는다; 탐침 실측)
     escCancelsWithoutShellConfirmation: !escFrame.includes('응답 중단 확인'),
@@ -953,7 +955,7 @@ async function runNextWakeupScenario(spec: NextTuiScenarioSpec, root: string, ba
     { label: 'busy over the due time', text: '긴 작업 하나', until: (s) => /(응답 중|턴 스트리밍|running|turn streaming|Thinking)/.test(s), timeoutMs: 30_000 }, // #38392 영어 크롬
     { label: 'long turn done', until: done(2, '긴 작업 하나'), timeoutMs: 30_000 },
     // TUI-NOTICE-QUIET (대표 11-24): the resume banner is no longer drawn — the third answered turn is the surface.
-    { label: 'woke after one deferral', until: (s) => done(3)(s), timeoutMs: 30_000 },
+    { label: 'woke after one deferral', until: (s) => done(3)(s) || (isSettledNextTuiScreen(s) && s.includes('변화 없음') && activeUserTexts(root).user.some((t) => t.startsWith('[예약 깨움 w1] 점검'))), timeoutMs: 30_000 },
   ];
   const run = await mockSeatPtySequence({
     ...base,
@@ -983,6 +985,71 @@ async function runNextWakeupScenario(spec: NextTuiScenarioSpec, root: string, ba
     exitedClean: run.exitCode === 0,
   };
   return { scenario: spec.scenario, universe: root, run, store: { ...store, reply }, logs, checks };
+}
+
+/** Real wall-clock regression: leave an unsent draft for three minutes while a scheduled wake retries. */
+async function runNextIdleDraftWakeupScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, done: Done): Promise<NextTuiScenarioResult> {
+  const draft = 'unsent draft remains';
+  let typedAt = 0;
+  let diagnosed = false;
+  const run = await mockSeatPtySequence({
+    ...base,
+    env: { ...base.env, [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: '예약해줘', name: 'ScheduleWakeup', args: { delaySeconds: 60, reason: 'idle draft check' } }) },
+    steps: [
+      { label: 'scheduled', text: '60초 뒤 예약해줘', until: done(1) },
+      { label: 'draft', text: draft, enter: false, until: (s) => {
+        const visible = s.split('\n').some((line) => line.startsWith('❯ ') && line.includes(draft));
+        if (visible && !typedAt) typedAt = Date.now();
+        return visible;
+      } },
+      { label: 'three minutes and wake', until: (s) => {
+        const waited = typedAt > 0 && Date.now() - typedAt >= 180_000;
+        const preserved = s.split('\n').some((line) => line.startsWith('❯ ') && line.includes(draft));
+        const user = activeUserTexts(root).user;
+        const stored = user.some((t) => t.startsWith('[예약 깨움 w1] idle draft check'));
+        if (waited && !diagnosed) {
+          diagnosed = true;
+          console.error('idle-draft diagnostic:', JSON.stringify({ waited, preserved, stored, user }));
+        }
+        return waited && preserved && stored;
+      }, timeoutMs: 260_000 },
+    ],
+  });
+  const logs = readLogs(spec, 'tui.wakeup,tui.autoturn,llm.route-decision');
+  const events = parseEvents(logs);
+  const store = activeUserTexts(root);
+  const last = run.frames.at(-1);
+  const checks = {
+    waitedThreeMinutes: Boolean(last && typedAt && Date.parse(last.at) - typedAt >= 180_000),
+    draftPreserved: Boolean(last?.screen.split('\n').some((line) => line.startsWith('❯ ') && line.includes(draft))),
+    wakeTurnStored: store.user.some((t) => t.startsWith('[예약 깨움 w1] idle draft check')),
+    onlyFakeProvider: onlyFake(events),
+    exitedClean: run.exitCode === 0,
+  };
+  return { scenario: spec.scenario, universe: root, run, store, logs, checks };
+}
+
+/** Real Next PTY: the final Backspace must not latch HumanTyping indefinitely. */
+async function runNextEmptyBackspaceWakeupScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, done: Done): Promise<NextTuiScenarioResult> {
+  let scheduledAt = 0;
+  let erasedAt = 0;
+  let premature = false;
+  const stored = () => activeUserTexts(root).user.some((t) => t.startsWith('[예약 깨움 w1] empty backspace check'));
+  const run = await mockSeatPtySequence({
+    ...base,
+    env: { ...base.env, [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: '예약해줘', name: 'ScheduleWakeup', args: { delaySeconds: 60, reason: 'empty backspace check' } }) },
+    steps: [
+      { label: 'scheduled', text: '60초 뒤 예약해줘', until: (s) => { if (!done(1)(s)) return false; scheduledAt = Date.now(); return true; } },
+      { label: 'near deadline', until: () => Date.now() - scheduledAt >= 55_000, timeoutMs: 65_000 },
+      { label: 'type', text: 'x', enter: false, until: (s) => s.split('\n').some((line) => line.startsWith('❯ ') && line.trimEnd().endsWith('x')) },
+      { label: 'backspace', keys: '\x7f', until: (s) => { const empty = s.split('\n').some((line) => line.trim() === '❯'); if (empty && !erasedAt) erasedAt = Date.now(); return empty; } },
+      { label: 'wake after typing', until: () => { if (Date.now() - erasedAt < 10_000 && stored()) premature = true; return stored(); }, timeoutMs: 150_000 },
+    ],
+  });
+  const logs = readLogs(spec, 'tui.wakeup,tui.autoturn,llm.route-decision');
+  const store = activeUserTexts(root);
+  const checks = { erased: erasedAt > 0, notPremature: !premature, wakeTurnStored: stored(), onlyFakeProvider: onlyFake(parseEvents(logs)), exitedClean: run.exitCode === 0 };
+  return { scenario: spec.scenario, universe: root, run, store, logs, checks };
 }
 
 /** TUI-NEXT-FOLD-DEFAULT — real Bash tool call; both progressive MessageBlock and saved tool row are selectable. */

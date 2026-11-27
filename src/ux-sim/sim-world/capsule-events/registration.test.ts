@@ -27,7 +27,8 @@ test('capsule-events registers one default C1 and the other scenes with literal 
     { id: 'C4', module: 'src/ux-sim/sim-world/capsule-events/c4-agent-background.ts' },
     { id: 'C3-ESC', module: 'src/ux-sim/sim-world/capsule-events/c3-esc-cancel.ts' },
     { id: 'C1-HARNESS', module: 'src/ux-sim/sim-world/capsule-events/c1-harness.ts' },
-    { id: 'C9-SESSION-SCOPED', module: 'src/ux-sim/sim-world/capsule-events/c9-session-scoped.ts' }]);
+    { id: 'C9-SESSION-SCOPED', module: 'src/ux-sim/sim-world/capsule-events/c9-session-scoped.ts' },
+    { id: 'A1', module: 'src/ux-sim/sim-world/capsule-events/a1-sample.ts' }]);
   expect(simWorldScenarios.map(row => row.id)).toEqual(['C1', 'C5', 'C6']);
   expect(table.entries['capsule-events/S3-AGENT']).toMatchObject({
     expect: 'red', redReason: 'S3 production Agent boundary unmeasured',
@@ -73,4 +74,11 @@ test('capsule-events registers one default C1 and the other scenes with literal 
   expect(table.entries['capsule-events/C9-SESSION-SCOPED']).toEqual({ expect: 'green',
     reason: "C9 session scope: two seat sessions built from the tree REPL tools run background RunShell capsules at once and each drain takes only its own completion; an idle seat's supplement Agent completion becomes one queued notice and opens no turn. The shared persisted queue file across REPL processes stays unmeasured (FU).",
     greenSince: 'ELN-CAPSULE-COMPLETION-SCOPED' });
+  // A1 (CAPSULE-A1-POLICY · the 11-18 46-minute sample): measured red first on main (0 policy rows),
+  // green since the dispatch junction asks the policy for every capsule-family tool.
+  // terra r9 mustFix[1]: the exposed wording states the SYNTHESIS provenance exactly — the audit directly
+  // observed only Bash·Agent; harness·MCP are structural-synthesis probes (감사 미확인), NOT a verbatim replay.
+  expect(table.entries['capsule-events/A1']).toEqual({ expect: 'green',
+    reason: 'A1 structural-synthesis sample (NOT a verbatim replay of the 11-18 46-minute turn): the audit directly observed only the Bash·Agent axes — the harness·MCP axes are structural-synthesis probes built on the audit\'s capsule-family structure, dispatched in ONE main turn to measure the junction; every axis lands a turn-life:capsule-policy judgment row (tool·kind·mode·syncCapMs·reason); judgment-only, the behavioral detach stays in the A2 shell host wiring',
+    greenSince: '2026-11-21 (pool4-capsule-a1-sample branch wiring commit · base 3ac94594af)' });
 });

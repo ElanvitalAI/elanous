@@ -2,7 +2,7 @@
 import { describe, expect, test } from 'bun:test';
 import { renderCountdown, renderFlowLane, renderHandGrid, renderHostTile, renderPulseDot, renderSparkline, renderTicker } from '../index.js';
 import { renderBurstBoard } from './burst-board.js';
-import { BURST_FIXTURE_NAMES, burstDemoSnapshot, burstFixture, DEMO_TICKS, playBurstReplay } from './burst-replay.js';
+import { BURST_FIXTURE_NAMES, burstDemoSnapshot, burstFixture, DEMO_TICKS, playBurstReplay, replayQueuePressure } from './burst-replay.js';
 
 describe('burst widgets', () => {
   test('PulseDot breathes on calm ticks, holds when busy', () => {
@@ -68,10 +68,19 @@ describe('renderBurstBoard (120×36 · 80×24 fallbacks)', () => {
     const receipt = renderBurstBoard(burstFixture('receipt'), 80);
     expect(receipt).toContain('  every launched resource released ✓');
   });
+  test('replay queue pressure uses synthetic lane data and reports missing lanes', () => {
+    const snapshot = burstFixture('bursting');
+    expect(replayQueuePressure(snapshot)).toBe('REPLAY (synthetic) · Judge unavailable · Review 1q/2m · Pregate 0q/1m');
+    expect(replayQueuePressure({ ...snapshot, lanes: [] })).toBe('REPLAY (synthetic) · Judge unavailable · Review unavailable · Pregate unavailable');
+  });
   test('the replay writes 4 frames per snapshot and restores the cursor', async () => {
     const out: string[] = [];
     await playBurstReplay({ write: (t) => out.push(t), sleep: async () => {}, columns: () => 80 }, { fromTick: DEMO_TICKS - 2 });
     expect(out.length).toBe(1 + 2 * 4 + 1);
+    const first = out[1]!.replace(/\x1b\[[HKJ]/g, '').trimEnd().split('\n');
+    expect(first.length).toBe(renderBurstBoard(burstDemoSnapshot(DEMO_TICKS - 2), 80, 0).length);
+    expect(first[3]).toContain('REPLAY (synthetic)');
+    expect(first[3]).toContain('Pregate');
     expect(out.at(-1)).toBe('\x1b[?25h');
   });
 });

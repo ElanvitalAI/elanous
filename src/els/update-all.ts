@@ -69,8 +69,11 @@ export interface UpdateAllDeps {
 export interface UpdateBatonPort {
   /** The seat that holds OP authority while OP restarts (cell: TC). */
   readonly acting: string;
-  /** Hand OP → acting right before OP is stopped; `exclude` = the old OP TUI pids (they must not count as the new OP). */
-  hand(reason: string, exclude: readonly number[]): Promise<{ ok: boolean; reason?: string }>;
+  /** ELS-BATON-ACTING-FALLBACK: healthy seats that may hold the lease when `acting` is still restarting after the
+   * patience window, or is down. Tried in order. */
+  readonly fallbacks?: readonly string[];
+  /** Hand OP → `acting` (the chosen seat) right before OP is stopped; `exclude` = the old OP TUI pids (they must not count as the new OP). */
+  hand(reason: string, exclude: readonly number[], acting: string): Promise<{ ok: boolean; reason?: string }>;
   /** The new OP is verified: give the lease back (idempotent — the server may already have returned it). */
   giveBack(memo: string): Promise<boolean>;
   /** OP is skipped this wave: one log line and one alert. */
@@ -80,6 +83,18 @@ export interface UpdateBatonPort {
 const SHA = /^[a-f0-9]{40}$/i;
 const SEAT = /^[A-Z][A-Z0-9_-]{0,63}$/;
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
+/** How long OP waits for the designated acting seat (TC) to finish its own restart before a healthy fallback takes the lease. */
+const BATON_PATIENCE_MS = 10 * 60 * 1000;
+/** Past the run deadline, OP alone keeps waiting this much longer (11-26: every rail skipped OP because TC's turn
+ * boundary came after the deadline and the CEO migrated OP by hand). */
+const BATON_EXTRA_MS = 20 * 60 * 1000;
+
+/** One plain line for a refusal reason; the operator-seat refusal says where to run from. */
+export function updateAllReasonText(reason: string, sender: string | null, cwd: string): string {
+  if (reason !== 'operator-seat-required') return reason;
+  return `operator-seat-required — update-all runs as OP (or RES-INFRA), but this shell is ${sender ? `seat ${safe(sender)}` : 'not a seat'} (cwd ${safe(cwd)}). `
+    + 'Run it from ~/elanous-hq/seats/OP (cd ~/elanous-hq/seats/OP && els update-all), or set COORD_ID=OP.';
+}
 
 function safe(value: string): string { return value.replace(/[\x00-\x1f\x7f-\x9f|]/g, ' ').slice(0, 160); }
 
@@ -216,6 +231,13 @@ export async function updateAllElsTabs(deps: UpdateAllDeps): Promise<{ ok: boole
     verifiedElnRows.add(index);
     const old = matches[0]!;
     if (!old.sessionId) { rows.push({ tab: pane.address, seat, result: 'failed', detail: 'session identity unavailable' }); return; }
+    // UPDATE-ALL-SKIP-CURRENT (11-26 · hands rebooted twice per rail): a TUI that already runs the desired install is not
+    // migrated again. A second update-all wave (2–3 min after the first) re-sent migrate to panes that had just relaunched
+    // on the new build, so each hand rebooted a second time (`tui.self-restart relaunch staleReason: same-as-installed`,
+    // 14 of 34 relaunches on 11-26 21:30–23:58) and lost its turn context and queue for nothing.
+    if (old.build?.source === 'installed' && old.build.sha.toLowerCase() === desired.toLowerCase()) {
+      rows.push({ tab: pane.address, seat, result: 'updated', detail: desired.slice(0, 12) }); return;
+    }
     const expected = { id: old.id, ownerPid: old.ownerPid, sessionId: old.sessionId, workdir: pane.cwd };
     const prior = seen.get(seat);
     if (prior && (prior.expected.id !== expected.id || prior.expected.ownerPid !== expected.ownerPid
@@ -258,27 +280,44 @@ export async function updateAllElsTabs(deps: UpdateAllDeps): Promise<{ ok: boole
     for (const pane of deferredOp.splice(0)) rows.push({ tab: pane.address, seat: 'OP', result: 'waiting', detail: `OP not restarted this wave: ${why}` });
     try { await deps.baton?.skip(why); } catch { /* the skip row is the record */ }
   };
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const patienceAt = deps.now() + Math.min(BATON_PATIENCE_MS, Math.floor(timeoutMs / 3));
   const startOp = async (current: readonly UpdateSeatRow[]): Promise<void> => {
     const baton = deps.baton!;
-    if (pending.has(baton.acting)) return; // the acting seat is restarting: wait for it
-    const actingRows = rows.filter(row => row.seat === baton.acting && !row.tab.endsWith(':*'));
-    // Healthy = a live eln TUI row for the acting seat, or (a codex/claude acting seat) its live local pane.
-    const actingAlive = current.some(row => row.kind === 'tui' && row.alive && row.seat === baton.acting)
-      || listing.panes.some(pane => pane.seat === baton.acting && pane.reach === 'local' && pane.state !== 'exited'
-        && ['codex', 'claude', 'grok'].includes(pane.kind ?? ''));
-    if (!actingAlive || actingRows.some(row => row.result === 'failed' || row.result === 'waiting')) { await skipOp('acting-unhealthy'); return; }
+    const candidates = [baton.acting, ...(baton.fallbacks ?? []).filter(seat => seat !== baton.acting && seat !== 'OP')];
+    // Healthy = not restarting, no failed/waiting row, and a live eln TUI row (or a live codex/claude/grok local pane).
+    const healthy = (seat: string): boolean => !pending.has(seat)
+      && !rows.some(row => row.seat === seat && !row.tab.endsWith(':*') && (row.result === 'failed' || row.result === 'waiting'))
+      && (current.some(row => row.kind === 'tui' && row.alive && row.seat === seat)
+        || listing.panes.some(pane => pane.seat === seat && pane.reach === 'local' && pane.state !== 'exited'
+          && ['codex', 'claude', 'grok'].includes(pane.kind ?? '')));
+    // The designated seat restarting gets the patience window first; then any healthy candidate may hold the lease.
+    if (pending.has(baton.acting) && deps.now() < patienceAt) return;
+    const chosen = candidates.find(healthy);
+    if (!chosen) {
+      if (candidates.some(seat => pending.has(seat))) return; // a candidate is still restarting: keep waiting
+      await skipOp('acting-unhealthy'); return;
+    }
     const oldPids = current.filter(row => row.kind === 'tui' && row.seat === 'OP').map(row => row.ownerPid);
     let handed: { ok: boolean; reason?: string };
-    try { handed = await baton.hand(`update-all migration to ${desired.slice(0, 12)}`, oldPids); }
+    try { handed = await baton.hand(`update-all migration to ${desired.slice(0, 12)}`, oldPids, chosen); }
     catch (error) { handed = { ok: false, reason: error instanceof Error ? error.message : String(error) }; }
     if (!handed.ok) { await skipOp(`acting-unhealthy (hand refused: ${safe(handed.reason ?? 'unknown')})`); return; }
-    deps.progress?.(`OP lease handed to ${safe(baton.acting)} · migrating OP`);
+    deps.progress?.(`OP lease handed to ${safe(chosen)}${chosen === baton.acting ? '' : ` (fallback: ${safe(baton.acting)} ${pending.has(baton.acting) ? 'still restarting' : 'unhealthy'})`} · migrating OP`);
     for (const pane of deferredOp.splice(0)) await requestPane(pane);
     if (!pending.has('OP')) { try { await baton.giveBack('OP migration was not started'); } catch { /* lease expires on its own */ } }
   };
-  const deadline = deps.now() + (deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const deadline = deps.now() + timeoutMs;
+  // OP alone may run past the deadline (bounded) while its baton or its own restart is unresolved.
+  const opDeadline = deadline + Math.min(BATON_EXTRA_MS, Math.floor(timeoutMs * 2 / 3));
+  const opUnresolved = (): boolean => !!deps.baton && (deferredOp.length > 0 || pending.has('OP'));
+  let extendedNoted = false;
   let nextProgress = deps.now() + 30_000;
-  while ((pending.size || deferredOp.length) && deps.now() < deadline) {
+  while ((pending.size || deferredOp.length) && (deps.now() < deadline || (opUnresolved() && deps.now() < opDeadline))) {
+    if (!extendedNoted && deps.now() >= deadline) {
+      extendedNoted = true;
+      deps.progress?.(`Deadline reached; OP keeps waiting up to ${Math.ceil((opDeadline - deps.now()) / 1000)}s more for its baton`);
+    }
     let current: readonly UpdateSeatRow[];
     try { await deps.sleep(1_000); current = deps.seats(); }
     catch (error) {

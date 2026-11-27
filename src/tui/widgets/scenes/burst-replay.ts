@@ -14,6 +14,7 @@ import { burstCourse, DEFAULT_BURST_CONFIG, DEFAULT_LEAD_MIN, forecast, recordLa
   type BurstState, type HostSlots, type ScaleDecision } from '../../../loops/op-pulse-burst.js';
 import type { Hand } from '../hand-grid.js';
 import type { TickerEvent } from '../ticker.js';
+import { fit } from '../text.js';
 import { BURST_FRAMES, renderBurstBoard, type BurstBoardSnapshot, type BurstReceipt } from './burst-board.js';
 import { boardSnapshot, planBurst, type HostMeasure, type LaneMeasure } from './burst-engine.js';
 import { paintBoard, renderBurstPanels, type PanelOverlay } from './burst-board-panels.js';
@@ -98,12 +99,13 @@ const cap = (w: World, s: Stage): number => (DEMO_WORLD.base[s] + lvl(w, s)) * D
 const rolling = (xs: readonly number[], end: number, n = 30): number => xs.slice(Math.max(0, end - n + 1), end + 1).reduce((a, b) => a + b, 0) * (30 / n);
 const waitMin = (q: number, perH: number): number => (perH > 0 ? (q / perH) * 60 : 0);
 
-function laneMeasures(w: World): Partial<Record<'Hands' | 'Review' | 'Pregate' | 'Judge' | 'Land', LaneMeasure>> {
+function laneMeasures(w: World): Partial<Record<'Hands' | 'Review' | 'Pregate' | 'Veto' | 'Land', LaneMeasure>> {
   const handsRate = handCount(w) * DEMO_WORLD.ratePerUnitH.hands;
   const m = (s: Stage): LaneMeasure => ({ queue: Math.round(w.q[s]), waitMin: waitMin(w.q[s], cap(w, s)), base: DEMO_WORLD.base[s], ratePerH: cap(w, s) });
   return {
     Hands: { queue: Math.round(w.backlog), waitMin: waitMin(w.backlog, handsRate), base: DEMO_WORLD.base.hands, ratePerH: handsRate },
-    Review: m('review'), Pregate: m('pregate'), Judge: m('judge'), Land: m('land'),
+    // JUD-RELAX (CEO 11-26): veto only — no item waits for a JUD judgement in the demo world either.
+    Review: m('review'), Pregate: m('pregate'), Veto: { queue: 0, waitMin: null, base: 0 }, Land: m('land'),
   };
 }
 
@@ -140,8 +142,7 @@ function flow(w: World): void {
     return out;
   };
   const landed = move('land', null);
-  move('judge', 'land');
-  move('pregate', 'judge');
+  move('pregate', 'land'); // JUD-RELAX: pregate → land (JUD = veto only, no judge stage)
   move('review', 'pregate');
   w.q.review += handsOut;
   w.landedTicks.push(landed);
@@ -359,6 +360,15 @@ export type BurstFixtureName = keyof typeof BURST_FIXTURES;
 export const BURST_FIXTURE_NAMES = Object.keys(BURST_FIXTURES) as BurstFixtureName[];
 export const burstFixture = (name: BurstFixtureName): BurstBoardSnapshot => burstDemoSnapshot(BURST_FIXTURES[name]());
 
+/** A replay-only queue snapshot, not a live measurement or a derived severity. */
+export function replayQueuePressure(snapshot: BurstBoardSnapshot): string {
+  const labels = ['Judge', 'Review', 'Pregate'] as const;
+  return `REPLAY (synthetic) · ${labels.map((label) => {
+    const lane = snapshot.lanes.find((item) => item.label === label);
+    return lane ? `${label} ${lane.queue}q${lane.waitMin == null ? '' : `/${lane.waitMin}m`}` : `${label} unavailable`;
+  }).join(' · ')}`;
+}
+
 export interface ReplayIo {
   readonly write: (text: string) => void;
   readonly sleep: (ms: number) => Promise<void>;
@@ -386,7 +396,13 @@ export async function playBurstReplay(io: ReplayIo, opts: { readonly speed?: num
     for (let t = opts.fromTick ?? 0; t < DEMO_TICKS; t++) {
       const snapshot = burstDemoSnapshot(t, opts.seed ?? 1);
       for (let f = 0; f < BURST_FRAMES; f++) {
-        const lines = renderForTerminal(snapshot, Math.max(40, io.columns()), io.rows?.() ?? 36, f, io.color === true);
+        const columns = Math.max(40, io.columns());
+        const rows = io.rows?.() ?? 36;
+        const lines = renderForTerminal(snapshot, columns, rows, f, io.color === true);
+        if (columns < 140 || rows < 40) {
+          const width = columns >= 100 ? Math.min(columns, 120) : Math.min(columns, 80);
+          lines[width >= 100 ? 2 : 3] = fit(replayQueuePressure(snapshot), width);
+        }
         io.write(`\x1b[H${lines.map((l) => `${l}\x1b[K`).join('\n')}\x1b[J`);
         await io.sleep(frameMs);
       }

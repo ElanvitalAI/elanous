@@ -1,0 +1,16 @@
+# FED-FACT-OP-ACTIONS (0.3.38 P1 · OP 11-27) — the 6-axis rubric's «성과» (achievement) axis, read from the fed ledger
+# (src/fed-state/actions.ts). Policy values live here, not in TS (YAML-SYSTEM «정의만으로 도는 시스템»).
+version: 1
+achievement:
+  # Facts that count as a state-changing action of the seat that decided them (decidedBy, else seat).
+  # «type:state» · «type:*» = every state of that type. mail / turn / beat are never actions (mail:ack scored OP 1 on 11-27).
+  count:
+    - cell:assign
+    - cell:veto
+    - cell:reassign
+    - cell:green
+    - decision:*
+    - hold:*
+    - land:*
+  # Score 1..5 = 1 + the number of steps the window's actions-per-hour reaches.
+  actions_per_hour_steps: [1, 3, 6, 10]

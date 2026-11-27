@@ -47,8 +47,9 @@ export async function liveHandPool(input: { panes?: readonly { seat?: unknown; s
   let cells: Parameters<typeof buildHandPool>[0]['cells'] = [];
   let history: Parameters<typeof buildHandPool>[0]['history'] = [];
   try {
-    const { checklistDevVersion, listChecklist } = require('../release-loop/checklist.js') as typeof import('../release-loop/checklist.js');
-    const list = listChecklist(checklistDevVersion());
+    const { listChecklist } = require('../release-loop/checklist.js') as typeof import('../release-loop/checklist.js');
+    const { activeBoardVersion } = require('../ops-dashboard/current-version.js') as typeof import('../ops-dashboard/current-version.js');
+    const list = listChecklist(activeBoardVersion());
     cells = list.items;
     history = list.history;
   } catch { /* no checklist → no cells */ }

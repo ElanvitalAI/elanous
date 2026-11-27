@@ -122,17 +122,19 @@ test('the seat moves on (a coordinator mail turn ends with the plan open again) 
   r.done();
 });
 
-test('a second block with a new reason after the first was escalated reaches the coordinator again (05:57 TC-H-CX-1 hole)', () => {
+test('a second block on another cell after the first was escalated reaches the coordinator again (05:57 TC-H-CX-1 hole)', () => {
+  // HAND-RAISE-FINGERPRINT-DEDUPE (11-26): a ✋'s identity is what it waits on (cell / refs), not its wording — the
+  // second block names another cell, so it is a new ✋; a reworded first block would be a repeat.
   const r = rig();
-  r.gc.noteTurnEnded({ lines: [], plan: planWire('blocked', 'first: owner unknown', 'HUMAN_DECISION') });
+  r.gc.noteTurnEnded({ lines: [], plan: planWire('blocked', 'first: owner unknown for ELS-A1', 'HUMAN_DECISION') });
   r.fire5m();
-  // A mail turn of its own; the plan is still blocked, same words → no new mail.
-  r.gc.noteTurnEnded({ lines: [], plan: planWire('blocked', 'first: owner unknown', 'HUMAN_DECISION') });
+  // A mail turn of its own; the plan is still blocked on the same cell, reworded → no new mail.
+  r.gc.noteTurnEnded({ lines: [], plan: planWire('blocked', 'ELS-A1: who owns it? still unknown', 'HUMAN_DECISION') });
   expect(r.inbox('TC').length).toBe(1);
-  r.gc.noteTurnEnded({ lines: [], plan: planWire('blocked', 'second: the demo branch is gone', 'HUMAN_DECISION') });
+  r.gc.noteTurnEnded({ lines: [], plan: planWire('blocked', 'second: the demo branch for ELS-B2 is gone', 'HUMAN_DECISION') });
   const tc = r.inbox('TC');
   expect(tc.length).toBe(2);
-  expect(tc[1]!.body.startsWith('[✋ NEED HUMAN · TC-H-CX-1] second: the demo branch is gone · ')).toBe(true);
+  expect(tc[1]!.body.startsWith('[✋ NEED HUMAN · TC-H-CX-1] second: the demo branch for ELS-B2 is gone · ')).toBe(true);
   r.done();
 });
 

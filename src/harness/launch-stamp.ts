@@ -112,9 +112,18 @@ export function resolveLaunchStamp(input: LaunchStampInput = {}, env: NodeJS.Pro
   };
 }
 
-/** Read the stamp off a ledger's first row. Missing or unreadable stamps are `unknown`. */
+/** The row that carries the launch stamp: the first `run-origin` row (or any row with `data.launch`). A harness run
+ *  writes authoring rows (`graph.unit` · `child-first-*`) before `run-origin`, so the first row is not the stamp. */
+function stampRow(entries: readonly RunLedgerEntry[] | null | undefined): RunLedgerEntry | undefined {
+  if (!entries) return undefined;
+  return entries.find((entry) => entry?.event === 'run-origin')
+    ?? entries.find((entry) => entry?.data && typeof entry.data === 'object' && 'launch' in entry.data)
+    ?? entries[0];
+}
+
+/** Read the stamp off the ledger's `run-origin` row (first row for older ledgers). Missing or unreadable stamps are `unknown`. */
 export function launchStampFromLedger(entries: readonly RunLedgerEntry[] | null | undefined): LaunchStamp {
-  const first = entries?.[0];
+  const first = stampRow(entries);
   const raw = first?.data?.launch;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return { entrance: 'unknown', actor: '', viaQueue: false };
@@ -137,12 +146,20 @@ export interface DoorRow {
   readonly outsideQueue: number;
 }
 
+export interface DoorExcludedCounts {
+  /** In-window graph-runner ledgers — first row names `data.graphId` without `data.launch`. */
+  readonly graphRun: number;
+  /** In-window seat-turn ledgers — first row event starts with `child-first-`. */
+  readonly seatTurn: number;
+}
+
 export interface DoorTable {
   readonly sinceMs: number;
   readonly runs: number;
   readonly unknown: number;
   readonly outsideQueue: number;
   readonly viaQueue: number;
+  readonly excluded: DoorExcludedCounts;
   readonly rows: readonly DoorRow[];
 }
 
@@ -162,7 +179,30 @@ function entryTime(entry: RunLedgerEntry | undefined): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-/** One row per door that actually fired, plus the period totals. Untagged ledgers count as `unknown`. */
+type LedgerKind = 'harness' | 'graph-run' | 'seat-turn';
+
+/**
+ * Classify a ledger. Any `run-origin` row or `data.launch` property marks a harness run — a harness ledger starts
+ * with authoring rows (`graph.unit` with graphId `self-implement`, `child-first-*` LLM calls) before its
+ * `run-origin` row. Without one, a first row naming `data.graphId` is a graph-runner run and a first row event
+ * starting with `child-first-` is a seat turn. Anything else is an unstamped legacy harness ledger.
+ */
+function ledgerKind(entries: readonly RunLedgerEntry[]): LedgerKind {
+  const harness = entries.some((entry) => entry?.event === 'run-origin'
+    || (entry?.data !== null && typeof entry?.data === 'object' && 'launch' in entry.data));
+  if (harness) return 'harness';
+  const first = entries[0];
+  const data = first?.data;
+  if (data && typeof data === 'object' && 'graphId' in data) return 'graph-run';
+  if (typeof first?.event === 'string' && first.event.startsWith('child-first-')) return 'seat-turn';
+  return 'harness';
+}
+
+/**
+ * One row per door that actually fired, plus the period totals. Untagged
+ * legacy harness ledgers count as `unknown`; graph-runner and seat-turn
+ * ledgers never count as harness runs — they only tally in `excluded`.
+ */
 export function queryLaunchDoors(options: DoorTableOptions = {}): DoorTable {
   const dir = options.dir ?? runLedgerDir();
   const now = options.now ?? Date.now();
@@ -179,6 +219,8 @@ export function queryLaunchDoors(options: DoorTableOptions = {}): DoorTable {
   let unknown = 0;
   let outsideQueue = 0;
   let viaQueue = 0;
+  let excludedGraphRun = 0;
+  let excludedSeatTurn = 0;
   for (const file of list(dir)) {
     if (!file.endsWith('.jsonl')) continue;
     const runId = file.slice(0, -'.jsonl'.length);
@@ -186,6 +228,15 @@ export function queryLaunchDoors(options: DoorTableOptions = {}): DoorTable {
     if (!entries || entries.length === 0) continue;
     const started = entryTime(entries[0]);
     if (started !== undefined && started < cutoff) continue;
+    const kind = ledgerKind(entries);
+    if (kind === 'graph-run') {
+      excludedGraphRun += 1;
+      continue;
+    }
+    if (kind === 'seat-turn') {
+      excludedSeatTurn += 1;
+      continue;
+    }
     const stamp = launchStampFromLedger(entries);
     runs += 1;
     if (stamp.entrance === 'unknown') unknown += 1;
@@ -204,12 +255,21 @@ export function queryLaunchDoors(options: DoorTableOptions = {}): DoorTable {
       outsideQueue: row.runs - row.viaQueue,
     }))
     .sort((left, right) => right.runs - left.runs || left.entrance.localeCompare(right.entrance));
-  return { sinceMs, runs, unknown, outsideQueue, viaQueue, rows };
+  return {
+    sinceMs,
+    runs,
+    unknown,
+    outsideQueue,
+    viaQueue,
+    excluded: { graphRun: excludedGraphRun, seatTurn: excludedSeatTurn },
+    rows,
+  };
 }
 
 export function renderLaunchDoors(table: DoorTable): string {
   const lines = [
     `doors  runs=${table.runs}  outside-queue=${table.outsideQueue}  via-queue=${table.viaQueue}  unknown=${table.unknown}`,
+    `excluded graph-run=${table.excluded.graphRun} seat-turn=${table.excluded.seatTurn}`,
     'entrance          runs  via-queue  outside-queue',
   ];
   for (const row of table.rows) {

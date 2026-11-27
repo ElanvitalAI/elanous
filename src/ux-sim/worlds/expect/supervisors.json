@@ -1,0 +1,175 @@
+{
+  "schema": 1,
+  "entries": {
+    "supervisors/SUP-RUN-SUPERVISOR": {
+      "expect": "green",
+      "greenSince": "2026-11-27 supervisors sim (this PR)",
+      "reason": "stalled TA run + 90 min+ pregate → close-zombie-run + end-zombie-pregate (exact PID) · zombie_runs line · a record whose pid was reused → closed-stale-record (no kill · no card · never retried) · an unkillable zombie → one kpi-breach to TC"
+    },
+    "supervisors/SUP-RUN-DOCTOR": {
+      "expect": "green",
+      "greenSince": "2026-11-27 supervisors sim (this PR)",
+      "reason": "RED tsc timeout (124) → retry-other-host · content RED → diagnose · re_success_ratio 0 → 0.5 · content-only REDs → one kpi-breach to TC"
+    },
+    "supervisors/SUP-AUTOPSY": {
+      "expect": "green",
+      "greenSince": "2026-11-27 supervisors sim (this PR)",
+      "reason": "refused land + closed PR + dead run → classified (land:tsc · pr:superseded · run:pod-died) · unclassified 3 → 0 · no-evidence close → one kpi-breach to OP"
+    },
+    "supervisors/SUP-MACROPHAGE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 delegated bodies (decision 11-27)",
+      "reason": "macrophage card reaps through the guardian reaper (real planReap): the 3 h test-universe orphan once by exact PID · young orphan and seat untouched · unkillable → one RES card (5 seeds)"
+    },
+    "supervisors/SUP-WATCHERS-CHECK": {
+      "expect": "green",
+      "greenSince": "2026-11-27 supervisors sim (this PR)",
+      "reason": "missing + DEAD heartbeat → restart both · missing_heartbeats 2 → 0 · still dead → one kpi-breach to OP"
+    },
+    "supervisors/SUP-SILENCE-WATCH": {
+      "expect": "green",
+      "greenSince": "2026-11-27 supervisors sim (this PR)",
+      "reason": "seat with requests past SLA → one bell per addressee · no reading body → one notice a day per (addressee, sender) · never answered → one kpi-breach to OP"
+    },
+    "supervisors/SUP-TRAIN-MANAGER": {
+      "expect": "green",
+      "greenSince": "2026-11-27 delegated bodies (decision 11-27)",
+      "reason": "train-manager card → land-steward: hot-file storm (3 PRs · 2 churn) → one pin proposal to TC (mail only) · pinned lane untouched · churn past escalate → one TC card (5 seeds)"
+    },
+    "supervisors/SUP-RELEASE-ROCKET": {
+      "expect": "green",
+      "greenSince": "2026-11-27 supervisors sim (this PR)",
+      "reason": "cut countdown with rehearsal due → start-rehearsal · late_milestones line · failed publish → one kpi-breach to OP"
+    },
+    "supervisors/SUP-HAND-STEWARD": {
+      "expect": "green",
+      "greenSince": "2026-11-27 supervisors sim (this PR)",
+      "reason": "idle hand + unowned ready cell → assign (hint · pull mail) · hint write fails → one kpi-breach to OP"
+    },
+    "supervisors/SUP-POOL-NEEDS-SPEC": {
+      "expect": "green",
+      "greenSince": "2026-11-27 POOL-PULL-NEEDS-SPEC (this PR)",
+      "reason": "seeds s..s+4 · 12 pool cells: with pull.requireDoneWhen hands claim exactly the cells with a done-when, none without · the board steward sends OP one needs-spec line naming the rest, not repeated on the same set · policy off offers all 12"
+    },
+    "supervisors/SUP-SUBJECT-LOST": {
+      "expect": "green",
+      "greenSince": "2026-11-27 supervisors sim (this PR)",
+      "reason": "all nine: subject unreadable 3 ticks → one reattach proposal to the literal L0 · one channel line · KPI stays unknown"
+    },
+    "supervisors/SUP-GUARDIAN-PULSE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 supervisors sim (guardian #40362 landed)",
+      "reason": "guardian resident pulse: dead supervisor → one restart and a line to its owner (not again on the next pulse) · bad 90 min → reattach proposal to its owner · healthy untouched (seeds s..s+2)"
+    },
+    "supervisors/KIT-ROLE-LLM": {
+      "expect": "green",
+      "greenSince": "2026-11-27 kit step 1 (#40402)",
+      "reason": "every loop voice = one streamLLM call with its usage site (5 sites × seeds) · no role / no provider → no LLM · a stream 429 surfaces to the caller"
+    },
+    "supervisors/KIT-LESSONS": {
+      "expect": "green",
+      "greenSince": "2026-11-27 kit step 1 (#40402)",
+      "reason": "butler lesson = shell row (pattern cell:<id>) · shell decay rewrite keeps the cell · legacy row reads · decayed row dropped · torn line not kept"
+    },
+    "supervisors/KIT-LAND-LOCK": {
+      "expect": "green",
+      "greenSince": "2026-11-27 kit step 1 (#40402)",
+      "reason": "land-graph tick lock: dead pid taken over 1 min later · live pid held · unreadable pid held at 10 min, taken at 61 min"
+    },
+    "supervisors/KIT-RELEASE-TARGET": {
+      "expect": "green",
+      "greenSince": "2026-11-27 kit step 1 (#40402)",
+      "reason": "release.graph.version 0.3.38 wins over earliest 0.3.37 · unset / run-less target → earliest · past-tail run not active"
+    },
+    "supervisors/SUP-REAP-OVERLAP": {
+      "expect": "green",
+      "greenSince": "2026-11-27 delegated bodies (decision 11-27)",
+      "reason": "guardian sanitize and the macrophage card on the same orphan, both orders → one kill and one audit row per target (5 seeds)"
+    },
+    "supervisors/SUP-LANE-POLICY": {
+      "expect": "green",
+      "greenSince": "2026-11-27 delegated bodies (decision 11-27)",
+      "reason": "real tickLand with the land-steward pack: pinned PR of a hot-file lane lands first · no pack → PR-number order · shipped pack parses (5 seeds)"
+    },
+    "supervisors/SUP-V3-EQUIV": {
+      "expect": "green",
+      "greenSince": "2026-11-27 YAML-SUPERVISORS-DEF",
+      "reason": "nine agent.yaml lint clean · v2 numbers and L0 (literal table) · v2 step order · same world ⇒ same reports and case kinds with v2 card vs agent.yaml (5 seeds)"
+    },
+    "supervisors/SUP-V3-POLICY-CHANGE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 YAML-SUPERVISORS-DEF",
+      "reason": "agent.yaml alone: churn_window_min 60→5 drops train-manager KPI 2→0 · max_per_tick 3→0 leaves the plan unacted (5 seeds)"
+    },
+    "supervisors/SUP-V3-LINT-REFUSES": {
+      "expect": "green",
+      "greenSince": "2026-11-27 YAML-SUPERVISORS-DEF",
+      "reason": "lint refuses missing body policy · unknown node kind · non-portable path · a wake with both cron and condition; refused ⇒ v2 card + one L0 card (5 seeds)"
+    },
+    "supervisors/SUP-V3-PORTABLE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 YAML-SUPERVISORS-DEF deeper verification",
+      "reason": "10 packages copied to a fresh universe lint clean · the 9 shell agents tick once from the copy (5 seeds)"
+    },
+    "supervisors/SUP-V3-SOAK": {
+      "expect": "green",
+      "greenSince": "2026-11-27 YAML-SUPERVISORS-DEF deeper verification",
+      "reason": "24 h synthetic clock × 9 agents with storms · outages · sub-agent down · host down: no double action in cooldown · one beat per tick · L0 cards ≤ episodes (5 seeds)"
+    },
+    "supervisors/SUP-V3-POLICY-FAULT": {
+      "expect": "green",
+      "greenSince": "2026-11-27 YAML-SUPERVISORS-DEF deeper verification",
+      "reason": "one policy key deleted / garbled per agent → lint refuses · one L0 card · v2 card keeps acting (land-steward refused, plain body) (5 seeds)"
+    },
+    "supervisors/SUP-JD-PARK": {
+      "expect": "green",
+      "greenSince": "2026-11-27 SUPERVISOR-JOURNAL-DEFECTS (this PR)",
+      "reason": "one action failing on one target 3× in a row → parked (no retry · one act-parked card to the L0) · another target still acts · one retry after 24 h re-parks without a new card"
+    },
+    "supervisors/SUP-JD-DEFUNCT": {
+      "expect": "green",
+      "greenSince": "2026-11-27 SUPERVISOR-JOURNAL-DEFECTS (this PR)",
+      "reason": "run-supervisor: 3 <defunct> records → closed-stale-record (no kill · KPI counts only the real zombie) · the real 95-min launcher ended next tick"
+    },
+    "supervisors/SUP-JD-CELL-CAP": {
+      "expect": "green",
+      "greenSince": "2026-11-27 SUPERVISOR-JOURNAL-DEFECTS (this PR)",
+      "reason": "autopsy: 2 cells opened in the last 24 h → no open-cell planned, 0 failed rows · 25 h later the repeated class opens its one cell"
+    },
+    "supervisors/SUP-JD-SILENCE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 SUPERVISOR-JOURNAL-DEFECTS (this PR)",
+      "reason": "silence-watch: 18 re-asks to a reader-less ORCHESTRATOR → no bell · one notice to OP a day · RES mail → GUARDIAN by the dormant reroute · a live TC with 5 requests → one bell"
+    },
+    "supervisors/SUP-WIP1-ACTIVE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 WIP1-ASSIGN-GUARD-ACTIVE-E4 (this PR)",
+      "reason": "real seatAssign: recent commit blocks higher-priority displacement without mutation; inactive lower cell returns to board"
+    },
+    "supervisors/SUP-YAML-RUNTIME": {
+      "expect": "green",
+      "greenSince": "2026-11-27 YAML-SUPERVISORS-RUNTIME (this PR)",
+      "reason": "the real registry builds the trigger from agent.yaml wake: · condition → cron and a new minute in agent.yaml change the registered row · a shim with its own trigger is refused · goal.yaml drift = lint failure, runtime unaffected (5 seeds)"
+    },
+    "supervisors/SUP-YAML-SHIPPED": {
+      "expect": "green",
+      "greenSince": "2026-11-27 YAML-SUPERVISORS-RUNTIME (this PR)",
+      "reason": "the nine shims are pure from_agent shims · decls come from agent.yaml · goal.yaml generated and parity-clean"
+    },
+    "supervisors/SUP-V3-SMART-LEARN": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LOOP-AGENT-V3-SMART-2 (this PR)",
+      "reason": "run-supervisor on the real shell with agent.yaml hooks: end-zombie-pregate fails 3× with one cause → one knowhow line with the cause → next tick the plan cites it and runs the fallback close-stale-record on a new record (no kill) · human knowhow ⊕ lesson cited in the plan · no duplicate line (3 seeds)"
+    },
+    "supervisors/SUP-V3-RETRO-SOUL": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LOOP-AGENT-V3-SMART-2 (this PR)",
+      "reason": "retro after retro_every_h: worked · failed and why · one change to try (case ⊕ retros.jsonl) · the voice prompt carries the soul block and quotes the retro · soul do_not vetoes the fallback · all 11 agent.yaml carry a soul and one without is refused (3 seeds)"
+    },
+    "supervisors/SUP-LOOP-EXCEPTION": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LOOP-EXCEPTION-WATCH (this PR)",
+      "reason": "release-traffic exception 3 min after rail 95: one registry retry → done → case resolved, no card · persistent: 2 retries → one OP card (run id · node · reason) → escalated · guardian «미정상화 사건» 1 · OP world card Loops line (5 seeds)"
+    }
+  }
+}

@@ -10,6 +10,7 @@
 // Machine fields ride in `refs` (block:/seat:/pane:/reason:) and `correlationId` = blockId; priority comes from intent=decision (P1).
 import type { BlockReason, HandCause } from '../agent-events/protocol.js';
 import type { MessageEnvelope } from '../msg/msg-store.js';
+import { classifyHandBlock, handAskCell, handAskRef, handNeedsClassifier, resolveHandRoot, waitedOnRefs, routeHandBlock, type HandClassification, type HandRootClassifier } from '../kit/mail-route/hand-route.js';
 
 export const ESCALATE_AFTER_MS = 5 * 60_000;
 
@@ -35,6 +36,15 @@ export interface NeedsHumanDeps {
   readonly clearTimer: (handle: unknown) => void;
   readonly newBlockId?: () => string;
   readonly log?: (event: string, data: Record<string, unknown>) => void;
+  /** KIT mail-route hand-route — the Jev classifier, asked only when the structured codes leave a block unclear
+   *  (absent = old rung at once; unavailable / unclear = old rung). */
+  readonly classifyHand?: HandRootClassifier;
+  /** HAND-RAISE-DOMAIN-ROUTING — the cell this seat holds (its ✋ cell for `hand-ask:` and a `cell-owner` route). */
+  readonly cellOf?: (seat: string) => string | null;
+  /** The checklist owner of a cell (hand-routes.yaml `cell-owner`). */
+  readonly cellOwnerOf?: (cell: string) => string | null;
+  /** The answer already given to ✋ mail #msgId (a by-reference repeat of an answered ask) — null = still open. */
+  readonly answerOf?: (msgId: number, seat: string) => string | null;
 }
 
 export type NeedsHumanHandledBy = 'turn-ack' | 'reply' | 'ack';
@@ -50,12 +60,40 @@ export interface NeedsHumanPush {
   /** Mail arrivals of this seat: a structured reply to this block's mail resumes the seat. Returns true when it did. */
   noteArrivals(arrivals: readonly NeedsHumanArrival[] | undefined): boolean;
   activeBlockId(): string | null;
+  /** Resolves when the first-rung mail of the latest block was routed (immediate unless the classifier was asked). */
+  routing(): Promise<void>;
+}
+
+// HAND-RAISE-FINGERPRINT-DEDUPE (11-26 23:xx · TC-H-POOL-2 sent 24 ✋ for one cause): the hand's model rewords the
+// block every turn, so «same reason + same text» never matched. A ✋'s identity is what it waits on, not its prose:
+// fingerprint = seat · reason · cause · the cell / refs named in it (ids like `TC-12`, `#40310`, `PR 40310` — sorted,
+// case-folded). The same fingerprint again — even after a resume and a new turn — is a repeat: the open ✋ is reused
+// (count · last seen), no new mail, no new card. It is forgotten when a rung replies, or after FINGERPRINT_TTL_MS.
+// 출처: a working day of one seat — an unanswered cause older than this is a new conversation.
+export const FINGERPRINT_TTL_MS = 6 * 60 * 60_000;
+
+// The waited-on refs a ✋ text names (cell ids · mail/PR numbers) — one definition in kit/mail-route (also the ask identity).
+export { waitedOnRefs };
+
+/** Seat · reason · cause · waited-on refs — the ✋'s identity, insensitive to how the sentence is worded. */
+export function handFingerprint(seat: string, reason: string, detail: string, cause?: string): string {
+  const refs = waitedOnRefs(detail).filter((r) => r !== seat.toUpperCase());
+  return `${seat.toUpperCase()}|${reason}|${cause ?? ''}|${refs.join(',')}`;
 }
 
 export function createNeedsHumanPush(deps: NeedsHumanDeps): NeedsHumanPush {
   let counter = 0;
   const newId = deps.newBlockId ?? (() => `blk-${Date.now().toString(36)}-${++counter}`);
-  let active: { blockId: string; reason: BlockReason; detail: string; cause?: HandCause; mailIds: Set<number>; rung: string; lastMailId: number | null; timer: unknown } | null = null;
+  type Block = { blockId: string; reason: BlockReason; detail: string; cause?: HandCause; mailIds: Set<number>; rung: string; lastMailId: number | null; timer: unknown;
+    fingerprint: string; count: number; firstAt: number; lastAt: number; routed?: string[]; ask?: string };
+  let active: Block | null = null;
+  /** Fingerprints with an open ✋ (posted, no reply yet) — survive a resume so a reworded repeat reuses the same ✋. */
+  const open = new Map<string, Block>();
+  /** Asks this process already answered by reference (ask → first row id): a re-block after that answer is a NEW ask
+   *  («answer #N did not unblock»), never a second by-reference resume — no resume loop on a stale answer. */
+  const referenced = new Map<string, number>();
+  const nowMs = (): number => Date.now();
+  let routingDone: Promise<void> = Promise.resolve();
   const log = (event: string, data: Record<string, unknown>): void => { try { deps.log?.(event, data); } catch { /* observation never breaks the turn */ } };
 
   const send = (seat: string, to: string, from: string | null, note?: string): boolean => {
@@ -66,7 +104,8 @@ export function createNeedsHumanPush(deps: NeedsHumanDeps): NeedsHumanPush {
     let failure = 'postMail threw';
     try {
       id = deps.postMail({ from: seat, to, kind: 'request', intent: 'decision', body, correlationId: block.blockId,
-        refs: [`block:${block.blockId}`, `seat:${seat}`, `pane:${deps.paneId()}`, `reason:${block.reason}`, ...(block.cause ? [`cause:${block.cause}`] : []), ...urgencyRef(block)] });
+        refs: [`block:${block.blockId}`, `seat:${seat}`, `pane:${deps.paneId()}`, `reason:${block.reason}`, ...(block.cause ? [`cause:${block.cause}`] : []), ...urgencyRef(block), ...(block.routed ?? []),
+          ...(from === null && block.ask ? [block.ask] : [])] });
       if (!Number.isSafeInteger(id) || id! <= 0) { failure = 'postMail returned no valid message id'; throw new Error(failure); }
     } catch {
       log('seat.needs-human', { phase: 'route-failed', error: failure, rung: to, seat, blockId: block.blockId });
@@ -130,15 +169,68 @@ export function createNeedsHumanPush(deps: NeedsHumanDeps): NeedsHumanPush {
       // The same block persisting (same code and same reason text, e.g. a mail-wake turn that ends still blocked): one mail per blockId.
       // A different reason text is a new block — it goes to the first rung again (05:57 TC-H-CX-1: a second block was swallowed
       // because only the code was compared while the first block, already escalated to OP, was never cleared).
-      if (active && active.reason === reason && active.detail === detail) return;
+      const fingerprint = handFingerprint(seat, reason, detail, cause);
+      const t = nowMs();
+      for (const [fp, b] of open) if (t - b.lastAt > FINGERPRINT_TTL_MS) open.delete(fp);
+      // Same identity as the active ✋, or as an open one from an earlier turn: a repeat — count it, send nothing.
+      const same = active && active.fingerprint === fingerprint ? active : open.get(fingerprint);
+      if (same) {
+        same.count += 1; same.lastAt = t;
+        if (active !== same) { if (active) deps.clearTimer(active.timer); active = same; }
+        log('seat.needs-human', { phase: 'repeat', seat, blockId: same.blockId, count: same.count, fingerprint, msgId: same.lastMailId });
+        return;
+      }
       if (active) { deps.clearTimer(active.timer); active = null; }
-      active = { blockId: newId(), reason, detail, ...(cause ? { cause } : {}), mailIds: new Set(), rung: '', lastMailId: null, timer: null };
+      active = { blockId: newId(), reason, detail, ...(cause ? { cause } : {}), mailIds: new Set(), rung: '', lastMailId: null, timer: null, fingerprint, count: 1, firstAt: t, lastAt: t };
+      open.set(fingerprint, active);
       const coordinator = deps.coordinatorOf();
-      const first = coordinator && coordinator !== seat ? coordinator : seat === 'OP' ? 'CEO' : 'OP';
-      if (first === 'CEO') { toCeo(seat); return; }
-      if (send(seat, first, null)) { arm(seat); return; }
-      // Delivery to the leader failed (no ledger row for the watcher to see): the CEO card is the only rung left.
-      toCeo(seat);
+      const defaultFirst = coordinator && coordinator !== seat ? coordinator : seat === 'OP' ? 'CEO' : 'OP';
+      if (defaultFirst === 'CEO') { toCeo(seat); return; }
+      // KIT mail-route hand-route — the first rung is the owner of the block's root when OP/TC would only forward it
+      // (WIP handover → TC ⊕ the WIP takeover rule · JUD verdict → JUDGE-BUTLER · env/host/lease → GUARDIAN). Structured
+      // codes decide at once; an unstructured line asks Jev once (async) — unavailable/unclear → old rung.
+      const block = active;
+      const cell = (() => { try { return deps.cellOf?.(seat) ?? null; } catch { return null; } })();
+      const input = { seat, defaultTo: defaultFirst, reason, detail, cause: cause ?? null, cell };
+      const ropts = deps.cellOwnerOf ? { cellOwnerOf: deps.cellOwnerOf } : undefined;
+      const deliver = (classification: HandClassification): void => {
+        if (active !== block) return; // resumed or replaced while the classifier was thinking
+        const route = routeHandBlock(input, classification, ropts);
+        if (route.rerouted) {
+          block.routed = [`hand-root:${route.root}`, `hand-routed-from:${defaultFirst}`];
+          log('seat.needs-human', { phase: 'hand-route', seat, blockId: block.blockId, root: route.root, by: route.by, rung: route.to, from: defaultFirst });
+        }
+        // HAND-RAISE-DOMAIN-ROUTING — the ask identity: the post layer folds the same ask inside 30 min into its first row.
+        const ask = handAskRef(route.root, handAskCell({ seat, claimed: cell, detail, isCell: deps.cellOwnerOf ? (id) => deps.cellOwnerOf!(id) !== null : null }));
+        const stale = referenced.get(ask);
+        block.ask = stale === undefined ? ask : `${ask}:after-${stale}`;
+        const note = [route.attach, stale === undefined ? undefined : `answer #${stale} did not unblock`].filter(Boolean).join(' · ') || undefined;
+        if (send(seat, route.to, null, note)) {
+          // The same ask was already answered (the post returned that first row): resume with its answer by reference.
+          const first = block.lastMailId;
+          let answer: string | null = null;
+          if (first !== null && deps.answerOf) { try { answer = deps.answerOf(first, seat); } catch { answer = null; } }
+          if (answer !== null && first !== null && stale === undefined) {
+            referenced.set(ask, first);
+            deps.clearTimer(block.timer);
+            active = null;
+            open.delete(block.fingerprint);
+            log('seat.needs-human', { phase: 'answered-by-reference', seat, blockId: block.blockId, msgId: first, ask: block.ask });
+            deps.resumeWith(`[✋ answered by reference #${first}] ${answer}`);
+            return;
+          }
+          arm(seat);
+          return;
+        }
+        // Delivery to the leader failed (no ledger row for the watcher to see): the CEO card is the only rung left.
+        toCeo(seat);
+      };
+      const structured = classifyHandBlock(input, ropts);
+      if (!deps.classifyHand || !handNeedsClassifier(input, ropts)) { routingDone = Promise.resolve(); deliver(structured); return; }
+      routingDone = resolveHandRoot(input, deps.classifyHand, ropts).then((c) => {
+        log('seat.needs-human', { phase: 'hand-classify', seat, blockId: block.blockId, root: c.root, by: c.by });
+        deliver(c);
+      }, () => deliver(structured));
     },
     resumed() {
       if (!active) return;
@@ -147,15 +239,19 @@ export function createNeedsHumanPush(deps: NeedsHumanDeps): NeedsHumanPush {
     },
     noteArrivals(arrivals) {
       const block = active;
+      // A reply to an earlier ✋ of this seat that is no longer active still closes its fingerprint.
+      if (arrivals) for (const [fp, b] of open) if (b !== block && arrivals.some((a) => a.replyTo !== undefined && b.mailIds.has(a.replyTo))) open.delete(fp);
       if (!block || !arrivals) return false;
       const hit = arrivals.find((a) => a.replyTo !== undefined && block.mailIds.has(a.replyTo));
       if (!hit) return false;
       deps.clearTimer(block.timer);
       active = null;
+      open.delete(block.fingerprint); // answered: the same cause later is a new ✋
       log('seat.needs-human', { phase: 'resumed-by-reply', rung: block.rung, blockId: block.blockId, replyTo: hit.replyTo });
       deps.resumeWith(hit.text);
       return true;
     },
     activeBlockId: () => active?.blockId ?? null,
+    routing: () => routingDone,
   };
 }

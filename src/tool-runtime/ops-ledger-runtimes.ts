@@ -33,7 +33,7 @@ import { buildSeatAssignTool, dispatchSeatAssign, type SeatAssignToolResult } fr
 export const msgListRuntime: ToolRuntime<Record<string, unknown>, MsgListResult> = {
   id: 'msg_list',
   spec: buildMsgListTool(),
-  async run(req) { return observeLedgerCall('MsgList', req, () => dispatchMsgList(req), (a, r) => ({ to: a.to, ...(r ? { count: r.count, after: r.after } : {}) })); },
+  async run(req) { return observeLedgerCall('MsgList', req, () => dispatchMsgList(req), (a, r) => ({ to: a.to, ...(r ? { count: r.count, total: r.total, hasMore: r.hasMore, after: r.after } : {}) })); },
 };
 
 export const msgPostRuntime: ToolRuntime<Record<string, unknown>, MsgPostResult> = {

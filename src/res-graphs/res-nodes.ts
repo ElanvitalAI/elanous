@@ -10,6 +10,7 @@
  * Run-scoped state (which host/lease this run is about) lives in `{root}/runs/<runId>.json`, written by the pick/route
  * node and read by the step nodes. Every node prints one JSON line `{ outcome, ... }`.
  */
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -36,7 +37,8 @@ export const DEFAULT_ACTUATOR = join(HERE, '..', '..', 'scripts', 'res', 'res-ac
 const STEP_TIMEOUT_MS: Record<string, number> = { start: 600_000, stop: 600_000, sanitize: 300_000, catchup: 1_900_000, auth: 300_000, smoke: 2_700_000, inflight: 60_000 };
 
 function seatState(ctx: NodeContext): string { return ctx.input?.vars?.seatState ?? join(process.env.HOME ?? '', 'elanous-hq', 'seat-state'); }
-function stateRoot(ctx: NodeContext): string { return ctx.input?.vars?.stateRoot ?? process.env.ELANOUS_STATE_DIR ?? process.cwd(); }
+// the canonical instance root — never process.cwd() (a node runs with cwd = the installed package · #40570 class)
+function stateRoot(ctx: NodeContext): string { return ctx.input?.vars?.stateRoot ?? process.env.ELANOUS_STATE_DIR ?? effectiveInstanceRoot(); }
 function root(ctx: NodeContext): string { const r = ctx.nodeInput?.root; return typeof r === 'string' ? r.replaceAll('{seatState}', seatState(ctx)) : resRoot(seatState(ctx)); }
 const live = (ctx: NodeContext) => ctx.input?.stage === 'live';
 

@@ -1,0 +1,46 @@
+graph_id: judge-butler
+version: 1
+loop:
+  title: 판정 집사 (judge-butler) — greens from evidence · HOLD ledger · judge ✋ · voice
+  root: 판정국
+  managed_by: trigger-registry
+  description: >-
+    First loop agent v2 (docs/conductor/LOOP-AGENT.md · sub-coordinator rank · L0 = JUD). Wakes on a new pregate receipt,
+    a land-graph ledger change, a HOLD ledger change, a checklist change (evidence added · release/features.sqlite) or new
+    mail — and at least every 10 min (the ✋ SLA). Heartbeat `judge-butler` (every 10 min) · one tick at a time (tick.lock). One tick signs
+    the yellow cells that meet done-when (same-head receipt · focused exit 0 · E4 sim/test evidence) as JUDGE-BUTLER
+    (decidedBy judge-butler · supervisedBy JUD), expires HOLDs whose expiry/unlock passed, proposes narrowing to owners of
+    HOLDs that freeze ≥3 hands (→ JUD after 30 min), answers judge-domain ✋ and voice mail (JUDGE-BUTLER / loop:judge-butler).
+    Never signs security-4 paths. Demote: eln loop demote judge-butler --to L1 · kill: --to off.
+  owner: OP # sub-coordinator rank = OP 직속 (failure cards → OP); its L0 supervisor JUD is in goal.yaml
+  trigger:
+    condition:
+      predicate:
+        kind: state-changed
+        parts:
+          - { file: '{seatState}/RES/evidence/PREGATE-GREEN' }
+          - { file: '{stateRoot}/land-graph/ledger.jsonl' }
+          - { file: '{stateRoot}/hold-ledger/events.jsonl' }
+          - { file: '{stateRoot}/release/features.sqlite' } # BUTLER-TICK-CADENCE: checklist evidence added / status changed
+          - { file: '{stateRoot}/release/features.sqlite-wal' }
+      cooldown_min: 2
+      max_wait_min: 10
+      on_max_wait: fire
+  goal:
+    kind: file-mtime
+    path: '{stateRoot}/loop-agents/judge-butler/last-tick.json'
+  failure:
+    goal_deadline_min: 30
+    max_attempts: 2
+    backoff_sec: [60]
+entry_node: tick
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: tick
+    kind: agent
+    recipe: 'cmd:judge-butler-tick'
+    max_visits: 1
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }

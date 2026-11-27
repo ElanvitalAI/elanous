@@ -807,8 +807,12 @@ export function noteDispatchSkip(v: string, id: string, reason: string, expected
 }
 
 /** Apply a measured verdict only while the release cell is still the snapshot that was judged. */
-export function setItemIfSnapshot(v: string, id: string, patch: Parameters<typeof setItem>[2], by: string, expected: Pick<ChecklistItem, 'title' | 'status' | 'evidence'>): Checklist {
-  return setItemGuarded(v, id, patch, by, expected);
+export function setItemIfSnapshot(v: string, id: string, patch: Parameters<typeof setItem>[2], by: string, expected: Pick<ChecklistItem, 'title' | 'status' | 'evidence'>, attribution?: GreenAttribution): Checklist {
+  const before = patch.status === 'green' ? expected : null;
+  const out = setItemGuarded(v, id, patch, by, expected);
+  // A measured green is a green fact too (the judge-butler signs through here) — attribution names the decider and the doer.
+  if (before) recordCellFacts(v, [id], patch, by, attribution, out);
+  return out;
 }
 
 function setItemGuarded(v: string, id: string, patch: Parameters<typeof setItem>[2], by: string, expected?: Pick<ChecklistItem, 'title' | 'status' | 'evidence'>): Checklist {
@@ -823,9 +827,16 @@ export function setItems(v: string, ids: string[], patch: Parameters<typeof setI
 }
 
 /** fed-state (SIGNAL-STATE-NOT-MAIL) — fail-open: green / owner change become typed cell facts. */
-function recordCellFacts(v: string, ids: readonly string[], patch: { status?: ChecklistStatus; owner?: string }, by: string): void {
+/** FED-FACT-ATTRIBUTION — who decided a green, who did the work (default: the cell owner), who supervises the decider. */
+export interface GreenAttribution { decidedBy?: string; doneBy?: string; supervisedBy?: string }
+function recordCellFacts(v: string, ids: readonly string[], patch: { status?: ChecklistStatus; owner?: string }, by: string, attribution?: GreenAttribution, after?: Checklist): void {
   for (const id of ids) {
-    if (patch.status === 'green') recordFact({ type: 'cell', cell: id, state: 'green', seat: by, ref: v, source: 'checklist' });
+    if (patch.status === 'green') {
+      const owner = (() => { try { return (after ?? listChecklist(v)).items.find(i => i.id === id)?.owner; } catch { return undefined; } })();
+      const doneBy = attribution?.doneBy ?? (owner ? owner.split('/')[0] : undefined);
+      recordFact({ type: 'cell', cell: id, state: 'green', seat: by, ref: v, source: 'checklist', decidedBy: attribution?.decidedBy ?? by,
+        ...(doneBy ? { doneBy } : {}), ...(attribution?.supervisedBy ? { supervisedBy: attribution.supervisedBy } : {}) });
+    }
     else if (patch.owner !== undefined) recordFact({ type: 'cell', cell: id, state: patch.owner && patch.owner !== '-' ? 'claim' : 'release', seat: by, ref: v, source: 'checklist' });
   }
 }

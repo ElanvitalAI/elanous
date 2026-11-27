@@ -3,13 +3,16 @@
 //    편집·시험 금지». TC answered «HOLD» again and again although its own rule (writer check ≤2 min) already gives the answer.
 // C: the answer is a lookup, not a judgement — open PR on the paths? recent commit by another seat? uncommitted files? which worktree?
 // Q: who answers? A: the space steward tick — deterministic, before the beacon:
-//   cause (structured: ref `cause:<c>`; legacy ✋ without it → the block code OWNER_UNKNOWN/DEPENDENCY_WAIT = writer-handover,
+//   cause (structured: ref `cause:<c>`; legacy ✋ without it → the block code OWNER_UNKNOWN = writer-handover (DEPENDENCY_WAIT is
+//   not a writer question — WRITER-CHECK-INTENT-GATE 11-26),
 //   APPROVAL_PENDING = res-approval; never the prose) → answer → HandRaise resolve with owner = blocked seat ⊕ deadline +30 m
 //   (a real outcome under BEACON-LADDER ②) → one digest line per leader per tick. A leader HOLD (no owner ⊕ deadline) on that
 //   chain is overridden and logged. What it cannot answer (worktree unknown) climbs as ONE card per cause to HQ.
 // 세 얼굴 = 관측 needhuman.resolver-* 로그 ⊕ digest 줄 · 판단 근거 = 답에 PR 번호·커밋·경로 원문 · 수복 = resolve / 원인별 카드 1장.
-import { HAND_CAUSES, isHandCause, type HandCause } from '../../agent-events/protocol.js';
+import { liveWipTakeoverRule } from '../../seat/seat-assign-wip1.js';
+import { WRITER_CHECK_CAUSES, isWriterCheckCause, type HandCause } from '../../agent-events/protocol.js';
 import type { MsgStore } from '../../msg/msg-store.js';
+import { readHandRoutes } from '../../kit/mail-route/hand-routes.js';
 import {
   appendOnce, applyHandOutcome, HAND_CEO, isCeoOnlyHand, keepsWaiting, lastLeaderReply, openHands,
   type HandLadderDeps, type OpenHand,
@@ -18,7 +21,10 @@ import {
 export const RESOLVER_DEADLINE_MS = 30 * 60_000;
 export const RECENT_COMMIT_MS = 2 * 60 * 60_000;
 export const RESOLVER_SENDER = 'ORCHESTRATOR';
-export const POLICY_AUTO_ANSWER = 'policy auto (guardian caps) · RES absorbed — no approval needed; test-universe read-only runs never need one';
+/** plan-limit (live 11-27 23:0x): the TUI's auto-continue cap — not an LLM quota, nothing for GUARDIAN to fix. Resume. */
+export const PLAN_LIMIT_AUTO_ANSWER = '재개 — plan-limit is the TUI auto-continue cap (not an LLM quota). Continue the open steps; if a step waits on your own background process, wait for it and update the plan instead of asking again';
+export const PLAN_LIMIT_WINDOW_MS = 60 * 60_000;
+export const POLICY_AUTO_ANSWER = 'policy auto (guardian caps) · RES absorbed — no approval needed; test-universe runs never need one (own temp HOME/TMPDIR · mkdtemp · SQLite/file writes there · head push to minim5/node-b/node-c) — only secrets · other users\' data · public exposure · destructive deletes · publish/money ask';
 
 export interface OpenPr { readonly number: number; readonly branch: string; readonly files: readonly string[] }
 export interface RecentCommit { readonly sha: string; readonly seat: string; readonly files: readonly string[] }
@@ -47,8 +53,14 @@ export function handCauseOf(hand: Pick<OpenHand, 'reason' | 'refs'>): HandCause 
   // money · security · irreversible · policy stay with people (category / urgency refs); the cause ref outranks the block code.
   if (isCeoOnlyHand({ reason: '', refs: hand.refs })) return null;
   const cause = refValue(hand.refs, 'cause:');
-  if (cause !== undefined) return isHandCause(cause) ? cause : null;
-  if (hand.reason === 'OWNER_UNKNOWN' || hand.reason === 'DEPENDENCY_WAIT') return 'writer-handover';
+  // hold · cell-scope are not the writer check's family: they route to their owners (hand-routes.yaml).
+  if (cause !== undefined) return isWriterCheckCause(cause) ? cause : null;
+  // A ✋ whose root the router (Jev) read as the auto-continue cap — an older TUI that sent no `cause:` for it.
+  if ((hand.refs ?? []).some((r) => r.startsWith('hand-ask:auto-continue:'))) return 'plan-limit';
+  // WRITER-CHECK-INTENT-GATE (11-26 23:xx · 28 wrong auto-answers): only an ownership question is a writer check.
+  // DEPENDENCY_WAIT waits on something else (a PR, a seat, an approval) — it stays on the ✋ ladder (#40318 escalation) or
+  // the hand parks it with `eln work block --on <ref>`; the writer lookup never answers it.
+  if (hand.reason === 'OWNER_UNKNOWN') return 'writer-handover';
   if (hand.reason === 'APPROVAL_PENDING') return 'res-approval';
   return null;
 }
@@ -57,10 +69,18 @@ const attempt = <T>(fn: () => T, fallback: T): T => { try { return fn(); } catch
 const overlap = (a: readonly string[], b: readonly string[]): boolean => a.some((x) => b.includes(x));
 
 /** The resolver's answer for one ✋ (pure over the ports). */
-export function resolveWriterCheck(hand: Pick<OpenHand, 'reason' | 'refs' | 'blockedSeat'>, ports: WriterCheckPorts, cache?: { prs?: readonly OpenPr[]; commits?: readonly RecentCommit[] }): ResolverVerdict | null {
+export function resolveWriterCheck(hand: Pick<OpenHand, 'reason' | 'refs' | 'blockedSeat'>, ports: WriterCheckPorts, cache?: { prs?: readonly OpenPr[] | null; commits?: readonly RecentCommit[]; planLimitHits?: (seat: string) => number; planLimitCardAt?: number }): ResolverVerdict | null {
   const cause = handCauseOf(hand);
   if (!cause) return null;
   const seat = hand.blockedSeat;
+  if (cause === 'plan-limit') {
+    // The 행정관 resumes the hand; the same hand at the cap N times in an hour → its leader gets the open steps instead.
+    const hits = attempt(() => cache?.planLimitHits?.(seat) ?? 1, 1);
+    const cardAt = cache?.planLimitCardAt ?? 3;
+    return hits >= cardAt
+      ? { kind: 'escalate', cause, why: `${seat} hit the auto-continue cap ${hits}× within 1h — resuming again would loop` }
+      : { kind: 'resolve', cause, answer: PLAN_LIMIT_AUTO_ANSWER };
+  }
   if (cause === 'res-approval' || cause === 'slot-isolation') return { kind: 'resolve', cause, answer: POLICY_AUTO_ANSWER };
   const worktree = attempt(() => ports.worktreeOf(seat, refValue(hand.refs, 'worktree:')), null);
   if (cause === 'worktree-path') {
@@ -69,15 +89,26 @@ export function resolveWriterCheck(hand: Pick<OpenHand, 'reason' | 'refs' | 'blo
   }
   // writer-handover: the writer check (≤2 min rule) done for the seat.
   const dirty = worktree ? attempt(() => ports.uncommitted(worktree), []) : [];
-  const paths = [...new Set([...(hand.refs ?? []).filter((r) => r.startsWith('path:')).map((r) => r.slice(5)), ...dirty])];
-  const prNum = Number(refValue(hand.refs, 'pr:'));
-  const prs = cache?.prs ?? attempt(() => ports.openPrs(), []);
-  const pr = prs.find((p) => p.number === prNum) ?? (paths.length ? prs.find((p) => overlap(p.files, paths)) : undefined);
+  // Dirty files are not evidence of the task or cell's scope: they may belong to unrelated WIP.
+  const taskPaths = [...new Set((hand.refs ?? []).filter((r) => r.startsWith('path:')).map((r) => r.slice(5)).filter(Boolean))];
+  const paths = [...new Set([...taskPaths, ...dirty])];
+  const prRef = refValue(hand.refs, 'pr:');
+  const prNum = Number(prRef);
+  const prs = cache?.prs === undefined ? attempt<readonly OpenPr[] | null>(() => ports.openPrs(), null) : cache.prs;
+  if (!prs) return { kind: 'escalate', cause, why: 'open PR lookup failed; relevance is unknown — do not hand over' };
+  const explicitPr = prRef ? prs.find((p) => p.number === prNum) : undefined;
+  if (prRef && (!explicitPr || !taskPaths.length || !explicitPr.files.length || !overlap(explicitPr.files, taskPaths))) {
+    return { kind: 'escalate', cause, why: `PR ${prRef} relevance to task/cell paths is unverified or mismatched — do not hand over` };
+  }
+  const pr = explicitPr ?? (taskPaths.length ? prs.find((p) => overlap(p.files, taskPaths)) : undefined);
   if (pr) return { kind: 'resolve', cause, answer: `open PR #${pr.number} touches these paths — continue on top of its branch ${pr.branch}` };
   const commits = cache?.commits ?? attempt(() => ports.recentCommits(), []);
   const other = paths.length ? commits.find((c) => c.seat.toUpperCase() !== seat.toUpperCase() && overlap(c.files, paths)) : undefined;
   if (other) return { kind: 'resolve', cause, coordinateWith: other.seat, answer: `${other.seat} committed ${other.sha.slice(0, 10)} on these files within 2h — one mail to ${other.seat} is sent for you; proceed in 30 min` };
-  if (dirty.length) return { kind: 'resolve', cause, answer: `uncommitted files in ${worktree} (${dirty.slice(0, 3).join(', ')}${dirty.length > 3 ? ` +${dirty.length - 3}` : ''}) — start a new branch and keep their files untouched` };
+  if (dirty.length) return { kind: 'resolve', cause, answer: `uncommitted files in ${worktree} (${dirty.slice(0, 3).join(', ')}${dirty.length > 3 ? ` +${dirty.length - 3}` : ''}) — ${liveWipTakeoverRule()}` };
+  // «You are the writer» only when the lookup actually ran on named paths. No paths, no PR ref, no dirty files = nothing was
+  // checked — never the generic «proceed» (11-26: 28 ✋ got it while they waited on something else); it climbs instead.
+  if (!paths.length) return { kind: 'escalate', cause, why: `${seat} named no paths (path: refs) and has no uncommitted files — the writer check has nothing to look up` };
   return { kind: 'resolve', cause, answer: 'no open PR and no recent commit on these paths — you are the writer; proceed' };
 }
 
@@ -106,13 +137,31 @@ export function runWriterCheckResolver(store: MsgStore, deps: HandLadderDeps & {
     seen.add(h.rootId);
     return true;
   });
-  const cache = { prs: attempt(() => deps.ports.openPrs(), [] as readonly OpenPr[]), commits: attempt(() => deps.ports.recentCommits(), [] as readonly RecentCommit[]) };
+  // plan-limit ✋ the seat raised in the last hour (structured: `cause:plan-limit` or the router's auto-continue ask root).
+  const planLimitHits = (seat: string): number => (store.db.query(`SELECT COUNT(*) AS n FROM msg_messages WHERE sender = ? AND created_at >= ?
+    AND (refs_json LIKE '%"cause:plan-limit"%' OR refs_json LIKE '%"hand-ask:auto-continue:%')`).get(seat, new Date(now - PLAN_LIMIT_WINDOW_MS).toISOString()) as { n: number }).n;
+  const planLimitCardAt = attempt(() => readHandRoutes().autoContinueCardAfterHitsPerHour, 3);
+  const cache = { prs: attempt<readonly OpenPr[] | null>(() => deps.ports.openPrs(), null), commits: attempt(() => deps.ports.recentCommits(), [] as readonly RecentCommit[]), planLimitHits, planLimitCardAt };
   const resolved: ResolverReport['resolved'][number][] = [];
   const unresolved = new Map<HandCause, OpenHand[]>();
   const deadline = new Date(now + RESOLVER_DEADLINE_MS).toISOString();
   for (const hand of opens) {
     const verdict = resolveWriterCheck(hand, deps.ports, cache);
     if (!verdict) continue;
+    if (verdict.kind === 'escalate' && verdict.cause === 'plan-limit') {
+      // Not a writer question for HQ: ONE card to the hand's leader (TC) with the plan's open steps (the ✋ line names them).
+      const leader = attempt(() => deps.ladder.parentOf(hand.blockedSeat), hand.receiver);
+      if (deps.live !== false) {
+        const { fresh, mail } = appendOnce(store, `hand-plan-limit-card:${hand.rootId}`, () => ({
+          from: RESOLVER_SENDER, to: leader, kind: 'request', intent: 'decision',
+          refs: [`hand-of:${hand.rootId}`, `seat:${hand.blockedSeat}`, 'cause:plan-limit', 'plan-limit-card'],
+          body: `[행정관 · plan-limit] ${verdict.why}. ✋ #${hand.rootId}: ${hand.body.replace(/\s+/gu, ' ').slice(0, 300)} · `
+            + `re-scope the plan or split the cell; close it: eln msg hand ${hand.rootId} resolve|reject "<text>"`,
+        }));
+        if (fresh) log('needhuman.resolver-plan-limit-card', { msgId: hand.id, seat: hand.blockedSeat, leader, cardId: mail.id });
+      }
+      continue;
+    }
     if (verdict.kind === 'escalate') { unresolved.set(verdict.cause, [...(unresolved.get(verdict.cause) ?? []), hand]); continue; }
     const last = lastLeaderReply(store, hand);
     const overrode = last !== null && keepsWaiting(last, []);
@@ -134,7 +183,7 @@ export function runWriterCheckResolver(store: MsgStore, deps: HandLadderDeps & {
     resolved.push({ msgId: hand.id, seat: hand.blockedSeat, leader: hand.receiver, cause: verdict.cause, answer: verdict.answer, overrode });
   }
   const cards: { cause: HandCause; members: number[]; cardId: number }[] = [];
-  for (const cause of HAND_CAUSES) {
+  for (const cause of WRITER_CHECK_CAUSES) {
     const members = unresolved.get(cause);
     if (!members?.length) continue;
     const lead = [...members].sort((a, b) => a.id - b.id)[0]!;

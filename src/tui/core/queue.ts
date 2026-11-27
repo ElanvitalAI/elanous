@@ -26,6 +26,14 @@ import {
   type NextTuiQueueNoticeEntry,
 } from './queue-contract.js';
 // Queue contract types live in queue-contract.ts (size-contract: 600-line module limit); importers keep this path.
+/**
+ * SEAT-MAIL-BUNDLE-BUDGET — the most notice text one bundle turn takes. 출처: 11-26 21:41 OP over-budget
+ * (src/session/chat.ts assembleTurnMessages: used 96 157 tokens vs cap 71 650 = prefix 23 650 + the 48k history ceiling,
+ * src/session/turn-budget.ts) — the newest turn is never trimmed, so the bundle itself must stay well under 48k tokens.
+ * 24 000 characters stays under ~16k tokens even for Korean text (≈1.5 chars/token), leaving room for the turn's history.
+ */
+export const NOTICE_BUNDLE_MAX_CHARS = 24_000;
+
 export * from './queue-contract.js';
 
 const passiveResultSource = (source?: NextTuiQueueNoticeSource): boolean =>
@@ -62,6 +70,8 @@ interface MutableItem {
   cancelReason?: string;
   urgent?: boolean;
   mailClass?: 'P0' | 'P1' | 'P2';
+  /** CLAUDE-OP-PROXY-LANE — rank inside the mail notices: 0 = crown / a person · 1 = the CEO's proxy · absent = the rest. */
+  mailRank?: 0 | 1;
   mailIntent?: string;
   mailKind?: string;
   replyTo?: number;
@@ -90,6 +100,8 @@ function snapshot(item: MutableItem): NextTuiQueueItem {
  */
 function deliveryOrder(a: MutableItem, b: MutableItem): number {
   if (a.kind !== b.kind) return a.kind === 'user' ? -1 : 1;
+  // CLAUDE-OP-PROXY-LANE — crown / a person's mail, then the CEO's proxy, then every other notice (urgent ones included).
+  if (a.kind === 'notice' && (a.mailRank ?? 2) !== (b.mailRank ?? 2)) return (a.mailRank ?? 2) - (b.mailRank ?? 2);
   if (a.kind === 'notice' && a.urgent !== b.urgent) {
     const rank = (item: MutableItem) => TURN_EVENT_SOURCES.indexOf(item.urgent ? 'urgent-mail' : 'mail');
     return rank(a) - rank(b);
@@ -357,7 +369,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
      * A completion notice. It always waits behind user utterances and never steers the running turn:
      * seat mail that lands during a turn stays `queue` until the idle door opens the next turn.
      */
-    enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string; mailClass?: 'P0' | 'P1' | 'P2'; mailIntent?: string; mailKind?: string; replyTo?: number; mail?: NextTuiQueueMailSpan; triage?: NextTuiQueueTriageMeta } = {}): NextTuiQueueItem {
+    enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta: { msgId?: number; occurredAt?: number; urgent?: boolean; passive?: boolean; digest?: string; mailClass?: 'P0' | 'P1' | 'P2'; mailRank?: 0 | 1; mailIntent?: string; mailKind?: string; replyTo?: number; mail?: NextTuiQueueMailSpan; triage?: NextTuiQueueTriageMeta } = {}): NextTuiQueueItem {
       return accept({
         kind: 'notice',
         mode: 'chat',
@@ -367,6 +379,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
         ...(meta.msgId === undefined ? {} : { msgId: meta.msgId }),
         ...(meta.urgent ? { urgent: true } : {}),
         ...(meta.mailClass === undefined ? {} : { mailClass: meta.mailClass }),
+        ...(meta.mailRank === undefined ? {} : { mailRank: meta.mailRank }),
         ...(meta.mailIntent === undefined ? {} : { mailIntent: meta.mailIntent }),
         ...(meta.mailKind === undefined ? {} : { mailKind: meta.mailKind }),
         ...(meta.replyTo === undefined ? {} : { replyTo: meta.replyTo }),
@@ -604,12 +617,19 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
     drainNotices(keep?: (item: NextTuiQueueItem) => boolean): NextTuiQueueNoticeDrain {
       const order = ordered();
       const batch: MutableItem[] = [];
+      let chars = 0;
       for (const item of order) {
         // SEAT-NOTICE-BUNDLE-DRAIN — 사람 줄은 이 묶음에 끼지 않고 자기 턴으로 남는다
         // (deliveryOrder가 사람 줄을 모든 알림 앞에 두므로, 비-notice 항목은 skip).
         if (item.kind !== 'notice' || item.mode !== 'chat') continue;
         // QUEUE-FINISH-FIRST — a held item (keep → true) stays queued for the release digest.
         if (keep?.(snapshot(item))) continue;
+        // SEAT-MAIL-BUNDLE-BUDGET (11-26 21:41 OP «Could not process the request»): one bundle turn must fit the turn's
+        // history allowance — a 47-mail bundle exceeded it, the turn failed before the provider call and every mail
+        // gave up unread. Past the budget the rest stay queued for the next bundle turn (the first item always goes).
+        // Arrival order is kept: once one item does not fit, no later item jumps ahead of it.
+        if (batch.length > 0 && chars + item.text.length > NOTICE_BUNDLE_MAX_CHARS) break;
+        chars += item.text.length;
         batch.push(item);
       }
       if (batch.length === 0) return { kind: 'none' };
@@ -623,6 +643,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
           ...(item.msgId === undefined ? {} : { msgId: item.msgId }),
           ...(item.passive ? { passive: true } : {}), ...(item.digest === undefined ? {} : { digest: item.digest }),
           ...(item.mailClass === undefined ? {} : { mailClass: item.mailClass }),
+          ...(item.mailRank === undefined ? {} : { mailRank: item.mailRank }),
           ...(item.mailIntent === undefined ? {} : { mailIntent: item.mailIntent }),
           ...(item.mailKind === undefined ? {} : { mailKind: item.mailKind }),
           ...(item.replyTo === undefined ? {} : { replyTo: item.replyTo }),

@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openMsgStore } from '../msg/msg-store.js';
-import { checkLoopNeighbors, emitLoopHeartbeat, SEAT_NEIGHBORS } from '../loops/neighbor-runtime.js';
+import { checkLoopNeighbors, SEAT_NEIGHBORS } from '../loops/neighbor-runtime.js';
+import { emitSignal as emitLoopHeartbeat } from '../kit/heartbeat/index.js';
 import { runSeatLoopOnce } from './seat-loop.js';
 
 test('MK seat uses the cmo-seat contract identity so OP detects its missed signal', async () => {

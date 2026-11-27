@@ -12,6 +12,8 @@ export interface FedKpi {
   opInboundPerHour: number; opInbound: number;
   opTurnsByMailPct: number | null; opTurns: number; opTurnsByMail: number;
   aux: { workNext: number; claims: number; stewardWakes: number; reclaims: number; blocks: number; greens: number };
+  /** FED-FACT-OP-ACTIONS — the OP seat's 성과 (state-changing actions it decided · graphs/policies/fed-rubric.yaml). Absent = policy unreadable. */
+  opAchievement?: import('./actions.js').SeatAchievement;
 }
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
@@ -62,7 +64,7 @@ export function parseWindow(w: string): number {
 }
 
 /** Ledger-backed KPI — the TS entry pulse and the status board call. */
-export function fedKpi(opts: { window?: string; now?: Date; path?: string } = {}): FedKpi {
+export function fedKpi(opts: { window?: string; now?: Date; path?: string; rubricPath?: string } = {}): FedKpi {
   const end = opts.now ?? new Date();
   const start = new Date(end.getTime() - parseWindow(opts.window ?? '1h'));
   // hand state carries over: read everything up to end (hand facts are few; window filter applied inside).
@@ -71,7 +73,14 @@ export function fedKpi(opts: { window?: string; now?: Date; path?: string } = {}
   // KPI read landed 0/h while main took 13 merges/h (OP 11-26 08:0x). main's first-parent «(#N)» commits are
   // the land truth; fold them in (deduped by ref in computeFedKpi). Explicit-path callers (tests) stay pure.
   const lands = opts.path ? [] : gitLandFacts(start, end);
-  return computeFedKpi(lands.length ? [...facts, ...lands] : facts, start, end);
+  const k = computeFedKpi(lands.length ? [...facts, ...lands] : facts, start, end);
+  // Lands from git carry no decider — only ledger facts feed the achievement count.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const a = require('./actions.js') as typeof import('./actions.js');
+    k.opAchievement = a.seatAchievement(facts, 'OP', start, end, a.loadRubricPolicy(opts.rubricPath));
+  } catch { /* fail-open: no line */ }
+  return k;
 }
 
 /** First-parent main merge commits in [start, end) as land facts. Fail-open (no repo → []), cached 60 s per window. */
@@ -103,6 +112,11 @@ export function parseGitLandLog(stdout: string, start: Date, end: Date): Fact[] 
   return out;
 }
 
+function formatAchievementLine(a: import('./actions.js').SeatAchievement): string {
+  const kinds = Object.entries(a.byKind).sort(([x], [y]) => x.localeCompare(y)).map(([k, v]) => `${k} ${v}`).join(' · ');
+  return `${a.seat} actions: ${a.actions} (${a.perHour}/h)${kinds ? ` · ${kinds}` : ''} · 성과 ${a.score}/5`;
+}
+
 export function formatFedKpi(k: FedKpi): string {
   return [
     `fed kpi ${k.windowStart} → ${k.windowEnd} (${k.hours}h)`,
@@ -111,13 +125,14 @@ export function formatFedKpi(k: FedKpi): string {
     `OP inbound/h: ${k.opInboundPerHour} (${k.opInbound})`,
     `OP turns opened by mail: ${k.opTurnsByMailPct === null ? 'n/a' : `${k.opTurnsByMailPct}%`} (${k.opTurnsByMail}/${k.opTurns})`,
     `aux: work-next ${k.aux.workNext} · claims ${k.aux.claims} · steward wakes ${k.aux.stewardWakes} · reclaims ${k.aux.reclaims} · blocks ${k.aux.blocks} · greens ${k.aux.greens}`,
+    ...(k.opAchievement ? [formatAchievementLine(k.opAchievement)] : []),
   ].join('\n');
 }
 
 /** `eln fed show <cell|seat>` — latest facts touching that id (state answer without mail). */
 export function showFed(id: string, opts: { limit?: number; path?: string } = {}): Fact[] {
   const { facts } = readFacts({ path: opts.path });
-  return facts.filter(f => f.cell === id || f.seat === id || f.from === id || f.to === id).slice(-(opts.limit ?? 20));
+  return facts.filter(f => f.cell === id || f.seat === id || f.from === id || f.to === id || f.decidedBy === id || f.doneBy === id).slice(-(opts.limit ?? 20));
 }
 
 /** HQ digest: cells blocked in the last 30 min (fed-state `work:block` facts) — replaces per-event steward-exception mails to HQ. */

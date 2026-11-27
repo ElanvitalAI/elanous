@@ -119,3 +119,50 @@ export function trimKeepingRecentHumans<T extends WireLike>(
   for (let i = 0; i < wire.length; i++) if (!removed.has(i) && wire[i]!.role === 'user' && isHuman(i)) keptHumanTurns++;
   return { kept: current(), dropped: removed.size, used, keptHumanTurns, overBudget: used > capTokens };
 }
+
+/**
+ * TURN-BUDGET-FLOOR (11-26 23:3x · OP lost 13 turns in 60 min to `session.compact over-budget`): inside one long turn the
+ * rows after its user message — tool calls and their results — are all protected, so a busy turn outgrows the cap and
+ * the next round dies. This stubs the tool results of the current turn except the last `keepLast` (each stub keeps its
+ * size and first line, so the model knows something was there and can re-run the tool). Pure; the wire order is kept.
+ */
+export function stubTurnToolPayloads<T extends WireLike>(wire: readonly T[], keepLast: number, minChars = 400): { wire: T[]; stubbed: number } {
+  let lastUser = -1;
+  for (let i = wire.length - 1; i >= 0 && lastUser < 0; i--) if (wire[i]!.role === 'user') lastUser = i;
+  const tools: number[] = [];
+  for (let i = lastUser + 1; i < wire.length; i++) if (wire[i]!.role === 'tool' && typeof wire[i]!.content === 'string') tools.push(i);
+  const stubAt = new Set(tools.slice(0, Math.max(0, tools.length - keepLast)));
+  let stubbed = 0;
+  const out = wire.map((m, i) => {
+    if (!stubAt.has(i) || (m.content as string).length <= minChars) return m;
+    const text = m.content as string;
+    stubbed++;
+    const first = text.split('\n', 1)[0]!.slice(0, 160);
+    return { ...m, content: `[tool output held back — over the turn budget · ${text.length.toLocaleString('en-US')} chars · first line: ${first}] Re-run the tool if you still need it.` };
+  });
+  return { wire: out, stubbed };
+}
+
+/** The ladder of protections to give up, in order, when a turn is over budget (TURN-BUDGET-FLOOR). */
+export const BUDGET_FLOOR_STEPS: ReadonlyArray<{ readonly step: string; readonly keepHumans: number; readonly keepToolResults?: number }> = [
+  { step: 'keep-humans:3', keepHumans: 3 },
+  { step: 'keep-humans:1', keepHumans: 1 },
+  { step: 'keep-humans:0', keepHumans: 0 },
+  { step: 'tool-results:last-4', keepHumans: 0, keepToolResults: 4 },
+  { step: 'tool-results:last-1', keepHumans: 0, keepToolResults: 1 },
+  { step: 'tool-results:none', keepHumans: 0, keepToolResults: 0 },
+];
+
+/**
+ * Walk {@link BUDGET_FLOOR_STEPS} over one built wire: the first step whose trim fits wins. null = none fits (the caller
+ * goes on to shrink the newest turn, then fails as before). `isHuman` indexes the built wire (stubbing keeps positions).
+ */
+export function applyBudgetFloor<T extends WireLike>(built: readonly T[], capTokens: number, measure: (messages: T[]) => number, isHuman: (index: number) => boolean):
+  { step: string; trimmed: HumanPreservingTrim<T>; stubbed: number } | null {
+  for (const floor of BUDGET_FLOOR_STEPS) {
+    const stub = floor.keepToolResults === undefined ? { wire: [...built], stubbed: 0 } : stubTurnToolPayloads(built, floor.keepToolResults);
+    const trimmed = trimKeepingRecentHumans(stub.wire, capTokens, measure, isHuman, floor.keepHumans);
+    if (!trimmed.overBudget) return { step: floor.step, trimmed, stubbed: stub.stubbed };
+  }
+  return null;
+}

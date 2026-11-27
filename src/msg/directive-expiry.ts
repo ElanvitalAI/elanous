@@ -23,6 +23,11 @@ export const DIRECTIVE_TTL_MS = 120 * MINUTE_MS;
 export const STANDING_TTL_MS = 24 * 60 * MINUTE_MS;
 
 const PASSIVE_KINDS: ReadonlySet<string> = new Set(['info', 'notice', 'status']);
+/**
+ * BULLETIN-DELIVERY-WAKE (11-26) — a federal bulletin is the coordinators' standing picture until the next one replaces
+ * it: it never lapses (the 30-min passive TTL dropped bulletins held behind a busy seat before they were read).
+ */
+const NO_EXPIRY_KINDS: ReadonlySet<string> = new Set(['bulletin']);
 const REQUEST_KINDS: ReadonlySet<string> = new Set(['coord', 'request']);
 
 export interface DirectiveFields {
@@ -59,7 +64,7 @@ export interface PostExpiryInput extends DirectiveFields {
   readonly now: Date;
 }
 
-export type PostExpiry = { readonly expiresAt?: string; readonly rule: 'flag' | 'standing' | 'none' | 'directive' | 'request' | 'passive' | 'kind-unlisted' };
+export type PostExpiry = { readonly expiresAt?: string; readonly rule: 'flag' | 'standing' | 'none' | 'directive' | 'request' | 'passive' | 'bulletin' | 'kind-unlisted' };
 
 /** The expiry `msg post` stamps. Flags win over the kind table; an unlisted kind (question · decision · alert …) gets none. */
 export function postExpiry(input: PostExpiryInput): PostExpiry {
@@ -69,8 +74,9 @@ export function postExpiry(input: PostExpiryInput): PostExpiry {
   if (input.expiry === false) return { rule: 'none' };
   if (input.expires !== undefined) return { expiresAt: at(parseExpiresDuration(input.expires)), rule: 'flag' };
   if (input.standing === true) return { expiresAt: at(STANDING_TTL_MS), rule: 'standing' };
-  if (isDirective(input)) return { expiresAt: at(DIRECTIVE_TTL_MS), rule: 'directive' };
   const kind = (input.kind ?? '').trim().toLowerCase();
+  if (NO_EXPIRY_KINDS.has(kind) && !input.crownDirective && !input.goal) return { rule: 'bulletin' };
+  if (isDirective(input)) return { expiresAt: at(DIRECTIVE_TTL_MS), rule: 'directive' };
   if (REQUEST_KINDS.has(kind)) return { expiresAt: at(REQUEST_TTL_MS), rule: 'request' };
   if (PASSIVE_KINDS.has(kind)) return { expiresAt: at(PASSIVE_TTL_MS), rule: 'passive' };
   return { rule: 'kind-unlisted' };

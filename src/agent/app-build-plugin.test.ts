@@ -185,3 +185,21 @@ test('without any executor the bridge fails closed instead of pretending a start
   expect(out.error).toContain('graph route executor is not configured');
   expect('started' in out).toBe(false); // started 상태는 이제 존재하지 않는다
 });
+
+test('APP-BUILD-LOCAL-PATH: a local host builds locally without a member and reports one local-build status', async () => {
+  const graph: unknown[] = [];
+  const out = await runAppBuild('app_build', { ask: '번역 서비스 만들어줘' }, { surface: 'tui' }, {
+    dispatchGraph: async (...call) => { graph.push(call); return { status: 'done' }; },
+    localAppBuild: async () => ({ kind: 'app-build', tool: 'app_build', status: 'local-build', mode: 'local', memberConnected: false,
+      buildComplete: true, workspace: '/tmp/translator', files: [], capabilities: [], choices: [],
+      run: { started: true, localUrl: 'http://127.0.0.1:31500/' }, message: '회원 연결이 없어 공개 게시 대신 이 기기에서 로컬로 만들었습니다: /tmp/translator' }),
+  });
+  expect(out).toMatchObject({ status: 'local-build', buildComplete: true, local: { workspace: '/tmp/translator' } });
+  expect(out.message).toContain('로컬로 만들었습니다');
+  expect(out.needsConnection).toBeUndefined();
+  expect(graph).toEqual([]);
+  // External agents are still refused before any local build.
+  const external = await runAppBuild('app_build', { ask: '번역 서비스 만들어줘' }, { surface: 'tui', requestOrigin: 'external-agent' }, {
+    localAppBuild: async () => { throw new Error('must not run'); } });
+  expect(external.status).toBe('rejected');
+});

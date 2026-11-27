@@ -4,6 +4,8 @@
 // door (`createInternalTurnGate`); only the REPL-child ↔ TUI hop (Bun IPC) is new, so the unit tests below
 // drive that hop end to end, and the L3 tests drive the real `--tui next` of this tree on the fake LLM.
 import { describe, expect, test } from 'bun:test';
+import { createDraftKeyClock } from './input/draft-idle.js';
+import { internalWakeBuffer } from './turn-events/door-wire.js';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -38,6 +40,55 @@ function fakeTimers(start = Date.UTC(2026, 9, 22, 3, 0, 0)) {
 }
 
 describe('REPL child ↔ next TUI wakeup hop', () => {
+  test('empty editor after backspace does not block a scheduled wake after typing expires', async () => {
+    const clock = fakeTimers();
+    let text = 'x';
+    let lastKey = clock.now();
+    let yields = 0;
+    const facts = { draft: () => text, unreadKeys: () => 0, lastHumanKeyAt: () => lastKey, now: clock.now };
+    const wake = createNextTuiWakeup({
+      isTurnRunning: () => false, getBufferText: () => internalWakeBuffer(facts),
+      getQueuedCount: () => 0, requestYield: () => { yields++; return true; },
+      notify: () => {}, env: {}, now: clock.now, setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer, lastHumanKeyAt: () => lastKey, pendingKeyCount: () => 0, log: () => {},
+    });
+    try {
+      await answerWakeupCall(wake.tool!, { type: 'elanous.wakeup.call', callId: 'empty-retry', args: { action: 'schedule', delaySeconds: 60, reason: 'empty retry' } });
+      clock.advance(59_000);
+      text = ''; // Backspace: the final human key leaves no draft.
+      lastKey = clock.now();
+      clock.advance(1_000);
+      expect(yields).toBe(0);
+      clock.advance(60_000);
+      expect(yields).toBe(1);
+      expect(wake.takePendingIfIdle()?.origin).toBe('scheduled');
+      expect(text).toBe('');
+    } finally { wake.dispose(); }
+  });
+  test('scheduled wake retries a restored draft and preserves it after the idle window', async () => {
+    const clock = fakeTimers();
+    const draftClock = createDraftKeyClock();
+    const editor = { text: 'unsent', cursor: 3 };
+    let yields = 0;
+    const facts = { draft: () => editor.text, unreadKeys: () => 0,
+      lastHumanKeyAt: () => draftClock(editor.text, 0, clock.now()), now: clock.now };
+    facts.lastHumanKeyAt(); // render observes the restored draft
+    const wake = createNextTuiWakeup({
+      isTurnRunning: () => false, getBufferText: () => internalWakeBuffer(facts),
+      getQueuedCount: () => 0, requestYield: () => { yields++; return true; },
+      notify: () => {}, env: {}, now: clock.now, setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer, lastHumanKeyAt: () => 0, pendingKeyCount: () => 0, log: () => {},
+    });
+    try {
+      await answerWakeupCall(wake.tool!, { type: 'elanous.wakeup.call', callId: 'draft-retry', args: { action: 'schedule', delaySeconds: 60, reason: 'retry draft' } });
+      clock.advance(60_000);
+      expect(yields).toBe(0);
+      clock.advance(60_000);
+      expect(yields).toBe(1);
+      expect(wake.takePendingIfIdle()?.origin).toBe('scheduled');
+      expect(editor).toEqual({ text: 'unsent', cursor: 3 });
+    } finally { wake.dispose(); }
+  });
   test('the child advertises exactly the classic ScheduleWakeup spec, and only when the TUI opened the hop', () => {
     const classic = buildScheduleWakeupHostTool(createWakeupScheduler({ startTurnIfIdle: () => ({ opened: false, reason: 'Disabled' }) }));
     const proc = { send: () => true, on: () => {}, off: () => {} };
@@ -260,6 +311,22 @@ describe('next TUI on N03 (this tree · fake LLM)', () => {
       });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 150_000);
+
+  test('next empty editor: actual Backspace permits the deferred scheduled wake', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'next-empty-backspace-'));
+    try {
+      const r = await runNextTuiScenario({ scenario: 'next-empty-backspace-wakeup', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
+      expect(r.checks).toEqual({ erased: true, notPremature: true, wakeTurnStored: true, onlyFakeProvider: true, exitedClean: true });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 240_000);
+
+  test('next idle draft: real three-minute wait preserves draft and opens the scheduled turn', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'next-idle-draft-'));
+    try {
+      const r = await runNextTuiScenario({ scenario: 'next-idle-draft-wakeup', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
+      expect(r.checks).toEqual({ waitedThreeMinutes: true, draftPreserved: true, wakeTurnStored: true, onlyFakeProvider: true, exitedClean: true });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 300_000);
 
   test('next-wakeup: a ScheduleWakeup from a turn opens one internal turn later, deferred while busy', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'n03-next-wake-'));

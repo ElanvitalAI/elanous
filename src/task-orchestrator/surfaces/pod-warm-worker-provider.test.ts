@@ -73,6 +73,20 @@ const candidate = { host: 'test-host', tier: 'standard' as const, spec };
 const testHostQuota: typeof resolveWarmPoolQuota = (profile, host, tier) =>
   (host === 'test-host' || host === 'test-host-b') ? (tier === 'standard' ? 4 : 0)
     : resolveWarmPoolQuota(profile, host, tier);
+test('real quota prevents any HQ or invalid host preparation while a valid host reaches preparation', async () => {
+  let kubectlCalls = 0;
+  const calls = () => { kubectlCalls++; return { status: 0, stdout: '', stderr: '' }; };
+  const opts = { controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64), kubectl: calls, profileConfig: { pod: { warmPoolProfile: 'gate' } }, rotationStatePath: join(mkdtempSync(join(tmpdir(), 'warm-quota-test-')), 'state.json') };
+  for (const host of ['mshq', 'unknown-host']) {
+    expect(() => new WarmPodProvider({ ...opts, candidates: [{ ...candidate, host }] })).toThrow('invalid warm candidate');
+  }
+  expect(kubectlCalls).toBe(0);
+  const provider = new WarmPodProvider({ ...opts, candidates: [{ ...candidate, host: 'node-b' }] });
+  (provider as any).readClusterQuarantineState = () => 'available';
+  let attempts = 0;
+  const prepare = spyOn(provider, 'ensureStandingWorker').mockImplementation(async () => { attempts++; return true; });
+  try { const result = await provider.reconcilePool(); expect({ attempts, failed: result.failed }).toEqual({ attempts: 1, failed: [] }); } finally { prepare.mockRestore(); }
+});
 const providerStateRoot = mkdtempSync(join(tmpdir(), 'warm-provider-state-tests-'));
 let providerStateIndex = 0;
 afterAll(() => rmSync(providerStateRoot, { recursive: true, force: true }));

@@ -127,7 +127,7 @@ describe('seat assign with the pool', () => {
       assign: (version, id, seat, options) => { calls.assign.push([version, id, seat, options]); return { from: 'UX', outcome: 'assigned' }; },
       post: (mail) => { calls.post.push(mail); return { id: 501 }; },
       wake: async () => ({ result: 'injected' }),
-      pool: () => ({ hosts: ['minim5'], scope: 'read-only test-universe runs', source: 'code-default' }),
+      pool: () => ({ hosts: ['minim5'], scope: 'test-universe runs (own temp HOME/TMPDIR · mkdtemp · SQLite/file writes there · head fetch/push to the pool host)', source: 'code-default' }),
       handPool: () => buildHandPool(input()),
       hq: 'OP',
       log: (event, data) => { calls.logs.push([event, data]); },

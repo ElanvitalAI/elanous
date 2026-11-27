@@ -1,6 +1,6 @@
 import { describe, expect, test, spyOn } from 'bun:test';
 import { resolve, join } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync, readFileSync, lstatSync, readlinkSync, symlinkSync, existsSync, copyFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync, readFileSync, lstatSync, readlinkSync, symlinkSync, existsSync, copyFileSync, chmodSync, readdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir, platform } from 'node:os';
 import { assessRailSafe, childPath, defaultPruneVersions, procStatHoldsNothing, liveRestartBlocked, planVersionPrune, relayImportClosure, rollbackTarget, runReleaseUpdate, runSelfUpdate, runUpdateForInstallation, updateRelay, versionCommit, type SelfUpdateDeps, type ReleaseUpdateDeps } from './self-update.js';
@@ -50,6 +50,7 @@ describe('runReleaseUpdate — release installer', () => {
     let installedVersion = '0.2.0';
     const deps: ReleaseUpdateDeps = {
       packageRoot,
+      verifyRestart: async () => ({ ok: false }),
       fetchInstaller: async (url) => { urls.push(url); return 'echo verified installer'; },
       wait: async () => {},
       run: (command, args, cwd, input, env) => {
@@ -265,6 +266,24 @@ describe('runReleaseUpdate — release installer', () => {
         if (!restarts) expect(result.reason).toBe('already at 0.2.0 · restart skipped');
       } finally { f.cleanup(); }
     }
+  });
+
+  test.each(['healthy', 'unhealthy', 'wrong-sha', 'same', 'no-restart'] as const)('release trigger registration gates on new build and verified health: %s', async (scenario) => {
+    const f = setup();
+    const events: string[] = [];
+    const old = { version: '0.1.0', versionDir: 'versions/old', commit: 'aaaaaaaaaaaa' };
+    const next = scenario === 'same' ? old : { version: '0.2.0', versionDir: 'versions/new', commit: 'bbbbbbbbbbbb' };
+    try {
+      writeFileSync(join(f.prefix, 'install.json'), JSON.stringify(old));
+      await runReleaseUpdate({ restart: scenario !== 'no-restart' }, { ...f.deps,
+        run: (command, args, cwd) => { events.push(command); if (command === 'bash') writeFileSync(join(f.prefix, 'install.json'), JSON.stringify(next)); return { status: 0, stderr: '' }; },
+        verifyRestart: async () => { events.push('health'); return { ok: scenario !== 'unhealthy', daemonSha: scenario === 'wrong-sha' ? old.commit : next.commit }; },
+        triggerRegisterRunner: () => { events.push('register'); return { status: 0, stdout: '', stderr: '' }; },
+      });
+      expect(events.includes('register')).toBe(scenario === 'healthy');
+      if (scenario === 'healthy') expect(events.indexOf('register')).toBeGreaterThan(events.indexOf('health'));
+      if (scenario === 'same' || scenario === 'no-restart') expect(events).not.toContain('health');
+    } finally { f.cleanup(); }
   });
 
   test('requested prerelease mismatch fails before service restart', async () => {
@@ -1519,17 +1538,21 @@ describe('self-update --dev and --rollback (temp install root only)', () => {
     return root;
   }
   // The fake installer behaves like scripts/install.sh: lays down versions/<ver>-<sha12> (with or without content), moves current, writes install.json.
-  const devDeps = (root: string, opts: { empty?: boolean; failAfterRelink?: boolean; installerArgs?: string[][]; pwaOut?: boolean; buildFails?: boolean } = {}): SelfUpdateDeps => ({
+  const devDeps = (root: string, opts: { empty?: boolean; failAfterRelink?: boolean; installerArgs?: string[][]; pwaOut?: boolean; buildFails?: boolean; markerCommit?: string; calls?: string[][] } = {}): SelfUpdateDeps => ({
     ...fixture().deps,
     installRoot: root,
     packageVersion: () => '0.2.16-dev.0',
     allowLiveRestart: false,
     run: (cmd, args, cwd) => {
+      opts.calls?.push([cmd, ...args]);
       if (cmd === 'bun' && args[0] === 'bin/elanous.mjs' && args[1] === 'nexus' && args[2] === 'build') {
         if (!opts.buildFails && opts.pwaOut !== false) {
           const builtOut = join(cwd, 'apps/pwa/out');
           mkdirSync(builtOut, { recursive: true });
-          writeFileSync(join(builtOut, 'index.html'), '<html>built</html>');
+          // Never overwrite a developer's real checkout build: a present out without a
+          // marker is now rebuilt (PWA-RUNTIME-LEAN), and this fake must stay harmless.
+          if (!existsSync(join(builtOut, 'index.html'))) writeFileSync(join(builtOut, 'index.html'), '<html>built</html>');
+          if (opts.markerCommit) writeFileSync(join(builtOut, 'elanous-pwa-build.json'), JSON.stringify({ commit: opts.markerCommit }));
         }
         return { status: opts.buildFails ? 1 : 0, stderr: opts.buildFails ? 'nexus build failed' : '' };
       }
@@ -1553,10 +1576,10 @@ describe('self-update --dev and --rollback (temp install root only)', () => {
     const kicked: string[] = [];
     try {
       // The kick's spawn start is awaited before the update returns (the CLI exits right after).
-      const ok = await runSelfUpdate({ dev: true, from: checkout }, { ...devDeps(root), kickDocsIndex: async (prefix) => { await new Promise((r) => setTimeout(r, 20)); kicked.push(prefix); } });
+      const ok = await runSelfUpdate({ dev: true, from: checkout, skipPwaBuild: true }, { ...devDeps(root), kickDocsIndex: async (prefix) => { await new Promise((r) => setTimeout(r, 20)); kicked.push(prefix); } });
       expect(ok.exitCode).toBe(0);
       expect(kicked).toEqual([root]);
-      const failed = await runSelfUpdate({ dev: true, from: checkout }, { ...devDeps(failedRoot, { empty: true, failAfterRelink: true }), kickDocsIndex: (prefix) => { kicked.push(prefix); } });
+      const failed = await runSelfUpdate({ dev: true, from: checkout, skipPwaBuild: true }, { ...devDeps(failedRoot, { empty: true, failAfterRelink: true }), kickDocsIndex: (prefix) => { kicked.push(prefix); } });
       expect(failed.exitCode).not.toBe(0);
       expect(kicked).toEqual([root]);
     } finally {
@@ -1569,7 +1592,7 @@ describe('self-update --dev and --rollback (temp install root only)', () => {
     const root = devRoot();
     const installerArgs: string[][] = [];
     try {
-      const result = await runSelfUpdate({ dev: true, from: checkout }, devDeps(root, { installerArgs }));
+      const result = await runSelfUpdate({ dev: true, from: checkout, skipPwaBuild: true }, devDeps(root, { installerArgs }));
       expect(installerArgs).toEqual([[join(checkout, 'scripts/install.sh'), '--no-modify-path', '--yes', '--prefix', root]]);
       expect(result).toMatchObject({ exitCode: 0, channel: 'dev', current: `versions/0.2.16-dev.0-${sha12}`, previous: 'versions/0.2.15-aaaaaaaaaaaa', restarted: false });
       expect(readlinkSync(join(root, 'current'))).toBe(`versions/0.2.16-dev.0-${sha12}`);
@@ -1582,7 +1605,7 @@ describe('self-update --dev and --rollback (temp install root only)', () => {
   test('--dev refuses an empty install: current and install.json stay on the previous version (10-06 05:30 incident)', async () => {
     const root = devRoot();
     try {
-      const result = await runSelfUpdate({ dev: true, from: checkout }, devDeps(root, { empty: true }));
+      const result = await runSelfUpdate({ dev: true, from: checkout, skipPwaBuild: true }, devDeps(root, { empty: true }));
       expect(result.exitCode).toBe(1);
       expect(result.reason).toContain('빈 판');
       expect(readlinkSync(join(root, 'current'))).toBe('versions/0.2.15-aaaaaaaaaaaa');
@@ -1593,7 +1616,7 @@ describe('self-update --dev and --rollback (temp install root only)', () => {
   test('--dev restores current and install.json when the installer moves current and then fails (rc≠0)', async () => {
     const root = devRoot();
     try {
-      const result = await runSelfUpdate({ dev: true, from: checkout }, devDeps(root, { empty: true, failAfterRelink: true }));
+      const result = await runSelfUpdate({ dev: true, from: checkout, skipPwaBuild: true }, devDeps(root, { empty: true, failAfterRelink: true }));
       expect(result.exitCode).toBe(1);
       expect(result.reason).toContain('설치기 실패');
       expect(readlinkSync(join(root, 'current'))).toBe('versions/0.2.15-aaaaaaaaaaaa');
@@ -1651,10 +1674,90 @@ describe('self-update --dev and --rollback (temp install root only)', () => {
     }
   });
 
+  test('PWA-RUNTIME-LEAN: dev install rebuilds a checkout PWA whose marker is another commit, skips a matching or marker-less one, and installs with the stale PWA when that rebuild fails', async () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'elanous-dev-pwa-stale-'));
+    mkdirSync(join(scratch, 'scripts'), { recursive: true });
+    copyFileSync(join(checkout, 'scripts/install.sh'), join(scratch, 'scripts/install.sh'));
+    const out = join(scratch, 'apps/pwa/out');
+    const roots: string[] = [];
+    const depsFor = (opts: { buildFails?: boolean; markerCommit?: string; calls: string[][] }) => {
+      const root = devRoot();
+      roots.push(root);
+      return {
+        root,
+        deps: {
+          ...devDeps(root, opts),
+          cliRoot: scratch,
+          git: (_cwd: string, args: string[]) => {
+            if (args.includes('--show-toplevel')) return { status: 0, stdout: `${scratch}\n`, stderr: '' };
+            if (args.includes('--verify')) return { status: 0, stdout: `${sha}\n`, stderr: '' };
+            return { status: 0, stdout: '', stderr: '' };
+          },
+        },
+      };
+    };
+    const builds = (calls: string[][]) => calls.filter((c) => c.join(' ') === 'bun bin/elanous.mjs nexus build').length;
+    const adopts = (calls: string[][]) => calls.filter((c) => c.join(' ') === 'bun apps/pwa/scripts/static-generation.ts adopt-packaged').length;
+    try {
+      // Stale: a real-directory out built for another commit → adopt, then rebuild.
+      mkdirSync(join(out, '_next'), { recursive: true });
+      writeFileSync(join(out, 'index.html'), '<html>old</html>');
+      writeFileSync(join(out, '_next', 'app.js'), 'old');
+      writeFileSync(join(out, 'elanous-pwa-build.json'), JSON.stringify({ commit: 'b'.repeat(40) }));
+      const staleCalls: string[][] = [];
+      const stale = depsFor({ calls: staleCalls, markerCommit: sha });
+      const rebuilt = await runSelfUpdate({ dev: true, from: scratch }, stale.deps);
+      expect(rebuilt.exitCode).toBe(0);
+      expect(adopts(staleCalls)).toBe(1);
+      expect(builds(staleCalls)).toBe(1);
+
+      // Fresh: marker names HEAD → no build at all.
+      const freshCalls: string[][] = [];
+      const fresh = depsFor({ calls: freshCalls });
+      expect((await runSelfUpdate({ dev: true, from: scratch }, fresh.deps)).exitCode).toBe(0);
+      expect(builds(freshCalls)).toBe(0);
+
+      // No marker (built before markers existed): kept as before — no build here.
+      rmSync(join(out, 'elanous-pwa-build.json'));
+      const legacyCalls: string[][] = [];
+      const legacy = depsFor({ calls: legacyCalls });
+      expect((await runSelfUpdate({ dev: true, from: scratch }, legacy.deps)).exitCode).toBe(0);
+      expect(builds(legacyCalls)).toBe(0);
+
+      // Stale and the rebuild fails → install still proceeds with the older PWA and says so.
+      writeFileSync(join(out, 'elanous-pwa-build.json'), JSON.stringify({ commit: 'c'.repeat(40) }));
+      const errors: string[] = [];
+      const failCalls: string[][] = [];
+      const failing = depsFor({ calls: failCalls, buildFails: true });
+      const kept = await runSelfUpdate({ dev: true, from: scratch }, { ...failing.deps, out: { log: () => {}, error: (s: string) => { errors.push(s); } } });
+      expect(builds(failCalls)).toBe(1);
+      expect(kept.exitCode).toBe(0);
+      expect(errors.join('\n')).toContain('pwa.lean fallback=stale-out reason=checkout-build-failed');
+      expect(readlinkSync(join(failing.root, 'current'))).toBe(`versions/0.2.16-dev.0-${sha12}`);
+
+      // A stub out (no _next — e.g. a test's 18-byte index.html) is not a fallback: set aside, and a failed build refuses.
+      rmSync(out, { recursive: true, force: true });
+      mkdirSync(out, { recursive: true });
+      writeFileSync(join(out, 'index.html'), '<html>built</html>');
+      writeFileSync(join(out, 'elanous-pwa-build.json'), JSON.stringify({ commit: 'd'.repeat(40) }));
+      const stubCalls: string[][] = [];
+      const stub = depsFor({ calls: stubCalls, buildFails: true });
+      const refused = await runSelfUpdate({ dev: true, from: scratch }, stub.deps);
+      expect(builds(stubCalls)).toBe(1);
+      expect(adopts(stubCalls)).toBe(0);
+      expect(refused.exitCode).toBe(1);
+      expect(refused.reason).toContain('current 를 바꾸지 않음');
+      expect(readdirSync(join(scratch, 'apps/pwa')).some((name) => name.startsWith('out.invalid-'))).toBe(true);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+      for (const root of roots) rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('--rollback returns current to previous; omitting previous makes rollback fail', async () => {
     const root = devRoot();
     try {
-      await runSelfUpdate({ dev: true, from: checkout }, devDeps(root));
+      await runSelfUpdate({ dev: true, from: checkout, skipPwaBuild: true }, devDeps(root));
       const back = await runSelfUpdate({ rollback: true }, devDeps(root));
       expect(back.exitCode).toBe(0);
       expect(readlinkSync(join(root, 'current'))).toBe('versions/0.2.15-aaaaaaaaaaaa');
@@ -1690,6 +1793,8 @@ describe('self-update --dev and --rollback (temp install root only)', () => {
       const result = await runReleaseUpdate({ restart: true }, {
         packageRoot,
         fetchInstaller: async () => 'echo installer',
+        // This fixture has no real daemon: never poll the live nexus after a mocked restart.
+        verifyRestart: async () => ({ ok: false }),
         run: (command) => {
           calls.push(command);
           if (command === 'bash') {

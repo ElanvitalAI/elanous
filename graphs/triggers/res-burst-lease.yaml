@@ -10,17 +10,25 @@ loop:
     steps run first (sanitize → rail catch-up → auth mirror → light pregate smoke → mark ready) → registered as a pregate
     host with caps. On «age ≥ ttl OR requester done OR budget hit» the lease drains (unregistered, inflight pregates get
     until ttl + 15m) → stop → receipt with spend. A failed activation marks the host failed and stops it.
-  owner: RES
+    Absorbed res-ready-pool (LOOP-AUDIT-APPLY 11-26 · it ran the same ready steps): when no lease is due, a burst host never
+    verified or verified > 7 days ago is made ready, one host per run (pool_* nodes: start → sanitize → rail catch-up →
+    auth → light pregate → mark ready → stop; any failure marks the host failed and stops it).
+    Owner = OP (resource-supervision: RES absorbed into OP · org map).
+  owner: OP
+  absorbs: [res-ready-pool]
   trigger:
     condition:
-      predicate: { kind: res, check: lease-due }
+      when:
+        any:
+          - { kind: res, check: lease-due }
+          - { kind: res, check: ready-stale, max_age_days: 7 }
       cooldown_min: 0
   goal:
     kind: ledger-line
     path: '{stateRoot}/loops/res-burst-lease.jsonl'
     contains: '"window":"{window}"'
   failure:
-    goal_deadline_min: 90
+    goal_deadline_min: 120 # the ready-pool chain (catch-up ≤ 30 min + light pregate ≤ 45 min) runs inside this graph now
     max_attempts: 2
     backoff_sec: [60]
   legacy:
@@ -41,11 +49,25 @@ nodes:
   - { node_id: drain, kind: agent, recipe: 'cmd:res-lease-drain', max_visits: 1 }
   - { node_id: stop, kind: agent, recipe: 'cmd:res-run-stop', max_visits: 1 }
   - { node_id: fail, kind: agent, recipe: 'cmd:res-run-fail', max_visits: 1 }
+  - { node_id: pool_pick, kind: agent, recipe: 'cmd:res-ready-pick', max_visits: 1 }
+  - { node_id: pool_start, kind: agent, recipe: 'cmd:res-step-start', max_visits: 1 }
+  - { node_id: pool_sanitize, kind: agent, recipe: 'cmd:res-step-sanitize', max_visits: 1 }
+  - { node_id: pool_catchup, kind: agent, recipe: 'cmd:res-step-catchup', max_visits: 1 }
+  - { node_id: pool_auth, kind: agent, recipe: 'cmd:res-step-auth', max_visits: 1 }
+  - { node_id: pool_smoke, kind: agent, recipe: 'cmd:res-step-smoke', max_visits: 1 }
+  - { node_id: pool_ready, kind: agent, recipe: 'cmd:res-ready-mark', max_visits: 1, input: { image: false } }
   - { node_id: mark, kind: agent, recipe: 'cmd:res-window-done', max_visits: 1, input: { ledger: '{stateRoot}/loops/res-burst-lease.jsonl' } }
   - { node_id: done, kind: gate, max_visits: 1 }
   - { node_id: failed, kind: gate, max_visits: 1 }
 edges:
-  - { from: route, on: outcome, map: { activate: start, drain: drain, none: mark, fail: failed, error: failed } }
+  - { from: route, on: outcome, map: { activate: start, drain: drain, none: pool_pick, fail: failed, error: failed } }
+  - { from: pool_pick, on: outcome, map: { picked: pool_start, none: mark, shadow: mark, fail: failed, error: failed } }
+  - { from: pool_start, on: outcome, map: { ok: pool_sanitize, fail: fail, error: fail } }
+  - { from: pool_sanitize, on: outcome, map: { ok: pool_catchup, fail: fail, error: fail } }
+  - { from: pool_catchup, on: outcome, map: { ok: pool_auth, fail: fail, error: fail } }
+  - { from: pool_auth, on: outcome, map: { ok: pool_smoke, fail: fail, error: fail } }
+  - { from: pool_smoke, on: outcome, map: { ok: pool_ready, fail: fail, error: fail } }
+  - { from: pool_ready, on: outcome, map: { ok: stop, fail: fail, error: fail } }
   - { from: start, on: outcome, map: { ready: register, stale: sanitize, fail: failed, error: fail } }
   - { from: sanitize, on: outcome, map: { ok: catchup, fail: fail, error: fail } }
   - { from: catchup, on: outcome, map: { ok: auth, fail: fail, error: fail } }

@@ -13,6 +13,7 @@ import {
 import { readChecklistContext } from './release-checklist-read-cli.js';
 import { parseElsLs } from '../els/els-self-context.js';
 import { CliUserError } from './cli-user-error.js';
+import { callerSeat } from '../kit/mail-route/sender.js';
 
 function ceoMinutes(value: string): number {
   if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) throw new CliUserError('대표 손 분량은 0 이상의 정수 분이어야 한다');
@@ -41,7 +42,7 @@ export function authorizeChecklistGreenSigner(input: { status: string | undefine
     return {
       allowed: false,
       seat: null,
-      refuse: 'green needs a judge seat (JUD*/REVIEW*) or OP; server-confirmed pane credential (els) required — ELANOUS_TRACK is not authority',
+      refuse: 'green needs a judge seat (JUD*/REVIEW*) or OP — no seat identity found (els pane seat · ELANOUS_TRACK · ELANOUS_SEAT · seats/<SEAT> folder)',
     };
   }
   return {
@@ -70,6 +71,25 @@ async function resolveServerConfirmedSeat(env: NodeJS.ProcessEnv = process.env):
   const mine = (ls.panes ?? []).find((row) => samePane(row) && row.workspace === ws) ?? (ls.panes ?? []).find(samePane) ?? null;
   const seat = typeof mine?.seat === 'string' ? mine.seat.trim() : '';
   return seat === '' ? undefined : seat;
+}
+
+/** JUD-GREEN-CREDENTIAL (#187277 · JUDGE-LOAD-REDUCTION §0c «JUD 서명·거부권 쓰기»): who writes a checklist cell. The els
+ *  server-confirmed pane seat when there is one; otherwise the seat's normal identity — the one `eln msg post` speaks as
+ *  (ELANOUS_TRACK → ELANOUS_SEAT → the seats/<SEAT> folder of the cwd). Same-host federation is trusted (OPS-RULES 판정·보안
+ *  완화 11-23 · 조율자 권한 확대 11-27) — a JUD seat that runs in seats/JUD without ELANOUS_TRACK signs green, HOLDs and
+ *  vetoes (yellow) as JUD, and the ledger row says by=JUD (it said «cli»). Server identity binding = SMARTSEC-GREEN-SIGNER-
+ *  SERVER-IDENTITY (after release). `confirm` is a test seam. */
+export async function resolveChecklistWriter(
+  status: string | undefined,
+  deps: { env?: NodeJS.ProcessEnv; cwd?: string; confirm?: (env: NodeJS.ProcessEnv) => Promise<string | undefined> } = {},
+): Promise<{ verdict: ChecklistGreenSignerVerdict; by: string }> {
+  const env = deps.env ?? process.env;
+  // ELANOUS_TRACK verbatim first (unchanged writes · e.g. «OP/q1»); the new part is only the fallback when it is absent.
+  const identity = env.ELANOUS_TRACK?.trim() || callerSeat(env, deps.cwd ?? process.cwd()) || undefined;
+  if (status !== 'green') return { verdict: authorizeChecklistGreenSigner({ status, seat: identity }), by: identity ?? 'cli' };
+  const confirmed = await (deps.confirm ?? resolveServerConfirmedSeat)(env).catch(() => undefined);
+  const verdict = authorizeChecklistGreenSigner({ status, seat: confirmed ?? identity });
+  return { verdict, by: verdict.seat ?? 'cli' };
 }
 
 /** Only the checklist write leaf; avoids loading release's unrelated command registry. */
@@ -105,10 +125,18 @@ export function registerReleaseChecklistSetCommand(program: Command): void {
     .option('--accelerator', '가속 등급 부여')
     .option('--no-accelerator', '가속 등급 해제(기본은 없음)')
     .option('--ref <path...>', '근거 문서 더하기 — 저장소 상대 경로[#절] (반복 가능 · 중복 제거)')
+    // 11-26 22:4x: the light leaf lacked the full CLI's --body/--done/--source — `set <id> --done …` (the OP planner's
+    // (w) action) failed «unknown option '--done'» on the installed build. Same three options as release-cli.ts.
+    .option('--body <text>', '내용 — 무엇·왜 (빈 문자열이면 지운다)')
+    .option('--done <criterion>', '완료 판정식 (빈 문자열이면 지운다)')
+    .option('--source <quote>', '출처 — 요청 원문 또는 원 우편 id (빈 문자열이면 지운다)')
     .action(
       async (
         ids: string[],
         opts: {
+          body?: string;
+          done?: string;
+          source?: string;
           ref?: string[];
           status?: string;
           evidence?: string;
@@ -141,17 +169,19 @@ export function registerReleaseChecklistSetCommand(program: Command): void {
           opts.ceoMinutes === undefined &&
           opts.ceoDate === undefined &&
           opts.accelerator === undefined &&
-          opts.ref === undefined
+          opts.ref === undefined &&
+          opts.body === undefined &&
+          opts.done === undefined &&
+          opts.source === undefined
         )
           throw new CliUserError(
             '갱신할 칸을 지정하라',
-            '--ref · --status · --evidence · --owner · --disposition · --kind · --priority · --deadline-version · --predecessor · --ceo-minutes · --ceo-date · --accelerator · --no-accelerator 중 하나',
+            '--ref · --status · --evidence · --owner · --disposition · --kind · --priority · --deadline-version · --predecessor · --ceo-minutes · --ceo-date · --accelerator · --no-accelerator · --body · --done · --source 중 하나',
           );
-        // #134310 ① — green 의 서명자 자리는 els 서버가 패널 자격으로 확인한 자리만 인정(ELANOUS_TRACK env 는 권한이 아님).
-        // CEO 11-23 relaxation: the server-confirmed seat is preferred, but a judge seat named in ELANOUS_TRACK is accepted when
-        // els cannot confirm it (judges outside an els pane were blocked from signing). Hardening = SMARTSEC FU.
-        const signerSeat = opts.status === 'green' ? ((await resolveServerConfirmedSeat()) ?? process.env.ELANOUS_TRACK) : process.env.ELANOUS_TRACK;
-        const greenSigner = authorizeChecklistGreenSigner({ status: opts.status, seat: signerSeat });
+        // #134310 ① ⊕ CEO 11-23 relaxation ⊕ JUD-GREEN-CREDENTIAL: the server-confirmed seat is preferred; when els cannot
+        // confirm one, the seat's normal identity (ELANOUS_TRACK · ELANOUS_SEAT · seats/<SEAT> cwd) writes. Hardening = SMARTSEC FU.
+        const writer = await resolveChecklistWriter(opts.status);
+        const greenSigner = writer.verdict;
         if (!greenSigner.allowed) {
           debug.log('release.checklist', 'green-signer-refusal', { version, ids, seat: greenSigner.seat });
           throw new CliUserError(
@@ -182,8 +212,11 @@ export function registerReleaseChecklistSetCommand(program: Command): void {
             ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}),
             ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}),
             ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}),
+            ...(opts.body !== undefined ? { body: opts.body.trim() ? opts.body : null } : {}),
+            ...(opts.done !== undefined ? { doneCriterion: opts.done.trim() ? opts.done : null } : {}),
+            ...(opts.source !== undefined ? { source: opts.source.trim() ? opts.source : null } : {}),
           },
-          opts.status === 'green' ? (greenSigner.seat ?? 'cli') : process.env.ELANOUS_TRACK || 'cli',
+          writer.by,
         );
         for (const id of ids) {
           const item = data.items.find((entry) => entry.id === id);

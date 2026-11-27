@@ -20,16 +20,11 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { KNOWHOW_HALF_LIFE_DAYS, seatKnowhowCards, type KnowhowKind } from '../kit/knowhow/index.js';
 
-export type KnowhowKind = 'fact' | 'warning' | 'heuristic' | 'playbook' | 'case';
-
-export const KNOWHOW_HALF_LIFE_DAYS: Record<KnowhowKind, number> = {
-  fact: 14,
-  warning: 30,
-  heuristic: 90,
-  playbook: 60,
-  case: Number.POSITIVE_INFINITY,
-};
+// The card grammar (split · 상태 · 종류 · 검증) lives in kit/knowhow — this module keeps the seat pack policy only.
+export type { KnowhowKind } from '../kit/knowhow/index.js';
+export { KNOWHOW_HALF_LIFE_DAYS } from '../kit/knowhow/index.js';
 
 /** One overall budget cap for the whole injected pack (RFC §A3 — value
  * unspecified in the ask; 32,000 chars adopted as the documented value for
@@ -76,86 +71,16 @@ export interface SeatPackDeps {
   topK?: number;
 }
 
-// 참/거짓 뒤 경계는 \b 대신 명시적 뒷자리 제한 — \w 가 ASCII 한정이라
-// 참(한글) 뒤에서는 \b 가 경계로 안 센다(실측: verified 가 null 로 흘렀다).
-const VERIFIED_TRUE_RE = /^\s*(\d{4}-\d{2}-\d{2})\s*참(?![^\s(·])/;
-const VERIFIED_FALSE_RE = /^\s*(\d{4}-\d{2}-\d{2})\s*거짓(?![^\s(·])/;
-const VERIFIED_UNVERIFIABLE_RE = /^\s*(\d{4}-\d{2}-\d{2})\s*못잼/;
-const FIELD_RE = /^-([^:]+):\s*(.*)$/;
-
-function calendarDate(isoDay: string): Date | null {
-  const date = new Date(`${isoDay}T00:00:00Z`);
-  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === isoDay ? date : null;
-}
-
+/** Seat cards via kit/knowhow (`K-<seat>-<N>` only — sub-track cards such as `K-OP-PR-01` are not seat pack cards). */
 export function parseKnowhowItems(body: string, seat: string): KnowhowItem[] {
-  const headerRe = new RegExp(`^##\\s+K-${seat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-\\d+`, 'i');
-  const items: KnowhowItem[] = [];
-  // First section before any card header is the document preamble — drop it.
-  const sections = body.split(/^##\s+/m);
-  for (const section of sections) {
-    const lines = section.split('\n');
-    const header = lines[0] ?? '';
-    if (!headerRe.test(`## ${header}`)) continue;
-    const rest = lines.slice(1).join('\n');
-    const fields: Record<string, string> = {};
-    let kind: KnowhowKind | null = null;
-    let status = '';
-    let verifiedAt: Date | null = null;
-    let verified: boolean | null = null;
-    for (const line of rest.split('\n')) {
-      const m = line.match(FIELD_RE);
-      if (m) {
-        const label = m[1].trim();
-        const value = m[2].trim();
-        fields[label] = value;
-        if (label === '종류' && value in KNOWHOW_HALF_LIFE_DAYS) {
-          kind = value as KnowhowKind;
-        } else if (label === '상태') {
-          status = value;
-        } else if (label === '검증') {
-          // A later verification line supersedes the earlier one even when
-          // malformed; otherwise an old «참» survives a failed new check.
-          verified = null;
-          verifiedAt = null;
-          const t = value.match(VERIFIED_TRUE_RE);
-          const f = value.match(VERIFIED_FALSE_RE);
-          const u = value.match(VERIFIED_UNVERIFIABLE_RE);
-          if (t) {
-            verified = true;
-            verifiedAt = calendarDate(t[1]);
-          } else if (f) {
-            verified = false;
-            verifiedAt = calendarDate(f[1]);
-          } else if (u) {
-            verified = null;
-            verifiedAt = calendarDate(u[1]);
-          }
-        }
-      }
-    }
-    // Inline `상태:`/`종류:` inside other fields (e.g. the 출처 line) also count.
-    for (const value of Object.values(fields)) {
-      if (!status) {
-        const s = value.match(/(?:^|·\s*|[·，,;|\s])상태:\s*(\S+)/);
-        if (s) status = s[1];
-      }
-      if (!kind) {
-        const k = value.match(/(?:^|·\s*|[·，,;|\s])종류:\s*(\S+)/);
-        if (k && k[1] in KNOWHOW_HALF_LIFE_DAYS) kind = k[1] as KnowhowKind;
-      }
-    }
-    items.push({
-      kind: kind ?? 'fact',
-      // Missing 상태 stays '' — the classifier refuses to inject it; the
-      // parser must not default a status-less card to `active` (must-fix 1).
-      status,
-      verifiedAt,
-      verified,
-      text: `## ${header}\n${rest}`.trim(),
-    });
-  }
-  return items;
+  return seatKnowhowCards(body, seat).map((card) => ({
+    kind: card.kind,
+    // Missing 상태 stays '' — the classifier refuses to inject it (must-fix 1).
+    status: card.status,
+    verifiedAt: card.verifiedAt,
+    verified: card.verified,
+    text: card.text,
+  }));
 }
 
 function withinHalfLife(item: KnowhowItem, now: Date): boolean {

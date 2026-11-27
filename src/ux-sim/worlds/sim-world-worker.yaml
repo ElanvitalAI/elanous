@@ -11,3 +11,8 @@ scenarios:
   - { id: WORKER-BINDINGS, module: src/ux-sim/sim-world/worker/scenarios.ts }
   - { id: WORKER-WIRE-ACCEPT, module: src/ux-sim/sim-world/worker/scenarios.ts }
   - { id: WORKER-WIRE-REJECT, module: src/ux-sim/sim-world/worker/scenarios.ts }
+  - { id: KIT-AUDIT-APPEND, module: src/ux-sim/sim-world/worker/kit-audit-ledger.ts }
+  - { id: KIT-AUDIT-SCHEMA, module: src/ux-sim/sim-world/worker/kit-audit-ledger.ts }
+  - { id: KIT-AUDIT-ROTATE, module: src/ux-sim/sim-world/worker/kit-audit-ledger.ts }
+  - { id: KIT-AUDIT-MALFORMED-TAIL, module: src/ux-sim/sim-world/worker/kit-audit-ledger.ts }
+  - { id: KIT-AUDIT-FAIL-SOFT, module: src/ux-sim/sim-world/worker/kit-audit-ledger.ts }

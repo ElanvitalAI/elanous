@@ -67,6 +67,26 @@ test('판별 UTC 저장 · KST 표시 · 순서 · 이력의 from/to 및 관측'
   } finally { log.mockRestore(); }
 });
 
+test('rehearsal time persists across reads and rejects a time at or after cut', () => {
+  setup();
+  const first = setSchedule('0.2.11', { cutAt: '2026-10-03T09:00+09:00', rehearsalAt: '2026-10-03T08:00+09:00' }, 'OP');
+  expect(first.rehearsalAt).toBe('2026-10-02T23:00:00.000Z');
+  expect(formatSchedule(first)).toContain('리허설 10-03(토) 08:00 KST');
+  expect(getSchedule('0.2.11')?.rehearsalAt).toBe(first.rehearsalAt);
+  expect(listSchedules().find(s => s.version === '0.2.11')?.rehearsalAt).toBe(first.rehearsalAt);
+  expect(() => setSchedule('0.2.11', { rehearsalAt: '2026-10-03T09:00+09:00' }, 'OP')).toThrow();
+  expect(() => setSchedule('0.2.11', { cutAt: '2026-10-03T08:00+09:00' }, 'OP')).toThrow();
+  expect(getSchedule('0.2.11')?.rehearsalAt).toBe(first.rehearsalAt);
+  expect(getSchedule('0.2.11')?.cutAt).toBe(first.cutAt);
+  const db = new Database(join(dir, 'release/features.sqlite'));
+  try {
+    expect(db.query('SELECT rehearsal_at FROM release_schedules WHERE version = ?').get('0.2.11')).toEqual({ rehearsal_at: first.rehearsalAt });
+    expect(db.query('SELECT field, "from", "to" FROM events WHERE version = ? AND field = ?').all('0.2.11', 'rehearsal_at')).toEqual([
+      { field: 'rehearsal_at', from: 'null', to: JSON.stringify(first.rehearsalAt) },
+    ]);
+  } finally { db.close(); }
+});
+
 test('시각은 오프셋 포함 ISO 만 · 잘못된 날짜나 비어 있는 첫 컷 거부', () => {
   setup();
   for (const value of ['2026-10-03T08:00', '2026-10-03 08:00', '2026-10-03T08:00+24:00', '2026-02-30T08:00+09:00']) {

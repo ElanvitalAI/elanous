@@ -1,0 +1,35 @@
+# 판정 집사 (judge-butler) — goal card (LOOP-AGENT §1 ① 목표). Read by src/judge-butler/cards.ts.
+# «틱 완료 ≠ 목표 완료»: the tick writes last-tick.json; the goal is closed only by these outcome numbers.
+id: judge-butler
+address: JUDGE-BUTLER          # mail seat id · alias loop:judge-butler
+rank: sub-coordinator          # OP 직속 · TC·JUD·UX·MK 와 동급
+supervisor: JUD                # L0: criteria · HOLD changes · security-4
+kpi:
+  greens_per_hour_min: 10      # 대표 시간당 초록 10
+  judge_queue_median_wait_max_min: 15
+  frozen_hands_max: 0
+  hand_answer_sla_min: 10      # judge-domain ✋ answered or escalated
+done_when_per_cell:            # both, on every merged PR the cell cites (GREEN-DEFINITION-ONE · JUDGE-LOAD-REDUCTION §0)
+  - same-head receipt          # a PREGATE-GREEN receipt that counts for the PR's landed head (green_rules.same_head)
+  - focused exit 0             # the receipt's focused result is acceptable (green_rules.focused_ok)
+  # sim/test-universe evidence (E4 line «E4 test|sim 층 — … 칸 <id> … rc 0») is NOT required — a missing E4 is one FU cell «<cell>-E4»
+# BUTLER-SIGN-MERGED-PATCHID (11-27): the land rule, read by src/judge-butler/done-when.ts (judgeCell). The same receipt rules as
+# the land graph (src/land-graph/receipt-rules.ts) — a receipt the land graph landed on is a receipt the butler signs on.
+green_rules:
+  same_head:                   # which receipt counts as «same head» for the landed head
+    - exact                    # receipt head == landed head
+    - patch-id                 # an older head whose PR-own delta (src/git-smart prDelta · stable patch-id · #40358) equals the landed head's
+  focused_ok:                  # which focused results are «focused exit 0»
+    - pass                     # focused raw pass > 0 ∧ fail = 0
+    - step-exit-0              # raw swept: the receipt's own focused step exit 0
+    - preexisting-on-main      # every head failure also fails on main (pregate focusedBaseline · newFailures = [] · BASELINE-FAIL-NONBLOCK 대표 11-27)
+    - doc-only-L0              # doc-only PR whose receipt ran no focused stage (L0)
+never_auto:
+  - security-4 paths           # auth · secret · remote-exec · destroy → JUD/Terra
+  - criteria change            # → JUD
+  - HOLD create / widen / lift # → owner or JUD (the butler proposes and expires only)
+voice:
+  per_hour_max: 12             # over → fold to a deterministic reply + escalation
+  role: coordinator            # the federation's configured coordinator LLM (resolveRoleLlm)
+report:
+  digest_every_min: 30

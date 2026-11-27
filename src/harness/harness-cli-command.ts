@@ -2201,8 +2201,9 @@ export function formatBudgetLine(decision: BudgetDecision): string {
 }
 
 /** 마지막 줄 JSON. `outcome` 은 그래프 러너가 간선을 고르는 칸과 같은 이름이다. */
-export function budgetOutcomeJson(decision: BudgetDecision): string {
+export function budgetOutcomeJson(decision: BudgetDecision, launchGate?: ReturnType<typeof harnessLaunchBudgetDecision>): string {
   return JSON.stringify({
+    ...(launchGate ? { launchGate } : {}),
     outcome: decision.action,
     provider: decision.provider ?? null,
     model: decision.model ?? null,
@@ -2221,6 +2222,8 @@ export async function runHarnessBudget(opts: { json?: boolean } = {}, io: {
 } = { log: (line) => console.log(line) }): Promise<BudgetDecision> {
   const inputs = await (io.read ?? readBudgetInputsLive)();
   const decision = decideBudget(inputs);
+  // Report the same default-chain decision used by the launch gate on this snapshot.
+  const launchGate = harnessLaunchBudgetDecision(inputs);
   try {
     debug.log('harness.budget-gate', 'decided', {
       action: decision.action,
@@ -2229,9 +2232,9 @@ export async function runHarnessBudget(opts: { json?: boolean } = {}, io: {
     });
   } catch { /* observation must not block the decision */ }
   if (opts.json) {
-    io.log(budgetOutcomeJson(decision));
+    io.log(budgetOutcomeJson(decision, launchGate));
   } else {
-    io.log(formatBudgetLine(decision));
+    io.log(`${formatBudgetLine(decision)}\nlaunch gate (default chain): ${formatBudgetLine(launchGate.decision)}${launchGate.warning ? ` · ${launchGate.warning}` : ''}`);
   }
   return decision;
 }

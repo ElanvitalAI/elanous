@@ -1,0 +1,30 @@
+import { test, expect } from 'bun:test';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { triggerRegistrationAnomalies } from './trigger-cli.js';
+import { listTriggers, openTriggerRegistry, readTriggerDecl, registerTrigger, triggerDeclSha } from './trigger-registry.js';
+
+test('reports missing and malformed declarations without touching a registry', () => {
+  const root = mkdtempSync(join(tmpdir(), 'trigger-anomalies-'));
+  const dir = join(root, 'graphs', 'triggers');
+  mkdirSync(dir, { recursive: true });
+  const decl = (id: string) => `graph_id: ${id}\nloop:\n  owner: TC\n  trigger:\n    cron: '* * * * *'\n  goal:\n    kind: file-mtime\n    path: /tmp/done\n`;
+  writeFileSync(join(dir, 'existing.yaml'), decl('existing'));
+  writeFileSync(join(dir, 'new.yaml'), decl('new'));
+  writeFileSync(join(dir, 'bad.yaml'), 'graph_id: bad\n');
+  writeFileSync(join(dir, 'recipes.yaml'), 'ignored');
+  writeFileSync(join(dir, 'example.rhythm.yaml'), 'ignored');
+  const declaration = readTriggerDecl('graphs/triggers/existing.yaml', root);
+  const db = openTriggerRegistry(join(root, 'isolated-state'));
+  expect(registerTrigger(db, declaration, { update: true }).created).toBe(true);
+  expect(registerTrigger(db, declaration, { update: true })).toMatchObject({ created: false, updated: false });
+  expect(listTriggers(db)).toHaveLength(1);
+  db.close();
+  const registered = [{ graphId: 'existing', declSha: triggerDeclSha(declaration) }];
+  const result = triggerRegistrationAnomalies(root, registered);
+  expect(result).toEqual([{ file: 'graphs/triggers/bad.yaml', error: expect.any(String) }, { file: 'graphs/triggers/new.yaml', graphId: 'new' }]);
+  writeFileSync(join(dir, 'existing.yaml'), decl('existing').replace("* * * * *", '*/5 * * * *'));
+  expect(triggerRegistrationAnomalies(root, registered)).toContainEqual({ file: 'graphs/triggers/existing.yaml', graphId: 'existing', error: 'registered declaration differs from source' });
+  expect(triggerRegistrationAnomalies(join(root, 'absent'), [])).toEqual([{ file: 'graphs/triggers', error: expect.any(String) }]);
+});

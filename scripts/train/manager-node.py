@@ -17,7 +17,9 @@ def main():
     data = context.get('input')
     if not isinstance(data, dict) or data.get('op_watching') is not True:
         raise ValueError('manager tick requires op_watching=true')
-    source = Path(__file__).resolve().parent / 'legacy/train-manager.py'
+    # LAND-STEWARD (11-27): the train manager is a sub-loop agent of 착지 집사 — its train work lives in
+    # src/land-steward/train.ts on the land-graph body. A manual tick is one heartbeat; legacy/train-manager.py stays on disk.
+    source = Path(__file__).resolve().parent / 'train-manager-heartbeat.py'
     result = subprocess.run([sys.executable, str(source), '--once'])
     print(json.dumps({'outcome': 'ok' if result.returncode == 0 else 'fail',
                       'exitCode': result.returncode, 'source': str(source)}))

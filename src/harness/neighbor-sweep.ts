@@ -16,6 +16,10 @@ import { join } from 'node:path';
 import ts from 'typescript';
 
 import { AST_GREP_MAX_BUFFER, AST_GREP_TIMEOUT_MS } from '../skills/tools/ast-grep.js';
+// SMART-ROUTER-TIER-FULL-WIRE(칸 43) — 등급 게이트 원천(실제 원천 스토어 → env → free fail-closed).
+import type { MembershipResolver } from '../plugins/smart-router/consumer.js';
+import { authorizeRouterFeatureAtEntry } from '../plugins/smart-router/full-wire.js';
+import { createMemberTierStore, memberTierResolver } from '../members/tier-store.js';
 
 // ── 모드 · 상수 ───────────────────────────────────────────────────────────
 
@@ -23,8 +27,14 @@ import { AST_GREP_MAX_BUFFER, AST_GREP_TIMEOUT_MS } from '../skills/tools/ast-gr
 export type NeighborSweepMode = 'off' | 'shadow' | 'on';
 export const NEIGHBOR_SWEEP_ENV = 'ELANOUS_HARNESS_NEIGHBOR_SWEEP';
 
-/** 생략·무효값 = shadow. 켜기는 명시 `on` 만. */
-export function resolveNeighborSweepMode(raw: unknown): NeighborSweepMode {
+/** 생략·무효값 = shadow. 켜기는 명시 `on` 만. 등급 게이트(router.neighbor_sweep · advanced 전용) 미달이면
+ *  계산도 하지 않는다(off — fail-closed). 원천 미주입 시 실제 회원 등급 원천(member-tier-store→env→free)으로 판정. */
+export function resolveNeighborSweepMode(
+  raw: unknown,
+  membership: MembershipResolver = memberTierResolver(createMemberTierStore()),
+): NeighborSweepMode {
+  const grant = authorizeRouterFeatureAtEntry('router.neighbor_sweep', membership);
+  if (!grant.allowed) return 'off';
   return raw === 'on' || raw === 'off' ? raw : 'shadow';
 }
 

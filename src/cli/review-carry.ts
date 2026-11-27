@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { delimiter, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { patchIdFromOutput } from '../git-smart/delta.js';
 
 const SHA = /^[0-9a-f]{40}$/i;
 const MAX = 32 * 1024 * 1024;
@@ -144,8 +145,8 @@ export function proveReviewCarry(cwd: string, oldHead: string, newHead: string, 
         pathsModes.push(`${match[3]}\0${match[1]}\0${match[2]}\0${fields[i + 1]}`);
       }
       const patched = run(['patch-id', '--stable'], objectEnv, `${diff}\n`);
-      const patchId = patched.status === 0 && !patched.error ? patched.stdout.trim().split(/\s+/)[0] : null;
-      return patchId && SHA.test(patchId) ? { patchId: patchId.toLowerCase(), pathsModes: pathsModes.sort() } : null;
+      const patchId = patched.status === 0 && !patched.error ? patchIdFromOutput(patched.stdout) : null; // SMART-MERGE ① shared parse
+      return patchId ? { patchId, pathsModes: pathsModes.sort() } : null;
     };
     const before = changed(oldBase, oldHead);
     const after = changed(newBase, newHead);

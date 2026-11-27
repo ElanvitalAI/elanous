@@ -17,6 +17,10 @@
 // shape · 3-option radio).
 
 import type { BudgetUserConfig, ModelTier } from '../model-tier/types.js';
+// SMART-ROUTER-TIER-FULL-WIRE(칸 43) — 등급 게이트 원천(실제 원천 스토어 → env → free fail-closed).
+import type { MembershipResolver } from '../plugins/smart-router/consumer.js';
+import { authorizeRouterFeatureAtEntry } from '../plugins/smart-router/full-wire.js';
+import { createMemberTierStore, memberTierResolver } from '../members/tier-store.js';
 
 export type BudgetStatus = 'ok' | 'warning' | 'cap-exceeded';
 
@@ -36,6 +40,14 @@ export interface BudgetEvaluation {
   recommendedFallback?: ModelTier;
   /** notifyAtPct echoed back for "(80%)" subtext in the modal header. */
   notifyAtPct: number;
+  /** SMART-ROUTER-TIER-FULL-WIRE(칸 43) — router.budget_alerts 미달 등급이어서 경보 상태를 내지 않을 때의 표지.
+   *  관측값(percent·monthlyUsdCap)은 그대로 실린다 — «기능 미달»을 숨기지 않는다. */
+  readonly alertsDenied?: {
+    readonly feature: 'router.budget_alerts';
+    readonly reason: string;
+    readonly entry: string;
+    readonly tierSource: string;
+  };
 }
 
 /** Default tier for `recommendedFallback` when the user hasn't pinned
@@ -50,6 +62,8 @@ export const DEFAULT_NOTIFY_AT_PCT = 80;
 export interface EvaluateBudgetOpts {
   budget: BudgetUserConfig | undefined;
   monthSoFarUsd: number;
+  /** SMART-ROUTER-TIER-FULL-WIRE(칸 43) — 등급 원천 주입(시험). 없으면 실제 원천 스토어 → env 폴백 → free. */
+  readonly membership?: MembershipResolver;
 }
 
 export function evaluateBudget(opts: EvaluateBudgetOpts): BudgetEvaluation {
@@ -70,6 +84,19 @@ export function evaluateBudget(opts: EvaluateBudgetOpts): BudgetEvaluation {
 
   const rawPercent = (monthSoFar / cap) * 100;
   const percent = Math.min(999, Math.round(rawPercent * 10) / 10);
+  // SMART-ROUTER-TIER-FULL-WIRE(칸 43) — budget_alerts 진입 게이트: 등급 원천(member-tier-store → env → free
+  // fail-closed)이 router.budget_alerts 를 거부하면 경보·추천 강하를 내지 않는다(status ok — fail-closed).
+  // 관측값(percent·monthlyUsdCap)은 그대로 실고 alertsDenied 표지로 기능 미달을 밝힌다(숫자를 지어내지 않는다).
+  const grant = authorizeRouterFeatureAtEntry('router.budget_alerts', opts.membership ?? memberTierResolver(createMemberTierStore()));
+  if (!grant.allowed) {
+    return {
+      status: 'ok',
+      percent,
+      monthlyUsdCap: cap,
+      notifyAtPct,
+      alertsDenied: { feature: 'router.budget_alerts', reason: grant.reason, entry: grant.entry, tierSource: grant.tierSource },
+    };
+  }
   const warnAt = cap * (notifyAtPct / 100);
 
   if (monthSoFar >= cap) {

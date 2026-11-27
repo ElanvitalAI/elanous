@@ -147,7 +147,7 @@ export function registerResCommands(program: Command): void {
     .action(async (opts: { dryRun?: boolean; shadowCards?: boolean; json?: boolean }) => {
       if (opts.dryRun && opts.shadowCards) { console.error('res patrol: --dry-run and --shadow-cards are exclusive'); process.exitCode = 2; return; }
       const { defaultPatrolRunDeps, runResPatrolWith } = await import('../res-policy/patrol-run.js');
-      const { beatSafe } = await import('../watch/heartbeat.js');
+      const { beatSafe } = await import('../kit/heartbeat/index.js');
       let result: Awaited<ReturnType<typeof runResPatrolWith>>;
       try { result = await runResPatrolWith(defaultPatrolRunDeps(), { dryRun: opts.dryRun === true, shadowCards: opts.shadowCards === true }); }
       catch (error) {
@@ -336,6 +336,8 @@ export function registerResCommands(program: Command): void {
       const rv = loadReservation(r);
       console.log(`reservation: ${rv?.active ? `node-b release-only (${rv.phase} ${rv.version} until ${rv.until})` : 'none'}`);
     });
+  // 수호자 (guardian v2) — TEST-UNIVERSE-REAPER · PREGATE-HOST-BALANCE doors.
+  (require('../guardian-agent/guardian-cli.js') as typeof import('../guardian-agent/guardian-cli.js')).registerReapCommands(res);
 }
 
 export function parseTtl(text: string): number {

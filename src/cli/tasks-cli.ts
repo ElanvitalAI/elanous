@@ -279,7 +279,7 @@ export interface DefaultTaskLauncherDeps {
   /** Isolated integration seam; production still reads the HQ rotation snapshot and config directly. */
   ownerCodexRotation?: () => ReturnType<typeof import('../oauth/codex-account-store.js').inspectCodexRotation>;
   ownerCodexRotationConfig?: { accountOrder?: readonly string[]; thresholdPercentByAccount?: Readonly<Record<string, unknown>>;
-    creditsAllowed?: boolean; creditReserve?: number };
+    creditsAllowed?: boolean; creditReserve?: number; creditAccounts?: readonly string[] };
   /** The HQ owner fence is checked before any token refresh. */
   ownerCodexLeaseHolder?: () => boolean;
   /** 원격 → 로컬 되돌림 알림(시험 주입). 기본 = stderr 한 줄. */
@@ -397,6 +397,7 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
       thresholdPercentByAccount: ownerConfig?.thresholdPercentByAccount ?? config.llm?.codexAccountRotationThresholdPercentByAccount,
       creditsAllowed: ownerConfig?.creditsAllowed ?? codexPolicyAllowsCredits(codexQuotaPolicyFromConfig()),
       creditReserve: ownerConfig?.creditReserve ?? config.llm?.codexCreditReserve,
+      creditAccounts: ownerConfig?.creditAccounts ?? (await import('../oauth/codex-credit-accounts.js')).readCodexCreditAccounts(() => config.llm).names,
     });
     if (candidates.length > 0 && eligible.length === 0) throw new NoEligibleOwnerCodexAccountError('HQ 소유 Codex 계정이 모두 사용 임계에 도달해 원격 부모 발사를 거부한다');
     const prerefreshDeps = {

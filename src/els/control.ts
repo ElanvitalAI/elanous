@@ -14,8 +14,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { clean, type QueueAudit } from './core.js';
 import { classifyShellArgv, simpleArgv, type AllowShape } from '../security/shell-argv-policy.js';
-import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { appendAuditLine } from '../kit/audit-ledger/index.js';
 import { sameUidSeatBoundary } from './seat-boundary.js';
 
 export const CONTROL_ACTIONS = ['read', 'do', 'input', 'new', 'status', 'list', 'rename', 'move', 'close'] as const;
@@ -405,9 +406,9 @@ function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
+/** kit/audit-ledger strict writer: one whole line · fsync · size rotation · 0600. Throws so the door keeps «audit-failed». */
 function defaultAppend(path: string, line: string): void {
-  mkdirSync(dirname(path), { recursive: true });
-  appendFileSync(path, line, { mode: 0o600 });
+  appendAuditLine(path, line, { mode: 0o600 });
 }
 
 /** Surfaces that refuse before the door (bad signature, replayed nonce) still write one audit line here. Nothing runs, so best effort. */

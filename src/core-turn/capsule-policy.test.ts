@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { createCapsulePolicy } from './capsule-policy.js';
+import { capsulePolicyKindForTool, createCapsulePolicy } from './capsule-policy.js';
 import type { CapsuleDecisionInput } from '../turn-capsule/contract.js';
 
 const decide = (turn: unknown, input: CapsuleDecisionInput) =>
@@ -41,5 +41,25 @@ describe('capsule policy (no switch)', () => {
     const policy = createCapsulePolicy({ turnConfig: () => ({}), correlation: { turnId: 'turn-1' }, log: (event, data) => { events.push([event, data]); throw Error('log'); } });
     expect(policy.decide(shell)).toEqual({ mode: 'sync', syncCapMs: 10000, reason: 'capsule-sync-cap' });
     expect(events).toEqual([['turn-life:capsule-policy', { turnId: 'turn-1', tool: 'Bash', kind: 'shell', mode: 'sync', syncCapMs: 10000, reason: 'capsule-sync-cap' }]]);
+  });
+});
+
+// CAPSULE-A1-POLICY junction mapper — the §1.5 capsule families (the 11-18 §C isolation axes + graph
+// runs); a dispatched tool outside the families is not a capsule: null, and the junction emits no row.
+describe('capsulePolicyKindForTool (junction mapper)', () => {
+  test('maps every capsule family; a non-capsule tool name is null', () => {
+    expect(capsulePolicyKindForTool('Bash')).toBe('shell');
+    expect(capsulePolicyKindForTool('RunShell')).toBe('shell');
+    expect(capsulePolicyKindForTool('WebTerminal')).toBe('shell');
+    expect(capsulePolicyKindForTool('Agent')).toBe('agent');
+    expect(capsulePolicyKindForTool('Task')).toBe('agent');
+    expect(capsulePolicyKindForTool('RunDevHarness')).toBe('harness');
+    expect(capsulePolicyKindForTool('HarnessProbe')).toBe('harness');
+    expect(capsulePolicyKindForTool('GraphRun')).toBe('graph');
+    expect(capsulePolicyKindForTool('RunGraph')).toBe('graph');
+    expect(capsulePolicyKindForTool('mcp__a1_sample__probe')).toBe('mcp');
+    expect(capsulePolicyKindForTool('Read')).toBeNull();
+    expect(capsulePolicyKindForTool('ScheduleWakeup')).toBeNull();
+    expect(capsulePolicyKindForTool('')).toBeNull();
   });
 });

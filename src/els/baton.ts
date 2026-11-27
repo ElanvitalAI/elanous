@@ -34,6 +34,11 @@ export type BatonEvent = { readonly action: 'hand' | 'take' | 'return' | 'expire
 
 /** ELS-BATON-AUTO-ON-RESTART (대표 11-24 04:4x · cell): the designated acting seat and the timings, in code (no flags). */
 export const AUTO_ACTING_SEAT = 'TC';
+/** ELS-BATON-ACTING-FALLBACK (OP 11-26): when TC is still restarting (or down) the update-all baton may go to one of
+ * these instead, so OP is not skipped every rail because TC's turn boundary came after the deadline. */
+export const AUTO_ACTING_FALLBACKS: readonly string[] = ['UX', 'JUD'];
+/** Every seat an automatic hand may name. */
+export const AUTO_ACTING_SEATS: readonly string[] = [AUTO_ACTING_SEAT, ...AUTO_ACTING_FALLBACKS];
 /** Lease TTL at an automatic hand (cell: --ttl 15m). */
 export const AUTO_TTL_MS = 15 * 60_000;
 /** The new OP must register within this window, else the acting seat keeps the lease and one 🚨 goes out. */
@@ -55,17 +60,18 @@ export class BatonLease {
    * Runtime hand right before the OP pane is stopped (update-all migration, seat relaunch, pane exit).
    * Idempotent: an active lease to the acting seat is kept (returns it, `handed: false`).
    */
-  autoHand(reason: string): { baton: ActingBaton; handed: boolean } {
+  autoHand(reason: string, acting: string = AUTO_ACTING_SEAT): { baton: ActingBaton; handed: boolean } {
     const now = this.clock();
     if (!Number.isFinite(now)) throw new Error('invalid clock');
+    if (!AUTO_ACTING_SEATS.includes(acting)) throw new Error(`acting seat must be one of ${AUTO_ACTING_SEATS.join(', ')}`);
     this.expire(now);
     const line = typeof reason === 'string' ? reason.replace(/[\r\n]+/g, ' ').trim().slice(0, 480) : '';
     if (!line) throw new Error('one-line reason required');
     if (this.current) {
-      if (this.current.acting !== AUTO_ACTING_SEAT) throw new Error('baton already active');
+      if (!AUTO_ACTING_SEATS.includes(this.current.acting)) throw new Error('baton already active');
       return { baton: { ...this.current }, handed: false };
     }
-    const baton: ActingBaton = { owner: 'OP', acting: AUTO_ACTING_SEAT, reason: `OP restart ${line}`, expiresAt: new Date(now + AUTO_TTL_MS).toISOString() };
+    const baton: ActingBaton = { owner: 'OP', acting, reason: `OP restart ${line}`, expiresAt: new Date(now + AUTO_TTL_MS).toISOString() };
     this.audit({ action: 'auto-hand', at: new Date(now).toISOString(), baton: { ...baton }, actor: 'runtime' });
     this.current = baton;
     this.auto = { reason: baton.reason, since: now, deadline: now + AUTO_RETURN_DEADLINE_MS, alerted: false };

@@ -19,6 +19,8 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { userConfigPath } from '../user-config.js';
 import { defaultConditionProbes } from '../loops/trigger-conditions.js';
+import { readSchedule } from '../release-loop/feature-store.js';
+import { dispatchScheduledGraph } from '../release-loop/scheduled-graph-dispatch.js';
 import {
   compareTable, configuredMode, createRun, criticalPath, defaultDetect, defaultStart, listRuns, loadRun, createRehearsal, markDone, enterQuickSurgery, noGoWith, skipStep, pidAlive, rehearsalKey, rehearsalReceiptPath,
   releaseHome, releaseSteps, resumeFrom, runDir, stepsFor, tickRelease, type ExecDeps, type PlanOptions, type PlanPaths, type ReleaseClock,
@@ -36,7 +38,42 @@ function graphConfig(): { cli?: string; cwd?: string } {
 
 function seatState(): string { return process.env.ELANOUS_SEAT_STATE ?? join(homedir(), 'elanous-hq', 'seat-state'); }
 
-export interface ReleaseGraphCliDeps { exec?: (stateRoot: string) => Partial<ExecDeps>; stateRoot?: string }
+export interface ReleaseGraphCliDeps {
+  exec?: (stateRoot: string) => Partial<ExecDeps>; stateRoot?: string;
+  graphConfig?: () => { mode?: unknown; version?: unknown } | undefined;
+  schedule?: (version: string) => ReturnType<typeof readSchedule>;
+  heartbeat?: (event: { name: string; saw: number; everyMin: number; last?: string; err?: string }) => void;
+}
+
+/** One scheduler step. All side effects are supplied by the caller for isolated tests. */
+export async function scheduleGraphTick(input: {
+  stateRoot: string; version?: string; d: ExecDeps;
+  schedule: (version: string) => ReturnType<typeof readSchedule>;
+}): Promise<string> {
+  const { stateRoot, version, d } = input;
+  if (!version || d.mode(version) !== 'live') return 'none';
+  const hasRun = !!loadRun(stateRoot, version);
+  // An existing run does not depend on the schedule store remaining available.
+  let schedule: ReturnType<typeof readSchedule> = null;
+  if (!hasRun) {
+    try { schedule = input.schedule(version); }
+    catch (error) {
+      d.post('OP', 'alert', `🔴 release graph ${version}: no run; cannot read schedule: ${error instanceof Error ? error.message : String(error)}`);
+      return 'red';
+    }
+  }
+  const outcome = await dispatchScheduledGraph({
+    mode: 'live', version, now: d.now(), hasRun,
+    schedule, claimPath: join(stateRoot, 'release-graph', 'schedule-claims.sqlite'),
+    red: async (v, reason) => { d.post('OP', 'alert', `🔴 release graph ${v}: ${reason}`); },
+    create: async (v, clock) => { createRun(stateRoot, { version: v, quick: true, clock }, d.now()); },
+  });
+  if (outcome === 'already-claimed' && !loadRun(stateRoot, version)) {
+    d.post('OP', 'alert', `🔴 release graph ${version}: creation claim exists without a run; reconcile before retry`);
+    return 'red';
+  }
+  return outcome;
+}
 
 export function defaultExecDeps(stateRoot: string, over: Partial<ExecDeps> = {}): ExecDeps {
   const cfg = graphConfig();
@@ -247,6 +284,15 @@ export function registerReleaseGraphCommands(release: Command, deps: ReleaseGrap
       try {
         const stateRoot = root();
         const d = exec(stateRoot);
+        const config = deps.graphConfig ? deps.graphConfig() : (readConfig() as { release?: { graph?: { mode?: unknown; version?: unknown } } } | null)?.release?.graph;
+        // Virtual-clock replays never create live runs or post live alerts.
+        let scheduleOutcome = 'none';
+        if (!o.at && config?.mode === 'live') {
+          if (typeof config.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(config.version)) {
+            d.post('OP', 'alert', `🔴 release graph: invalid configured live version ${String(config.version)}`);
+            scheduleOutcome = 'red';
+          } else scheduleOutcome = await scheduleGraphTick({ stateRoot, version: config.version, d, schedule: deps.schedule ?? (v => readSchedule(v)) });
+        }
         const results = [];
         for (const v of listRuns(stateRoot)) {
           const s = loadRun(stateRoot, v);
@@ -258,8 +304,9 @@ export function registerReleaseGraphCommands(release: Command, deps: ReleaseGrap
         mkdirSync(join(stateRoot, 'release-graph'), { recursive: true });
         // Goal file for the trigger registry (file-mtime): proves the tick ran this window.
         writeFileSync(join(stateRoot, 'release-graph', 'last-tick.json'), `${JSON.stringify({ at: d.now().toISOString(), runs: results.map(r => ({ version: r.version, mode: r.mode, events: r.events.length, done: r.done, hardStop: r.hardStop })) })}\n`);
-        (await import('../watch/heartbeat.js')).beatSafe({ name: 'release-graph-tick', saw: results.length, everyMin: 5, last: d.now().toISOString() });
-        out({ outcome: 'ok', ok: true, runs: results.map(r => ({ version: r.version, mode: r.mode, events: r.events.map(e => `${e.kind}${e.step ? `:${e.step}` : ''}`), done: r.done, hardStop: r.hardStop })) }, o.json);
-      } catch (e) { (await import('../watch/heartbeat.js')).beatSafe({ name: 'release-graph-tick', saw: 0, everyMin: 5, err: e instanceof Error ? e.message : String(e) }); fail(e, o.json); }
+        const beat = deps.heartbeat ?? (await import('../kit/heartbeat/index.js')).beatSafe;
+        beat({ name: 'release-graph-tick', saw: results.length, everyMin: 5, last: d.now().toISOString() });
+        out({ outcome: scheduleOutcome === 'red' ? 'red' : 'ok', ok: scheduleOutcome !== 'red', scheduleOutcome, runs: results.map(r => ({ version: r.version, mode: r.mode, events: r.events.map(e => `${e.kind}${e.step ? `:${e.step}` : ''}`), done: r.done, hardStop: r.hardStop })) }, o.json);
+      } catch (e) { (deps.heartbeat ?? (await import('../kit/heartbeat/index.js')).beatSafe)({ name: 'release-graph-tick', saw: 0, everyMin: 5, err: e instanceof Error ? e.message : String(e) }); fail(e, o.json); }
     });
 }

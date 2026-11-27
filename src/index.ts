@@ -305,9 +305,17 @@ const registerProviderCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'provid
 const registerCatalogCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'catalog'
   ? (() => undefined)
   : (require('./cli/catalog-cli.js') as typeof import('./cli/catalog-cli.js')).registerCatalogCommands) as typeof import('./cli/catalog-cli.js').registerCatalogCommands;
+// OP-CONTEXT-BUS — `eln bus` (not a fast root: registered on the full parse only).
+const registerBusCommands = (INDEX_FAST_ROOT
+  ? (() => undefined)
+  : (require('./cli/bus-cli.js') as typeof import('./cli/bus-cli.js')).registerBusCommands) as typeof import('./cli/bus-cli.js').registerBusCommands;
 const registerOrgCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'org'
   ? (() => undefined)
   : (require('./cli/org-cli.js') as typeof import('./cli/org-cli.js')).registerOrgCommands) as typeof import('./cli/org-cli.js').registerOrgCommands;
+// CLAUDE-OP-PROXY-IDENTITY — `eln proxy grant|status|revoke` (not a fast root: the full tree registers it).
+const registerProxyCommands = (INDEX_FAST_ROOT
+  ? (() => undefined)
+  : (require('./cli/proxy-cli.js') as typeof import('./cli/proxy-cli.js')).registerProxyCommands) as typeof import('./cli/proxy-cli.js').registerProxyCommands;
 const registerHostsCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'hosts'
   ? (() => undefined)
   : (require('./cli/hosts-cli.js') as typeof import('./cli/hosts-cli.js')).registerHostsCommands) as typeof import('./cli/hosts-cli.js').registerHostsCommands;
@@ -1815,6 +1823,16 @@ workCmd.command('block <cell>').description('My cell waits on another seat (appr
 (await import('./loops/op-pulse-cli.js')).registerPulseCommands(program);
 // COACH-CONTEXT-AUTO-INJECT — `eln coach act|list` · `eln op world [--write]`.
 (await import('./op-world/op-world-cli.js')).registerOpWorldCommands(program);
+// WORLD-REGISTRY — `eln world ls|show|anomalies|sweep|register|update|summary` (one ledger of every actor · CEO 11-27).
+(await import('./resource-ledger/world-cli.js')).registerWorldCommands(program);
+// RESOURCE-FACTS-FROM-LEDGER — `eln route host <purpose>` (machines routed by the registry · CEO 11-27 10:5x).
+(await import('./kit/resource-facts/cli.js')).registerRouteCommands(program);
+// LLM-ACCOUNT-POLICY-YAML — `eln policy show|lint|explain llm-accounts` · `eln policy override set|ls|clear` (CEO 11-27 16:2x).
+(await import('./kit/resource-facts/policy-cli.js')).registerPolicyCommands(program);
+// ALLOCATION-BUDGET — `eln alloc ls|who|by-purpose|by-period|top|budget|summary|advise|grant|release|reclaim|reconcile|policy` (CEO 11-27).
+(await import('./allocation/alloc-cli.js')).registerAllocCommands(program);
+// HOLD-AS-LEDGER-OBJECT (D1 · 0.3.38) — `eln hold add|ls|narrow|lift|expire`.
+(await import('./hold-ledger/hold-cli.js')).registerHoldCommands(program);
 const fedCmd = program.command('fed').description('Federation state ledger (fed-state) — state answers without mail');
 fedCmd.command('record <type>').description('Append one typed fact (land|green|cell|hand|judge|slot|mail|turn|beat|phase|steward|work) — fail-open, for scripts')
   .option('--seat <seat>').option('--cell <id>').option('--state <s>').option('--from <seat>').option('--to <seat>').option('--kind <k>').option('--ref <ref>')
@@ -1829,6 +1847,17 @@ fedCmd.command('show <id>').description('Latest facts for a cell or seat').optio
   .action(async (id: string, opts: { limit?: string; json?: boolean }) => { process.exitCode = (await import('./fed-state/fed-cli.js')).runFedShowCli(id, opts); });
 fedCmd.command('backfill').description('Backfill mail posts (msg store) and lands (origin/main «(#N)») for a window — idempotent').option('--window <w>', 'lookback', '24h').option('--repo <dir>', 'git repo for lands').option('--dry-run')
   .action(async (opts: { window?: string; repo?: string; dryRun?: boolean }) => { process.exitCode = await (await import('./fed-state/fed-cli.js')).runFedBackfillCli(opts); });
+// FED-OBSERVE (대표 11-26 23:3x) — whole-federation snapshot ⊕ the all-seat chat log, from structured sources (read-only).
+fedCmd.command('snapshot').description('One call, whole federation: per seat pane · build · queue · last turn · errors · mail; ✋ · holds · land · judge · loops · release; saved to <state>/fed-state/snapshots/latest.json')
+  .option('--json', 'JSON output').option('--anomalies', 'only what is abnormal, one line why each').option('--no-save', 'do not write the snapshot file').option('--quiet', 'save only, print nothing').option('--all', 'table: include declared hands without a pane')
+  .action(async (opts: { json?: boolean; anomalies?: boolean; save?: boolean; quiet?: boolean; all?: boolean }) => { process.exitCode = await (await import('./fed-observe/fed-observe-cli.js')).runFedSnapshotCli(opts); });
+fedCmd.command('chatlog').description('All-seat chat log: every seat\'s turns (input → reply → tools → outcome) and the mails between seats, one time-ordered stream (read-only)')
+  .option('--since <w>', 'window (30m · 2h · 1d; default 30m unless --turns)').option('--turns <n>', 'last N turns per seat').option('--seat <csv>', 'only these seats (OP,TC,…)')
+  .option('--grep <text>', 'only entries containing this text').option('--clip <n>', 'characters per body (0 = no clip)', '240').option('--no-mail', 'turns only')
+  .option('--max-bytes <n>', 'transcript tail bytes read per seat').option('--json', 'JSON output')
+  .action(async (opts: { since?: string; turns?: string; seat?: string; grep?: string; clip?: string; mail?: boolean; maxBytes?: string; json?: boolean }) => {
+    process.exitCode = await (await import('./fed-observe/fed-observe-cli.js')).runFedChatlogCli(opts);
+  });
 const stewardSpaceCmd = stewardCmd.command('space').description('행정관 — per-coordinator steward graph (graphs/steward/space.yaml)');
 stewardSpaceCmd.command('status').description('Last tick per scope: counts · rollup · escalations')
   .option('--scope <seat>', 'One coordinator scope, e.g. TC')
@@ -3892,6 +3921,7 @@ selfCmd.command('repair-commit-export <pr> <base-head> <child-output> <repo> <ou
 
 // ELN-OP-SELF-HEAL-LOOP — 자기 관측 집계 `elanous self observe [--since] [--seat] [--json]`(읽기만 · 칸 초안은 출력만).
 { const { registerSelfObserveCommand } = await import('./cli/self-observe.js'); registerSelfObserveCommand(selfCmd); }
+{ const { registerSelfPromptCommand } = await import('./cli/self-prompt.js'); registerSelfPromptCommand(selfCmd); }
 
 // TUI-RESTART-NESTED-CHAIN — `elanous self reap-chains --dry-run|--yes` (one-shot cleanup of nested TUI restart chains).
 { const { registerSelfReapChainsCommand } = await import('./cli/self-reap-chains.js'); registerSelfReapChainsCommand(selfCmd); }
@@ -5746,14 +5776,16 @@ const selfOrchestrateCmd = selfCmd
           grokApiKeyOptIn = launchPolicy.harness?.pod?.grokApiKeyOptIn === true;
           const credential = resolveGrokCredential();
           const { resolveCodexQuotaPolicy, codexPolicyAllowsCredits, codexPolicyAllowsFallback } = await import('./oauth/codex-quota-policy.js');
-          const resolvedQuota = resolveCodexQuotaPolicy(launchPolicy.llm);
+          // LLM-ACCOUNT-POLICY-WIRING: the policy-pack decision rides the launch (and the Pod env) — pack and Pod agree.
+          const { decidedCodexQuotaPolicy } = await import('./kit/resource-facts/llm-decide.js');
+          const resolvedQuota = resolveCodexQuotaPolicy(launchPolicy.llm, undefined, decidedCodexQuotaPolicy('pod-launch'));
           const quotaPolicy = resolvedQuota.policy;
-          const { normalizeFallbackChain } = await import('./oauth/fallback-chain.js');
+          const { effectiveFallbackChain } = await import('./oauth/fallback-chain.js');
           const fallbackEnabled = codexPolicyAllowsFallback(quotaPolicy)
-            && normalizeFallbackChain(launchPolicy.llm?.fallbackChain, launchPolicy.llm?.provider).chain.includes('grok');
+            && effectiveFallbackChain(launchPolicy.llm?.fallbackChain, launchPolicy.llm?.provider).chain.includes('grok');
           // CODEX-CREDITS-STEP — 체인 마지막 칸(크레딧). 켜져 있을 때만 grok 잔량을 잰다(발사 관문과 같은 80% 상한).
           //   Pod 는 «grok 뒤» 순서(문서화된 배치)만 따른다 — grok 앞에 둔 체인은 Pod 계획에서 크레딧 칸을 쓰지 않는다.
-          const launchChain = normalizeFallbackChain(launchPolicy.llm?.fallbackChain, launchPolicy.llm?.provider).chain;
+          const launchChain = effectiveFallbackChain(launchPolicy.llm?.fallbackChain, launchPolicy.llm?.provider).chain;
           const codexCreditsStep = codexPolicyAllowsFallback(quotaPolicy)
             && launchChain.includes('codex-credits')
             && (!launchChain.includes('grok') || launchChain.indexOf('codex-credits') > launchChain.indexOf('grok'));
@@ -5766,7 +5798,7 @@ const selfOrchestrateCmd = selfCmd
             try {
               const { readFileSync } = await import('node:fs');
               const prodLlm = (JSON.parse(readFileSync(`${prodInstanceRoot()}/config.json`, 'utf8')) as { llm?: Record<string, unknown> }).llm;
-              production = resolveCodexQuotaPolicy(prodLlm);
+              production = resolveCodexQuotaPolicy(prodLlm, undefined, decidedCodexQuotaPolicy('pod-launch'));
             } catch { /* no production config on this machine */ }
           }
           const described = await announceLaunchQuotaPolicy({ runId, current: resolvedQuota, universe: { kind, root }, ...(production ? { production } : {}) });
@@ -5842,6 +5874,8 @@ const selfOrchestrateCmd = selfCmd
             // SUBSCRIPTION-EXHAUST-REROUTE — 예비분 이하 잔액(«알려진» 값)의 계정은 크레딧으로 쓰지 않는다.
             creditReserve: typeof launchPolicy.llm?.codexCreditReserve === 'number' && Number.isFinite(launchPolicy.llm.codexCreditReserve) && launchPolicy.llm.codexCreditReserve >= 0
               ? launchPolicy.llm.codexCreditReserve : (await import('./oauth/codex-account-store.js')).DEFAULT_CODEX_CREDIT_RESERVE,
+            // CODEX-CREDIT-ACCOUNTS — 크레딧을 쓸 수 있는 계정만(resource facts → llm.codexCreditAccounts · 없으면 종전).
+            creditAccounts: (await import('./oauth/codex-credit-accounts.js')).readCodexCreditAccounts(() => launchPolicy.llm).names,
             ...podFallbackCredentials(namedChildDecision.provider, {
               grokSubscription: fallbackEnabled && grokSubscriptionUsable,
               grokApiKey: fallbackEnabled && credential?.kind === 'api_key',
@@ -6898,15 +6932,25 @@ selfCmd
       }
       return;
     }
+    // LOOP-AGENT v2 (대표 11-27): loop agents' own lessons · knowhow · cases are searchable here too (read-only).
+    const printLoopAgents = async (): Promise<void> => {
+      try {
+        const la = (await import('./loop-agent/cli.js')).loopAgentRecall(query, limitN);
+        if (!la.length) return;
+        ui.header(`loop agents 기억 (${la.length})`);
+        for (const h of la) console.log(`  [${h.at.slice(0, 16).replace('T', ' ')} loop:${h.agent}/${h.where}] ${h.text.slice(0, 160)}`);
+      } catch { /* fail-soft */ }
+    };
     const db = openSurfaceEventsDb();
     try {
       const hits = recallSelfEvents(db, query, { limit: limitN, sinceHours: sinceH, excludeObserverOutput: opts.includeObserverOutput !== true });
-      if (hits.length === 0) { ui.info(`"${query}" 관련 구현 기억 없음(domain=elanous).`); return; }
+      if (hits.length === 0) { ui.info(`"${query}" 관련 구현 기억 없음(domain=elanous).`); await printLoopAgents(); return; }
       ui.header(`self-awareness 회상 (${hits.length})`);
       for (const h of hits) {
         console.log(`  [${h.ts.slice(0, 16).replace('T', ' ')} ${h.surface}] (score ${h.score.toFixed(2)})`);
         console.log(`    ${(h.summary ?? h.text).slice(0, 160)}`);
       }
+      await printLoopAgents();
     } finally { db.close(); }
   });
 
@@ -7030,6 +7074,8 @@ program
 
 registerScheduleCommands(program);
 registerGuardianCommands(program);
+// LLM-ROUTE-BY-GUARDIAN — `eln review <PR>`: reviewer engine/account picked by the guardian's routing policy.
+if (!INDEX_FAST_ROOT) { const routeCli = require('./llm-route/route-cli.js') as typeof import('./llm-route/route-cli.js'); routeCli.registerReviewCommand(program); routeCli.registerRouteLlmCommand(program); }
 registerResCommands(program);
 registerWatchCommands(program);
 
@@ -7224,6 +7270,8 @@ registerOpsCommands(program);
 registerCatalogCommands(program);
 registerHostsCommands(program);
 registerOrgCommands(program);
+registerBusCommands(program);
+registerProxyCommands(program);
 registerAppCommands(program);
 registerOutputsCommands(program);
 

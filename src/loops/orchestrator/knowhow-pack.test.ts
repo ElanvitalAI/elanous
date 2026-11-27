@@ -62,6 +62,14 @@ test('pack keeps only active items that carry a measurement command, sorted by i
   expect(items[0]!.prescription).toBe('앞머리에 rebase 한 줄을 넣는다');
 });
 
+test('pack accepts other loop agents without admitting inactive or unmeasured items', () => {
+  const doc = itemDoc('K-TC-101', 'TC', 'TC 상황')
+    + '\n' + itemDoc('K-BOARD-STEWARD-102', 'steward', 'steward 상황')
+    + '\n' + itemDoc('K-UX-103', 'inactive', 'inactive').replace('상태: active', '상태: superseded')
+    + '\n' + itemDoc('K-UX-104', 'unmeasured', 'unmeasured').replace('- 재는 명령: `git status --porcelain`\n', '');
+  expect(parseKnowhowDoc(doc).map(item => item.id)).toEqual(['K-BOARD-STEWARD-102', 'K-TC-101']);
+});
+
 test('pack carries a version and a content hash that changes when an item body changes', () => {
   const first = buildKnowhowPack(parseKnowhowDoc(DOC), '/tmp/knowhow.md');
   const again = buildKnowhowPack(parseKnowhowDoc(DOC), '/tmp/knowhow.md');
@@ -70,6 +78,13 @@ test('pack carries a version and a content hash that changes when an item body c
   expect(again.hash).toBe(first.hash);
   const changed = buildKnowhowPack(parseKnowhowDoc(DOC.replace('rebase 한 줄을 넣는다', 'merge 를 쓴다')), '/tmp/knowhow.md');
   expect(changed.hash).not.toBe(first.hash);
+});
+
+test('pack citation changes when validity or provenance changes', () => {
+  const item = fixtureItem();
+  const hash = buildKnowhowPack([item], '/tmp/knowhow.md').hash;
+  expect(buildKnowhowPack([{ ...item, validWhen: 'only after review' }], '/tmp/knowhow.md').hash).not.toBe(hash);
+  expect(buildKnowhowPack([{ ...item, source: 'different evidence · 상태: active' }], '/tmp/knowhow.md').hash).not.toBe(hash);
 });
 
 test('resident pack reloads when the doc lands a new item, without a code deploy', () => {

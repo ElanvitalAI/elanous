@@ -16,7 +16,7 @@ import { createOverviewCache } from '../../ops/overview-cache.js';
 import { resourcesFromOverview } from '../../ops/resources.js';
 import { loopsMapFromCache } from '../../ops/loops-map.js';
 import { parseSince } from '../../ops/overview-collect.js';
-import { handleResourceLedgerApi } from './resource-ledger.js';
+import { handleResourceLedgerApi, handleWorldApi } from './resource-ledger.js';
 import { handleResourceGuardianApi } from './resource-guardian.js';
 import { buildTrainThroughput, collectTrainSummaryEvents, isValidTrainDate, parseTrainThroughputLogs, trainIdentityFromBatchDirectory, trainKeysFromManifest, trainRejectionsFromSummary } from './train-throughput.js';
 import type { MetaApiOpts } from './meta-api.js';
@@ -362,6 +362,7 @@ export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Re
     if (pathname === '/v1/ops/resources') return jsonResponse({ error: 'unauthorized' }, 401);
     if (pathname === '/v1/ops/resources/ledger' && !offeredCredential(req)) return jsonResponse({ error: 'unauthorized' }, 401);
     if (pathname === '/v1/ops/resources/guardian' && !offeredCredential(req)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (pathname === '/v1/ops/resources/world' && !offeredCredential(req)) return jsonResponse({ error: 'unauthorized' }, 401);
     // LOOP-MAP-API: a request that offers no credential at all is 401 in the same body shape;
     // a credential that is not an operator stays 403, exactly like the neighbouring ops paths.
     if (pathname === '/v1/ops/loops-map' && !offeredCredential(req)) return jsonResponse({ error: 'unauthorized' }, 401);
@@ -392,6 +393,8 @@ export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Re
       : served(jsonResponse({ stale: true })));
   }
   if (pathname === '/v1/ops/resources/ledger') return served(handleResourceLedgerApi());
+  // WORLD-REGISTRY — every actor (seats · loops · supervisors · launchd · cron · hosts · processes · fuel · credentials).
+  if (pathname === '/v1/ops/resources/world') return served(handleWorldApi(url));
   if (pathname === '/v1/ops/resources/guardian') return served(handleResourceGuardianApi());
   if (pathname === '/v1/ops/train-throughput') {
     const date = url.searchParams.get('date') ?? todayKst();

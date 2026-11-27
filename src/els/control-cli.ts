@@ -166,3 +166,4 @@ export function askHitlOnTerminal(timeoutMs: number, io: { readonly stdin: NodeJ
 
 // ELS-FANOUT-GATHER: the els CLI reaches fanout/gather through this already-sanctioned door (no new eln→els edge).
 export { registerFanoutCommands } from './fanout-cli.js';
+export { registerChannelCommands } from './channel-cli.js';

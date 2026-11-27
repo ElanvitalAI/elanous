@@ -23,6 +23,18 @@ function landedSince(sinceMs: number, cwd: string): Set<number> | null {
   return prs;
 }
 
+/** The pulse graph's measure step: the live probes plus the OP next-action planner's live snapshot and actuators. */
+export function livePulseProbesWithPlanner(roots: { stateRoot: string; seatState: string }): PulseProbes {
+  return {
+    ...livePulseProbes(),
+    nextActionState: async (now: Date) => (await import('./op-next-action-live.js')).liveNextActionState(roots, now),
+    nextActuators: () => (require('./op-next-action-live.js') as typeof import('./op-next-action-live.js')).liveNextActuators(roots),
+    throughput: async (now: Date, stage: string) => (await (await import('./throughput-controller-live.js')).runThroughputLive(roots, now, stage)).block,
+    // OP-WORLD-LENS — the world card rides the brief (computed fresh · cache refreshed · Δ against OP's last turn, not advanced).
+    worldCard: async (now: Date) => (await import('../op-world/world-lens.js')).freshLensLines('OP', now),
+  };
+}
+
 export function livePulseProbes(): PulseProbes {
   return {
     now: () => new Date(),
@@ -105,7 +117,9 @@ export function livePulseProbes(): PulseProbes {
       });
       const measure: PulseMeasure = { at: now.toISOString(), version, landedPerH: landed1h ? landed1h.size : null,
         greenPerH: items ? [...greenBySpace.values()].reduce((a, b) => a + b, 0) : null, judgeQueue: judgeAges ? judgeAges.length : null,
-        judgeWaitMedianMin: judgeAges ? median(judgeAges) : null, budget, spaces: spaceRows, unmeasured };
+        judgeWaitMedianMin: judgeAges ? median(judgeAges) : null, budget, spaces: spaceRows, unmeasured,
+        // WORLD-REGISTRY — every actor in one line (lease ledger); unread stays null, never «all well».
+        world: (await import('../resource-ledger/world-summary.js')).liveWorldDigest(now)?.line ?? null };
       const open = items ? items.filter(i => i.status !== 'green' && i.status !== 'done').length : null;
       const extra: PulseExtra = { landed3hPerH: landed3h ? landed3h.size / 3 : null, green3hPerH: null,
         readyBacklog: items ? [...readyBySpace.values()].reduce((a, b) => a + b, 0) : null, openInScope: open,

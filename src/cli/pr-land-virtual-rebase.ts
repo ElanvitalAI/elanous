@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { delimiter, resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { patchIdFromOutput } from '../git-smart/delta.js';
 
 const SHA40 = /^[a-f0-9]{40}$/iu;
 type Verdict = { ok: true; oldBase: string; patchId: string }
@@ -92,8 +93,8 @@ export function verifyVirtualRebasePatch(input: MergeTreeInput): Verdict {
       const diff = checked(['diff', '--no-ext-diff', '--no-renames', '--binary', from, to], inEnv);
       if (!diff) return { ok: false as const, reason: 'diff-unmeasured' };
       const patched = git(['patch-id', '--stable'], inEnv, `${diff}\n`);
-      const patchId = patched.status === 0 && !patched.error ? patched.stdout.trim().split(/\s+/u)[0] : undefined;
-      return patchId && SHA40.test(patchId)
+      const patchId = patched.status === 0 && !patched.error ? patchIdFromOutput(patched.stdout) : null; // SMART-MERGE ① shared parse
+      return patchId
         ? { ok: true as const, patchId }
         : { ok: false as const, reason: 'patch-id-unmeasured' };
     };

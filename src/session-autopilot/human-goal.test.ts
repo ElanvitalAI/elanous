@@ -1,4 +1,4 @@
-// AUTOPILOT-HUMAN-GOAL — literal expectations (fresh temp universe per test · injected clock · injected standing goal).
+// AUTOPILOT-HUMAN-GOAL — literal expectations (fresh temp universe per test · injected clock · no release-derived goal).
 // Incident 11-25 06:3x: a person's multi-step request under AUTO never became the goal (the goal stayed a stale
 // trusted-mail frame line), and the seat ended its turn with «아직 결과가 없어» while 3 background agents ran.
 import { afterAll, beforeEach, expect, test } from 'bun:test';
@@ -23,13 +23,13 @@ function harness(seed?: Record<string, unknown>) {
   if (seed) { mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, JSON.stringify(seed)); }
   const logs: Array<[string, Record<string, unknown>]> = [];
   const pilot = createAutopilot({ file, now: () => T0, coordinator: true, log: (e, d) => { logs.push([e, d]); },
-    standingGoal: () => ({ version: '0.3.36', phase: '개발' }), raiseDecision: () => 'D-x', postProgress: () => {} });
+    raiseDecision: () => 'D-x', postProgress: () => {} });
   pilot.refresh();
   const derived = () => logs.filter(([e]) => e === 'goal-derived').map(([, d]) => d);
   return { pilot, logs, derived };
 }
 
-const staleSeed = { v: 1, on: true, by: 'default', goal: STALE, standing: { version: '0.3.36', phase: '개발' },
+const staleSeed = { v: 1, on: true, by: 'default', goal: STALE, standing: { version: '0.3.36', phase: '개발' }, releaseSeen: '0.3.36',
   firstClass: [{ id: 'crown:31', source: 'crown', text: STALE, at: 1 }],
   derived: { tier: 'first-class', source: 'crown:31', goal: STALE } };
 
@@ -37,6 +37,10 @@ test('a goal text stored by an older build loses its frame on load (crown falls 
   const h = harness(staleSeed);
   expect(h.pilot.state().goal).toBe('[지시] 31');
   expect(h.derived()).toEqual([{ tier: 'first-class', source: 'crown:31', goal: '[지시] 31', reason: 'refresh' }]);
+  // NO-RELEASE-GOAL: the legacy release fields go; the open crown goal stays.
+  expect(h.pilot.state().standing).toBeUndefined();
+  expect(h.pilot.state().releaseSeen).toBeUndefined();
+  expect(h.logs.filter(([e]) => e === 'release-goal-cleared')).toEqual([['release-goal-cleared', { goal: '', releaseSeen: '0.3.36' }]]);
 });
 
 test('multi-step human request: the model sets goal + done criterion → human goal replaces the stale frame goal', async () => {
@@ -61,14 +65,14 @@ test('a goal without a done criterion is refused (status ask / one-step command 
   const out = await dispatchAutopilotTool('autopilot_set', { on: true, goal: 'OP 활동 보여줘' }, { cwd: dir, file, now: () => T0 });
   expect(out).toEqual({ error: 'Not a goal: no-explicit-ask. A goal is set only when the person explicitly says to set it as a goal (quote their words in explicit_ask) or a crown mail carries a goal field. Answer the question or do the request in this turn.' });
   h.pilot.refresh();
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
+  expect(h.pilot.state().goal).toBeUndefined();
 });
 
 test('status ask and ack-only lines typed by a person never change the goal (harness derives nothing from text)', () => {
   const h = harness();
   for (let i = 0; i < 3; i += 1) { h.pilot.noteHuman(); h.pilot.turnEnded({ selfInitiated: false, failed: false, fingerprint: '네' }); }
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
-  expect(h.derived()).toEqual([{ tier: 'standing', source: 'standing', goal: '0.3.36 개발', reason: 'refresh' }]);
+  expect(h.pilot.state().goal).toBeUndefined();
+  expect(h.derived()).toEqual([]);
 });
 
 test('one sanitizer for every source: trusted-mail notice · crown relay body · a pasted human frame', () => {
@@ -91,7 +95,7 @@ test('a background agent finishing re-feeds the open first-class goal (once per 
   expect(h.logs.filter(([e]) => e === 'goal-refeed')).toEqual([['goal-refeed', { tier: 'first-class', source: 'human', goal: '0.3.36 로스터 확정', capsuleId: 'c1', kind: 'agent', status: 'ok' }]]);
 });
 
-test('no first-class goal open (standing only) → an agent finishing re-feeds nothing', () => {
+test('no first-class goal open (no goal at all) → an agent finishing re-feeds nothing', () => {
   const h = harness();
   expect(h.pilot.noteBackgroundDone({ capsuleId: 'c9', kind: 'agent', status: 'ok', summary: 'x' })).toBeNull();
 });

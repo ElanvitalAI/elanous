@@ -1,3 +1,4 @@
+import { tierModel } from '../src/llm/model-defaults.js';
 // Explicitly isolated, synthetic evaluation; no production tools are dispatched.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,7 +11,7 @@ import { runRoster770 } from '../src/seat-loop/op-roster-770.js';
 
 const args = process.argv.slice(2);
 const value = (flag: string) => { const i = args.indexOf(flag); return i < 0 ? undefined : args[i + 1]; };
-const promptPath = value('--prompt-file'), output = value('--output'), model = value('--model') ?? 'gpt-6.1-terra';
+const promptPath = value('--prompt-file'), output = value('--output'), model = value('--model') ?? tierModel('balanced');
 const inTemp = (path: string | undefined) => Boolean(path && isAbsolute(path) && resolve(path).startsWith(`${resolve(tmpdir())}/`));
 for (const name of ['ELANOUS_STATE_DIR', 'ELANOUS_CONFIG_DIR']) if (!inTemp(process.env[name])) throw new Error(`${name} must be inside the temporary directory`);
 if (!inTemp(promptPath) || !inTemp(output)) throw new Error('prompt and output must be inside the temporary directory');

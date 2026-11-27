@@ -108,7 +108,10 @@ export async function installAgent(deps: SupervisorDeps): Promise<{ ok: true } |
   // bootout first so a changed plist is picked up; "not loaded" is fine.
   await deps.launchctl(['bootout', `${domain}/${SUPERVISOR_LABEL}`]).catch(() => undefined);
   const started = await deps.launchctl(['bootstrap', domain, deps.paths.plist]).catch((error: unknown) => ({ code: 127, output: String(error) }));
-  return started.code === 0 ? { ok: true } : { ok: false, reason: `launchctl bootstrap failed (${started.code}): ${started.output.trim().slice(0, 200)}` };
+  if (started.code !== 0) return { ok: false, reason: `launchctl bootstrap failed (${started.code}): ${started.output.trim().slice(0, 200)}` };
+  // WORLD-REGISTRY: an elanous installer registers what it bootstrapped (fail-open — never fails the install).
+  try { (require('../resource-ledger/world-register.js') as typeof import('../resource-ledger/world-register.js')).registerLaunchdQuietly({ label: SUPERVISOR_LABEL, plist: deps.paths.plist, purpose: 'els server (Elanous Side)', owner: 'TC' }); } catch { /* fail-open */ }
+  return { ok: true };
 }
 
 /** `els` with no arguments: make sure a server answers. Prints one line only when it installs the agent. */

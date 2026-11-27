@@ -75,6 +75,7 @@ import { getUserConfig } from '../user-config/reader.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { spawnElanousSync as defaultSpawnElanousSync } from '../instance/spawn-elanous.js';
+import { msgPostArgsAsCaller } from '../kit/mail-route/sender.js';
 import { classifyPrLandRefusal, mayLaunchPrLandDriftRepair, observeDirectPrLandRefusal, observePrLandRefusal, type PrLandRefusalContext } from './pr-land-refusal.js';
 import { bindPrLandRefusalToRecover, PR_LAND_CARD_ID_ENV } from './pr-land-recovery.js';
 import type { HeavyRemoteInput, HeavyRemoteResult } from './pr-land-heavy-remote.js';
@@ -220,7 +221,8 @@ function notifyCodeConflictOwner(input: {
   const body = `[LAND-CONFLICT-AUTOMERGE-LIVE] PR #${input.pr} head ${input.head.slice(0, 12)} 코드 충돌은 자동 병합하지 않았습니다. 경로: ${input.files.join(' · ')} · 사유: ${input.reason} · 수리 런/주인 확인이 필요합니다.`;
   const sent = input.send
     ? input.send({ cwd: input.cwd, recipient, body })
-    : defaultSpawnElanousSync(['msg', 'post', '--from', 'OPC', '--to', recipient, '--kind', 'report', '--body', body], {
+    // KIT mail-route sender — `--from` = the seat running `pr land` (never a hardcoded seat · #87535 shape); no seat = LAND-GRAPH.
+    : defaultSpawnElanousSync(msgPostArgsAsCaller({ to: recipient, kind: 'report', body, fallback: 'LAND-GRAPH', cwd: input.cwd }), {
       executable: 'eln', cwd: input.cwd, encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024,
     }).status === 0;
   return { sent, recipient };
@@ -2662,7 +2664,12 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   //   근본은 훈계가 아니라 ***분포***였다: 스크립트에 박힌 이름 중 «가장 흔한» 것이 ***낡은 것***이라
   //   옆 파일을 베끼면 낡은 이름을 물려받는다. ⇒ 이 자가 «신규»만 막는다(ratchet).
   //   ⚠️ `.github/workflows` 가 없어 `pr land` 가 «유일한» 강제점이다.
-  const modelHardcode = gateVerdict('model-hardcode-gate', deps.runModelHardcodeGate ?? ((o) => runModelHardcodeGate({ log: o.log, error: o.error, args: [], cwd }) === 0), out);
+  const modelChangedPaths = pinned ? changedPaths : currentChangePaths(run, cwd, staged, base, out, true);
+  if (modelChangedPaths === null) {
+    out.error('❌ model-hardcode-gate: changed-files 측정 실패 — 착지를 중단합니다.');
+    return 1;
+  }
+  const modelHardcode = gateVerdict('model-hardcode-gate', deps.runModelHardcodeGate ?? ((o) => runModelHardcodeGate({ log: o.log, error: o.error, args: ['--changed-files', ...modelChangedPaths], cwd }) === 0), out);
   record('model-hardcode-gate', modelHardcode.ok, { measured: modelHardcode.measured });
   if (!modelHardcode.ok) {
     out.error('✗ model-hardcode-gate: scripts/ci-model-hardcode-gate.ts blocked pr land because changed files hardcode a model id — derive it from tierModel()/config instead.');

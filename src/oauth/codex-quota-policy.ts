@@ -22,7 +22,7 @@ export type CodexQuotaPolicy = (typeof CODEX_QUOTA_POLICIES)[number];
 export interface ResolvedCodexQuotaPolicy {
   readonly policy: CodexQuotaPolicy;
   /** 어디서 정해졌나 — `policy-file`(policy/llm.yaml credits.codex) · `config`(옛 `codexQuotaPolicy`) · `legacy-credits`(옛 `codexCreditsAllowed`) · `default` · `invalid`(모르는 값 → 기본). */
-  readonly source: 'env' | 'policy-file' | 'config' | 'legacy-credits' | 'default' | 'invalid';
+  readonly source: 'env' | 'policy-pack' | 'policy-file' | 'config' | 'legacy-credits' | 'default' | 'invalid';
 }
 
 export const CODEX_QUOTA_POLICY_LABEL: Readonly<Record<CodexQuotaPolicy, string>> = {
@@ -47,11 +47,15 @@ const FILE_VALUE_TO_POLICY: Readonly<Record<Exclude<CodexQuotaPolicyFileValue, '
 export function resolveCodexQuotaPolicy(
   llm: { readonly codexQuotaPolicy?: unknown; readonly codexCreditsAllowed?: unknown } | undefined,
   file?: CodexQuotaPolicyFileValue,
+  /** LLM-ACCOUNT-POLICY-YAML — the decision of graphs/policies/llm-accounts.yaml ⊕ overrides (kit/resource-facts
+   *  `decidedCodexQuotaPolicy`). When given it wins over policy/llm.yaml and the legacy keys (they become fallbacks). */
+  pack?: CodexQuotaPolicy,
 ): ResolvedCodexQuotaPolicy {
   // A Pod has no copy of the host config; the launcher hands the host's policy down in this variable
   // (09-29: without it every Pod child fell back to grok while all three accounts still had credits).
   const fromEnv = process.env.ELANOUS_CODEX_QUOTA_POLICY?.trim();
   if (fromEnv && isCodexQuotaPolicy(fromEnv)) return { policy: fromEnv, source: 'env' };
+  if (pack !== undefined && isCodexQuotaPolicy(pack)) return { policy: pack, source: 'policy-pack' };
   // 정책 파일이 깨졌으면 옛 키가 credits 라 해도 따르지 않는다 — 크레딧은 돈이라 닫는다.
   if (file === 'unreadable') return { policy: 'fallback', source: 'invalid' };
   const raw = llm?.codexQuotaPolicy;

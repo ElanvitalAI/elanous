@@ -21,6 +21,7 @@ import { formatDecisionRow } from './decision-list-format.js';
 import { decisionListSince, filterDecisionListSince } from './decision-list-since.js';
 import { openMsgStore } from '../msg/msg-store.js';
 import { resolveSeat } from '../seat-address/seat-address.js';
+import { recordAction } from '../fed-state/actions.js';
 // Preserve the formatter export for existing consumers of this CLI module.
 export { formatDecisionRow } from './decision-list-format.js';
 
@@ -37,6 +38,11 @@ function agent(o?: string): string {
   const value = o?.trim() || process.env.AI_AGENT?.trim();
   if (!value) throw new Error('agent unknown: provide --agent or AI_AGENT');
   return value;
+}
+/** FED-FACT-OP-ACTIONS — the seat a decision fact is attributed to: the resolved seat, else ELANOUS_TRACK, else the agent. */
+function actorSeat(fallback: string): string {
+  const raw = process.env.ELANOUS_TRACK?.trim() || process.env.ELANOUS_SEAT?.trim() || fallback;
+  try { return resolveSeat(raw)?.id ?? raw; } catch { return raw; }
 }
 function parseOption(raw: string): DecisionOption {
   const m = /^([a-z])=(.+?):(.+)$/.exec(raw);
@@ -200,10 +206,12 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
         const store = openMsgStore(join(config.stateDir ?? elanousStateRoot(), 'msg', 'messages.db'));
         try {
           const message = store.append({ from: seat, to: 'OP', kind: 'question', body });
+          recordAction({ kind: 'decision', verb: 'propose', by: seat, to: 'OP', ref: `msg:${message.id}`, why: validated.title, source: 'decisions' });
           return emit({ routedTo: 'OP', messageId: message.id, body }, o.json, `OP 우편으로 제안 전달: #${message.id}`);
         } finally { store.close(); }
       }
       const entry = new DecisionLedger(config).raise(validated);
+      recordAction({ kind: 'decision', verb: 'raise', by: seat ?? actorSeat(who), ref: entry.id, why: validated.title, source: 'decisions' });
       return emit(entry, o.json, `올림: ${formatDecisionRow(entry)}`);
     }));
   root.command('record-seat').description('위임 범위에서 이미 내린 자리 결정을 사후 보고로 원장에 기록 (대표 카드 아님)')
@@ -216,6 +224,7 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       if (!mayWrite('record-seat', o.hqOverride)) return;
       const entry = new DecisionLedger(config).recordSeatDecision({ seat: o.seat, title: o.title, decision: o.decision,
         delegation: o.delegation, ...(o.at ? { decidedAt: o.at } : {}), ...(o.ref.length ? { refs: o.ref } : {}) });
+      recordAction({ kind: 'decision', verb: 'record', by: o.seat, ref: entry.id, why: o.title, source: 'decisions' });
       return emit(entry, o.json, formatSeatDecisionRow(entry));
     }));
   root.command('seat-report').description('밤사이 자리들의 사후 결정을 한 번에 조회 (기본 최근 24시간)')
@@ -256,6 +265,7 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       const by = { kind: 'auto' as const, origin: 'automation' as const, agent: agent(o.agent), delegation: o.delegation!, ...(o.track ? { track: o.track } : {}) };
       if (!mayWrite('decide', o.hqOverride)) return;
       const { entry, delivery, notice } = new DecisionLedger(config).decideWithDelivery(id, choice, by, o.note);
+      recordAction({ kind: 'decision', verb: 'decide', by: actorSeat(by.agent), ref: entry.id, why: `${choice}${o.note ? ` · ${o.note}` : ''}`, source: 'decisions' });
       const failures = [
         ...(delivery && !delivery.ok ? [`⚠ 답 전달 실패(${delivery.questionId} · ${delivery.reason}) — 결정은 기록됐다 · 다시: elanous decisions retry-answer ${entry.id}`] : []),
         ...(notice.status === 'failed' ? [`⚠ 자리 우편 실패(${notice.seat} · ${notice.reason}) — 결정은 기록됐다 · 다시: elanous decisions retry-notify ${entry.id}`] : []),

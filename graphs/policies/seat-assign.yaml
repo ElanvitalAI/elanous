@@ -1,0 +1,32 @@
+# WIP1-ASSIGN-GUARD (0.3.38 P0 · OP 11-27 12:10) — policy of `eln seat assign` / SeatAssign / steward assignments
+# (src/seat/seat-assign-wip1.ts) and the uncommitted-WIP takeover rule every coordinator prompt states.
+# Read by name; change a value here, not in TS. There is no on/off switch.
+version: 1
+wip1:
+  # A hand's cell is ACTIVE when it is yellow, owned by the hand, and either touched in the ledger (updatedAt) within this
+  # window or the hand pool shows the hand working on it. An active cell blocks a second one (WIP 1).
+  active_window_min: 180
+  # Highest first. A new cell strictly higher than every active cell the hand holds takes the hand; the lower cells go
+  # back to the board through the veto path (audited). Equal or lower = refused, with the top idle hand suggested.
+  priority_order: [P0, P1, P2]
+  # A cell without a priority ranks as this.
+  unranked_as: P2
+  # WIP1-ASSIGN-GUARD-ACTIVE (OP 11-27 15:5x · TC-H-CC-1 lost YAML-DEF-LOADER mid-implementation): a higher cell displaces
+  # a lower one only when that cell is NOT actively worked — no commit · push · edit/test (worktree) · ledger activity on
+  # it within this many minutes, and the hand's pane is not in one of active_panes on it. Actively worked = refused.
+  active_recent_min: 30
+  active_panes: [WORKING, WAITING_APPROVAL, WAITING_REPLY]
+takeover:
+  # OPS-RULES «미커밋 WIP 인수 규칙» (11-27 10:3x): one line to the owner → no reply in this many minutes → keep a
+  # preservation copy → take over.
+  reply_wait_min: 30
+  # WIP untouched this long is taken over at once (same preservation copy, no question).
+  stale_hours: 24
+  # The preservation copy: this branch, or `git stash push -u -m <tag>` with the stash SHA recorded.
+  keep_branch: wip-keep/<seat>-<date>
+pull:
+  # POOL-PULL-NEEDS-SPEC (0.3.38 P1 · OP 11-27 16:30): `eln work next` does not offer an unowned cell without a done-when
+  # (checklist doneCriterion · `eln release checklist set <id> --done "..."`) — hands claimed such cells and asked TC
+  # «what is the KPI contract / who judges / done line» (hand blocks 10→34). The board steward lists them to OP as
+  # «needs-spec» once per changed set instead.
+  requireDoneWhen: true

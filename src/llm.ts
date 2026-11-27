@@ -52,7 +52,7 @@ import { llmUsageCostFields } from './budget/llm-cost.js';
 import { accumulateByokUsage } from './llm/openrouter-byok-cost.js';
 import { ACTION_PHASE_OPS_TOOLS, isSteeredShellRejection, REPAIR_PHASE_READ_ONLY_OPS_TOOLS } from './llm/tool-loop-steered-rejection.js';
 import { ToolCallTiming } from './chat/tool-call-timing.js';
-import { spendPolicyStream, SpendPolicyStopError } from './llm/spend-policy-stream.js';
+import { spendPolicyStream, SpendPolicyStopError, spendStopIsLeaseOnly } from './llm/spend-policy-stream.js';
 import { recordChildFirstLlmResponse, recordChildFirstLlmStart, recordChildFirstToolCall } from './llm/child-first-llm-observation.js';
 import {
   dispatchWithParallelSafety,
@@ -444,6 +444,16 @@ export interface LLMOpts {
       messages: LLMMessage[],
       startIndex: number,
     ) => Promise<{ messages: LLMMessage[]; reason: string; nextIndex: number } | null>;
+    /** TURN-REQUEST-SIZE-LOSS — last compaction rung: drop the oldest whole messages (pair-safe, archived) until
+     *  `measure` (the exact serialized wire chars) is at most `targetChars`. Also the shrink before the one retry after
+     *  a provider size rejection. */
+    trimOldest?: (
+      messages: LLMMessage[],
+      measure: (messages: LLMMessage[]) => number,
+      targetChars: number,
+    ) => Promise<{ messages: LLMMessage[]; reason: string; dropped: number } | null>;
+    /** Target of `trimOldest` as a share of maxChars (`chat.requestSize.trimTargetRatio`). */
+    trimTargetRatio?: number;
     /** Receives compacted provider messages so the tool-loop can replace its canonical history. */
     onCompacted?: (messages: LLMMessage[]) => void | Promise<void>;
     onMeasured?: (info: {
@@ -4414,9 +4424,9 @@ function permitsAutomaticProviderFallback(opts: LLMOpts & { provider?: LLMProvid
 function configuredFallbackChainSteps(): readonly string[] {
   try {
     const { getUserConfig } = require('./user-config.js') as typeof import('./user-config.js');
-    const { normalizeFallbackChain } = require('./oauth/fallback-chain.js') as typeof import('./oauth/fallback-chain.js');
+    const { effectiveFallbackChain } = require('./oauth/fallback-chain.js') as typeof import('./oauth/fallback-chain.js');
     const llm = getUserConfig().llm;
-    return normalizeFallbackChain(llm.fallbackChain, llm.provider).chain;
+    return effectiveFallbackChain(llm.fallbackChain, llm.provider).chain;
   } catch (err) {
     // ⛔ 조용히 삼키면 「설정을 못 읽었다」가 「폴백 후보가 없다」로 «둔갑»한다 —
     //   호출자는 그것을 `fallback candidates exhausted` 로 보고 사람에게 그렇게 말한다.
@@ -5092,6 +5102,9 @@ type StreamLLMOpts = LLMOpts & {
 let liveSpendTestSeam: { readonly eligible?: boolean; readonly deps?: Partial<import('./oauth/llm-call-gate.js').LlmCallGateDeps> & { policyDir?: string }; readonly providerFor?: (name: string) => LLMProvider | undefined } | undefined;
 export function __setLiveSpendTestSeam(seam: typeof liveSpendTestSeam): void { liveSpendTestSeam = seam; }
 
+/** Upkeep call sites that never stop on a spend-policy «stop» (they fall back to the ordinary provider resolution). */
+export const SPEND_GUARD_UPKEEP_SITES: ReadonlySet<string> = new Set(['compact-summary']);
+
 /** 지출 관문 대상인가 — 명시 provider(opts.provider/initialProvider · auto 아닌 설정)·가짜 기본은 건드리지 않는다. */
 function liveSpendEligible(opts: StreamLLMOpts): boolean {
   if (liveSpendTestSeam?.eligible !== undefined) return liveSpendTestSeam.eligible;
@@ -5120,7 +5133,23 @@ export async function streamLLM(
     liveSpendTestSeam?.deps ?? {},
   ).catch((error) => live.gateErrorOutcome(error, { ...(liveSpendTestSeam?.deps?.policyDir !== undefined ? { policyDir: liveSpendTestSeam.deps.policyDir } : {}), actor: opts.usageSite ?? 'stream-llm' })); // 관문 자체 오류: 정책 정본 있으면 멈춤(fail-closed) · 없으면 통과
   if (result.outcome === 'pass-through') return streamLLMCore(messages, onChunk, opts);
-  if (result.outcome === 'stop') throw new Error(`LLM spend guard stop: ${result.reason}`);
+  if (result.outcome === 'stop') {
+    // COMPACT-NEVER-STALLS (11-27 09:32–09:42: seat compaction died on «no-candidate … codex-default:no-lease» and contexts
+    // kept growing): internal upkeep (session compaction / rotation summaries) must always run — on a policy stop it goes
+    // through the ordinary provider resolution, observed once. Work calls still stop (fail-closed).
+    // SPEND-NO-LEASE-FALLBACK (대표 «크레딧 무서워 진행 멈추지 않음» · 11-27 hand capsules failed to start on
+    // «no-candidate (codex-default:no-lease)»): when the ONLY reason every row failed is a missing vault lease, the gate has
+    // no spend facts to protect — the call runs on the ordinary provider resolution with one warn row instead of stopping.
+    if (spendStopIsLeaseOnly(result.reason)) {
+      try { debug.log('llm.spend', 'no-lease-fallback', { site: opts.usageSite ?? 'stream-llm', reason: result.reason.slice(0, 200) }, { level: 'warn' }); } catch { /* observe only */ }
+      return streamLLMCore(messages, onChunk, opts);
+    }
+    if (opts.usageSite !== undefined && SPEND_GUARD_UPKEEP_SITES.has(opts.usageSite)) {
+      try { debug.log('llm.spend', 'upkeep-bypass', { site: opts.usageSite, reason: result.reason.slice(0, 200) }, { level: 'warn' }); } catch { /* observe only */ }
+      return streamLLMCore(messages, onChunk, opts);
+    }
+    throw new Error(`LLM spend guard stop: ${result.reason}`);
+  }
   const account = result.provider === 'openai-codex' ? live.codexAccountNameForRow(result.row) : undefined;
   const routed: StreamLLMOpts = { ...opts, ...(opts.model === undefined && result.model ? { model: result.model } : {}) };
   // ⛔ process.env 를 바꾸지 않는다 — 계정은 호출 범위(AsyncLocalStorage)로만 전한다(동시 호출 꼬임·env 영구 잔존 0).
@@ -13318,6 +13347,8 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
         // streamCodexResponsesEvents would build (session-derived key).
         const sessionCacheKey = codexSessionCacheKey(opts.sessionId, process.env.ELANOUS_RUN_ID)?.key;
         let serializedWireBody: string | undefined;
+        let trimRequestMessages: ((target: number) => Promise<{ reason: string; dropped: number } | null>) | undefined;
+        let currentRequestChars = 0;
         if (requestGuard) {
           serializedWireBody = serializeCodexResponsesWireBody(requestBody, promptCache, sessionCacheKey);
           // The cap protects TEXT context: inline image payloads are not counted (they have their own budget above).
@@ -13328,6 +13359,38 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
             ? Math.min(requestGuard.maxChars, requestGuard.compactAtChars!)
             : requestGuard.maxChars;
           let requestCompacted = false;
+          const trimTargetChars = Math.floor(requestGuard.maxChars * (requestGuard.trimTargetRatio ?? 0.7));
+          const wireFor = (candidate: LLMMessage[]) => {
+            const converted = messagesToResponsesInput(candidate, {
+              acceptToolImages: codexAcceptToolImages,
+              acceptUserMessageImages: codexAcceptUserImages,
+              replayCodexReasoning: !useStore,
+              stablePrefix: true,
+            });
+            const body = { ...requestBody, instructions: converted.instructions, input: enforceResponsesImageBudget(converted.input).input };
+            const wire = serializeCodexResponsesWireBody(body, promptCache, sessionCacheKey);
+            return { body, wire, chars: requestTextChars(wire) };
+          };
+          // Drop the oldest messages down to `target` and commit the result as the request (shared by the pre-send
+          // rung and the retry after a provider size rejection). null = nothing could be dropped or it did not shrink.
+          trimRequestMessages = async (target: number) => {
+            if (!requestGuard.trimOldest) return null;
+            const trimmed = await requestGuard.trimOldest(messages, (candidate) => wireFor(candidate).chars, target);
+            if (!trimmed) return null;
+            const next = wireFor(trimmed.messages);
+            if (next.chars >= requestChars) return null;
+            debug.log('llm.request', 'request-size-trim-oldest', {
+              provider: 'openai-codex', beforeChars: requestChars, afterChars: next.chars, targetChars: target,
+              dropped: trimmed.dropped, maxChars: requestGuard.maxChars,
+            }, { level: 'warn' });
+            messages.splice(0, messages.length, ...trimmed.messages);
+            await requestGuard.onCompacted?.(messages);
+            requestBody = { ...requestBody, instructions: next.body.instructions, input: applyImageBudget(next.body.input, 'trim-oldest') };
+            serializedWireBody = serializeCodexResponsesWireBody(requestBody, promptCache, sessionCacheKey);
+            requestChars = requestTextChars(serializedWireBody);
+            currentRequestChars = requestChars;
+            return trimmed;
+          };
           let requestCompactReason = requestChars > requestGuard.maxChars
             ? 'store-threading-skipped'
             : 'under-cap';
@@ -13407,6 +13470,24 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
                 break;
               }
             }
+            // TURN-REQUEST-SIZE-LOSS — the rungs above only shrink big texts and tool outputs; a record of many small
+            // messages (seat mail, short replies) is still over. Drop the oldest whole messages, archived, to the target.
+            if (requestChars > compactAtChars && requestGuard.trimOldest) {
+              try {
+                const trimmed = await trimRequestMessages(trimTargetChars);
+                if (trimmed) {
+                  requestCompacted = true;
+                  requestCompactReason = requestChars > requestGuard.maxChars
+                    ? `compaction-still-over-cap:${trimmed.reason}` : trimmed.reason;
+                }
+              } catch (error) {
+                requestCompactReason = 'compaction-error';
+                debug.log('llm.request', 'request-size-compact-error', {
+                  provider: 'openai-codex', requestChars, maxChars: requestGuard.maxChars,
+                  message: error instanceof Error ? error.message : String(error),
+                }, { level: 'warn' });
+              }
+            }
           }
           requestGuard.onMeasured?.({
             provider: 'openai-codex', requestChars, maxChars: requestGuard.maxChars,
@@ -13421,6 +13502,19 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
             compacted: requestCompacted,
             reason: requestCompactReason,
           });
+          // REQUEST-SIZE-FLOOR (11-27): still over the cap after compaction → stub the largest old tool outputs / texts
+          // (never the last two items) instead of throwing the turn away.
+          if (requestChars > requestGuard.maxChars) {
+            const { floorRequestInput } = await import('./session/request-size-guard.js');
+            const floor = floorRequestInput(requestBody.input as unknown as Record<string, unknown>[],
+              (inp) => requestTextChars(serializeCodexResponsesWireBody({ ...requestBody, input: inp as unknown as typeof requestBody.input }, promptCache, sessionCacheKey)), requestGuard.maxChars);
+            if (floor) {
+              debug.log('llm.request', 'request-size-floor', { provider: 'openai-codex', beforeChars: requestChars, afterChars: floor.chars, stubbed: floor.stubbed, maxChars: requestGuard.maxChars }, { level: 'warn' });
+              requestBody = { ...requestBody, input: floor.input as unknown as typeof requestBody.input };
+              serializedWireBody = serializeCodexResponsesWireBody(requestBody, promptCache, sessionCacheKey);
+              requestChars = floor.chars;
+            }
+          }
           if (requestChars > requestGuard.maxChars) {
             debug.log('llm.request', 'request-size-limit-blocked', {
               provider: 'openai-codex', requestChars, maxChars: requestGuard.maxChars,
@@ -13428,27 +13522,49 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
             }, { level: 'error' });
             throw new RequestSizeLimitError(requestChars, requestGuard.maxChars, requestCompactReason);
           }
+          currentRequestChars = requestChars;
         }
-        try {
-          yield* streamCodexResponsesEvents(responsesUrl, tokens.accessToken, requestBody, opts.signal, {
-            accountId,
-            promptCache,
-            ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
-            ...(serializedWireBody ? { serializedWireBody } : {}),
-            // Capture the new response id from the SSE stream so the
-            // next call can thread it. If the backend skips the event
-            // lastResponseId stays undefined and we fall back to full
-            // input on the next turn (safe — just no token savings).
-            onResponseCreated: useStore ? (id) => { lastResponseId = id; } : undefined,
-            remainingFallbacks: opts.remainingFallbacks,
-          });
-        } catch (error) {
-          if (requestedAccount && responsesUrl.startsWith(CODEX_API_BASE_URL) && error instanceof ApiHttpError
-            && (error.status === 401 || error.status === 403)) {
-            try { recordCodexUnauthorized(requestedAccount.storePath, requestedAccount.storeKey, codexHealthCredential(tokens)); }
-            catch { /* preserve the original API error */ }
+        // TURN-REQUEST-SIZE-LOSS — a provider refusal for size (context window / 413) before any output is not the end
+        // of the turn: drop the oldest history to the trim target (below what was refused) and send once more.
+        for (let sizeRetry = 0; ; sizeRetry++) {
+          let emitted = false;
+          try {
+            for await (const event of streamCodexResponsesEvents(responsesUrl, tokens.accessToken, requestBody, opts.signal, {
+              accountId,
+              promptCache,
+              ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+              ...(serializedWireBody ? { serializedWireBody } : {}),
+              // Capture the new response id from the SSE stream so the
+              // next call can thread it. If the backend skips the event
+              // lastResponseId stays undefined and we fall back to full
+              // input on the next turn (safe — just no token savings).
+              onResponseCreated: useStore ? (id) => { lastResponseId = id; } : undefined,
+              remainingFallbacks: opts.remainingFallbacks,
+            })) {
+              emitted = true;
+              yield event;
+            }
+            break;
+          } catch (error) {
+            if (requestedAccount && responsesUrl.startsWith(CODEX_API_BASE_URL) && error instanceof ApiHttpError
+              && (error.status === 401 || error.status === 403)) {
+              try { recordCodexUnauthorized(requestedAccount.storePath, requestedAccount.storeKey, codexHealthCredential(tokens)); }
+              catch { /* preserve the original API error */ }
+            }
+            const sizeRejected = (error as { status?: unknown } | null)?.status === 413 || classifyError(error) === 'context-window-exceeded';
+            if (sizeRejected && sizeRetry === 0 && !emitted && !useStore && trimRequestMessages && !opts.signal?.aborted) {
+              const before = currentRequestChars;
+              const target = Math.floor(Math.min(before, requestGuard!.maxChars) * (requestGuard!.trimTargetRatio ?? 0.7));
+              let retried: { reason: string; dropped: number } | null = null;
+              try { retried = await trimRequestMessages(target); } catch { retried = null; }
+              debug.log('llm.request', 'request-size-retry', {
+                provider: 'openai-codex', beforeChars: before, targetChars: target, retried: retried !== null,
+                dropped: retried?.dropped ?? 0, message: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200),
+              }, { level: 'warn' });
+              if (retried) continue;
+            }
+            throw error;
           }
-          throw error;
         }
         // Snapshot full input AFTER the stream completes so the next
         // call's delta computation uses what the backend actually has

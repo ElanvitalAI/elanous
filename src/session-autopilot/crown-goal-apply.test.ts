@@ -1,4 +1,4 @@
-// CROWN-GOAL-APPLY — literal expectations (fresh temp universe per test · injected clock · injected standing goal).
+// CROWN-GOAL-APPLY — literal expectations (fresh temp universe per test · injected clock · no release-derived goal).
 import { afterAll, beforeEach, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -20,7 +20,7 @@ function harness() {
   const logs: Array<[string, Record<string, unknown>]> = [];
   const notes: string[] = [];
   const pilot = createAutopilot({ file, now: () => T0, coordinator: true, log: (e, d) => { logs.push([e, d]); }, notify: (line) => { notes.push(line); },
-    standingGoal: () => ({ version: '0.3.36', phase: '개발' }), raiseDecision: () => 'D-x', postProgress: () => {} });
+    raiseDecision: () => 'D-x', postProgress: () => {} });
   pilot.refresh();
   return { pilot, logs, notes, events: (name: string) => logs.filter(([e]) => e === name).map(([, d]) => d) };
 }
@@ -135,7 +135,7 @@ test('three goal mails in a row are all applied (an explicit setter is never thr
 test('a goal field from a non-setter is refused and logged; the goal stays', () => {
   const h = harness();
   expect(h.pilot.observeMail([{ msgId: 170, sender: 'TC', goal: '내 골로 바꿔', body: 'x', text: 'msg:170' }])).toBe(false);
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
+  expect(h.pilot.state().goal).toBeUndefined();
   expect(h.events('goal-apply-refused')).toEqual([{ reason: 'sender-not-allowed', sender: 'TC', msgId: 170, goal: '내 골로 바꿔' }]);
   expect(h.events('goal-applied')).toEqual([{ source: 'mail:TC', by: 'TC', msgId: 170, goal: '내 골로 바꿔', applied: false, reason: 'sender-not-allowed',
     detail: 'TC is not OP / CLAUDE-OP and no federation ladder places it above the seat' }]);

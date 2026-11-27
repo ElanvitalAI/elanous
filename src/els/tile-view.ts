@@ -2,7 +2,7 @@
 // the app (attach-app.ts) feeds the rows and each pane's last ANSI screen; this file lays out and draws the frame.
 // Every drawn row is exactly `cols` terminal cells wide (CJK/emoji measured by the same fitAnsi/fitCells as the pane view).
 
-import { fitAnsi, fitCells, wordOfState } from './attach-view.js';
+import { fitAnsi, fitCells, spliceCells, wordOfState, type DialogBox } from './attach-view.js';
 import { STATUS } from './status-vocab.js';
 
 const ESC = '\u001b';
@@ -265,8 +265,14 @@ export function tileFrameRows(view: TileFrameInput): string[] {
 }
 
 /** The frame as one paint in the app frame writer's composed format (cursor hidden, home, rows) — damage-only repaint. */
-export function drawTileFrame(view: TileFrameInput): string {
-  return `${ESC}[?25l${ESC}[H${tileFrameRows(view).join('\r\n')}${ESC}[?25l`;
+export function drawTileFrame(view: TileFrameInput, layers: readonly DialogBox[] = []): string {
+  // ELS-ZAXIS S2: the overlay stack floats over the tile grid too (spliced cell-exact, bottom → top).
+  const rows = tileFrameRows(view);
+  for (const layer of layers) layer.lines.forEach((text, at) => {
+    const y = layer.y + at;
+    if (y >= 0 && y < rows.length && layer.x < view.cols) rows[y] = spliceCells(rows[y]!, layer.x, text, Math.min(layer.width, view.cols - layer.x));
+  });
+  return `${ESC}[?25l${ESC}[H${rows.join('\r\n')}${ESC}[?25l`;
 }
 
 export function parseTileGrid(value: string | undefined): TileGridSpec | undefined {

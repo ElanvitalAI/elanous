@@ -10,10 +10,11 @@
 
 import { appendFileSync, chmodSync, mkdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
-import { hostname } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { buildCommitTime, cliBuildIdentity } from '../version/build-stamp.js';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { dirname, basename, join } from 'node:path';
+import { appendAuditLine } from '../kit/audit-ledger/index.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { stateDirSourceForChild } from '../agent/identity-env.js';
 import { openMsgStore } from '../msg/msg-store.js';
@@ -43,11 +44,24 @@ import { startElsHttpV1 } from './http-v1.js';
 import { appendSendAudit, type ControlExecute } from './control.js';
 import { createLineDecoder } from './wire.js';
 import { serveSubscribe } from './subscribe.js';
+import { createNoteEditor } from './elements/note-editor.js';
+import { createOverlayRegistry, serveOverlayWatch, type OverlayRegistry, type OverlayRequest } from './overlay-registry.js';
+import { createChannelHub, type ChannelCaller, type ChannelHub, type ChannelRequest } from './channel-log.js';
+import { loopVoiceResolver } from './loop-voice.js';
+import { createTabHostSync, hostPaneMayAct } from './element-host.js';
+import { attachToast, serveElnAttach, sshFetch, type ElnAttachDeps } from './eln-attach.js';
+import { createMemoStore, watchMemoClose } from './memo-store.js';
+import { clearRestoredSidechat, createSidechatHub, pushSidechat, sidechatPanes, watchSidechatClose, type SidechatStream } from './sidechat-hub.js';
+import { productModelCall, productWebSearch, searchSidechatStream, type SidechatToolDeps } from './sidechat-tools.js';
+import { createRemoteFiles, sshRunner, type RemoteRunner } from './files-remote.js';
+import { elsHostsPath, loadHostRegistry } from './hosts.js';
+import { POPUP_WS } from './elements/term.js';
 import { foregroundOf, parsePs, type Foreground } from './foreground.js';
 import { audit as controlAudit, authorize, classifyShell, createControl, inputExplicitlyDenied, pinAllowList } from './control.js';
 import { journalControl } from './control-cli.js';
 import { peerUid } from './peer-uid.js';
 import { auditOperator, localOperatorAllowed, LOCAL_OPERATOR_OPS } from './local-operator.js';
+import { proxyPeerAuthority, proxyPeerVerified, readProxyGrant, recordProxyAction, proxyStateRoot } from '../proxy/proxy-identity.js';
 import { runtimeProcessIdentity, SeatRuntimeRegistry, type RuntimeProcess, type RuntimeClaim } from './seat-runtime.js';
 import { peerPid, processIdentity, processStartStamp, baselineBeforePidLookup, resolvePeerSeatWithAnchor, resolveElsPeerSeat, resolveAncestorPane, inspectReadAncestry, verifyPanePeer, type ProcessIdentity } from './peer-seat.js';
 type PeerSeat = { pane: string; seat: string; anchor?: ProcessIdentity; runtimeLive?: () => boolean };
@@ -109,7 +123,15 @@ export type ElsRequest =
   | { readonly op: 'build'; readonly pane: string; readonly sha: string; readonly version?: string; readonly stamp?: string }
   | { readonly op: 'ls' }
   | { readonly op: 'subscribe' }
+  /** ELS-ZAXIS: the overlay registry (open · close · raise · lower · focus · update · list) — act-view tier (#40244 §2-3). */
+  | ({ readonly op: 'overlay' } & OverlayRequest)
+  /** ELS-ZAXIS: read-only push of the overlay stack on this connection (the attach app's z axis). */
+  | { readonly op: 'overlay-watch' }
+  /** ELS-CHANNEL P0: the channel log (post · read · list · ack · wait · hold · resume · open). The sender is the server-authenticated caller. */
+  | ({ readonly op: 'channel' } & ChannelRequest)
   | { readonly op: 'grep'; readonly pattern: string }
+  /** ELS-ATTACH: a file into an open agent pane's input line (@-mention / path · never Enter) — src/els/eln-attach.ts. */
+  | { readonly op: 'eln-attach'; readonly path: string; readonly source: string; readonly ws?: string; readonly pane?: string }
   | { readonly op: 'new'; readonly ws: string; readonly cwd: string; readonly command: readonly string[]; readonly title?: string; readonly uniqueSeat?: string }
   | { readonly op: 'read'; readonly pane: string; readonly at?: { readonly ws: string; readonly tab: string } }
   | { readonly op: 'send'; readonly pane: string; readonly text: string }
@@ -133,7 +155,7 @@ export type ElsRequest =
   /** `confirmed`: the person said yes (the view's y / button) — the control door refuses close without it (#39143). */
   | { readonly op: 'close'; readonly pane: string; readonly confirmed?: boolean }
   | { readonly op: 'close-workspace'; readonly ws: string; readonly confirmed?: boolean }
-  | { readonly op: 'close-tab'; readonly tab: string; readonly confirmed?: boolean }
+  | { readonly op: 'close-tab'; readonly tab: string; readonly confirmed?: boolean; readonly proxyConfirmed?: boolean }
   | { readonly op: 'do'; readonly pane: string; readonly text: string; readonly from: string; readonly at?: { readonly ws: string; readonly tab: string } }
   | { readonly op: 'snapshot'; readonly pane: string }
   /** ELS-TILE-MODE: the pane's current ANSI screen from memory — read-only, nothing persisted (the tile grid's refresh). */
@@ -171,6 +193,47 @@ export function elsSocketTaken(socketPath: string): Promise<'live' | 'dead' | 'n
 
 const RESULTS_MAX_BYTES = 256 * 1024;
 const childTabsOf = new WeakMap<ElsCore, ChildTabs>();
+/** ELS-SIDECHAT-SEARCH: the search tools' facts — vault (config obsidian.vault), the journal lastFocus pane's folder, web. */
+function sidechatToolDeps(core: ElsCore): SidechatToolDeps {
+  return {
+    vault: () => { try { return (require('../user-config.js') as typeof import('../user-config.js')).getUserConfig().obsidian?.vault; } catch { return undefined; } },
+    cwd: () => {
+      try {
+        const listed = JSON.parse(core.list().message) as { panes?: Array<{ pane: string; cwd?: string }>; lastFocus?: { paneId?: string } };
+        return listed.panes?.find((row) => row.pane === listed.lastFocus?.paneId)?.cwd;
+      } catch { return undefined; }
+    },
+    web: productWebSearch,
+  };
+}
+/** ELS-ZAXIS: one overlay registry per server core (memory ⊕ <els>/overlays.json). */
+const overlaysOf = new WeakMap<ElsCore, OverlayRegistry>();
+/** ELS-CHANNEL P0: one channel hub per server core (memory ⊕ <els>/channels/*.jsonl). */
+const channelsOf = new WeakMap<ElsCore, ChannelHub>();
+/** ELS-ATTACH: the attach op's server facts — the listing, the machine-input paste (never Enter: the adapter's text has
+ *  none, and serveElnAttach refuses one), the vault, this els state folder (remote cache), ssh for host:/path files. */
+function elnAttachDeps(core: ElsCore, stateDir: string): ElnAttachDeps {
+  return { stateDir, fetchRemote: sshFetch,
+    listing: () => JSON.parse(core.list().message) as ReturnType<ElnAttachDeps['listing']>,
+    insert: (pane, text) => core.machineInput(pane, text, true),
+    vault: () => { try { return (require('../user-config.js') as typeof import('../user-config.js')).getUserConfig().obsidian?.vault; } catch { return undefined; } } };
+}
+/** ELS-TAKEOUT: a md file in a new read-only viewer tab (`elanous side obsidian --file <md>`) in the workspace the person
+ *  last focused (the journal's lastFocus — the owner view records it). The same program that runs this server runs the
+ *  viewer (the test universe's tree in a test run, the installed elanous in production). Returns an error line, or
+ *  undefined when the tab opened. */
+function openViewerTab(core: ElsCore, file: string, title: string): string | undefined {
+  let ws: string | undefined;
+  try {
+    const listed = JSON.parse(core.list().message) as { workspaces?: Array<{ id: string; name: string }>; lastFocus?: { workspaceId?: string } };
+    ws = listed.workspaces?.find((row) => row.id === listed.lastFocus?.workspaceId)?.name ?? (listed.workspaces?.length === 1 ? listed.workspaces[0]!.name : undefined);
+  } catch { ws = undefined; }
+  if (!ws) return 'no workspace in view';
+  const script = process.argv[1] ?? '';
+  const self = /elanous(\.mjs|\.ts|\.js)?$/.test(script) && script !== process.execPath ? [process.execPath, script] : ['elanous'];
+  const opened = core.newPane({ ws, cwd: dirname(file), command: [...self, 'side', 'obsidian', '--file', file], title });
+  return opened.exitCode === 0 ? undefined : opened.message.slice(0, 120);
+}
 // #38610 REVIEW must ① — the outbound webhooks this owner server runs, on the real boot path.
 const webhookOutOf = new WeakMap<ElsCore, ReturnType<typeof createOutboundWebhooks>>();
 const childEventSeqs = new WeakMap<ElsCore, Map<string, number>>();
@@ -316,6 +379,21 @@ function declaredHqCoordinator(): string | undefined {
   try { return loadFederationLadder().hq; } catch { return undefined; }
 }
 
+/** ELS-CHANNEL §1-2: the sender of a channel message, from the authenticated connection only — a pane role (token ⊕
+ *  ancestry), a verified tool-door peer, or the same-uid operator outside any pane (a person's terminal). */
+async function channelCaller(core: ElsCore, stateRoot: string, toolDoor: boolean, paneSeat: string | undefined, callerPane: string | undefined, firstSeat: (() => Promise<PeerSeat | undefined>) | undefined): Promise<ChannelCaller> {
+  const peer = toolDoor && paneSeat === undefined ? await firstSeat?.() : undefined;
+  const seat = paneSeat ?? peer?.seat;
+  const pane = callerPane ?? peer?.pane;
+  if (!toolDoor && paneSeat === undefined) return { role: 'operator', human: true };
+  if (seat === 'OP') return { role: 'op', seat, ...(pane ? { pane } : {}) };
+  const journal = loadJournal(elsJournalPath(stateRoot));
+  const id = pane ? core.paneExists(pane) : undefined;
+  const wsId = id ? journal.tabs.find(t => t.id === journal.panes.find(p => p.id === id)?.tabId)?.workspaceId : undefined;
+  const ws = wsId ? journal.workspaces.find(w => w.id === wsId) : undefined;
+  return { role: 'hand', ...(id ? { pane: id } : {}), ...(seat && seat !== 'unknown' ? { seat } : {}), workspaces: ws ? [ws.id, ws.name] : [] };
+}
+
 async function dispatch(core: ElsCore, request: ElsRequest, parent: SpawnParent | undefined, stateRoot: string, uid: number | undefined, pid: number | undefined, seatLookup: SeatLookup, baseline: ProcessIdentity | undefined, firstSeat: (() => Promise<PeerSeat | undefined>) | undefined, sendAuditDir: string, toolDoor: boolean, toolDo = false, paneSeat?: string, callerPane?: string, auditDenial?: (request: ElsRequest, reason: string) => void, claimedPid?: number, actorCurrent?: () => boolean, actorSeat?: string, reauthorize?: (request: ElsRequest) => { readonly allow: boolean; readonly reason?: string }): Promise<ElsResult> {
   // JUD #39484 ② — a tool-door actor is re-verified on EVERY message, never once per connection.
   if (toolDoor && actorCurrent && !actorCurrent()) {
@@ -377,9 +455,14 @@ async function dispatch(core: ElsCore, request: ElsRequest, parent: SpawnParent 
     let allowed = false;
     // OP-HANDLES-L2: the coordinator grant (journal ⊕ federation) covers typing / close / close-tab on federation seat panes.
     const coordinatorGranted = (): boolean => !!coordinatorGrantForSeat(core, stateRoot, seat?.seat, (seat as { pane?: string } | undefined)?.pane ?? callerPane, request);
-    if (request.op === 'read' || request.op === 'tile-frame' || request.op === 'snapshot' || request.op === 'record' || request.op === 'status' || request.op === 'close' || request.op === 'build' || request.op === 'do' || request.op === 'input-line' || request.op === 'interrupt' || request.op === 'send' || request.op === 'send-verified' || request.op === 'input') {
+    if (request.op === 'read' || request.op === 'tile-frame' || request.op === 'snapshot' || request.op === 'record' || request.op === 'status' || request.op === 'close' || request.op === 'build' || request.op === 'do' || request.op === 'input-line' || request.op === 'interrupt' || request.op === 'send' || request.op === 'send-verified' || request.op === 'input' || request.op === 'eln-attach') {
       const recording = request.op === 'record' && typeof request.pane === 'string' ? recordingFor(core, request.pane) : undefined;
-      allowed = typeof request.pane === 'string' && (ownPane(request.pane) || ((request.op === 'read' || request.op === 'tile-frame' || request.op === 'status' || hqTypingRequest(request)) && !!core.paneExists(request.pane) && hqReadObserver(seat?.seat, callerPane, journal)) || (request.op === 'record' &&
+      // COORD-RIGHTS (11-27): reads → every coordinator (`hqReadObserver`); typing → HQ only here (`hqObserver`), space
+      // coordinators type through the in-scope grant below. The caller pane is the verified seat's pane when there is one.
+      const observerPane = (seat as { pane?: string } | undefined)?.pane ?? callerPane;
+      allowed = typeof request.pane === 'string' && (ownPane(request.pane)
+        || ((request.op === 'read' || request.op === 'tile-frame' || request.op === 'status') && !!core.paneExists(request.pane) && hqReadObserver(seat?.seat, observerPane, journal))
+        || (hqTypingRequest(request) && !!core.paneExists(request.pane) && hqObserver(seat?.seat, observerPane, journal)) || (request.op === 'record' &&
         ((!recording && request.pane === callerPane && callerPane !== undefined) || (!!recording &&
           (recording.paneId === callerPane || (!!seat && seat.seat !== 'unknown' && recording.ownerSeat === seat.seat))))));
       if (allowed && (request.op === 'read' || request.op === 'do' || request.op === 'input-line') && request.at) allowed = core.locate(request.at.ws, request.at.tab, request.pane) === core.paneExists(request.pane);
@@ -393,9 +476,22 @@ async function dispatch(core: ElsCore, request: ElsRequest, parent: SpawnParent 
     } else if (request.op === 'rename' || request.op === 'reorder') {
       const scoped = seat && request.op === 'reorder' ? coordinatorTabScope({ kind: 'hand', pane: callerPane ?? '', seat: seat.seat, workspaces: [] }, request, journal) : undefined;
       allowed = scoped ? scoped.allow : (request.op === 'rename' && request.kind === 'tab' ? tabRenameAuthority : ownKind(request.kind, request.id)) && (request.op !== 'reorder' || request.before === undefined || request.before === '' || request.before === 'end' || ownKind(request.kind, request.before));
+    } else if (request.op === 'overlay') {
+      // ELS-ZAXIS act-view (#40244 §2-3): look is open to every pane; OP acts on every space; any other pane acts only on
+      // its own pane's workspace (open names it in `ws`; other acts resolve the layer's owner workspace).
+      const ws = overlaysOf.get(core)?.workspaceOfRequest(request);
+      const callerWs = callerPane ? journal.tabs.find(t => t.id === journal.panes.find(p => p.id === core.paneExists(callerPane))?.tabId)?.workspaceId : undefined;
+      const wsId = ws ? journal.workspaces.find(w => w.id === ws || w.name === ws)?.id : undefined;
+      allowed = request.action === 'list' || seat?.seat === 'OP' || (!!wsId && (wsId === callerWs || ownWorkspace(wsId)))
+        || hostPaneMayAct(journal.panes, core.paneExists(callerPane ?? '') ?? '', overlaysOf.get(core)?.stack(), request);   // ELS-ELEMENT-HOST
+    } else if (request.op === 'channel') {
+      // ELS-CHANNEL §3-3: the hub judges the channel scope with the caller identity built below (never request fields).
+      allowed = true;
     } else if (request.op === 'close-workspace') allowed = ownWorkspace(request.ws);
     else if (request.op === 'close-tab') allowed = ownTab(request.tab);
-    if (!allowed && (request.op === 'close' || request.op === 'close-tab' || request.op === 'do' || request.op === 'input-line' || request.op === 'send' || request.op === 'send-verified' || request.op === 'input')) allowed = coordinatorGranted();
+    // COORD-RIGHTS (11-27): reads (every coordinator, every pane) and interrupt (in scope) go through the same grant.
+    if (!allowed && (request.op === 'close' || request.op === 'close-tab' || request.op === 'do' || request.op === 'input-line' || request.op === 'send' || request.op === 'send-verified' || request.op === 'input'
+      || request.op === 'interrupt' || request.op === 'read' || request.op === 'tile-frame' || request.op === 'status' || request.op === 'snapshot')) allowed = coordinatorGranted();
     if (!allowed) {
       if (request.op === 'do' || request.op === 'coordinator') auditDenial?.(request, 'target is not owned by caller seat');
       return { exitCode: 1, message: `els: ${request.op} denied — target is not owned by caller seat${request.op === 'record' && typeof request.pane === 'string' ? ` (${JSON.stringify(request.pane)})` : ''}` };
@@ -432,6 +528,22 @@ async function dispatch(core: ElsCore, request: ElsRequest, parent: SpawnParent 
       return { ...listed, message: JSON.stringify(payload) };
     }
     case 'grep': return core.grep(request.pattern);
+    case 'channel': {
+      const hub = channelsOf.get(core);
+      if (!hub) return { exitCode: 1, message: 'els channel: no channel hub on this server' };
+      const { op: _op, ...channelRequest } = request;
+      return hub.apply(channelRequest, await channelCaller(core, stateRoot, toolDoor, paneSeat, callerPane, firstSeat));
+    }
+    case 'eln-attach': {
+      const result = await serveElnAttach(elnAttachDeps(core, dirname(elsJournalPath(stateRoot))), request);
+      return { exitCode: result.ok ? 0 : 1, message: JSON.stringify(result) };
+    }
+    case 'overlay': {
+      const registry = overlaysOf.get(core);
+      if (!registry) return { exitCode: 1, message: 'els overlay: no overlay registry on this server' };
+      const { op: _op, ...overlayRequest } = request;
+      return registry.apply(overlayRequest);
+    }
     case 'new': {
       if (toolDoor) {
         // A human owner credential or a label-only registration is not a tool seat.
@@ -603,7 +715,7 @@ async function dispatch(core: ElsCore, request: ElsRequest, parent: SpawnParent 
       try { seat = uid === undefined ? undefined : firstSeat ? await firstSeat() : await seatLookup(pid, baseline); } catch { seat = undefined; }
       // ELS-OP-CROSS-SPACE-SEND: the HQ observer may type a line into any pane; interrupt (Escape) stays owner-only.
       // OP-HANDLES-L2: a space coordinator types into federation seat panes of its own spaces the same way.
-      const hqTyping = (who: PeerSeat | undefined): boolean => !interrupt && !!who && (hqReadObserver(who.seat, who.pane, loadJournal(elsJournalPath(stateRoot)))
+      const hqTyping = (who: PeerSeat | undefined): boolean => !interrupt && !!who && (hqObserver(who.seat, who.pane, loadJournal(elsJournalPath(stateRoot)))
         || (typeof request.pane === 'string' && !!coordinatorGrantForSeat(core, stateRoot, who.seat, who.pane, { op: 'input-line', pane: request.pane, text: '', from: '' } as ElsRequest)));
       const hq = hqTyping(seat);
       const elsDir = dirname(elsSocketPath(stateRoot));
@@ -1042,6 +1154,12 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
     }
     const key = lookupPid === pid && runtimeRegistry?.matches(pid, uid, runtimeBaseline, runtimeToken) ? runtimeRegistry.key() : undefined;
     const descendant = runtimeRegistry?.isDescendant(pid, uid, runtimeBaseline) === true;
+    // CLAUDE-OP-PROXY-IDENTITY — on the tool door, the verified CEO-proxy session is a verified OP tool seat
+    // (kernel ancestry to the granted Claude Code process · audited · noticed); a self-declared label never is.
+    if (!key && toolDoor && lookupPid === pid && !descendant && (!external || external.seat === 'unknown' || external.seat === 'OP')) {
+      const proxied = proxyPeerAuthority({ pid, expectStart: runtimeBaseline?.start, op: 'els-act' });
+      if (proxied) return { seat: 'OP', pane: `proxy:${proxied.grantId.slice(0, 12)}`, runtimeLive: proxied.live };
+    }
     if (!key) return (toolDoor || descendant) && !injectedSeatLookup && external?.seat === 'OP' ? undefined : external;
     if (external && external.seat !== 'OP') return undefined;
     return { seat: 'OP', pane: key, runtimeLive: () => runtimeRegistry?.isLiveGeneration(key) === true };
@@ -1163,6 +1281,12 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
       void ready.then((core) => { if (core) serveSubscribe(core, socket); else answer({ exitCode: 1, message: 'els: the server is stopping' }); });
       return;
     }
+    // ELS-ZAXIS: the overlay stack, pushed on this connection (never reaches dispatch). Not on the tool socket.
+    if (request.op === 'overlay-watch') {
+      if (effectiveToolDoor) { answer({ exitCode: 1, message: 'els: overlay-watch is unavailable to tool callers' }); return; }
+      void ready.then((core) => { const registry = core ? overlaysOf.get(core) : undefined; if (registry) serveOverlayWatch(registry, socket); else answer({ exitCode: 1, message: 'els: the server is stopping' }); });
+      return;
+    }
     if (request.op === 'attach') {
       // Lines can arrive in the same chunk as the attach line, before `ready` resolves: keep them, never drop them.
       attachLine = bufferEarly;
@@ -1213,6 +1337,14 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
     catch { handled = true; answer({ exitCode: 2, message: 'els: malformed request' }); return; }
     // Valid JSON that is not an object (null, 7, "x", [..]) has no `.op`: refuse this connection, never throw in the owner.
     if (!isRequestObject(request)) { handled = true; answer({ exitCode: 2, message: 'els: malformed request' }); return; }
+    // CLAUDE-OP-PROXY-IDENTITY — `proxyConfirmed` is set only here, from the kernel peer's ancestry (never a client field):
+    // the verified CEO-proxy session closes a tab no seat owns without a person's prompt. The audit row ⊕ OP notice are
+    // written by the close-tab authorization only when this flag is what allowed the close (recordProxyAction).
+    if ('proxyConfirmed' in request) delete (request as { proxyConfirmed?: unknown }).proxyConfirmed;
+    if (request.op === 'close-tab' && request.confirmed !== true && !toolDoor
+      && proxyPeerVerified({ pid, expectStart: runtimeBaseline?.start })) {
+      (request as { proxyConfirmed?: boolean }).proxyConfirmed = true;
+    }
     const guard = guardRef.current;
     // OP #128880: holder-side nonce confirmation — pre-door by design (a holder holds no els role),
     // fail-closed without the live server's memory-only nonce. The peer pid is kernel-provided and the
@@ -1366,7 +1498,7 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
             batonAutoReturn(elsDir, stateRoot, request.handoff ?? 'OP restart verified by the restart runtime');
             return { exitCode: 0, message: JSON.stringify(lease.active()) };
           }
-          return batonAutoHand(elsDir, request.reason ?? '', (request.exclude ?? []).filter(n => Number.isSafeInteger(n) && n > 0));
+          return batonAutoHand(elsDir, request.reason ?? '', (request.exclude ?? []).filter(n => Number.isSafeInteger(n) && n > 0), request.acting);
         }
         try {
           if (request.action === 'hand') lease.hand(actor, request.owner ?? '', request.acting ?? '', request.reason ?? '', request.ttlMs ?? 0);
@@ -1510,7 +1642,7 @@ export function serveConnection(ready: Promise<ElsCore | undefined>, socket: Soc
 
 /** Pane PTYs live in outside holder processes (D1a): src/els/holder.ts holderPty is the default spawn; the
  *  registry-owned registryPty of the old contract is gone — a server stop now releases the panes instead of killing them. */
-import { AUTH_OWNER_TOKEN_ENV, AUTH_PANE_TOKEN_ENV, authorizeRequest, closeTabAuditLine, coordinatorAuthority, coordinatorGrant, coordinatorTabScope, type CoordinatorGrant, type FederationJournal, denialAuditLine, hqReadObserver, hqTypingRequest, isMutating, isServerOwnerRole, PaneRegistry, resolveTabCloseScope, rulesLoader, spawnParentOf, type ServerRole, type SpawnParent } from './server-auth.js';
+import { AUTH_OWNER_TOKEN_ENV, AUTH_PANE_TOKEN_ENV, authorizeRequest, closeTabAuditLine, coordinatorAuthority, coordinatorGrant, coordinatorTabScope, type CoordinatorGrant, type FederationJournal, denialAuditLine, hqObserver, hqReadObserver, hqTypingRequest, isMutating, isServerOwnerRole, PaneRegistry, resolveTabCloseScope, rulesLoader, spawnParentOf, type ServerRole, type SpawnParent } from './server-auth.js';
 import { archiveExitedPane } from './exited-archive.js';
 
 // The map is populated only after this server owns both sockets; snapshots never confer authority.
@@ -1535,11 +1667,11 @@ function isActingSeat(elsDir: string, seat: string | undefined): boolean {
 const opReporters = new Map<string, number[]>();
 const autoExcluded = new Map<string, Set<number>>();
 function batonLog(line: string): void { try { process.stderr.write(`els.baton ${line}\n`); } catch { /* observation is best effort */ } }
-function batonAutoHand(elsDir: string, reason: string, exclude: readonly number[]): ElsResult {
+function batonAutoHand(elsDir: string, reason: string, exclude: readonly number[], acting?: string): ElsResult {
   const lease = batonLeases.get(elsDir);
   if (!lease) return { exitCode: 1, message: 'els baton: server unavailable' };
   try {
-    const { baton, handed } = lease.autoHand(reason);
+    const { baton, handed } = lease.autoHand(reason, acting);
     if (handed) autoExcluded.set(elsDir, new Set([...(opReporters.get(elsDir) ?? []), ...exclude]));
     else for (const pid of exclude) autoExcluded.get(elsDir)?.add(pid);
     publishBatonSnapshot(elsDir, lease);
@@ -1584,7 +1716,7 @@ function batonAlertMail(stateRoot: string, to: string, body: string): void {
 function batonAutoSkip(elsDir: string, stateRoot: string, reason: string): void {
   const why = reason.replace(/[\r\n]+/g, ' ').trim().slice(0, 200) || 'acting-unhealthy';
   batonLog(`auto-hand skipped reason=${why}`);
-  try { appendFileSync(join(elsDir, 'baton-audit.jsonl'), `${JSON.stringify({ action: 'auto-hand-skipped', at: new Date().toISOString(), reason: why, actor: 'runtime' })}\n`, { mode: 0o600 }); } catch { /* audit best effort */ }
+  try { appendAuditLine(join(elsDir, 'baton-audit.jsonl'), `${JSON.stringify({ action: 'auto-hand-skipped', at: new Date().toISOString(), reason: why, actor: 'runtime' })}\n`, { mode: 0o600 }); } catch { /* audit best effort */ }
   batonAlertMail(stateRoot, 'OP', `🚨 [baton] OP restart skipped this wave — ${why}: the acting seat is not healthy, so OP was not stopped. Restart OP after the acting seat is back.`);
 }
 function batonTick(elsDir: string, stateRoot: string, lease: BatonLease): void {
@@ -1637,6 +1769,10 @@ function listen(server: Server, socketPath: string): Promise<NodeJS.ErrnoExcepti
 export interface ElsServerOptions {
   readonly stateRoot?: string;
   /** Clock seam of the child tabs for isolated tests (tab-after / close-delay / repaint period), never supplied by wire requests. */
+  /** ELS-SIDECHAT: the sidechat model call (tests/sim inject a fake; default = the product LLM client, budget tier). */
+  readonly sidechatStream?: SidechatStream;
+  /** ELS-FILES-SSH: how the file browser reaches a remote host (tests/sim inject a fake; default = the person's ssh, BatchMode). */
+  readonly filesRemoteRun?: RemoteRunner;
   readonly childTabs?: Pick<ChildTabsDeps, 'tabAfterMs' | 'closeDelayMs' | 'tickMs' | 'paneSize' | 'colorMode'>;
   /** Isolated Telegram transport for a product ELS boot test. */
   readonly ceoFetchImpl?: typeof fetch;
@@ -1831,6 +1967,50 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
     appendFileSync(resultsPath, `${JSON.stringify({ at: new Date().toISOString(), ws, line })}\n`, { mode: 0o600 });
   });
   childTabsOf.set(core, createChildTabs({ core, notifyParent, paneSize: (pane) => core.paneSize(pane), ...(options.childTabs ?? {}) }));
+  // ELS-ZAXIS: the overlay registry — the Obsidian element's vault is the config key obsidian.vault (this universe's config).
+  // ELS-SIDECHAT: the sidechat popup's session lives here (one per server, only while the popup is open).
+  // ELS-SIDECHAT-SEARCH: the model may search the vault, the focused pane's folder and the web (read-only, bounded).
+  const sidechat = createSidechatHub({ stream: options.sidechatStream ?? searchSidechatStream(productModelCall, () => sidechatToolDeps(core)), push: () => pushSidechat(overlaysOf.get(core)),
+    panes: sidechatPanes(core, () => overlaysOf.get(core)?.stack().layers.filter((layer) => layer.kind === 'sidechat').at(-1)?.ownerWorkspace) });
+  // ELS-TAKEOUT: memos under this els state folder · a toast (opened after the current apply returns) · a read-only tab.
+  const takeout = { stateDir: dirname(journalPath),
+    notify: (text: string, level: 'info' | 'success' | 'warning' | 'error') => { queueMicrotask(() => { overlaysOf.get(core)?.apply({ action: 'open', kind: 'toast', props: { text: text.slice(0, 190), level } }); }); },
+    openTab: (file: string, title: string) => openViewerTab(core, file, title),
+    // ELS-ATTACH: the Obsidian viewer's `a` — the result is a toast.
+    attach: (path: string, source: string) => { void serveElnAttach(elnAttachDeps(core, dirname(journalPath)), { path, source }).then((result) => { const line = attachToast(result); overlaysOf.get(core)?.apply({ action: 'open', kind: 'toast', props: line }); }); } };
+  // ELS-OBSIDIAN-EDIT: the Obsidian popup's note editor (one buffer per server; backups under <els state>/obsidian-backup).
+  const vaultOf = (): string | undefined => { try { return (require('../user-config.js') as typeof import('../user-config.js')).getUserConfig().obsidian?.vault; } catch { return undefined; } };
+  const noteEditor = createNoteEditor({ vault: vaultOf, backupDir: () => join(dirname(journalPath), 'obsidian-backup'), notify: takeout.notify });
+  // ELS-MEMO: the memo popup's text — <els state>/memos/popup.md (debounced atomic writes, flushed when the popup closes).
+  const memo = createMemoStore({ file: join(dirname(journalPath), 'memos', 'popup.md') });
+  const tabHosts = createTabHostSync({ panes: () => loadJournal(journalPath).panes, newPane: (input) => core.newPane(input), close: (pane) => { core.close(pane); },
+    cwd: process.env.HOME || dirname(journalPath) });
+  // ELS-FILES-SSH: remote file browsing — one ssh call per folder/preview miss, a landed read re-hydrates the files layer.
+  const files = createRemoteFiles({ run: options.filesRemoteRun ?? sshRunner(join(dirname(journalPath), 'ssh')),
+    registered: () => loadHostRegistry(elsHostsPath(dirname(dirname(journalPath)))).hosts.filter((host) => host.attach || host.update).map((host) => host.name),
+    onReady: () => { const registry = overlaysOf.get(core); const layer = registry?.stack().layers.find((one) => one.kind === 'files'); if (registry && layer) registry.apply({ action: 'update', id: layer.id, props: layer.props }); } });
+  // ELS-POPUP-TERM: a term layer opened without a pane gets one HERE, in one step of the server's single thread (two viewers
+  // or a tool and a viewer can never start two shells): the live els-popup pane is reused, else the person's $SHELL starts
+  // in their home — a shell only, never a caller-chosen command.
+  const popupPane = (): string | undefined => {
+    try {
+      const listed = JSON.parse(core.list().message) as { panes?: { pane?: string; workspace?: string; state?: string }[] };
+      const live = listed.panes?.find((one) => one.workspace === POPUP_WS && one.state !== 'exited' && typeof one.pane === 'string');
+      if (live?.pane) return live.pane;
+      const made = core.newPane({ ws: POPUP_WS, cwd: homedir(), command: [process.env.SHELL?.trim() || '/bin/sh'], title: 'popup' });
+      return made.exitCode === 0 ? (JSON.parse(made.message) as { pane?: string }).pane : undefined;
+    } catch { return undefined; }
+  };
+  overlaysOf.set(core, createOverlayRegistry({ dir: dirname(journalPath), context: () => {
+    try { return { sidechat, memo, noteEditor, ...takeout, popupPane, files, vault: (require('../user-config.js') as typeof import('../user-config.js')).getUserConfig().obsidian?.vault }; } catch { return { sidechat, memo, noteEditor, ...takeout, popupPane, files }; }
+  },
+  // ELS-ELEMENT-HOST: a layer in the tab frame is drawn by one host pane (`side element host <kind> <key>`), spawned here.
+  onTabHosts: tabHosts }));
+  watchSidechatClose(overlaysOf.get(core)!, sidechat);
+  // ELS-CHANNEL P1b: a message to loop:<id> is one call of that loop agent's voice (in-process or <els>/loops/<id>.json command).
+  channelsOf.set(core, createChannelHub({ dir: join(dirname(journalPath), 'channels'), loopVoice: loopVoiceResolver(join(dirname(journalPath), 'loops')) }));
+  watchMemoClose(overlaysOf.get(core)!, memo);
+  clearRestoredSidechat(overlaysOf.get(core)!);              // ELS-SIDECHAT-EDGE A4: a restored layer shows no dead session
   if (options.ps) psOf.set(core, options.ps);
   // JUD #39053 ⓒ1: every socket request is judged here in the server. The role comes from the
   // server-minted pane-token ledger; the CLI's env never decides anything.
@@ -1838,6 +2018,12 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
   const loadRules = rulesLoader(elsDir);
   const workspaceOf = (request: ElsRequest): string | undefined => {
     if (request.op === 'new' || request.op === 'close-workspace') return request.ws;
+    if (request.op === 'overlay') {
+      const ws = overlaysOf.get(core)?.workspaceOfRequest(request);
+      if (!ws) return undefined;
+      const listed = JSON.parse(core.list().message) as { workspaces?: Array<{ id: string; name: string }> };
+      return listed.workspaces?.find((w) => w.id === ws || w.name === ws)?.name ?? ws;
+    }
     if (request.op === 'child') return request.action === 'start' || request.action === 'tree' || request.action === 'summary'
       ? request.ws : request.id ? childTabsOf.get(core)?.workspaceOf(request.id) : undefined;
     if (request.op === 'record' && typeof request.pane === 'string') return core.workspaceOf(request.pane)?.name ?? recordingFor(core, request.pane)?.workspace;
@@ -1853,8 +2039,8 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
   const grantFor = (role: ServerRole, request: ElsRequest): boolean => {
     if (role.kind !== 'hand' && role.kind !== 'peer') return false;
     const granted = coordinatorGrantForSeat(core, stateRoot, role.seat, role.pane, request);
-    if (granted) {
-      try { appendFileSync(join(elsDir, 'control-audit.jsonl'), `${JSON.stringify({ ...granted.audit, principal: role.kind === 'peer' ? `local:${role.uid}(${role.seat})` : `els-pane:${role.pane}(${role.seat})` })}\n`, { mode: 0o600 }); }
+    if (granted && granted.audit.observe !== true) {   // COORD-RIGHTS: observing is not audited per poll (read-only)
+      try { appendAuditLine(join(elsDir, 'control-audit.jsonl'), `${JSON.stringify({ ...granted.audit, principal: role.kind === 'peer' ? `local:${role.uid}(${role.seat})` : `els-pane:${role.pane}(${role.seat})` })}\n`, { mode: 0o600 }); }
       catch { /* the door must not break on audit IO */ }
     }
     return !!granted;
@@ -1897,17 +2083,29 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
         // whether a person confirmed it (a coordinator close without a person is the routine path, still on record).
         if (verdict.allow && scope) {
           try {
-            appendFileSync(join(elsDir, 'control-audit.jsonl'), `${JSON.stringify(closeTabAuditLine(role, scope, request.confirmed === true, acting))}\n`, { mode: 0o600 });
+            appendAuditLine(join(elsDir, 'control-audit.jsonl'), `${JSON.stringify(closeTabAuditLine(role, scope, request.confirmed === true, acting))}\n`, { mode: 0o600 });
           } catch { /* the door must not break on audit IO */ }
+        }
+        // CLAUDE-OP-PROXY-IDENTITY — the proxy's server-set confirmation decided this close (an allowed, unowned, non-OP
+        // tab, no person's yes): one proxy audit row ⊕ OP notice. If that row cannot be written the close is refused.
+        if (verdict.allow && scope && (request as { proxyConfirmed?: boolean }).proxyConfirmed === true && request.confirmed !== true
+          && !scope.opTab && !scope.ownerSeats.some((seat) => seat)) {
+          try {
+            const grant = readProxyGrant(proxyStateRoot()).grant;
+            if (!grant) return { allow: false, reason: 'els: close-tab denied — the proxy grant changed during authorization' };
+            recordProxyAction({ op: 'els-close-unowned', target: scope.tabId, grantId: grant.grantId });
+          } catch { return { allow: false, reason: 'els: close-tab denied — proxy audit row could not be written' }; }
         }
         return verdict.allow && scope
           ? { allow: true, verifiedRequest: { op: 'close-tab', tab: scope.tabId, confirmed: true } }
           : verdict;
       }
+      // ELS-ELEMENT-HOST: a tab host pane acts (update · close · frame) on the ONE layer it draws, whatever its workspace.
+      if (request.op === 'overlay' && role.kind === 'hand' && hostPaneMayAct(loadJournal(journalPath).panes, role.pane, overlaysOf.get(core)?.stack(), request)) return { allow: true };
       return authorizeRequest(role, request, workspaceOf(request), loadRules(), undefined, acting, granted);
     },
     audit: (request, role, reason, pid, claimedPid) => {
-      try { appendFileSync(join(elsDir, 'control-audit.jsonl'), `${denialAuditLine(request, role, reason, pid, claimedPid)}\n`, { mode: 0o600 }); }
+      try { appendAuditLine(join(elsDir, 'control-audit.jsonl'), `${denialAuditLine(request, role, reason, pid, claimedPid)}\n`, { mode: 0o600 }); }
       catch { /* the door must not break on audit IO */ }
     },
     seatSet: (request) => paneRegistry.registerSeat(request.seat)
@@ -1941,7 +2139,7 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
   }
   chmodSync(toolSocketPath, 0o600);
   const batonDir = dirname(socketPath);
-  const batonLease = new BatonLease(event => appendFileSync(join(batonDir, 'baton-audit.jsonl'), `${JSON.stringify(event)}\n`, { mode: 0o600 }), options.now ?? Date.now);
+  const batonLease = new BatonLease(event => appendAuditLine(join(batonDir, 'baton-audit.jsonl'), `${JSON.stringify(event)}\n`, { mode: 0o600 }), options.now ?? Date.now);
   batonLeases.set(batonDir, batonLease);
   publishBatonSnapshot(batonDir, batonLease);
   const batonTimer = setInterval(() => { batonTick(batonDir, stateRoot, batonLease); try { publishBatonSnapshot(batonDir, batonLease); } catch { /* expiry already revoked */ } }, 1000);
@@ -2012,6 +2210,7 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
     ceoWiring?.stop();
     mailHub.stop(); // ELS-SERVER-EVENT-HUB-NO-DB-POLL — the watcher dies with its server; the badge state keeps its memory.
     mailBadgeState.dispose(); // JUD-B #132880 — frees the resync timer and the off-thread compute worker.
+    channelsOf.get(core)?.dispose(); // ELS-CHANNEL: pending waits answer «timeout» instead of hanging on a dead server.
     // D1a must-1(JUD-B #107693): attach 연결을 stopAll() «앞에» 서버 떠남으로 끝낸다 — 이 뒤 pane 들은 홀더에서 살아
     // 있고 새 서버가 입양한다. 이 경로에서 «pane exited» 를 보내면 클라가 자식이 죽은 줄로 뷰를 끊는다.
     attachState.stopping = true;
@@ -2068,6 +2267,8 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
     return refused;
   }
   core.reapExited();
+  // ELS-ELEMENT-HOST-FU ②: an element's tab comes back as that element — a host pane that lost its PTY is drawn again.
+  try { tabHosts.restore(overlaysOf.get(core)?.stack().layers ?? []); } catch { /* the layers stay; frame switch still works */ }
   // ELS-ORPHAN-SERVE-REAP (OP #131393③ · 골 #132048③): a stateRoot can keep holder residue nobody owns —
   // a SIGKILL'd holder never runs its cleanup, and a SIGKILL'd serve leaves live detached holders no server
   // will ever adopt (reattach only ever looks at journal panes). Now that the journal load has judged the

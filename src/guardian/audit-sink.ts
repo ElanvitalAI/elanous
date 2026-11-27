@@ -12,7 +12,7 @@
 // Fire-and-forget: failures are swallowed so no dispatch path blocks
 // on disk IO. Matches control-audit-log's contract.
 
-import { appendFileSync, mkdirSync, existsSync } from 'node:fs';
+import { appendAuditSafe } from '../kit/audit-ledger/index.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { join } from 'node:path';
 
@@ -66,11 +66,7 @@ export function appendGuardianAudit(ev: GuardianAuditEvent): void {
     try { testSink(ev); } catch { /* swallow */ }
     return;
   }
-  try {
-    const root = defaultRoot();
-    if (!existsSync(root)) mkdirSync(root, { recursive: true });
-    appendFileSync(todayFile(), JSON.stringify(ev) + '\n');
-  } catch {
-    // Audit failure never escapes — dispatch must not block on disk.
-  }
+  // kit/audit-ledger: fsync · rotation · schema tag; the safe writer logs `kit.audit-ledger write-failed` and never throws —
+  // dispatch must not block on disk.
+  try { appendAuditSafe(todayFile(), 'guardian.verdict/1', { ...ev }); } catch { /* defaultRoot() migration failure — swallow */ }
 }

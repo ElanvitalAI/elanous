@@ -8,3 +8,4 @@ scenarios:
   - { id: OP-C1, module: src/ux-sim/sim-world/op-channel/scenarios.ts }
   - { id: OP-C2, module: src/ux-sim/sim-world/op-channel/scenarios.ts }
   - { id: OP-C3, module: src/ux-sim/sim-world/op-channel/scenarios.ts }
+  - { id: OP-SEAT-MODEL, module: src/ux-sim/sim-world/op-channel/seat-model.ts }

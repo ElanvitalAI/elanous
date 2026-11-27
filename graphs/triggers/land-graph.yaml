@@ -1,7 +1,7 @@
 graph_id: land-graph
 version: 1
 loop:
-  title: Land graph — judge → land (judge-kingdom autonomy)
+  title: 착지 집사 (land-steward) — land graph body · train manager · finisher · cell link · KPI · voice
   root: 판정국
   managed_by: trigger-registry
   description: >-
@@ -10,10 +10,14 @@ loop:
     lands up to land.graph.slots through op-direct-land-v2.sh (ratchet · tsc · isolation on the merge result) with a
     post-notice to OP and a COACH-ACTIONS row. Refusals → one typed card to the author with the exact fix.
     Shadow (config land.graph.mode ≠ live) records would-land / would-refuse only. Done-when = last-tick.json rewritten.
+    LAND-STEWARD (loop agent v2 · graphs/loop-agents/land-steward): the tick runs `eln land steward tick` — the same body with
+    the train manager's order and the steward as terminal owner of refusals (no land mail to TC/OP except security-4), KPI
+    (lands/h ≥ 10 · landable ≥ 50% · finisher wait p50 ≤ 30 m · refusals without next action 0) and one channel line per
+    breach (loop:land-steward). Level: eln land steward level shadow|off → the plain body.
   owner: TC # org duty «landing» (landingOwner) — veto stays JUD
   trigger:
     condition:
-      predicate: { kind: state-changed, parts: [{ file: '{seatState}/RES/evidence/PREGATE-GREEN' }] }
+      predicate: { kind: state-changed, parts: [{ file: '{seatState}/RES/evidence/PREGATE-GREEN' }, { file: '{seatState}/RES/evidence/PREGATE-RED' }] }
       cooldown_min: 2
       max_wait_min: 10
       on_max_wait: fire
@@ -33,7 +37,7 @@ terminal_nodes: [done, failed]
 nodes:
   - node_id: tick
     kind: agent
-    recipe: 'cmd:land-graph-tick'
+    recipe: 'cmd:land-steward-tick'
     max_visits: 1
   - { node_id: done, kind: gate, max_visits: 1 }
   - { node_id: failed, kind: gate, max_visits: 1 }

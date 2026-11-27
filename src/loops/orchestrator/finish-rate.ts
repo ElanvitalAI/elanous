@@ -1,7 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { debug } from '../../debug/log.js';
+import { resolveDevRepoRoot } from '../throughput-controller-live.js';
 import { loadRunLedger, resolveFederatedRunLedgerTargets } from '../../self-implement/run-ledger.js';
 import { withFileLockSync } from '../../storage/file-lock.js';
 import type { LogTarget } from '../../cli/logs-cli.js';
@@ -107,6 +108,8 @@ export interface MeasureFinishDeps {
   listStarts?: (cutoff: number) => StartObservation;
   ledgerTargets?: readonly LogTarget[];
   runGh?: (args: string[]) => string;
+  /** Development-repo resolver. Default is resolveDevRepoRoot (ELANOUS_REPO → config repo.path → code root → ~/elanous-hq/repo.git). */
+  resolveRepo?: () => string | null;
 }
 
 function defaultListStarts(cutoff: number, targets?: readonly LogTarget[]): StartObservation {
@@ -186,8 +189,10 @@ function defaultListStarts(cutoff: number, targets?: readonly LogTarget[]): Star
   return { starts: [...starts.values()], unreadable: [...unreadable.values()], unreadableDirectories, incomplete: [...incomplete.values()] };
 }
 
-function defaultRunGh(args: string[]): string {
-  return execFileSync('gh', args, { cwd: resolve(import.meta.dir, '../../..'), encoding: 'utf8', timeout: 60_000, maxBuffer: 20 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+const REPO_UNAVAILABLE = 'repo unavailable';
+
+function defaultRunGh(args: string[], cwd: string): string {
+  return execFileSync('gh', args, { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 20 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
 function readPrs(runGh: (args: string[]) => string, args: string[]): Pr[] {
@@ -210,7 +215,25 @@ export function measureFinish(deps: MeasureFinishDeps = {}, now: Date = new Date
   let staleDrafts: number | null = null;
   let conflictRatio: number | null = null;
   let unknownMergeable: number | null = null;
-  const gh = deps.runGh ?? defaultRunGh;
+  let gh: (args: string[]) => string = deps.runGh ?? (() => { throw new Error(REPO_UNAVAILABLE); });
+  let repoUnavailable = false;
+  if (!deps.runGh) {
+    let repo: string | null = null;
+    let repoError: string | null = null;
+    try { repo = (deps.resolveRepo ?? resolveDevRepoRoot)(); }
+    catch (error) { repoError = reason(error); }
+    if (!repo) {
+      repoUnavailable = true;
+      const why = repoError ?? REPO_UNAVAILABLE;
+      reasons.landed = why;
+      reasons.staleDrafts = why;
+      reasons.conflictRatio = why;
+      reasons.unknownMergeable = why;
+    } else {
+      const cwd = repo;
+      gh = (args) => defaultRunGh(args, cwd);
+    }
+  }
   try {
     const observation = deps.listStarts ? deps.listStarts(cutoff) : defaultListStarts(cutoff, deps.ledgerTargets);
     if (!observation || !Array.isArray(observation.starts) || !Array.isArray(observation.unreadable)
@@ -234,20 +257,20 @@ export function measureFinish(deps: MeasureFinishDeps = {}, now: Date = new Date
       reasons.launched = [reasons.launched, `원장 폴더 ${observation.unreadableDirectories}개 못 읽음(하한값)`].filter(Boolean).join(' · ');
     }
   } catch (error) { reasons.launched = reason(error); }
-  try {
+  if (!repoUnavailable) try {
     const prs = readPrs(gh, ['--state', 'merged', '--search', `merged:>=${new Date(cutoff).toISOString().replace(/\.\d{3}Z$/, 'Z')}`, '--json', 'number,headRefName,mergedAt']);
     if (prs.some(pr => typeof pr.mergedAt !== 'string' || !Number.isFinite(Date.parse(pr.mergedAt)))) throw new Error('invalid merged PR timestamp');
     landed = new Set(prs.filter(pr => pr.headRefName.startsWith('self-impl/') && Date.parse(pr.mergedAt!) >= cutoff
       && Date.parse(pr.mergedAt!) <= now.getTime()).map(pr => pr.number)).size;
   } catch (error) { reasons.landed = reason(error); }
-  try {
+  if (!repoUnavailable) try {
     const drafts = readPrs(gh, ['--state', 'open', '--draft', '--json', 'number,headRefName,createdAt,mergeable,labels']);
     if (drafts.some(pr => typeof pr.createdAt !== 'string' || !Number.isFinite(Date.parse(pr.createdAt)) || !Array.isArray(pr.labels)
       || pr.labels.some(label => !label || typeof label.name !== 'string'))) throw new Error('invalid draft observation');
     staleDrafts = drafts.filter(pr => pr.headRefName.startsWith('self-impl/') && Date.parse(pr.createdAt!) < cutoff
       && !pr.labels!.some(label => label.name === 'elanous:superseded')).length;
   } catch (error) { reasons.staleDrafts = reason(error); }
-  try {
+  if (!repoUnavailable) try {
     const prs = readPrs(gh, ['--state', 'open', '--json', 'number,headRefName,mergeable']);
     const harness = prs.filter(pr => pr.headRefName.startsWith('self-impl/'));
     if (harness.some(pr => !['CONFLICTING', 'MERGEABLE', 'UNKNOWN'].includes(pr.mergeable ?? ''))) throw new Error('invalid mergeability observation');
@@ -264,6 +287,7 @@ export function measureFinish(deps: MeasureFinishDeps = {}, now: Date = new Date
     : 'no harness runs launched in the last 24 hours';
   else if (landed > launched) reasons.landingRate = `landed exceeds launched — population mismatch (launched=${launched}, landed=${landed})`;
   else landingRate = landed / launched;
+  if (repoUnavailable && launched !== null && reasons.landed === REPO_UNAVAILABLE) reasons.landingRate = REPO_UNAVAILABLE;
   return { launched, ...(launchedUnreadable > 0 ? { launchedUnreadable } : {}), ...(launchedIncomplete > 0 ? { launchedIncomplete } : {}), landed, landingRate, staleDrafts, conflictRatio, unknownMergeable, reasons };
 }
 

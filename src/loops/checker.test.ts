@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
 import { checkLoops, daemonScheduleEntries, dueBefore, entriesFromRegistry, launcherEvidence, notifyOwners, observeLoopCheck, previousLoopFire, scheduleFindings, versionEvidence, extendHealthyLauncher } from './checker.js';
-import { emitLoopHeartbeat } from './neighbor-runtime.js';
+import { emitSignal as emitLoopHeartbeat } from '../kit/heartbeat/index.js';
 import { registerLoopCommands } from './loop-cli.js';
 import { listAllLoops, listLoops, type LoopEntry } from './registry.js';
 

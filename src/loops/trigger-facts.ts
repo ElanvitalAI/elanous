@@ -25,7 +25,7 @@ interface RunState {
 export const ACTIVE_TAIL_MIN = 6 * 60;
 
 /** The release the facts describe: the earliest non-rehearsal run whose publishAt + tail is still ahead. */
-export function activeRelease(stateRoot: string, now: Date): { version: string; state: RunState } | null {
+export function activeRelease(stateRoot: string, now: Date, graphVersion?: string | null): { version: string; state: RunState } | null {
   const dir = join(stateRoot, 'release-graph');
   if (!existsSync(dir)) return null;
   const runs = readdirSync(dir).filter(v => /^\d+\.\d+\.\d+$/.test(v))
@@ -33,8 +33,15 @@ export function activeRelease(stateRoot: string, now: Date): { version: string; 
     .filter((r): r is { version: string; state: RunState } => !!r.state?.clock?.cutAt && !!r.state.clock.publishAt && r.state.kind !== 'rehearsal')
     .filter(r => Date.parse(r.state.clock!.publishAt!) + ACTIVE_TAIL_MIN * 60_000 > now.getTime())
     .sort((a, b) => Date.parse(a.state.clock!.cutAt!) - Date.parse(b.state.clock!.cutAt!));
-  return runs[0] ?? null;
+  // kit/release-target (DUPLICATION-MAP §1-11 · the 0.3.37-vs-0.3.38 night): the release in play is release.graph.version
+  // (ops-dashboard/current-version.ts — the canonical resolver) when that run is here and active; «earliest run» is only the
+  // fallback when the graph target is unset or has no active run.
+  const target = graphVersion === undefined ? readGraphTarget() : graphVersion;
+  return (target ? runs.find(r => r.version === target) : undefined) ?? runs[0] ?? null;
 }
+const readGraphTarget = (): string | null => {
+  try { return (require('../ops-dashboard/current-version.js') as typeof import('../ops-dashboard/current-version.js')).readReleaseGraphVersion() ?? null; } catch { return null; }
+};
 
 function rehearsalState(dir: string, version: string, scheduledAt?: string): string {
   const st = readJson(join(dir, `${version}-rehearsal`, 'state.json')) as RunState | undefined;

@@ -9,6 +9,7 @@ import { gateRemoteHostCap, realGateRemoteRunner, resolveGateRemoteSettings, run
 import { decideWarmReuse, type WarmReuseEvidenceByConsumer, type WarmReuseSwitchConfig } from '../task-orchestrator/surfaces/pod-warm-switch.js';
 import { buildLandWarmEvidence, type LandShadowSampleWindow } from './pr-land-pod-shadow-job.js';
 import { readWarmReuseEvidence, warmReuseEvidencePath, type WarmReuseEvidenceRow } from '../task-orchestrator/surfaces/warm-reuse-evidence.js';
+import { filterRoutable } from '../kit/resource-facts/index.js';
 
 const SHA = /^[0-9a-f]{40}$/i;
 // This is the stable fallback order when settings.host is unavailable; an explicitly configured allowlisted host
@@ -310,7 +311,10 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
   const deadline = started + settings.slotWaitSeconds * 1000;
   let outcome: RemoteRunOutcome = { kind: 'busy' };
   let selectedHost: PrLandHeavyHost = PR_LAND_HEAVY_HOSTS[0];
-  const hosts: readonly PrLandHeavyHost[] = [settings.host, ...PR_LAND_HEAVY_HOSTS.filter((host) => host !== settings.host)];
+  const ordered: readonly PrLandHeavyHost[] = [settings.host, ...PR_LAND_HEAVY_HOSTS.filter((host) => host !== settings.host)];
+  // RESOURCE-FACTS-FROM-LEDGER: a host the world registry rules out (unhealthy · reserved · off) is skipped without a code change.
+  const routable = filterRoutable(ordered, 'full-gate') as PrLandHeavyHost[];
+  const hosts: readonly PrLandHeavyHost[] = routable.length ? routable : ordered;
   wait: for (;;) {
     for (const host of hosts) {
       selectedHost = host;

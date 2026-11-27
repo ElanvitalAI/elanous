@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "entries": {
+    "supervisors/LA-B1": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40388 (max-wait fire keeps the state key)",
+      "reason": "quiet world: the butler ticks on register, then once per 10-min max-wait — [1,11,21,31]; a max-wait fire on an unchanged met state keeps the state key (trigger-registry.ts conditionStep)"
+    },
+    "supervisors/LA-B2": {
+      "expect": "green",
+      "reason": "trigger goal file-mtime last-tick.json · deadline 30 min · 2 attempts → exception card to OP · stale (>15 min) / dead-pid tick.lock taken over · tick.lock refuses an overlapping live tick"
+    },
+    "supervisors/LA-D1": {
+      "expect": "green",
+      "reason": "SIGNAL-DIET-OP-DIGEST #40356 · machine mail parked · one SIGNAL-DIGEST row at +31 min · 🚨 and human mail direct"
+    },
+    "supervisors/LA-D2": {
+      "expect": "red",
+      "redReason": "due digest waits for the next OP-bound write",
+      "reason": "edge found 11-27 sim: flushOpDigestIfDue runs only inside an OP-bound write (msg-store.ts) — no reader/timer flush, a quiet half hour keeps a decision item parked"
+    },
+    "supervisors/LA-R1": {
+      "expect": "green",
+      "reason": "DORMANT-ADDRESS REROUTE #40356 via real msg post CLI · RES → GUARDIAN postoffice (rerouted-from:RES) · REVIEW-2 → JUD · REL 🚨 → OP inbox at once"
+    },
+    "supervisors/LA-R2": {
+      "expect": "green",
+      "reason": "fixed: msg-cli.ts / ops-ledger.ts pass the wake-resolver live probe (liveByWake) — a revived RES tab gets its mail directly again"
+    },
+    "supervisors/LA-R3": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40389 (never back to the sender · live bug #191271)",
+      "reason": "OP → dormant RES lands at GUARDIAN (not OP) · GUARDIAN → RES goes to the OP digest · OP → REL stays at REL; no row has sender = recipient"
+    }
+  }
+}

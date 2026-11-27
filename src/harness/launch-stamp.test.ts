@@ -85,10 +85,12 @@ describe('launch stamp', () => {
     expect(table.unknown).toBe(1);
     expect(table.outsideQueue).toBe(2);
     expect(table.viaQueue).toBe(1);
+    expect(table.excluded).toEqual({ graphRun: 0, seatTurn: 0 });
     expect(table.rows.reduce((sum, row) => sum + row.runs, 0)).toBe(table.runs);
     const rendered = renderLaunchDoors(table);
     expect(rendered).toContain('unknown');
     expect(rendered).toContain('queue-tick');
+    expect(rendered.split('\n')[1]).toBe('excluded graph-run=0 seat-turn=0');
     expect(rendered).toContain('total               3');
   });
 
@@ -144,3 +146,121 @@ describe('run-origin first row', () => {
   });
 });
 
+describe('DOORS-NON-HARNESS-EXCLUDE', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  test('혼합 원장에서 graph-run과 seat-turn만 제외하고 스탬프 하니스는 유지한다', () => {
+    const dir = ledgerDir();
+    write(dir, 'graph-run-1', 'start', { graphId: 'natural-language-research', node: 'research' }, INSIDE);
+    write(dir, 'graph-run-2', 'start', { graphId: 'landing-train' }, INSIDE);
+    write(dir, 'seat-turn-1', 'child-first-llm-call', { status: 'started', at: INSIDE }, INSIDE);
+    write(dir, 'harness-run-1', 'run-origin', { launch: { entrance: 'self-implement', actor: 'OP', viaQueue: false } }, INSIDE);
+    const table = queryLaunchDoors({ dir, now: NOW, sinceMs: DAY });
+    expect(table.runs).toBe(1);
+    expect(table.unknown).toBe(0);
+    expect(table.outsideQueue).toBe(1);
+    expect(table.viaQueue).toBe(0);
+    expect(table.excluded).toEqual({ graphRun: 2, seatTurn: 1 });
+    expect(table.rows.map((row) => row.entrance)).toEqual(['self-implement']);
+    const rendered = renderLaunchDoors(table);
+    expect(rendered.split('\n')[1]).toBe('excluded graph-run=2 seat-turn=1');
+    expect(rendered).toContain('total               1');
+  });
+
+  test('첫 줄에 data.launch가 있으면 graphId가 함께 있어도 하니스 런으로 센다', () => {
+    const dir = ledgerDir();
+    write(dir, 'launch-with-graph', 'run-origin', {
+      launch: { entrance: 'dev-ask', actor: 'MK', viaQueue: false },
+      graphId: 'natural-language-research',
+    }, INSIDE);
+    const table = queryLaunchDoors({ dir, now: NOW, sinceMs: DAY });
+    expect(table.runs).toBe(1);
+    expect(table.unknown).toBe(0);
+    expect(table.excluded).toEqual({ graphRun: 0, seatTurn: 0 });
+    expect(table.rows.map((row) => row.entrance)).toEqual(['dev-ask']);
+  });
+
+  test('launch: "legacy" 문자열과 graphId가 함께 있어도 하니스 런으로 센다', () => {
+    const dir = ledgerDir();
+    write(dir, 'launch-legacy-string', 'run-origin', { launch: 'legacy', graphId: 'natural-language-research' }, INSIDE);
+    const table = queryLaunchDoors({ dir, now: NOW, sinceMs: DAY });
+    expect(table.runs).toBe(1);
+    expect(table.unknown).toBe(1);
+    expect(table.excluded).toEqual({ graphRun: 0, seatTurn: 0 });
+    expect(table.rows.map((row) => row.entrance)).toEqual(['unknown']);
+  });
+
+  test('launch: null 값도 속성이 있으면 graphId보다 우선해 하니스 런으로 센다', () => {
+    const dir = ledgerDir();
+    write(dir, 'launch-null-with-graph', 'run-origin', { launch: null, graphId: 'natural-language-research' }, INSIDE);
+    const table = queryLaunchDoors({ dir, now: NOW, sinceMs: DAY });
+    expect(table.runs).toBe(1);
+    expect(table.unknown).toBe(1);
+    expect(table.excluded).toEqual({ graphRun: 0, seatTurn: 0 });
+    expect(table.rows.map((row) => row.entrance)).toEqual(['unknown']);
+  });
+
+  test('launch: null 값이 child-first 이벤트와 함께 있어도 하니스 런으로 센다', () => {
+    const dir = ledgerDir();
+    write(dir, 'launch-null-with-child-first', 'child-first-llm-call', { launch: null, status: 'started' }, INSIDE);
+    const table = queryLaunchDoors({ dir, now: NOW, sinceMs: DAY });
+    expect(table.runs).toBe(1);
+    expect(table.unknown).toBe(1);
+    expect(table.excluded).toEqual({ graphRun: 0, seatTurn: 0 });
+    expect(table.rows.map((row) => row.entrance)).toEqual(['unknown']);
+  });
+
+  test('첫 줄에 data.launch가 있으면 child-first 이벤트와 함께 있어도 하니스 런으로 센다', () => {
+    const dir = ledgerDir();
+    write(dir, 'launch-with-child-first', 'child-first-llm-call', {
+      launch: { entrance: 'harness-say', actor: 'OP', viaQueue: false },
+      status: 'started',
+    }, INSIDE);
+    const table = queryLaunchDoors({ dir, now: NOW, sinceMs: DAY });
+    expect(table.runs).toBe(1);
+    expect(table.excluded).toEqual({ graphRun: 0, seatTurn: 0 });
+    expect(table.rows.map((row) => row.entrance)).toEqual(['harness-say']);
+  });
+
+  test('graphId: null 값도 속성이 있으면 graph-run으로 제외한다', () => {
+    const dir = ledgerDir();
+    write(dir, 'graph-id-null', 'start', { graphId: null }, INSIDE);
+    const table = queryLaunchDoors({ dir, now: NOW, sinceMs: DAY });
+    expect(table.runs).toBe(0);
+    expect(table.unknown).toBe(0);
+    expect(table.excluded).toEqual({ graphRun: 1, seatTurn: 0 });
+    expect(table.rows).toEqual([]);
+  });
+
+  test('graphId: null이 child-first 이벤트와 함께 있어도 graph-run으로 제외한다', () => {
+    const dir = ledgerDir();
+    write(dir, 'graph-id-null-child-first', 'child-first-llm-call', { graphId: null, status: 'started' }, INSIDE);
+    const table = queryLaunchDoors({ dir, now: NOW, sinceMs: DAY });
+    expect(table.runs).toBe(0);
+    expect(table.excluded).toEqual({ graphRun: 1, seatTurn: 0 });
+    expect(renderLaunchDoors(table).split('\n')[1]).toBe('excluded graph-run=1 seat-turn=0');
+  });
+
+  test('창 밖 graph-run 원장은 하니스 집계와 제외 집계 어디에도 들어가지 않는다', () => {
+    const dir = ledgerDir();
+    write(dir, 'graph-run-stale', 'start', { graphId: 'natural-language-research' }, '2026-10-01T00:00:00.000Z');
+    const table = queryLaunchDoors({ dir, now: NOW, sinceMs: DAY });
+    expect(table.runs).toBe(0);
+    expect(table.excluded).toEqual({ graphRun: 0, seatTurn: 0 });
+    expect(renderLaunchDoors(table)).toContain('(no runs)');
+  });
+
+  test('real harness ledger order: authoring rows (graph.unit self-implement · child-first) before run-origin still count as the stamped harness run', () => {
+    const dir = ledgerDir();
+    // 11-27 node-c run-3c6a0c36: rows 1-9 = graph.unit {graphId:"self-implement"} and child-first-llm-call, row 10 = run-origin with the stamp.
+    write(dir, 'run-harness-real', 'graph.unit', { graphId: 'self-implement', nodeId: 'author', phase: 'enter' }, INSIDE);
+    write(dir, 'run-harness-real', 'child-first-llm-call', { status: 'started' }, INSIDE);
+    write(dir, 'run-harness-real', 'run-origin', { hostId: 'h', launch: { entrance: 'harness-ask', actor: 'OP', viaQueue: false } }, INSIDE);
+    write(dir, 'graph-run-real', 'start', { graphId: 'natural-language-research' }, INSIDE);
+    const table = queryLaunchDoors({ dir, now: NOW, sinceMs: 24 * 60 * 60 * 1000 });
+    expect(table.runs).toBe(1);
+    expect(table.unknown).toBe(0);
+    expect(table.excluded).toEqual({ graphRun: 1, seatTurn: 0 });
+    expect(table.rows.map((row) => row.entrance)).toEqual(['harness-ask']);
+  });
+});

@@ -4,16 +4,16 @@ import { AgentSpawnGuard, guardedAgentSpawn, isVerificationSpawn, wordJaccard } 
 import { agentSpendLabel, safeAgentSpend, toolActivityLines, toolActivityTarget, updateToolActivity, type ToolActivityRow } from '../../tui/chat/tool-activity.js';
 
 // A fake task ledger: background agents stay "running" until the test finishes them.
-function harness() {
+function harness(seat = 'TC-H-CX-1') {
   let clock = 1_000_000;
   const tasks = new Map<string, { state: string; finishedAt?: number }>();
-  const guard = new AgentSpawnGuard({ now: () => clock, taskState: id => tasks.get(id) });
+  const guard = new AgentSpawnGuard({ now: () => clock, taskState: id => tasks.get(id), isCoordinator: s => s === 'OP' || s === 'TC' });
   let n = 0;
   const spawn = (args: Record<string, unknown>) => guardedAgentSpawn(args, async () => {
     const taskId = `t${++n}`;
     tasks.set(taskId, { state: 'running' });
     return { taskId, background: true };
-  }, guard, 'OP');
+  }, guard, seat);
   const finish = (taskId: string) => tasks.set(taskId, { state: 'done', finishedAt: clock });
   const advance = (ms: number) => { clock += ms; };
   return { guard, spawn, finish, advance };
@@ -38,6 +38,18 @@ describe('agent spawn guard rules', () => {
     h.finish('t1');
     await expect(h.spawn({ description: 'delta survey', prompt: 'survey delta config files', reason: 'large output' }))
       .resolves.toMatchObject({ taskId: 't4', background: true });
+  });
+
+  test('COORD-RIGHTS: a coordinator seat (OP · TC) runs 8 long-lane agents; the 9th is refused', async () => {
+    for (const seat of ['OP', 'TC']) {
+      const h = harness(seat);
+      const topics = ['alpha module', 'beta pipeline', 'gamma release', 'delta config', 'epsilon ledger', 'zeta roster', 'eta router', 'theta mail'];
+      for (const [i, t] of topics.entries()) {
+        await expect(h.spawn({ description: `${t} survey`, prompt: `survey ${t} ${i} files`, reason: 'parallel' })).resolves.toMatchObject({ background: true });
+      }
+      await expect(h.spawn({ description: 'iota survey', prompt: 'survey iota widgets', reason: 'parallel' }))
+        .rejects.toThrow(`NOT SPAWNED — 8 agents are already running for this seat (limit 8): ${topics.map(t => `${t} survey`).join(', ')}.`);
+    }
   });
 
   test('same normalized name is a duplicate until its result is consumed', async () => {

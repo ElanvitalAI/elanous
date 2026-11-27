@@ -1,0 +1,33 @@
+graph_id: world-sweep
+version: 1
+loop:
+  title: 수호자 · 세계 원장 스윕 (WORLD-REGISTRY) — every actor on every host into the lease ledger
+  root: 수호자
+  managed_by: trigger-registry
+  description: >-
+    The guardian's world-ledger sub-agent (FEDERATION-ORG-SYSTEM-1127 v2 · GUARDIAN-CHARTER-1127 §4.2). Every 15 min, LLM 0:
+    probe each registered host (launchctl ⊕ LaunchAgents plists/log mtime ⊕ crontab ⊕ elanous processes, over ssh) and fold
+    the loop registry · watch beats · els panes · host-registry into the lease ledger as world-actor / world-sweep lines
+    (deltas only). Running-but-unregistered = unregistered · registered-but-silent past SLA = zombie (`eln world anomalies`).
+    It beats `eln watch beat world-sweep` itself. Writes as loop:guardian. Demote/kill with the guardian: eln loop demote.
+  owner: OP # failure cards → OP (RES has no pane); the ledger's write owner is loop:guardian, L0 RES
+  trigger:
+    cron: '7,22,37,52 * * * *'
+  goal:
+    kind: file-mtime
+    path: '{stateRoot}/loop-agents/guardian/world-sweep.json'
+  failure:
+    goal_deadline_min: 12
+    max_attempts: 2
+    backoff_sec: [120]
+entry_node: sweep
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: sweep
+    kind: agent
+    recipe: 'cmd:world-sweep-tick'
+    max_visits: 1
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: sweep, on: outcome, map: { ok: done, fail: failed, error: failed } }

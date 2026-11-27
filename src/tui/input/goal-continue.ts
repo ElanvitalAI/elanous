@@ -265,6 +265,8 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
   // Only newly completed steps on the same plan are evidence of progress. Version bumps,
   // changed wording, and completing the same step twice cannot buy another budget.
   let planIdentity: string | undefined;
+  /** The open steps of the last continued plan — named in the plan-limit ✋ so its leader sees what is left. */
+  let lastOpenSteps: string[] = [];
   const completedPlanSteps = new Set<number>();
   let planNudged = false;
   const planLimit = deps.planContinueLimit ?? DEFAULT_PLAN_CONTINUE_LIMIT;
@@ -323,7 +325,11 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
         armed = null;
         log('tui', 'turn.auto-continue', { rejected: true, reason: 'plan-limit', n: planConsecutive, limit: planLimit });
         deps.notify?.(`⏸ Plan still has open steps after ${planConsecutive} automatic continues — a person is needed · any key resumes`);
-        blockedFor('HUMAN_DECISION', 'plan-limit');
+        // HAND-RAISE-DOMAIN-ROUTING (live 11-27 23:0x): structured cause `plan-limit` — the auto-continue cap, not an LLM quota.
+        // The 행정관 resumes it (kit/mail-route/hand-routes.yaml autoContinueCap); the line names the open steps for the leader.
+        const open = lastOpenSteps.slice(0, 4).map((step) => step.replace(/\s+/gu, ' ').slice(0, 60));
+        blockedFor('HUMAN_DECISION', 'plan-limit',
+          `plan-limit · auto-continue cap ${planConsecutive}/${planLimit} (not an LLM quota)${open.length ? ` · open steps: ${open.join(' | ')}${lastOpenSteps.length > 4 ? ` +${lastOpenSteps.length - 4}` : ''}` : ''}`, 'plan-limit');
         return { opened: false, reason: 'plan-limit' };
       }
       const planResult = deps.startTurnIfIdle(mode === 'plan' ? PLAN_CONTINUE_PROMPT : PLAN_NUDGE_PROMPT,
@@ -472,6 +478,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
         if (planOutcome.kind !== 'blocked') unblocked();
         if (planOutcome.kind === 'continue') {
           const steps = end.plan!.steps;
+          lastOpenSteps = steps.filter((step) => step.status !== 'completed').map((step) => step.step);
           const identity = JSON.stringify(steps.map((step) => step.step));
           if (planIdentity === undefined) {
             planIdentity = identity;

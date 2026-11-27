@@ -33,7 +33,10 @@ test('three consecutive budgeted empty dispatch cycles notify OP and seat with c
     const sent = runHoldHygiene(f.deps);
     expect(sent.map(row => row.to)).toEqual(['OP', 'TC']);
     expect(messages(f.deps.root, 'TC')[0]?.body).toContain('잠금 ×2 · 경로 없음 ×2');
-    expect(messages(f.deps.root, 'OP')).toHaveLength(1);
+    // SIGNAL-DIET-OP-DIGEST — the ORCHESTRATOR copy to OP waits for the 30-min machine digest (parked, not an inbox row).
+    expect(messages(f.deps.root, 'OP')).toHaveLength(0);
+    const store = openMsgStore(join(f.deps.root, 'msg', 'messages.db'));
+    try { expect(store.pendingOpDigest()).toHaveLength(1); } finally { store.close(); }
     expect(runHoldHygiene(f.deps)).toEqual([]);
     expect(runHoldHygiene({ ...f.deps, now: new Date(f.deps.now.getTime() + 30 * 60_000) })).toHaveLength(2);
   } finally { f.close(); }

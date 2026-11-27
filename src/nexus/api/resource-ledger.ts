@@ -2,6 +2,8 @@ import { buildResourceLedgerSnapshot, defaultResourceHosts, defaultResourceRun }
 import { activeResourcePools, declareResourcePool, latestWarmPoolPodReceipts, readResourceLedger, readResourceLedgerWithObservations, recordHostReadinessHeartbeat, replaceResourcePool, resourcePoolsForMachine, type HostReadinessHeartbeat } from '../../resource-ledger/resource-ledger.js';
 import { redactSecretText } from '../../debug/log.js';
 import { jsonResponse } from './json-response.js';
+import { foldWorld } from '../../resource-ledger/world-registry.js';
+import { worldApiBody } from '../../resource-ledger/world-summary.js';
 
 export type ResourceLedgerSnapshot = ReturnType<typeof buildResourceLedgerSnapshot>;
 let snapshotOverride: (() => ResourceLedgerSnapshot) | null = null;
@@ -87,4 +89,20 @@ export async function handleResourceLedgerHostReadinessPost(req: Request, machin
   } catch {
     return jsonResponse({ error: 'invalid-heartbeat' }, 400);
   }
+}
+
+/** WORLD-REGISTRY read view for coordinators (operator-gated under /v1/ops): every actor folded from the lease ledger.
+ *  `?view=summary|anomalies|actors` (default actors) · filters `kind` · `state` · `owner` · `host`. Read-only — writes go
+ *  through `eln world register|update` (owners) and the guardian's sweep. */
+export function handleWorldApi(url: URL, now: Date = new Date(), events: () => ReturnType<typeof readResourceLedger> = readResourceLedger): Response {
+  const v = url.searchParams.get('view');
+  if (v !== null && v !== 'summary' && v !== 'anomalies' && v !== 'actors') return jsonResponse({ error: 'invalid-view' }, 400);
+  try {
+    const body = worldApiBody(foldWorld(events(), now), now, { view: (v ?? 'actors') as 'summary' | 'anomalies' | 'actors',
+      kind: url.searchParams.get('kind'), state: url.searchParams.get('state'), owner: url.searchParams.get('owner'), host: url.searchParams.get('host') });
+    // Coordinators read this over the network: secrets never leave, even if a crontab line carried one.
+    const safe = body.actors ? { ...body, actors: body.actors.map(a => ({ ...a, purpose: a.purpose === null ? null : redactSecretText(a.purpose),
+      meta: JSON.parse(redactSecretText(JSON.stringify(a.meta))) as Record<string, unknown> })) } : body;
+    const response = jsonResponse(safe); response.headers.set('cache-control', 'no-store'); return response;
+  } catch { return jsonResponse({ error: 'resource-ledger-unavailable' }, 503); }
 }

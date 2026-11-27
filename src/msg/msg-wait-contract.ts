@@ -78,7 +78,7 @@ export function isHandMail(m: Classifiable): boolean {
 export function isAnswerExpectedMail(m: Classifiable): boolean {
   if (isHandMail(m)) return false;
   const kind = (m.kind ?? '').toLowerCase();
-  return kind === 'question' || kind === 'ask' || kind === 'decision' || m.intent === 'decision';
+  return kind === 'question' || kind === 'ask' || kind === 'decision' || kind === 'consult' || m.intent === 'decision';
 }
 
 export function waitUntilOf(m: { readonly refs?: readonly string[] | null }): number | null {

@@ -14,7 +14,7 @@ export type ReviewEngineFamily = string;
 /** The responder did not report a model, or its report names no family (e.g. claude ACP `default`). */
 export const RESPONDED_ENGINE_UNMEASURED = 'unmeasured' as const;
 
-export type ReviewInvalidReason = 'responded-model-mismatch' | 'responded-model-unknown';
+export type ReviewInvalidReason = 'responded-model-mismatch' | 'responded-model-unknown' | 'glm-review-forbidden';
 
 // Synonyms only — a token missing here is NOT dropped; it is compared as its own family.
 const FAMILY_ALIASES: Readonly<Record<string, string>> = {
@@ -78,10 +78,11 @@ export function assessReviewEngineValidity(input: ReviewEngineValidityInput): Re
   const respondedEngine = reported ?? RESPONDED_ENGINE_UNMEASURED;
   const engines = { ...(requestedEngine ? { requestedEngine } : {}), respondedEngine };
   if (input.landingGateState === 'mismatch') return { invalid: true, invalidReason: 'responded-model-mismatch', ...engines };
-  if (!input.requested) return { invalid: false, ...engines };
-  if (reported === undefined) return { invalid: true, invalidReason: 'responded-model-unknown', ...engines };
-  if (requestedEngine !== undefined && requestedEngine !== reported) {
+  if (input.requested && reported === undefined) return { invalid: true, invalidReason: 'responded-model-unknown', ...engines };
+  if (input.requested && requestedEngine !== undefined && requestedEngine !== reported) {
     return { invalid: true, invalidReason: 'responded-model-mismatch', ...engines };
   }
+  // GLM is prohibited as review evidence even when it was explicitly requested.
+  if (requestedEngine === 'glm' || reported === 'glm') return { invalid: true, invalidReason: 'glm-review-forbidden', ...engines };
   return { invalid: false, ...engines };
 }

@@ -41,23 +41,16 @@ describe('registration', () => {
     expect(registerTrigger(db, decl({ graphId: 'g-new' })).row.stage).toBe('live');
   });
 
-  test('the three Phase 1 graphs declare condition triggers, owner, goal and a legacy marker', () => {
-    const retro = readTriggerDecl('graphs/triggers/op-retro.yaml', REPO);
-    expect([retro.graphId, retro.cron, retro.owner, retro.goal.kind]).toEqual(['op-retro', undefined, 'OP', 'file-mtime']);
-    // 출처: RFC-loop-agents-graph-runner-topology §19b — literals copied from the graph YAML declarations under test.
-    expect(retro.condition).toEqual({ predicate: { kind: 'all', of: [{ kind: 'minute-at-least', minute: 15 },
-      { kind: 'not-updated-since', path: '{seatState}/OP/retro/ELN-OP-RETRO-{date}.md', since: 'hour-start' }] },
-    // 출처: RFC-loop-agents-graph-runner-topology §19b — literals copied from the graph YAML declarations under test.
-      cooldownMin: 30, maxWaitMin: 70, onMaxWait: 'fire' });
-    expect(retro.legacy).toEqual({ kind: 'marker', path: '{seatState}/OP/tools/.graph-cutover/op-retro' });
+  test('the Phase 1 graphs declare condition triggers, owner, goal and a legacy marker (op-retro · op-idle-triage absorbed 11-26)', () => {
+    expect(existsSync(join(REPO, 'graphs/triggers/op-retro.yaml'))).toBe(false);
+    expect(existsSync(join(REPO, 'graphs/triggers/op-idle-triage.yaml'))).toBe(false);
+    expect(readTriggerDecl('graphs/triggers/op-pulse.yaml', REPO).absorbs).toEqual(['op-retro']);
+    expect(readTriggerDecl('graphs/triggers/board-steward.yaml', REPO).absorbs).toEqual(['op-idle-triage']);
     const bulletin = readTriggerDecl('graphs/triggers/op-bulletin.yaml', REPO);
     expect(bulletin.condition).toEqual({ predicate: { kind: 'state-changed', parts: ['landed-count', 'idle-seats', 'hands-up-count'] },
     // 출처: RFC-loop-agents-graph-runner-topology §19b — literals copied from the graph YAML declarations under test.
       cooldownMin: 15, maxWaitMin: 30, onMaxWait: 'fire' });
     expect(bulletin.goal.path).toBe('{seatState}/OPS/BULLETIN-NOW.md');
-    const idle = readTriggerDecl('graphs/triggers/op-idle-triage.yaml', REPO);
-    expect(idle.condition).toEqual({ predicate: { kind: 'idle-with-open-cell', status: 'yellow', idleMin: 10 }, cooldownMin: 10, onMaxWait: 'fire' });
-    expect(idle.goal).toEqual({ kind: 'ledger-line', path: '{stateRoot}/loops/idle-triage.jsonl', contains: '"window":"{window}"' });
   });
 
   test('a trigger with both or neither of cron and condition is refused', () => {
@@ -155,5 +148,73 @@ describe('crash recovery', () => {
     expect(cards[0]).toContain('OWNER-X|[graph-trigger exception] g-retro');
     expect(cards[0]).toContain('never reported');
     expect(existsSync(join(dir, 'state', 'graph-trigger-registry.db'))).toBe(true);
+  });
+});
+
+describe('independent trigger cadence', () => {
+  test('a subsequent scheduled tick on another connection fires the next land window while the first is pending', async () => {
+    registerTrigger(db, decl({ graphId: 'a-slow' }));
+    registerTrigger(db, decl({ graphId: 'z-land', cron: '*/2 * * * *' }));
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let clock = new Date('2026-11-25T09:10:00Z');
+    const calls: string[] = [];
+    const deps: TriggerTickDeps = {
+      now: () => clock, vars: { seatState: join(dir, 'seat'), stateRoot: join(dir, 'state') },
+      runGraph: async (row, input, runId) => { calls.push(`${row.graphId}:${input.window}`); if (row.graphId === 'a-slow') await gate; return { status: 'done', runId }; },
+      postCard: async () => 'card', scheduleAction: async () => {},
+    };
+    const first = tickTriggers(db, deps);
+    const nextDb = openTriggerRegistry(join(dir, 'state'));
+    try {
+      clock = new Date('2026-11-25T09:12:00Z');
+      await tickTriggers(nextDb, deps);
+      expect(calls).toEqual(['a-slow:2026-11-25T09:10:00.000Z', 'z-land:2026-11-25T09:10:00.000Z', 'z-land:2026-11-25T09:12:00.000Z']);
+    } finally { nextDb.close(); release(); await first; }
+  });
+
+  test('land starts while an earlier runner is pending; overlapping ticks dedupe and wait for their work', async () => {
+    registerTrigger(db, decl({ graphId: 'a-slow' }));
+    registerTrigger(db, decl({ graphId: 'z-land' }));
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const calls: string[] = [];
+    const deps: TriggerTickDeps = {
+      now: () => new Date('2026-11-25T09:10:00Z'),
+      vars: { seatState: join(dir, 'seat'), stateRoot: join(dir, 'state') },
+      runGraph: async (row, _input, runId) => { calls.push(row.graphId); if (row.graphId === 'a-slow') await gate; return { status: 'done', runId }; },
+      postCard: async () => 'card', scheduleAction: async () => {},
+    };
+    let settled = false;
+    const first = tickTriggers(db, deps).finally(() => { settled = true; });
+    try {
+      expect(calls).toEqual(['a-slow', 'z-land']);
+      await tickTriggers(db, deps);
+      expect(calls).toEqual(['a-slow', 'z-land']);
+      expect(settled).toBe(false);
+    } finally { release(); await first; }
+    expect(listFires(db, 'a-slow')[0]!.status).toBe('dispatched');
+    expect(listFires(db, 'z-land')[0]!.status).toBe('dispatched');
+  });
+
+  for (const status of ['done', 'failed'] as const) test(`late ${status} from a stale attempt cannot overwrite recovery`, async () => {
+    registerTrigger(db, decl({ graphId: 'slow', maxAttempts: 2 }));
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let clock = new Date('2026-11-25T09:10:00Z');
+    const deps: TriggerTickDeps = {
+      now: () => clock, vars: { seatState: join(dir, 'seat'), stateRoot: join(dir, 'state') },
+      runGraph: async (_row, _input, runId) => { await gate; return { status, runId }; },
+      postCard: async () => 'card', scheduleAction: async () => {},
+    };
+    const first = tickTriggers(db, deps);
+    try {
+      clock = new Date('2026-11-25T09:45:00Z');
+      await tickTriggers(db, deps);
+      expect(listFires(db, 'slow').find(f => f.window === '2026-11-25T09:10:00.000Z')!.status).toBe('retry-wait');
+    } finally { release(); await first; }
+    const recovered = listFires(db, 'slow').find(f => f.window === '2026-11-25T09:10:00.000Z')!;
+    expect(recovered.status).toBe('retry-wait');
+    expect(recovered.error).toContain('never reported');
   });
 });

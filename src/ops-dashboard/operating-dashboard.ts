@@ -16,6 +16,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSyn
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CurrentVersion } from './current-version.js';
+import { hostsFor } from '../kit/resource-facts/index.js';
 
 export interface DashboardRow { axis: string; value: string }
 export interface DashboardSnapshot {
@@ -136,7 +137,8 @@ export const subscriptionProbe: Probe = async (ctx) => {
   return { value: parts.join(' · ') || 'no subscription windows' };
 };
 
-export const HOSTS = ['node-b', 'minim5', 'mbp'] as const;
+/** Hosts the dashboard probes — the registry's pregate hosts (RESOURCE-FACTS-FROM-LEDGER · no fixed list). */
+export const dashboardHosts = (): string[] => hostsFor('pregate');
 export const hostsProbe: Probe = async (ctx) => {
   const one = async (host: string | null): Promise<string> => {
     const cmd = 'sysctl -n hw.ncpu; uptime';
@@ -149,7 +151,7 @@ export const hostsProbe: Probe = async (ctx) => {
       return `${host ?? 'local'} ${(load / cores).toFixed(2)}/core`;
     } catch (error) { return `${host ?? 'local'} unmeasured(${(error as Error).message.split('\n')[0]!.slice(0, 40)})`; }
   };
-  const lines = await Promise.all([one(null), ...HOSTS.map((h) => one(h))]);
+  const lines = await Promise.all([one(null), ...dashboardHosts().map((h) => one(h))]);
   return { value: lines.join(' · ') };
 };
 

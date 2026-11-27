@@ -71,7 +71,7 @@ describe('QUEUE-FINISH-FIRST — the literal scenarios', () => {
     const held = r.logs.filter((l) => l.category === 'tui.queue' && l.event === 'held');
     expect(held.map((l) => l.data.msgId)).toEqual([101, 102, 103]);
     expect(held.every((l) => l.data.reason === 'work-in-progress' && l.data.class === 'P2')).toBe(true);
-    expect(heldChip(r.ff.heldCount())).toBe('📩 3 held');
+    expect(heldChip(r.ff.heldCount())).toBe('📩 3 held in TUI queue');
   });
 
   test('continuation completes (no open item) → ONE digest turn with the 3 mails', () => {

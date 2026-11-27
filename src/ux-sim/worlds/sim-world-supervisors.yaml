@@ -1,4 +1,41 @@
-# SIM-WORLD supervisors pack — rows { id, module } filled by the supervisors hand (SIM-WORLD §2 · contract seat-state/TC/SIM-KERNEL-API.md).
+# SIM-WORLD supervisors pack — the v2 supervisors (SUPERVISOR-REVIVE-1127 · CEO 11-27 «감독자들도 일을 제대로 만드는 계획을 …
+# 시뮬월드에서»): per supervisor subject event → wake → reversible action / work item → KPI line → escalation only outside
+# policy (seeds s..s+2), plus «subject lost» for all nine and the guardian pulse (owned by the guardian agent).
 schema: 1
 world: supervisors
-scenarios: []
+scenarios:
+  - { id: SUP-RUN-SUPERVISOR, module: src/ux-sim/sim-world/supervisors/run-lifecycle.ts }
+  - { id: SUP-RUN-DOCTOR, module: src/ux-sim/sim-world/supervisors/run-lifecycle.ts }
+  - { id: SUP-AUTOPSY, module: src/ux-sim/sim-world/supervisors/run-lifecycle.ts }
+  - { id: SUP-MACROPHAGE, module: src/ux-sim/sim-world/supervisors/delegates.ts }
+  - { id: SUP-REAP-OVERLAP, module: src/ux-sim/sim-world/supervisors/delegates.ts }
+  - { id: SUP-WATCHERS-CHECK, module: src/ux-sim/sim-world/supervisors/hygiene.ts }
+  - { id: SUP-SILENCE-WATCH, module: src/ux-sim/sim-world/supervisors/hygiene.ts }
+  - { id: SUP-TRAIN-MANAGER, module: src/ux-sim/sim-world/supervisors/delegates.ts }
+  - { id: SUP-LANE-POLICY, module: src/ux-sim/sim-world/supervisors/delegates.ts }
+  - { id: SUP-RELEASE-ROCKET, module: src/ux-sim/sim-world/supervisors/flow.ts }
+  - { id: SUP-HAND-STEWARD, module: src/ux-sim/sim-world/supervisors/flow.ts }
+  - { id: SUP-POOL-NEEDS-SPEC, module: src/ux-sim/sim-world/supervisors/pool-needs-spec.ts }
+  - { id: SUP-SUBJECT-LOST, module: src/ux-sim/sim-world/supervisors/common.ts }
+  - { id: SUP-GUARDIAN-PULSE, module: src/ux-sim/sim-world/supervisors/common.ts }
+  - { id: SUP-JD-PARK, module: src/ux-sim/sim-world/supervisors/journal-defects.ts }
+  - { id: SUP-JD-DEFUNCT, module: src/ux-sim/sim-world/supervisors/journal-defects.ts }
+  - { id: SUP-JD-CELL-CAP, module: src/ux-sim/sim-world/supervisors/journal-defects.ts }
+  - { id: SUP-JD-SILENCE, module: src/ux-sim/sim-world/supervisors/journal-defects.ts }
+  - { id: KIT-ROLE-LLM, module: src/ux-sim/sim-world/supervisors/kits.ts }
+  - { id: KIT-LESSONS, module: src/ux-sim/sim-world/supervisors/kits.ts }
+  - { id: KIT-LAND-LOCK, module: src/ux-sim/sim-world/supervisors/kits.ts }
+  - { id: KIT-RELEASE-TARGET, module: src/ux-sim/sim-world/supervisors/kits.ts }
+  - { id: SUP-V3-EQUIV, module: src/ux-sim/sim-world/supervisors/v3.ts }
+  - { id: SUP-V3-POLICY-CHANGE, module: src/ux-sim/sim-world/supervisors/v3.ts }
+  - { id: SUP-V3-LINT-REFUSES, module: src/ux-sim/sim-world/supervisors/v3.ts }
+  - { id: SUP-V3-PORTABLE, module: src/ux-sim/sim-world/supervisors/v3.ts }
+  - { id: SUP-V3-SOAK, module: src/ux-sim/sim-world/supervisors/v3.ts }
+  - { id: SUP-V3-POLICY-FAULT, module: src/ux-sim/sim-world/supervisors/v3.ts }
+
+  - { id: SUP-WIP1-ACTIVE, module: src/ux-sim/sim-world/supervisors/wip1-active.ts }
+  - { id: SUP-YAML-RUNTIME, module: src/ux-sim/sim-world/supervisors/yaml-runtime.ts }
+  - { id: SUP-YAML-SHIPPED, module: src/ux-sim/sim-world/supervisors/yaml-runtime.ts }
+  - { id: SUP-V3-SMART-LEARN, module: src/ux-sim/sim-world/supervisors/v3-smart.ts }
+  - { id: SUP-V3-RETRO-SOUL, module: src/ux-sim/sim-world/supervisors/v3-smart.ts }
+  - { id: SUP-LOOP-EXCEPTION, module: src/ux-sim/sim-world/supervisors/loop-exceptions.ts }

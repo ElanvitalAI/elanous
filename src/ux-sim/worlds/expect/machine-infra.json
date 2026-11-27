@@ -20,6 +20,141 @@
       "expect": "green",
       "greenSince": "2026-11-22 (SIM-WORLD-0333-DEVICES · CX-15 원문 052cd31d)",
       "reason": "a provider action is rejected before an unresponsive external call can run"
+    },
+    "machine-infra/WORLD-UNREGISTERED": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40369 (WORLD-REGISTRY 2/3)",
+      "reason": "unregistered long-running processes on a host → one unregistered anomaly each; an owner world-actor line makes that row live (N → N-1)"
+    },
+    "machine-infra/WORLD-ZOMBIE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40369 (WORLD-REGISTRY 2/3)",
+      "reason": "watcher beating every k min: live → zombie past 2k min → live on one new beat (retire never)"
+    },
+    "machine-infra/WORLD-UNREACHABLE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40369 (WORLD-REGISTRY 2/3)",
+      "reason": "failed host probe keeps rows present/live, flags unreachable:host and names it in the digest line; clears when the host answers"
+    },
+    "machine-infra/WORLD-QUIET": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40369 (WORLD-REGISTRY 2/3)",
+      "reason": "a re-sweep with no change appends exactly one world-sweep line per scope and zero declarations"
+    },
+    "machine-infra/HOSTFACTS-ROUTED": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40403 (임대관 host facts)",
+      "reason": "host facts written each pulse route pregate through resource-facts (an unreachable host is gone, the HQ host never)"
+    },
+    "machine-infra/HOSTFACTS-MAINT-RESERVED": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40403 (임대관 host facts)",
+      "reason": "a host in a maintenance window is written reserved (out of routing) although its probe is healthy; back in pool → healthy"
+    },
+    "machine-infra/HOSTFACTS-LEDGER-FAULT": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40403 (임대관 host facts)",
+      "reason": "a missing / corrupt ledger → resource-facts defaults; a failed facts write returns 0 and never throws"
+    },
+    "machine-infra/HOSTFACTS-ON-CHANGE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40403 (임대관 host facts)",
+      "reason": "the 임대관 rewrites a host row only on a material change (quiet pulse = 0 rows)"
+    },
+    "machine-infra/RF-UNHEALTHY": {
+      "expect": "green",
+      "greenSince": "2026-11-27 (RESOURCE-FACTS-FROM-LEDGER)",
+      "reason": "the guardian marks node-b unhealthy → every caller (kit ⊕ migrated call sites) stops picking it; healthy again → back"
+    },
+    "machine-infra/RF-MAINTENANCE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 (RESOURCE-FACTS-FROM-LEDGER)",
+      "reason": "minim5 under maintenance (owner off · RES policy reserved) → gone from every caller; back after"
+    },
+    "machine-infra/RF-PAID-NOT-APPROVED": {
+      "expect": "green",
+      "greenSince": "2026-11-27 (RESOURCE-FACTS-FROM-LEDGER)",
+      "reason": "a paid VM is never routed (burst included) until OP approves it in the registry; revoked → gone"
+    },
+    "machine-infra/RF-LEDGER-DOWN": {
+      "expect": "green",
+      "greenSince": "2026-11-27 (RESOURCE-FACTS-FROM-LEDGER)",
+      "reason": "corrupt ledger ⊕ garbage policy → defaults with «default used», no throw, never HQ for heavy work"
+    },
+    "machine-infra/RF-LEDGER-RECOVERS": {
+      "expect": "green",
+      "greenSince": "2026-11-27 (RESOURCE-FACTS-FROM-LEDGER)",
+      "reason": "no ledger → defaults; first guardian host rows → ledger wins (new host joins · roles narrowed) without restart"
+    },
+    "machine-infra/RF-ALL-OUT": {
+      "expect": "green",
+      "greenSince": "2026-11-27 (RESOURCE-FACTS-FROM-LEDGER)",
+      "reason": "every gate host unhealthy → pickHost «no host» with a reason per host; nothing lands on HQ or an unapproved VM"
+    },
+    "machine-infra/MAINT-ROTATION": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40411 (maintenance windows)",
+      "reason": "windows rotate over 4 hosts for 3 days — one out at a time · pool 3 · no cut overlap · every host ≥ 2 windows · nothing forced"
+    },
+    "machine-infra/MAINT-TIGHT-FORCE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40411 (maintenance windows)",
+      "reason": "tight capacity defers a window at most twice, then forces it (one host at a time, cut window respected)"
+    },
+    "machine-infra/MAINT-CUT-WINDOW": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40411 (maintenance windows)",
+      "reason": "a due host waits out the cut window (03:00–06:30) — the first window opens at the literal expected time"
+    },
+    "machine-infra/MAINT-STEP-FAULT": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40411 (maintenance windows)",
+      "reason": "injected step failures (ssh error · throw · reaper crash) land in the digest; the window still begins and its state is saved"
+    },
+    "machine-infra/MAINT-WORLD-ROW": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40411 (maintenance windows)",
+      "reason": "maintenance state lives in the world row: draining/maintenance → out of host-pick; pool → back in"
+    },
+    "machine-infra/WORLD-CONTROL": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40382 (WORLD-REGISTRY 3/3)",
+      "reason": "MK pause refused · failing bootout recorded failed (state unchanged) · OP pause → off · guardian resume → live; bootout/bootstrap over the actor host; four world-control lines, applied ones carry undo"
+    },
+    "machine-infra/WORLD-AUTOREG": {
+      "expect": "green",
+      "greenSince": "2026-11-27 #40382 (WORLD-REGISTRY 3/3)",
+      "reason": "registerCronQuietly (schedule create hook) → the sweep sees the line → registered · live · owner = calling seat · 0 unregistered"
+    },
+    "machine-infra/KIT-HB-STALENESS": {
+      "expect": "green",
+      "greenSince": "2026-11-27 kit/heartbeat (#40413)",
+      "reason": "5 seeded beat streams (shuffled append order): staleness fresh/late/dead/missing equals the hand oracle at every probe, and judgeWatchers DEAD equals staleness dead"
+    },
+    "machine-infra/KIT-HB-ONE-TRUTH": {
+      "expect": "green",
+      "greenSince": "2026-11-27 kit/heartbeat (#40413)",
+      "reason": "5 seeds of out-of-order seat-loop signals plus lease renewals: the loop_signals mirror row equals the beats.jsonl truth (at, health, lease) for every loop"
+    },
+    "machine-infra/KIT-HB-WATCHER-VIEW": {
+      "expect": "green",
+      "greenSince": "2026-11-27 kit/heartbeat (#40413)",
+      "reason": "5 seeds: an idle seat (loop-signal beat) never shows in the watcher view; a stopped watcher is OK at exactly 2x cadence and DEAD one minute later"
+    },
+    "machine-infra/WT-EPHEMERAL-ELIGIBLE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 (WORKTREE-EPHEMERAL)",
+      "reason": "a clean merged inactive worktree idle over 48h is classified as a candidate without deletion"
+    },
+    "machine-infra/WT-EPHEMERAL-ACTIVE-PTY": {
+      "expect": "green",
+      "greenSince": "2026-11-28 (WORKTREE-EPHEMERAL)",
+      "reason": "an active PTY excludes the candidate and records the reason"
+    },
+    "machine-infra/KIT-HB-FAIL-SOFT": {
+      "expect": "green",
+      "greenSince": "2026-11-27 kit/heartbeat (#40413)",
+      "reason": "5 seeds: an unwritable ledger never throws from beat(); emitSignal reports the failed truth write and leaves no mirror row"
     }
   }
 }

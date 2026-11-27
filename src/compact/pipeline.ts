@@ -34,6 +34,10 @@ export interface RunCompactOpts {
   /** Active model — fed to provider for summarizerModelHint
    *  resolution. Only meaningful when `provider` is set. */
   activeModelId?: string;
+  /** CONTEXT-BUDGET-ROTATION — 요약 모델 명시 오버라이드(«명시 > 셀프»).
+   *  provider.summarize 의 summarizerModel 로 전달된다. 카탈로그 힌트 단은
+   *  2026-07-19 개편으로 삭제됐다 — 재도입 금지(codex 400 회귀 재발). */
+  summarizerModel?: string;
   /** User `/compact <hint>` — forwarded to provider. */
   summaryHint?: string;
 }
@@ -87,6 +91,7 @@ export async function runCompactPipeline(
       preserveFirst: anchorCount,
       hint: opts.summaryHint,
       ...(opts.activeModelId ? { activeModelId: opts.activeModelId } : {}),
+      ...(opts.summarizerModel ? { summarizerModel: opts.summarizerModel } : {}),
     });
     if (summary) {
       // Wave 5 · optional verify probe — only when explicitly opted in.

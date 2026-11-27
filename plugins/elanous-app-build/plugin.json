@@ -66,7 +66,7 @@
       },
       {
         "name": "app_build",
-        "description": "새 앱이나 시스템을 생성·설계·구현·시험하고 승인 후 배포한다. Build a new application, test and publish the approved result. 기존 산출물만 배포하려면 app_deploy를 사용한다.",
+        "description": "새 앱이나 시스템을 생성·설계·구현·시험하고 승인 후 배포한다. Build a new application, test and publish the approved result. 기존 산출물만 배포하려면 app_deploy를 사용한다. 로컬 eln 세션에서 회원 연결이 없으면 이 기기에서 로컬로 빌드·실행하고 tailnet 에만 공유한다(status local-build) — 이를 «불가능»으로 전하지 않는다.",
         "handler": "graph:app-build",
         "parameters": {
           "type": "object",
@@ -78,6 +78,20 @@
             "seedRequested": {
               "type": "boolean",
               "description": "Optional. The host sets it when the line asks for sample or synthetic data."
+            },
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "translation",
+                  "summarization",
+                  "ocr",
+                  "tts",
+                  "search"
+                ]
+              },
+              "description": "Optional. External capabilities the app needs (e.g. a translation service → [\"translation\"]). The host resolves each from the eln LLM provider, the eln secret store or a free/local option before asking the user; translation defaults to LLM translation."
             },
             "artifactMetadata": {
               "description": "Optional. Omit to use the host default runtime [bun, backend/entry.ts] with /health.",

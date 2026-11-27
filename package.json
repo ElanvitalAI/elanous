@@ -1,7 +1,7 @@
 {
   "name": "elanous",
   "mcpName": "io.github.ElanvitalAI/elanous",
-  "version": "0.3.37",
+  "version": "0.3.38",
   "description": "Self-healing coding harness where eyes, hands, and memory all turn on one sentence — it authors its own goals, implements them in isolated worktrees, and reviews its own work.",
   "license": "Apache-2.0",
   "author": "Elanvital AI",
@@ -41,6 +41,8 @@
     "examples/teams/",
     "graphs/",
     "apps/pwa/",
+    "!apps/pwa/node_modules/**",
+    "!apps/pwa/.next/**",
     "!apps/pwa/**/*.test.*",
     "!apps/pwa/**/*.browser-test-support.ts",
     "!apps/pwa/src/lib/testing/restore-module-mocks.ts",

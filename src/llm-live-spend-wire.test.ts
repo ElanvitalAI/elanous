@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { __setLiveSpendTestSeam, streamLLM, type LLMProvider } from './llm.js';
+import { spendStopIsLeaseOnly } from './llm/spend-policy-stream.js';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { createInMemoryGuardStore } from './oauth/llm-spend-guard.js';
 import { readRecentSpendTransitions } from './nexus/llm-spend-policy/ledger.js';
@@ -74,11 +75,26 @@ describe('streamLLM 지출 관문 배선', () => {
     expect(process.env.ELANOUS_CODEX_ACCOUNT).toBeUndefined();
   });
 
-  test('정책 있음 + 임대 없음(observers 빈 상태) → 모든 행 불가 → 멈춤(throw)', async () => {
+  test('SPEND-NO-LEASE-FALLBACK: 정책 있음 + 임대 없음 → 멈추지 않고 일반 공급자 선택으로 진행(경고 1줄)', async () => {
     await writeStoredSpendPolicy({ actor: 'test', dir, document: { providers: { 'codex-default': { capPct: 90 } } } });
     seam({ observers: [] });
-    await expect(run()).rejects.toThrow(/LLM spend guard stop/);
+    expect(typeof (await run()).text).toBe('string');
   });
+
+  test('spendStopIsLeaseOnly: only «every row failed for a missing lease»', () => {
+    expect(spendStopIsLeaseOnly('no-candidate(걷는 순서 전부 불가 — codex-default:no-lease(새 임대 0 = fail-closed · 넥서스에서 정책+임대를 함께 받아라) · codex-team:no-lease:expired-grant)')).toBe(true);
+    expect(spendStopIsLeaseOnly('no-candidate(걷는 순서 전부 불가 — codex-default:no-lease(x) · codex-team:cap-pct-exhausted(96% ≥ 상한 95%))')).toBe(false);
+    expect(spendStopIsLeaseOnly('policy-unreadable')).toBe(false);
+    expect(spendStopIsLeaseOnly('no-candidate(걷는 순서 전부 불가 — codex-default:no-lease(새 임대 0 = fail-closed · 넥서스에서 정책+임대를 함께 받아라) · openrouter:no-lease(새 임대 0 = fail-closed · 넥서스))')).toBe(true);
+  });
+
+  test('COMPACT-NEVER-STALLS: the same no-lease stop does not stop session compaction (upkeep site) — it runs on the ordinary provider', async () => {
+    await writeStoredSpendPolicy({ actor: 'test', dir, document: { providers: { 'codex-default': { capPct: 90 } } } });
+    seam({ observers: [] });
+    const text = await streamLLM([{ role: 'user', content: 'summarise' }], () => {}, { usageSite: 'compact-summary' });
+    expect(typeof text).toBe('string'); // compaction got an answer instead of «spend guard stop: no-candidate»
+  });
+
 
   test('정책 정본이 깨짐(마지막 정상 사본도 없음) → policy-unreadable 멈춤', async () => {
     mkdirSync(dir, { recursive: true });

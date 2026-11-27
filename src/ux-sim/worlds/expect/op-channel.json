@@ -15,6 +15,11 @@
       "expect": "green",
       "greenSince": "2026-11-21 (#39405 CEO channel · main d6f032d64f)",
       "reason": "OP-CHANNEL-INGRESS-1121 저장 실패 중 재시작 축 (JUD #119836 / OP #119845): 낡은 (source, message_id) 키 + reply_text 없는 db 부팅 1 → 재키 COPY 실패 → ROLLBACK(migrate-rolled-back) · 행 2 생존 → 열 복구 후 부팅 2 재키 성공 · 같은 행 waiting 2"
+    },
+    "op-channel/OP-SEAT-MODEL": {
+      "expect": "green",
+      "greenSince": "2026-11-27 SEAT-MODEL-SURVIVES-MIGRATION (this PR)",
+      "reason": "seat /model choice restored after a migration (5 seeds × seats OP·TC·UX·OPT) · an existing session choice kept · corrupt file restores nothing · unwritable store keeps the session choice"
     }
   }
 }

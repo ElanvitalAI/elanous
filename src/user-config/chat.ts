@@ -27,6 +27,9 @@ export interface ChatAutoCompactConfig {
   preserveFirstN: number;
   partial: boolean;
   workingBudgetTokens: number;
+  /** CONTEXT-BUDGET-ROTATION — Layer 3 요약 모델 명시 오버라이드. 없으면
+   *  활성 모델(셀프)로 요약한다. 카탈로그 힌트 단 재도입 금지(codex 400 회귀). */
+  summarizerModel?: string;
 }
 
 export interface ChatSystemPromptConfig {
@@ -96,8 +99,23 @@ export interface ChatCompactConfig {
   archiveRetentionMb: number;
 }
 
+/** TURN-REQUEST-SIZE-LOSS (0.3.38 · 11-27) — the Codex wire cap and the points below it where each rung of the
+ *  request-size ladder acts. All are characters of the serialized request body (what the cap measures). */
+export interface ChatRequestSizeConfig {
+  /** Hard cap: a request over this is never sent (#32254). */
+  maxChars: number;
+  /** In-request proactive compaction starts at maxChars × compactRatio (OP48041). */
+  compactRatio: number;
+  /** Turn window, oldest-history trim and the retry after a provider size rejection aim at maxChars × trimTargetRatio,
+   *  leaving room for this turn's tool outputs. */
+  trimTargetRatio: number;
+  /** Max transcript characters handed to the compaction summarizer (a whole 855k-char record timed out / overflowed). */
+  summaryInputMaxChars: number;
+}
+
 export interface ChatConfig {
   factQuestion: { maxToolTurns: number };
+  requestSize: ChatRequestSizeConfig;
   /** Short questions may receive a tool-free first reply. Default true. */
   fastPath: boolean;
   conciseness: ChatConcisenessConfig;
@@ -124,6 +142,12 @@ const CHAT_CONCISENESS_DEFAULTS: ChatConcisenessConfig = {
 
 export const CHAT_DEFAULTS: ChatConfig = {
   factQuestion: { maxToolTurns: 6 },
+  requestSize: {
+    maxChars: 400_000,
+    compactRatio: 0.85,
+    trimTargetRatio: 0.7,
+    summaryInputMaxChars: 200_000,
+  },
   fastPath: true,
   conciseness: { ...CHAT_CONCISENESS_DEFAULTS },
   toolOutput: {
@@ -188,11 +212,19 @@ export function parseChatConfig(raw: unknown): ChatConfig {
   const chatAutoCompact = (chat.autoCompact ?? {}) as Record<string, unknown>;
   const chatCompact = (chat.compact ?? {}) as Record<string, unknown>;
   const chatSystemPrompt = (chat.systemPrompt ?? {}) as Record<string, unknown>;
+  const chatRequestSize = (chat.requestSize && typeof chat.requestSize === 'object' && !Array.isArray(chat.requestSize))
+    ? chat.requestSize as Record<string, unknown> : {};
   return {
       factQuestion: {
         maxToolTurns: typeof chatFactQuestion.maxToolTurns === 'number'
           && Number.isSafeInteger(chatFactQuestion.maxToolTurns) && chatFactQuestion.maxToolTurns > 0
           ? chatFactQuestion.maxToolTurns : CHAT_DEFAULTS.factQuestion.maxToolTurns,
+      },
+      requestSize: {
+        maxChars: clampNum(chatRequestSize.maxChars, CHAT_DEFAULTS.requestSize.maxChars, 10_000, 10_000_000),
+        compactRatio: clampNum(chatRequestSize.compactRatio, CHAT_DEFAULTS.requestSize.compactRatio, 0.3, 1),
+        trimTargetRatio: clampNum(chatRequestSize.trimTargetRatio, CHAT_DEFAULTS.requestSize.trimTargetRatio, 0.2, 0.95),
+        summaryInputMaxChars: clampNum(chatRequestSize.summaryInputMaxChars, CHAT_DEFAULTS.requestSize.summaryInputMaxChars, 10_000, 10_000_000),
       },
       fastPath: chat.fastPath === false || chat.fastPath === 'false' ? false : CHAT_DEFAULTS.fastPath,
       conciseness: {
@@ -244,6 +276,10 @@ export function parseChatConfig(raw: unknown): ChatConfig {
           chatAutoCompact.workingBudgetTokens,
           CHAT_DEFAULTS.autoCompact.workingBudgetTokens,
         ),
+        ...(() => {
+          const summarizerModel = str(chatAutoCompact.summarizerModel);
+          return summarizerModel ? { summarizerModel } : {};
+        })(),
       },
       compact: {
         verifyProbe: chatCompact.verifyProbe === true,

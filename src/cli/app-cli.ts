@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { Command } from 'commander';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
@@ -110,6 +110,23 @@ export function registerAppCommands(program: Command, deps: AppCliDeps = {}): vo
         process.stderr.write(`app lifecycle: ${error instanceof Error ? error.message : String(error)}\n`);
         setExitCode(1);
       } finally { if (owned) lifecycle.close(); }
+    });
+  // APP-BUILD-LOCAL-PATH — (re)start a locally built app (eln-app.json) with its capability env injected by eln:
+  // key values are read here and go only into the child process env; output carries names and URLs only.
+  app.command('run-local <dir>')
+    .description('Start a locally built app on a free 31500-31599 port with eln-injected capability env and share that port on the tailnet')
+    .action(async (dir: string) => {
+      const write = deps.write ?? ((text: string) => process.stdout.write(text));
+      const setExitCode = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
+      try {
+        const { startLocalApp } = await import('../graph-runner/app-build/local-build.js');
+        const result = await startLocalApp(resolve(dir));
+        write(`${JSON.stringify(result)}\n`);
+        if (!result.started) setExitCode(1);
+      } catch (error) {
+        process.stderr.write(`app run-local: ${error instanceof Error ? error.message : String(error)}\n`);
+        setExitCode(1);
+      }
     });
   app.command('openapi <slug>')
     .description('Generate deterministic OpenAPI 3.1 JSON from a local app contract')

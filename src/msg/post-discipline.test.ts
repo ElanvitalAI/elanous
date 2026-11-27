@@ -5,7 +5,7 @@ import { backpressureVerdict, canonicalPostKind, isUrgentPost, postDestination, 
 describe('E — structured post', () => {
   test('CLI stores a kind-less post as passive info (rule kindless) and has a one-line warning for it', () => {
     expect(resolvePostShape({ from: 'TC', to: 'OP' }, 'cli')).toEqual({ ok: true, kind: 'info', cls: 'info', needsReply: false, rule: 'kindless' });
-    expect(postKindlessWarning()).toBe('msg post warning (no --kind): stored as --kind info (passive · needsReply=false · no turn) — add --kind <request|question|decision|alert|info|notice|status|report|announce|coord|ack|receipt|goal> and --needs-reply when you wait for an answer');
+    expect(postKindlessWarning()).toBe('msg post warning (no --kind): stored as --kind info (passive · needsReply=false · no turn) — add --kind <request|question|decision|alert|info|notice|status|report|announce|coord|ack|receipt|goal|consult|coach> and --needs-reply when you wait for an answer');
   });
   test('CLI refuses a kind outside the closed set and names it', () => {
     const r = resolvePostShape({ from: 'TC', to: 'OP', kind: 'memo' }, 'cli');

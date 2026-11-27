@@ -240,7 +240,8 @@ export function listLoops(opts: LoopRegistryOptions = {}): LoopEntry[] {
     if (!declaredCron && !events.length && !matched.length) continue;
     if (!/^[a-zA-Z0-9][\w.-]*$/.test(doc.graph_id)) throw new Error(`unsafe loop graph_id: ${doc.graph_id}`);
     if (loops.some(loop => loop.id === doc.graph_id)) throw new Error(`duplicate loop graph_id: ${doc.graph_id}`);
-    if (header?.root != null && header.root !== '조율자' && header.root !== '수호자')
+    // two ROOTs (조율자 · 수호자) ⊕ the three kingdoms (federation 11-23: 판정국 · 발행국 · 자원국) — release-rocket declares 발행국
+    if (header?.root != null && !['조율자', '수호자', '판정국', '발행국', '자원국'].includes(String(header.root)))
       throw new Error(`invalid loop root for ${doc.graph_id}: ${String(header.root)}`);
     if (header?.stage !== undefined && (typeof header.stage !== 'string' || !LOOP_STAGES.includes(header.stage as LoopStage)))
       throw new Error(`invalid loop stage for ${doc.graph_id}: ${String(header.stage)}`);

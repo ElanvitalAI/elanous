@@ -485,6 +485,44 @@ exec /bin/bash "$@"
     expect(spawnSync(foreign, [], { encoding: 'utf8' }).stdout).toBe('other\n');
   }, 120_000);
 
+  // ELS-HERDR-CLI-PARITY: the installer is what puts `els` on PATH next to `elanous`; its herdr-word screen must come out of it.
+  test('the installer puts a working `els` beside elanous: its shim is exactly `elanous side`, so `els --help` is the herdr-word screen', async () => {
+    const env = setup();
+    const installed = run(['--no-modify-path'], env, hostPathWithoutEln(), repoRoot, { ELANOUS_INSTALL_TEST_REAL: '1' });
+    expect(installed.result.status, installed.result.stderr).toBe(0);
+    const els = join(env.prefix, 'bin', 'els');
+    const body = readFileSync(els, 'utf8').split('\n');
+    expect(lstatSync(els).isFile()).toBe(true);
+    expect(statSync(els).mode & 0o111).not.toBe(0);
+    expect(body.slice(0, 3)).toEqual(['#!/bin/sh', '# elanous-wrapper', 'exec "$(dirname "$0")/elanous" side "$@"']);
+
+    // simCli executes the installed JS entry; the exact shim forwarding is checked above.
+    const viaSide = await simCli(['side', '--help'], {
+      mode: 'spawn',
+      entrypoint: join(env.prefix, 'current', 'node_modules', 'elanous', 'bin', 'elanous.mjs'),
+      allowPaths: [['side']], cwd: repoRoot,
+      stateRoot: join(env.dir, 'cli-state'), configRoot: join(env.dir, 'cli-state'),
+      injectTestFlag: false, timeoutMs: 60_000,
+      env: { HOME: env.home, COLUMNS: '80', XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache') },
+    });
+    expect(viaSide.exitCode, viaSide.stderr).toBe(0);
+    expect(viaSide.stdout).toContain('Usage: elanous side');
+    expect(viaSide.stdout).toMatch(/\n {2}workspace\|ws +Workspaces: list/);
+    expect(viaSide.stdout).toContain('Agents: run `els --skill`');
+  }, 180_000);
+
+  test('does not replace a foreign els in the prefix, and warns once', () => {
+    const env = setup();
+    mkdirSync(join(env.prefix, 'bin'), { recursive: true });
+    const els = join(env.prefix, 'bin', 'els');
+    writeFileSync(els, '#!/bin/sh\necho other\n');
+    chmodSync(els, 0o755);
+    const installed = run(['--no-modify-path'], env);
+    expect(installed.result.status, installed.result.stderr).toBe(0);
+    expect(installed.result.stdout.match(/⚠ els:/g)).toHaveLength(1);
+    expect(readFileSync(els, 'utf8')).toBe('#!/bin/sh\necho other\n');
+  }, 120_000);
+
   // 🩸 2026-09-25 빈 debian:12: ~/.bashrc 는 비대화형이면 맨 앞에서 return 한다 ⇒ `bash -lc elanous`(ssh 원격 명령)가 못 찾았다.
   test('a bash user without an override gets the PATH block in ~/.profile too (login shells)', () => {
     const { home, result } = run([], setup(), process.env.PATH ?? '', repoRoot, { ELANOUS_SHELL_STARTUP: '', SHELL: '/bin/bash' });

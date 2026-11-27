@@ -64,7 +64,7 @@ import { isResearchAgentIntent } from '../tool-hints/signals.js';
 import { createReasoningThoughtBuffer } from './reasoning-thought-buffer.js';
 import { scanTurnSignalsAsync, type TurnObservation } from '../lessons/lesson-turn-signals.js';
 import {
-  REQUEST_SIZE_MAX_CHARS,
+  requestSizePolicy,
   createRequestSizeGuard,
   estimateRequestChars,
   formatRequestSizeStatus,
@@ -177,7 +177,7 @@ export interface CoreTurnBridgeDeps {
   }) => void | Promise<void>;
   /** Test seam for the live compaction boundary. */
   requestSizeRunCompactPipeline?: RunCompactPipeline;
-  /** Override the request-size cap (tests). Defaults to `REQUEST_SIZE_MAX_CHARS`. */
+  /** Override the request-size cap (tests). Defaults to `chat.requestSize.maxChars`. */
   requestSizeMaxChars?: number;
   /** POST-TURN-LESSON-REVIEW — friction 원장(stateDir) 루트. 생략 시 운영 기본(elanousStateRoot).
    *  시험은 임시 디렉터리를 주입해 브리지→원장 배선을 직접 검증한다. */
@@ -429,7 +429,7 @@ export function bridgeCoreTurnToAcp(
       // keeps turn-0 history untouched until compactFirstRequest writes back.
       let requestSizeGuard: RequestSizeGuard | undefined;
       if (deps.tuiRouting === true) {
-        const maxChars = deps.requestSizeMaxChars ?? REQUEST_SIZE_MAX_CHARS;
+        const maxChars = deps.requestSizeMaxChars ?? requestSizePolicy().maxChars;
         let historyCompacted = false;
         const compactHistory = async (requestChars: number, stage: 'first-request') => {
           if (!deps.compactPersistedHistory || historyCompacted) return false;

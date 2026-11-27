@@ -1,0 +1,38 @@
+# SUPERVISOR-CORRECTION-JOURNAL (0.3.38 P1 · OP · 대표 11-27 12:5x «감독들의 실제 활동 교정내역 일지를 만들게 해 주세요»).
+# Every supervisor loop agent keeps an append-only journal of REAL corrections (acted · failed · refused) under its home
+# <state>/loop-agents/<id>/journal/<YYYY-MM-DD>.jsonl (src/loop-agent/journal.ts). Policy values live here, not in TS.
+version: 1
+rotation:
+  # The day a row belongs to (and the file it is written to) — the operator's calendar day.
+  tz: Asia/Seoul
+  # Day files older than this are deleted when a new day file starts.
+  keep_days: 30
+rollup:
+  # One line per agent per window into OP's 30-min machine digest and ws:supervisors — only when it acted or failed.
+  window_min: 30
+  top: 3
+  # Missed windows (no tick for a while) are rolled up at most this many back — never a flood of old windows.
+  lookback_windows: 2
+kpi:
+  # kit/kpi judgment (raw value): corrections per day across the supervisors · failed / (acted + failed).
+  corrections_per_day: { at_least: 1 }
+  failure_rate: { at_most: 0.3 }
+# Bespoke agents (own bodies · own case kinds) journal from their case rows: case kind → journal status.
+# per_ref: one journal row per evidence ref (e.g. one per reaped pid); a case with no refs is not a correction.
+cases:
+  judge-butler:
+    sign: { status: acted }
+    hold-expire: { status: acted }
+    hand-freed: { status: acted }
+    hand-answer: { status: acted }
+    escalation-withdrawn: { status: acted }
+    verify-failed: { status: failed }
+    sign-refused: { status: refused }
+  guardian:
+    reap: { status: acted, per_ref: true }
+# The voice LLM ladder after the configured role (kit/loop-shell role-llm): resolved through the router tier map
+# (src/model-tier/llm-tier-map.ts · no fixed model). A provider that errors or streams nothing is skipped for the process.
+voice:
+  fallback:
+    - { provider: openai-codex, tier: budget }
+    - { provider: openrouter, tier: budget }

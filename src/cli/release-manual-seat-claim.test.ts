@@ -221,3 +221,67 @@ test('incident simulation: only the current cell owner may delegate and only OP 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('claim rejects invalid actor and changing away from an active PR owner without changing the persisted owner', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'claim-owner-consistency-'));
+  const previousTrack = process.env.ELANOUS_TRACK;
+  let openPullRequests: readonly CellOpenPullRequest[] = [];
+  setElanousConfigDir(dir);
+  const run = async (actor: string, ...args: string[]) => {
+    process.env.ELANOUS_TRACK = actor;
+    const command = new Command();
+    registerReleaseCommands(command, {}, {}, {}, {}, {}, {}, undefined, { listOpenPullRequests: () => openPullRequests });
+    await command.parseAsync(['release', 'checklist', '--version', '9.9.9', ...args], { from: 'user' });
+  };
+  try {
+    await run('TC', 'add', 'CONSISTENCY', 'synthetic claim', '--owner', 'TC');
+    await expect(run('INVALID-ACTOR', 'claim', 'CONSISTENCY', '--by', 'TC')).rejects.toThrow();
+    expect(listChecklist('9.9.9').items.find((i) => i.id === 'CONSISTENCY')?.owner).toBe('TC');
+    openPullRequests = [openPr({ title: 'fix(CONSISTENCY): active work', headRefName: 'tc/claim-owner', assignees: ['TC'] })];
+    await expect(run('TC', 'claim', 'CONSISTENCY', '--by', 'UX')).rejects.toThrow(/#42 owner=TC/);
+    expect(listChecklist('9.9.9').items.find((i) => i.id === 'CONSISTENCY')?.owner).toBe('TC');
+  } finally {
+    if (previousTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = previousTrack;
+    resetElanousConfigDir();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('claim JSON, fresh list JSON, and persisted owner agree after allowed reassignment', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'claim-owner-reread-'));
+  const previousTrack = process.env.ELANOUS_TRACK;
+  const originalLog = console.log;
+  const originalWrite = process.stdout.write;
+  const output: string[] = [];
+  setElanousConfigDir(dir);
+  process.env.ELANOUS_TRACK = 'TC';
+  console.log = (...args: unknown[]) => { output.push(args.join(' ')); };
+  process.stdout.write = ((chunk: string | Uint8Array, encoding?: unknown, callback?: () => void) => {
+    output.push(String(chunk));
+    if (typeof encoding === 'function') encoding();
+    else callback?.();
+    return true;
+  }) as typeof process.stdout.write;
+  const run = async (...args: string[]) => {
+    const command = new Command();
+    registerReleaseCommands(command, {}, {}, {}, {}, {}, {}, undefined, { listOpenPullRequests: () => [] });
+    await command.parseAsync(['release', 'checklist', '--version', '9.9.9', '--json', ...args], { from: 'user' });
+    return JSON.parse(output.pop()!);
+  };
+  try {
+    await run('add', 'REREAD', 'synthetic', '--owner', 'TC');
+    const result = await run('claim', 'REREAD', '--by', 'UX');
+    const listed = await run('list');
+    expect(result.items.find((i: { id: string }) => i.id === 'REREAD').owner).toBe('UX');
+    expect(listed.items.find((i: { id: string }) => i.id === 'REREAD').owner).toBe('UX');
+    expect(listChecklist('9.9.9').items.find((i) => i.id === 'REREAD')?.owner).toBe('UX');
+    await expect(run('claim', 'REREAD', '--by', 'NOT-A-SEAT')).rejects.toThrow();
+    expect(listChecklist('9.9.9').items.find((i) => i.id === 'REREAD')?.owner).toBe('UX');
+  } finally {
+    console.log = originalLog;
+    process.stdout.write = originalWrite;
+    if (previousTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = previousTrack;
+    resetElanousConfigDir();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

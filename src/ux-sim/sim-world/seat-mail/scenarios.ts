@@ -20,6 +20,7 @@ import { wakeRecipient } from '../../../loops/msg-wake.js';
 import { setUserConfigOverlay } from '../../../user-config.js';
 import { createFakeHerdr } from '../../fake-herdr.js';
 import type { SimWorldScenario, SimWorldScenarioContext, SimWorldScenarioOutcome } from '../types.js';
+import { mailRouteScenarios } from './mail-route-scenarios.js';
 
 const SEAT = 'SIMSEAT';
 
@@ -308,4 +309,4 @@ const m8: SimWorldScenario = {
   },
 };
 
-export const simWorldScenarios: readonly SimWorldScenario[] = [m1, m1b, m2, m3, m4, m5, m6, m7, m8];
+export const simWorldScenarios: readonly SimWorldScenario[] = [m1, m1b, m2, m3, m4, m5, m6, m7, m8, ...mailRouteScenarios];

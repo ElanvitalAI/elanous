@@ -82,9 +82,9 @@ describe('rail 30 · waiting cells ⊕ coordinator board', () => {
     receipts: [{ pr: 201, head12: '999999999999', host: 'minim5', status: 'LIGHT_PASS_NOT_FULL_GATE', atMs: agoMs(15) }],
     verdicts,
   });
-  test('a hand whose every cell waits on JUD is told «take work next» (the leader-held cell is the board), not woken on its cell', () => {
+  test('a hand whose every cell waits on JUD gets the leader-held board cell assigned (ADMIN-RESOLVE-NOT-NAG), not woken on its cell', () => {
     const plan = planMatch(waitingSnap(), { scope: live('TC'), state: emptyScopeState() });
-    expect(plan.rows.map((r) => [r.action, r.target, r.seat, r.reason])).toEqual([['wake', 'TC-H-CX-1', 'TC-H-CX-1', 'idle-all-waiting:30m']]);
+    expect(plan.rows.map((r) => [r.action, r.target, r.seat, r.reason])).toEqual([['assign', 'CELL-H', 'TC-H-CX-1', 'pull-for-idle:idle-all-waiting:30m']]);
   });
   test('a FAIL verdict makes the cell active again → woken on its own cell', () => {
     const plan = planMatch(waitingSnap([{ pr: 201, head12: '999999999999', kind: 'jud', verdict: 'FAIL', atMs: agoMs(5) }]), { scope: live('TC'), state: emptyScopeState() });
@@ -282,11 +282,15 @@ describe('R3 judge · R4 hand-off', () => {
       ['judge-assign', '#108', 'JUD-B', 'green-no-verdict:security-4'],
       ['judge-assign', '#102', 'JUD-C', 'green-no-verdict'],
     ]);
-    expect(planJudge(s, { scope: live('JUD', { judge: 1 }), state: emptyScopeState() }).map((r) => [r.action, r.target]))
-      .toEqual([['judge-assign', '#108'], ['defer', '#102']]);
+    // JUD-HAND-DISCOVERY: caps.judge counts hands (batches) — one hand takes both items in one batch.
+    expect(planJudge(s, { scope: live('JUD', { judge: 1 }), state: emptyScopeState() }).map((r) => [r.action, r.target, r.seat]))
+      .toEqual([['judge-assign', '#108', 'JUD-B'], ['judge-assign', '#102', 'JUD-B']]);
     const noJudge = snap({ ...s, seats: [{ seat: 'JUD-B', activity: 'working', idleForMs: null }] });
     expect(planJudge(noJudge, { scope: live('JUD'), state: emptyScopeState() }).map((r) => [r.action, r.target, r.reason]))
-      .toEqual([['defer', '#108', 'no-judge-hand'], ['defer', '#102', 'no-judge-hand']]);
+      .toEqual([['defer', '#108', 'no-free-judge-hand:cooling=0,fresh=0,busy=1'], ['defer', '#102', 'no-free-judge-hand:cooling=0,fresh=0,busy=1']]);
+    const noJudgeSeat = snap({ ...s, seats: [{ seat: 'TC-H-CX-1', activity: 'idle', idleForMs: 60 * 60_000 }] });
+    expect(planJudge(noJudgeSeat, { scope: live('JUD'), state: emptyScopeState() }).map((r) => r.reason))
+      .toEqual(['no-judge-hand', 'no-judge-hand']);
     expect(planHandoff(s, { scope: live('JUD') }).map((r) => [r.action, r.target, r.reason])).toEqual([['ambiguous', '#107', 'pass-not-landed']]);
   });
   test('fresh PASS → hand-off to the poller; a hold blocks the hand-off', () => {
@@ -334,7 +338,7 @@ describe('R5 watch · R6 digest · X card', () => {
     ];
     const tc = exceptionCard('TC', 'OP', rows, emptyScopeState(), NOW)!;
     expect(tc.to).toBe('TC');
-    expect(tc.body).toBe('[행정관 · TC] 예외 카드 1건\n- ambiguous #101@aaaaaaaaaaaa — pregate-stuck\n결정은 보드에 적으면 다음 틱이 집행합니다.');
+    expect(tc.body).toBe(`[행정관 · TC] 예외 카드 1건\n- ambiguous #101@aaaaaaaaaaaa — pregate-stuck\n담당: TC · 기한: ${new Date(NOW + 30 * 60_000).toISOString()}\n다음 행동: 각 예외를 해결하거나 담당자와 기한을 정해 보드에 인계하세요. 결정은 다음 틱이 집행합니다.`);
     const hq = exceptionCard('OP', 'OP', rows, emptyScopeState(), NOW)!;
     expect(hq.title).toBe('[행정관 · OP] 예외 카드 1건');
     const seen = emptyScopeState();

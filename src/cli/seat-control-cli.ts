@@ -1,5 +1,6 @@
 import type { Command } from 'commander';
 import { detectSeatTui } from '../seat/seat-boot-preamble.js';
+import { proxyAwareSender } from '../proxy/proxy-identity.js';
 import { authorizeSeatControl, type SeatControlMode } from '../seat/seat-control.js';
 import { listPtyManifestRows } from '../pty-shell/pty-manifest.js';
 import { requestRemotePtyControl, PTY_CONTROL_STALE_MS, type PtyControlResult } from '../pty-shell/pty-control-ipc.js';
@@ -57,7 +58,8 @@ export function registerSeatControlCommand(command: Command): void {
     .action(async (seat: string, mode: string) => {
       try {
         const result = await runSeatControl(seat.toUpperCase(), mode, {
-          sender: () => detectSeatTui(process.cwd())?.seat ?? null,
+          // CLAUDE-OP-PROXY-IDENTITY — the verified proxy session (ELANOUS_TRACK=CLAUDE-OP) acts as OP (audited · noticed).
+          sender: proxyAwareSender('seat-control', `${seat.toUpperCase()} ${mode}`, () => detectSeatTui(process.cwd())?.seat ?? null),
           rows: listPtyManifestRows,
           send: (id, action, payload, options) => requestRemotePtyControl(id, action, payload, options),
           seatOfPid: (pid) => { const cwd = processCwd(pid); return cwd ? detectSeatTui(cwd)?.seat : undefined; },

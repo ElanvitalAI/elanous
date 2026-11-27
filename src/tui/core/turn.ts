@@ -189,9 +189,9 @@ export function startNextTuiTurn(input: Omit<NextTuiTurnInput, 'signal'>, deps: 
 
 /** User submissions take priority; a cancelled turn cannot open an automatic follow-up. */
 export function decideNextTuiAutoContinue(
-  outcome: NextTuiTurnOutcome, queuedCount: number, draft: string,
+  outcome: NextTuiTurnOutcome, queuedCount: number, draft: string, idleDraftMayYield = false,
 ): 'complete' | 'check' | 'yield' | 'none' {
   if (outcome.kind === 'cancelled') return 'none';
   if (outcome.goalComplete) return 'complete';
-  return queuedCount > 0 || draft.length > 0 ? 'yield' : 'check';
+  return queuedCount > 0 || (draft.length > 0 && !idleDraftMayYield) ? 'yield' : 'check';
 }

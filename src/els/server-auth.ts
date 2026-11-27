@@ -24,7 +24,7 @@ export const AUTH_OWNER_TOKEN_ENV = 'ELANOUS_ELS_OWNER_TOKEN';
  * `child` reads are decided by MUTATING_CHILD_ACTIONS below (tree/summary are reads; status updates state).
  */
 // GOAL-ORCHESTRATION-NL: tile-frame is the tile view's read of a pane screen (same data as read); without it every tile drew blank.
-export const READ_OPS: ReadonlySet<string> = new Set(['ping', 'auth', 'ls', 'subscribe', 'grep', 'read', 'tile-frame', 'status']);
+export const READ_OPS: ReadonlySet<string> = new Set(['ping', 'auth', 'ls', 'subscribe', 'overlay-watch', 'grep', 'read', 'tile-frame', 'status']);
 /** `child` actions that mutate the tree; tree and summary are reads. */
 const MUTATING_CHILD_ACTIONS: ReadonlySet<string> = new Set(['start', 'end', 'pin', 'unpin', 'dismiss', 'progress', 'status']);
 
@@ -162,18 +162,51 @@ export class PaneRegistry {
 export type AuthVerdict = { readonly allow: true } | { readonly allow: false; readonly reason: string };
 
 /**
- * CEO 11-23 (ELS-ELN-SECURITY-RELAX): reading a pane's screen or status changes nothing, so the HQ observer may read
- * every pane in every space. HQ observer = the OP seat or the journal's HQ coordinator seat, or a seatless pane caller
- * (seat absent or `unknown`, e.g. the eln OP pane opened by `els seat`) that sits in a workspace whose journal coordinator
- * is OP/HQ. A named non-HQ seat (hand, sub-coordinator) keeps its own-pane scope. `read`/`status` use this, and so does
- * non-destructive typing (`hqTypingRequest`, ELS-OP-CROSS-SPACE-SEND).
+ * COORD-RIGHTS (CEO 11-27 08:0x · live 07:38 «els: read denied — target is not owned by caller seat» for OP #189879 and
+ * UX #189881): the live journal carries no `ownerSeat` on seat panes — the OP pane has only `seatIdentity: OP`, the UX
+ * pane only `cwd: …/seats/UX` — so a seatless caller pane was never recognized as its coordinator. The pane's seat is
+ * `ownerSeat` → `seatIdentity` → the seat folder its cwd IS (`…/seats/<SEAT>` exactly; a deeper path is not the seat).
  */
-export function hqReadObserver(seat: string | undefined, callerPane: string | undefined,
-  journal: { readonly hqCoordinatorSeat?: string; readonly workspaces: readonly { readonly id: string; readonly coordinatorSeat?: string }[];
-    readonly tabs: readonly { readonly id: string; readonly workspaceId: string }[]; readonly panes: readonly { readonly id: string; readonly tabId: string }[] }): boolean {
+export function paneSeatOf(pane: { readonly ownerSeat?: string; readonly seatIdentity?: string; readonly cwd?: string } | undefined): string | undefined {
+  if (!pane) return undefined;
+  const named = [pane.ownerSeat, pane.seatIdentity].find(s => !!s && s !== 'unknown');
+  if (named) return named.toUpperCase();
+  const m = /\/elanous-hq\/seats\/([A-Za-z0-9][A-Za-z0-9_-]*)\/?$/.exec(pane.cwd ?? '');
+  return m ? m[1]!.toUpperCase() : undefined;
+}
+
+type ObserverJournal = { readonly hqCoordinatorSeat?: string; readonly workspaces: readonly { readonly id: string; readonly coordinatorSeat?: string }[];
+  readonly tabs: readonly { readonly id: string; readonly workspaceId: string }[];
+  readonly panes: readonly { readonly id: string; readonly tabId: string; readonly ownerSeat?: string; readonly seatIdentity?: string; readonly cwd?: string }[] };
+
+/**
+ * The caller's seat: the claimed seat when named, else the caller pane's IDENTITY — `seatIdentity` or its exact seat cwd.
+ * `ownerSeat` is not identity here: a worker pane a seat spawned is owned by that seat but is not that seat.
+ */
+export function callerSeatOf(seat: string | undefined, callerPane: string | undefined, journal: Pick<ObserverJournal, 'panes'>): string | undefined {
+  if (seat !== undefined && seat !== 'unknown') return seat;
+  const row = callerPane ? journal.panes.find(p => p.id === callerPane) : undefined;
+  return row ? paneSeatOf({ ...(row.seatIdentity ? { seatIdentity: row.seatIdentity } : {}), ...(row.cwd ? { cwd: row.cwd } : {}) }) : undefined;
+}
+
+/**
+ * CEO 11-23 (ELS-ELN-SECURITY-RELAX) ⊕ COORD-RIGHTS 11-27: reading a pane's screen or status changes nothing, so every
+ * coordinator observes every pane in every space. Observer = the OP seat, the journal's HQ coordinator seat, any
+ * workspace's coordinator seat (TC · JUD · UX · MK …), or a seatless pane sitting in a workspace whose coordinator is
+ * OP/HQ. The caller seat resolves through `callerSeatOf`. A hand keeps its own-pane scope.
+ * Non-destructive typing (`hqTypingRequest`, ELS-OP-CROSS-SPACE-SEND) uses the HQ-only half (`hqObserver`).
+ */
+export function hqReadObserver(seat: string | undefined, callerPane: string | undefined, journal: ObserverJournal): boolean {
+  const who = callerSeatOf(seat, callerPane, journal);
+  if (hqObserver(seat, callerPane, journal)) return true;
+  return !!who && journal.workspaces.some(w => w.coordinatorSeat === who);
+}
+
+/** HQ only: OP, the journal's HQ coordinator, or a seatless pane in an OP/HQ-coordinated workspace. */
+export function hqObserver(seat: string | undefined, callerPane: string | undefined, journal: ObserverJournal): boolean {
   const hq = journal.hqCoordinatorSeat;
   const isHq = (name: string | undefined): boolean => name === 'OP' || (!!hq && name === hq);
-  if (isHq(seat)) return true;
+  if (isHq(callerSeatOf(seat, callerPane, journal))) return true;
   if (seat !== undefined && seat !== 'unknown') return false;
   const row = callerPane ? journal.panes.find(p => p.id === callerPane) : undefined;
   const wsId = row && journal.tabs.find(t => t.id === row.tabId)?.workspaceId;
@@ -193,18 +226,38 @@ export function hqTypingRequest(request: { readonly op: string; readonly bytes?:
 }
 
 /**
+ * COORD-RIGHTS (CEO 11-27 08:0x «조율자가 다른 탭을 보고 컨트롤하는 게 막혀 있다»): observing changes nothing, so every
+ * coordinator — HQ or a space coordinator (TC · JUD · UX …) — reads every pane in every space (read · tile-frame ·
+ * status · snapshot). Before, only the HQ observer could; a sub-coordinator saw only its own pane.
+ */
+export function coordinatorReadRequest(op: string): boolean {
+  return op === 'read' || op === 'tile-frame' || op === 'status' || op === 'snapshot';
+}
+
+/**
+ * COORD-RIGHTS: interrupting a turn (the `interrupt` op · ESC · ^C) is steering, not destruction — a coordinator may do
+ * it on a federation seat pane in its scope (audited). EOF (^D), suspend (^Z) and quit (^\) still end or stop the pane's
+ * process and stay owner-only.
+ */
+export function coordinatorInterruptRequest(request: { readonly op: string; readonly bytes?: unknown }): boolean {
+  if (request.op === 'interrupt') return true;
+  return request.op === 'input' && typeof request.bytes === 'string' && /[\x03\x1b]/.test(request.bytes) && !/[\x04\x1a\x1c]/.test(request.bytes);
+}
+
+/**
  * OP-HANDLES-L2 (TRACE-OP-RESOURCE-OPTIMIZATION-1125 §5: ElsControl send/new refused 12/12 «no rule grants …»).
  * The coordinator grant: the HQ coordinator (the OP seat, the journal's / federation.yaml's HQ coordinator seat, or a
  * seatless pane in an HQ-coordinated workspace — `hqReadObserver`) may `new`, type (`hqTypingRequest`) and `close` on
  * panes owned by a federation seat in every space; a space coordinator gets the same inside the spaces it coordinates.
  * The federation seat set comes from the seat registry ⊕ federation.yaml (never a literal list here). Interrupt and raw
  * control bytes stay owner-only; the OP tab itself still needs a person (authorizeRequest refuses it first).
+ * COORD-RIGHTS (11-27): interrupt (ESC · ^C) joins the in-scope grant; reads are granted to every coordinator everywhere.
  */
 export interface FederationJournal {
   readonly hqCoordinatorSeat?: string;
   readonly workspaces: readonly { readonly id: string; readonly name: string; readonly coordinatorSeat?: string }[];
   readonly tabs: readonly { readonly id: string; readonly workspaceId: string }[];
-  readonly panes: readonly { readonly id: string; readonly tabId: string; readonly ownerSeat?: string }[];
+  readonly panes: readonly { readonly id: string; readonly tabId: string; readonly ownerSeat?: string; readonly seatIdentity?: string; readonly cwd?: string }[];
 }
 
 export type CoordinatorAuthority =
@@ -214,11 +267,12 @@ export type CoordinatorAuthority =
 /** Who coordinates: HQ (everywhere) or a space coordinator (its own spaces). `declaredHq` = federation.yaml `hq.coordinator`. */
 export function coordinatorAuthority(seat: string | undefined, callerPane: string | undefined, journal: FederationJournal, declaredHq?: string): CoordinatorAuthority | undefined {
   const hq = journal.hqCoordinatorSeat ?? declaredHq;
-  if (hqReadObserver(seat, callerPane, { ...journal, ...(hq ? { hqCoordinatorSeat: hq } : {}) }))
-    return { scope: 'hq', seat: seat && seat !== 'unknown' ? seat : hq ?? 'OP' };
-  if (!seat || seat === 'unknown') return undefined;
-  const workspaceIds = journal.workspaces.filter(ws => ws.coordinatorSeat === seat).map(ws => ws.id);
-  return workspaceIds.length ? { scope: 'space', seat, workspaceIds } : undefined;
+  const withHq = { ...journal, ...(hq ? { hqCoordinatorSeat: hq } : {}) };
+  const who = callerSeatOf(seat, callerPane, withHq);
+  if (hqObserver(seat, callerPane, withHq)) return { scope: 'hq', seat: who ?? hq ?? 'OP' };
+  if (!who) return undefined;
+  const workspaceIds = journal.workspaces.filter(ws => ws.coordinatorSeat === who).map(ws => ws.id);
+  return workspaceIds.length ? { scope: 'space', seat: who, workspaceIds } : undefined;
 }
 
 export interface CoordinatorGrant { readonly allow: true; readonly audit: Record<string, unknown> }
@@ -242,13 +296,21 @@ export function coordinatorGrant(authority: CoordinatorAuthority | undefined,
     const ws = journal.workspaces.find(row => row.id === request.ws || row.name === request.ws);
     return ws && inScope(ws.id) ? audit({ workspace: ws.name }) : undefined;
   }
-  if (hqTypingRequest(request) || request.op === 'close') {
+  // COORD-RIGHTS: observe = every pane, every space, any coordinator (no scope, no federation-owner condition).
+  if (coordinatorReadRequest(request.op)) {
+    const id = typeof request.pane === 'string' ? paneId(request.pane) : undefined;
+    if (!id) return undefined;
+    const row = journal.panes.find(p => p.id === id);
+    return audit({ pane: id, owner: paneSeatOf(row) ?? 'unknown', observe: true });
+  }
+  if (hqTypingRequest(request) || coordinatorInterruptRequest(request) || request.op === 'close') {
     const id = typeof request.pane === 'string' ? paneId(request.pane) : undefined;
     const row = id ? journal.panes.find(p => p.id === id) : undefined;
-    if (!row || !federated(row.ownerSeat) || !inScope(workspaceOfTab(row.tabId))) return undefined;
+    const owner = paneSeatOf(row);   // COORD-RIGHTS: live seat panes carry seatIdentity / a seat cwd, not ownerSeat
+    if (!row || !federated(owner) || !inScope(workspaceOfTab(row.tabId))) return undefined;
     // Closing the HQ coordinator's own pane stays a person's call.
-    if (request.op === 'close' && (row.ownerSeat === 'OP' || row.ownerSeat === journal.hqCoordinatorSeat)) return undefined;
-    return audit({ pane: row.id, owner: row.ownerSeat });
+    if (request.op === 'close' && (owner === 'OP' || owner === journal.hqCoordinatorSeat)) return undefined;
+    return audit({ pane: row.id, owner });
   }
   if (request.op === 'close-tab') {
     const panes = journal.panes.filter(p => p.tabId === request.tab);
@@ -320,7 +382,7 @@ function doorAction(op: string): 'read' | 'do' | 'input' | 'new' | 'close' | 'mo
   switch (op) {
     case 'do': case 'build': case 'child': case 'record': return 'do';
     case 'snapshot': return 'read'; // same screen as `read`, but it writes a file: mutating at the door, judged with `read`'s rules
-    case 'send': case 'send-verified': case 'attach': case 'input': case 'input-line': case 'interrupt': case 'resize': return 'input';
+    case 'send': case 'send-verified': case 'attach': case 'input': case 'input-line': case 'interrupt': case 'resize': case 'eln-attach': return 'input';
     case 'new': return 'new';
     case 'close': case 'close-workspace': case 'close-tab': return 'close';
     default: return undefined; // `reorder` is a workspace-less UI-order action: any pane role may do it.
@@ -329,6 +391,9 @@ function doorAction(op: string): 'read' | 'do' | 'input' | 'new' | 'close' | 'mo
 
 export function isMutating(request: RequestShape): boolean {
   if (request.op === 'child') return MUTATING_CHILD_ACTIONS.has(String(request.action));
+  if (request.op === 'overlay') return request.action !== 'list';
+  // ELS-CHANNEL: read · list · wait only read the log; post · ack · hold · resume · open write it.
+  if (request.op === 'channel') return !['read', 'list', 'wait'].includes(String(request.action));
   return !READ_OPS.has(request.op);
 }
 
@@ -354,7 +419,9 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
   // plain scratch tab — is closed unconfirmed by no one, the owner terminal and same-UID operators
   // included: nobody answered a prompt for it. A person confirms it (confirm:true), a coordinator
   // closes a seated tab below, and the OP tab above is refused for every caller, confirmed or not.
-  if (request.op === 'close-tab' && request.confirmed !== true && !tabScope?.opTab
+  // CLAUDE-OP-PROXY-IDENTITY — `proxyConfirmed` (set by the server from the verified CEO-proxy peer, audited) stands in
+  // for the person's yes on an UNOWNED tab only; the OP tab above still needs a person.
+  if (request.op === 'close-tab' && request.confirmed !== true && (request as { proxyConfirmed?: boolean }).proxyConfirmed !== true && !tabScope?.opTab
     && !tabScope?.ownerSeats.some((seat) => seat))
     return { allow: false, reason: 'els: close-tab denied — a tab no seat owns closes only with confirm:true (a person\'s confirmation)' };
   if (role.kind === 'outsider' || role.kind === 'owner') return { allow: true };
@@ -367,6 +434,16 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
       : { allow: false, reason: `els: ${request.op} denied — OP authority required` };
   }
   if (!isMutating(request)) return { allow: true };
+  // ELS-ZAXIS act-view (#40244 §2-3 · 대표 decision 2): OP (pane, verified peer, acting baton) on every space; any other pane
+  // only on its own workspace — the overlay's owner workspace, resolved by the server (never a caller field alone).
+  if (request.op === 'overlay') {
+    if (role.kind === 'op' || (role.kind === 'peer' && role.seat === 'OP') || actingOp) return { allow: true };
+    if (role.kind === 'hand' && workspace !== undefined && role.workspaces.includes(workspace)) return { allow: true };
+    return { allow: false, reason: 'els: overlay denied — a pane acts on overlays of its own workspace only (OP: every space)' };
+  }
+  // ELS-CHANNEL §3-3: every pane role reaches the channel hub; the hub judges the channel scope with the caller identity
+  // the server built from this connection (own workspace · own pair · run meta — OP: every channel).
+  if (request.op === 'channel') return { allow: true };
   // (11-23 완화) outsider/owner are allowed above — the old outsider/owner new·attach·typing branches are gone.
   // `reorder` changes tab/workspace order in the owner UI: a workspace-less mutation any pane role may do.
   if (request.op === 'reorder') return { allow: true };
@@ -392,7 +469,9 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
       return { allow: false, reason: 'els: close-tab denied — tab contains another or unverified seat owner' };
   }
   // OP-HANDLES-L2: a coordinator grant covers new / non-destructive typing / close on federation seat panes in scope.
-  if (granted && (action === 'new' || action === 'close' || (action === 'input' && hqTypingRequest(request)))) return { allow: true };
+  // COORD-RIGHTS: … and interrupt (ESC · ^C) there, and snapshot/read of every pane.
+  if (granted && (action === 'new' || action === 'close' || (action === 'input' && (hqTypingRequest(request) || coordinatorInterruptRequest(request)))
+    || (action === 'read' && coordinatorReadRequest(request.op)))) return { allow: true };
   // JUD #39096 ⓑ: a ledger-verified peer seat is a principal — «토큰 역할 ∨ peer seat». The control
   // 문 still makes the final adjudication; the role door only refuses to block the verified peer.
   const principal: Principal = role.kind === 'op'

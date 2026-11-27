@@ -62,7 +62,7 @@ describe('sim world run — reserved ids through the real CLI process', () => {
   // Source: R-LIVE10 — real CLI child processes; the allowance covers process boot on a loaded gate host.
   }, 120_000);
 
-  test('`sim world run memory --seed 1` exits 0: memory M01–M12 green except M09/M10 xfail, no pack-empty event', async () => {
+  test('`sim world run memory --seed 1` exits 0: memory M01–M12 green except M09/M10 xfail, KIT-KNOWHOW-* green, no pack-empty event', async () => {
     const root = stateRoot();
     const result = await simCli(['sim', 'world', 'run', 'memory', '--seed', '1', '--run-id', 'empty-packs'], {
       mode: 'spawn', stateRoot: root, allowPaths: RUN, timeoutMs: 60_000 });
@@ -70,12 +70,12 @@ describe('sim world run — reserved ids through the real CLI process', () => {
       // No OS network isolation on this host: every scenario is infra-error and the run exits 1 with one sandbox-failed event.
       expect(result.exitCode).toBe(1);
       const refused = JSON.parse(readFileSync(join(root, 'sim-world', 'empty-packs', 'summary.json'), 'utf8'));
-      expect([refused.ok, refused.counts['infra-error'], refused.events.map((event: { kind: string }) => event.kind)]).toEqual([false, 13, ['sandbox-failed']]);
+      expect([refused.ok, refused.counts['infra-error'], refused.events.map((event: { kind: string }) => event.kind)]).toEqual([false, 17, ['sandbox-failed']]);
       return;
     }
     expect({ exitCode: result.exitCode, stderr: result.stderr }).toMatchObject({ exitCode: 0 });
     const printed = JSON.parse(result.stdout.trim().split('\n').at(-1)!);
-    expect([printed.ok, printed.scenarios]).toEqual([true, 13]);
+    expect([printed.ok, printed.scenarios]).toEqual([true, 17]);
     const summary = JSON.parse(readFileSync(join(root, 'sim-world', 'empty-packs', 'summary.json'), 'utf8'));
     expect([summary.schema, summary.seed, summary.engine, summary.only, summary.ok]).toEqual(['sim-world.summary/1', 1, 'legacy', null, true]);
     // SIM-WORLD-MEMORY (S0): the runner calls the memory port now; M09 and M10 stay xfail with the observed literal reason.
@@ -94,6 +94,11 @@ describe('sim world run — reserved ids through the real CLI process', () => {
       ['memory', 'M11', 'legacy', 'pass', null],
       ['memory', 'M12', 'legacy', 'pass', null],
       ['memory', 'M25', 'legacy', 'pass', null],
+      // kit/knowhow (#40414): the one KNOWHOW card parser and its callers over real-shaped and seeded documents.
+      ['memory', 'KIT-KNOWHOW-REAL-SHAPES', 'legacy', 'pass', null],
+      ['memory', 'KIT-KNOWHOW-GENERATED', 'legacy', 'pass', null],
+      ['memory', 'KIT-KNOWHOW-CALLERS-AGREE', 'legacy', 'pass', null],
+      ['memory', 'KIT-KNOWHOW-DETERMINISM', 'legacy', 'pass', null],
     ]);
     expect(summary.worlds).toEqual(['memory']);
     expect(summary.events.map((event: { kind: string; world: string }) => `${event.kind}:${event.world}`)).toEqual([]);
@@ -175,7 +180,7 @@ describe('sim world replay of a run recorded before a world was added', () => {
 
 describe('sim world registration ↔ pack files', () => {
   test('every registered world has a pack yaml on disk whose `world:` matches (literal list, not the product constant)', () => {
-    const worlds = ['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel', 'router-cost', 'toolbatch', 'els', 'els-remote', 'member-journey', 'machine-infra'];
+    const worlds = ['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel', 'router-cost', 'toolbatch', 'els', 'els-remote', 'member-journey', 'machine-infra', 'fed-org', 'llm-route', 'smart-merge', 'alloc-budget'];
     const registered: string[] = [...SIM_WORLD_IDS];
     expect(registered).toEqual(worlds);
     for (const world of worlds) {
@@ -193,8 +198,8 @@ describe('sim world run all — full run (slow: capsule-events ~92s on node-b)',
     const result = await simCli(['sim', 'world', 'run', 'all', '--seed', '1', '--run-id', 'full'], {
       mode: 'spawn', stateRoot: root, allowPaths: RUN, timeoutMs: 900_000 }); // 1124 main-red ENOENT: 280s에 스폰 래퍼가 CLI를 살해해 summary.json 기록 직전 사망 — all 런 지속 증가(#39881 ripen 포함) 대응
     const summary = JSON.parse(readFileSync(join(root, 'sim-world', 'full', 'summary.json'), 'utf8'));
-    expect(summary.worlds).toEqual(['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel', 'router-cost', 'toolbatch', 'els', 'els-remote', 'member-journey', 'machine-infra']);
-    expect(Object.keys(summary.worldWallMs).sort()).toEqual(['capsule-events', 'els', 'els-remote', 'graph', 'machine-infra', 'member-journey', 'memory', 'op-channel', 'router-cost', 'seat-mail', 'seat-mail-roundtrip', 'supervisors', 'ta', 'toolbatch', 'worker']);
+    expect(summary.worlds).toEqual(['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel', 'router-cost', 'toolbatch', 'els', 'els-remote', 'member-journey', 'machine-infra', 'fed-org', 'llm-route', 'smart-merge', 'alloc-budget']);
+    expect(Object.keys(summary.worldWallMs).sort()).toEqual(['alloc-budget', 'capsule-events', 'els', 'els-remote', 'fed-org', 'graph', 'llm-route', 'machine-infra', 'member-journey', 'memory', 'op-channel', 'router-cost', 'seat-mail', 'seat-mail-roundtrip', 'smart-merge', 'supervisors', 'ta', 'toolbatch', 'worker']);
     expect(summary.events.filter((event: { kind: string }) => event.kind === 'pack-empty').map((event: { world: string }) => event.world))
       .toEqual(['ta', 'supervisors', 'seat-mail']);
     expect(JSON.parse(result.stdout.trim().split('\n').at(-1)!).ok).toBe(summary.ok);

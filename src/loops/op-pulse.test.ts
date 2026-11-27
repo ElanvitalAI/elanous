@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 import { detectPhase, loadRhythm, parseRhythm, pulseDue, pulseGaps, renderPulseBrief, rhythmRow, type PulseMeasure } from './op-pulse.js';
 import { parseUrgency, urgencyOf, urgentCeoLines } from './op-pulse-urgency.js';
+import { resolvePostShape } from '../msg/post-discipline.js';
 
 const RHYTHM = join(import.meta.dir, '../../graphs/triggers/op-pulse.rhythm.yaml');
 const MIN_YAML = `
@@ -20,7 +21,7 @@ describe('rhythm table', () => {
     const r = loadRhythm(RHYTHM);
     expect([...r.rows.keys()].sort()).toEqual(['build', 'burst', 'demo-freeze', 'night', 'post-release', 'pre-cut', 'release-window']);
     for (const row of r.rows.values()) expect(row.source.startsWith('docs/conductor/')).toBe(true);
-    expect(r.rows.get('build')!.targets.landedPerH).toBe(20);
+    expect(r.rows.get('build')!.targets.landedPerH).toBe(10);
     expect(r.rows.get('release-window')!.newWork).toBe(false);
   });
   test('a bad edit is refused loud', () => {
@@ -54,7 +55,8 @@ describe('gaps', () => {
   test('all green → no gap', () => { expect(pulseGaps(measure(), targets)).toEqual([]); });
   test('each missed target is one gap row', () => {
     const gaps = pulseGaps(measure({ landedPerH: 7, judgeWaitMedianMin: 45, spaces: [{ space: 'UX', landedPerH: 1, greenPerH: 0, hands: 3, idleWithWork: 4, readyCells: 2, blockedCells: 1 }] }), targets);
-    expect(gaps.map(g => `${g.space}:${g.metric}:${g.value}`)).toEqual(['FED:landed/h:7', 'JUD:judge-wait:45', 'UX:idle-with-work:4', 'UX:ready-cells:2']);
+    // JUD-RELAX (CEO 11-26): a long judge wait is no gap — JUD keeps the veto only.
+    expect(gaps.map(g => `${g.space}:${g.metric}:${g.value}`)).toEqual(['FED:landed/h:7', 'UX:idle-with-work:4', 'UX:ready-cells:2']);
   });
   test('unmeasured is never a gap', () => {
     expect(pulseGaps(measure({ landedPerH: null, greenPerH: null, judgeWaitMedianMin: null }), targets)).toEqual([]);
@@ -62,8 +64,17 @@ describe('gaps', () => {
   test('the brief starts with phase and rhythm and carries the contract', () => {
     const row = loadRhythm(RHYTHM).rows.get('build')!;
     const brief = renderPulseBrief({ window: '2026-11-26T12:00:00.000Z', phase: { phase: 'build', evidence: 'e' }, row, gaps: [{ metric: 'landed/h', space: 'FED', value: 7, target: '≥ 20' }], table: 't', phaseChanged: null, tablePath: '/x' });
-    expect(brief.split('\n')[0]).toBe('[pulse 2026-11-26T12:00:00.000Z] 국면: build · 리듬: 60분 · 착지 20/h · 초록 10/h · 판정 대기 ≤30m · 손잡이 reprioritize, lend-hands, judge-relief, vm-ask, burst-propose');
+    expect(brief.split('\n')[0]).toBe('[pulse 2026-11-26T12:00:00.000Z] 국면: build · 리듬: 60분 · 착지 10/h · 초록 10/h · 손잡이 reprioritize, lend-hands, vm-ask, burst-propose');
     expect(brief).toContain('eln pulse verify --window 2026-11-26T12:00:00.000Z');
+  });
+  // eln OP 11-27 11:0x — «op-pulse 의 beat 우편이 현재 CLI 에서 거부되는 계약 불일치»: the brief says `--kind beat`, the
+  // closed kind set refused it (rc 2), so no beat mail was ever stored and `eln pulse verify` could not meet the goal.
+  test('the beat mail the brief prescribes passes the CLI post shape (kind stored as beat · no reply wait)', () => {
+    const row = loadRhythm(RHYTHM).rows.get('build')!;
+    const brief = renderPulseBrief({ window: '2026-11-27T02:00:00.000Z', phase: { phase: 'build', evidence: 'e' }, row, gaps: [{ metric: 'landed/h', space: 'TC', value: 3, target: '≥ 10' }], table: 't', phaseChanged: null, tablePath: '/x' });
+    const kind = /--kind (\S+)/.exec(brief)?.[1];
+    expect(kind).toBe('beat');
+    expect(resolvePostShape({ from: 'OP', to: 'TC', kind }, 'cli')).toEqual({ ok: true, kind: 'beat', cls: 'request', needsReply: false, rule: 'explicit' });
   });
 });
 

@@ -26,6 +26,8 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 // 오버플로 컨텍스트에 continuation 을 무작정 재주입하지 않도록 context-pressure bail 을 둔다.
 
 import { extractRecentUserText, runCoreTurn } from './run-core-turn.js';
+// ELN-PERSISTENCE-LADDER ③(§⑫ OP orders ELN-UNIVERSAL-AGENT-1124 · OP #144681) — 진척 판정 pure 모듈.
+import { EMPTY_PROGRESS_TOKENS, progressBeyondSignature, progressTokens, type ProgressTokens } from './goal-done-when.js';
 import type { CoreTurnContext, CoreTurnResult, CoreTurnStopReason } from './types.js';
 import { getToolLoopPhaseRejectedTools, TOOL_LOOP_MAX_TURNS_DEFAULT } from '../llm.js';
 import { DELEGATE_HINT, shouldHintDelegate } from '../agent/delegate-hint.js';
@@ -673,6 +675,8 @@ export async function runGoalLoop(
   let evidenceMismatchRetried = 0;
   let rejectedToolCompletionRetried = 0;
   let lastSig = '';
+  // ELN-PERSISTENCE-LADDER ③(§⑯) — 직전 턴 산물 토큰(진척 판정용).
+  let lastTokens: ProgressTokens = EMPTY_PROGRESS_TOKENS;
   let lastInputTokens = 0;
   let delegateHinted = false;
   let toolCallsThisIteration = 0;
@@ -1759,8 +1763,11 @@ export async function runGoalLoop(
     }
 
     // ⑥ spin 감지(ref lazycodex rail#5) — 직전 턴과 동일 tool 시그니처가 반복되면 무진전.
+    //    ELN-PERSISTENCE-LADDER ③(§⑫): 턴 상한 끊음은 «진척 없음» 기준만 — 진척 = 새 파일·새 근거·새 산출.
+    //    같은 시그니처여도 progressBeyondSignature 가 새 산물을 보면 noProgress 를 리셋하고 이어 돈다.
     const sig = toolCallSignature(turnNewMessages);
-    if (sig !== '' && sig === lastSig) {
+    const tokens = progressTokens(turnNewMessages);
+    if (sig !== '' && sig === lastSig && !progressBeyondSignature(lastTokens, tokens)) {
       noProgress += 1;
       debug.log('goal.loop', 'no-progress-tick', { sessionId: ctx.sessionId, ...runAttribution, iteration: iterations, noProgress }, { level: 'debug' });
       if (noProgress >= noProgressLimit) {
@@ -1771,6 +1778,7 @@ export async function runGoalLoop(
       noProgress = 0;
     }
     lastSig = sig;
+    lastTokens = tokens;
 
     // ⑦ 도구를 썼지만 완료 신호가 없음 = 진행 중 → continuation 재주입 후 다음 반복.
     //    다음이 마지막 반복이면 «최종 보고 한 번» 줄을 붙인다(TUI-GOAL-INTERIM-QUIET).

@@ -1,4 +1,17 @@
 # SIM-WORLD ta pack — rows { id, module } filled by the ta hand (SIM-WORLD §2 · contract seat-state/TC/SIM-KERNEL-API.md).
+# TA-GP* = goal policy (대표 11-27 12:2x): policy-aware authoring · precheck before launch · revise after the first implementation.
 schema: 1
 world: ta
-scenarios: []
+scenarios:
+  - { id: TA-GP1, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
+  - { id: TA-GP2, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
+  - { id: TA-GP3, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
+  - { id: TA-GP4, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
+  - { id: TA-GP5, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
+  - { id: TA-GP6, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
+  - { id: TA-GP7, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
+  - { id: TA-GP8, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
+  - { id: TA-GP9, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
+  - { id: TA-GP10, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
+  - { id: TA-GP11, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
+  - { id: TA-GP12, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }

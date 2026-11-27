@@ -10,13 +10,12 @@
 //    regenerates WORLD-NOW.md from the same facts.
 // Faces: observe = `op-world` debug rows (facts missing · chars) · judge = the block itself · heal = every reader fails
 //    open to «unknown»; the block never throws into a turn.
-import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { coachCursorPath, coachDelta, coachLedgerPath, readCoachActions, readCoachCursor, writeCoachCursor, type CoachDelta } from './coach-ledger.js';
 
-export const WORLD_MAX_LINES = 40;
+export const WORLD_MAX_LINES = 64;
 export const WORLD_TARGET = { landedPerH: 10, greenPerH: 10 } as const;
 
 export interface WorldFacts {
@@ -27,6 +26,8 @@ export interface WorldFacts {
   rate: { landed1h: number | null; green1h: number | null } | null;
   handsOpen: number | null;
   coach: CoachDelta | null;
+  /** OP-WORLD-LENS — the world card lines (world-lens.ts · cached) · absent = not collected. */
+  lens?: string[] | null;
 }
 
 const UNKNOWN = 'unknown';
@@ -86,6 +87,8 @@ export function renderWorldBlock(f: WorldFacts, now: Date, tzOffsetMin: number =
       lines.push(`  ${a.fresh ? 'NEW ' : ''}${t(a.at)} ${a.by}: ${one(a.what, 140)}${a.why ? ` — why: ${one(a.why, 80)}` : ''}${a.next ? ` — next: ${one(a.next, 80)}` : ''}`);
     }
   }
+  // OP-WORLD-LENS — the ledger-driven card rides after the coach lines (its own line cap stays inside the block cap).
+  if (f.lens && f.lens.length) lines.push(...f.lens);
   return lines.slice(0, WORLD_MAX_LINES).join('\n');
 }
 
@@ -100,6 +103,8 @@ export interface WorldDeps {
   seat?: string;
   /** Advance the seat's coach cursor after reading (a turn did see the delta). */
   advanceCursor?: boolean;
+  /** Include the OP world card (cached · world-lens.ts). Default: only for the live roots (no explicit instanceRoot). */
+  withLens?: boolean;
   coachCap?: number;
 }
 
@@ -193,13 +198,19 @@ function readOrg(hqRoot: string): WorldFacts['org'] {
   } catch { return null; }
 }
 
-function readLanded1h(repoRoot: string | undefined, now: Date): number | null {
-  if (!repoRoot) return null;
+/** Lands in the last hour — first-parent main «(#N)» through `gitLandFacts`, the same source as `eln fed kpi` (a bulletin
+ *  read «main 착지 0» from another window while 7 had landed · 11-27). null = no git dir. */
+function readLanded1h(gitDir: string, now: Date): number | null {
   try {
-    const out = spawnSync('git', ['-C', repoRoot, 'log', 'origin/main', `--since=${new Date(now.getTime() - 3_600_000).toISOString()}`, '--format=%s'], { encoding: 'utf8', timeout: 3_000 });
-    if (out.status !== 0) return null;
-    return out.stdout.split('\n').filter(l => /\(#\d+\)\s*$/u.test(l)).length;
+    if (!existsSync(gitDir)) return null;
+    const { gitLandFacts } = req<typeof import('../fed-state/kpi.js')>('../fed-state/kpi.js');
+    return new Set(gitLandFacts(new Date(now.getTime() - 3_600_000), now, gitDir).map(f => f.ref)).size;
   } catch { return null; }
+}
+
+function gitDirOf(repoRoot: string | undefined, hqRoot: string): string {
+  if (repoRoot) return existsSync(join(repoRoot, '.git')) ? join(repoRoot, '.git') : repoRoot;
+  return process.env.ELANOUS_FED_GIT_DIR || join(hqRoot, 'repo.git');
 }
 
 function readHandsOpen(now: Date): number | null {
@@ -218,9 +229,6 @@ function defaultInstanceRoot(): string | null {
 }
 function defaultLedgerRoot(): string | undefined {
   try { return req<typeof import('../instance/resolve.js')>('../instance/resolve.js').releaseLedgerRoot(); } catch { return undefined; }
-}
-function defaultRepoRoot(): string | undefined {
-  try { return req<typeof import('../domains/schedule-registry.js')>('../domains/schedule-registry.js').repoRoot(); } catch { return undefined; }
 }
 export function defaultHqRoot(): string { return join(homedir(), 'elanous-hq'); }
 
@@ -244,7 +252,12 @@ export function collectWorldFacts(deps: WorldDeps = {}): WorldFacts {
   const ledgerRoot = deps.ledgerRoot ?? defaultLedgerRoot();
   const release = readRelease(hqRoot, ledgerRoot);
   const { board, green1h } = release ? readBoard(release.version, ledgerRoot, now) : { board: null, green1h: null };
-  const landed1h = readLanded1h(deps.repoRoot ?? defaultRepoRoot(), now);
+  const landed1h = readLanded1h(gitDirOf(deps.repoRoot, hqRoot), now);
+  let lens: string[] | null | undefined;
+  if (deps.withLens ?? deps.instanceRoot === undefined) {
+    try { lens = req<typeof import('./world-lens.js')>('./world-lens.js').lensLinesForTurn(instanceRoot, deps.seat ?? 'OP', now, deps.advanceCursor ?? false); }
+    catch { lens = null; }
+  }
   return {
     release, board,
     graph: instanceRoot ? readGraph(instanceRoot, release?.version ?? null) : null,
@@ -252,6 +265,7 @@ export function collectWorldFacts(deps: WorldDeps = {}): WorldFacts {
     rate: landed1h === null && green1h === null ? null : { landed1h, green1h },
     handsOpen: readHandsOpen(now),
     coach: readCoach(instanceRoot, deps.seat ?? 'OP', deps.advanceCursor ?? false, deps.coachCap ?? 5),
+    ...(lens !== undefined ? { lens } : {}),
   };
 }
 

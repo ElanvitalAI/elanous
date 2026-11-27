@@ -68,6 +68,8 @@ export interface NextTuiQueueItem {
   readonly urgent?: boolean;
   /** QUEUE-FINISH-FIRST: the mail's class from its structured ledger fields (intent · origin · crown) — set at enqueue. */
   readonly mailClass?: 'P0' | 'P1' | 'P2';
+  /** CLAUDE-OP-PROXY-LANE — 0 = crown / a person · 1 = the CEO's proxy · absent = the rest (order inside the notices). */
+  readonly mailRank?: 0 | 1;
   /** QUEUE-P1-3MIN: the mail's structured intent (request · decision · info · alert) — a decision joins at once. */
   readonly mailIntent?: string;
   readonly mailKind?: string;
@@ -159,6 +161,8 @@ export interface NextTuiQueueNoticeEntry {
   readonly passive?: boolean;
   readonly digest?: string;
   readonly mailClass?: 'P0' | 'P1' | 'P2';
+  /** CLAUDE-OP-PROXY-LANE — 0 = crown / a person · 1 = the CEO's proxy · absent = the rest (order inside the notices). */
+  readonly mailRank?: 0 | 1;
   readonly mailIntent?: string;
   readonly mailKind?: string;
   readonly replyTo?: number;

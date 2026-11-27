@@ -19,3 +19,13 @@ scenarios:
   - { id: SB3, module: src/ux-sim/sim-world/graph/schedule-devices.ts }
   - { id: SB4, module: src/ux-sim/sim-world/graph/schedule-devices.ts }
   - { id: SB5, module: src/ux-sim/sim-world/graph/schedule-devices.ts }
+  - { id: LA3-EQUIV, module: src/ux-sim/sim-world/graph/loop-agent-v3.ts }
+  - { id: LA3-POLICY, module: src/ux-sim/sim-world/graph/loop-agent-v3.ts }
+  - { id: LA3-REFUSE, module: src/ux-sim/sim-world/graph/loop-agent-v3.ts }
+  - { id: LA3-EDGE, module: src/ux-sim/sim-world/graph/loop-agent-v3.ts }
+  - { id: LA3-PORTABLE, module: src/ux-sim/sim-world/graph/loop-agent-v3.ts }
+  - { id: LA3S-FASTER, module: src/ux-sim/sim-world/graph/loop-agent-v3-smart.ts }
+  - { id: LA3S-DEDUPE, module: src/ux-sim/sim-world/graph/loop-agent-v3-smart.ts }
+  - { id: LA3S-LLM, module: src/ux-sim/sim-world/graph/loop-agent-v3-smart.ts }
+  - { id: LA3S-POLICY, module: src/ux-sim/sim-world/graph/loop-agent-v3-smart.ts }
+  - { id: LA3S-AGENTS, module: src/ux-sim/sim-world/graph/loop-agent-v3-smart.ts }

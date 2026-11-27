@@ -24,12 +24,12 @@ export interface LiveReadings {
   readonly greenPerHour: readonly number[] | null;
   readonly hands: readonly Hand[] | null;
   readonly hosts: readonly HostMeasure[] | null;
-  readonly measures: Partial<Record<'Hands' | 'Review' | 'Pregate' | 'Judge' | 'Land', LaneMeasure>>;
+  readonly measures: Partial<Record<'Hands' | 'Review' | 'Pregate' | 'Veto' | 'Land', LaneMeasure>>;
   readonly landTarget: number;
   readonly gaps: readonly string[];
   readonly events: readonly { at: string; text: string }[];
   /** Test universe only: the synthetic forecast the «all resources» driver writes (burst-allin.ts). */
-  readonly synthetic?: { lanes?: Partial<Record<'Hands' | 'Review' | 'Pregate' | 'Judge' | 'Land', { queue: number | null; waitMin: number | null }>>; deadline: string; forecast: string; forecastOk: boolean; forecastWas?: string; landedPerHour: readonly number[] } | null;
+  readonly synthetic?: { lanes?: Partial<Record<'Hands' | 'Review' | 'Pregate' | 'Veto' | 'Land', { queue: number | null; waitMin: number | null }>>; deadline: string; forecast: string; forecastOk: boolean; forecastWas?: string; landedPerHour: readonly number[] } | null;
 }
 
 const hhmm = (d: Date): string => `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
@@ -52,7 +52,7 @@ export function liveSnapshot(r: LiveReadings, tick: number): BurstBoardSnapshot 
   const syn = r.synthetic ?? null;
   // Test universe: lanes the real probes leave unmeasured start from 0 so the burst's own steps show (queue/wait = synthetic).
   const measures: LiveReadings['measures'] = { ...r.measures };
-  if (syn) for (const label of ['Hands', 'Review', 'Pregate', 'Judge', 'Land'] as const) {
+  if (syn) for (const label of ['Hands', 'Review', 'Pregate', 'Veto', 'Land'] as const) {
     const m = measures[label];
     const sl = syn.lanes?.[label];
     measures[label] = { ...(m ?? { queue: null, waitMin: null }), base: m?.base ?? 0, ...(sl ? { queue: sl.queue, waitMin: sl.waitMin } : {}) } as LaneMeasure;
@@ -69,6 +69,17 @@ export function liveSnapshot(r: LiveReadings, tick: number): BurstBoardSnapshot 
 }
 
 const short = (e: unknown): string => (e instanceof Error ? e.message : String(e)).split('\n')[0]!.slice(0, 60);
+
+/** Active JUD vetoes on the land graph (holds by the veto owner) — the board's «Veto» lane (JUD-RELAX: veto only). null = unread. */
+export function liveVetoCount(): number | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { holdVerdict, readHolds } = require('../../../land-graph/land-graph.js') as typeof import('../../../land-graph/land-graph.js');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { effectiveInstanceRoot } = require('../../../instance/resolve.js') as typeof import('../../../instance/resolve.js');
+    return Object.values(readHolds(effectiveInstanceRoot())).filter(h => holdVerdict(h).block !== null).length;
+  } catch { return null; }
+}
 
 /** Read every live source once (slow: one git fetch inside the pulse measure). */
 export async function readLiveSources(opts: { seatState?: string; now?: Date } = {}): Promise<LiveReadings> {
@@ -112,7 +123,7 @@ export async function readLiveSources(opts: { seatState?: string; now?: Date } =
       ...(extra.hosts ? { hosts: extra.hosts } : {}),
     });
     measures.Hands = { queue: extra.readyBacklog, waitMin: null, base: handsN };
-    measures.Judge = { queue: measure.judgeQueue, waitMin: measure.judgeWaitMedianMin, base: null };
+    measures.Veto = { queue: liveVetoCount(), waitMin: null, base: null };
     measures.Review = { queue: null, waitMin: extra.reviewWaitMin, base: null };
     measures.Pregate = { queue: null, waitMin: extra.gateWaitMin, base: null };
     measures.Land = { queue: extra.landQueue, waitMin: null, base: null };

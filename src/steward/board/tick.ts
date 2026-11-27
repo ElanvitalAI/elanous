@@ -8,13 +8,14 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, appendF
 import { dirname, join } from 'node:path';
 import type { PulsePhase } from '../../loops/op-pulse.js';
 import {
-  boardHealth, breaches, cmpVersion, cardsAllowed, cutList, digestLine, leaderWrite, nextBoard, rankBoard,
+  boardHealth, breaches, cmpVersion, cardsAllowed, cutList, digestLine, leaderWrite, needsSpecCells, needsSpecLine, nextBoard, rankBoard,
   type BoardCellIn, type CutList, type HandIn, type OrderLedger,
 } from './model.js';
 
 export const BOARD_ACTOR = 'steward:BOARD';
 
-export interface BoardState { version: string | null; published: string[]; cards: Array<{ at: number; key: string }>; lastPhase: PulsePhase | null }
+/** `needsSpec` = the needs-spec set last sent to the owner (sorted ids joined by ','; '' = none) — the digest dedupe key. */
+export interface BoardState { version: string | null; published: string[]; cards: Array<{ at: number; key: string }>; lastPhase: PulsePhase | null; needsSpec?: string }
 
 export interface BoardDeps {
   readonly dir: string; // <root>/steward/board (live) or a shadow dir
@@ -39,6 +40,8 @@ export interface BoardDeps {
   /** Scratch board for ops synthetic events: only then are `synthetic`-tagged cells read. A real board never sees them. */
   readonly synthetic?: boolean;
   readonly card: (line: string, to: string) => void;
+  /** POOL-PULL-NEEDS-SPEC: policy `pull.requireDoneWhen` (graphs/policies/seat-assign.yaml). Absent = false (no needs-spec line). */
+  readonly requireDoneWhen?: () => boolean;
 }
 
 export interface BoardTickResult {
@@ -54,6 +57,8 @@ export interface BoardTickResult {
   readonly cards: readonly string[];
   readonly digest: string;
   readonly owner: string;
+  /** Open unowned cells without a done-when (empty when the policy is off). */
+  readonly needsSpec: readonly string[];
 }
 
 const statePath = (dir: string): string => join(dir, 'board-state.json');
@@ -65,7 +70,8 @@ function atomic(path: string, text: string): void { mkdirSync(dirname(path), { r
 export function readBoardState(dir: string): BoardState {
   try {
     const raw = JSON.parse(readFileSync(statePath(dir), 'utf8')) as Partial<BoardState>;
-    return { version: raw.version ?? null, published: Array.isArray(raw.published) ? raw.published : [], cards: Array.isArray(raw.cards) ? raw.cards : [], lastPhase: raw.lastPhase ?? null };
+    return { version: raw.version ?? null, published: Array.isArray(raw.published) ? raw.published : [], cards: Array.isArray(raw.cards) ? raw.cards : [], lastPhase: raw.lastPhase ?? null,
+      ...(typeof raw.needsSpec === 'string' ? { needsSpec: raw.needsSpec } : {}) };
   } catch { return { version: null, published: [], cards: [], lastPhase: null }; }
 }
 
@@ -109,14 +115,28 @@ export function boardTick(deps: BoardDeps): BoardTickResult {
     if (deps.live) deps.card(line, owner);
     cards.push(line); state.cards.push({ at: nowMs, key: b.key });
   }
+  // POOL-PULL-NEEDS-SPEC: the needs-spec set goes to the owner once per changed set (same set → not re-sent each tick).
+  let requireDoneWhen = false;
+  try { requireDoneWhen = deps.requireDoneWhen?.() === true; } catch { requireDoneWhen = false; }
+  const needsSpec = requireDoneWhen ? needsSpecCells(cells) : [];
+  const specKey = needsSpec.join(',');
+  if (specKey !== (state.needsSpec ?? '')) {
+    if (needsSpec.length) {
+      const line = `[BOARD 행정관] ${needsSpecLine(needsSpec)}`;
+      if (deps.live) deps.card(line, owner);
+      cards.push(line);
+    }
+    state.needsSpec = specKey;
+  }
   state.cards = state.cards.filter((c) => nowMs - c.at < 60 * 60_000);
   state.version = version; state.lastPhase = phase;
   atomic(statePath(deps.dir), `${JSON.stringify(state)}\n`);
-  const digest = digestLine({ phase, version, order, health, cut });
+  const digest = digestLine({ phase, version, order, health, cut }) + (needsSpec.length ? ` · needs-spec ${needsSpec.length}` : '');
   mkdirSync(deps.dir, { recursive: true });
   appendFileSync(digestPath(deps.dir), `${JSON.stringify({ at: now.toISOString(), owner, live: deps.live, digest, order: order.slice(0, 10), spaces: health.spaces, blocked: health.blocked.length,
-    wip: health.wip.map((w) => ({ seat: w.seat, held: w.held })), returned: returned.length, leaderFlag: leader.flagged ? leader.by : null, cards: cards.length, opened: opened?.version ?? null })}\n`);
-  return { outcome: 'ok', live: deps.live, version, phase, order, cut, opened, returned, leaderFlag: leader.flagged ? leader.by : null, cards, digest, owner };
+    wip: health.wip.map((w) => ({ seat: w.seat, held: w.held })), returned: returned.length, leaderFlag: leader.flagged ? leader.by : null, cards: cards.length, opened: opened?.version ?? null,
+    ...(needsSpec.length ? { needsSpec: needsSpec.slice(0, 50) } : {}) })}\n`);
+  return { outcome: 'ok', live: deps.live, version, phase, order, cut, opened, returned, leaderFlag: leader.flagged ? leader.by : null, cards, digest, owner, needsSpec };
 }
 
 export function readCutList(dir: string, version: string): CutList | null {

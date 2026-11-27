@@ -79,6 +79,11 @@ export interface ChildPluginRuntimeOptions {
   graphDeps?: GraphRunOptions['deps'];
   /** Fake model for the isolated default graph route; production uses the CLI model provider. */
   graphPrompt?: (prompt: string) => Promise<string>;
+  /** APP-BUILD-LOCAL-PATH — local hosts (Next TUI · agent CLI) only: app_build without a member connection
+   *  builds in a workspace under this directory. The daemon never sets it. */
+  localAppBuildCwd?: () => string;
+  /** Test seam for the local app build. */
+  localAppBuild?: (args: Record<string, unknown>) => Promise<unknown>;
   /** Safe run-scoped progress for the owning Next TUI; raw runner diagnostics stay private. */
   observeGraphProgress?: (event: GraphProgressObservation) => void;
 }
@@ -282,6 +287,10 @@ export function createChildPluginRoutes(options: ChildPluginRuntimeOptions = {})
     requestConfirmation: options.requestConfirmation
       ?? (options.requestDecision ? async (prompt: string) => (await options.requestDecision!(prompt)).approved : undefined),
     getDispatchContext: dispatchContext,
+    ...(options.localAppBuild || options.localAppBuildCwd ? { localAppBuild: options.localAppBuild ?? (async (args: Record<string, unknown>) => {
+      const { runLocalAppBuild } = await import('../graph-runner/app-build/local-build.js');
+      return runLocalAppBuild({ ask: String(args.ask), capabilities: args.capabilities, cwd: options.localAppBuildCwd!() });
+    }) } : {}),
   });
   const hostTools = routes.hostTools(host.hostLLMTools());
   return {

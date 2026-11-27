@@ -129,6 +129,7 @@ describe('reduce keeps the source records', () => {
     expect(sourcesSection([])).toBe('');
     expect(withoutSources(out)).toBe('브리핑 본문');
     expect(withoutSources('no list')).toBe('no list');
+    expect(withoutSources('본문 (https://a.example/x)\n\n### Sources\n1. Reuters · https://r.example')).toBe('본문 (https://a.example/x)');
   });
   test('a run carries desk records into the final result; the dead desk\'s text never reaches the reduce', async () => {
     const seen: string[] = [];

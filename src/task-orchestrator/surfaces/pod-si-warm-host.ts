@@ -10,7 +10,7 @@ import { runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js'
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { debug } from '../../debug/log.js';
 import { getUserConfig } from '../../user-config.js';
-import { normalizeFallbackChain } from '../../oauth/fallback-chain.js';
+import { effectiveFallbackChain, normalizeFallbackChain } from '../../oauth/fallback-chain.js';
 import { classifyPodTerminal, applyPodTerminal, podTerminalPrBody,
   type PrTerminalRecord } from '../../self-dev/draft-residue.js';
 import type { SiWarmCommand, SiWarmReply, SiWarmReturnedBytes } from './pod-si-warm-protocol.js';
@@ -240,11 +240,15 @@ export function siWarmPayload(input: ChildInput, options: PodSpawnOptions, runId
 
 /** Carry the same normalized child fallback config as a fresh Pod Job. configuredProvider is required to preserve provider-derived defaults. */
 export function siWarmFallbackFiles(raw: unknown, grok: { grokAuth?: string; grokApiKey?: string } | null,
-  configuredProvider: string | undefined):
+  configuredProvider: string | undefined, decidedChain?: readonly string[]):
   Record<string, string> {
-  // The fixed warm runner only carries Codex accounts and optional Grok credentials.
-  const available = normalizeFallbackChain(raw, configuredProvider).chain.filter(step =>
-    step === 'codex-rotate' || (step === 'grok' && !!(grok?.grokAuth || grok?.grokApiKey)));
+  // The fixed warm runner only carries Codex accounts and optional Grok credentials. LLM-ACCOUNT-POLICY-WIRING: the
+  // caller's policy-applied chain (effectiveFallbackChain) when given — the same chain a fresh Pod Job carries.
+  const carryable = (step: string) => step === 'codex-rotate' || (step === 'grok' && !!(grok?.grokAuth || grok?.grokApiKey));
+  // A policy chain with a step the warm runner cannot carry (codex-credits · openrouter · zai · grok without a credential)
+  // goes to the cold Job path whole — never a warm run with a truncated chain.
+  if (decidedChain && !decidedChain.every(carryable)) throw new Error('policy chain has steps the warm runner cannot carry');
+  const available = (decidedChain ?? normalizeFallbackChain(raw, configuredProvider).chain).filter(carryable);
   // A configured chain with no carryable provider cannot enter the warm worker.
   // Its caller catches this before acquiring a lease and uses the cold Job path.
   if (available.length === 0) throw new Error('no carryable warm fallback provider');
@@ -260,6 +264,10 @@ export function siWarmExecutionKey(input: ChildInput, runId: string): string {
     feature: input.feature, base: input.base, autoMerge: input.autoMerge,
     autoReview: input.autoReview, openPr: input.openPr, draft: input.draft })).digest('hex');
 }
+
+/** The lease/launch boundary (pod-si-warm-provider) — swapped only by tests and sims (everything before it is real). */
+let warmLease: typeof acquireSiWarmLease = acquireSiWarmLease;
+export function _setSiWarmLeaseForTesting(fn: typeof acquireSiWarmLease | null): void { warmLease = fn ?? acquireSiWarmLease; }
 
 /** Host-owned private input builder. A preparation failure happens before any Pod exec or lease. */
 export async function acquireSiWarmChild(input: ChildInput, options: PodSpawnOptions): Promise<SiWarmAcquireResult> {
@@ -285,7 +293,8 @@ export async function acquireSiWarmChild(input: ChildInput, options: PodSpawnOpt
       ? [plannedAccount, ...rotation!.filter(name => name !== plannedAccount)] : undefined;
     const credentials = (options.credentials ?? hostCredentials)(plannedAccount);
     const deadlineMs = (options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS) * 1000;
-    const fallback = normalizeFallbackChain(config.llm.fallbackChain, config.llm.provider).chain;
+    const effective = effectiveFallbackChain(config.llm.fallbackChain, config.llm.provider);
+    const fallback = effective.chain;
     let grok: { grokAuth?: string; grokApiKey?: string } | null = null;
     if (fallback.includes('grok')) {
       try { grok = hostGrokCredentials({ minValidityMs: deadlineMs,
@@ -301,7 +310,8 @@ export async function acquireSiWarmChild(input: ChildInput, options: PodSpawnOpt
         : { 'elanous-auth.json': credentials.elanousAuth,
           'codex-auth.json': credentials.codexAuth }),
       'gh-token': credentials.ghToken,
-      ...siWarmFallbackFiles(config.llm.fallbackChain, grok, config.llm.provider) },
+      // Only a POLICY chain must be carried whole (else cold); without a pack the old behavior stands (carryable steps).
+      ...siWarmFallbackFiles(config.llm.fallbackChain, grok, config.llm.provider, effective.source === 'policy-pack' ? fallback : undefined) },
     ...(accounts ? { accounts } : {}) };
     const payload = Buffer.from(JSON.stringify(siWarmPayload(pinnedInput, options, runId)));
     const credentialBundle = Buffer.from(JSON.stringify(bundle));
@@ -315,5 +325,5 @@ export async function acquireSiWarmChild(input: ChildInput, options: PodSpawnOpt
     }, { level: 'warn' });
     return { status: 'no-entry', reason: 'invalid-input' };
   }
-  return acquireSiWarmLease(prepared);
+  return warmLease(prepared);
 }

@@ -78,9 +78,14 @@ export function registerMsgHandCommands(msg: Command, deps: MsgHandCliDeps): voi
         if (target === 'beacon') {
           // BEACON-LADDER — the OP steward watcher's rule, one shot (the steward HQ tick runs the same call).
           const { liveDormantSeats } = await import('../steward/space/tick.js');
+          const { sweepDormantUnanswered, sweepLoopHandSla } = await import('../kit/mail-route/dormant-watch.js');
+          // GUARDIAN-HAND-SLA — first, as the steward HQ tick does: loop-agent ✋ past their SLA back to the domain owner.
+          const loopSla = sweepLoopHandSla(store, { hq: ladder.hq, log: (event, data) => { try { debug.log('msg', event, data); } catch { /* fail-open */ } } });
           const report = ladderModule.beaconHands(store, { ...ladderDeps, dormantSeats: liveDormantSeats() });
-          if (opts.json) out.log(JSON.stringify(report));
-          else { out.log(ladderModule.beaconLine(report)); for (const f of report.fired) out.log(`beacon ✋ #${f.leadId} ${f.seat}@${f.leader} → #${f.cardId}: ${f.why}`); }
+          // DORMANT-SEAT-ROUTE — the same one shot: rerouted dormant-seat mail unanswered for 10 min → one OP card.
+          const dormant = sweepDormantUnanswered(store, { log: (event, data) => { try { debug.log('msg', event, data); } catch { /* fail-open */ } } });
+          if (opts.json) out.log(JSON.stringify({ ...report, dormant, loopSla }));
+          else { out.log(loopSla.line); out.log(ladderModule.beaconLine(report)); for (const f of report.fired) out.log(`beacon ✋ #${f.leadId} ${f.seat}@${f.leader} → #${f.cardId}: ${f.why}`); out.log(dormant.line); }
           return;
         }
         if (target === 'board') {
@@ -101,6 +106,8 @@ export function registerMsgHandCommands(msg: Command, deps: MsgHandCliDeps): voi
         if (!ladderModule.HAND_ACTIONS.includes(verb as never)) throw new Error('hand: action must be resolve, reject or escalate');
         const result = ladderModule.applyHandOutcome(store, { msgId, action: verb as import('../msg/hand-raise-ladder.js').HandAction, text: (textParts ?? []).join(' '), via: 'cli',
           ...(opts.from ? { actor: opts.from } : {}), ...(opts.owner ? { owner: opts.owner } : {}), ...(opts.deadline ? { deadline: opts.deadline } : {}) }, ladderDeps);
+        // FED-FACT-OP-ACTIONS — a ✋ outcome is a decision by the seat that gave it. Fail-open.
+        if (result.by) (await import('../fed-state/actions.js')).recordAction({ kind: 'decision', verb: verb, by: result.by, to: result.to, ref: `msg:${result.msgId}`, source: 'msg-hand' });
         out.log(opts.json ? JSON.stringify(result) : result.output);
       } catch (error) {
         out.error(`msg hand: ${error instanceof Error ? error.message : String(error)}`);

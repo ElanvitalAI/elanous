@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { requestEls } from '../els/client.js';
 import { elsSocketPath } from '../els/server.js';
@@ -25,11 +25,12 @@ async function registerOpSeat(root: string): Promise<void> {
 test('real terminal: «+» opens the new-tab name dialog; typing never reaches the pane; Ctrl+C clears, Esc cancels (tab count unchanged), Enter makes a tab with that title', async () => {
   const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-newtab-'));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
   const socket = elsSocketPath(root);
   const view = { executable: process.execPath, args: [BIN, '--test-state-dir', '{root}', 'side'], root, rows: 30, cols: 100, env: { SHELL: '/bin/sh', NODE_ENV: 'development' } };
   const shellShown = (screen: string): boolean => screen.split('\n').some((line) => line.includes('│') && line.includes('$'));
   const tabRow = (screen: string): string => screen.split('\n')[0] ?? '';
-  const dialogVisible = (screen: string): boolean => screen.includes('┌ New tab');
+  const dialogVisible = (screen: string): boolean => screen.includes('새 탭 이름');
   const titles = async (): Promise<string[]> => (JSON.parse((await requestEls(socket, { op: 'ls' })).message) as { panes: { title: string }[] }).panes.map((pane) => pane.title);
   // The first view starts the server and shows where the «+» is (1-based cell column: wide glyphs count two).
   const first = await mockSeatPtySequence({ ...view, ready: { label: 'first-screen', timeoutMs: 30_000, until: shellShown }, steps: [{ label: 'looked', text: '', until: 'new · menu', timeoutMs: 15_000 }], quitKeys: '\u0002q' }); // 출처: #37153 live PTY readiness bound; 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
@@ -72,6 +73,7 @@ test('real terminal: «+» opens the new-tab name dialog; typing never reaches t
     ],
     quitKeys: '\u0002q',
   });
+  if (process.env.ELS_PTY_CAPTURE) writeFileSync(process.env.ELS_PTY_CAPTURE, JSON.stringify({ cancel: cancel.frames, save: save.frames }, null, 2));
   expect(save.exitCode).toBe(0);
   expect(await titles()).toContain('새탭A');
   expect((await titles()).length).toBe(2);

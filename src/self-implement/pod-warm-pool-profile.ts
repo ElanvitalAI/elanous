@@ -1,3 +1,7 @@
+import { resourceFacts } from '../kit/resource-facts/facts.js';
+import { DEFAULT_HOSTS } from '../kit/resource-facts/defaults.js';
+import type { ResourceFacts } from '../kit/resource-facts/types.js';
+
 /** Warm-pool profile labels select a host/tier allocation policy. */
 export const WARM_POOL_PROFILES = ['fixed', 'gate', 'landing', 'feature'] as const;
 export type WarmPoolProfile = (typeof WARM_POOL_PROFILES)[number];
@@ -47,19 +51,6 @@ export function deriveWarmPoolPhaseRatios(
 const CUT_LEDGER_PHASE_RATIOS = deriveWarmPoolPhaseRatios([
   { phase: 'cut', shardSeconds: 16_673.53 },
 ]);
-const STANDARD_HOST_MAX: Readonly<Record<string, number>> = {
-  'node-b': 16,
-  'node-c': 4,
-  'elangram-wsl': 5,
-  'host-e-wsl': 5,
-  'gcp1': 2,
-  'aws1': 2,
-  'aws2': 2,
-};
-
-// Only this host/tier pair has a measured lite allocation. Other pairs fail closed to zero.
-const LITE_HOST_MAX: Readonly<Record<string, number>> = { mbp: 7 };
-
 export function isWarmPoolProfile(value: unknown): value is WarmPoolProfile {
   return typeof value === 'string' && (WARM_POOL_PROFILES as readonly string[]).includes(value);
 }
@@ -94,14 +85,15 @@ export function resolveWarmPoolQuota(
   host: string,
   tier: WarmPoolTier,
   phaseRatios: WarmPoolPhaseRatios = CUT_LEDGER_PHASE_RATIOS,
+  facts: ResourceFacts = resourceFacts(),
 ): number {
   if (!isWarmPoolProfile(profile) || !host.trim()) return 0;
-  const cap = tier === 'lite'
-    ? (Object.hasOwn(LITE_HOST_MAX, host) ? LITE_HOST_MAX[host] : 0)
-    : tier === 'standard'
-      ? (Object.hasOwn(STANDARD_HOST_MAX, host) ? STANDARD_HOST_MAX[host] : 0)
-      : 0;
-  if (cap === 0 || profile === 'fixed') return cap;
+  if (DEFAULT_HOSTS.some(h => h.host === host && h.hq) || facts.hosts.some(h => h.host === host && h.hq)) return 0;
+  if (tier !== 'lite' && tier !== 'standard') return 0;
+  const quotas = facts.warmPoolQuotas;
+  const cap = quotas && Object.hasOwn(quotas, host) ? quotas[host]?.[tier] : undefined;
+  if (typeof cap !== 'number' || !Number.isSafeInteger(cap) || cap <= 0) return 0;
+  if (profile === 'fixed') return cap;
   const ratio = phaseRatios[profile];
   if (!Number.isFinite(ratio) || ratio < 0 || ratio > 1) return 0;
   return Math.floor(cap * ratio);

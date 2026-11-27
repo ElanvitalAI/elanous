@@ -1,0 +1,110 @@
+{
+  "schema": 1,
+  "entries": {
+    "llm-route/LR-CLAUDE-DOWN-TERRA": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "Claude ACP down (claude ✗) · team/third 95 % → review on Terra default"
+    },
+    "llm-route/LR-TERRA-OVERLOAD-GROK": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "Terra overload ×2 for the same review → grok (7 %)"
+    },
+    "llm-route/LR-TERRA-OVERLOAD-GROK-HOT": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "Terra overload ×2 but grok 75 % → no grok · waiver path with one 🚨"
+    },
+    "llm-route/LR-GROK-70-NEVER": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "grok at exactly 70 % is not a review fallback"
+    },
+    "llm-route/LR-GLM-NEVER-REVIEW": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "GLM never reviews — 40 random worlds per seed, everything else down in half of them"
+    },
+    "llm-route/LR-CODEX-95-DEFAULT": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "codex team/third 95 % → default account for review and hard work"
+    },
+    "llm-route/LR-ALL-CODEX-95-OPENROUTER": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "every codex ≥ 95 % · zai week 100 % → OpenRouter credits for work · review on grok (every Terra unavailable), never OpenRouter"
+    },
+    "llm-route/LR-POLICY-FIXED-VALUE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "a hardcoded expiry in ops tooling → policy class · rerouted · one card to the owner"
+    },
+    "llm-route/LR-EXPIRED-AUTH-REPAIR": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "expired auth → unhealthy · re-check auth + refresh attempted · repair budget spent → card"
+    },
+    "llm-route/LR-NO-LEASE-NEVER-STALL": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "spend guard «no-candidate (codex-default:no-lease)» on every codex route → compaction and work still get a route"
+    },
+    "llm-route/LR-NO-HOST-PIN": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "no route is pinned to a host; no skip reason names a host"
+    },
+    "llm-route/LR-FLAP-HYSTERESIS": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "terra default flaps fail/ok every minute for 30 min → at most 3 route switches"
+    },
+    "llm-route/LR-STALE-USAGE-REFRESH": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "usage snapshot 11 min old → one refresh, then decide on the fresh numbers"
+    },
+    "llm-route/LR-ALL-DOWN-ALARM-ONCE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "every provider failing → compaction still routed (cheapest) · 🚨 exactly once in 10 min"
+    },
+    "llm-route/LR-REVIEW-MERGE-BASE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "review requested on a PR with main merged → merge-base diff, no refusal"
+    },
+    "llm-route/LR-REVIEW-DELTA-OVER": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "delta over budget → full re-review (no refusal)"
+    },
+    "llm-route/LR-REVIEW-HEAD-MOVED": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "PR head moves mid-review → re-queue, the verdict is not recorded"
+    },
+    "llm-route/LR-TERRA-ALL-UNAVAILABLE-GROK": {
+      "expect": "green",
+      "greenSince": "2026-11-27 LLM-ROUTE-BY-GUARDIAN (this PR)",
+      "reason": "every Terra unavailable (team/third at cap · default not runnable) · Claude ✗ → grok at once (no 2 wasted calls) · 0 alarms"
+    },
+    "llm-route/LR-REVIEW-GIT-MERGE-BASE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 synthetic actual-git fixture",
+      "reason": "synthetic git merge-base and pure review helper; no production review invocation"
+    },
+    "llm-route/LR-REVIEW-GIT-RANGE-DIFF": {
+      "expect": "green",
+      "greenSince": "2026-11-27 synthetic actual-git fixture",
+      "reason": "synthetic git range-diff and pure review helper; no production review invocation"
+    },
+    "llm-route/LR-REVIEW-GIT-HEAD-MOVED": {
+      "expect": "green",
+      "greenSince": "2026-11-27 synthetic actual-git fixture",
+      "reason": "synthetic git head-moved and pure review helper; no production review invocation"
+    }
+  }
+}

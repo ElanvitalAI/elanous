@@ -9,6 +9,7 @@ import { appendPulseLedger, beatsForWindow, detectPhase, parseRhythm, pulseDue, 
 import { burstCourse, burstProposal, digestionRate, forecast, parseBurstConfig, planScale, pressures, startBurst, type BurstConfig, type BurstState,
   type Deadline, type ForecastRow, type HostSlots } from './op-pulse-burst.js';
 import { burstEntry, demandSurge, urgentCeoLines, type CeoLine, type DemandSignals } from './op-pulse-urgency.js';
+import { executeNextActions, needsOpTurn, planNextActions, renderNextActionBlock, type ActionResult, type NextActionState, type NextActuators } from './op-next-action.js';
 
 export interface PulseExtra {
   landed3hPerH: number | null; green3hPerH: number | null;
@@ -25,6 +26,14 @@ export interface PulseProbes {
   measure(now: Date): Promise<{ measure: PulseMeasure; extra: PulseExtra }>;
   /** Crown mails (id · crownDirective · refs · createdAt) since an ISO time. */
   crownMails(sinceIso: string, now: Date): Array<{ id: number; crownDirective?: string | null; refs?: readonly string[] | null; createdAt: string }>;
+  /** OP-NEXT-BEST-ACTION: the planner snapshot (absent = the planner does not run). */
+  nextActionState?(now: Date): Promise<NextActionState>;
+  /** Actuators for planner-owned actions (live stage only). */
+  nextActuators?(): NextActuators;
+  /** THROUGHPUT-CONTROLLER: one run (snapshot → binding constraint → lever; live = machine levers + board line) → its block. */
+  throughput?(now: Date, stage: string): Promise<string>;
+  /** OP-WORLD-LENS: the world card lines for the brief (absent/null = no card). */
+  worldCard?(now: Date): Promise<string[] | null>;
 }
 
 export interface PulsePathsIn { seatState: string; stateRoot: string; rhythmPath: string }
@@ -81,6 +90,8 @@ export interface PulseRunResult {
   burstStarted: BurstState | null;
   brief: string | null;
   tablePath: string;
+  /** OP-NEXT-BEST-ACTION results (empty when the planner is not wired). */
+  nextActions: ActionResult[];
 }
 
 /**
@@ -141,9 +152,30 @@ export async function runPulse(p: PulseProbes, input: PulsePathsIn & { window: s
   }
   const forecastLines = rows.map(r => `- 마감 ${r.label} ${r.at} · 남은 ${r.remaining} · 속도 ${r.ratePerH ?? '?'}/h · 예상 완료 ${r.projectedFinish ?? '측정 불가'} · 부족 ${r.shortfall}${r.preset ? ` · 권고 ${r.preset}` : ''}`);
   const fullTable = `${table}${forecastLines.length ? `\n예측:\n${forecastLines.join('\n')}\n` : ''}${burstLines.length ? `\n버스트:\n${burstLines.join('\n')}\n` : ''}`;
-  const needTurn = gaps.length > 0 || phaseChanged !== null || burstLines.length > 0;
+  // OP-NEXT-BEST-ACTION: plan from state, do the planner-owned actions now (live), hand the rest to the OP turn.
+  let nextActions: ActionResult[] = []; let nextBlock: string | null = null;
+  if (p.nextActionState) {
+    try {
+      const plan = planNextActions(await p.nextActionState(now));
+      nextActions = await executeNextActions(plan, p.nextActuators?.() ?? {}, input.stage);
+      nextBlock = renderNextActionBlock(nextActions, plan.goals, plan.mail);
+      appendPulseLedger(paths.nextLedger, { window: input.window, at: now.toISOString(), stage: input.stage, unmeasured: plan.unmeasured,
+        actions: nextActions.map(r => ({ rule: r.action.rule, actor: r.action.actor, key: r.action.key, status: r.status, what: r.action.what, evidence: r.evidence })) });
+    } catch (error) {
+      nextBlock = `## 다음 행동 (next-action planner)
+planner failed: ${(error instanceof Error ? error.message : String(error)).slice(0, 200)}`;
+    }
+  }
+  // THROUGHPUT-CONTROLLER (FEATURE-SHIP-ACCELERATION §1): the hour's binding constraint and its lever lead the block.
+  if (p.throughput) {
+    try { const tp = await p.throughput(now, input.stage); nextBlock = nextBlock ? `${tp}\n\n${nextBlock}` : tp; }
+    catch (error) { nextBlock = `## 처리량 제어 (throughput controller)\ncontroller failed: ${(error instanceof Error ? error.message : String(error)).slice(0, 200)}${nextBlock ? `\n\n${nextBlock}` : ''}`; }
+  }
+  const nextTurn = needsOpTurn(nextActions);
+  const needTurn = gaps.length > 0 || phaseChanged !== null || burstLines.length > 0 || nextTurn;
   mkdirSync(dirname(paths.table), { recursive: true });
-  appendFileSync(paths.table, needTurn ? `\n${fullTable}` : `\n- ${measure.at} · 국면 ${phase.phase} · 전부 초록 (착지 ${measure.landedPerH ?? '?'}/h · 초록 ${measure.greenPerH ?? '?'}/h) — OP 턴 없음\n`);
+  appendFileSync(paths.table, needTurn ? `\n${fullTable}` : `\n- ${measure.at} · 국면 ${phase.phase} · 전부 초록 (착지 ${measure.landedPerH ?? '?'}/h · 초록 ${measure.greenPerH ?? '?'}/h) — OP 턴 없음${measure.world ? ` · ${measure.world}` : ''}\n`);
+  if (nextBlock) appendFileSync(paths.table, `\n${nextBlock}\n`);
   // The cadence clock is anchored on the fire window, not on this measure: a retry of the same window (goal deadline →
   // backoff → re-measure) must not push the next beat out by deadline+backoff (11-25 rail 47: 30m cadence beat ~hourly).
   const windowMs = Date.parse(input.window);
@@ -152,11 +184,18 @@ export async function runPulse(p: PulseProbes, input: PulsePathsIn & { window: s
   const anchorMs = Number.isFinite(windowMs) && windowMs <= now.getTime() ? windowMs : now.getTime();
   const anchor = new Date(Number.isFinite(prevMs) && prevMs > anchorMs ? prevMs : anchorMs).toISOString();
   writePulseState(paths.state, { lastPulseAt: anchor, lastPhase: phase.phase });
-  const brief = needTurn ? `${renderPulseBrief({ window: input.window, phase, row, gaps, table: fullTable, phaseChanged, tablePath: paths.table })}${burstLines.length ? `\n\n버스트:\n${burstLines.join('\n')}` : ''}${forecastLines.length ? `\n\n예측:\n${forecastLines.join('\n')}` : ''}` : null;
+  const pulseBrief = gaps.length > 0 || phaseChanged !== null || burstLines.length > 0;
+  let world: string[] | null = null;
+  if (needTurn && p.worldCard) { try { world = await p.worldCard(now); } catch { world = null; } }
+  const briefCore = !needTurn ? null : !pulseBrief ? `[pulse ${input.window}] 국면: ${phase.phase}${world?.length ? `\n\n${world.join('\n')}` : ''}\n\n${nextBlock ?? ''}` : `${nextBlock ? `${nextBlock}\n\n` : ''}${renderPulseBrief({ window: input.window, phase, row, gaps, table: fullTable, phaseChanged, tablePath: paths.table, world })}${burstLines.length ? `\n\n버스트:\n${burstLines.join('\n')}` : ''}${forecastLines.length ? `\n\n예측:\n${forecastLines.join('\n')}` : ''}`;
+  // WORLD-REGISTRY — the OP turn always sees the world line (live · zombie · unregistered · no-owner).
+  const brief = briefCore && measure.world ? `${briefCore}\n\n${measure.world}` : briefCore;
   appendPulseLedger(paths.ledger, { window: input.window, at: now.toISOString(), stage: input.stage, phase: phase.phase, gaps: gaps.length, outcome: needTurn ? 'turn' : 'green',
     entry: entry?.trigger ?? null, burst: active?.id ?? null });
   if (!needTurn) appendPulseLedger(paths.ledger, { goal: 'met', window: input.window, by: 'all-green' });
-  return { outcome: needTurn ? 'turn' : 'green', phase, phaseChanged, gaps, forecast: rows, entry, burstStarted, brief, tablePath: paths.table };
+  // A turn opened only for the next action has no leader beats to verify — the action line is its goal.
+  else if (!pulseBrief) appendPulseLedger(paths.ledger, { goal: 'met', window: input.window, by: 'next-action' });
+  return { outcome: needTurn ? 'turn' : 'green', phase, phaseChanged, gaps, forecast: rows, entry, burstStarted, brief, tablePath: paths.table, nextActions };
 }
 
 /** The turn step: live → the pulse inbox (the OP TUI opens one origin-`pulse` turn); shadow → a receipt only. */

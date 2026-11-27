@@ -22,13 +22,13 @@ describe('widget registry', () => {
     expect(w.ok && w.command.some((x) => /test-universe|all-in|prewarm/.test(x))).toBe(false);
   });
   test('unknown widget and a missing fed-board script are refusals with a reason', () => {
-    expect(widgetLaunch('nope', {})).toEqual({ ok: false, reason: 'unknown widget «nope» — one of: burst-board, fed-board, invest-board, release-board' });
+    expect(widgetLaunch('nope', {})).toEqual({ ok: false, reason: 'unknown widget «nope» — one of: burst-board, fed-board, invest-board, release-board, obsidian, files' });
     const home = mkdtempSync(join(tmpdir(), 'wh-'));
     expect(widgetLaunch('fed-board', { HOME: home })).toMatchObject({ ok: false });
     mkdirSync(join(home, 'elanous-hq', 'seat-state', 'OPS', 'tools'), { recursive: true });
     writeFileSync(join(home, 'elanous-hq', 'seat-state', 'OPS', 'tools', 'fed-board.sh'), '#!/bin/zsh\n');
     expect(widgetLaunch('fed-board', { HOME: home })).toEqual({ ok: true, name: 'fed-board', title: '▦ fed-board', command: ['zsh', join(home, 'elanous-hq', 'seat-state', 'OPS', 'tools', 'fed-board.sh')] });
-    expect(widgetListing({ HOME: home }).split('\n').length).toBe(4);
+    expect(widgetListing({ HOME: home }).split('\n').length).toBe(6);
   });
   test('workspace: --ws, else the els workspace of this shell, else the folder name', () => {
     expect(widgetWorkspace('BURST', { ELANOUS_ELS_WS: 'OP' }, '/a/b')).toBe('BURST');

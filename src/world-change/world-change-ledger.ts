@@ -1,7 +1,7 @@
 // COORD-WORLD-TRANSFORM — 세계 변경 원장 (JSONL append).
 // 각 세계 변형마다 «무엇·왜·되돌리기·지표» 한 줄 기록: append 전용 JSONL, 되돌리기 표시는 원자적 재작성(temp+rename).
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendAuditLine } from '../kit/audit-ledger/index.js';
 
 export type WorldChangeHandle = 'seat' | 'structure' | 'device' | 'rule' | 'resource' | 'goal';
 export type WorldChangeAction = 'relocate' | 'modify' | 'create';
@@ -31,8 +31,8 @@ const newId = (): string => `wc-${Date.now().toString(36)}-${(++seq).toString(36
 /** 한 줄 원자적 append — 원장은 한 번 쓴 기록을 지우지 않는다. */
 export function recordWorldChange(file: string, draft: WorldChangeDraft): WorldChangeEntry {
   const entry: WorldChangeEntry = { ...draft, id: draft.id ?? newId(), status: draft.status ?? 'applied' };
-  mkdirSync(dirname(file), { recursive: true });
-  appendFileSync(file, `${JSON.stringify(entry)}\n`, 'utf8');
+  // kit/audit-ledger: one whole line · fsync. No rotation — markReverted rewrites this one file in place.
+  appendAuditLine(file, JSON.stringify(entry), { maxBytes: 0 });
   return entry;
 }
 

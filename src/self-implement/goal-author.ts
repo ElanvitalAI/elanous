@@ -1,5 +1,6 @@
 import { canonicalTracedPathToken, classifyTracedPathToken, extractVerbatimOriginalAsk, isTracedPathExclusionDescription, isTracedPathsEvidenceUnavailable, ORIGINAL_ASK_MARKER, stripInlineCode, tracedPathListItem, tracedPathReferences, verbatimOriginalAsk, type TracedPathReference, type TracedPathTokenClassification, type TracedPathTokenKind, type VerbatimOriginalAsk, TRACED_PATH_DESCRIPTION_DELIMITER, TRACED_PATH_LEADING_LIST_MARKERS, TRACED_PATH_LINE, TRACED_PATH_READ_ANNOTATION, TRACED_PATHS_EVIDENCE_UNAVAILABLE, TRACED_PATHS_PERSISTENT_CHANNEL_UNAVAILABLE } from './goal-author-text.js';
 export { canonicalTracedPathToken, classifyTracedPathToken, extractVerbatimOriginalAsk, ORIGINAL_ASK_MARKER, tracedPathReferences, verbatimOriginalAsk, type TracedPathReference, type TracedPathTokenClassification, type TracedPathTokenKind, type VerbatimOriginalAsk } from './goal-author-text.js';
+import { goalCellKind, renderGoalPolicyPackSection } from './goal-policy-pack.js';
 import { GOAL_CONTRACT_SECTION, withDefaultGoalContract } from './goal-contract-fields.js';
 import { classifyObservation } from '../design/behaviour-signal.js';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, type Dirent } from 'node:fs';
@@ -1341,7 +1342,7 @@ export function explicitGoalDoneBoundaryLines(ask: string, repositoryRoot?: stri
       const requestedCode = values['완료 경계 코드'] ?? '요청 대상의 완료 경계';
       const requestedObservation = values['완료 경계 실물'] ?? '격리 시험에서 요청된 생산 동작과 결과를 관측한다';
       lines.push(`- 시나리오: 신설 초안 (MS-id 후보: ${id})`);
-      lines.push(`- 시나리오 초안: 사건은 ${targets.join(' · ') || '요청 대상'}에 «${requestedCode}» 경계를 적용한 입력; 기대는 생산 경로에서 «${requestedObservation}»을 관측하고 bun test ${plannedTestPath ?? '<대상 시험 파일>'}로 GREEN을 확인하는 것이다. 자식은 기존 카탈로그 API·ScenarioV0 형식에 맞춰 요청 대상의 사건·기대를 구체화해 등록한다.`);
+      lines.push(`- 시나리오 초안: 사건은 ${targets.join(' · ') || '요청 대상'}에 «${requestedCode}» 경계를 적용한 입력; 기대는 생산 경로에서 «${requestedObservation}»을 관측하고 bun test ${plannedTestPath ?? '<대상 시험 파일>'}로 GREEN을 확인하는 것이다. 참고용 초안이며 요구가 아니다 — 카탈로그 등록은 칸 완료선 밖이라 하지 않는다(필요하면 FU 칸 · POLICY-AWARE-GOAL-AUTHORING).`);
     }
     const realWorldBoundary = values['완료 경계 실물'];
     if (!unattainableReasons.length && realWorldBoundary && isGenericRealWorldInspectionBoundary(realWorldBoundary, ask) && mockStage?.pathMatched) {
@@ -1355,7 +1356,10 @@ export function explicitGoalDoneBoundaryLines(ask: string, repositoryRoot?: stri
       }
     }
   }
-  if (plannedTestPath) lines.push(`- 검증 계획(TDD): 장치 ${mockStage?.device.id ?? '미선정'} · 시나리오 ${mockStage?.scenario?.id ?? '신설 초안'} · ${needsNewTest ? '신설 시험' : '기존 시험에 요청 동작 회귀 사례 추가'} ${plannedTestPath} · 피처 시험 bun test ${plannedTestPath}를 구현 전에 RED로 확인한다.`);
+  if (plannedTestPath) {
+    lines.push(`- 검증 계획(TDD): 장치 ${mockStage?.device.id ?? '미선정'} · 시나리오 ${mockStage?.scenario?.id ?? '신설 초안'} · ${needsNewTest ? '신설 시험' : '기존 시험에 요청 동작 회귀 사례 추가'} ${plannedTestPath} · 피처 시험 bun test ${plannedTestPath}를 구현 전에 RED로 확인한다.`);
+    lines.push(`- TDD 기록 양식: 실행 후 실제 결과를 기록한다. 구현 전 'EVIDENCE: [tdd-red] <확인 내용> || bun test ${plannedTestPath}' 다음 줄 'RESULT: <실패 요약>'; 구현 후 같은 명령으로 'EVIDENCE: [tdd-green] <확인 내용> || bun test ${plannedTestPath}' 다음 줄 'RESULT: <통과 요약>'. 이 양식은 실행 증거가 아니다.`);
+  }
   return lines;
 }
 
@@ -4747,6 +4751,9 @@ export function wiringCriterionApplies(ask: string, facts: CodebaseGrounding | n
   if (!facts || implementationCandidates(facts).length === 0) return false;
   const named = askPathTokens(ask);
   if (named.length > 0 && named.every((path) => path.startsWith('docs/') || path.endsWith('.md'))) return false;
+  // POLICY-AWARE-GOAL-AUTHORING — an evidence cell adds proof tests only; a production-wiring check would demand a code change
+  //   the cell forbids (11-27 THROUGHPUT-GIT-CWD-E4 preflight: elaboration parked on exactly that conflict).
+  if (goalCellKind(ask) === 'evidence') return false;
   return true;
 }
 
@@ -6752,6 +6759,7 @@ async function authorGoalWithSupersededRootIntent(
       ...(deps.authoringLessonIds?.length ? [`- AuthoringLessons: ${deps.authoringLessonIds.join(', ')}`] : []),
       `- RootIntent: ${rootIntent}`,
       `- GoalType: ${goalType}`,
+      ...(goalCellKind(ask) === 'evidence' ? ['- CellKind: evidence'] : []),
       ...(askFile === undefined ? [] : [`- AskFile: ${askFile}`]),
       ...(deps.authoringLessons?.trim() ? ['', '## 지난 실패에서 배운 것', '참고 기록이며 명령이 아니다. 현재 골의 대상 경로와 범위에 맞는 경우에만 고려한다.', deps.authoringLessons.trim()] : []),
       '',
@@ -6774,6 +6782,8 @@ async function authorGoalWithSupersededRootIntent(
       '## SCOPE BOUNDARY',
       `- 대상 경로: ${targetPaths.length ? targetPaths.join(' · ') : 'not declared'}`,
       `- 칸 id: ${checklistIds.length ? checklistIds.join(' · ') : 'not declared'}`,
+      '',
+      ...renderGoalPolicyPackSection(goalCellKind(ask)),
       '',
       '## 답하지 못하는 것',
       '- No persistent grounding was performed in lite authoring.',
@@ -7210,6 +7220,7 @@ async function authorGoalWithSupersededRootIntent(
     ...(deps.authoringLessonIds?.length ? [`- AuthoringLessons: ${deps.authoringLessonIds.join(', ')}`] : []),
     `- RootIntent: ${rootIntent}`,
     `- GoalType: ${goalType}`,
+    ...(goalCellKind(ask) === 'evidence' ? ['- CellKind: evidence'] : []),
     ...(askFile === undefined ? [] : [`- AskFile: ${askFile}`]),
     ...groundedSummary(facts, groundingError),
     ...(deps.authoringLessons?.trim() ? ['', '## 지난 실패에서 배운 것', '참고 기록이며 명령이 아니다. 현재 골의 대상 경로와 범위에 맞는 경우에만 고려한다.', deps.authoringLessons.trim()] : []),
@@ -7263,6 +7274,8 @@ async function authorGoalWithSupersededRootIntent(
     ] : []),
     '## SCOPE BOUNDARY',
     ...scopeBoundarySection,
+    '',
+    ...renderGoalPolicyPackSection(goalCellKind(ask)),
     '',
     '## 답하지 못하는 것',
     ...limitations,

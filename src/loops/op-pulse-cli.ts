@@ -7,6 +7,11 @@
 //   burst launched             --lane <lane> --id <exact id> [--host h] [--cost-usd n] — record a launch (budget-guarded)
 //   burst stop                 --reason <text> — clean exit: close every recorded launch by exact id, receipt
 //   burst status
+//   next [--json] [--snapshot f] [--save-snapshot f]   OP next-best-action plan from state — read only (the pulse does it)
+//   throughput [--json] [--snapshot f] [--save-snapshot f] [--execute]   lands/h · greens/h → binding constraint → lever
+//   dismiss <msgId> --why <line>                       a directive mail needs no cell (the planner stops asking)
+//   enforce --since <iso> [--promise] [--tui-progress] turn-end enforcement (called by the OP TUI)
+import { installedBin } from '../instance/cli-bin.js';
 import type { Command } from 'commander';
 import { join } from 'node:path';
 import { pulsePaths, readPulseState, rhythmLine, rhythmRow } from './op-pulse.js';
@@ -24,7 +29,7 @@ async function paths(now = new Date()) { return pulsePaths(seatState(), await st
 async function liveCloser(l: BurstLaunch): Promise<void> {
   const { spawnSync } = await import('node:child_process');
   if (l.lane === 'hands' || l.lane === 'remote') {
-    const r = spawnSync('els', ['close', l.id], { encoding: 'utf8', timeout: 30_000 }); // Source: one exact pane close per launch.
+    const r = spawnSync(installedBin('els'), ['close', l.id], { encoding: 'utf8', timeout: 30_000 }); // Source: one exact pane close per launch · absolute els (cron PATH)
     if (r.status !== 0) throw new Error(`els close ${l.id} exit ${r.status}: ${String(r.stderr).trim().slice(0, 120)}`);
     return;
   }
@@ -54,6 +59,58 @@ export function registerPulseCommands(program: Command): void {
     console.log(r.ok ? `pulse ${o.window}: beats ${r.beats.map(b => `#${b.id}→${b.to}`).join(' ')} — goal met` : `pulse ${o.window}: no beat mail with [pulse ${o.window}] yet`);
     process.exitCode = r.ok ? 0 : 3;
   });
+  pulse.command('next').description('OP next-best-action — the rule ladder over live state (or a saved snapshot); read only, the pulse executes')
+    .option('--json').option('--snapshot <file>', 'plan from a saved state snapshot (test universe) instead of live state')
+    .option('--save-snapshot <file>', 'write the live state snapshot as JSON (read only)')
+    .action(async (o: { json?: boolean; snapshot?: string; saveSnapshot?: string }) => {
+      const { readFileSync, writeFileSync } = await import('node:fs');
+      const { planNextActions, executeNextActions, renderNextActionBlock } = await import('./op-next-action.js');
+      const now = new Date();
+      // THROUGHPUT-CONTROLLER: the hour's binding constraint first (read only here — the pulse pulls machine levers).
+      if (!o.json && !o.snapshot) console.log(`${(await (await import('./throughput-controller-live.js')).runThroughputLive({ stateRoot: await stateRoot(), seatState: seatState() }, now, 'manual')).block}\n`);
+      const state = o.snapshot ? JSON.parse(readFileSync(o.snapshot, 'utf8')) as import('./op-next-action.js').NextActionState
+        : await (await import('./op-next-action-live.js')).liveNextActionState({ stateRoot: await stateRoot(), seatState: seatState() }, now);
+      if (o.saveSnapshot) writeFileSync(o.saveSnapshot, `${JSON.stringify(state, null, 2)}\n`);
+      const plan = planNextActions(state);
+      const results = await executeNextActions(plan, {}, 'manual');
+      if (o.json) { console.log(JSON.stringify({ at: state.now, version: state.version, unmeasured: plan.unmeasured, goals: plan.goals, actions: plan.actions })); return; }
+      console.log(renderNextActionBlock(results, plan.goals, plan.mail));
+      if (plan.unmeasured.length) console.log(`\nunmeasured: ${plan.unmeasured.join(', ')}`);
+    });
+  pulse.command('enforce').description('Turn-end enforcement (OP TUI calls it after a pulse/idle turn): a no-op turn → the engine runs pending machine actions, OP actions become FORCED next')
+    .requiredOption('--since <iso>', 'turn start').option('--origin <o>', 'turn origin', 'pulse').option('--promise', 'the turn ended on «HH:MM에 확인»')
+    .option('--tui-progress', 'the TUI saw progress rows in the turn').option('--json')
+    .action(async (o: { since: string; origin: string; promise?: boolean; tuiProgress?: boolean; json?: boolean }) => {
+      const since = new Date(o.since);
+      if (!Number.isFinite(since.getTime())) { console.error('pulse enforce: --since must be an ISO time'); process.exitCode = 2; return; }
+      const { runTurnEnforce } = await import('./op-turn-enforce-run.js');
+      const row = await runTurnEnforce({ stateRoot: await stateRoot(), seatState: seatState() }, { since, origin: o.origin, promise: !!o.promise, tuiProgress: !!o.tuiProgress, now: new Date() });
+      console.log(o.json ? JSON.stringify(row) : `enforce ${row.noop ? 'no-op turn' : 'turn acted'} · did ${(row.did as string[]).length} · forced ${(row.forced as string[]).length}`);
+    });
+  pulse.command('dismiss <msgId>').description('A directive/mission mail needs no cell — record why; the next-action planner stops listing it')
+    .requiredOption('--why <line>').option('--by <seat>', 'who', 'OP')
+    .action(async (msgId: string, o: { why: string; by: string }) => {
+      const id = Number(msgId);
+      if (!Number.isInteger(id) || id <= 0) { console.error('pulse dismiss: <msgId> must be a mail id'); process.exitCode = 2; return; }
+      const { appendDismissed } = await import('./op-next-action-live.js');
+      appendDismissed(await stateRoot(), { msgId: id, why: o.why, by: o.by.toUpperCase(), at: new Date().toISOString() });
+      console.log(`dismissed #${id} (${o.why})`);
+    });
+  pulse.command('throughput').description('Throughput controller — lands/h · greens/h → ONE binding constraint → its lever (read only unless --execute)')
+    .option('--json').option('--snapshot <file>', 'decide from a saved snapshot (test universe / sim seed)').option('--save-snapshot <file>', 'write the live snapshot as JSON')
+    .option('--execute', 'send the machine levers now (cards · deduped 6 h) and write the board line — what the pulse does')
+    .action(async (o: { json?: boolean; snapshot?: string; saveSnapshot?: string; execute?: boolean }) => {
+      const { readFileSync, writeFileSync } = await import('node:fs');
+      const tc = await import('./throughput-controller.js');
+      const live = await import('./throughput-controller-live.js');
+      const roots = { stateRoot: await stateRoot(), seatState: seatState() };
+      if (!o.snapshot && !o.saveSnapshot && !o.json) { console.log((await live.runThroughputLive(roots, new Date(), o.execute ? 'live' : 'manual')).block); return; }
+      const snap = o.snapshot ? JSON.parse(readFileSync(o.snapshot, 'utf8')) as import('./throughput-controller.js').ThroughputSnapshot : await live.liveThroughputSnapshot(roots, new Date());
+      if (o.saveSnapshot) writeFileSync(o.saveSnapshot, `${JSON.stringify(snap, null, 2)}\n`);
+      const verdict = tc.decideThroughput(snap);
+      const did = await tc.executeThroughput(verdict, o.execute && !o.snapshot ? live.liveThroughputActuators(roots) : null, o.execute && !o.snapshot ? 'live' : 'manual');
+      console.log(o.json ? JSON.stringify({ verdict, did }) : tc.renderThroughputBlock(verdict, did));
+    });
   const burst = pulse.command('burst').description('Pressure-driven elastic mode (local first · front-to-back · anticipate)');
   burst.command('plan').option('--json').action(async (o: { json?: boolean }) => {
     const now = new Date(); const p = await paths(now);

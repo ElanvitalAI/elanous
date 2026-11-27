@@ -65,6 +65,26 @@
       "expect": "green",
       "reason": "memory world M25 through the real runGraph: seatKey TC promote lands in template key seat:TC, seat OP reads nothing, unapproved promote refused",
       "greenSince": "#39199 (GRAPH-MEMORY-SCOPES port wired into the runner)"
+    },
+    "memory/KIT-KNOWHOW-REAL-SHAPES": {
+      "expect": "green",
+      "reason": "kit/knowhow reads real KNOWHOW spellings (active. · unproven(…)) · ### note stays in its card · malformed/fenced headings are not cards · seat pack and lint agree",
+      "greenSince": "#40414 (kit/knowhow)"
+    },
+    "memory/KIT-KNOWHOW-GENERATED": {
+      "expect": "green",
+      "reason": "kit/knowhow over five seeded documents matches the generator ground truth (id · seat · sub-track · 상태 · malformed)",
+      "greenSince": "#40414 (kit/knowhow)"
+    },
+    "memory/KIT-KNOWHOW-CALLERS-AGREE": {
+      "expect": "green",
+      "reason": "seat packs, the K3 coordinator pack and the export lint read the same cards via kit/knowhow",
+      "greenSince": "#40414 (kit/knowhow)"
+    },
+    "memory/KIT-KNOWHOW-DETERMINISM": {
+      "expect": "green",
+      "reason": "same seed ⇒ same document and parse · next seed ⇒ another · CRLF and LF parse alike",
+      "greenSince": "#40414 (kit/knowhow)"
     }
   }
 }

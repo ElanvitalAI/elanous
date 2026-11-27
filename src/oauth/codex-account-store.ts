@@ -5,6 +5,7 @@
 //   (조회는 되는데 실행은 안 되던 그 자리 · MANUAL-llm-provider-operations §3a).
 // ⛔ 토큰 «값»은 어디에도 출력하지 않는다 — accountId 앞 8자만(R-LLM2).
 
+import { decidedAccountOrder, decidedCodexQuotaPolicy, decidedFallbackModel, decidedRotationThresholds } from '../kit/resource-facts/llm-decide.js';
 import { currentCodexAccountOverride } from './codex-account-override.js';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
@@ -29,11 +30,12 @@ import {
   codexAccountThresholdPercent,
   type RotationCandidate,
 } from './codex-account-rotation.js';
+import { codexCreditAccountAllowed, readCodexCreditAccounts, type CodexCreditAccounts } from './codex-credit-accounts.js';
 import { codexPolicyAllowsCredits, codexPolicyAllowsFallback, resolveCodexQuotaPolicy, type CodexQuotaPolicy, type CodexQuotaPolicyFileValue, type ResolvedCodexQuotaPolicy } from './codex-quota-policy.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { debug } from '../debug/log.js';
 import {
-  decideFallback, fallbackChainForProvider, normalizeFallbackChain, grokQuotaFromUsageSnapshot,
+  decideFallback, fallbackChainForProvider, effectiveFallbackChain, grokQuotaFromUsageSnapshot,
   type FallbackDecision, type FallbackInput, type FallbackStep, type RotationOutcome,
 } from './fallback-chain.js';
 import type { ClaudePtyMaturity } from './claude-pty-maturity.js';
@@ -63,7 +65,7 @@ export function _setCodexAccountOutboundSenderForTesting(sender: CodexAccountOut
 /** ⛔⭐ 정적 import 로 읽는다 — 종전 `require()` 는 ESM 에서 «정의되지 않을 수 있고», 그러면
  *  fail-soft 가 삼켜 ***config false 가 영영 무시된다***(리뷰 should-fix: 노브가 no-op 이 된다).
  *  ⚠️ 순환 없음을 확인했다 — user-config 는 oauth 를 안 끌어온다. */
-type RotationConfig = { llm?: { provider?: string; model?: string; codexCreditReserve?: unknown; codexAccountRotation?: boolean; codexAccountAlerts?: boolean; codexAccountRotationThresholdPercent?: unknown; codexAccountRotationThresholdPercentByAccount?: Readonly<Record<string, unknown>>; codexAccountHostWeights?: Readonly<Record<string, Readonly<Record<string, number>>>>; codexCreditsAllowed?: boolean; codexResetAutoConsumePerDay?: number; codexQuotaPolicy?: unknown; fallbackChain?: unknown; openrouter?: { fallbackModel?: unknown } } };
+type RotationConfig = { llm?: { provider?: string; model?: string; codexCreditReserve?: unknown; codexCreditAccounts?: unknown; codexAccountRotation?: boolean; codexAccountAlerts?: boolean; codexAccountRotationThresholdPercent?: unknown; codexAccountRotationThresholdPercentByAccount?: Readonly<Record<string, unknown>>; codexAccountHostWeights?: Readonly<Record<string, Readonly<Record<string, number>>>>; codexCreditsAllowed?: boolean; codexResetAutoConsumePerDay?: number; codexQuotaPolicy?: unknown; fallbackChain?: unknown; openrouter?: { fallbackModel?: unknown } } };
 
 function readUserConfig(): RotationConfig {
   return getUserConfig();
@@ -254,7 +256,7 @@ function pinnedAccountExhausted(home: string, accountName: string): boolean {
 
 /** codex 한도 정책(`llm.codexQuotaPolicy` · 옛 `codexCreditsAllowed`) — 못 읽으면 `fallback`(크레딧은 돈이라 fail-closed). */
 export function codexQuotaPolicyFromConfig(): CodexQuotaPolicy {
-  try { return resolveCodexQuotaPolicy(configReader().llm, codexQuotaPolicyFileValue()).policy; } catch { return 'fallback'; }
+  try { return resolveCodexQuotaPolicy(configReader().llm, codexQuotaPolicyFileValue(), decidedCodexQuotaPolicy()).policy; } catch { return 'fallback'; }
 }
 
 /** `policy/llm.yaml` 의 `credits.codex` — 파일 출처일 때만 값을 낸다(없거나 다른 출처면 undefined). 파일이 깨졌거나 못 읽으면 `unreadable`. */
@@ -268,7 +270,7 @@ function codexQuotaPolicyFileValue(): CodexQuotaPolicyFileValue | undefined {
 }
 
 function inspectedQuotaPolicy(): ResolvedCodexQuotaPolicy {
-  try { return resolveCodexQuotaPolicy(configReader().llm, codexQuotaPolicyFileValue()); } catch { return { policy: 'fallback', source: 'default' }; }
+  try { return resolveCodexQuotaPolicy(configReader().llm, codexQuotaPolicyFileValue(), decidedCodexQuotaPolicy()); } catch { return { policy: 'fallback', source: 'default' }; }
 }
 
 /** 지금 계정의 크레딧 신호 — 판정 입력 두 칸. 신호를 이 계정에 귀속할 수 없으면 비운다(모른다). */
@@ -298,6 +300,12 @@ export function codexCreditReserveFromConfig(): number {
   } catch { return DEFAULT_CODEX_CREDIT_RESERVE; }
 }
 
+/** CODEX-CREDIT-ACCOUNTS — 유료 크레딧을 쓸 수 있는 계정 목록(resource facts → `llm.codexCreditAccounts` → 없음=종전).
+ *  facts 와 config 를 «따로» 읽는다 — config 판독이 깨져도 facts 목록은 지킨다. 아무것도 못 읽었고 판독이 실패했으면 `[]`(돈 · fail-closed). */
+export function codexCreditAccountsFromConfig(): CodexCreditAccounts {
+  return readCodexCreditAccounts(() => configReader().llm);
+}
+
 /** grok 자격 «존재» 판독 — 테스트 격리 심(실 자격을 안 읽게). */
 let grokCredentialPresent: () => boolean = () => resolveGrokCredential() !== null;
 export function _setGrokCredentialPresentForTesting(fn: (() => boolean) | null): void {
@@ -321,10 +329,10 @@ function rotationCreditsGrant(candidates: readonly RotationCandidate[]): Rotatio
   if (!codexPolicyAllowsFallback(policy)) return { allowed: false, via: 'none' };
   try {
     const llm = configReader().llm;
-    const { chain } = normalizeFallbackChain(llm?.fallbackChain, llm?.provider);
+    const { chain } = effectiveFallbackChain(llm?.fallbackChain, llm?.provider);
     if (!chain.includes('codex-credits')) return { allowed: false, via: 'none' };
-    const creditAccountCount = codexCreditAccountNames(candidates, codexCreditReserveFromConfig()).length;
-    const fallbackModel = configReader().llm?.openrouter?.fallbackModel;
+    const creditAccountCount = codexCreditAccountNames(candidates, codexCreditReserveFromConfig(), codexCreditAccountsFromConfig().names).length;
+    const fallbackModel = decidedFallbackModel() ?? configReader().llm?.openrouter?.fallbackModel;
     const decision = decideFallback({
       rotation: { reason: 'no-candidate' },
       chain,
@@ -616,11 +624,17 @@ function rotationThresholdFromConfig(): unknown {
 }
 
 function rotationThresholdsByAccountFromConfig(): Readonly<Record<string, unknown>> | undefined {
+  // LLM-ACCOUNT-POLICY-YAML: the pack decision (cap · skip-without-credits = 0) first; the config key is the fallback.
+  const decided = decidedRotationThresholds();
+  if (decided) return decided;
   try { return configReader().llm?.codexAccountRotationThresholdPercentByAccount; } catch { return undefined; }
 }
 
 /** «먼저 쓸» 계정 순서. ⛔ 문자열 배열이 아니면 「없음」으로 접는다(조용히 부분 적용하지 않는다). */
 function accountOrderFromConfig(): readonly string[] | undefined {
+  // LLM-ACCOUNT-POLICY-YAML: the decided route order (pack order · level demotions · unroutable dropped) first.
+  const decided = decidedAccountOrder('openai-codex');
+  if (decided) return decided;
   try {
     const raw = (configReader().llm as { codexAccountOrder?: unknown } | undefined)?.codexAccountOrder;
     if (!Array.isArray(raw)) return undefined;
@@ -706,6 +720,8 @@ export function inspectCodexRotation(
   readonly to: string | undefined;
   /** SUBSCRIPTION-EXHAUST-REROUTE — 크레딧 예비분에 닿아 `no-candidate` 가 됐을 때만 있다. */
   readonly creditReserveHit?: { readonly balance: number; readonly reserve: number };
+  /** CODEX-CREDIT-ACCOUNTS — 크레딧을 쓸 수 있는 계정 목록과 출처(없으면 종전: 잔액 확인된 모든 계정). */
+  readonly creditAccounts?: CodexCreditAccounts;
 } {
   const path = deps.storePath ?? codexAccountReadStorePath(authStorePath());
   const now = deps.now ?? Date.now();
@@ -728,8 +744,9 @@ export function inspectCodexRotation(
   const policy = inspectedQuotaPolicy();
   const rawThreshold = rotationThresholdFromConfig();
   const thresholdPercentByAccount = rotationThresholdsByAccountFromConfig();
+  const creditAccounts = codexCreditAccountsFromConfig();
   const decision = decideCodexRotation({
-    current, explicit, enabled, disabledProvenance: rotationConfig.state, currentReached, currentUsedPercent, accountOrder: accountOrderFromConfig(), balanceKey: env.ELANOUS_RUN_ID?.trim(), accountWeights: accountWeightsForHost(), resetCreditAvailability: resetCreditAvailability(currentHome, now), thresholdPercent: rawThreshold, thresholdPercentByAccount, creditsAllowed: rotationCreditsGrant(candidates).allowed, creditReserve: codexCreditReserveFromConfig(), ...currentCredits, candidates, creditPace: rotationCreditPace(candidates, now),
+    current, explicit, enabled, disabledProvenance: rotationConfig.state, currentReached, currentUsedPercent, accountOrder: accountOrderFromConfig(), balanceKey: env.ELANOUS_RUN_ID?.trim(), accountWeights: accountWeightsForHost(), resetCreditAvailability: resetCreditAvailability(currentHome, now), thresholdPercent: rawThreshold, thresholdPercentByAccount, creditsAllowed: rotationCreditsGrant(candidates).allowed, creditReserve: codexCreditReserveFromConfig(), creditAccounts: creditAccounts.names, ...currentCredits, candidates, creditPace: rotationCreditPace(candidates, now),
   });
   // ⛔⭐ 나이는 «만료돼도» 낸다 — 「65분 전」과 「3일 전」은 다른 진단이다(리뷰 must-fix).
   const observedAtByHome: Record<string, number> = {};
@@ -744,7 +761,7 @@ export function inspectCodexRotation(
     if (resetsAt !== undefined) resetsAtByHome[c.home] = resetsAt;
   }
   return {
-    current, currentHome, currentReached, currentUsedPercent, policy,
+    current, currentHome, currentReached, currentUsedPercent, policy, creditAccounts,
     currentCreditBalance: currentSignalAttributable ? currentCredits.currentCreditBalance : candidates.find((c) => c.storeKey === current.storeKey)?.creditBalance,
     currentHasCredits: currentSignalAttributable ? currentCredits.currentHasCredits : candidates.find((c) => c.storeKey === current.storeKey)?.hasCredits,
     currentObservedAt: currentQuota?.observedAtMs,
@@ -846,6 +863,7 @@ export function resolveCodexAccountForRun(
     thresholdPercentByAccount: rotationThresholdsByAccountFromConfig(),
     creditsAllowed: creditsGrant.allowed,
     creditReserve: codexCreditReserveFromConfig(),
+    creditAccounts: codexCreditAccountsFromConfig().names,
     ...currentCreditsInput(currentQuota),
     candidates,
     balanceKey: runId,
@@ -1111,8 +1129,8 @@ function observeCodexCreditsStep(
 
 /** 크레딧 잔액이 «확인된» codex 계정 이름(잔액 > 0 · 보유 ≠ false · 홈을 안다). 잔액을 모르면 넣지 않는다 — 돈이라 fail-closed.
  *  (budget-gate `codexCreditCandidate` 와 같은 자.) */
-export function codexCreditAccountNames(candidates: readonly RotationCandidate[], reserve = 0): string[] {
-  return creditCandidatesByBalance(candidates, reserve).map((c) => c.name);
+export function codexCreditAccountNames(candidates: readonly RotationCandidate[], reserve = 0, allow?: readonly string[]): string[] {
+  return creditCandidatesByBalance(candidates, reserve, allow).map((c) => c.name);
 }
 
 /** 명시 계정 «자신»의 크레딧 잔액이 확인되나(잔액 > 0 · 보유 ≠ false) — 신호를 귀속 못 하면 후보 목록의 같은 이름 줄. */
@@ -1121,7 +1139,9 @@ function explicitAccountHasCredits(snapshot: {
   readonly candidates: readonly RotationCandidate[];
   readonly currentCreditBalance?: number;
   readonly currentHasCredits?: boolean;
-}, reserve = 0): boolean {
+}, reserve = 0, allow?: readonly string[]): boolean {
+  // CODEX-CREDIT-ACCOUNTS — 명시 계정이라도 목록 밖이면 크레딧 ✗(구독 전용).
+  if (!codexCreditAccountAllowed(snapshot.current.name, allow)) return false;
   const self = snapshot.candidates.find((c) => c.name === snapshot.current.name);
   const balance = snapshot.currentCreditBalance ?? self?.creditBalance;
   const has = snapshot.currentHasCredits ?? self?.hasCredits;
@@ -1141,8 +1161,8 @@ function explicitAccountCandidate(snapshot: {
 }
 
 /** 잔액이 가장 많은(확인된) 계정 — 크레딧 칸이 실제로 쓸 계정. */
-function richestCreditCandidate(candidates: readonly RotationCandidate[], reserve = 0): RotationCandidate | undefined {
-  return creditCandidatesByBalance(candidates, reserve)[0];
+function richestCreditCandidate(candidates: readonly RotationCandidate[], reserve = 0, allow?: readonly string[]): RotationCandidate | undefined {
+  return creditCandidatesByBalance(candidates, reserve, allow)[0];
 }
 
 /**
@@ -1212,7 +1232,7 @@ export function resolveRunFallback(
     }
 
     const llm = configReader().llm;
-    const normalized = normalizeFallbackChain(llm?.fallbackChain, llm?.provider);
+    const normalized = effectiveFallbackChain(llm?.fallbackChain, llm?.provider);
     const { dropped, usedDefault } = normalized;
     // 대표 정책 `within-quota` — codex 밖으로 폴백하지 않는다(회전만). 전부 차면 멈춘다.
     const quotaPolicy = codexQuotaPolicyFromConfig();
@@ -1262,9 +1282,10 @@ export function resolveRunFallback(
     //   ⛔ 사람이 계정을 «명시»했으면 그 계정의 잔액만 본다 — 다른 계정 잔액으로 칸을 열고 명시 계정으로 쏘면 fail-closed 가 깨진다.
     const explicitAccount = snapshot.reason === 'explicit';
     const creditReserve = codexCreditReserveFromConfig();
+    const creditAllow = codexCreditAccountsFromConfig().names;
     const creditAccounts = !effectiveChain.includes('codex-credits') ? []
-      : explicitAccount ? (explicitAccountHasCredits(snapshot, creditReserve) ? [snapshot.current.name] : [])
-      : codexCreditAccountNames(snapshot.candidates, creditReserve);
+      : explicitAccount ? (explicitAccountHasCredits(snapshot, creditReserve, creditAllow) ? [snapshot.current.name] : [])
+      : codexCreditAccountNames(snapshot.candidates, creditReserve, creditAllow);
     const codexCreditsAvailable = effectiveChain.includes('codex-credits') && (deps.codexCreditsAvailable ?? creditAccounts.length > 0);
     // CLAUDE-FAILOVER-FU — 체인에 `claude-pty` 가 «있을 때만» 원장 성숙도를 재서 판정 입력에 싣는다.
     //   ⛔ 없으면 `undefined` 이고 판정은 종전 그대로다(수집 0회 · 판정식 무변경).
@@ -1283,7 +1304,7 @@ export function resolveRunFallback(
     //   명시 계정이면 «그 계정»의 홈을 싣는다 — 계정은 안 바꾸되, 잔액을 확인한 계정과 발사 홈이 갈리지 않게.
     const creditTo = judged.action !== 'codex-credits' ? undefined
       : explicitAccount ? explicitAccountCandidate(snapshot)
-      : richestCreditCandidate(snapshot.candidates, creditReserve);
+      : richestCreditCandidate(snapshot.candidates, creditReserve, creditAllow);
     const decision: FallbackDecision = judged.action === 'codex-credits' && creditTo ? { ...judged, to: creditTo } : judged;
     if (reserveHit) {
       debug.log('llm.codex', 'credit-reserve-hit', {

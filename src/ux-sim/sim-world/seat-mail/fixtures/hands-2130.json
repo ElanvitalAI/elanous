@@ -1,0 +1,331 @@
+{
+ "source": "seat-state/OP/evidence/20261126/fed-chatlog/2130/mail.jsonl (2026-11-27 12:00–12:30Z) · the 13 ✋ to TC · refs from eln msg thread <id> --json · liveTo = where they went on #40535 (classifier stopped: spend guard no-lease) · jev = Jev (Typesafe System One) live answer to the hand-routes.yaml choice question, re-recorded 11-27 23:1x with the autocontinue choice (plan-limit = the TUI auto-continue cap) (model · probabilities · ms)",
+ "hands": [
+  {
+   "id": 197256,
+   "seat": "MVP-B",
+   "at": "2026-11-27T12:02:35.008Z",
+   "reason": "DEPENDENCY_WAIT",
+   "cell": "HQ-PHYSICAL-RESTRUCTURE",
+   "liveTo": "TC",
+   "liveAsk": "hand-ask:ambiguous:HQ-PHYSICAL-RESTRUCTURE",
+   "detail": "CX-6 기존 인계 #197219에서 운영 복구가 검증된 단위와 실제 writer·소비자·복구점이 아직 확인되지 않음. OP에 보충표와 미결을 보고함.",
+   "jev": {
+    "model": "jev-1.14.0",
+    "ms": 234,
+    "probabilities": {
+     "wip": 0.48,
+     "jud": 0.05,
+     "hold": 0.03,
+     "guardian": 0.02,
+     "autocontinue": 0.01,
+     "approval": 0,
+     "cell": 0.17,
+     "decision": 0.01,
+     "unclear": 0.23
+    }
+   }
+  },
+  {
+   "id": 197278,
+   "seat": "TC-H-POOL-3",
+   "at": "2026-11-27T12:04:42.401Z",
+   "reason": "DEPENDENCY_WAIT",
+   "cell": "OP-TRAFFIC-MARGIN",
+   "liveTo": "TC",
+   "liveAsk": "hand-ask:ambiguous:OP-TRAFFIC-MARGIN",
+   "detail": "TC가 기존 후속 실행 종료 근거와 사건별 HOLD 원문·범위를 복구해야 함; H-156으로 칸 반환",
+   "jev": {
+    "model": "jev-1.14.0",
+    "ms": 234,
+    "probabilities": {
+     "wip": 0,
+     "jud": 0,
+     "hold": 0.97,
+     "guardian": 0.01,
+     "autocontinue": 0,
+     "approval": 0,
+     "cell": 0.02,
+     "decision": 0,
+     "unclear": 0
+    }
+   }
+  },
+  {
+   "id": 197282,
+   "seat": "TC-H-CX-5",
+   "at": "2026-11-27T12:05:06.764Z",
+   "reason": "OWNER_UNKNOWN",
+   "cause": "writer-handover",
+   "cell": null,
+   "liveTo": "TC",
+   "liveAsk": "hand-ask:wip-handoff:*",
+   "detail": "기존 위임 작업 식별자·결과를 이 세션에서 확인할 수 없어 TC에 인계 여부를 요청한 상태다. 작업트리 clean이 종료 증거는 아니다.",
+   "jev": {
+    "model": "jev-1.14.0",
+    "ms": 234,
+    "probabilities": {
+     "wip": 0.32,
+     "jud": 0.06,
+     "hold": 0.02,
+     "guardian": 0.36,
+     "autocontinue": 0,
+     "approval": 0,
+     "cell": 0.19,
+     "decision": 0,
+     "unclear": 0.05
+    }
+   }
+  },
+  {
+   "id": 197284,
+   "seat": "TC-H-CX-1",
+   "at": "2026-11-27T12:05:19.592Z",
+   "reason": "DEPENDENCY_WAIT",
+   "cell": null,
+   "liveTo": "TC",
+   "liveAsk": "hand-ask:ambiguous:*",
+   "detail": "정본에서 요청된 TERM·PID 재사용 reaper 구현 경로를 찾지 못했으며 부모 구현 PR 또는 경로가 TC에서 필요합니다.",
+   "jev": {
+    "model": "jev-1.14.0",
+    "ms": 234,
+    "probabilities": {
+     "wip": 0,
+     "jud": 0,
+     "hold": 0,
+     "guardian": 0,
+     "autocontinue": 0,
+     "approval": 0,
+     "cell": 1,
+     "decision": 0,
+     "unclear": 0
+    }
+   }
+  },
+  {
+   "id": 197326,
+   "seat": "TC-H-CX-3",
+   "at": "2026-11-27T12:09:07.019Z",
+   "reason": "HUMAN_DECISION",
+   "cell": "ELN-APPROVAL-WAIT-BLOCKS-TURN",
+   "liveTo": "TC",
+   "liveAsk": "hand-ask:design-decision:ELN-APPROVAL-WAIT-BLOCKS-TURN",
+   "detail": "완료선의 checklist 네트워크 읽기 및 우편 본문 무승인은 현재 RunShell의 단일 사용 실행 승인·다른 사용자 데이터 보호 경계와 충돌한다. 권한 있는 정책 결정과 안전한 범위가 필요하며 승인 우회는 할 수 없다.",
+   "jev": {
+    "model": "jev-1.14.0",
+    "ms": 234,
+    "probabilities": {
+     "wip": 0,
+     "jud": 0,
+     "hold": 0,
+     "guardian": 0.01,
+     "autocontinue": 0,
+     "approval": 0.99,
+     "cell": 0,
+     "decision": 0,
+     "unclear": 0
+    }
+   }
+  },
+  {
+   "id": 197330,
+   "seat": "TC-H-CX-5",
+   "at": "2026-11-27T12:09:50.171Z",
+   "reason": "DEPENDENCY_WAIT",
+   "cell": "RELEASE-SCHEDULE-AUTO-GRAPH-RUN",
+   "liveTo": "TC",
+   "liveAsk": "hand-ask:ambiguous:RELEASE-SCHEDULE-AUTO-GRAPH-RUN",
+   "detail": "TC #196158의 중복 시험 금지에 따라 기존 CX-7 수행선의 완료선별 원출력과 JUD 독립 판정이 필요합니다.",
+   "jev": {
+    "model": "jev-1.14.0",
+    "ms": 234,
+    "probabilities": {
+     "wip": 0,
+     "jud": 0.91,
+     "hold": 0.04,
+     "guardian": 0,
+     "autocontinue": 0,
+     "approval": 0.03,
+     "cell": 0.01,
+     "decision": 0,
+     "unclear": 0.01
+    }
+   }
+  },
+  {
+   "id": 197341,
+   "seat": "TC-H-CX-7",
+   "at": "2026-11-27T12:11:01.263Z",
+   "reason": "HUMAN_DECISION",
+   "cell": "YAML-SUPERVISORS-DEF-0338-E4",
+   "liveTo": "TC",
+   "liveAsk": "hand-ask:design-decision:YAML-SUPERVISORS-DEF-0338-E4",
+   "detail": "plan-limit",
+   "jev": {
+    "model": "jev-1.14.0",
+    "ms": 233,
+    "probabilities": {
+     "wip": 0,
+     "jud": 0,
+     "hold": 0,
+     "guardian": 0,
+     "autocontinue": 1,
+     "approval": 0,
+     "cell": 0,
+     "decision": 0,
+     "unclear": 0
+    }
+   }
+  },
+  {
+   "id": 197354,
+   "seat": "TC-H-CX-3",
+   "at": "2026-11-27T12:11:30.891Z",
+   "reason": "APPROVAL_PENDING",
+   "cell": "ELN-APPROVAL-WAIT-BLOCKS-TURN",
+   "liveTo": "TC",
+   "liveAsk": "hand-ask:ambiguous:ELN-APPROVAL-WAIT-BLOCKS-TURN",
+   "detail": "네트워크 명령은 정식 단일 사용 승인 또는 권한 있는 시험 범위가 필요하며 실제 우편 DB/IPC 종단 검증은 아직 없다.",
+   "jev": {
+    "model": "jev-1.14.0",
+    "ms": 233,
+    "probabilities": {
+     "wip": 0,
+     "jud": 0,
+     "hold": 0.01,
+     "guardian": 0.03,
+     "autocontinue": 0,
+     "approval": 0.95,
+     "cell": 0,
+     "decision": 0,
+     "unclear": 0.01
+    }
+   }
+  },
+  {
+   "id": 197389,
+   "seat": "TC-H-CX-7",
+   "at": "2026-11-27T12:15:08.368Z",
+   "reason": "DEPENDENCY_WAIT",
+   "cell": "YAML-SUPERVISORS-DEF-0338-E4",
+   "liveTo": "TC",
+   "liveAsk": "hand-ask:ambiguous:YAML-SUPERVISORS-DEF-0338-E4",
+   "detail": "완료선의 네 장면에 대한 main 등록 정본과 시드 원영수·baseline이 없어 TC에 결손을 전달했다. 기존 수행선 확인 후 중복 없는 검증 및 독립 판정이 필요하다.",
+   "jev": {
+    "model": "jev-1.14.0",
+    "ms": 233,
+    "probabilities": {
+     "wip": 0,
+     "jud": 0.99,
+     "hold": 0,
+     "guardian": 0,
+     "autocontinue": 0,
+     "approval": 0,
+     "cell": 0.01,
+     "decision": 0,
+     "unclear": 0
+    }
+   }
+  },
+  {
+   "id": 197416,
+   "seat": "TC-H-CX-7",
+   "at": "2026-11-27T12:17:19.162Z",
+   "reason": "DEPENDENCY_WAIT",
+   "cell": "OP-WORLD-LENS-E4",
+   "liveTo": "TC",
+   "liveAsk": "hand-ask:ambiguous:OP-WORLD-LENS-E4",
+   "detail": "기존 작업트리 미커밋 변경 작성자의 인계 및 겹침 경계 확인이 필요하며 보존한다.",
+   "jev": {
+    "model": "jev-1.14.0",
+    "ms": 232,
+    "probabilities": {
+     "wip": 0.99,
+     "jud": 0,
+     "hold": 0.01,
+     "guardian": 0,
+     "autocontinue": 0,
+     "approval": 0,
+     "cell": 0,
+     "decision": 0,
+     "unclear": 0
+    }
+   }
+  },
+  {
+   "id": 197480,
+   "seat": "TC-H-CC-2",
+   "at": "2026-11-27T12:24:25.404Z",
+   "reason": "DEPENDENCY_WAIT",
+   "cell": "LOOP-AGENT-V2-GOAL",
+   "liveTo": "TC",
+   "liveAsk": "hand-ask:ambiguous:LOOP-AGENT-V2-GOAL",
+   "detail": "서버 인증 주체를 CLI 정책 변경에 전달할 신뢰 경계와 기존 인증 수행선의 접합 계약이 필요함; TC #197479에 구체 결손 보고.",
+   "jev": {
+    "model": "jev-1.14.0",
+    "ms": 233,
+    "probabilities": {
+     "wip": 0,
+     "jud": 0,
+     "hold": 0,
+     "guardian": 0.93,
+     "autocontinue": 0,
+     "approval": 0.02,
+     "cell": 0.01,
+     "decision": 0.03,
+     "unclear": 0.01
+    }
+   }
+  },
+  {
+   "id": 197493,
+   "seat": "TC-H-CX-3",
+   "at": "2026-11-27T12:26:14.029Z",
+   "reason": "APPROVAL_PENDING",
+   "cell": "ELN-APPROVAL-WAIT-BLOCKS-TURN",
+   "liveTo": "TC",
+   "liveAsk": "hand-ask:ambiguous:ELN-APPROVAL-WAIT-BLOCKS-TURN:after-197354",
+   "detail": "실제 승인 필요한 네트워크 명령은 정식 단일 사용 승인 또는 권한 있는 범위가 필요하며, 격리 watcher 수동 poll은 TUI 종단 증거가 아니다.",
+   "jev": {
+    "model": "jev-1.14.0",
+    "ms": 231,
+    "probabilities": {
+     "wip": 0,
+     "jud": 0,
+     "hold": 0.02,
+     "guardian": 0.03,
+     "autocontinue": 0.01,
+     "approval": 0.93,
+     "cell": 0,
+     "decision": 0,
+     "unclear": 0.01
+    }
+   }
+  },
+  {
+   "id": 197532,
+   "seat": "MVP-B",
+   "at": "2026-11-27T12:30:13.557Z",
+   "reason": "HUMAN_DECISION",
+   "cell": "SIM-WORLD-SMART-MERGE-E4",
+   "liveTo": "TC",
+   "liveAsk": "hand-ask:design-decision:SIM-WORLD-SMART-MERGE-E4",
+   "detail": "plan-limit",
+   "jev": {
+    "model": "jev-1.14.0",
+    "ms": 232,
+    "probabilities": {
+     "wip": 0,
+     "jud": 0,
+     "hold": 0,
+     "guardian": 0,
+     "autocontinue": 1,
+     "approval": 0,
+     "cell": 0,
+     "decision": 0,
+     "unclear": 0
+    }
+   }
+  }
+ ]
+}

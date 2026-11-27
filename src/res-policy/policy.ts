@@ -8,6 +8,7 @@
 // (defaults in code ⊕ `res.policy` overrides in the operating config) / 수복과 인계 = allow → act without asking ·
 // deny → refuse with alternatives · ask → one «[수호자 · RES]» exception card (RES tab, or OP when RES is dormant).
 import { debug } from '../debug/log.js';
+import { hostsFor, hqHosts, paidHostsFor } from '../kit/resource-facts/index.js';
 
 export type ResVerdict = 'allow' | 'deny' | 'ask';
 
@@ -75,9 +76,10 @@ export interface ResPolicy {
 /** Defaults live in code (OPS-RULES «운영 config 최소화»); the operating config overrides only what RES changes. */
 export const DEFAULT_RES_POLICY: ResPolicy = {
   version: 'res-policy-v1',
-  preApprovedTestHosts: ['minim5', 'node-b', 'node-c'],
-  forbiddenTestHosts: ['mshq'],
-  cloudHosts: ['aws1', 'aws2', 'aws3', 'gcp1', 'gcp2'],
+  // RESOURCE-FACTS-FROM-LEDGER: host lists are read from the world registry at use time (getters), not frozen here.
+  get preApprovedTestHosts(): readonly string[] { return hostsFor('test-run'); },
+  get forbiddenTestHosts(): readonly string[] { return hqHosts(); },
+  get cloudHosts(): readonly string[] { return paidHostsFor('burst'); },
   // Source: seat-state/OP/tools/cloud-hosts.tsv (11-25).
   cloudInstances: { aws1: 'i-05e66cd52ebd3a2c6', aws2: 'i-02e62f64f818609d5', aws3: 'i-08f7e3976c47a563a', gcp1: 'elanous-burst-128', gcp2: 'elanous-burst-64-b' },
   vm: {

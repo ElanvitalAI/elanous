@@ -2,12 +2,15 @@
 // 가짜 codex 점검 seam · 시계 주입 · 디스크·네트워크 0.
 import { describe, expect, test } from 'bun:test';
 import { readAccountWindowSnapshot, resolveWindowAccountsMode, type AccountWindowSnapshotDeps } from './account-window-snapshot.js';
+import type { MembershipResolver } from '../plugins/smart-router/consumer.js';
 import { WINDOW_ACCOUNT_EVENT, WINDOW_SNAPSHOT_TTL_MS } from './window-account-selector.js';
 
 const NOW = WINDOW_SNAPSHOT_TTL_MS * 4;
 const OLDER = NOW - WINDOW_SNAPSHOT_TTL_MS / 2;
 const NEWER = NOW - WINDOW_SNAPSHOT_TTL_MS / 4;
 const USED_HALF = 50;
+/** SMART-ROUTER-TIER-FULL-WIRE(칸 43) — 등급 원천 주입(시험): subscription_window_aware 허용 등급(pro). */
+const PRO_MEMBER: MembershipResolver = { currentTier: () => 'pro' };
 
 type Inspect = ReturnType<NonNullable<AccountWindowSnapshotDeps['inspectCodex']>>;
 const inspect = (over: Partial<Inspect> = {}): Inspect => ({
@@ -90,8 +93,10 @@ describe('readAccountWindowSnapshot — codex quota signals only', () => {
     expect(resolveWindowAccountsMode({ harness: { windowAccounts: 'on' } })).toBe('on');
     expect(resolveWindowAccountsMode({ harness: { windowAccounts: 'live' as never } })).toBe('shadow');
     expect(resolveWindowAccountsMode(undefined)).toBe('shadow');
-    expect(read('openai-codex', { config: () => ({ harness: { windowAccounts: 'on' } }) }).snapshot?.selection).toBe('on');
-    expect(read('openai-codex', { config: () => ({ harness: { windowAccounts: 'on' } }), forceShadow: true }).snapshot?.selection).toBe('shadow');
+    expect(read('openai-codex', { config: () => ({ harness: { windowAccounts: 'on' } }), membership: PRO_MEMBER }).snapshot?.selection).toBe('on');
+    // 칸 43 — 등급 게이트: 미달 등급(free)은 `on` 요청도 shadow 로 강등(fail-closed).
+    expect(read('openai-codex', { config: () => ({ harness: { windowAccounts: 'on' } }), membership: { currentTier: () => 'free' } }).snapshot?.selection).toBe('shadow');
+    expect(read('openai-codex', { config: () => ({ harness: { windowAccounts: 'on' } }), forceShadow: true, membership: PRO_MEMBER }).snapshot?.selection).toBe('shadow');
     const broken = read('openai-codex', { config: () => { throw new TypeError('bad'); } });
     expect(broken.snapshot?.selection).toBe('shadow');
     expect(broken.events[0]).toEqual({ event: 'snapshot-skip', data: { provider: 'openai-codex', reason: 'config-unreadable', error: 'TypeError' } });

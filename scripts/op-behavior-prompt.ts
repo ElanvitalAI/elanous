@@ -1,3 +1,4 @@
+import { tierModel } from '../src/llm/model-defaults.js';
 // Copy this script into each pinned checkout to capture that revision's actual
 // assembled OP REPL prompt. It does not call a model or a production tool.
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, utimesSync, writeFileSync } from 'node:fs';
@@ -31,7 +32,7 @@ if (existsSync(agents)) {
   if (fixture) { const stamp = new Date('2026-11-23T18:00:00.000Z'); utimesSync(agents, stamp, stamp); }
 }
 const cfg = getUserConfig();
-cfg.llm.model = process.argv[3] ?? 'gpt-6.1-terra';
+cfg.llm.model = process.argv[3] ?? tierModel('balanced');
 setGlobalAnchorPathForTest(null);
 const prompt = buildReplSystemPrompt({ cfg, cwd, enabledToolNames: ['Read', 'MsgPost', 'MsgAck', 'RunShell'],
   sessionId: 'op-live-eval', seatBootDeps: { home, msgPath: join(root, 'msg', 'messages.db'), env: { NODE_ENV: 'production' },

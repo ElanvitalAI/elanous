@@ -74,6 +74,52 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
+test('rejects a missing required clock before creating a run', () => {
+  for (const field of ['rehearsalAt', 'cutAt', 'publishAt'] as const) {
+    const clock = { ...CLOCK, [field]: undefined } as unknown as typeof CLOCK;
+    expect(() => createRun(root, { version: '0.3.37', quick: true, clock }, now)).toThrow(`${field} must be an ISO time`);
+    expect(loadRun(root, '0.3.37')).toBeNull();
+  }
+});
+
+test('rejects unordered or equal required times without creating a run', () => {
+  for (const clock of [
+    { ...CLOCK, rehearsalAt: CLOCK.cutAt },
+    { ...CLOCK, publishAt: CLOCK.cutAt },
+    { ...CLOCK, rehearsalAt: CLOCK.publishAt },
+  ]) {
+    expect(() => createRun(root, { version: '0.3.37', quick: true, clock }, now))
+      .toThrow('expected rehearsalAt < cutAt < publishAt');
+    expect(loadRun(root, '0.3.37')).toBeNull();
+  }
+});
+
+test('creating an existing version preserves the original clock and state', () => {
+  const existing = loadRun(root, V)!;
+  const result = createRun(root, {
+    version: V, quick: false,
+    clock: { rehearsalAt: '2027-01-01T00:00:00Z', cutAt: '2027-01-01T01:00:00Z', publishAt: '2027-01-01T02:00:00Z' },
+  }, new Date('2027-01-01T00:00:00Z'));
+  expect(result).toEqual(existing);
+  expect(loadRun(root, V)).toEqual(existing);
+  expect(readLedger(root, V).filter(event => event.kind === 'created')).toHaveLength(1);
+});
+
+test('retry recovers the creation record after interruption following state publication', () => {
+  const existing = loadRun(root, V)!;
+  // Model a crash after state.json was published but before the creation ledger append.
+  const ledgerPath = join(root, 'release-graph', V, 'ledger.jsonl');
+  rmSync(ledgerPath);
+  // Another operation may have appended after the interrupted creator; recovery must preserve it.
+  const later = { at: '2026-11-25T12:01:00.000Z', kind: 'recovery-test-marker' };
+  appendFileSync(ledgerPath, `${JSON.stringify(later)}\n`);
+  const result = createRun(root, { version: V, quick: true, clock: CLOCK }, now);
+  expect(result).toEqual(existing);
+  const rows = readLedger(root, V);
+  expect(rows.filter(event => event.kind === 'created')).toHaveLength(1);
+  expect(rows).toContainEqual(later);
+});
+
 describe('plan', () => {
   test('quick path = the 21 golden steps; the full path adds the hard rehearsal and telemetry', () => {
     expect(stepsFor(loadRun(root, V)!, OPTS).map(s => s.id)).toEqual(['cli-fresh', 'notes', 'roster', 'schedule', 'cut', 'cut-push', 'pregate', 'prebuild',

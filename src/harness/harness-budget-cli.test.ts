@@ -76,6 +76,31 @@ describe('harness budget CLI', () => {
     expect(parsed.reasons.some((line: string) => line.includes('grok:'))).toBe(true);
   });
 
+  test('unmeasured usage shows the launch verdict alongside the strict budget verdict', async () => {
+    const inputs = {
+      preference: {
+        mode: 'auto' as const,
+        chain: [{ provider: 'openai-codex' }],
+        // 출처: #40489 — 같은 파일의 기존 budgetGate fixture(15% headroom, 95% cap); 미측정 정책 비교용.
+        budgetGate: { minHeadroomPercent: 15, onShortfall: 'next-provider' as const, maxUsedPercent: { 'openai-codex': 95 } },
+        source: { mode: 'explicit' as const, chain: 'config' as const },
+      },
+      codexCandidates: [],
+      grokUsedPercent: undefined,
+      maxUsedPercent: { 'openai-codex': 95 },
+    };
+    const lines: string[] = [];
+    await runHarnessBudget({ json: true }, { log: (line) => lines.push(line), read: () => inputs });
+    const result = JSON.parse(lines[0]!);
+    expect(result.outcome).toBe('stop');
+    expect(result.launchGate.decision.action).toBe('proceed');
+    expect(result.launchGate.unmeasuredProvider).toBe('openai-codex');
+    lines.length = 0;
+    await runHarnessBudget({}, { log: (line) => lines.push(line), read: () => inputs });
+    expect(lines[0]).toContain('launch gate (default chain): budget: proceed');
+    expect(lines[0]).toContain('usage unmeasured');
+  });
+
   test('installHarnessCliCommand 가 budget 서브커맨드를 단다', () => {
     const program = new Command();
     program.exitOverride();

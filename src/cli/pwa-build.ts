@@ -10,8 +10,9 @@
 // build into the Tailscale share decision.
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { join as joinPath, dirname } from 'node:path';
+import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
+import { join as joinPath, dirname, resolve as resolvePath } from 'node:path';
+import { debug } from '../debug/log.js';
 
 export interface PwaBuildOpts {
   /** Override the apps/pwa cwd (tests + first-boot wizard). Defaults to
@@ -126,6 +127,63 @@ export function checkPwaBuildDeps(
   return { ok: missing.length === 0, missing };
 }
 
+/** Same name as apps/pwa/scripts/static-generation.ts PWA_BUILD_MARKER. */
+export const PWA_BUILD_MARKER = 'elanous-pwa-build.json';
+
+/** Commit recorded in `<out>/elanous-pwa-build.json`, or '' when absent/unreadable. */
+export function readPwaBuildMarkerCommit(outDir: string): string {
+  try {
+    const marker = JSON.parse(readFileSync(joinPath(outDir, PWA_BUILD_MARKER), 'utf-8')) as { commit?: unknown };
+    return typeof marker.commit === 'string' && /^[0-9a-f]{40}$/.test(marker.commit) ? marker.commit : '';
+  } catch {
+    return '';
+  }
+}
+
+/** A served export: regular index.html that is not the prerender error shell, plus _next assets. */
+export function staticExportProblem(outDir: string): string | undefined {
+  try {
+    const index = joinPath(outDir, 'index.html');
+    if (!existsSync(index) || !lstatSync(index).isFile()) return 'out-missing';
+    if (readFileSync(index, 'utf-8').includes('__next_error__')) return 'out-error-shell';
+    const assets = joinPath(outDir, '_next');
+    if (!existsSync(assets) || readdirSync(assets).length === 0) return 'out-no-assets';
+    return undefined;
+  } catch {
+    return 'out-unreadable';
+  }
+}
+
+export type PrebuiltPwaVerdict =
+  | { kind: 'checkout' }
+  | { kind: 'prebuilt'; commit: string }
+  | { kind: 'fallback'; reason: string };
+
+/**
+ * PWA-RUNTIME-LEAN — in an installed package (packed revision, no .git) the
+ * PWA ships prebuilt in apps/pwa/out. When its build marker names this
+ * package's commit, `nexus build` has nothing to do and must not install the
+ * ~750MB apps/pwa/node_modules. A checkout keeps the old build path.
+ */
+export function checkPrebuiltPwa(pwaCwd: string): PrebuiltPwaVerdict {
+  const root = resolvePath(pwaCwd, '../..');
+  const packedPath = joinPath(root, 'src/version/packed-revision.json');
+  if (existsSync(joinPath(root, '.git')) || !existsSync(packedPath)) return { kind: 'checkout' };
+  let packed = '';
+  try {
+    const raw = JSON.parse(readFileSync(packedPath, 'utf-8')) as { commit?: unknown };
+    packed = typeof raw.commit === 'string' && /^[0-9a-f]{40}$/.test(raw.commit) ? raw.commit : '';
+  } catch { /* unreadable → fallback below */ }
+  if (!packed) return { kind: 'fallback', reason: 'packed-revision-unreadable' };
+  const outDir = joinPath(pwaCwd, 'out');
+  const problem = staticExportProblem(outDir);
+  if (problem) return { kind: 'fallback', reason: problem };
+  const marker = readPwaBuildMarkerCommit(outDir);
+  if (!marker) return { kind: 'fallback', reason: 'marker-missing' };
+  if (marker !== packed) return { kind: 'fallback', reason: `marker-mismatch out=${marker.slice(0, 12)} package=${packed.slice(0, 12)}` };
+  return { kind: 'prebuilt', commit: packed };
+}
+
 export async function runPwaBuild(opts: PwaBuildOpts = {}): Promise<PwaBuildResult> {
   const out = opts.out ?? console;
   const argvBin = opts.argvBin ?? process.argv[1] ?? '';
@@ -138,6 +196,28 @@ export async function runPwaBuild(opts: PwaBuildOpts = {}): Promise<PwaBuildResu
 
   const t0 = Date.now();
   const spawnFn = opts.spawnFn ?? defaultSpawn;
+  const prebuilt = checkPrebuiltPwa(cwd);
+  if (prebuilt.kind === 'prebuilt') {
+    out.log(`pwa.lean skip=prebuilt commit=${prebuilt.commit.slice(0, 12)} — installed package already carries this version's PWA (${joinPath(cwd, 'out')})`);
+    try { debug.log('pwa', 'lean-prebuilt', { commit: prebuilt.commit, cwd }); } catch { /* 관측 실패가 빌드를 막지 않는다 */ }
+    return { exitCode: 0, cwd, durationMs: Date.now() - t0 };
+  }
+  if (prebuilt.kind === 'fallback') {
+    // Never ship a blank PWA: the old in-place build path still runs. A
+    // real-directory out is swapped only after Next succeeds
+    // (static-generation.ts replaceInstalledRealDirOut).
+    out.log(`pwa.lean fallback=in-place-build reason=${prebuilt.reason}`);
+    try { debug.log('pwa', 'lean-fallback', { fallback: 'in-place-build', reason: prebuilt.reason, cwd }); } catch { /* 관측 실패가 빌드를 막지 않는다 */ }
+  }
+  return runPwaBuildInPlace(cwd, t0, spawnFn, out);
+}
+
+async function runPwaBuildInPlace(
+  cwd: string,
+  t0: number,
+  spawnFn: NonNullable<PwaBuildOpts['spawnFn']>,
+  out: NonNullable<PwaBuildOpts['out']>,
+): Promise<PwaBuildResult> {
   // Prepare a cold install from the checked-in lockfile and verify that the
   // dependencies appeared before allowing the build to run.
   let deps = checkPwaBuildDeps(cwd);

@@ -6,10 +6,21 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { parseDocument } from 'yaml';
 
-export const ORG_ROLES = ['coo', 'cto', 'cmo', 'cxo', 'leader', 'advisor', 'judge', 'steward', 'hand'] as const;
+// `proxy` (CLAUDE-OP-PROXY-IDENTITY · 11-26): the CEO's proxy — holds no duty; its OP operator authority comes from the
+// process-bound grant (src/proxy/proxy-identity.ts), never from this map.
+export const ORG_ROLES = ['coo', 'cto', 'cmo', 'cxo', 'leader', 'advisor', 'judge', 'steward', 'hand', 'proxy'] as const;
 export type OrgRole = typeof ORG_ROLES[number];
 
 const EXEC: readonly OrgRole[] = ['coo', 'cto', 'cmo', 'cxo', 'leader'];
+
+/**
+ * Roles held by loop agents (graph triggers, no conversational inbox) — 대표 11-26: REL and RES became loop agents.
+ * Mail meant to be read by a seat (bulletins, digests) skips these seats.
+ */
+export const LOOP_AGENT_ROLES: readonly OrgRole[] = ['steward'];
+/** True when the seat reads mail in a conversation (unknown seats count as conversational). */
+export const isConversationalSeat = (org: { seats: Readonly<Record<string, { role: OrgRole }>> }, seat: string): boolean =>
+  !LOOP_AGENT_ROLES.includes(org.seats[seat.trim().toUpperCase()]?.role as OrgRole);
 
 /** duty → roles allowed to hold it. */
 export const DUTY_ROLES: Readonly<Record<string, readonly OrgRole[]>> = {
@@ -48,6 +59,7 @@ export const DEFAULT_ORG: OrgMap = {
   seats: {
     OP: { role: 'coo' }, TC: { role: 'cto' }, MK: { role: 'cmo' }, UX: { role: 'cxo' },
     JUD: { role: 'judge' }, REL: { role: 'steward' }, RES: { role: 'steward' }, 'TC-ADV': { role: 'advisor' },
+    'CLAUDE-OP': { role: 'proxy' },
   },
   spaces: {
     hq: { leader: 'OP' }, tc: { leader: 'TC', advisor: 'TC-ADV' }, mk: { leader: 'MK' }, ux: { leader: 'UX' },

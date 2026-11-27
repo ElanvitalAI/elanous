@@ -2448,6 +2448,112 @@ describe('defaultSeams.gate — dependency-wide validation feedback', () => {
   });
 });
 
+describe('PWA-GATE-OWN-DELTA-CACHE — the dependency gate judges the PR-own delta after main sync', () => {
+  /** main ← base; feature commits `featureFiles`; main then commits `mainFiles`; feature merges main (the pre-PR sync). */
+  function syncedRepo(featureFiles: Record<string, string>, mainFiles: Record<string, string>): string {
+    const cwd = mkdtempSync(join(tmpdir(), 'seam-own-delta-'));
+    git(cwd, 'init', '-b', 'main');
+    git(cwd, 'config', 'user.email', 't@t.co');
+    git(cwd, 'config', 'user.name', 'T');
+    mkdirSync(join(cwd, 'apps/pwa/src'), { recursive: true });
+    mkdirSync(join(cwd, 'src/kit'), { recursive: true });
+    writeFileSync(join(cwd, 'apps/pwa/src/entry.tsx'), "import '../../../src/kit/pwa-used.js';\n");
+    writeFileSync(join(cwd, 'src/kit/pwa-used.ts'), 'export const used = 1;\n');
+    writeFileSync(join(cwd, 'src/kit/own.ts'), 'export const own = 1;\n');
+    writeFileSync(join(cwd, 'bun.lock'), 'lock v1\n');
+    writeFileSync(join(cwd, 'package.json'), '{"name":"root"}\n');
+    git(cwd, 'add', '-A');
+    git(cwd, 'commit', '-m', 'base');
+    git(cwd, 'checkout', '-b', 'feature');
+    for (const [file, body] of Object.entries(featureFiles)) writeFileSync(join(cwd, file), body);
+    git(cwd, 'add', '-A');
+    git(cwd, 'commit', '-m', 'feature');
+    git(cwd, 'checkout', 'main');
+    for (const [file, body] of Object.entries(mainFiles)) writeFileSync(join(cwd, file), body);
+    git(cwd, 'add', '-A');
+    git(cwd, 'commit', '-m', 'main moved');
+    git(cwd, 'checkout', 'feature');
+    git(cwd, 'merge', '--no-edit', 'main');
+    return cwd;
+  }
+  const baseOptions: DefaultSeamsOptions = {
+    runIntegrityGate: () => ({ passed: true, steps: [], log: '[test] PASS' }),
+    runHarnessPolicyGates: () => ({ passed: true, failures: [] }),
+  };
+
+  test('main changed bun.lock, package.json and a PWA-reachable file; the PR did not ⇒ no dependency/PWA build', async () => {
+    const cwd = syncedRepo(
+      { 'src/kit/own.ts': 'export const own = 2;\n' },
+      { 'bun.lock': 'lock v2\n', 'package.json': '{"name":"root","v":2}\n', 'src/kit/pwa-used.ts': 'export const used = 2;\n' },
+    );
+    try {
+      const scopes: unknown[] = [];
+      const observation = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+        if (category === 'self-implement' && event === 'gate.dependency-scope') scopes.push(data);
+      }) as never);
+      try {
+        await defaultSeams({
+          ...baseOptions,
+          runDependencyChangeGate: () => { throw new Error('main-only dependency change must not build the PWA'); },
+        }).gate(cwd, { mode: 'postsync' });
+      } finally { observation.mockRestore(); }
+      expect(scopes).toEqual([expect.objectContaining({ source: 'pr-own-delta', count: 1, mode: 'postsync' })]);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  test('the PR changes the PWA app ⇒ the dependency gate runs on exactly the PR-own files (not main\'s bun.lock)', async () => {
+    const cwd = syncedRepo(
+      { 'apps/pwa/src/entry.tsx': "import '../../../src/kit/pwa-used.js';\nexport const page = 1;\n" },
+      { 'bun.lock': 'lock v2\n' },
+    );
+    try {
+      const calls: Array<{ files: string[]; cacheDir?: string }> = [];
+      const gate = await defaultSeams({
+        ...baseOptions,
+        runDependencyChangeGate: ({ changedFiles, cacheDir }) => {
+          calls.push({ files: [...changedFiles], cacheDir });
+          return { ran: true, passed: false, failures: [{ step: 'pwa-build', lines: ['PWA build failed'] }] };
+        },
+      }).gate(cwd, { mode: 'postsync' });
+      expect(calls.map((call) => call.files)).toEqual([['apps/pwa/src/entry.tsx']]);
+      expect(calls[0]!.cacheDir).toMatch(/pwa-build-cache$/);
+      expect(gate.passed).toBe(false);
+      expect(gate.log).toContain('[dependency-change: pwa-build] FAIL');
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  test('a cache hit is visible in gate.log as a PASS with its key', async () => {
+    const cwd = syncedRepo({ 'src/kit/pwa-used.ts': 'export const used = 3;\n' }, { 'README.md': 'main\n' });
+    try {
+      const gate = await defaultSeams({
+        ...baseOptions,
+        runDependencyChangeGate: () => ({ ran: false, passed: true, measured: true, failures: [], trigger: 'pwa-reachable', pwaReachableChanged: ['src/kit/pwa-used.ts'], pwaBuildCache: 'hit', pwaBuildCacheKey: 'a'.repeat(64) }),
+      }).gate(cwd, { mode: 'postsync' });
+      expect(gate.log).toContain(`[dependency-change: pwa-build] PASS (cache=hit key=${'a'.repeat(16)})`);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  test('unknown own delta ⇒ the wider gate list is kept (never narrows on unknown)', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'seam-own-delta-unknown-'));
+    try {
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      writeFileSync(join(cwd, 'README.md'), 'base\n');
+      git(cwd, 'add', '-A');
+      git(cwd, 'commit', '-m', 'base');
+      writeFileSync(join(cwd, 'bun.lock'), 'lock\n');
+      const calls: string[][] = [];
+      await defaultSeams({
+        ...baseOptions,
+        prOwnChangedFiles: () => ({ files: null, reason: 'no merge-base with main' }),
+        runDependencyChangeGate: ({ changedFiles }) => { calls.push([...changedFiles]); return { ran: true, passed: true, failures: [] }; },
+      }).gate(cwd);
+      expect(calls).toEqual([['bun.lock']]);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+});
+
 describe('defaultSeams — platform gates', () => {
   let repo: string;
 

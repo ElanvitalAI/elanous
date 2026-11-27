@@ -3,7 +3,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { classifyLandExit, decide, replayAttempt, tickLand, type Facts, type LandDeps } from './land-graph.js';
+import { classifyLandExit, decide, replayAttempt, security4Hits, tickLand, type Facts, type LandDeps } from './land-graph.js';
 
 const pr = { number: 40001, head: 'a'.repeat(40), base: 'main', draft: false, state: 'OPEN' as const, title: 't', author: 'TC', files: ['src/x.ts'] };
 const receipt = { dir: '/r/40001-aaaaaaaaaaaa-minim5', head: 'a'.repeat(40), host: 'minim5', focused: ['src/x.test.ts'], rawDir: '/raw' };
@@ -24,6 +24,50 @@ describe('decide', () => {
   });
   test('only security-4 findings bind', () => { expect(decide(facts({ security: ['auth:x'] })).cls).toBe('security-finding'); });
   test('cardSeat overrides every recipient', () => { expect(decide(facts({ hold: 'x', cardSeat: 'TEST-LAND' })).card?.to).toEqual(['TEST-LAND']); });
+});
+
+describe('decide · JUD-RELAX land rule (CEO 11-26)', () => {
+  test('swept raw + receipt focused step exit 0 → land (bun exit 0 ⇔ 0 fail)', () => {
+    const d = decide(facts({ focused: { swept: true, exit: 0 } }));
+    expect([d.action, d.why.includes('focused step exit 0')]).toEqual(['land', true]);
+  });
+  test('swept raw exit 1 → refuse; with a baseline-name-diff introduced 0 → land', () => {
+    expect(decide(facts({ focused: { swept: true, exit: 1 } })).cls).toBe('baseline-failing-focused');
+    const nd = { receipt: '/nd.json', command: 'bun test a', headPass: 30, headFail: 2 };
+    expect(decide(facts({ focused: { swept: true, exit: 1 }, baselineDiff: nd })).action).toBe('land');
+    expect(decide(facts({ focused: { pass: 30, fail: 2 }, baselineDiff: nd })).action).toBe('land');
+  });
+  test('L0 receipt (focused stage skipped, list recorded) on doc-only files → L0 land · on code → refuse', () => {
+    const l0 = { ...receipt, focused: ['test/rules-contract.test.ts'], grade: 'L0', focusedExit: null };
+    const doc = decide(facts({ pr: { ...pr, files: ['docs/conductor/A.md'] }, receipt: l0, focused: 'unreadable' }));
+    expect([doc.action, doc.lane]).toEqual(['land', 'L0-doc-only']);
+    expect(decide(facts({ receipt: l0, focused: 'unreadable' })).cls).toBe('no-focused-stage');
+  });
+  test('hot file is no longer a JUD review wait', () => {
+    expect(decide(facts({ pr: { ...pr, files: ['src/index.ts', 'package.json'] } })).action).toBe('land');
+  });
+  test('security-4 path: no Terra → wait review-required (card author) · PASS/WARN → land · FAIL → wait · security finding → refuse', () => {
+    const sec = { ...pr, files: ['src/oauth/refresh.ts'] };
+    const none = decide(facts({ pr: sec }));
+    expect([none.action, none.cls, none.card?.to]).toEqual(['wait', 'review-required', ['TC']]);
+    expect(none.card?.body).toContain('--model gpt-6.1-terra');
+    expect(decide(facts({ pr: sec, terra: { verdict: 'pass', securityFindings: [] } })).action).toBe('land');
+    expect(decide(facts({ pr: sec, terra: { verdict: 'WARN', securityFindings: [] } })).action).toBe('land');
+    expect(decide(facts({ pr: sec, terra: { verdict: 'fail', securityFindings: [] } })).cls).toBe('review-required');
+    expect(decide(facts({ pr: sec, terra: { verdict: 'pass', securityFindings: ['secret-leak:x'] } })).cls).toBe('security-finding');
+  });
+  test('non-security path ignores Terra entirely', () => {
+    expect(decide(facts({ terra: { verdict: 'fail', securityFindings: [] } })).action).toBe('land');
+  });
+  test('security-4 path classes', () => {
+    expect(security4Hits(['src/oauth/a.ts', 'src/secret/b.ts', 'src/pty/c.ts', 'src/disk-steward/d.ts', 'src/els/server-auth.ts', 'scripts/vm-deploy.sh'])
+      .map(x => x.split(':')[0])).toEqual(['auth', 'secret', 'remote-exec', 'destroy', 'auth', 'remote-exec']);
+    // One shared table with the judge-butler (GREEN-DEFINITION-ONE): the land path's authority boundary only · tests/patches never.
+    expect(security4Hits(['src/cli/land-graph-cli.ts', 'src/org/land-authority.ts', 'src/org/org-map.ts', 'seat-state/OP/tools/op-waiver.sh'])
+      .map(x => x.split(':')[0])).toEqual(['auth', 'auth', 'auth']);
+    expect(security4Hits(['src/land-graph/land-graph.ts', 'seat-state/OP/patches/JUD-RELAX-op-waiver-security-only.patch', 'src/pty/spawn.test.ts'])).toEqual([]);
+    expect(security4Hits(['src/org/seat-roles.ts', 'src/user-config-codex-credits.ts', 'docs/a.md', 'src/llm/token-count.ts'])).toEqual([]);
+  });
 });
 
 describe('classifyLandExit (11-25 STOP lines)', () => {
@@ -62,6 +106,11 @@ describe('tickLand', () => {
     const d = deps(root, { land: async () => { lands++; return { rc: 9, text: 'STOP isolation-gate rc=1' }; }, prNow: async () => ({ ...pr, state }) });
     await tickLand(d); await tickLand(d);
     expect(lands).toBe(1);
+  });
+  test('a JUD HOLD verdict on file vetoes like a hold (re-checked before the merge)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'lg-')); let lands = 0;
+    const res = await tickLand(deps(root, { org: { path: ORG }, judHold: () => ({ reason: 'HOLD verdict hold-40001', by: 'JUD' }), land: async () => { lands++; return { rc: 0, text: '' }; } }));
+    expect([lands, res.decisions[0]?.action]).toEqual([0, 'hold']);
   });
   test('shadow posts no card unless a card seat is set', async () => {
     const root = mkdtempSync(join(tmpdir(), 'lg-')); const posts: string[] = [];

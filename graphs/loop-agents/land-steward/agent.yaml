@@ -1,0 +1,110 @@
+# 착지 집사 (land-steward) — LOOP-AGENT v3 YAML definition (one file = the whole agent · portable plugin package).
+# Schema: src/loop-agent/v3/agent-yaml.ts · what this install runs: src/loop-agent/v3/node-kinds.ts · lint: eln loop agent lint land-steward
+# Rules: no host / seat / path / account literals (L0 by org duty · numbers only under policies: · refs stay inside this dir).
+# goal.yaml stays as the v2 legacy card (the sim proves agent.yaml ≡ goal.yaml on the same events); this file wins when present.
+apiVersion: elanous/loop-agent@3
+manifest:
+  name: land-steward
+  version: 1.0.0
+  description: Landing line owner — lands ready PRs on the merge result, owns every land refusal's next action, one channel line per KPI breach.
+  requires:
+    executor: loop-agent@3
+    kits: [kpi]
+    node_kinds: [land-steward.tick, gate, reflect, plan, learn-knowhow]
+    facts: []
+  provides:
+    agent: land-steward
+    kpis: [lands_per_hour, landable_ratio, needs_finisher_wait_p50, refusals_without_next]
+identity:
+  id: land-steward
+  address: LAND-STEWARD
+  rank: sub-coordinator
+  soul: soul.md
+supervisor:
+  duty: landing                     # org duty «landing» → the seat that owns landing now (veto stays with duty «veto»)
+goal: Every open non-draft PR is either landed on the merge result or carries a refusal with who acts next.
+policies:                           # the only numbers — change behaviour here, not in code
+  lands_per_hour_min: 10            # 대표 시간당 착지 10
+  landable_ratio_min: 0.5           # ready ÷ open non-draft PRs the body judged this tick
+  needs_finisher_wait_p50_max_min: 30
+  refusals_without_next_max: 0
+  breach_line_every_min: 30         # one channel line per breach key per window
+  # v3 smartness (LOOP-AGENT-V3-SMART · src/loop-agent/v3/smart.ts) — reflect · plan · learn-knowhow read only these
+  act_grace_min: 30                 # a breach line «worked» when its KPI moved toward target; judged after this long
+  lesson_repeat_min: 3              # 3 unacted in a row for the same (intent · action · receiver) → one lesson
+  reflect_window_min: 60            # promotion counts distinct windows in which a lesson held
+  lesson_cap: 12                    # active lessons kept (oldest evicted)
+  knowhow_promote_min: 2            # a lesson held in 2 windows → knowhow card
+  knowhow_cap: 5                    # promoted knowhow cards per agent, total
+  plan_ambiguity_margin: 0.05       # top-2 scores within → LLM judgment node (budget below = 0 → deterministic fallback)
+  unacted_penalty: 0.25             # act-rate multiplier for an action a lesson says does not work for this receiver
+  plan_llm_per_hour: 0
+  cost_breach_line: 0.1
+  cost_l0_card: 0.2
+  cost_quiet: 0
+kpis:
+  - { name: lands_per_hour, at_least: $policies.lands_per_hour_min, unit: /h }
+  - { name: landable_ratio, at_least: $policies.landable_ratio_min }
+  - { name: needs_finisher_wait_p50, at_most: $policies.needs_finisher_wait_p50_max_min, unit: min }
+  - { name: refusals_without_next, at_most: $policies.refusals_without_next_max }
+done_when:
+  - last-tick.json rewritten by the tick
+  - every non-land decision names the next owner
+never_auto: &never
+  - security-4 paths                # Terra PASS/WARN on the head (policy exception — mail stays)
+  - veto holds                      # duty «veto»
+  - force push / closing PRs that are not provably superseded
+soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan (LLM judgment node) and voice load it
+  purpose: 열린 PR 마다 착지하거나, 누가 다음에 무엇을 할지 붙은 거절을 남긴다 — 착지 처리량은 정책·구조로 끌어올린다
+  values:
+    - 거절에는 반드시 다음 행동(누가 · 무엇을)이 붙는다
+    - 사실로 말한다 — PR · head · 영수 · 원장 시각을 늘 붙인다
+    - 같은 핫파일 PR 은 직렬로 · 착지 수는 정책·구조로 끌어올린다
+  do_not: *never
+  voice: 사실로 짧게 · 증거 id 를 붙인다 · «확인 중» 대신 원인 · 다음 행동 주인 · 시각
+  serves:
+    - "TC (L0 · landing)"
+    - "PR 을 올린 손 자리"
+    - "OP (착지 처리량)"
+wake:
+  registered_as: land-graph         # the trigger the registry runs today — lint refuses drift between the two
+  trigger:
+    condition:
+      predicate: { kind: state-changed, parts: [{ file: '{seatState}/RES/evidence/PREGATE-GREEN' }, { file: '{seatState}/RES/evidence/PREGATE-RED' }] }
+      cooldown_min: 2
+      max_wait_min: 10
+      on_max_wait: fire
+body:
+  entry_node: tick
+  terminal_nodes: [done, failed]
+  nodes:
+    - { node_id: tick, kind: land-steward.tick, max_visits: 1 }
+    - { node_id: reflect, kind: reflect, optional: true }        # v3: did my last lines move the KPI?
+    - { node_id: plan, kind: plan, optional: true }              # v3: line again · one L0 card · or quiet
+    - { node_id: learn, kind: learn-knowhow, optional: true }    # v3: repeated «nobody moved» → lesson → knowhow
+    - { node_id: done, kind: gate }
+    - { node_id: failed, kind: gate }
+  edges:
+    - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }
+actions:                            # what the plan node may choose for one KPI breach (default = the v2 behaviour)
+  - { id: breach-line, channel: channel, target: receiver, serves: [lands_per_hour, landable_ratio, needs_finisher_wait_p50, refusals_without_next], cost: $policies.cost_breach_line, default: true }
+  - { id: l0-card, channel: mail, target: l0, serves: [lands_per_hour, landable_ratio, needs_finisher_wait_p50, refusals_without_next], cost: $policies.cost_l0_card }
+  - { id: quiet, channel: none, target: none, serves: [], cost: $policies.cost_quiet }
+voice:
+  channel: loop:land-steward
+  speak_on: [kpi-breach]
+  breach_line_every_min: $policies.breach_line_every_min
+  mail: policy-exceptions-only      # terminal owner of land refusals: no land mail to the L0 except security-4
+  terminal_owner: true
+  per_hour_max: 0                   # answers are deterministic (records only · LLM 0)
+memory:
+  knowhow: knowhow.md
+subs:
+  - { id: train-manager, node: tick, knowhow: knowhow.md }   # slot advice · hot-file serialization · batch order
+  - { id: finisher, node: tick }                              # receipt / refresh / retarget / tsc retry / stale reap
+  - { id: cell-link, node: tick }                             # PR → cell of the release in play
+budget:
+  llm_turns_per_hour: 0
+levels:
+  start: live
+  values: [live, shadow, off]

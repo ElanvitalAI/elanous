@@ -48,6 +48,14 @@ export function dispatchHandRaise(args: Record<string, unknown>, deps: { openSto
       ladderModule.recordHoldReject(store, { msgId, actor: actor ?? 'unknown', via: 'tool', now: deps.now?.() ?? Date.now() });
       throw new Error(`resolve needs owner and deadline. ${ladderModule.holdRejectMessage(msgId)}`);
     }
+    // 11-26 21:42 OP: a ✋ re-delivered after an over-budget turn was resolved a second time → «dispatch failed: already
+    // resolved». The guard is right; the answer is a no-op, not an error — it names the outcome so the seat moves on.
+    const already = (() => { const hand = ladderModule.readHandMail(store, msgId); const closed = hand ? ladderModule.handClosedOn(store, hand) : null;
+      return closed === 'resolved' || closed === 'rejected' ? closed : null; })();
+    if (already && action !== 'escalate') {
+      return { ok: true, action, msgId, to: '', mailId: null, noop: true,
+        output: `✋ #${msgId} is already ${already} — nothing sent (no-op). Move on to the next item.` };
+    }
     const result = ladderModule.applyHandOutcome(store, { msgId, action, text: typeof args.text === 'string' ? args.text : '', via: 'tool',
       ...(actor ? { actor } : {}), ...(action === 'resolve' ? { owner, deadline } : {}) }, {
       ladder: deps.ladder ?? ladderModule.loadFederationLadder(), now: deps.now ?? (() => Date.now()), raiseDecision: ladderModule.spawnHandDecision,

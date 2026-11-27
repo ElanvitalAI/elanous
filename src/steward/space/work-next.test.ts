@@ -205,3 +205,37 @@ describe('eln work next', () => {
     ]);
   });
 });
+
+describe('POOL-PULL-NEEDS-SPEC — pull.requireDoneWhen', () => {
+  test('a cell without done-when is not offered; a cell with one is; the ledger row names the skipped cell', () => {
+    ledger();
+    addItem(V, { id: 'NO-SPEC', title: 'kpi contract unknown', priority: 'P0' });
+    addItem(V, { id: 'HAS-SPEC', title: 'measurable cell', priority: 'P2', doneCriterion: 'focused test green' });
+    const rows: Record<string, unknown>[] = [];
+    const r = workNext('TC-1', deps({ requireDoneWhen: () => true }, rows));
+    expect(r).toMatchObject({ code: 0, line: 'HAS-SPEC · measurable cell · done-when: focused test green' });
+    expect(rows.at(-1)).toMatchObject({ outcome: 'claimed', cell: 'HAS-SPEC', skipped: { 'needs-spec': ['NO-SPEC'] } });
+    expect(listChecklist(V).items.map((i) => [i.id, i.owner ?? null])).toEqual([['NO-SPEC', null], ['HAS-SPEC', 'TC-1']]);
+  });
+
+  test('only cells without done-when → exit 3 and the breakdown says needs-spec', () => {
+    ledger();
+    addItem(V, { id: 'NO-SPEC', title: 'kpi contract unknown', priority: 'P0' });
+    addItem(V, { id: 'BLANK-SPEC', title: 'blank done line', priority: 'P1', doneCriterion: '   ' });
+    const rows: Record<string, unknown>[] = [];
+    const r = workNext('TC-1', deps({ requireDoneWhen: () => true }, rows));
+    expect(r.code).toBe(3);
+    expect(r.code === 3 && r.breakdown?.endsWith(' · needs-spec 2 (no done-when — OP sets one)')).toBe(true);
+    expect(rows.at(-1)).toMatchObject({ outcome: 'empty', skipped: { 'needs-spec': ['NO-SPEC', 'BLANK-SPEC'] } });
+  });
+
+  test('policy false (and absent) → the cell without done-when is offered as before', () => {
+    ledger();
+    addItem(V, { id: 'NO-SPEC', title: 'kpi contract unknown', priority: 'P0' });
+    const off = workNext('TC-1', deps({ requireDoneWhen: () => false }));
+    expect(off).toMatchObject({ code: 0, line: 'NO-SPEC · kpi contract unknown · done-when: kpi contract unknown' });
+    ledger();
+    addItem(V, { id: 'NO-SPEC', title: 'kpi contract unknown', priority: 'P0' });
+    expect(workNext('TC-2', deps()).code).toBe(0);
+  });
+});

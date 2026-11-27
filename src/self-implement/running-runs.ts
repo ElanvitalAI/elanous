@@ -9,7 +9,7 @@ import { isPidAlive } from '../git-fs/worktree.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { loadSelfDevRun, selfDevRunsDir, type SelfDevRunState } from '../self-dev/run-store.js';
 import { listPtyManifestRowsAt } from '../pty-shell/pty-manifest.js';
-import { classifyFederatedLedgerDirectoryReadFailure, isTerminatedUnfinishedLifecycle, queryFederatedUnfinishedRunLedgers, resolveFederatedRunLedgerDirectories, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery, type NonBlockingRunLedgerRecord, type UnfinishedRunLifecycle } from './run-ledger.js';
+import { classifyFederatedLedgerDirectoryReadFailure, isTerminatedUnfinishedLifecycle, queryFederatedUnfinishedRunLedgers, resolveFederatedRunLedgerDirectories, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery, type NonBlockingRunLedgerRecord, loadRunLedger, type RunLedgerEntry, type UnfinishedRunLifecycle } from './run-ledger.js';
 import { SELF_IMPLEMENT_PROGRESS_STAGES } from './orchestrator.js';
 
 export type RunningRunStatus = 'running' | 'probable-running' | 'ended-unclosed' | 'unknown';
@@ -649,6 +649,13 @@ function runningRunsUnreadable(result: RunningRunsResult): readonly UnreadableRu
   return result.unreadable ?? (result.count !== undefined && typeof result.count !== 'number' ? result.count.unreadable : []);
 }
 
+export function isSeatTurnLedger(entries: readonly Pick<RunLedgerEntry, 'event' | 'data'>[]): boolean {
+  const firstEvent = entries[0]?.event;
+  return typeof firstEvent === 'string'
+    && firstEvent.startsWith('child-first-')
+    && !entries.some((entry) => entry.event === 'pipeline-node-entry' || entry.event === 'phase');
+}
+
 export interface RunProgressRow {
   readonly runId: string;
   readonly status: RunningRunStatus;
@@ -662,8 +669,32 @@ export interface RunProgressRow {
   readonly phaseObservation: RunningRunPhaseObservation;
 }
 
-export function buildRunProgressRows(result: RunningRunsResult, nowMs: number = Date.now()): RunProgressRow[] {
-  return result.entries.map((entry) => {
+function isSeatTurnAssessment(entry: RunningRunAssessment): boolean {
+  if (entry.phaseObservation === 'observed' || entry.lastPhase != null) return false;
+  const observedEntries: RunLedgerEntry[] = [];
+  for (const directory of entry.ledgerDirectories) {
+    try {
+      const ledger = loadRunLedger(entry.runId, directory);
+      if (ledger) observedEntries.push(...ledger);
+    } catch {
+      return false;
+    }
+  }
+  return isSeatTurnLedger(observedEntries);
+}
+
+interface RunProgressPresentation {
+  readonly rows: RunProgressRow[];
+  readonly excludedEntries: readonly RunningRunAssessment[];
+}
+
+function buildRunProgressPresentation(result: RunningRunsResult, nowMs: number): RunProgressPresentation {
+  const visibleEntries: RunningRunAssessment[] = [];
+  const excludedEntries: RunningRunAssessment[] = [];
+  for (const entry of result.entries) {
+    (isSeatTurnAssessment(entry) ? excludedEntries : visibleEntries).push(entry);
+  }
+  const rows = visibleEntries.map((entry) => {
     const activityMs = entry.lastActivityTimestamp === null ? Number.NaN : Date.parse(entry.lastActivityTimestamp);
     return {
       runId: entry.runId,
@@ -676,6 +707,11 @@ export function buildRunProgressRows(result: RunningRunsResult, nowMs: number = 
       phaseObservation: entry.phaseObservation ?? 'not-observed',
     };
   });
+  return { rows, excludedEntries };
+}
+
+export function buildRunProgressRows(result: RunningRunsResult, nowMs: number = Date.now()): RunProgressRow[] {
+  return buildRunProgressPresentation(result, nowMs).rows;
 }
 
 function formatElapsed(ms: number): string {
@@ -692,10 +728,15 @@ function formatElapsed(ms: number): string {
 
 export function renderRunProgressTable(result: RunningRunsResult, nowMs: number = Date.now()): string {
   const partial = isPartialRunningRuns(result);
+  const presentation = buildRunProgressPresentation(result, nowMs);
+  const excludedEntries = presentation.excludedEntries;
+  const excludedSeatTurns = excludedEntries.length;
+  const excludedRunning = excludedEntries.filter((entry) => entry.status === 'running').length;
+  const excludedProbable = excludedEntries.filter((entry) => entry.status === 'probable-running').length;
   const header = partial
-    ? `부분 관측 — 최소 ${runningRunsLowerBound(result)} (${result.stalled ? `중단 단계 ${result.stalled.stage} · 사유 ${result.stalled.reason}` : `읽지 못한 원장: ${runningRunsUnreadable(result).map((item) => `${item.dir}:${item.reason}`).join(',') || '목록 미관측'}`})`
-    : `도는 런 ${result.counts.running + result.counts['probable-running']} (확인 ${result.counts.running} · 추정 ${result.counts['probable-running']})`;
-  const rows = buildRunProgressRows(result, nowMs).map((row) => {
+    ? `부분 관측 — 최소 ${Math.max(0, runningRunsLowerBound(result) - excludedRunning - excludedProbable)} (${result.stalled ? `중단 단계 ${result.stalled.stage} · 사유 ${result.stalled.reason}` : `읽지 못한 원장: ${runningRunsUnreadable(result).map((item) => `${item.dir}:${item.reason}`).join(',') || '목록 미관측'}`}) · 자리 턴 ${excludedSeatTurns} 제외`
+    : `도는 런 ${result.counts.running + result.counts['probable-running'] - excludedRunning - excludedProbable} (확인 ${result.counts.running - excludedRunning} · 추정 ${result.counts['probable-running'] - excludedProbable}) · 자리 턴 ${excludedSeatTurns} 제외`;
+  const rows = presentation.rows.map((row) => {
     const phaseUnreadable = row.phaseObservation === 'unreadable' || row.phaseObservation === 'partially-unreadable';
     const phase = row.lastPhase ?? (phaseUnreadable ? '미관측 (단계 저장소 읽기 실패)' : '미관측');
     const phaseAt = row.lastPhaseObservedAt ?? '미관측';

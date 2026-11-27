@@ -210,12 +210,14 @@ describe('restart and boot', () => {
       const store = createSeatPlanFileStore(join(root, 'plan.json'));
       const inbox = [mail(1, '#5001 merge 시험 보고'), mail(2, '#5002 merge 시험 보고')];
       const boot1 = realPort();
-      const rt1 = wireSeatMailToPlan(boot1.port, { seat: SEAT, ledger: fakeLedger(inbox), store });
+      // The clock is the mail's day (PLAN-STALE-ON-BOOT expires items older than 48 h at boot).
+      const now = () => Date.UTC(2026, 10, 17, 7, 0, 0);
+      const rt1 = wireSeatMailToPlan(boot1.port, { seat: SEAT, ledger: fakeLedger(inbox), store, now });
       rt1.absorb();
       const planBefore = rt1.plan().map(t => t.id);
       // New process: a fresh queue, the same ledger (nothing was acked), the same plan file.
       const boot2 = realPort();
-      const rt2 = wireSeatMailToPlan(boot2.port, { seat: SEAT, ledger: fakeLedger(inbox), store });
+      const rt2 = wireSeatMailToPlan(boot2.port, { seat: SEAT, ledger: fakeLedger(inbox), store, now });
       expect(rt2.plan().map(t => t.id)).toEqual(planBefore);
       expect(noticeTexts(boot2.queue)).toHaveLength(MAX_ACTIVE_PLAN_ITEMS);
       rt2.absorb();

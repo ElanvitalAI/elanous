@@ -13,7 +13,7 @@ import {
 } from '../nexus/config/user-config.js';
 import { registerPwaInstance, listPwaInstances, type PwaRegistryEntry, type PwaLauncherProvenance } from './pwa-registry.js';
 import { debug } from '../debug/log.js';
-import { runPwaBuild, checkPwaBuildDeps, resolvePwaCwd, type PwaBuildResult } from './pwa-build.js';
+import { runPwaBuild, checkPwaBuildDeps, checkPrebuiltPwa, resolvePwaCwd, type PrebuiltPwaVerdict, type PwaBuildResult } from './pwa-build.js';
 import { runPwaInstall, type PwaInstallResult } from './pwa-install.js';
 import { runPwaStop, type PwaStopOpts, type PwaStopResult } from './pwa-stop.js';
 import { checkPwaStaleness } from './pwa-staleness.js';
@@ -161,6 +161,8 @@ export interface PwaStartOpts {
   /** Run the staleness check (default = mtime walk). Returning
    *  `stale=true` triggers a one-shot build. */
   stalenessFn?: (pwaCwd: string) => { stale: boolean; reason: string };
+  /** PWA-RUNTIME-LEAN prebuilt check (default `checkPrebuiltPwa`). Test seam. */
+  prebuiltFn?: (pwaCwd: string) => PrebuiltPwaVerdict;
   /** Run `runPwaBuild` (default). Test seam to count invocations. */
   buildFn?: (cwd: string) => Promise<PwaBuildResult>;
   /** Run `runPwaInstall` (default). Test seam — production shells out
@@ -367,6 +369,14 @@ async function maybeAutoBuild(
     if (opts.rebuild) {
       out.error('  --rebuild: could not locate apps/pwa — skipping build.');
     }
+    return 0;
+  }
+  // PWA-RUNTIME-LEAN: an installed package whose packaged PWA is this version's
+  // build has nothing to build — skip before the auto-install gate, which would
+  // otherwise pull ~750MB of apps/pwa/node_modules into the install.
+  const prebuilt = (opts.prebuiltFn ?? checkPrebuiltPwa)(pwaCwd);
+  if (prebuilt.kind === 'prebuilt') {
+    if (opts.rebuild) out.log(`  pwa.lean skip=prebuilt commit=${prebuilt.commit.slice(0, 12)} — installed package carries this version's PWA; --rebuild has nothing to build.`);
     return 0;
   }
   let needBuild = opts.rebuild === true;

@@ -1,0 +1,23 @@
+# SIM-WORLD smart-merge pack — SMART-MERGE (CEO 11-27 10:0x · 10:2x): stack rebuild after squash, PR-own delta, conflict ladder,
+# revert guard and the edges (force push · closed PR · network loss · racing finishers) on real temp git repos.
+schema: 1
+world: smart-merge
+scenarios:
+  - { id: SM-STALE-PR-REAP, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-STACK-4DEEP, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-STACK-MANUAL-MERGE, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-MAIN-ONLY-MERGE, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-HOT-FILE-5PR, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-LIST-APPEND, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-SEMANTIC-LLM, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-SECURITY4-SAME-LADDER, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-REVERT-GUARD, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-FORCE-PUSHED-UPSTREAM, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-PR-CLOSED-MID, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-FETCH-FAIL-MID, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-RACE-LOCK, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-REFUSED-BEFORE-INSTALL, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-STACK-AUTO-DISCOVER, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-DECLARED-SUPERSEDE, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-RESTRUCTURE-PLUS-INSERT, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-REVIEW-OWN-DELTA, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }

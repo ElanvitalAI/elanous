@@ -57,7 +57,8 @@ test('key router: plain text is input; ctrl+b then a herdr key is an action; ctr
   expect(router.feed('\u0002')).toEqual([]);
   expect(router.feed('k')).toEqual([{ kind: 'action', action: 'previous' }]);
   expect(router.feed('\u0002\u0002')).toEqual([{ kind: 'input', bytes: '\u0002' }]);
-  expect(router.feed('\u0002\u001bq')).toEqual([{ kind: 'input', bytes: 'q' }]);
+  // ELS-POPUP-TERM: ctrl+b Esc is a key of its own now (it hides the popup terminal; the app ignores it elsewhere).
+  expect(router.feed('\u0002\u001bq')).toEqual([{ kind: 'unknown', key: '\u001b' }, { kind: 'input', bytes: 'q' }]);
   expect(router.feed('\u00023')).toEqual([{ kind: 'action', action: 'goto', n: 3 }]);
   expect(router.feed('\u0002z')).toEqual([{ kind: 'unknown', key: 'z' }]);
   const keyed: [string, KeyAction][] = [['q', 'detach'], ['n', 'next'], ['p', 'previous'], ['w', 'next-workspace'], ['b', 'toggle-sidebar'], ['c', 'new'], ['N', 'new-workspace'], ['x', 'close'], ['D', 'close-workspace'], ['?', 'help']];

@@ -15,6 +15,7 @@
 //          수복과 인계 = WIP returns and order rewrites (live only); everything else is a card to OP.
 
 import type { PulsePhase } from '../../loops/op-pulse.js';
+import { needsSpec } from '../space/work-next.js';
 
 export interface BoardCellIn {
   readonly id: string;
@@ -31,6 +32,8 @@ export interface BoardCellIn {
   /** Explicit space tag; absent = the owner's coordinator scope, else `BOARD`. */
   readonly space?: string;
   readonly tags?: readonly string[];
+  /** The cell's done-when (checklist doneCriterion) — blank on an unowned cell = needs-spec (POOL-PULL-NEEDS-SPEC). */
+  readonly doneCriterion?: string;
 }
 
 export interface HandIn { readonly seat: string; readonly space: string; readonly idle: boolean }
@@ -118,7 +121,11 @@ export function nextBoard(cells: readonly BoardCellIn[], published: string, next
   return { version: next, carried, fresh };
 }
 
-export interface SpaceHealth { readonly space: string; readonly ready: number; readonly idleHands: number; readonly hands: number; readonly short: boolean }
+/**
+ * `idleHands` = idle hands with no open cell of their own (they need supply) · `idleHolding` = idle hands that hold an open
+ * cell (11-26 22:43: TC «0 ready / 8 idle» were all of this kind — they need a wake on their own cell, not a split).
+ */
+export interface SpaceHealth { readonly space: string; readonly ready: number; readonly idleHands: number; readonly hands: number; readonly short: boolean; readonly idleHolding?: number }
 export interface Blocked { readonly id: string; readonly on: string }
 export interface WipViolation { readonly seat: string; readonly held: number; readonly keep: string; readonly giveBack: readonly string[] }
 export interface Health { readonly spaces: readonly SpaceHealth[]; readonly blocked: readonly Blocked[]; readonly wip: readonly WipViolation[] }
@@ -144,8 +151,10 @@ export function boardHealth(input: { cells: readonly BoardCellIn[]; hands: reado
   const spaces = new Set<string>([...readyBy.keys(), ...input.hands.map((h) => h.space.toUpperCase())]);
   const rows: SpaceHealth[] = [...spaces].sort().map((space) => {
     const hs = input.hands.filter((h) => h.space.toUpperCase() === space);
-    const idleHands = hs.filter((h) => h.idle).length; const ready = readyBy.get(space) ?? 0;
-    return { space, ready, idleHands, hands: hs.length, short: idleHands > 0 && ready < READY_PER_HAND * idleHands };
+    const idleAll = hs.filter((h) => h.idle);
+    const idleHolding = idleAll.filter((h) => heldBy.has(h.seat.toUpperCase())).length;
+    const idleHands = idleAll.length - idleHolding; const ready = readyBy.get(space) ?? 0;
+    return { space, ready, idleHands, hands: hs.length, short: idleHands > 0 && ready < READY_PER_HAND * idleHands, ...(idleHolding ? { idleHolding } : {}) };
   });
   const wip: WipViolation[] = [...heldBy.entries()].filter(([, l]) => l.length > 1).map(([seat, l]) => {
     const sorted = [...l].sort((a, b) => rankOf(a.id) - rankOf(b.id) || pri(a) - pri(b) || Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || a.id.localeCompare(b.id));
@@ -154,13 +163,28 @@ export function boardHealth(input: { cells: readonly BoardCellIn[]; hands: reado
   return { spaces: rows, blocked: blocked.sort((a, b) => a.id.localeCompare(b.id)), wip };
 }
 
+/** POOL-PULL-NEEDS-SPEC — open unowned work cells without a done-when, sorted (`eln work next` does not offer them). */
+export function needsSpecCells(cells: readonly BoardCellIn[]): string[] {
+  return cells.filter((c) => c.status === 'yellow' && isWorkCell(c) && needsSpec(c)).map((c) => c.id).sort();
+}
+
+/** The OP line for a needs-spec set (≤ 20 ids named). */
+export function needsSpecLine(ids: readonly string[]): string {
+  const named = ids.slice(0, 20).join(' · ') + (ids.length > 20 ? ` · +${ids.length - 20} more` : '');
+  return `needs-spec ${ids.length}: pool cells without a done-when — hands skip them (eln work next). Set one: eln release checklist set <id> --done "<measurable line>" · ${named}`;
+}
+
 export interface Breach { readonly key: string; readonly line: string }
 
 /** Threshold breaches worth an OP card (everything else is only the digest row). */
 export function breaches(input: { health: Health; leader: { flagged: boolean; by: string | null }; cut: CutList | null; phaseChanged: boolean }): Breach[] {
   const out: Breach[] = [];
   const short = input.health.spaces.filter((s) => s.short);
-  if (short.length) out.push({ key: `supply:${short.map((s) => s.space).join(',')}`, line: `ready < 2× idle hands in ${short.map((s) => `${s.space} ${s.ready}/${s.idleHands}`).join(' · ')} — leaders: split cells` });
+  // 11-26 22:4x: «— leaders: split cells» was forwarded as a mail and nothing moved. The OP next-action planner acts on
+  // supply itself (rule (c): assign cells with a done-when, record split requests); the card says that, not «mail leaders».
+  if (short.length) out.push({ key: `supply:${short.map((s) => s.space).join(',')}`, line: `ready < 2× idle hands in ${short.map((s) => `${s.space} ${s.ready}/${s.idleHands}`).join(' · ')} — the OP planner (c) assigns cells nobody is on and records split requests; do not mail leaders` });
+  const holding = input.health.spaces.filter((s) => (s.idleHolding ?? 0) > 0);
+  if (holding.length) out.push({ key: `idle-holding:${holding.map((s) => `${s.space}${s.idleHolding}`).join(',')}`, line: `idle hands holding their own open cell: ${holding.map((s) => `${s.space} ${s.idleHolding}`).join(' · ')} — the OP planner (b) wakes each on its cell` });
   const bigWip = input.health.wip.filter((w) => w.held >= 3);
   if (bigWip.length) out.push({ key: `wip:${bigWip.map((w) => w.seat).join(',')}`, line: `WIP-1 broken: ${bigWip.map((w) => `${w.seat} holds ${w.held}`).join(' · ')}` });
   if (input.leader.flagged) out.push({ key: `leader-order:${input.leader.by}`, line: `leader ${input.leader.by} rewrote priority-order — ignored (leaders keep supply only)` });
@@ -176,7 +200,7 @@ export function cardsAllowed(breach: readonly Breach[], sent: ReadonlyArray<{ at
 }
 
 export function digestLine(input: { phase: PulsePhase; version: string; order: readonly string[]; health: Health; cut: CutList | null }): string {
-  const sp = input.health.spaces.map((s) => `${s.space} ${s.ready}r/${s.idleHands}i${s.short ? '!' : ''}`).join(' ');
+  const sp = input.health.spaces.map((s) => `${s.space} ${s.ready}r/${s.idleHands}i${s.idleHolding ? `+${s.idleHolding}h` : ''}${s.short ? '!' : ''}`).join(' ');
   const cut = input.cut ? ` · cut ${input.cut.counts.ship}s/${input.cut.counts.waive}w/${input.cut.counts.defer}d/${input.cut.counts.hold}h` : '';
   return `[BOARD ${input.version} · ${input.phase}] top ${input.order.slice(0, 3).join(' > ') || '-'} · ${sp || 'no spaces'} · blocked ${input.health.blocked.length} · wip ${input.health.wip.length}${cut}`;
 }

@@ -47,8 +47,11 @@ describe('assessReviewEngineValidity', () => {
       .toEqual({ invalid: false, requestedEngine: 'gpt', respondedEngine: 'gpt' });
   });
 
-  test('no explicit request ⇒ nothing to contradict; the responder is still reported as observed or unmeasured', () => {
-    expect(assessReviewEngineValidity({ respondedModel: 'z-ai/glm-5.3' })).toEqual({ invalid: false, respondedEngine: 'glm' });
+  test('GLM cannot supply review evidence, even when explicitly requested or selected implicitly', () => {
+    expect(assessReviewEngineValidity({ requested: 'z-ai/glm-5.3', respondedModel: 'z-ai/glm-5.3' }))
+      .toEqual({ invalid: true, invalidReason: 'glm-review-forbidden', requestedEngine: 'glm', respondedEngine: 'glm' });
+    expect(assessReviewEngineValidity({ respondedModel: 'z-ai/glm-5.3' }))
+      .toEqual({ invalid: true, invalidReason: 'glm-review-forbidden', respondedEngine: 'glm' });
     expect(assessReviewEngineValidity({})).toEqual({ invalid: false, respondedEngine: 'unmeasured' });
   });
 });

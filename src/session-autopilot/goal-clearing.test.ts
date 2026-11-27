@@ -33,7 +33,7 @@ function harness(opts: { slowCheck?: () => Promise<boolean> } = {}) {
   const pilot = createAutopilot({ file, now: () => t, coordinator: true, checkRoot: dir, handoffDir: join(dir, 'handoffs'),
     log: (e, d) => { logs.push([e, d]); }, notify: (line) => { notices.push(line); }, lossLedger: (line) => { losses.push(line); },
     raiseDecision: (card) => { cards.push(card.title); return `D-${cards.length}`; }, postProgress: () => {},
-    standingGoal: () => ({ version: '0.3.36', phase: '개발' }), ...(opts.slowCheck ? { slowCheck: opts.slowCheck } : {}) });
+    ...(opts.slowCheck ? { slowCheck: opts.slowCheck } : {}) });
   pilot.refresh();
   pilot.noteTurnStart('human');
   return { pilot, logs, notices, losses, cards, advance: (ms: number) => { t += ms; }, now: () => t,
@@ -52,11 +52,11 @@ test('check-based clear: done_check «file:plans/X.md» — the next tick after 
   mkdirSync(join(dir, 'plans'), { recursive: true });
   writeFileSync(join(dir, 'plans', 'X.md'), '# final\n');
   h.pilot.tick();
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
+  expect(h.pilot.state().goal).toBeUndefined();
   expect(h.events('goal-cleared')).toEqual([{ by: 'check', goal: '0.3.36 로스터 재조정', id: h.pilot.history()[0]!.id, outcome: 'done' }]);
   expect(h.notices).toContain('✓ goal cleared: 0.3.36 로스터 재조정 (done by check)');
   expect(h.pilot.takeNudges()).toEqual(['✓ goal cleared: 0.3.36 로스터 재조정 (done by check)']);
-  expect(h.pilot.statusText()).toBe('🚗 AUTO · 0.3.36 개발 · demo D-1');
+  expect(h.pilot.statusText()).toBe('🚗 AUTO · demo D-1');
   expect(readAutopilotState(file)?.life).toBeUndefined();
 });
 
@@ -76,7 +76,7 @@ test('mail-based clear: another seat\'s goal-done mail (ref or body token) clear
   const h = harness();
   goal(h, '0.3.36 로스터 재조정');
   expect(h.pilot.observeMail([{ msgId: 9001, sender: 'OPC', refs: ['goal-done:current'], body: 'goal-done:current — ROSTER-0.3.36-FINAL.md written' }])).toBe(true);
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
+  expect(h.pilot.state().goal).toBeUndefined();
   expect(h.events('goal-cleared').map((d) => [d.by, d.goal, d.reason])).toEqual([['mail', '0.3.36 로스터 재조정', 'OPC msg:9001']]);
   expect(h.notices).toContain('✓ goal cleared: 0.3.36 로스터 재조정 (done by mail)');
 
@@ -85,7 +85,7 @@ test('mail-based clear: another seat\'s goal-done mail (ref or body token) clear
   h.pilot.observeMail([{ msgId: 9002, sender: 'TC', body: '무관한 우편' }]);
   expect(h.pilot.state().goal).toBe('JUD 판정 회신 받기');
   h.pilot.observeMail([{ msgId: 9003, sender: 'JUD', body: '판정 PASS', createdAt: iso(h.now()) }]);
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
+  expect(h.pilot.state().goal).toBeUndefined();
 });
 
 test('deadline: one nudge at the deadline, then expired 30 min later with a loss-ledger line', () => {
@@ -99,7 +99,7 @@ test('deadline: one nudge at the deadline, then expired 30 min later with a loss
   expect(h.pilot.goalFeed()).toContain(`\n⏰ 기한 ${hhmm(T0 + 60 * MIN)} · id `);
   h.advance(30 * MIN);
   h.pilot.tick();
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
+  expect(h.pilot.state().goal).toBeUndefined();
   expect(h.events('goal-expired').map((d) => d.goal)).toEqual(['택틱 한 장']);
   expect(h.losses.length).toBe(1);
   expect(h.losses[0]!.startsWith(`- ${iso(T0 + 90 * MIN)} · expired · 택틱 한 장 · id=human:`)).toBe(true);
@@ -222,7 +222,7 @@ test('escape blocked → parallel: waiting on replies > 15 min parks the goal as
   h.pilot.turnEnded({ selfInitiated: false, failed: false, waitingOn: 1, stateChanged: true });
   h.advance(16 * MIN);
   h.pilot.tick();
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
+  expect(h.pilot.state().goal).toBeUndefined();
   expect(h.pilot.pins().map((p) => p.text)).toEqual(['JUD 판정 받기']);
   expect(h.events('goal-escape').map((d) => d.kind)).toEqual(['parallel']);
   expect(h.pilot.takeNudges()).toEqual(['⤴ escape: parallel — «JUD 판정 받기» parked until the reply arrives; pull the next roster item']);
@@ -254,6 +254,6 @@ test('`eln seat goal-done OP current --reason … --from OPC` posts the structur
   const h = harness();
   goal(h, '0.3.36 로스터 재조정');
   h.pilot.observeMail(rows.map((m) => ({ msgId: m.id, sender: m.from, body: m.body, ...(m.refs ? { refs: m.refs } : {}) })));
-  expect(h.pilot.state().goal).toBe('0.3.36 개발');
+  expect(h.pilot.state().goal).toBeUndefined();
   expect(h.events('goal-cleared').map((d) => [d.by, d.reason])).toEqual([['mail', 'OPC msg:1']]);
 });

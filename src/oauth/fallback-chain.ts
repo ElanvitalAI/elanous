@@ -20,6 +20,7 @@
 
 import type { RotationCandidate } from './codex-account-rotation.js';
 import type { ClaudePtyMaturity } from './claude-pty-maturity.js';
+import { capOf } from '../kit/resource-facts/index.js';
 
 /** 체인에 놓을 수 있는 칸. ⛔ 모르는 이름은 «조용히 건너뛰지 않고» 거부한다(오타 방어).
  *
@@ -62,6 +63,21 @@ export function fallbackChainForProvider(provider: unknown): readonly FallbackSt
 
 export function isFallbackStep(value: unknown): value is FallbackStep {
   return typeof value === 'string' && (FALLBACK_STEPS as readonly string[]).includes(value);
+}
+
+/** LLM-ACCOUNT-POLICY-YAML — the chain a caller should run: the policy pack's decided chain (fallback index of the
+ *  phase/levels/overrides applied · codex-credits kept while an account may spend credits) when a pack is in force, else
+ *  the given config value (`llm.fallbackChain`) — then normalized. `normalizeFallbackChain` itself stays pure. */
+export function effectiveFallbackChain(
+  configValue: unknown,
+  configuredProvider?: unknown,
+): ReturnType<typeof normalizeFallbackChain> & { readonly source: 'policy-pack' | 'config' } {
+  let decided: string[] | undefined;
+  try { decided = (require('../kit/resource-facts/llm-decide.js') as typeof import('../kit/resource-facts/llm-decide.js')).decidedFallbackChain(); }
+  catch { decided = undefined; }
+  // A valid policy with every step off is a real answer ([]) — never the legacy default chain normalize would pick.
+  if (decided && decided.length === 0) return { chain: [], dropped: [], usedDefault: false, source: 'policy-pack' };
+  return { ...normalizeFallbackChain(decided ?? configValue, configuredProvider), source: decided ? 'policy-pack' : 'config' };
 }
 
 /** config 의 `llm.fallbackChain` 을 읽어 «쓸 수 있는» 체인으로 만든다.
@@ -374,7 +390,8 @@ export function grokQuotaFromUsageSnapshot(snapshot: {
   if (typeof snapshot.rateLimitReached === 'string' && snapshot.rateLimitReached.length > 0) return 'exhausted';
   const weekly = snapshot.windows?.find((window) => window.kind === 'weekly');
   if (weekly && Number.isFinite(weekly.remainingPercent) && weekly.remainingPercent >= 0 && weekly.remainingPercent <= 100) {
-    return 100 - weekly.remainingPercent >= 70 ? 'exhausted' : 'usable';
+    // RESOURCE-FACTS-FROM-LEDGER: the grok weekly cut is a resource fact (policy `caps.grokWeeklyExhaustedPercent` · CEO 11-11 «70 %»).
+    return 100 - weekly.remainingPercent >= capOf('grokWeeklyExhaustedPercent') ? 'exhausted' : 'usable';
   }
   const credits = snapshot.credits;
   if (!credits) return 'unknown';

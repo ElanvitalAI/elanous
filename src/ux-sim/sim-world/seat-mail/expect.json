@@ -45,6 +45,86 @@
       "expect": "green",
       "reason": "ELN-RESEARCH-TURN-SEAT-REPLY 11-23 · a seat research turn could not MsgPost its reply (research allowlist) · fixed by this PR · regression lock",
       "greenSince": "2026-11-23"
+    },
+    "seat-mail/MR1": {
+      "expect": "green",
+      "reason": "KIT mail-route (CEO 11-27 중복 정리) · fold-once · TUI bundle and repl digest list a mail id once · regression lock",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR2": {
+      "expect": "green",
+      "reason": "KIT mail-route (CEO 11-27 중복 정리) · dormant reroute live probe at the msg post entrance (LA-R2) · regression lock",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR3": {
+      "expect": "green",
+      "reason": "KIT mail-route (CEO 11-27 중복 정리) · P0 machine mail bypasses the OP digest window · plain machine mail folds into one digest · regression lock",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR4": {
+      "expect": "green",
+      "reason": "KIT mail-route (CEO 11-27 중복 정리) · child msg post signs as the caller seat (pr-cli / drift-radar were --from OPC) · regression lock",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR5": {
+      "expect": "green",
+      "reason": "KIT mail-route (CEO 11-27 중복 정리) · fold-once in the reverse order (repl first) · action mail never suppressed · regression lock",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR6": {
+      "expect": "green",
+      "reason": "KIT mail-route (CEO 11-27 중복 정리) · bus wake window ⊕ prio:P0 bypass · regression lock",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR7": {
+      "expect": "green",
+      "reason": "KIT mail-route (CEO 11-27 중복 정리 · 10:44 분석) · #191271 OP mail to dormant RES → GUARDIAN, never back to OP · regression lock",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR8": {
+      "expect": "green",
+      "reason": "KIT mail-route (CEO 11-27 중복 정리 · 10:44 분석) · hand WIP/owner block → TC with the WIP takeover rule · regression lock",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR9": {
+      "expect": "green",
+      "reason": "KIT mail-route (CEO 11-27 중복 정리 · 10:44 분석) · hand JUD verdict via msg post → JUDGE-BUTLER · regression lock",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR10": {
+      "expect": "green",
+      "reason": "KIT mail-route (CEO 11-27 중복 정리 · 10:44 분석) · hand env/host/lease block → GUARDIAN · regression lock",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR11": {
+      "expect": "green",
+      "reason": "KIT mail-route (CEO 11-27 중복 정리 · 10:44 분석) · design-decision hand → OP · unclear keeps the old rung · regression lock",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR12": {
+      "expect": "green",
+      "reason": "KIT mail-route · standing rule 11-20 · unstructured hand line routed by the cheap-model root (no keyword rules) · model down/hung/unclear → old rung, never blocks · regression lock",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR13": {
+      "expect": "green",
+      "reason": "HAND-RAISE-DOMAIN-ROUTING (0.3.38 P0) · POOL-1↔TC echo (11-27 56 mails) reproduced on the old wire (4 ✋ to TC) · on this change one ✋ to GUARDIAN, re-asks by reference, one answer resumes · TC 0",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR14": {
+      "expect": "green",
+      "reason": "DORMANT-SEAT-ROUTE (0.3.38 P0) · dormant RES → GUARDIAN · 10-min no answer → one OP card · answered/young none · idempotent",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR15": {
+      "expect": "green",
+      "reason": "HAND-RAISE-DOMAIN-ROUTING (0.3.38 P0) · HOLD → JUDGE-BUTLER · cell-scope → cell owner · design/own cell → TC fallback · routing table = hand-routes.yaml",
+      "greenSince": "2026-11-27"
+    },
+    "seat-mail/MR16": {
+      "expect": "green",
+      "reason": "HAND-RAISE-DOMAIN-ROUTING · 2130 window (11-27 12:00–12:30Z) replay of the 13 real ✋ to TC · Jev down → TC 11 · GUARDIAN 1 (+1 folded) · recorded live Jev answers (231–234 ms) → TC 6 (2 plan-limit = auto-continue, resumed by the 행정관) · JUDGE-BUTLER 3 · GUARDIAN 2 · 2 folded by reference",
+      "greenSince": "2026-11-27"
     }
   }
 }

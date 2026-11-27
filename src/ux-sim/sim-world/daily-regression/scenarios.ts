@@ -39,6 +39,7 @@ import { dr14 } from './dr14-els-wheel.js';
 import { dr16 } from './dr16-autopilot.js';
 import { dr17 } from './dr17-bulk-triage.js';
 import { dr18 } from './dr18-docsearch.js';
+import { dr19 } from './dr19-goal-continue-vanish.js';
 
 export interface DailyRegressionContext {
   /** Fresh directory owned by this scenario run. */
@@ -592,11 +593,17 @@ const dr12: DailyRegressionScenario = {
   },
 };
 
-export const dailyRegressionScenarios: readonly DailyRegressionScenario[] = [dr01, dr02, dr03, dr04, dr05, dr06, dr07, dr08, dr11, dr12, dr14, dr15, dr16, dr17, dr18];
+export const dailyRegressionScenarios: readonly DailyRegressionScenario[] = [dr01, dr02, dr03, dr04, dr05, dr06, dr07, dr08, dr11, dr12, dr14, dr15, dr16, dr17, dr18, dr19];
 
 /** Behaviours whose PR is not on main yet. When one lands, its scenario replaces the row here (same id). */
 export const dailyRegressionPending: readonly DailyRegressionPending[] = [
   { id: 'DR01b', title: 'per-mail ✉ one-line rows in the notice turn', waitingFor: '#39941 not merged' },
   { id: 'DR09', title: 'baton auto on restart: TC first, never both down, 3 mails during the gap not lost', waitingFor: '#39942 not merged' },
   { id: 'DR10', title: 'mail held while work is in progress + peek + person input joins after the tool batch', waitingFor: 'queue PR #39946 (QUEUE-FINISH-FIRST) still draft' },
+  // DR13 expected behaviour (becomes a scenario in the routing PR; today's gap was measured 11-24 on an isolated els server, see the PR body):
+  //  (a) a hand's escalation mail posted to OP is knocked to its space coordinator first (the coordinator seat sees it unread);
+  //  (b) the coordinator's escalation reaches OP with the hand's original sender kept in the envelope;
+  //  (c) a hand's direct mail to OP is also copied (info) to its space coordinator, or refused with a hint — never silently skipped;
+  //  (d) a BLOCKED/WAITING_APPROVAL pane in a space raises one mail to that space's coordinator, then to OP when unanswered.
+  { id: 'DR13', title: 'tab → space coordinator → OP chain: hand mail, coordinator escalation, direct-to-OP copy, needs-person block routed via the coordinator', waitingFor: 'coordinator routing PR not written — workspace coordinator assignment is read only by tab/ls authority and state views, never by mail, doorbell or needs-person paths' },
 ];

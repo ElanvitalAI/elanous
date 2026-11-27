@@ -66,6 +66,11 @@ delete process.env.ELANOUS_ESCALATE_MODEL;
 process.env.ELANOUS_SSH_HOSTS_PATH = join(tmpdir(), `elanous-test-ssh-hosts-${process.pid}`, 'absent.json');
 delete process.env.ELANOUS_MEDIA_HOST;
 
+// LLM-ACCOUNT-POLICY-YAML: the repo pack (graphs/policies/llm-accounts.yaml) carries the operator's live account policy;
+// a test that did not ask for it must not decide credits/rotation from it. Pack tests point these at their own files.
+process.env.LLM_ACCOUNT_POLICY_PACK = join(tmpdir(), `elanous-test-llm-pack-${process.pid}`, 'absent.yaml');
+delete process.env.LLM_ACCOUNT_POLICY_OVERLAY;
+
 // The OP traffic signal and handed ledger are host files (~/elanous-hq/seat-state/OP/…). A seat-loop test that
 // reaches them filters its fixture checklist by the operator's live versions/hold/handed (SEAT-LOOP-HONOR-SIGNAL).
 // Point both at nothing (= «no signal installation»); signal tests inject `deps.trafficSignal` or set the env.

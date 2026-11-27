@@ -4,7 +4,7 @@ import { runSeatInPlaceUpdateWorld } from './seat-inplace-update-world.js';
 describe('SEAT-INPLACE-UPDATE simulation world (seeds 1·2·3)', () => {
   test('every case matches its literal expectation · durable diff empty · turns lost 0', async () => {
     const rows = await runSeatInPlaceUpdateWorld([1, 2, 3]);
-    expect(rows.length).toBe(33);
+    expect(rows.length).toBe(36);
     const byCase = Object.fromEntries(rows.map((r) => [r.case, r.actual]));
     expect(byCase['s1 idle boundary']).toBe('go · sess-OP-1 · notices [mail #1] full notice text 1');
     expect(byCase['s2 mid-turn']).toBe('wait:turn-running → go');
@@ -17,6 +17,7 @@ describe('SEAT-INPLACE-UPDATE simulation world (seeds 1·2·3)', () => {
     expect(byCase['s3 leaders']).toBe('TC:go UX:go MK:go JUD:go CC-1:none');
     expect(byCase['s1 new build will not start']).toBe('wait:probe-retry · stay-card · none · 1 card · 0 exits');
     expect(byCase['s2 pane id']).toBe('p00002abc|sess-2 ×2');
+    expect(byCase['s3 held notice + cap']).toBe('held notice 3 full text · handBlockPullAt 900003');
     for (const row of rows) {
       expect(row.actual).toBe(row.expected);
       expect(row.durableDiff).toEqual([]);

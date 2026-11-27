@@ -27,9 +27,15 @@ export const isSeatState = (value: unknown): value is SeatState => SEAT_STATES.s
 /**
  * WRITER-CHECK-RESOLVER (대표 11-25 22:4x) — the ✋ family the space steward answers itself, as a structured field (never prose):
  * writer-handover = who owns the files / an earlier writer's work · worktree-path = which worktree / file path ·
- * slot-isolation = a free root / slot / write scope before editing · res-approval = an RES (or guardian) approval to run.
+ * slot-isolation = a free root / slot / write scope before editing · res-approval = an RES (or guardian) approval to run ·
+ * hold = a HOLD on the work (does it apply · who lifts it) · cell-scope = what is in a cell's scope / who decides its assignment ·
+ * plan-limit = the TUI's own auto-continue cap (N automatic plan continues) — NOT an LLM quota; the 행정관 resumes it.
  */
-export const HAND_CAUSES = ['writer-handover', 'worktree-path', 'slot-isolation', 'res-approval'] as const;
+export const HAND_CAUSES = ['writer-handover', 'worktree-path', 'slot-isolation', 'res-approval', 'hold', 'cell-scope', 'plan-limit'] as const;
+/** The causes the space steward's writer check answers itself (the rest route by kit/mail-route/hand-routes.yaml:
+ *  hold → the judge butler · cell-scope → the cell's owner — HAND-RAISE-DOMAIN-ROUTING). */
+export const WRITER_CHECK_CAUSES = ['writer-handover', 'worktree-path', 'slot-isolation', 'res-approval', 'plan-limit'] as const satisfies readonly HandCause[];
+export const isWriterCheckCause = (value: unknown): value is HandCause => WRITER_CHECK_CAUSES.some((cause) => cause === value);
 export type HandCause = typeof HAND_CAUSES[number];
 export const isHandCause = (value: unknown): value is HandCause => HAND_CAUSES.some((cause) => cause === value);
 export const isBlockReason = (value: unknown): value is BlockReason => BLOCK_REASONS.some((reason) => reason === value);

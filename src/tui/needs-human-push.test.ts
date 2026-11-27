@@ -30,7 +30,7 @@ test('block with no coordinator → exactly 1 decision mail to OP with the machi
   r.push.blocked('HUMAN_DECISION', 'plan needs a choice');
   expect(r.mails.length).toBe(1);
   expect(r.mails[0]).toEqual({ from: 'JUD-B', to: 'OP', intent: 'decision', correlationId: 'blk-1',
-    refs: ['block:blk-1', 'seat:JUD-B', 'pane:pane-7', 'reason:HUMAN_DECISION'],
+    refs: ['block:blk-1', 'seat:JUD-B', 'pane:pane-7', 'reason:HUMAN_DECISION', 'hand-ask:design-decision:*'],
     body: '[✋ NEED HUMAN · JUD-B] plan needs a choice · 원하는 것: 이 막힘을 풀 결정·입력 (답장하면 그대로 재개) · 선택지: 재개/중단/다른 방법' });
   expect(r.logs[0]).toEqual({ event: 'seat.needs-human', data: { phase: 'routed', rung: 'OP', msgId: 101, seat: 'JUD-B', blockId: 'blk-1' } });
 });
@@ -138,4 +138,30 @@ test('nothing from OP in 5 min → the CEO card as before; a failing check also 
   broken.push.blocked('HUMAN_DECISION', 'need the design call');
   broken.fire();
   expect(broken.cards.map((c) => c.seat)).toEqual(['UX']);
+});
+
+// HAND-RAISE-DOMAIN-ROUTING (0.3.38) — the ✋ ask identity rides every first rung; an already-answered same ask resumes the
+// seat with that answer by reference (the post layer returned the first row's id).
+test('first rung carries hand-ask:<root>:<cell>; a by-reference first row that has an answer resumes the seat at once', () => {
+  const posted: { to: string; refs?: string[] }[] = [];
+  const resumed: string[] = [];
+  const logs: { event: string; data: Record<string, unknown> }[] = [];
+  const push = createNeedsHumanPush({
+    seat: () => 'TC-H-POOL-1', paneId: () => 'p', coordinatorOf: () => 'TC',
+    cellOf: () => 'CELL-A',
+    postMail: (e) => { posted.push({ to: e.to, ...(e.refs ? { refs: e.refs } : {}) }); return 4242; },
+    answerOf: (id) => (id === 4242 ? 'run 77 exited 0' : null),
+    raiseDecision: () => {}, resumeWith: (t) => { resumed.push(t); }, setTimer: () => null, clearTimer: () => {},
+    newBlockId: () => 'blk-9', log: (event, data) => { logs.push({ event, data }); },
+  });
+  push.blocked('TOOL_DENIED', 'RES run record for node-c?');
+  expect(posted).toEqual([{ to: 'GUARDIAN', refs: ['block:blk-9', 'seat:TC-H-POOL-1', 'pane:p', 'reason:TOOL_DENIED', 'hand-root:env', 'hand-routed-from:TC', 'hand-ask:env:CELL-A'] }]);
+  expect(resumed).toEqual(['[✋ answered by reference #4242] run 77 exited 0']);
+  expect(push.activeBlockId()).toBeNull();
+  expect(logs.at(-1)).toEqual({ event: 'seat.needs-human', data: { phase: 'answered-by-reference', seat: 'TC-H-POOL-1', blockId: 'blk-9', msgId: 4242, ask: 'hand-ask:env:CELL-A' } });
+  // the same ask again after that answer is a NEW ask to the owner (no second by-reference resume — no loop)
+  push.blocked('TOOL_DENIED', 'RES run record for node-c — still missing');
+  expect(posted.length).toBe(2);
+  expect(posted[1]!.refs!.at(-1)).toBe('hand-ask:env:CELL-A:after-4242');
+  expect(resumed.length).toBe(1);
 });

@@ -15,7 +15,7 @@ import { streamLLM } from '../llm.js';
 import { debug } from '../debug/log.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 import {
-  buildCompactTranscript,
+  boundedCompactTranscript,
   getCompactSystemPrompt,
   stripCompactScratchpad,
 } from './summarize.js';
@@ -158,7 +158,7 @@ export function getDefaultCompactProvider(): CompactProvider {
       const sourceMessageCount = slice.filter((m) => m.role !== 'system').length;
       if (sourceMessageCount === 0) return null;
 
-      const transcript = buildCompactTranscript(slice);
+      const transcript = boundedCompactTranscript(slice);
       const systemPrompt = args.hint
         ? `${getCompactSystemPrompt()}\n\nFocus directive: ${args.hint}`
         : getCompactSystemPrompt();

@@ -16,8 +16,8 @@ import { defaultMsgStorePath, openMsgStoreReadOnly } from '../../msg/msg-store.j
 import { getElanousConfigDir, getElanousConfigDirOverride } from '../../elanous-config-dir.js';
 import { defaultWakeLedgerPath, recentSeatWakes } from '../../seat/wake-ledger.js';
 import { activityFromClock, sessionIdOfCommand, sessionModelActivityMs } from './activity.js';
-import type { StewardSpaceConfig } from './config.js';
-import type { CellView, HostView, MergedView, OpenHandView, PrView, ReceiptView, SeatView, Snapshot, VerdictView } from './model.js';
+import { STEWARD_SPACE_DEFAULTS, type StewardSpaceConfig } from './config.js';
+import type { CellView, HostView, JudgeCellView, MergedView, OpenHandView, PrView, ReceiptView, SeatView, Snapshot, VerdictView } from './model.js';
 
 export const DEFAULT_RECEIPTS_DIR = join(homedir(), 'elanous-hq/seat-state/RES/evidence/PREGATE-GREEN');
 /** review-results lives under the state root (resolver, never a literal home path — isolation gate). */
@@ -252,6 +252,32 @@ export interface SnapshotSources {
   readonly wakes?: () => Record<string, { by: string; atMs: number }>;
   /** federation.yaml seat roles (seat → role) — the judge side is decided by role, not by name prefix only. */
   readonly roles?: () => Record<string, string>;
+  /** JUD-HAND-DISCOVERY: the judge-butler's last tick (JSON) — cells it refused with «JUD signs this one». */
+  readonly judgeCells?: () => unknown;
+}
+
+/** The judge-butler's tick report (src/judge-butler/butler-cli.ts writes `<stateRoot>/loop-agents/judge-butler/last-tick.json`). */
+export const butlerLastTickPath = (stateRoot: string): string => join(stateRoot, 'loop-agents', 'judge-butler', 'last-tick.json');
+
+/** Cells the butler will not sign and says a judge must (notSignedWhy in src/judge-butler/body.ts: «security-4 → JUD/Terra — …»
+ *  · «veto stands (…) — …»). Every other refusal (missing receipt · E4 run · HOLD) is not judge work. A tick older than
+ *  `judgeCellsMaxAgeMinutes` (or unparsable) throws — named in sourceErrors, R3 keeps judging open PRs. */
+export function parseButlerJudgeCells(body: unknown, nowMs: number, maxAgeMinutes: number = STEWARD_SPACE_DEFAULTS.judgeCellsMaxAgeMinutes): JudgeCellView[] {
+  const tick = (body && typeof body === 'object' ? body : {}) as { at?: unknown; notSigned?: unknown };
+  const at = typeof tick.at === 'string' ? Date.parse(tick.at) : NaN;
+  if (!Number.isFinite(at)) throw new Error('butler last tick: no «at»');
+  if (nowMs - at > maxAgeMinutes * 60_000) throw new Error(`butler last tick ${Math.floor((nowMs - at) / 60_000)}m old`);
+  if (!Array.isArray(tick.notSigned)) throw new Error('butler last tick: no «notSigned»');
+  const out: JudgeCellView[] = [];
+  for (const raw of tick.notSigned) {
+    const { cell, why } = (raw ?? {}) as { cell?: unknown; why?: unknown };
+    if (typeof cell !== 'string' || !cell.trim() || typeof why !== 'string') continue;
+    const kind = why.startsWith('security-4 → JUD') ? 'security-4' : why.startsWith('veto stands') ? 'veto' : null;
+    if (!kind) continue;
+    const prs = [...new Set([...why.matchAll(/#(\d{3,7})\b/gu)].map((m) => Number(m[1])))];
+    out.push({ cell: cell.trim(), kind, why: why.slice(0, 240), prs });
+  }
+  return out;
 }
 
 export function liveSources(config: StewardSpaceConfig | undefined, nowMs: number): SnapshotSources {
@@ -270,6 +296,7 @@ export function liveSources(config: StewardSpaceConfig | undefined, nowMs: numbe
     pulls: () => readPulls(effectiveInstanceRoot(), nowMs),
     wakes: () => recentSeatWakes(defaultWakeLedgerPath(), nowMs),
     roles: () => loadDeclaredSeatRoles(),
+    judgeCells: () => JSON.parse(readFileSync(butlerLastTickPath(effectiveInstanceRoot()), 'utf8')),
     openHands: (ladder) => {
       const store = openMsgStoreReadOnly(defaultMsgStorePath());
       try { return dedupeHands(openHands(store, { now: nowMs, ladder })).map(({ lead: h, members }) => ({ receiver: h.receiver, waitedMs: Math.max(...members.map((m) => m.waitedMs)), sender: h.sender, blockedSeat: h.blockedSeat })); }
@@ -309,8 +336,9 @@ export function buildSnapshot(sources: SnapshotSources, nowMs: number): Snapshot
   const pulls = sources.pulls ? attempt('pulls', () => sources.pulls!(), {} as Record<string, number>) : {};
   const wakes = sources.wakes ? attempt('wakes', () => sources.wakes!(), {} as Record<string, { by: string; atMs: number }>) : {};
   const roles = sources.roles ? attempt('roles', () => sources.roles!(), {} as Record<string, string>) : {};
+  const judgeCells = sources.judgeCells ? attempt('judgeCells', () => parseButlerJudgeCells(sources.judgeCells!(), nowMs), [] as JudgeCellView[]) : [];
   return { nowMs, hq, coordinators: [...coordinators].sort(), parent, seats, version: list.version, cells: list.cells, prs, merged,
-    receipts, verdicts, hosts: util.hosts, utilAgeMs: util.ageMs, openHands: hands, pulls, wakes, roles, sourceErrors: errors };
+    receipts, verdicts, hosts: util.hosts, utilAgeMs: util.ageMs, openHands: hands, pulls, wakes, roles, judgeCells, sourceErrors: errors };
 }
 
 /** Nodes that must not act on a snapshot missing these sources. */

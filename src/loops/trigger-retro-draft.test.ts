@@ -73,15 +73,45 @@ describe('retro-draft node', () => {
     expect(String(out.error)).toContain('disk full');
   });
 
-  test('the op-retro graph enters at the draft node with the four measures', () => {
-    const graph = parseYaml(readFileSync(join(REPO, 'graphs/triggers/op-retro.yaml'), 'utf8')) as { entry_node: string; nodes: { node_id: string; recipe?: string; input?: { measures?: { label: string }[] } }[] };
-    expect(graph.entry_node).toBe('draft');
-    const node = graph.nodes.find((n) => n.node_id === 'draft')!;
+  test('op-pulse carries the retro node (op-retro absorbed 11-26): after the pulse step, hourly, with the four measures', () => {
+    const graph = parseYaml(readFileSync(join(REPO, 'graphs/triggers/op-pulse.yaml'), 'utf8')) as { entry_node: string; nodes: { node_id: string; recipe?: string; input?: { every?: string; measures?: { label: string }[] } }[];
+      edges: { from: string; map: Record<string, string> }[] };
+    expect(graph.entry_node).toBe('measure');
+    const node = graph.nodes.find((n) => n.node_id === 'retro')!;
     expect(node.recipe).toBe('cmd:trigger-retro-draft');
+    expect(node.input!.every).toBe('hour');
     expect(node.input!.measures!.map((m) => m.label)).toEqual(['6능력·바탕(op-eval)', '착지 1h(main first-parent)', '초록(현재 판 칸)', '우편 1h(OP 받음·보냄)']);
+    const edge = (from: string) => graph.edges.find((e) => e.from === from)!.map;
+    expect(edge('measure')).toEqual({ turn: 'turn', green: 'retro', fail: 'failed', error: 'failed' });
+    expect(edge('turn')).toEqual({ ok: 'retro', fail: 'failed', error: 'failed' });
+    // a retro failure never fails the pulse (the pulse goal is its own ledger line)
+    expect(edge('retro')).toEqual({ ok: 'done', fail: 'done', error: 'done' });
     const recipes = parseYaml(readFileSync(join(REPO, 'graphs/triggers/recipes.yaml'), 'utf8')) as Record<string, { command: string }>;
     expect(recipes['trigger-retro-draft']!.command).toContain('trigger-nodes.ts" retro-draft');
   });
+
+  for (const seed of [1, 2, 3]) {
+    test(`SIM seed ${seed}: every: hour — pulses at 15-min cadence draft one retro per clock hour, one retro turn each`, () => {
+      const queued: DivertedEntry[] = [];
+      // KST 19:0x → 20:5x, pulses every 15 min starting at a seed-shifted minute; windows are the pulse fire minutes
+      const startMs = Date.parse('2026-11-26T10:00:00.000Z') + seed * 4 * 60_000;
+      for (let i = 0; i < 8; i++) {
+        const at = new Date(startMs + i * 15 * 60_000);
+        const c = { graphId: 'op-pulse', runId: `p${i}`,
+          input: { stage: 'live' as const, window: at.toISOString(), attempt: 1, shadowDir: join(dir, 'shadow'), vars: { stateRoot: join(dir, 'state'), seatState: join(dir, 'seat') } },
+          nodeInput: { seat: 'OP', every: 'hour', file: '{seatState}/OP/retro/ELN-OP-RETRO-hourly.md', measures: [{ label: '착지 1h', cmd: ['echo', '9'] }] } };
+        retroDraft(c, { now: () => new Date(at.getTime() + 20_000), run: () => ({ status: 0, stdout: `${i}`, stderr: '' }), enqueueTurn: (e) => queued.push(e) });
+      }
+      const text = readFileSync(join(dir, 'seat', 'OP', 'retro', 'ELN-OP-RETRO-hourly.md'), 'utf8');
+      const hours = [...text.matchAll(/<!-- op-retro hour=([^ ]+) -->/g)].map((m) => m[1]);
+      // 8 pulses × 15 min starting 19:04–19:12 KST span two clock hours (19 and 20) → exactly two drafts and two turns.
+      // (the hour key follows the host clock zone; two distinct keys whatever the zone)
+      expect(hours).toHaveLength(2);
+      expect(new Set(hours).size).toBe(2);
+      expect(queued).toHaveLength(2);
+      expect(text).not.toContain('op-retro window=');
+    });
+  }
 });
 
 describe('TUI feed opens the retro turn through the internal-turn door, never the wake scheduler', () => {

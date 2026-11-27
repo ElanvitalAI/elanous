@@ -11,6 +11,7 @@
 // HITL(제1원칙): 코딩은 자율, PR open 은 approvePr 게이트(대표 승인·draft 기본). 실패 시 worktree 는
 // 보존(검사용). 관측 = self-implement.* 카테고리.
 
+import { correctAfterReview, recordGoalRevision, recordRoundCorrections, reviseJudgmentAfterImpl } from './goal-revise.js';
 import { reviewerTag, recordReviewerOnCard, type ReviewerRan } from './reviewer-record.js';
 import {
   PR_EVIDENCE_AXES,
@@ -36,7 +37,7 @@ import { judgePredictionAccuracy } from './judge-prediction-accuracy.js';
 import { classifyPodReviewBudgetResidue, measureReviewFindingRecurrence, type ReviewFindingRecurrence, type RecurrenceFinding } from './review-finding-recurrence.js';
 import type { ReviewRework, SelfDevJobResult } from '../self-dev/run-types.js';
 import { createHash } from 'node:crypto';
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { writeGoalDocumentAtomic } from './goal-document-write.js';
 import { hostname, loadavg } from 'node:os';
 import { resolveHostId } from '../platform/host-id.js';
@@ -230,7 +231,7 @@ import { formatGateFailedId, type PremiseReviewCard, type PremiseReviewInput } f
 import { runWorkflowToCompletion } from '../workflow-runtime/executor.js';
 import { mapReworkVerdict, supervisionObservationFields } from './supervision-vocabulary.js';
 import { resolveRunOutcome } from './run-outcome.js';
-import { authorLimitationCountFromGoal, authoredSignalExecution, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, judgeTddEvidence, receiveObservedTddRed, receiveObservedTddGreen, runTddBaseHeadTest, requiredEvidenceFromGoal, createRequiredEvidenceBudget, coverRequiredEvidence, settleUncoveredEvidence, formatUncoveredEvidenceFeedback, type OffDiffEvidenceParse } from './off-diff-evidence.js';
+import { authorLimitationCountFromGoal, authoredSignalExecution, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, judgeTddEvidence, receiveObservedTddRed, receiveObservedTddGreen, runTddBaseHeadTest, runTddBaseHeadTestWithMainBase, requiredEvidenceFromGoal, createRequiredEvidenceBudget, coverRequiredEvidence, settleUncoveredEvidence, formatUncoveredEvidenceFeedback, type OffDiffEvidenceParse } from './off-diff-evidence.js';
 import type { TddRecordTag } from './tdd-evidence-tags.js';
 import { resolveEvidenceHeadCommit } from './evidence-command-budget.js';
 import { pressDecisionSignals, type DecisionSignalPressResult } from './decision-signal-press.js';
@@ -1257,6 +1258,8 @@ export interface SelfImplementSeams {
   evidenceCommandRunner?: (command: string, cwd: string) => Pick<ReturnType<typeof spawnSync>, 'status' | 'stdout' | 'stderr' | 'error'>;
   /** Replays the goal's changed Bun test on base and head when child RED output is absent. */
   runTddBaseHeadTest?: typeof runTddBaseHeadTest;
+  /** Test seam: the main merge-base used when the immediate base cannot prove RED (TDD-RED-MAIN-BASE). */
+  tddMainBase?: (cwd: string) => string | undefined;
   /** `commit` pins the pushed state; without it the worktree HEAD is pushed. */
   preserveBlockedBranch?: (ctx: { cwd: string; branch: string; title: string; commit?: string }) => boolean | Promise<boolean>;
   /** DRAFT-NOT-ARCHIVE — `tools.selfImplement.draftOnStop` 읽기 seam. 생략하면 user-config(실패·부재 = 'always' · 종전). */
@@ -6269,6 +6272,8 @@ async function runSelfImplementInner(
     };
   }
   let round = 0;
+  // TDD-PROVEN-CARRY — the planned command this run already proved RED→GREEN (same command) in an earlier round.
+  let provenTddCommand: string | undefined;
   const deferFullGateToLand = (roundNumber: number, mode: 'run-stage' | 'postsync'): SelfImplementGateResult => {
     observe('harness.gate-deferred-to-land', {
       runId, round: roundNumber, mode, passed: false, gateExecuted: false, landingGate: 'merge-train',
@@ -8065,10 +8070,12 @@ async function runSelfImplementInner(
         observe('tdd-base-test', { round: input.round, status: 'unmeasured', reason: 'base-commit-unavailable' }, { level: 'warn' });
         return { transcript: input.transcript, judgment: input.judgment };
       }
-      const result = (s.runTddBaseHeadTest ?? runTddBaseHeadTest)({ cwd: wt.path, baseSha: wt.resolvedBase, goal: input.goal });
+      // A relaunch/rework base is the previous head (test already green) — RED is re-measured at the main merge-base.
+      const result = runTddBaseHeadTestWithMainBase({ cwd: wt.path, baseSha: wt.resolvedBase, goal: input.goal, run: s.runTddBaseHeadTest ?? runTddBaseHeadTest,
+        ...(s.tddMainBase ? { mainBase: s.tddMainBase } : {}) });
       observe('tdd-base-test', {
         round: input.round, status: result.accepted ? 'red-green' : 'unmeasured', reason: result.reason,
-        baseSha: wt.resolvedBase, command: result.command, baseResult: result.baseResult ?? null, headResult: result.headResult ?? null,
+        baseSha: result.baseSha, baseSource: result.baseSource, command: result.command, baseResult: result.baseResult ?? null, headResult: result.headResult ?? null,
       }, result.accepted ? {} : { level: 'warn' });
       if (!result.accepted || !result.transcript) return { transcript: input.transcript, judgment: input.judgment };
       const transcript = `${result.transcript}\n${input.transcript}`;
@@ -8101,6 +8108,20 @@ async function runSelfImplementInner(
     if (receivedTddGreen.accepted) {
       tddTranscript = receivedTddGreen.transcript;
       tddJudgment = judgeTddEvidence(roundGoal, parseOffDiffEvidence(tddTranscript));
+    }
+    // GOAL-REVISE-AFTER-FIRST-IMPL — 구현 직후 판정값을 정책 안에서 다시 맞춘다(GREEN 이 있고 결손이 RED 뿐이면 RED 를 권장으로).
+    //   차이는 골 문서 끝 절과 관측에 남는다 · 보안 4종은 다루지 않는다.
+    // Only a successful implementation round proves the pair (Terra review must-fix: a failed round's records must not carry).
+    if (impl.ok && tddJudgment.red.observed && tddJudgment.green.observed && tddJudgment.sameCommand && tddJudgment.green.verify) provenTddCommand = tddJudgment.green.verify;
+    const goalRevision = reviseJudgmentAfterImpl({ goal: roundGoal, judgment: tddJudgment, implementationOk: impl.ok, provenCommand: provenTddCommand });
+    if (goalRevision.revised) {
+      tddJudgment = goalRevision.judgment;
+      observe('goal-revised', { round, changes: [...goalRevision.changes] });
+      progress('implementing', `판정값 재조정 — ${goalRevision.changes[0]}`);
+      if (opts.goalFile) {
+        try { writeFileSync(opts.goalFile, recordGoalRevision(readFileSync(opts.goalFile, 'utf8'), goalRevision, round)); }
+        catch (error) { observe('goal-revised', { round, record: 'unwritten', reason: String(error).slice(0, 200) }, { level: 'warn' }); }
+      }
     }
     let tddEvidenceFailure: SelfImplementResult['tddEvidenceFailure'];
     if (tddJudgment.needsRepair && impl.ok && round < effectiveMax && opts.goalFile
@@ -9131,6 +9152,28 @@ async function runSelfImplementInner(
             progress('reviewing', `반사 실패 — ${oneLine(safeErrorDescription(error))}`);
           }
         }
+        // GOAL-REVISE-AFTER-FIRST-IMPL (broadened) — the same goal rubric corrects the goal before the rework round:
+        //   (a) security hardening outside security-4 → relaxed · (b) a repeated finding → written into the done-when ·
+        //   (c) an edge → FU (not another rework). The next round reads the corrected goal file.
+        try {
+          let goalText: string | undefined;
+          try { goalText = opts.goalFile ? readFileSync(opts.goalFile, 'utf8') : undefined; } catch { goalText = undefined; }
+          if (goalText !== undefined) {
+            const previousMustFix = reviewFindingHistory.filter((r): r is string[] => Array.isArray(r)).flat();
+            const corrected = correctAfterReview({ mustFix: effectiveMustFix, previousMustFix, targetPaths: declaredPathsFromGoalDocumentText(goalText).paths });
+            if (corrected.corrections.length) {
+              // The corrected goal file is the durable record (and the FU hand-off) — drop findings only after it is written.
+              let written = false;
+              try { writeFileSync(opts.goalFile!, recordRoundCorrections(goalText, corrected.corrections, corrected.tighten, round)); written = true; }
+              catch (error) { observe('goal-corrected', { round, record: 'unwritten', kept: effectiveMustFix.length, reason: String(error).slice(0, 200) }, { level: 'warn' }); }
+              if (written) {
+                effectiveMustFix = [...corrected.mustFix];
+                observe('goal-corrected', { round, kinds: corrected.corrections.map((c) => c.kind), fu: [...corrected.fu], tighten: corrected.tighten.length });
+                progress('reviewing', `골 정정 ${corrected.corrections.length}건 — ${corrected.corrections.map((c) => c.kind).join(' · ')}`);
+              }
+            }
+          }
+        } catch (error) { observe('goal-corrected', { round, outcome: 'unmeasured', reason: String(error).slice(0, 200) }, { level: 'warn' }); }
         if (effectiveMustFix.length === 0) {
           observe('review-round-triage', {
             round,

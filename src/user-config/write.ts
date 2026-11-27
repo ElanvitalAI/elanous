@@ -203,6 +203,7 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
       codexCreditsAllowed: cfg.llm.codexCreditsAllowed,
       codexQuotaPolicy: cfg.llm.codexQuotaPolicy,
       codexCreditReserve: cfg.llm.codexCreditReserve,
+      codexCreditAccounts: cfg.llm.codexCreditAccounts,
       grokWeeklyCapPct: cfg.llm.grokWeeklyCapPct,
       zaiCodingPlan: cfg.llm.zaiCodingPlan,
       fallbackChain: cfg.llm.fallbackChain,
@@ -326,6 +327,9 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
       factQuestion: cfg.chat.factQuestion.maxToolTurns !== CHAT_DEFAULTS.factQuestion.maxToolTurns
         ? { maxToolTurns: cfg.chat.factQuestion.maxToolTurns } : undefined,
       fastPath: cfg.chat.fastPath,
+      // TURN-REQUEST-SIZE-LOSS — sparse like factQuestion: only a hand-set threshold is written back.
+      requestSize: JSON.stringify(cfg.chat.requestSize) !== JSON.stringify(CHAT_DEFAULTS.requestSize)
+        ? { ...cfg.chat.requestSize } : undefined,
       conciseness: stripUndef({
         enabled: cfg.chat.conciseness.enabled,
         finalMessageMaxLines: cfg.chat.conciseness.finalMessageMaxLines,

@@ -84,10 +84,11 @@ function buildHour(r: () => number, base: number, prefix: string): FloodMail[] {
     add({ key: `self-${i}`, atS: at(), from: 'OP', cat: 'self', needsOP: false, body: pad(`${what} ${i}`), legacy, structured: { kind: 'notice', needsReply: false } });
   }
   // CLAUDE-OP (17/h): boards 6 (every 10 min) · landing notices 8 · retro reminders/orders 2 · crown relays 1
+  // CLAUDE-OP-PROXY-LANE: unsolicited boards/notices are coaching (`coach` kind → coach note); info/request ride the proxy lane.
   for (let i = 0; i < 6; i++) add({ key: `coach-board-${i}`, atS: base + 30 + i * 600, from: 'CLAUDE-OP', cat: 'coach-board', needsOP: false, body: pad(`[⚡ 전시 상황판 ${i}]`),
-    legacy: { kind: 'decision', intent: 'decision' }, structured: { kind: 'info', needsReply: false } });
+    legacy: { kind: 'decision', intent: 'decision' }, structured: { kind: 'coach', needsReply: false } });
   for (let i = 0; i < 8; i++) add({ key: `coach-notice-${i}`, atS: at(), from: 'CLAUDE-OP', cat: 'coach-notice', needsOP: false, body: pad(`[코치 직권 착지 후통보] #4${i}`),
-    legacy: { kind: 'info', intent: 'info' }, structured: { kind: 'info', needsReply: false } });
+    legacy: { kind: 'info', intent: 'info' }, structured: { kind: 'coach', needsReply: false } });
   for (let i = 0; i < 2; i++) add({ key: `coach-retro-${i}`, atS: at(), from: 'CLAUDE-OP', cat: 'coach-retro', needsOP: false, body: pad(`[코치 · 회고 알림 ${i}]`),
     legacy: { kind: 'decision', intent: 'decision' }, structured: { kind: 'notice', needsReply: false } });
   // crown relays with the CEO's words: 8 of 54 coach «decision» mails in 08–14 (≈1.3/h) — 1/h here.

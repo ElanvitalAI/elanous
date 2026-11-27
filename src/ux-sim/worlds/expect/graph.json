@@ -75,6 +75,56 @@
       "expect": "green",
       "greenSince": "#39267 (SCHEDULE-GRAPH-S1 Slice A — main c304956c36)",
       "reason": "두 그래프(memory-lifecycle·release-loop) 동시 발화: lease 가 (triggerId,dedupeKey) 단위라 서로를 막지 않고 둘 다 실행된다 — 그래프 간 상한 새로 없음."
+    },
+    "graph/LA3-EQUIV": {
+      "expect": "green",
+      "greenSince": "LOOP-AGENT-V3-YAML (this PR)",
+      "reason": "land-steward from agent.yaml ≡ goal.yaml (v2) on seeds 1–5: same decisions · lands · KPI · channel lines · author mail · cases · ledger; no L0 mail"
+    },
+    "graph/LA3-POLICY": {
+      "expect": "green",
+      "greenSince": "LOOP-AGENT-V3-YAML (this PR)",
+      "reason": "lands_per_hour_min 10 → 3 drops the lands breach line; landable_ratio_min 0.5 → 0 drops the ratio line — YAML only, no code change"
+    },
+    "graph/LA3-REFUSE": {
+      "expect": "green",
+      "greenSince": "LOOP-AGENT-V3-YAML (this PR)",
+      "reason": "bad yaml · unknown node kind · missing $policies ref · missing kit · non-optional hook · wake drift → lint errors named; steward runs plain body (off), silent channel, one L0 card (landing duty → TC) per error set over 3 ticks"
+    },
+    "graph/LA3-EDGE": {
+      "expect": "green",
+      "greenSince": "LOOP-AGENT-V3-YAML (this PR)",
+      "reason": "20 wakes in 1 min → 2 lines (one per breach key); empty ledger → KPI, no error; finisher down on seeds 1–5 → tick completes, every refusal names a next owner"
+    },
+    "graph/LA3-PORTABLE": {
+      "expect": "green",
+      "greenSince": "LOOP-AGENT-V3-YAML (this PR)",
+      "reason": "agent dir copied into a fresh universe (no goal.yaml · no trigger file) lints (warning: not registered) and runs; seat literal + absolute soul path → refused as not portable"
+    },
+    "graph/LA3S-FASTER": {
+      "expect": "green",
+      "greenSince": "LOOP-AGENT-V3-SMART (this PR)",
+      "reason": "same seeded stream (two silent receivers) on seeds 1–5: agent.yaml with reflect·plan·learn-knowhow vs the same YAML without — v3 meets backlog ≤ 4 sooner (v2 never/later) and sends fewer unacted mails (lessons → escalate-l0)"
+    },
+    "graph/LA3S-DEDUPE": {
+      "expect": "green",
+      "greenSince": "LOOP-AGENT-V3-SMART (this PR)",
+      "reason": "15–19 never-acting receivers × 12 reflections: one lesson per key · 12 active (cap) · 5 knowhow cards (cap) each once · a store that already has the marker promotes none"
+    },
+    "graph/LA3S-LLM": {
+      "expect": "green",
+      "greenSince": "LOOP-AGENT-V3-SMART (this PR)",
+      "reason": "ambiguous plan: router answers a candidate → judgedBy llm; absent → router-unavailable · throws → llm-error · garbage → llm-invalid · budget spent → over-budget — all keep the deterministic top"
+    },
+    "graph/LA3S-POLICY": {
+      "expect": "green",
+      "greenSince": "LOOP-AGENT-V3-SMART (this PR)",
+      "reason": "YAML only: cost_l0 0.15 → 2 turns escalate-l0 into fold-digest · lesson_repeat_min 3 → 5 moves the first switch later (seeds 1–5)"
+    },
+    "graph/LA3S-AGENTS": {
+      "expect": "green",
+      "greenSince": "LOOP-AGENT-V3-SMART (this PR)",
+      "reason": "land-steward 8 ticks (KPI cannot move): v2 16 lines; v3 lines ×3 → L0 card (TC by duty) ×3 → quiet, 4 lessons · judge-butler wrapper: silent TC → escalate-l0 on its 3rd proposal, UX (acts) always mail (seeds 1–5)"
     }
   }
 }

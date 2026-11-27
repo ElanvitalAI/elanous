@@ -39,7 +39,7 @@ export interface StewardSpaceConfig {
 
 export const STEWARD_SPACE_DEFAULT_CAPS: StewardSpaceCaps = { assign: 4, pregate: 3, judge: 2 };
 export const STEWARD_SPACE_DEFAULTS = {
-  pregateHosts: ['minim5', 'node-b', 'node-c'] as readonly string[],
+  // pregateHosts: none here — the registry's pregate hosts (kit/resource-facts) are the default (tick.ts · RESOURCE-FACTS).
   hostSlots: 1,
   maxLoadPerCore: 0.7,
   cutTimes: ['04:00', '16:00'] as readonly string[],
@@ -50,6 +50,11 @@ export const STEWARD_SPACE_DEFAULTS = {
   stallMinutes: 120,
   /** GREEN receipt without a verdict this long goes to R3. */
   judgeWaitMinutes: 30,
+  /** JUD-HAND-DISCOVERY: R3 hands one idle judge hand up to this many items (cells ⊕ PRs) in ONE mail — `caps.judge` counts
+   *  hands (batches) per tick. One item per hand per 30-min cooldown capped judging at ~6/h while 19 cells waited (11-28). */
+  judgeBatch: 5,
+  /** The judge-butler's last tick older than this = its «JUD signs this one» list is not trusted (source error, PR queue only). */
+  judgeCellsMaxAgeMinutes: 60,
   /** The same seat / cell / PR head is not re-planned within this window. */
   cooldownMinutes: 30,
   /** A dispatched pregate without a receipt after this long is a watch exception. */

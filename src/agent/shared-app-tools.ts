@@ -34,7 +34,10 @@ export interface SharedAppTools {
 }
 
 /** L2 core + L3 finance(gated) + skill discovery/execution + graph app_build bridge 단일 조립. */
-export function buildSharedAppTools(cfg?: UserConfig): SharedAppTools {
+export function buildSharedAppTools(cfg?: UserConfig, options: {
+  /** APP-BUILD-LOCAL-PATH — local CLI only: app_build without a member connection builds under this directory. */
+  localAppBuildCwd?: string;
+} = {}): SharedAppTools {
   const core = buildCoreTools();
   const fin = cfg && financeEnabled(cfg) ? buildFinanceTools() : null;
   const skillsList = buildElanousSkillsListTool();
@@ -47,7 +50,10 @@ export function buildSharedAppTools(cfg?: UserConfig): SharedAppTools {
   // context(B5) — 기억 조회 같은 긴 코어 도구가 진행 한 줄(emitFeedback)을 낼 수 있게 코어까지 넘긴다.
   const dispatch = async (name: string, args: Record<string, unknown>, context?: ToolRuntimeContext): Promise<unknown> =>
     name === deploy.name ? runAppDeploy(args, context) :
-    appBuildNames.has(name) ? runAppBuild(name as 'app_build' | 'app_build_plan', args, context) :
+    appBuildNames.has(name) ? runAppBuild(name as 'app_build' | 'app_build_plan', args, context, options.localAppBuildCwd ? {
+      localAppBuild: async (buildArgs) => (await import('../graph-runner/app-build/local-build.js'))
+        .runLocalAppBuild({ ask: String(buildArgs.ask), capabilities: buildArgs.capabilities, cwd: options.localAppBuildCwd! }),
+    } : undefined) :
     name === skillsList.name ? dispatchElanousSkillsList(args as ElanousSkillsListArgs) :
       name === skill.id ? skill.run(args as unknown as SkillExecArgs, { surface: context?.surface ?? 'skill', signal: context?.signal }) :
         fin && fin.names.has(name) ? fin.dispatch(name, args) : core.dispatch(name, args, undefined, context);

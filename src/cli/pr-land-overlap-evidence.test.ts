@@ -1236,6 +1236,19 @@ describe('all same-head reviews decide together (already-ancestor-auto)', () => 
       .toEqual({ ok: true, reviewResult: `${STD_DIR}/${name}` });
   });
 
+  test('refuses a historical completed Claude to GLM fallback even without an invalid flag', () => {
+    const name = `pr-${PR}-${HEAD.slice(0, 12)}.json`;
+    const legacy = { model: 'openrouter/z-ai/glm-5.3', respondedModel: 'z-ai/glm-5.3',
+      reviewRoute: 'api', fallbackAttempted: true,
+      claudeFallbackGlm: { model: 'openrouter/z-ai/glm-5.3', glmReviewed: true } };
+    expect(decide([name], () => passBody(legacy)))
+      .toEqual({ ok: false, reason: 'review-invalid-legacy-claude-glm-fallback' });
+    expect(decide([name], () => passBody({ ...legacy, invalid: false })))
+      .toEqual({ ok: false, reason: 'review-invalid-legacy-claude-glm-fallback' });
+    expect(decide([name], () => passBody({ claudeFallbackGlm: { glmReviewed: false } })))
+      .toEqual({ ok: true, reviewResult: `${STD_DIR}/${name}` });
+  });
+
   test('ignores head prefixes shorter than 10, longer than 40 and other PRs', () => {
     expect(decide([
       `card-${PR}-${HEAD.slice(0, 9)}.json`,

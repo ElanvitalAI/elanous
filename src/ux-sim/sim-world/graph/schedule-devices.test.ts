@@ -50,7 +50,7 @@ test('장치 3종 · 시나리오 15개 리터럴 (① 시계 · ⑤ 국면 · �
 
 test('기대표 리터럴 — sim-world-expect.json graph/* 15행이 모듈 원천과 일치', () => {
   const entries = (expectTable as { entries: Record<string, { expect: string; reason?: string; redReason?: string }> }).entries;
-  const graphKeys = Object.keys(entries).filter((key) => key.startsWith('graph/')).sort();
+  const graphKeys = Object.keys(entries).filter((key) => key.startsWith('graph/') && !key.startsWith('graph/LA3-') && !key.startsWith('graph/LA3S-')).sort(); // LA3-* = loop-agent-v3.ts · LA3S-* = loop-agent-v3-smart.ts
   expect(graphKeys).toEqual(simWorldScenarios.map((scenario) => `graph/${scenario.id}`).sort());
   for (const [id, reason] of Object.entries(SCHEDULE_S1_RED_REASONS)) {
     expect(entries[`graph/${id}`]!.expect).toBe('red');

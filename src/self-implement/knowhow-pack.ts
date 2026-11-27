@@ -3,6 +3,7 @@ import { lstatSync, readFileSync, realpathSync, readdirSync, statSync } from 'no
 import { createHash } from 'node:crypto';
 import { join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { knowhowField, parseKnowhowDoc, type KnowhowCard } from '../kit/knowhow/index.js';
 
 export const KNOWHOW_PACK_MAX_BYTES = 4096;
 const MARKER = '[KNOWHOW-PACK v1';
@@ -268,14 +269,11 @@ function inside(root: string, path: string): boolean {
   return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !rel.startsWith(sep));
 }
 
-function promotedSections(source: string): Array<{ id: string; text: string }> {
-  const sections: Array<{ id: string; text: string }> = [];
-  for (const block of source.split(/(?=^## K-[A-Z]+-\d+\b)/m)) {
-    const id = /^## (K-[A-Z]+-\d+)\b/m.exec(block)?.[1];
-    if (!id || !/^[-*] 출처:.*상태: active\s*$/m.test(block)) continue;
-    sections.push({ id, text: block.trim() });
-  }
-  return sections;
+/** Promoted cards = `K-<SEAT>-<N>` cards (no sub-track) whose 상태 is active, via kit/knowhow. */
+function promotedSections(source: string): Array<{ id: string; text: string; card: KnowhowCard }> {
+  return parseKnowhowDoc(source).cards
+    .filter((card) => card.sub === null && /^[A-Z]+$/.test(card.seat) && card.status === 'active')
+    .map((card) => ({ id: card.id, text: card.text, card }));
 }
 
 function mentionedPaths(text: string): Set<string> {
@@ -383,8 +381,8 @@ export function selectHealKnowhowPack(repo: string, signature: string): KnowhowP
       const real = realpathSync(file);
       if (!inside(realRoles, real) || !statSync(real).isFile() || statSync(real).size > 2_000_000) continue;
       for (const section of promotedSections(readFileSync(real, 'utf8'))) {
-        const explicit = /^- 원인 서명:\s*([a-z][a-z0-9-]*)\s*$/m.exec(section.text)?.[1];
-        const remedy = /^- 처방(?:\(힐링\))?:\s*(\S[^\r\n]*)$/m.exec(section.text)?.[1];
+        const explicit = /^([a-z][a-z0-9-]*)$/.exec(knowhowField(section.card, '원인 서명'))?.[1];
+        const remedy = knowhowField(section.card, /^처방(?:\(힐링\))?$/) || undefined;
         if (explicit !== signature || !remedy || selected.some((item) => item.id === section.id)) continue;
         const next = [...selected, { id: section.id, remedy }];
         const text = `[SUPERVISOR-HEAL-PACK signature=${signature} ids=${next.map((item) => item.id).join(',')}]\n${next.map((item) => `${item.id}: ${item.remedy}`).join('\n')}`;

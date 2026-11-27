@@ -4,7 +4,7 @@ import { chmodSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } fro
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { tickLand } from '../land-graph/land-graph.js';
-import { defaultLandDeps, ghInvocation, repoSlugFromUrl, resolveLandRepo } from './land-graph-cli.js';
+import { defaultLandDeps, ghInvocation, landToolPath, repoSlugFromUrl, resolveLandRepo } from './land-graph-cli.js';
 
 // The land-graph trigger runs `land graph tick` with cwd = the installed package dir (not a git repo);
 // a bare `gh pr list` there fails with «fatal: not a git repository». gh must never depend on the cwd.
@@ -48,5 +48,16 @@ describe('land graph gh target', () => {
     expect(r.error).toBeUndefined();
     expect(r.decisions).toEqual([]);
     expect(readFileSync(log, 'utf8')).toContain('pr list --state open --limit 100 --json');
+  });
+});
+
+describe('land command PATH (11-26: launchd python3 = system 3.9 → land-name-diff-check TypeError → every live land STOP)', () => {
+  test('existing package-manager bin dirs go first, no duplicates, the rest keeps its order', () => {
+    const exists = (d: string) => d === '/opt/homebrew/bin';
+    expect(landToolPath('/usr/bin:/bin:/opt/homebrew/bin', exists)).toBe('/opt/homebrew/bin:/usr/bin:/bin');
+    expect(landToolPath(undefined, () => false)).toBe('');
+    expect(landToolPath('/usr/bin', () => true)).toBe('/opt/homebrew/bin:/usr/local/bin:/usr/bin');
+    expect(landToolPath('/usr/bin::/bin', () => false)).toBe('/usr/bin::/bin'); // no package-manager dir → PATH untouched
+    expect(landToolPath(':/usr/bin', exists)).toBe('/opt/homebrew/bin::/usr/bin'); // the empty (cwd) segment survives
   });
 });

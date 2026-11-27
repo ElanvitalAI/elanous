@@ -24,7 +24,7 @@ export async function dispatchReplMessageTool(
   }
   const { dispatchMsgList, dispatchMsgPost, dispatchMsgAck } = await import('../skills/tools/ops-ledger.js');
   if (name === 'MsgList') return observeLedgerCall(name, args, () => dispatchMsgList(args, deps.ledger),
-    (a, r) => ({ to: a.to, ...(r ? { count: r.count, after: r.after } : {}) }));
+    (a, r) => ({ to: a.to, ...(r ? { count: r.count, total: r.total, hasMore: r.hasMore, after: r.after } : {}) }));
   if (name === 'MsgPost') return observeLedgerCall(name, args, () => dispatchMsgPost(args, deps.ledger),
     (a, r) => ({ from: a.from, to: a.to, ...(r ? (r.message ? { id: r.message.id } : { diverted: r.diverted }) : {}) }));
   return observeLedgerCall(name, args, () => dispatchMsgAck(args, deps.ledger),

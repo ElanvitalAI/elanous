@@ -16,6 +16,7 @@ import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../instance/resolve.js';
 import { listChecklist } from '../../release-loop/checklist.js';
 import {
+  buildMsgListTool,
   dispatchMsgAck,
   dispatchMsgList,
   dispatchMsgPost,
@@ -75,6 +76,42 @@ describe('ops-ledger msg tools (우편)', () => {
     const afterAck = await dispatchMsgList({ to: 'TC' }, msgDeps);
     expect(afterAck.count).toBe(0);
     expect(afterAck.after).toBe(posted.message!.id);
+  });
+
+  test('OP-MAIL-PAGE (11-26 «10 = all» confusion): a 10-message page reports total · hasMore · nextCursor; cursor pages the same unacked view', async () => {
+    const ids: number[] = [];
+    for (let i = 1; i <= 25; i++) ids.push((await dispatchMsgPost({ from: 'TC', to: 'OP', body: `m${i}`, kind: 'info' }, msgDeps)).message!.id);
+    // one mail in the second page is acked per id («seen»): the unacked view must keep hiding it on every page.
+    await dispatchMsgAck({ to: 'OP', ids: [ids[12]] }, msgDeps);
+    const first = await dispatchMsgList({ to: 'OP', limit: 10 }, msgDeps);
+    expect(first.count).toBe(10);
+    expect(first.total).toBe(24);
+    expect(first.hasMore).toBe(true);
+    expect(first.totalCapped).toBe(false);
+    expect(first.nextCursor).toBe(ids[9]);
+    expect(first.output).toBe(`MsgList OP: 10 of 24 unacked in inbox after #0 — 14 more remain: call again with cursor=${ids[9]}`);
+    const second = await dispatchMsgList({ to: 'OP', limit: 10, cursor: first.nextCursor }, msgDeps);
+    expect(second.messages.map(m => m.body)).toEqual(['m11', 'm12', 'm14', 'm15', 'm16', 'm17', 'm18', 'm19', 'm20', 'm21']);
+    expect(second.total).toBe(14);
+    expect(second.hasMore).toBe(true);
+    const third = await dispatchMsgList({ to: 'OP', limit: 10, cursor: second.nextCursor }, msgDeps);
+    expect(third.messages.map(m => m.body)).toEqual(['m22', 'm23', 'm24', 'm25']);
+    expect(third.hasMore).toBe(false);
+    expect(third.nextCursor).toBeNull();
+    expect(third.output).toBe(`MsgList OP: 4 of 4 unacked in inbox after #${ids[20]} — that is all`);
+    // `after` stays the history view (acked mail included) and says «message(s)», not «unacked in inbox».
+    const history = await dispatchMsgList({ to: 'OP', limit: 5, after: ids[10] }, msgDeps);
+    expect(history.messages.map(m => m.body)).toEqual(['m12', 'm13', 'm14', 'm15', 'm16']);
+    expect(history.output).toBe(`MsgList OP: 5 of 14 message(s) after #${ids[10]} — 9 more remain: call again with after=${ids[15]}`);
+    await expect(dispatchMsgList({ to: 'OP', cursor: -1 }, msgDeps)).rejects.toThrow("'cursor'");
+  });
+
+  test('OP-MAIL-PAGE: the tool description says a call is one page and the footer «held in TUI queue» is a different count', () => {
+    const description = buildMsgListTool().description;
+    expect(description).toContain('ONE CALL RETURNS AT MOST `limit` MESSAGES');
+    expect(description).toContain('returned < total means more remain');
+    expect(description).toContain('held in TUI queue');
+    expect(description).toContain('unacked in inbox');
   });
 
   test('좌석 정규화 · ALL 발신 거부 · 인자 검증', async () => {

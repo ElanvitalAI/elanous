@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { extendSignalLease } from '../kit/heartbeat/index.js';
 import * as registry from './registry.js';
 import { dueBefore } from './schedule-due.js';
 import type { CheckEntry, CheckResult, LoopCounts, LoopScope, LoopState, ScheduleFinding } from './checker-contract.js';
@@ -117,30 +118,10 @@ export function launcherEvidence(entries: CheckEntry[], root: string): CheckEntr
   }
 }
 
-// Extend only an observed healthy launcher that is still heartbeating. The CAS prevents replacing a renewed lease.
+// Extend only an observed healthy launcher that is still heartbeating. The CAS (kit/heartbeat) prevents replacing a renewed lease.
 export function extendHealthyLauncher(root: string, finding: ScheduleFinding, now: Date): boolean {
-  if (finding.kind !== 'end-expired' || !Number.isFinite(now.getTime())) return false;
-  const path = join(root, 'msg', 'messages.db');
-  if (!existsSync(path)) return false;
-  const db = new Database(path);
-  try {
-    db.exec('PRAGMA busy_timeout = 10000');
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      const row = db.query('SELECT at, health, ends_at FROM loop_signals WHERE loop_id=?')
-        .get(finding.id) as { at: string; health: string; ends_at: string | null } | null;
-      const age = row ? now.getTime() - Date.parse(row.at) : NaN;
-      if (!row || row.health !== 'healthy' || !Number.isFinite(age) || age < 0 || age > 15 * 60_000 ||
-          !row.ends_at || !Number.isFinite(Date.parse(row.ends_at)) || Date.parse(row.ends_at) > now.getTime()) {
-        db.exec('COMMIT');
-        return false;
-      }
-      const result = db.query('UPDATE loop_signals SET ends_at=? WHERE loop_id=? AND at=? AND health=? AND ends_at=?')
-        .run(new Date(now.getTime() + 15 * 60_000).toISOString(), finding.id, row.at, row.health, row.ends_at);
-      db.exec('COMMIT');
-      return result.changes === 1;
-    } catch (error) { db.exec('ROLLBACK'); throw error; }
-  } finally { db.close(); }
+  if (finding.kind !== 'end-expired') return false;
+  return extendSignalLease(root, finding.id, now);
 }
 
 export function countLoopStates(results: CheckResult[]): LoopCounts {

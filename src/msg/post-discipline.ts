@@ -27,9 +27,13 @@
  *          a note or a fold ledger the receiver reads on its next turn.
  */
 
+import { onProxyLane } from './proxy-lane.js';
+
 /** E — the closed set of canonical kinds a sender picks from. */
 export const MSG_POST_KINDS = [
   'request', 'question', 'decision', 'alert', 'info', 'notice', 'status', 'report', 'announce', 'coord', 'ack', 'receipt', 'goal',
+  // CLAUDE-OP-PROXY-LANE: `consult` asks a peer for an opinion (answer expected) · `coach` is unsolicited coaching (a note).
+  'consult', 'coach',
 ] as const;
 export type MsgPostKind = typeof MSG_POST_KINDS[number];
 
@@ -38,6 +42,8 @@ export const MSG_POST_KIND_ALIASES: Readonly<Record<string, MsgPostKind>> = {
   ask: 'question', incident: 'alert', 'stall-alert': 'alert', urgent: 'alert', interrupt: 'alert', supervisor: 'alert',
   'status-card': 'status', progress: 'status', bulletin: 'notice', review: 'report', receipts: 'receipt', retro: 'report',
   'retro-report': 'report', reply: 'status', 'seat-cap-resume': 'notice', pregate: 'request', 'pregate-receipt': 'request', task: 'request', 'work-order': 'request', assign: 'request', approval: 'decision',
+  // OP-PULSE beat (renderPulseBrief contract · op-turn-outcome OUTPUT_MAIL_KINDS) — a leader's next-window order, no reply.
+  beat: 'request',
 };
 
 /**
@@ -45,7 +51,7 @@ export const MSG_POST_KIND_ALIASES: Readonly<Record<string, MsgPostKind>> = {
  * A request is work, not a question: it waits for its result (A217 deadline ⊕ done), not for a reply — so it opens the
  * receiver's turn only with `--needs-reply` (or a crown flag · ✋ refs), and a routine one rides the digest.
  */
-const ASKING_KINDS: ReadonlySet<MsgPostKind> = new Set(['question', 'decision']);
+const ASKING_KINDS: ReadonlySet<MsgPostKind> = new Set(['question', 'decision', 'consult']);
 
 /** Coach seats — their context injections are notes, not mail (F). */
 export const COACH_SEATS: readonly string[] = ['CLAUDE-OP'];
@@ -85,6 +91,11 @@ export interface PostShapeInput {
    * `receipt:` ref for a `cell:` the receiver owns or assigned (computed by the caller from the ledger · undefined = no).
    */
   readonly answersReceiverAsk?: boolean;
+  /**
+   * CLAUDE-OP-PROXY-LANE — the sender's proxy identity was checked by the caller: true = verified · false = checked and
+   * NOT verified (a self-declared proxy: its posts stay coach notes) · undefined = not checked (lane by sender seat).
+   */
+  readonly proxyVerified?: boolean;
 }
 
 export type PostEntrance = 'cli' | 'tool' | 'legacy';
@@ -157,7 +168,7 @@ export function isUrgentPost(input: PostShapeInput & { cls?: MsgPostKind; needsR
   if (typeof input.priority === 'number' && input.priority >= 1) return true;
   const cls = input.cls ?? canonicalPostKind(input.kind) ?? intentKind(lower(input.intent));
   if (cls === 'alert' || lower(input.intent) === 'alert') return true;
-  if ((cls === 'question' || cls === 'decision' || lower(input.intent) === 'decision') && input.needsReply === true) return true;
+  if ((cls === 'question' || cls === 'decision' || cls === 'consult' || lower(input.intent) === 'decision') && input.needsReply === true) return true;
   return false;
 }
 
@@ -167,7 +178,7 @@ export type PostDestination = 'mailbox' | 'self-wake' | 'coach-note';
  * F — where a post goes. A seat's mail to itself is a scheduled wake (a human's or a crown relay stays mail); a coach
  * mail is a coach note unless it needs a reply or carries a crown flag.
  */
-export function postDestination(input: PostShapeInput & { needsReply?: boolean | null; answersReceiverAsk?: boolean }): PostDestination {
+export function postDestination(input: PostShapeInput & { needsReply?: boolean | null; answersReceiverAsk?: boolean; cls?: MsgPostKind | null }): PostDestination {
   const from = input.from.toUpperCase();
   const to = input.to.toUpperCase();
   const keepsMail = Boolean(input.crownDirective) || lower(input.origin?.kind) === 'human' || hasRef(input.refs, 'telegram-message:');
@@ -175,13 +186,24 @@ export function postDestination(input: PostShapeInput & { needsReply?: boolean |
   // COACH-REPLY-AS-MAIL (OP #180740 re-ask loop · 11-26) — a coach post answering the receiver's own ask (replyTo a mail
   // the receiver sent, explicit or auto-threaded) is an answer, not an injection: it stays mail so the receiver's
   // reply-watch (`mail-from:<coach>` · `mail-reply:<id>`) closes, and it is outside the 30-min coach budget.
+  // CLAUDE-OP-PROXY-LANE — a (not disproven) proxy post of a lane kind is mail on the proxy lane; the gate budgets it.
+  if (COACH_SEATS.includes(from) && proxyLaneEligible(input)) return 'mailbox';
   if (COACH_SEATS.includes(from) && !keepsMail && input.needsReply !== true && input.answersReceiverAsk !== true) return 'coach-note';
   return 'mailbox';
 }
 
-/** G defaults — N pending passive items · M turns per hour. */
-export const BACKPRESSURE_DEFAULTS = { maxPendingPassive: 30, maxTurnsPerHour: 20 } as const;
-export interface BackpressureConfig { maxPendingPassive: number; maxTurnsPerHour: number }
+/**
+ * CLAUDE-OP-PROXY-LANE — the post may ride the proxy lane: a proxy seat, an EXPLICIT lane kind (a kind-less post stays a
+ * coach note — the tool path's auto-tag never opens the lane), and its identity not disproven.
+ */
+export function proxyLaneEligible(input: Pick<PostShapeInput, 'from' | 'kind' | 'proxyVerified'>): boolean {
+  if (input.proxyVerified === false) return false;
+  return onProxyLane(input.from, canonicalPostKind(input.kind));
+}
+
+/** G defaults — N pending passive items · M turns per hour (the floor) · K turns per active correspondent. */
+export const BACKPRESSURE_DEFAULTS = { maxPendingPassive: 30, maxTurnsPerHour: 20, turnsPerCorrespondent: 2 } as const;
+export interface BackpressureConfig { maxPendingPassive: number; maxTurnsPerHour: number; turnsPerCorrespondent?: number }
 
 export interface BackpressureInput {
   readonly urgent: boolean;
@@ -189,15 +211,32 @@ export interface BackpressureInput {
   readonly pendingPassive: number;
   /** Receiver's turns in the last hour (null = unknown → only the queue counts). */
   readonly turnsLastHour: number | null;
+  /**
+   * THROTTLE-AUDIT — distinct seats that wrote to the receiver in the last hour (rows ⊕ folded posts). null/absent = unknown
+   * (the floor `maxTurnsPerHour` alone applies).
+   */
+  readonly correspondentsLastHour?: number | null;
 }
 
 export type BackpressureVerdict = { fold: false; reason: 'urgent' | 'below' } | { fold: true; reason: 'queue' | 'turns' };
+
+/**
+ * THROTTLE-AUDIT (CEO 11-27 11:0x «a land-10 target needs that much upstream supply — a fixed cap blocking it is absurd»):
+ * the turns/h ceiling scales with the receiver's span. 11-27 live: TC (a hub for ~13 hands ⊕ UX · MK · JUD) was folded 275
+ * times on a fixed 20 turns/h — requests included, and the digest shows only the last 3 heads. A hub that turns twice an
+ * hour per active correspondent is not saturated. Ceiling = max(floor, perCorrespondent × correspondents).
+ */
+export function turnsCeiling(cfg: BackpressureConfig, correspondents: number | null | undefined): number {
+  const per = cfg.turnsPerCorrespondent ?? BACKPRESSURE_DEFAULTS.turnsPerCorrespondent;
+  const n = typeof correspondents === 'number' && Number.isFinite(correspondents) && correspondents > 0 ? Math.floor(correspondents) : 0;
+  return Math.max(cfg.maxTurnsPerHour, per * n);
+}
 
 /** G — fold a non-urgent post when the receiver is saturated. */
 export function backpressureVerdict(input: BackpressureInput, cfg: BackpressureConfig = BACKPRESSURE_DEFAULTS): BackpressureVerdict {
   if (input.urgent) return { fold: false, reason: 'urgent' };
   if (input.pendingPassive > cfg.maxPendingPassive) return { fold: true, reason: 'queue' };
-  if (input.turnsLastHour !== null && input.turnsLastHour > cfg.maxTurnsPerHour) return { fold: true, reason: 'turns' };
+  if (input.turnsLastHour !== null && input.turnsLastHour > turnsCeiling(cfg, input.correspondentsLastHour)) return { fold: true, reason: 'turns' };
   return { fold: false, reason: 'below' };
 }
 
@@ -210,5 +249,6 @@ export function foldedLine(to: string, reason: 'queue' | 'turns'): string {
 export function backpressureConfigFrom(raw: unknown): BackpressureConfig {
   const o = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
   const num = (v: unknown, d: number): number => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : d);
-  return { maxPendingPassive: num(o.maxPendingPassive, BACKPRESSURE_DEFAULTS.maxPendingPassive), maxTurnsPerHour: num(o.maxTurnsPerHour, BACKPRESSURE_DEFAULTS.maxTurnsPerHour) };
+  return { maxPendingPassive: num(o.maxPendingPassive, BACKPRESSURE_DEFAULTS.maxPendingPassive), maxTurnsPerHour: num(o.maxTurnsPerHour, BACKPRESSURE_DEFAULTS.maxTurnsPerHour),
+    turnsPerCorrespondent: num(o.turnsPerCorrespondent, BACKPRESSURE_DEFAULTS.turnsPerCorrespondent) };
 }

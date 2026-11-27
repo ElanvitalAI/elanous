@@ -16,6 +16,7 @@ import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { debug } from '../../debug/log.js';
+import { knowhowField, parseKnowhowDoc as parseCards, type KnowhowCard } from '../../kit/knowhow/index.js';
 
 export const KNOWHOW_PACK_VERSION = 'K3';
 export const KNOWHOW_DOC_RELATIVE_PATH = 'docs/roles/OP/KNOWHOW.md';
@@ -90,31 +91,25 @@ function stripTicks(value: string): string {
   return match ? match[1]!.trim() : trimmed;
 }
 
-function labeledLine(section: string, field: keyof KnowhowItem): string {
-  for (const line of section.split('\n')) {
-    const entry = /^-\s+([^:]{1,24}):\s*(.+)$/.exec(line.trim());
-    if (!entry) continue;
-    const label = entry[1]!.trim();
-    if (FIELD_LABELS.some(([pattern, name]) => name === field && pattern.test(label))) return stripTicks(entry[2]!);
+function labeledLine(card: KnowhowCard, field: keyof KnowhowItem): string {
+  for (const [pattern, name] of FIELD_LABELS) {
+    if (name !== field) continue;
+    const value = knowhowField(card, pattern);
+    if (value) return stripTicks(value);
   }
   return '';
 }
 
-/** Split the markdown inventory into K items. Unknown labels are ignored, not fatal. */
+/** OP cards (`K-OP-<N>` · `K-OP-<SUB>-<N>`) via kit/knowhow, kept when 상태 is active and a 재는 명령 exists. */
 export function parseKnowhowDoc(text: string): KnowhowItem[] {
-  const sections = text.split(/^## /m).slice(1);
   const items: KnowhowItem[] = [];
-  for (const section of sections) {
-    const heading = /^(K-OP-(?:[A-Z]{1,4}-)?\d+)\s+(.*)$/.exec(section.split('\n', 1)[0] ?? '');
-    if (!heading) continue;
+  for (const card of parseCards(text, { allSeats: true }).cards) {
     const item: KnowhowItem = {
-      id: heading[1]!, title: heading[2]!.trim(), status: '', situation: labeledLine(section, 'situation'),
-      signal: labeledLine(section, 'signal'), prescription: labeledLine(section, 'prescription'),
-      command: labeledLine(section, 'command'), expectation: labeledLine(section, 'expectation'),
-      validWhen: labeledLine(section, 'validWhen'), source: labeledLine(section, 'source'),
+      id: card.id, title: card.title, status: card.status, situation: labeledLine(card, 'situation'),
+      signal: labeledLine(card, 'signal'), prescription: labeledLine(card, 'prescription'),
+      command: labeledLine(card, 'command'), expectation: labeledLine(card, 'expectation'),
+      validWhen: labeledLine(card, 'validWhen'), source: labeledLine(card, 'source'),
     };
-    const status = /상태:\s*([A-Za-z][A-Za-z-]*)/.exec(item.source);
-    if (status) item.status = status[1]!;
     if (item.status !== 'active') continue;
     if (!item.command || /^\(없음/.test(item.command)) continue;
     items.push(item);
@@ -124,7 +119,7 @@ export function parseKnowhowDoc(text: string): KnowhowItem[] {
 
 export function buildKnowhowPack(items: KnowhowItem[], docPath: string): KnowhowPack {
   const body = items.map(item => [item.id, item.title, item.situation, item.signal, item.prescription,
-    item.command, item.expectation].join('\n')).join('\n---\n');
+    item.command, item.expectation, item.validWhen, item.source].join('\n')).join('\n---\n');
   const hash = createHash('sha256').update(`${KNOWHOW_PACK_VERSION}\n${body}`).digest('hex').slice(0, 16);
   return { version: KNOWHOW_PACK_VERSION, hash, docPath, items };
 }

@@ -18,7 +18,8 @@
  * State: <stateRoot>/release-graph/<version>/{state.json, ledger.jsonl, logs/}. One tick = `tickRelease`.
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
@@ -340,8 +341,20 @@ export function ledger(stateRoot: string, version: string, row: Omit<LedgerRow, 
 
 export function readLedger(stateRoot: string, version: string): LedgerRow[] {
   const p = join(runDir(stateRoot, version), 'ledger.jsonl');
-  if (!existsSync(p)) return [];
-  return readFileSync(p, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l) as LedgerRow);
+  const rows = existsSync(p) ? readFileSync(p, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l) as LedgerRow) : [];
+  // state.json is atomically published before the journal append. A crash in that
+  // gap must not erase the creation event. Project it from the durable state on
+  // reads, without appending a duplicate when concurrent creators recover.
+  const state = /^\d+\.\d+\.\d+$/.test(version) ? loadRun(stateRoot, version) : null;
+  return projectCreatedEvent(rows, state);
+}
+
+/** Shared projection for all in-process readers; the raw journal remains append-only. */
+export function projectCreatedEvent(rows: LedgerRow[], state: RunState | null): LedgerRow[] {
+  if (state && typeof state.createdAt === 'string' && !rows.some(row => row.kind === 'created')) {
+    return [{ at: state.createdAt, kind: 'created', quick: state.quick, clock: state.clock, profile: state.profile }, ...rows];
+  }
+  return rows;
 }
 
 export function listRuns(stateRoot: string): string[] {
@@ -352,7 +365,14 @@ export function listRuns(stateRoot: string): string[] {
 
 export function createRun(stateRoot: string, input: { version: string; quick: boolean; clock: ReleaseClock; notesFile?: string; prepDir?: string; profile?: Profile }, now: Date): RunState {
   if (!/^\d+\.\d+\.\d+$/.test(input.version)) throw new Error(`release graph: version must be x.y.z: ${input.version}`);
-  for (const [k, val] of Object.entries(input.clock)) if (val !== undefined && Number.isNaN(Date.parse(val))) throw new Error(`release graph: ${k} must be an ISO time: ${val}`);
+  for (const k of ['rehearsalAt', 'cutAt', 'publishAt'] as const) {
+    const val = input.clock?.[k];
+    if (typeof val !== 'string' || Number.isNaN(Date.parse(val))) throw new Error(`release graph: ${k} must be an ISO time: ${val}`);
+  }
+  if (input.clock.demoAt !== undefined && Number.isNaN(Date.parse(input.clock.demoAt))) throw new Error(`release graph: demoAt must be an ISO time: ${input.clock.demoAt}`);
+  if (Date.parse(input.clock.rehearsalAt) >= Date.parse(input.clock.cutAt) || Date.parse(input.clock.cutAt) >= Date.parse(input.clock.publishAt)) {
+    throw new Error('release graph: expected rehearsalAt < cutAt < publishAt');
+  }
   const existing = loadRun(stateRoot, input.version);
   if (existing) return existing;
   const home = releaseHome(input.version);
@@ -363,7 +383,25 @@ export function createRun(stateRoot: string, input: { version: string; quick: bo
   };
   for (const s of stepsFor(state)) state.steps[s.id] = { status: 'pending' };
   criticalPath(stepsFor(state)); // refuse a broken DAG at creation
-  saveRun(stateRoot, state);
+  // Publish a complete initial state without replacing a concurrent creator's run.
+  // A hard link is an atomic no-clobber operation on the same filesystem; a crash
+  // before it leaves only an unreferenced temp file, so another tick can retry.
+  const dir = runDir(stateRoot, input.version);
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(dir, `state.initial.${randomUUID()}.tmp`);
+  writeFileSync(tmp, `${JSON.stringify(state, null, 1)}\n`, { flag: 'wx' });
+  try {
+    try {
+      linkSync(tmp, join(dir, 'state.json'));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const winner = loadRun(stateRoot, input.version);
+      if (!winner) throw error;
+      return winner;
+    }
+  } finally {
+    unlinkSync(tmp);
+  }
   ledger(stateRoot, input.version, { kind: 'created', quick: input.quick, clock: input.clock, profile: state.profile }, now);
   return state;
 }

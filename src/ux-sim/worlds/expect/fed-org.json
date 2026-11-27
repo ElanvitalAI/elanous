@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "entries": {
+    "fed-org/FED-ORG-DETERMINISM": {
+      "expect": "green",
+      "greenSince": "2026-11-27 fed-org sim (this PR)",
+      "reason": "same seed reproduces the simulated day (org model and 14 loop bodies); seed+1 differs"
+    },
+    "fed-org/FED-ORG-CALIBRATION": {
+      "expect": "green",
+      "greenSince": "2026-11-27 fed-org sim (this PR)",
+      "reason": "S0 first 4 h within ratio band of the 11-26 night (mail 549/h · ✋ 74/h · TC in 168/h · lands 10.5/h · idle hands 15 · echo 0.23 · OP no-op)"
+    },
+    "fed-org/FED-ORG-TARGET": {
+      "expect": "green",
+      "greenSince": "2026-11-27 fed-org sim (this PR)",
+      "reason": "S0/S1/S2 never reach 10 lands/h + 10 greens/h; S3/S4 reach it on >= 80% of seeds"
+    },
+    "fed-org/FED-ORG-HEADROOM": {
+      "expect": "green",
+      "greenSince": "2026-11-27 fed-org sim (this PR)",
+      "reason": "S4 at pregate rho~1 never drains a 40-PR judge backlog; S4 + headroom drains it within 6 h of the event"
+    },
+    "fed-org/FED-ORG-HELPERS": {
+      "expect": "green",
+      "greenSince": "2026-11-27 fed-org sim (this PR)",
+      "reason": "0 helpers serve <= 80% of loop-agent items within 10 min; 2 helpers add >= 20 pts at a higher LLM call rate"
+    },
+    "fed-org/FED-ORG-BODY": {
+      "expect": "green",
+      "greenSince": "2026-11-27 fed-org sim (this PR)",
+      "reason": "cron bodies waste >= 40% of ticks; shared reactive runtime misses 0 windows and spawns 0 processes; goal node and durable cursor improve attainment and recovery"
+    },
+    "fed-org/KIT-KPI-WINDOW-EVENT-TIME": {
+      "expect": "green",
+      "greenSince": "2026-11-27 kit/kpi (#40409)",
+      "reason": "6 seeded streams with 30 min future skew: kit per-hour count equals the event-time brute force, independent of read order, slides with now, never counts future rows"
+    },
+    "fed-org/KIT-KPI-RAW-JUDGMENT": {
+      "expect": "green",
+      "greenSince": "2026-11-27 kit/kpi (#40409)",
+      "reason": "6 seeds x 200 near-target values: kpiOk judges the raw value (a value that rounds onto the target while below it is a breach); NaN is unknown"
+    },
+    "fed-org/KIT-KPI-BREACH-DEBOUNCE": {
+      "expect": "green",
+      "greenSince": "2026-11-27 kit/kpi (#40409)",
+      "reason": "6 seeds: one new per run of misses, one recovered per run end, unknown readings change nothing; per-key alerts only at run start and every >= 30 min inside a run"
+    }
+  }
+}

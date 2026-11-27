@@ -5,6 +5,7 @@
 // then answers nothing and the brief states no fact from that desk. Key values are never printed, logged or put in a
 // recorded URL (EODHD's token is a query parameter — the recorded endpoint drops it; errors carry status codes only).
 import { grokAgentSearch, type GrokAgentSearchResult } from '../grok/agent-search.js';
+import { cutSourcesSection } from './voice.js';
 
 export interface SourceRecord { readonly provider: string; readonly url: string; readonly fetchedAt: string; readonly title?: string }
 export interface SourceItem { readonly text: string; readonly source: SourceRecord }
@@ -287,6 +288,5 @@ export function sourcesSection(desks: readonly { readonly workerId: string; read
 
 /** The brief without its «출처» section — what the voice node speaks (URLs are not read aloud). */
 export function withoutSources(result: string): string {
-  const i = result.indexOf('\n## 출처\n');
-  return i < 0 ? result : result.slice(0, i).trimEnd();
+  return cutSourcesSection(result);
 }

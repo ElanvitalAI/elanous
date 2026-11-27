@@ -24,8 +24,17 @@ describe('seat-stop port — one door from the control channel to the running TU
 describe('entry wires the seat stop (Ctrl+Q unchanged)', () => {
   const entry = readFileSync(new URL('./entry.ts', import.meta.url), 'utf8');
 
-  test('Ctrl+Q is still abort → wait → break, byte for byte (TC #89986: the key stays the last rung)', () => {
-    expect(entry.includes("      if (key.ctrl && key.name === 'q') {\n        turnAbort?.abort();\n        await turnDone;\n        break;\n      }\n")).toBe(true);
+  test('Ctrl+Q aborts and leaves at once — the last rung never joins a stalled turn (#39526 supersedes TC #89986 wait)', () => {
+    // #39526: a physical quit no longer awaits the turn; the exit path closes the child instead.
+    expect(entry.includes("      if (key.ctrl && key.name === 'q') {\n        humanQuitRequested = true;\n        turnAbort?.abort('human quit');\n")).toBe(true);
+    const quitAt = entry.indexOf("      if (key.ctrl && key.name === 'q') {");
+    const branch = entry.slice(quitAt, entry.indexOf('\n      }\n', quitAt));
+    expect(branch.includes('break;')).toBe(true);
+    expect(branch.includes('await turnDone')).toBe(false);
+    expect(entry.includes('    if (humanQuitRequested) {\n      closeTui();\n')).toBe(true);
+    expect(entry.includes('    } else await turnDone;\n')).toBe(true);
+    // Still the last rung: the seat-stop key is handled before it.
+    expect(entry.indexOf('if (key === seatStopKey) {')).toBeLessThan(quitAt);
   });
 
   test('the seat-stop key leaves the loop before the queue door, and a turn end runs a waiting quit/migrate', () => {

@@ -4,13 +4,18 @@
 // the override in its ledger `<seat-state>/RES/PREGATE-HOSTS.json` ({ "hosts": [{ "host": "minim5", "preApproved": true }] }).
 // A ledger that is present and readable replaces the default (only its preApproved=true rows count); an absent or broken
 // ledger keeps the default. Anything outside the pool (prod universe · a write · another host · paid VM) asks as before.
+// COORD-RIGHTS (CEO 11-27 08:0x): «read-only» was read by hands as «no temp file, no SQLite, no HEAD push» and every
+// isolated test stalled on «사건별 인가» (mail #189564–#189596). The scope now says what a test-universe run may do:
+// writes inside its own isolated temp HOME/TMPDIR (mkdtemp · SQLite · files) and fetching/pushing the head to the pool
+// host. «Shared state» = the prod universe, another seat's worktree, the canonical ledgers — those still ask.
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { hostsFor } from '../kit/resource-facts/index.js';
 
-/** Code default (대표 11-25 L5): local test hosts. mshq is HQ (seats · review) and stays out of the pool. */
-export const PREAPPROVED_TEST_HOSTS: readonly string[] = ['minim5', 'node-b', 'node-c'];
-export const PREAPPROVED_SCOPE = 'read-only test-universe runs';
+/** Default pool (대표 11-25 L5): the registry's local test hosts (RESOURCE-FACTS-FROM-LEDGER) — the HQ host never has the role. */
+export const preapprovedTestHosts = (): readonly string[] => hostsFor('test-run');
+export const PREAPPROVED_SCOPE = 'test-universe runs (own temp HOME/TMPDIR · mkdtemp · SQLite/file writes there · head fetch/push to the pool host)';
 export const PREGATE_HOSTS_LEDGER = join('RES', 'PREGATE-HOSTS.json');
 
 export interface PreapprovedPool {
@@ -34,13 +39,14 @@ export function preapprovedPool(seatStateRoot: string, read: (path: string) => s
     });
     return { hosts: [...new Set(hosts)], scope: PREAPPROVED_SCOPE, source: path };
   } catch {
-    return { hosts: [...PREAPPROVED_TEST_HOSTS], scope: PREAPPROVED_SCOPE, source: 'code-default' };
+    return { hosts: [...preapprovedTestHosts()], scope: PREAPPROVED_SCOPE, source: 'code-default' };
   }
 }
 
 export interface RunRequest {
   readonly host: string;
   readonly universe: 'test' | 'sim' | 'prod';
+  /** True when the run writes no SHARED state — writes inside its own isolated temp HOME/TMPDIR (mkdtemp · SQLite · files) count as read-only. */
   readonly readOnly: boolean;
 }
 
@@ -58,6 +64,6 @@ export function runNeedsResApproval(run: RunRequest, pool: PreapprovedPool): Run
 /** The one line SeatAssign mails carry so the receiving seat does not ask RES first. */
 export function preapprovalLine(pool: PreapprovedPool): string {
   return pool.hosts.length
-    ? `resources: pre-approved pool ${pool.hosts.join(' · ')} — ${PREAPPROVED_SCOPE} need no RES approval; just run (prod universe · writes · other hosts still ask RES)`
+    ? `resources: pre-approved pool ${pool.hosts.join(' · ')} — ${PREAPPROVED_SCOPE} need no RES approval and no per-case authorization; just run (prod universe · shared-state writes · hosts outside the pool still ask RES)`
     : 'resources: the pre-approved pool is empty (RES ledger) — ask RES before running';
 }

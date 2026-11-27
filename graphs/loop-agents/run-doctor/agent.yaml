@@ -1,0 +1,137 @@
+# 런 닥터 (run-doctor) — LOOP-AGENT v3 YAML definition (YAML-SUPERVISORS-DEF · 대표 11-27 12:0x «감독자들도 다 로직·정책 등을 yaml 로»).
+# Schema: src/loop-agent/v3/agent-yaml.ts · executor: src/loop-agent/v3/supervisor.ts · lint: eln loop agent lint run-doctor
+# Tiers: ① rules / thresholds / routing = this file (policies · body edges) · ② deterministic logic = the node kinds it requires
+# (provides.nodes · their tests and the supervisors sim world are the spec) · ③ fuzzy judgment = the voice block (one LLM turn when spoken to · role router · facts-only fold).
+# The ONE definition (YAML-SUPERVISORS-RUNTIME): the trigger registry reads wake: from here (graphs/triggers/<registered_as>.yaml is only the tick shim) and goal.yaml is GENERATED from this file (eln loop agent gen) — only the fallback when this file is refused.
+apiVersion: elanous/loop-agent@3
+manifest:
+  name: run-doctor
+  version: 1.0.0
+  description: "실패→재성공 비율을 0.5 이상으로 — 진단 카드 ⊕ 기반 실패 자동 재실행 1회"
+  requires:
+    executor: loop-agent@3
+    kits: [kpi]
+    node_kinds: [run-doctor.observe, loop-agent.act, loop-agent.learn, loop-agent.judge, loop-agent.finish, gate, reflect, plan, learn-knowhow, retro]
+    facts: []
+  provides:
+    agent: run-doctor
+    kpis: [re_success_ratio]
+    nodes: [run-doctor.observe]   # tier ② — src/loop-agent/bodies/run-doctor.ts (+ its tests · sim world supervisors)
+identity:
+  id: run-doctor
+  address: RUN-DOCTOR
+  rank: supervisor
+  soul: soul.md
+supervisor:
+  duty: landing
+# v2 card fields that live only here — graphs/loop-agents/run-doctor/goal.yaml is GENERATED from this file (eln loop agent gen run-doctor)
+card:
+  name: 런 닥터
+  role: &purpose 실패한 TA 런·RED pregate·tsc 시간초과마다 진단 카드를 쓰고, 기반(infra) 실패는 다른 호스트로 한 번 자동 재실행한다.
+  temperament: &voice 진단은 분류·처방 한 줄. 같은 처방을 두 번 반복하지 않는다.
+  values: &values
+    - 기반 RED 는 작성자 탓이 아니다 — 다른 호스트로 바로 한 번(L5).
+    - main 도 실패하는 시험은 착지를 막지 않는다 — 이름 대조만(OPS-RULES 11-27 ④).
+    - 수리는 head 당 한 번 — 두 번째는 사람·구조의 몫.
+  subject: RED pregate(RES evidence/PREGATE-RED) · 실패한 TA/그래프 런(run-ledger stop·run-status failed) · tsc 시간초과
+  actions:
+    - diagnose
+    - retry-other-host
+    - retry-loop
+    - card-loop-owner
+  wake_events:
+    - RED pregate 생김(PREGATE-RED 새 폴더)
+    - 런 실패(run-ledger stop·run-status failed)
+    - changed-tsc exit 124
+  voice_role: coordinator
+  fallback_seat: TC
+goal: "실패→재성공 비율을 0.5 이상으로 — 진단 카드 ⊕ 기반 실패 자동 재실행 1회"
+policies:   # tier ① — the only numbers (the body reads them through pv() · change behaviour here, not in code)
+  re_success_ratio_min: 0.5
+  max_per_tick: 4
+  cooldown_min: 30
+  escalate_after_min: 120
+  heartbeat_every_min: 10
+  subject_lost_ticks: 3   # unreadable subject this many ticks → reattach proposal to the L0
+  window_h: 24   # RED·실패 런을 보는 창
+  settle_min: 60   # 첫 RED 뒤 재성공을 셀 때까지 기다림
+  retry_max_age_h: 6   # 이보다 오래된 기반 RED 는 재시도하지 않음
+  # LOOP-EXCEPTION-WATCH (순찰대 · reconcile: 본다 → 정상화 → 다시 본다 · kit/case-ledger 도메인 loop-exception)
+  loop_exception_min: 5   # 이보다 어린 트리거 exception 은 레지스트리 자체 재시도 몫
+  rail_window_min: 20   # 레일(설치 ⊕ els kickstart) 뒤 이 안에 난 예외 = 재기동 사고 → 한 번 정상화
+  loop_normalize_attempts: 2   # 정상화 사다리: ① 다시 돌림 ② 이유를 잡으며 다시 돌림 → 그다음은 주인(L0) 카드
+  loop_case_sla_min: 60   # 이 안에 정상(마지막 실행 done)으로 안 돌아오면 사다리와 상관없이 올린다 — «본 채로» 남지 않음
+  # v3 smartness (LOOP-AGENT-V3-SMART-2 · src/loop-agent/v3/smart.ts) — reflect · plan · learn-knowhow · retro read only these
+  act_grace_min: 0   # an action's outcome is known when it returns (acted | failed) — no waiting
+  lesson_repeat_min: 3   # the same action failing 3× in a row on one kind of subject → ONE lesson with the cause
+  reflect_window_min: 60
+  lesson_cap: 12   # active lessons kept (oldest evicted)
+  knowhow_promote_min: 1   # the lesson becomes one knowhow line at once (marker-deduped · plan reads it next tick)
+  knowhow_cap: 5   # learned knowhow lines per agent, total
+  plan_ambiguity_margin: 0   # the shell plan is deterministic (body plan ⊕ knowhow ⊕ fallback)
+  unacted_penalty: 0.25
+  plan_llm_per_hour: 0
+  retro_every_h: 6   # retro (회고): journal ⊕ KPI window → what worked · what failed and why · one change to try
+  cost_act: 0
+kpis:
+  - { name: re_success_ratio, at_least: $policies.re_success_ratio_min, unit: "비율" }
+done_when:
+  - "24h 창의 RED PR 중 절반 이상이 뒤에 PREGATE-GREEN"
+  - "창 안 모든 실패에 진단 카드가 있다"
+never_auto: &never
+  - "작성자 코드·PR 수정"
+  - "같은 head 두 번째 재실행"
+  - "허용 밖 호스트(aws1·VM) 배정"
+  - "게이트 기준 완화"
+soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan and voice load it · aliases = one definition with the card
+  purpose: *purpose
+  values: *values
+  do_not: *never
+  voice: *voice
+  serves:
+    - "TC (L0 · landing)"
+    - "재시도를 기다리는 TA 런 주인"
+wake:
+  registered_as: run-doctor-agent
+  trigger:
+    condition:
+      predicate: {"kind":"state-changed","parts":[{"file":"{seatState}/RES/evidence/PREGATE-RED"},{"file":"{stateRoot}/run-ledger"}]}
+      cooldown_min: 2
+      max_wait_min: 30
+      on_max_wait: fire
+  failure: { goal_deadline_min: 30, max_attempts: 2, backoff_sec: [60] }   # the registry's goal deadline · attempts · backoff (was graphs/triggers/run-doctor-agent.yaml)
+body:   # tier ① routing — observe outcome → steps (ok · breach · unknown → act; off · error → finish)
+  entry_node: observe
+  terminal_nodes: [done]
+  nodes:
+    - { node_id: observe, kind: run-doctor.observe, max_visits: 1 }
+    - { node_id: act, kind: loop-agent.act, max_visits: 1 }
+    - { node_id: learn, kind: loop-agent.learn, max_visits: 1 }
+    - { node_id: judge, kind: loop-agent.judge, max_visits: 1 }
+    - { node_id: finish, kind: loop-agent.finish, max_visits: 1 }
+    - { node_id: done, kind: gate }
+    - { node_id: reflect, kind: reflect, optional: true }        # v3: did my actions work? same failure N× → a pattern with its cause
+    - { node_id: plan, kind: plan, optional: true }              # v3: the body plan ⊕ learned knowhow → fallback · soul do_not · cited memory
+    - { node_id: learn-knowhow, kind: learn-knowhow, optional: true } # v3: one lesson → one knowhow line
+    - { node_id: retro, kind: retro, optional: true }            # v3: every retro_every_h → retro entry in memory (the voice quotes it)
+  edges:
+    - { from: observe, on: outcome, map: { ok: act, breach: act, unknown: act, off: finish, error: finish } }
+    - { from: act, on: outcome, map: { ok: learn } }
+    - { from: learn, on: outcome, map: { ok: judge } }
+    - { from: judge, on: outcome, map: { ok: finish } }
+    - { from: finish, on: outcome, map: { ok: done } }
+actions:   # v3 plan (LOOP-AGENT-V3-SMART-2): the card rights as plan choices · fallback = what the plan runs once a knowhow line says the action keeps failing
+  - { id: diagnose, channel: self, target: self, serves: [re_success_ratio], cost: $policies.cost_act, default: true }
+  - { id: retry-other-host, channel: self, target: self, serves: [re_success_ratio], cost: $policies.cost_act, fallback: diagnose }
+voice:   # tier ③ — one LLM turn only when spoken to (role router · coordinator) · facts-only fold over budget
+  channel: loop:run-doctor
+  speak_on: [kpi-breach, kpi-recovered, subject-lost]
+  mail: l0-only
+  per_hour_max: 6
+memory:
+  knowhow: knowhow.md
+budget:
+  llm_turns_per_hour: 6
+levels:
+  start: live
+  values: [live, L1, shadow, off]

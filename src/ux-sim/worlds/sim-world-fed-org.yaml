@@ -1,0 +1,14 @@
+# SIM-WORLD fed-org pack — federation org structure simulation (CEO 11-27 00:0x): S0 tonight → S4 loop-agent federation,
+# stress events, loop-agent helpers and the 14 loop bodies. Device FED-ORG-POLICY-MODEL (seeded · LLM 0).
+schema: 1
+world: fed-org
+scenarios:
+  - { id: FED-ORG-DETERMINISM, module: src/ux-sim/sim-world/fed-org/scenarios.ts }
+  - { id: FED-ORG-CALIBRATION, module: src/ux-sim/sim-world/fed-org/scenarios.ts }
+  - { id: FED-ORG-TARGET, module: src/ux-sim/sim-world/fed-org/scenarios.ts }
+  - { id: FED-ORG-HEADROOM, module: src/ux-sim/sim-world/fed-org/scenarios.ts }
+  - { id: FED-ORG-HELPERS, module: src/ux-sim/sim-world/fed-org/scenarios.ts }
+  - { id: FED-ORG-BODY, module: src/ux-sim/sim-world/fed-org/scenarios.ts }
+  - { id: KIT-KPI-WINDOW-EVENT-TIME, module: src/ux-sim/sim-world/fed-org/kit-kpi.ts }
+  - { id: KIT-KPI-RAW-JUDGMENT, module: src/ux-sim/sim-world/fed-org/kit-kpi.ts }
+  - { id: KIT-KPI-BREACH-DEBOUNCE, module: src/ux-sim/sim-world/fed-org/kit-kpi.ts }

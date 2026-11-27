@@ -9,9 +9,10 @@ import { requestEls } from './client.js';
 import { widgetLaunch } from './widget-registry.js';
 import { audit, createControl, type ControlAction, type ControlTarget, type IdResolver, type StructPayload } from './control.js';
 import type { ElsRequest } from './server.js';
+import { CHANNEL_ACTIONS, CHANNEL_WAIT_MAX_MS, type ChannelRequest } from './channel-log.js';
 
 export const ELS_CONTROL_TOOL_NAME = 'ElsControl';
-export const ELS_CONTROL_ACTIONS = ['ls', 'status', 'read', 'new', 'widget', 'do', 'send', 'stop', 'close', 'rename', 'move', 'focus'] as const;
+export const ELS_CONTROL_ACTIONS = ['ls', 'status', 'read', 'new', 'widget', 'overlay', 'element', 'do', 'send', 'stop', 'close', 'rename', 'move', 'focus', 'channel'] as const;
 export type ElsControlAction = (typeof ELS_CONTROL_ACTIONS)[number];
 
 /** Door action per tool action. focus: the door vocabulary + server focus pointer land in the follow-up
@@ -23,6 +24,10 @@ const DOOR_ACTION: Record<ElsControlAction, ControlAction | null> = {
   new: 'new',
   // BURST-BOARD-GENERAL: a read-only board tab «▦ <name>» in the caller pane's own workspace — the same door as new.
   widget: 'new',
+  // ELS-ZAXIS: overlay has its own path in runElsControl (runOverlay) — the els server judges it (act-view tier).
+  overlay: null,
+  // ELS-ELEMENT-HOST: element rides the same overlay path (runOverlay).
+  element: null,
   do: 'do',
   // Tool-authored operations need the stricter do gate; the server independently authenticates input.
   send: 'do',
@@ -31,6 +36,8 @@ const DOOR_ACTION: Record<ElsControlAction, ControlAction | null> = {
   rename: 'rename',
   move: 'move',
   focus: null,
+  // ELS-CHANNEL P0: channel has its own path (runChannel) — the els server stamps the sender and judges the channel scope.
+  channel: null,
 };
 
 /** ELANOUS_ELS_SOCKET gate — '' when the daemon is not running inside an els pane. */
@@ -189,9 +196,14 @@ export async function runElsControl(args: unknown, deps: ElsControlDeps): Promis
   if (action === 'widget') {
     const w = widgetLaunch(str(a.widget) || str(a.name) || str(a.text), process.env);
     if (!w.ok) return { tool: ELS_CONTROL_TOOL_NAME, action, allowed: false, ok: false, exitCode: 2, code: 'unknown-widget', reason: w.reason, message: `ElsControl widget: ${w.reason}; nothing was opened` };
-    const opened = await runElsControl({ action: 'new', pane: str(a.pane), title: w.title, text: w.command.join(' ') }, deps);
+    // The caller's own pane (env ELANOUS_ELS_PANE, set by els for every pane) when the model leaves `pane` out.
+    const opened = await runElsControl({ action: 'new', pane: str(a.pane) || (process.env.ELANOUS_ELS_PANE ?? '').trim(), title: w.title, text: w.command.join(' ') }, deps);
     return { ...opened, action };
   }
+  if (action === 'overlay') return runOverlay(a, deps);
+  if (action === 'channel') return runChannel(a, deps);
+  // ELS-ELEMENT-HOST: element.open {element, frame} · element.frame · element.workbench · element.close — the overlay door.
+  if (action === 'element') return runOverlay({ ...a, overlay: str(a.element_action) || 'open' }, deps);
   const doorAction = DOOR_ACTION[action];
   if (!doorAction) {
     return {
@@ -300,8 +312,65 @@ export async function runElsControl(args: unknown, deps: ElsControlDeps): Promis
   };
 }
 
+/**
+ * ELS-ZAXIS (대표 11-26 «AI opens Obsidian in els on the z axis»): overlay open · close · list — a floating element over the
+ * els screen (obsidian = the read-only vault viewer, toast = a short notice). The layer belongs to the calling pane's
+ * workspace (from the els journal, never from the arguments); the els server judges the act-view tier (#40244 §2-3:
+ * OP every space, any other pane its own workspace). Every call leaves a control-audit line.
+ */
+async function runOverlay(a: Record<string, unknown>, deps: ElsControlDeps): Promise<ElsControlResult> {
+  const sub = str(a.overlay) || 'open';
+  const element = str(a.element) || str(a.widget) || str(a.name);
+  const ctl = join(dirname(deps.socketPath), 'ctl.sock');
+  const paneId = str(a.pane) || (process.env.ELANOUS_ELS_PANE ?? '').trim();
+  if (sub !== 'open' && sub !== 'close' && sub !== 'list' && sub !== 'frame' && sub !== 'workbench') return { tool: ELS_CONTROL_TOOL_NAME, action: 'overlay', allowed: false, ok: false, exitCode: 2, message: 'ElsControl overlay: overlay must be open · close · list · frame · workbench' };
+  const frame = str(a.frame);
+  let ws: string | undefined;
+  let paneCwd: string | undefined;
+  if (sub !== 'list') {
+    if (!paneId) return refusal('overlay', 'pane-required', 'pane id is required (the overlay opens in that pane\'s workspace)', deps.stateDir, '');
+    const listed = await requestEls(ctl, { op: 'ls' });
+    const listing = listed.exitCode === 0 ? parseListing(listed.message) : undefined;
+    const resolved = listing ? resolvePane(listing, paneId) : undefined;
+    if (!resolved) return refusal('overlay', 'unknown-pane', `unknown pane ${paneId}`, deps.stateDir, paneId);
+    ws = resolved.target.workspace;
+    paneCwd = resolved.listing.panes.find((one) => one.pane === resolved.target.pane)?.cwd;
+  }
+  const request: ElsRequest = sub === 'list' ? { op: 'overlay', action: 'list' }
+    : sub === 'close' ? { op: 'overlay', action: 'close', ...(str(a.id) ? { id: str(a.id) } : { kind: element || 'obsidian' }) }
+    : sub === 'frame' ? { op: 'overlay', action: 'frame', frame: frame || 'next', ...(str(a.id) ? { id: str(a.id) } : { kind: element || 'obsidian' }) }
+    : sub === 'workbench' ? { op: 'overlay', action: 'workbench', ...(ws ? { ws } : {}) }
+    : { op: 'overlay', action: 'open', kind: element || 'obsidian', ...(ws ? { ws } : {}), ...(frame ? { frame } : {}),
+      props: element === 'toast' ? { text: str(a.text), level: str(a.level) || 'info' }
+        : element === 'files' ? (str(a.path) && str(a.path).startsWith('/') ? { dir: str(a.path) } : paneCwd ? { dir: paneCwd } : {}) : {} };
+  const answer = await requestEls(ctl, request);
+  audit(deps.stateDir, { principal: 'eln:tool', kind: 'eln', pane: paneId, action: `overlay.${sub}`, element: element || (sub === 'list' ? '' : 'obsidian'), result: answer.exitCode === 0 ? 'allowed' : 'denied', reason: answer.exitCode === 0 ? '' : answer.message, at: Date.now() });
+  return { tool: ELS_CONTROL_TOOL_NAME, action: 'overlay', allowed: answer.exitCode === 0, ok: answer.exitCode === 0, exitCode: answer.exitCode, message: answer.message, request, ...(sub === 'list' && answer.exitCode === 0 ? { data: tryParse(answer.message) } : {}) };
+}
+
+/** ELS-CHANNEL P0 (내부 문서 `ELS-CHANNEL` §5-1): post/read/list/ack/wait/hold/resume on the els channel log. The tool
+ *  never names a sender — the server stamps it from this connection's credential. wait is server-side (≤25 s), not a poll. */
+async function runChannel(a: Record<string, unknown>, deps: ElsControlDeps): Promise<ElsControlResult> {
+  const sub = (str(a.channelAction) || 'read') as ChannelRequest['action'];
+  if (!(CHANNEL_ACTIONS as readonly string[]).includes(sub) || sub === 'open' || sub === 'loop-say') return { tool: ELS_CONTROL_TOOL_NAME, action: 'channel', allowed: false, ok: false, exitCode: 2, message: 'ElsControl channel: channelAction must be post · read · list · ack · wait · hold · resume' };
+  const ch = str(a.channel);
+  if (sub !== 'list' && !ch) return refusal('channel', 'channel-required', 'channel id is required (ws:<id> · run:<id> · pair:<a>+<b>)', deps.stateDir, '');
+  const list = (v: unknown): string[] | undefined => typeof v === 'string' && v.trim() ? v.split(',').map((x) => x.trim()).filter(Boolean) : Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : undefined;
+  const after = typeof a.after === 'number' && Number.isInteger(a.after) && a.after >= 0 ? a.after : undefined;
+  const to = list(a.to), refs = list(a.refs);
+  const request: ElsRequest = { op: 'channel', action: sub, ...(ch ? { channel: ch } : {}),
+    ...(sub === 'post' ? { type: str(a.type) || 'say', body: str(a.text), ...(to ? { to } : {}), ...(refs ? { refs } : {}), ...(str(a.replyTo) ? { replyTo: str(a.replyTo) } : {}) } : {}),
+    ...(sub === 'ack' ? { id: str(a.id) } : {}),
+    ...((sub === 'read' || sub === 'wait') && after !== undefined ? { after } : {}) };
+  const answer = await requestEls(join(dirname(deps.socketPath), 'ctl.sock'), request, sub === 'wait' ? CHANNEL_WAIT_MAX_MS + 5_000 : undefined);
+  audit(deps.stateDir, { principal: 'eln:tool', kind: 'eln', pane: '', action: `channel.${sub}`, element: ch, result: answer.exitCode === 0 ? 'allowed' : 'denied', reason: answer.exitCode === 0 ? '' : answer.message, at: Date.now() });
+  return { tool: ELS_CONTROL_TOOL_NAME, action: 'channel', allowed: answer.exitCode === 0, ok: answer.exitCode === 0, exitCode: answer.exitCode, message: answer.message, request, ...(answer.exitCode === 0 ? { data: tryParse(answer.message) } : {}) };
+}
+
 /** Actions that only look: they never need the caller's OP runtime registration. */
 const LOOK_ACTIONS: ReadonlySet<string> = new Set(['ls', 'status', 'read']);
+const isLook = (args: Record<string, unknown>): boolean => LOOK_ACTIONS.has(str(args.action)) || (str(args.action) === 'overlay' && str(args.overlay) === 'list')
+  || (str(args.action) === 'channel' && ['read', 'list', 'wait'].includes(str(args.channelAction) || 'read'));
 /** The server's tool-door answer when the caller's runtime is not (or no longer) registered (server.ts `new`). */
 const UNVERIFIED_TOOL_SEAT = 'verified tool seat required';
 
@@ -377,7 +446,7 @@ export async function dispatchElsControl(args: unknown): Promise<string> {
     });
   }
   const seat = elsControlSeat();
-  const acting = !LOOK_ACTIONS.has(str(argsRecord(args).action));
+  const acting = !isLook(argsRecord(args));
   if (acting) await ensureOpRuntimeRegistered();
   const deps = { socketPath, stateDir: dirname(socketPath), ...(seat ? { seat } : {}) };
   let result = await runElsControl(args, deps);
@@ -393,19 +462,32 @@ export function buildElsControlTool(): LLMToolSpec {
   return {
     name: ELS_CONTROL_TOOL_NAME,
     description:
-      'ELS panes·tabs 제어 — 모든 동작이 els 제어 문(control-allow.json 허용목록 · 감사 · close 사람 확인)을 경유합니다. 결과는 구조 JSON. 동작: ls·status·read·new·widget(읽기 전용 보드 탭 «▦ 이름» — «버스트 보드 탭 띄워줘» → widget burst-board · fed-board · invest-board · release-board)·do·send·stop(중단 키 요청; 결과는 read로 확인)·close·rename·move·focus(focus는 후속 델타).',
+      'ELS panes·tabs 제어 — 모든 동작이 els 제어 문(control-allow.json 허용목록 · 감사 · close 사람 확인)을 경유합니다. 결과는 구조 JSON. 동작: ls·status·read·new·overlay(z축 떠 있는 창 — «옵시디언 띄워줘» → overlay open element obsidian · «옵시디언 닫아줘» → overlay close element obsidian · «사이드챗 열어줘» → overlay open element sidechat · «메모 띄워줘» → overlay open element memo · «파일 브라우저 띄워줘» → overlay open element files (path 선택) · «팝업 터미널 띄워줘» → overlay open element term · 알림 → overlay open element toast text …)·element(요소를 popup·tile·tab 으로 — «옵시디언 타일로» → element open element obsidian frame tile · «탭으로 바꿔» → element element_action frame frame tab · «워크벤치» → element element_action workbench)·widget(읽기 전용 보드 탭 «▦ 이름» — «버스트 보드 탭 띄워줘» → widget burst-board · fed-board · invest-board · release-board · «옵시디언 탭 띄워줘» → widget obsidian)·do·send·stop(중단 키 요청; 결과는 read로 확인)·close·rename·move·focus(focus는 후속 델타)·channel(다른 타일의 에이전트와 구조화된 글 — «옆 타일 codex 에게 물어봐» → channel post channel ws:<공간> type ask to <pane> text … · 답 확인 → channel wait/read · 보낸 이는 서버가 pane 자격으로 정함).',
     parameters: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: [...ELS_CONTROL_ACTIONS], description: '수행 동작' },
         pane: { type: 'string', description: '대상 pane id — 유일한 대상 지정자입니다. workspace·tab·shell 은 els 저널에서 도구가 직접 조회하며 인자로 받지 않습니다 (new 는 이 pane 의 workspace 에 엽니다)' },
         title: { type: 'string', description: 'new: 새 탭 제목' },
-        widget: { type: 'string', description: 'widget: 보드 이름 — burst-board · fed-board · invest-board · release-board (별칭 burst·federation·invest·release)' },
+        widget: { type: 'string', description: 'widget: 보드 이름 — burst-board · fed-board · invest-board · release-board · obsidian (별칭 burst·federation·invest·release·vault·옵시디언)' },
+        overlay: { type: 'string', enum: ['open', 'close', 'list', 'frame', 'workbench'], description: 'overlay: open(기본) · close · list · frame · workbench' },
+        element: { type: 'string', description: 'overlay/element 요소 종류 — obsidian(읽기 전용 볼트 뷰어) · toast(짧은 알림, text) · sidechat(미니 LLM 질문) · memo(메모 패드 — 모든 공간 위 고정 가능) · files(읽기 전용 파일 브라우저) · term(팝업 터미널 — 사람의 셸, 명령은 고를 수 없음) · 등록된 다른 요소' },
+        element_action: { type: 'string', enum: ['open', 'frame', 'workbench', 'close'], description: 'element: open(기본) · frame(창 형태 바꾸기, 상태 유지) · workbench(옵시디언·파일·터미널·사이드챗 2x2 타일) · close' },
+        frame: { type: 'string', enum: ['popup', 'tile', 'tab', 'next'], description: 'element open/frame: popup(떠 있는 창) · tile(오른쪽 나란히) · tab(탭) · next — open 에서 생략하면 팝업' },
+        path: { type: 'string', description: 'overlay files: 시작 폴더(절대 경로) — 없으면 호출 pane 의 cwd' },
+        level: { type: 'string', enum: ['info', 'success', 'warning', 'error'], description: 'overlay toast 수준' },
         text: { type: 'string', description: 'new: the command the new tab runs (e.g. "eln" for an agent tab) · do/send: the line to type into the pane' },
         kind: { type: 'string', description: 'rename·move·close 구조 종류: workspace|tab' },
-        id: { type: 'string', description: 'rename·move 구조 대상 id (pane 과 같은 workspace 안이어야 함)' },
+        id: { type: 'string', description: 'rename·move 구조 대상 id (pane 과 같은 workspace 안이어야 함) · channel ack: 글 id' },
         name: { type: 'string', description: 'rename: 새 이름' },
         before: { type: 'string', description: 'move: 이 항목 앞으로 이동 (형제 id)' },
+        channelAction: { type: 'string', enum: ['post', 'read', 'list', 'ack', 'wait', 'hold', 'resume'], description: 'channel: post · read(기본) · list · ack · wait(서버가 다음 글까지 ≤25초 기다림) · hold · resume' },
+        channel: { type: 'string', description: 'channel id — ws:<workspace> · run:<runId> · pair:<a>+<b>(a<b 정렬)' },
+        type: { type: 'string', enum: ['say', 'ask', 'answer', 'handoff', 'file', 'done'], description: 'channel post 글 종류 (text = 본문)' },
+        to: { type: 'string', description: 'channel post: 받을 pane id·자리 (쉼표 구분)' },
+        replyTo: { type: 'string', description: 'channel post: answer·done 이 닫는 ask·handoff 글 id' },
+        refs: { type: 'string', description: 'channel post: 구조 ref (쉼표 구분 · pr:N · cell:X · file:<path>)' },
+        after: { type: 'number', description: 'channel read·wait: 이 seq 뒤의 글만' },
       },
       required: ['action'],
     },

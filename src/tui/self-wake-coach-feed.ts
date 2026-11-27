@@ -15,9 +15,11 @@
  *          수복과 인계 = a failed arm keeps the entry; the next tick retries.
  */
 import { debug } from '../debug/log.js';
+import { MAIL_ROUTE_POLICY_DEFAULTS, readMailRoutePolicy, windowDue } from '../kit/mail-route/policy.js';
 import { coachNoteLine, divertedLineCount, divertedRoot, divertedSince, foldedDigestLine, noteTurnStamp, pendingDiverted, takeDiverted, type DivertedEntry } from '../msg/diverted-mail.js';
 
-export const FOLDED_DIGEST_WINDOW_MS = 10 * 60_000;
+/** The folded-digest window — the default of the shared mail-route policy (`foldedWindowMinutes`). */
+export const FOLDED_DIGEST_WINDOW_MS = MAIL_ROUTE_POLICY_DEFAULTS.foldedWindowMs;
 /** RAIL30 ④ — a self-wake older than this when the TUI drains it is dropped (one line), not replayed. */
 export const SELF_WAKE_STALE_DROP_MS = 2 * 60 * 60_000;
 /** A graph retro turn not opened within this long is dropped (one line) — the next hour's graph run writes a new draft. */
@@ -114,7 +116,7 @@ export function createSelfWakeCoachFeed(deps: SelfWakeCoachFeedDeps): SelfWakeCo
         } catch (error) { log('msg.diverted.drain-failed', { seat: deps.seat, ledger: 'folded-meter', error: String(error).slice(0, 160) }); }
       }
       try {
-        if (lastFoldAt === null || at - lastFoldAt >= FOLDED_DIGEST_WINDOW_MS) {
+        if (windowDue(lastFoldAt, at, readMailRoutePolicy().foldedWindowMs)) {
           const line = foldedDigestLine(pendingDiverted('folded', deps.seat, root));
           if (line) { out.folded = takeDiverted('folded', deps.seat, () => true, root).length; deps.enqueuePassive(line); lastFoldAt = at; }
         }

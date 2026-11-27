@@ -1,9 +1,11 @@
 import { describe, expect, spyOn, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
-import { runDependencyChangeGate } from './dependency-change-gate.js';
+import { gitAt } from '../git-fs/smart-run.js';
+import { pwaBuildCacheKey, runDependencyChangeGate } from './dependency-change-gate.js';
+import { pwaReachableSrcFiles } from './pwa-import-graph.js';
 
 const brokenConsumer = 'src/acp/server.ts(36,3): error TS2724: missing SDK session API';
 
@@ -258,3 +260,129 @@ describe('runDependencyChangeGate', () => {
   }));
 });
 
+
+/** A git work tree: apps/pwa importing src/llm/x.ts, an unrelated src/other/z.ts, root manifests and installed next. */
+function gitFixture(check: (cwd: string, cacheDir: string) => void): void {
+  const root = mkdtempSync(join(tmpdir(), 'pwa-build-cache-'));
+  const cwd = join(root, 'repo');
+  const cacheDir = join(root, 'state', 'pwa-build-cache');
+  const g = (...args: string[]) => {
+    const r = gitAt(cwd)(args);
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+  };
+  try {
+    mkdirSync(join(cwd, 'apps/pwa/src'), { recursive: true });
+    mkdirSync(join(cwd, 'apps/pwa/node_modules/next'), { recursive: true });
+    mkdirSync(join(cwd, 'src/llm'), { recursive: true });
+    mkdirSync(join(cwd, 'src/other'), { recursive: true });
+    writeFileSync(join(cwd, '.gitignore'), 'node_modules/\n');
+    writeFileSync(join(cwd, 'apps/pwa/node_modules/next/package.json'), '{}');
+    writeFileSync(join(cwd, 'apps/pwa/package.json'), '{"name":"pwa"}\n');
+    writeFileSync(join(cwd, 'apps/pwa/src/a.tsx'), "import '../../../src/llm/x.js';\n");
+    writeFileSync(join(cwd, 'src/llm/x.ts'), 'export const x = 1;\n');
+    writeFileSync(join(cwd, 'src/other/z.ts'), 'export const z = 1;\n');
+    writeFileSync(join(cwd, 'package.json'), '{"name":"root"}\n');
+    writeFileSync(join(cwd, 'bun.lock'), 'lock v1\n');
+    writeFileSync(join(cwd, 'tsconfig.json'), '{}\n');
+    g('init', '-q', '-b', 'main');
+    g('-c', 'user.email=t@t.co', '-c', 'user.name=T', 'add', '-A');
+    g('-c', 'user.email=t@t.co', '-c', 'user.name=T', 'commit', '-q', '-m', 'base');
+    check(cwd, cacheDir);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const BUILD = 'bun bin/elanous.mjs --test nexus build';
+
+describe('PWA-GATE-OWN-DELTA-CACHE — content-addressed PWA build cache', () => {
+  test('a green build is stored; the same inputs are a hit that skips the build and still count as measured', () => gitFixture((cwd, cacheDir) => {
+    const calls: string[] = [];
+    const run = (cmd: string, args: readonly string[]) => { calls.push([cmd, ...args].join(' ')); return { status: 0, stdout: 'built' }; };
+    const events: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'self-implement' && event === 'gate.pwa-build') events.push(data ?? {});
+    }) as never);
+    try {
+      const first = runDependencyChangeGate({ cwd, changedFiles: ['src/llm/x.ts'], run, cacheDir });
+      expect(first).toMatchObject({ ran: true, passed: true, measured: true, pwaBuildCache: 'miss' });
+      expect(calls).toEqual([BUILD]);
+      expect(readdirSync(cacheDir).filter((file) => file.endsWith('.json'))).toEqual([`${first.pwaBuildCacheKey}.json`]);
+      calls.length = 0;
+      const second = runDependencyChangeGate({ cwd, changedFiles: ['src/llm/x.ts'], run, cacheDir });
+      expect(second).toEqual({
+        ran: false, passed: true, measured: true, failures: [], trigger: 'pwa-reachable', pwaReachableChanged: ['src/llm/x.ts'],
+        pwaBuildCache: 'hit', pwaBuildCacheKey: first.pwaBuildCacheKey,
+      });
+      expect(calls).toEqual([]);
+      expect(events.map((event) => event.cache)).toEqual(['miss', 'hit']);
+      expect(events[1]!.key).toBe(first.pwaBuildCacheKey!.slice(0, 16));
+    } finally { log.mockRestore(); }
+  }));
+
+  test('the key moves with bun.lock (and with a reachable src edit) but not with an unrelated src file', () => gitFixture((cwd, cacheDir) => {
+    const key = () => pwaBuildCacheKey(cwd, pwaReachableSrcFiles(cwd));
+    const base = key();
+    expect(base).toMatch(/^[0-9a-f]{64}$/);
+    writeFileSync(join(cwd, 'src/other/z.ts'), 'export const z = 2;\n');
+    expect(key()).toBe(base);
+    writeFileSync(join(cwd, 'bun.lock'), 'lock v2\n');
+    const lockMoved = key();
+    expect(lockMoved).not.toBe(base);
+    writeFileSync(join(cwd, 'src/llm/x.ts'), 'export const x = 2;\n');
+    expect(key()).not.toBe(lockMoved);
+    // A cached green build for the old lock is not reused for the new one.
+    const calls: string[] = [];
+    const run = (cmd: string, args: readonly string[]) => { calls.push([cmd, ...args].join(' ')); return { status: 0 }; };
+    writeFileSync(join(cwd, 'bun.lock'), 'lock v1\n');
+    writeFileSync(join(cwd, 'src/llm/x.ts'), 'export const x = 1;\n');
+    expect(runDependencyChangeGate({ cwd, changedFiles: ['src/llm/x.ts'], run, cacheDir }).pwaBuildCache).toBe('miss');
+    writeFileSync(join(cwd, 'bun.lock'), 'lock v2\n');
+    expect(runDependencyChangeGate({ cwd, changedFiles: ['bun.lock'], run, cacheDir }).pwaBuildCache).toBe('miss');
+    expect(calls.filter((call) => call === BUILD)).toHaveLength(2);
+  }));
+
+  test('a failed build is never cached — the next gate on the same inputs builds again and fails again', () => gitFixture((cwd, cacheDir) => {
+    const calls: string[] = [];
+    const run = (cmd: string, args: readonly string[]) => { calls.push([cmd, ...args].join(' ')); return { status: 1, stderr: "Cannot find module 'styled-jsx/package.json'" }; };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = runDependencyChangeGate({ cwd, changedFiles: ['src/llm/x.ts'], run, cacheDir });
+      expect(result).toMatchObject({ passed: false, pwaBuildCache: 'miss' });
+      expect(result.failures[0]!.lines).toContain("Cannot find module 'styled-jsx/package.json'");
+    }
+    expect(calls).toEqual([BUILD, BUILD]);
+    expect(existsSync(cacheDir) ? readdirSync(cacheDir) : []).toEqual([]);
+  }));
+
+  test('missing PWA deps on a new key stays «못 쟀다»; only an identical green key passes measured', () => gitFixture((cwd, cacheDir) => {
+    const run = () => ({ status: 0 });
+    expect(runDependencyChangeGate({ cwd, changedFiles: ['src/llm/x.ts'], run, cacheDir }).pwaBuildCache).toBe('miss');
+    rmSync(join(cwd, 'apps/pwa/node_modules'), { recursive: true });
+    expect(runDependencyChangeGate({ cwd, changedFiles: ['src/llm/x.ts'], run, cacheDir })).toMatchObject({ passed: true, measured: true, pwaBuildCache: 'hit' });
+    writeFileSync(join(cwd, 'src/llm/x.ts'), 'export const x = 3;\n');
+    expect(runDependencyChangeGate({ cwd, changedFiles: ['src/llm/x.ts'], run, cacheDir })).toMatchObject({
+      ran: false, passed: true, measured: false, skipped: 'pwa-deps-missing', pwaBuildCache: 'miss',
+    });
+  }));
+
+  test('a change to the PWA app itself builds (cache miss on its new content)', () => gitFixture((cwd, cacheDir) => {
+    const calls: string[] = [];
+    const run = (cmd: string, args: readonly string[]) => { calls.push([cmd, ...args].join(' ')); return { status: 0 }; };
+    writeFileSync(join(cwd, 'apps/pwa/src/a.tsx'), "import '../../../src/llm/x.js';\nexport const page = 1;\n");
+    const result = runDependencyChangeGate({ cwd, changedFiles: ['apps/pwa/src/a.tsx'], run, cacheDir });
+    expect(result).toMatchObject({ ran: true, passed: true, trigger: 'pwa-reachable', pwaReachableChanged: ['apps/pwa/src/a.tsx'], pwaBuildCache: 'miss' });
+    expect(calls).toEqual([BUILD]);
+    expect(runDependencyChangeGate({ cwd, changedFiles: ['apps/pwa/node_modules/next/x.js'], run, cacheDir })).toEqual({ ran: false, passed: true, failures: [] });
+  }));
+
+  test('no git work tree ⇒ cache unavailable, the build still runs', () => fixture((cwd) => {
+    mkdirSync(join(cwd, 'apps/pwa/src'), { recursive: true });
+    const calls: string[] = [];
+    const result = runDependencyChangeGate({ cwd, changedFiles: ['apps/pwa/src/a.tsx'], cacheDir: join(cwd, '.cache'),
+      run: (cmd, args) => { calls.push([cmd, ...args].join(' ')); return { status: 0 }; } });
+    expect(result).toMatchObject({ ran: true, passed: true, pwaBuildCache: 'unavailable' });
+    expect(result.pwaBuildCacheKey).toBeUndefined();
+    expect(calls).toEqual([BUILD]);
+    expect(existsSync(join(cwd, '.cache'))).toBe(false);
+  }));
+});

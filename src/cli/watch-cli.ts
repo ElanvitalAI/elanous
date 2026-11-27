@@ -1,5 +1,5 @@
 /**
- * `eln watch …` — the watch-the-watchers surface (src/watch/heartbeat.ts).
+ * `eln watch …` — the watch-the-watchers surface (src/kit/heartbeat/index.ts).
  *
  *   beat <name> --saw n [--last id|ts] [--err msg] [--every min] [--source msg]   one heartbeat line
  *   status [--json]                                                                every watcher: age · saw · error · cadence · verdict
@@ -7,7 +7,7 @@
  */
 import type { Command } from 'commander';
 import { alertStatePath, alertStep, appendBeat, beatLedgerPath, beatSafe, judgeWatchers, makeBeat, readAlertState, readBeats,
-  writeAlertState, type SourceHead, type WatcherVerdict } from '../watch/heartbeat.js';
+  writeAlertState, type SourceHead, type WatcherVerdict } from '../kit/heartbeat/index.js';
 
 export const ALERT_TO = 'CLAUDE-OP';
 export const ALERT_FROM = 'OP';

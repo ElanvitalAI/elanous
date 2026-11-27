@@ -106,8 +106,9 @@ export function liveHandTitleReporter(input: {
       return (process.env.ELANOUS_TRACK?.trim().toUpperCase() || resolveSeatId(input.cwd)) ?? null;
     },
     cells: () => {
-      const { checklistDevVersion, listChecklist } = require('../release-loop/checklist.js') as typeof import('../release-loop/checklist.js');
-      return listChecklist(checklistDevVersion()).items;
+      const { listChecklist } = require('../release-loop/checklist.js') as typeof import('../release-loop/checklist.js');
+      const { activeBoardVersion } = require('../ops-dashboard/current-version.js') as typeof import('../ops-dashboard/current-version.js');
+      return listChecklist(activeBoardVersion()).items;
     },
     spaceOf: (seat) => {
       const { loadFederationLadder } = require('../msg/hand-raise-ladder.js') as typeof import('../msg/hand-raise-ladder.js');

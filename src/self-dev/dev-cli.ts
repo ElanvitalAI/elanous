@@ -2271,7 +2271,7 @@ export function buildDevCliSpec(
     const requestedChildLlm = buildChildLlmSelection({ ...opts, readPreference: () => getUserConfig() });
     // 주간 상한 재배분(grok → codex)을 먼저, 과부하 페일오버(codex → grok)를 그 뒤에 — 과부하는 «지금 실패 중»이라 더 강한 신호다.
     const capped = requestedChildLlm?.provider === 'grok'
-      ? rebalanceGrokChildForLaunch(requestedChildLlm, getUserConfig().llm.grokWeeklyCapPct ?? 80, readGrokWeekly(), runId,
+      ? rebalanceGrokChildForLaunch(requestedChildLlm, ((require('../kit/resource-facts/llm-decide.js') as typeof import('../kit/resource-facts/llm-decide.js')).decidedGrokWeeklyCap() ?? getUserConfig().llm.grokWeeklyCapPct ?? 80), readGrokWeekly(), runId,
         recordLaunch ? { record: recordLaunch } : {})
       : requestedChildLlm;
     const childLlm = applyLaunchOverloadFailover(capped, {

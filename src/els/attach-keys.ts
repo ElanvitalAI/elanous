@@ -79,7 +79,7 @@ export function createKeyRouter(options: { pasteTimeoutMs?: number } = {}): { re
             }
             armed = false;
             if (char === PREFIX) typed += PREFIX;
-            else if (char === ESCAPE) { /* the prefix is cancelled */ }
+            else if (char === ESCAPE) emit({ kind: 'unknown', key: ESCAPE });   // ELS-POPUP-TERM: ctrl+b Esc (the app ignores it elsewhere)
             else if (char >= '1' && char <= '9') emit({ kind: 'action', action: 'goto', n: Number(char) });
             else if (AFTER_PREFIX[char]) emit({ kind: 'action', action: AFTER_PREFIX[char]! });
             else emit({ kind: 'unknown', key: char });

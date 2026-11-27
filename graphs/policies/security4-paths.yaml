@@ -1,0 +1,22 @@
+# SEC4-PATHS-RELAX (대표 11-27 12:5x «보안을 너무 빡빡하게 보면 안 된다») — the ONE table of security-4 paths.
+# Read by src/judge-butler/done-when.ts (loadSecurity4Paths) → security4Hits, used by the judge butler (done-when per cell)
+# and the land graph (JUD-RELAX land rule: a security-4 PR waits for Terra). Change a path here, not in TS.
+# Default = relaxed: only the four classes bind (auth · secret · remote-exec · destroy). Tests, fixtures, docs and patches
+# never count (isNonExecutablePath in TS). Each entry: cls (one of the four) + re (a JavaScript regex source, matched
+# case-insensitively against the repo-relative path).
+version: 1
+paths:
+  - cls: auth
+    re: '^src/(auth|oauth|members)/|^src/els/(server-auth|holder)|(^|/)(auth|oauth|login)[^/]*(/|$)'
+  # Land-path authority boundary: who may land/veto (org land-authority · org-map) and the land/waiver scripts that hold the
+  # credentials and make the actual merge call (op-direct-land-v2 · op-waiver). src/cli/land-graph-cli.ts is NOT here
+  # (SEC4-PATHS-RELAX): it is a large kit/loop CLI that only shells out to those scripts — every kit PR touching it waited
+  # for a Terra review nobody ran.
+  - cls: auth
+    re: '^src/org/(land-authority|org-map)\.ts$|^seat-state/OP/tools/[^/]*(land|waiver)[^/]*\.(sh|ts|py|mjs)$'
+  - cls: secret
+    re: '^src/secret/|(^|/)[^/]*(secrets?|credentials?|creds?|keychain|api-?keys?)([-_./]|$)'
+  - cls: remote-exec
+    re: '^src/(pty|pty-shell|shell-primitive|shell-runner|ssh|exec-requests|skills/tools/shell)([-_./]|$)|^scripts/[^/]*deploy|(^|/)[^/]*(pty|spawn|remote-exec)[^/]*\.(ts|tsx|sh|py)$'
+  - cls: destroy
+    re: '^src/disk-steward/|(^|/)[^/]*(purge|wipe|destroy|rm-?rf)[^/]*$'

@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { CliUserError } from './cli-user-error.js';
 import { ownerSeatFromPullRequest } from '../../scripts/release-loop/gate-bisect-owner-mail.js';
 
 export interface CellOpenPullRequest {
@@ -101,8 +102,10 @@ export function assertManualSeatClaimOpenPrOwner(
   cellId: string,
   claimant: string,
   deps: ManualSeatClaimDeps = {},
+  target?: string,
 ): void {
   const pullRequests = deps.listOpenPullRequests?.(cellId) ?? listOpenCellPullRequests(cellId);
-  const refusal = manualSeatClaimOpenPrRefusal(cellId, claimant, pullRequests);
-  if (refusal) throw new Error(refusal);
+  const refusal = manualSeatClaimOpenPrRefusal(cellId, claimant, pullRequests)
+    ?? (target ? manualSeatClaimOpenPrRefusal(cellId, target, pullRequests) : null);
+  if (refusal) throw new CliUserError(refusal);
 }

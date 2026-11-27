@@ -1262,7 +1262,7 @@ export async function buildDefaultSelfImplementSeams(
           if (attempt.provider?.name === 'openai-codex' && classifyReviewProviderFailure(error instanceof Error ? error.message : String(error)) === 'rate-limited') { podCodexBlocked = true; recordPodFallback(role, 'codex-quota-exhausted'); }
           throw error;
         }
-      }, observeFallback(role), { maxCalls: 2, shouldFallback: (attempt, reason) => process.env.ELANOUS_SUBSTRATE !== 'pod' || attempt.provider?.name !== 'openai-codex' || reason === 'rate-limited' || reason === 'credentials-unavailable' },
+      }, observeFallback(role), { maxCalls: role === 'review' ? 3 : 2, terraOverloadOnly: role === 'review', shouldFallback: (attempt, reason) => role === 'review' || process.env.ELANOUS_SUBSTRATE !== 'pod' || attempt.provider?.name !== 'openai-codex' || reason === 'rate-limited' || reason === 'credentials-unavailable' },
     );
     reviewerRan[role] = { provider: r.used.provider?.name ?? 'unknown', model: r.used.model };
     return r.text;
@@ -1304,7 +1304,8 @@ export async function buildDefaultSelfImplementSeams(
             }
           },
           preSkipped: reviewPlan.skipped,
-          maxCalls: 2,
+          terraOverloadOnly: true,
+          maxCalls: 3,
         },
       );
     } catch (error) {

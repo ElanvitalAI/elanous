@@ -89,7 +89,8 @@ describe.each(SEEDS)('SIM release-traffic seed %i', (seed) => {
     expect(config).toEqual({ 'node-b': 5, 'aws1': 2 });
     expect(updates).toBe(1);
     const fires = listFires(db, 'release-traffic', 100);
-    expect(fires.length).toBeLessThanOrEqual(4);
+    // ≤ 4 traffic edges + 2 reservation-class edges (res-reservation absorbed 11-26: first idle key · reserved@v → idle at publish + 45m)
+    expect(fires.length).toBeLessThanOrEqual(6);
     expect(runs.some(r => r.includes('release.published=true'))).toBe(true);
     expect(readAudit(resRoot()).filter(r => r.to !== undefined).every(r => typeof r.undo === 'string')).toBe(true);
   });

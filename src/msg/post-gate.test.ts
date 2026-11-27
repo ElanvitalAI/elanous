@@ -32,7 +32,7 @@ test('gate: kind-less → passive info ⊕ warning · unknown kind refused · se
   const self = gatePost({ envelope: { from: 'OP', to: 'OP', body: '⏰ wake', kind: 'notice' }, entrance: 'cli' }, deps);
   expect(self.action).toBe('divert');
   expect(pendingDiverted('self-wake', 'OP', root).map((e) => e.body)).toEqual(['⏰ wake']);
-  const coach = gatePost({ envelope: { from: 'CLAUDE-OP', to: 'OP', body: 'board', kind: 'info' }, entrance: 'tool' }, deps);
+  const coach = gatePost({ envelope: { from: 'CLAUDE-OP', to: 'OP', body: 'board', kind: 'coach' }, entrance: 'tool' }, deps);
   expect(coach.action === 'divert' && coach.ledger).toBe('coach-note');
   const coachAsk = gatePost({ envelope: { from: 'CLAUDE-OP', to: 'OP', body: 'decide?', kind: 'decision' }, entrance: 'tool' }, deps);
   expect(coachAsk.action).toBe('post');

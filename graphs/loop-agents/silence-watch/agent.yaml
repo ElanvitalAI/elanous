@@ -1,0 +1,129 @@
+# 침묵 감시 (silence-watch) — LOOP-AGENT v3 YAML definition (YAML-SUPERVISORS-DEF · 대표 11-27 12:0x «감독자들도 다 로직·정책 등을 yaml 로»).
+# Schema: src/loop-agent/v3/agent-yaml.ts · executor: src/loop-agent/v3/supervisor.ts · lint: eln loop agent lint silence-watch
+# Tiers: ① rules / thresholds / routing = this file (policies · body edges) · ② deterministic logic = the node kinds it requires
+# (provides.nodes · their tests and the supervisors sim world are the spec) · ③ fuzzy judgment = the voice block (one LLM turn when spoken to · role router · facts-only fold).
+# The ONE definition (YAML-SUPERVISORS-RUNTIME): the trigger registry reads wake: from here (graphs/triggers/<registered_as>.yaml is only the tick shim) and goal.yaml is GENERATED from this file (eln loop agent gen) — only the fallback when this file is refused.
+apiVersion: elanous/loop-agent@3
+manifest:
+  name: silence-watch
+  version: 1.0.0
+  description: "SLA 넘은 미결 요청 0 (받는 이가 결정했거나 · 보낸 이가 읽는 몸 없음을 안다)"
+  requires:
+    executor: loop-agent@3
+    kits: [kpi]
+    node_kinds: [silence-watch.observe, loop-agent.act, loop-agent.learn, loop-agent.judge, loop-agent.finish, gate, reflect, plan, learn-knowhow, retro]
+    facts: []
+  provides:
+    agent: silence-watch
+    kpis: [unanswered_mail_past_sla]
+    nodes: [silence-watch.observe]   # tier ② — src/loop-agent/bodies/silence-watch.ts (+ its tests · sim world supervisors)
+identity:
+  id: silence-watch
+  address: SILENCE-WATCH
+  rank: supervisor
+  soul: soul.md
+supervisor:
+  duty: escalation-parent
+# v2 card fields that live only here — graphs/loop-agents/silence-watch/goal.yaml is GENERATED from this file (eln loop agent gen silence-watch)
+card:
+  name: 침묵 감시
+  role: &purpose SLA 안에 아무도 결정하지 않은 요청 우편과 멈춘 감독자를 찾아, 받는 자리를 한 번 다시 깨우고 읽는 몸이 없으면 보낸 이에게 알린다
+  temperament: &voice 차분하다 · 우편 번호와 무응답 분으로 말한다 · 재촉하지 않고 한 번만 두드린다
+  values: &values
+    - 답 없는 요청은 두 번 실패한다 — 받는 쪽도 보낸 쪽도 모른다
+    - 한 번만 다시 깨운다 · 반복 재촉은 소음이다
+    - 읽는 몸이 없으면 보낸 이에게 사실대로 알린다
+  subject: SLA(30분) 넘게 아무도 수락·거절·완료하지 않은 요청 우편(needsAck · 24시간 안) · 받는 주소의 읽는 몸 유무 · heartbeat 가 멈춘 loop 감독자
+  actions:
+    - redeliver
+    - bounce
+  wake_events:
+    - 5분마다 (cron */5)
+    - 우편 원장 변경 (msg messages.db)
+  voice_role: coordinator
+  fallback_seat: OP
+goal: "SLA 넘은 미결 요청 0 (받는 이가 결정했거나 · 보낸 이가 읽는 몸 없음을 안다)"
+policies:   # tier ① — the only numbers (the body reads them through pv() · change behaviour here, not in code)
+  unanswered_mail_past_sla_max: 0
+  max_per_tick: 8
+  cooldown_min: 60
+  escalate_after_min: 60
+  heartbeat_every_min: 5
+  subject_lost_ticks: 3   # unreadable subject this many ticks → reattach proposal to the L0
+  sla_min: 30   # 요청 응답 SLA
+  lookback_h: 24   # 미결 요청을 보는 창
+  # v3 smartness (LOOP-AGENT-V3-SMART-2 · src/loop-agent/v3/smart.ts) — reflect · plan · learn-knowhow · retro read only these
+  act_grace_min: 0   # an action's outcome is known when it returns (acted | failed) — no waiting
+  lesson_repeat_min: 3   # the same action failing 3× in a row on one kind of subject → ONE lesson with the cause
+  reflect_window_min: 60
+  lesson_cap: 12   # active lessons kept (oldest evicted)
+  knowhow_promote_min: 1   # the lesson becomes one knowhow line at once (marker-deduped · plan reads it next tick)
+  knowhow_cap: 5   # learned knowhow lines per agent, total
+  plan_ambiguity_margin: 0   # the shell plan is deterministic (body plan ⊕ knowhow ⊕ fallback)
+  unacted_penalty: 0.25
+  plan_llm_per_hour: 0
+  retro_every_h: 6   # retro (회고): journal ⊕ KPI window → what worked · what failed and why · one change to try
+  cost_act: 0
+kpis:
+  - { name: unanswered_mail_past_sla, at_most: $policies.unanswered_mail_past_sla_max, unit: "mail" }
+done_when:
+  - "unanswered_mail_past_sla == 0 한 틱"
+  - "읽는 몸 없는 주소로 간 요청은 보낸 이가 알림을 받음"
+never_auto: &never
+  - "남의 우편 ack·done·만료 처리"
+  - "받는 자리 대신 답하기·결정하기"
+  - "같은 우편 두 번 재배달"
+  - "사람 탭에 키 입력·주입 (사람 탭 주입 0)"
+  - "감독자 재기동 (watchers-check 몫)"
+soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan and voice load it · aliases = one definition with the card
+  purpose: *purpose
+  values: *values
+  do_not: *never
+  voice: *voice
+  serves:
+    - "OP (L0)"
+    - "요청을 보낸 자리와 받는 자리"
+wake:
+  registered_as: silence-watch-agent
+  trigger:
+    condition:
+      predicate: {"kind":"state-changed","parts":[{"file":"{stateRoot}/msg/messages.db"}]}
+      cooldown_min: 2
+      max_wait_min: 5
+      on_max_wait: fire
+  failure: { goal_deadline_min: 5, max_attempts: 2, backoff_sec: [60] }   # the registry's goal deadline · attempts · backoff (was graphs/triggers/silence-watch-agent.yaml)
+body:   # tier ① routing — observe outcome → steps (ok · breach · unknown → act; off · error → finish)
+  entry_node: observe
+  terminal_nodes: [done]
+  nodes:
+    - { node_id: observe, kind: silence-watch.observe, max_visits: 1 }
+    - { node_id: act, kind: loop-agent.act, max_visits: 1 }
+    - { node_id: learn, kind: loop-agent.learn, max_visits: 1 }
+    - { node_id: judge, kind: loop-agent.judge, max_visits: 1 }
+    - { node_id: finish, kind: loop-agent.finish, max_visits: 1 }
+    - { node_id: done, kind: gate }
+    - { node_id: reflect, kind: reflect, optional: true }        # v3: did my actions work? same failure N× → a pattern with its cause
+    - { node_id: plan, kind: plan, optional: true }              # v3: the body plan ⊕ learned knowhow → fallback · soul do_not · cited memory
+    - { node_id: learn-knowhow, kind: learn-knowhow, optional: true } # v3: one lesson → one knowhow line
+    - { node_id: retro, kind: retro, optional: true }            # v3: every retro_every_h → retro entry in memory (the voice quotes it)
+  edges:
+    - { from: observe, on: outcome, map: { ok: act, breach: act, unknown: act, off: finish, error: finish } }
+    - { from: act, on: outcome, map: { ok: learn } }
+    - { from: learn, on: outcome, map: { ok: judge } }
+    - { from: judge, on: outcome, map: { ok: finish } }
+    - { from: finish, on: outcome, map: { ok: done } }
+actions:   # v3 plan (LOOP-AGENT-V3-SMART-2): the card rights as plan choices · fallback = what the plan runs once a knowhow line says the action keeps failing
+  - { id: redeliver, channel: self, target: self, serves: [unanswered_mail_past_sla], cost: $policies.cost_act, default: true, fallback: bounce }
+  - { id: bounce, channel: self, target: self, serves: [unanswered_mail_past_sla], cost: $policies.cost_act }
+voice:   # tier ③ — one LLM turn only when spoken to (role router · coordinator) · facts-only fold over budget
+  channel: loop:silence-watch
+  speak_on: [kpi-breach, kpi-recovered, subject-lost]
+  mail: l0-only
+  per_hour_max: 6
+memory:
+  knowhow: knowhow.md
+budget:
+  llm_turns_per_hour: 6
+levels:
+  start: live
+  values: [live, L1, shadow, off]

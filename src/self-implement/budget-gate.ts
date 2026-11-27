@@ -4,6 +4,7 @@
 import type { RotationCandidate } from '../oauth/codex-account-rotation.js';
 import { DEFAULT_CODEX_CREDIT_RESERVE, inspectCodexRotation } from '../oauth/codex-account-store.js';
 import { codexPolicyAllowsCredits, codexPolicyAllowsFallback } from '../oauth/codex-quota-policy.js';
+import { codexCreditAccountAllowed } from '../oauth/codex-account-rotation.js';
 import { getUsageStore } from '../budget/usage-store.js';
 import type { UsageSnapshot } from '../budget/types.js';
 import { debug } from '../debug/log.js';
@@ -42,6 +43,8 @@ export interface DecideBudgetInput {
   readonly codexCreditsAllowed?: boolean;
   /** SUBSCRIPTION-EXHAUST-REROUTE — `llm.codexCreditReserve`. 잔액이 이 값 «초과»인 계정만 크레딧 후보다. 없으면 종전(> 0). */
   readonly codexCreditReserve?: number;
+  /** CODEX-CREDIT-ACCOUNTS — 유료 크레딧을 쓸 수 있는 계정만(없으면 종전 · 회전·Pod 배분과 같은 목록). */
+  readonly codexCreditAccounts?: readonly string[];
 }
 
 export interface BudgetDecision {
@@ -58,6 +61,7 @@ export interface BudgetInputs {
   readonly maxUsedPercent: BudgetGateMaxUsedPercent;
   readonly codexCreditsAllowed?: boolean;
   readonly codexCreditReserve?: number;
+  readonly codexCreditAccounts?: readonly string[];
 }
 
 /** `llm.codexCreditReserve` from the same config the preference was read from — invalid or absent = default. */
@@ -122,7 +126,7 @@ function codexCreditCandidate(input: DecideBudgetInput, creditsStep = false): Bu
   const floor = typeof input.codexCreditReserve === 'number' && Number.isFinite(input.codexCreditReserve) && input.codexCreditReserve >= 0
     ? input.codexCreditReserve : creditsStep && input.codexCreditsAllowed !== true ? DEFAULT_CODEX_CREDIT_RESERVE : 0;
   return input.codexCandidates
-    .filter((candidate) => candidate.hasCredits !== false
+    .filter((candidate) => codexCreditAccountAllowed(candidate.name, input.codexCreditAccounts) && candidate.hasCredits !== false
       && typeof candidate.creditBalance === 'number' && Number.isFinite(candidate.creditBalance) && candidate.creditBalance > floor)
     .sort((a, b) => (b.creditBalance! - a.creditBalance!) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))[0];
 }
@@ -286,6 +290,8 @@ export function readBudgetInputs(deps: ReadBudgetInputsDeps = {}): BudgetInputs 
     ...(rotation.policy && codexPolicyAllowsCredits(rotation.policy.policy) ? { codexCreditsAllowed: true, codexCreditReserve: budgetCreditReserve(config) }
       // CODEX-CREDITS-STEP — the `codex-credits` slot keeps the same reserve (a credit spend below it is the case the reserve exists for).
       : preference.chain.some((slot) => slot.codexCredits === true) ? { codexCreditReserve: budgetCreditReserve(config) } : {}),
+    // CODEX-CREDIT-ACCOUNTS — 회전이 읽은 «같은» 목록(다시 짓지 않는다).
+    ...(rotation.creditAccounts?.names !== undefined ? { codexCreditAccounts: rotation.creditAccounts.names } : {}),
   };
 }
 

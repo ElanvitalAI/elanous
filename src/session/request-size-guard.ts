@@ -28,11 +28,22 @@ import type { LLMMessage, LLMOpts } from '../llm.js';
 import type { CompactProvider } from '../compact/provider.js';
 import { truncateProportional } from '../compact/truncate-proportional.js';
 import { appendArchiveEntry, archiveReferencePath, getDefaultArchiveDir, inspectArchive } from '../compact/archive.js';
+import { CHAT_DEFAULTS, type ChatRequestSizeConfig } from '../user-config/chat.js';
+import { getUserConfig } from '../user-config/reader.js';
 
-/** #32254 — the wire cap for Codex TUI requests (serialized body chars). */
-export const REQUEST_SIZE_MAX_CHARS = 400_000;
-// Source: OP48041 requests proactive compaction at 85% of the unchanged hard cap.
-const REQUEST_SIZE_COMPACT_RATIO = 0.85;
+/** #32254 — the wire cap for Codex TUI requests (serialized body chars). The live value is
+ *  `chat.requestSize.maxChars` (config); this is its default. */
+export const REQUEST_SIZE_MAX_CHARS = CHAT_DEFAULTS.requestSize.maxChars;
+
+/** TURN-REQUEST-SIZE-LOSS — the request-size thresholds from `chat.requestSize` (defaults in code, a user may set them
+ *  in the config file). Read at call time; an unreadable config falls back to the defaults. */
+export function requestSizePolicy(): ChatRequestSizeConfig {
+  try {
+    return getUserConfig().chat?.requestSize ?? CHAT_DEFAULTS.requestSize;
+  } catch {
+    return CHAT_DEFAULTS.requestSize;
+  }
+}
 
 export type RequestSizeGuard = NonNullable<LLMOpts['requestSizeGuard']>;
 export type RequestSizeMeasurement = Parameters<NonNullable<RequestSizeGuard['onMeasured']>>[0];
@@ -196,9 +207,20 @@ function preservesActiveInstructions(before: LLMMessage[], after: LLMMessage[]):
 
 export function createRequestSizeGuard(opts: CreateRequestSizeGuardOptions): RequestSizeGuard {
   let measuredProviderRequests = 0;
+  const policy = requestSizePolicy();
+  const maxChars = opts.maxChars ?? policy.maxChars;
   return {
-    maxChars: opts.maxChars ?? REQUEST_SIZE_MAX_CHARS,
-    compactAtChars: Math.floor((opts.maxChars ?? REQUEST_SIZE_MAX_CHARS) * REQUEST_SIZE_COMPACT_RATIO),
+    maxChars,
+    compactAtChars: Math.floor(maxChars * policy.compactRatio),
+    trimTargetRatio: policy.trimTargetRatio,
+    trimOldest: async (messages, measure, targetChars) => {
+      const options = opts.compactOptions();
+      return trimOldestMessages(messages, measure, targetChars, {
+        ...(options.sessionId !== undefined ? { sessionId: options.sessionId } : {}),
+        ...(options.archiveEnabled !== undefined ? { archiveEnabled: options.archiveEnabled } : {}),
+        ...(options.archiveDir !== undefined ? { archiveDir: options.archiveDir } : {}),
+      });
+    },
     compactMessages: async (currentMessages, info) => {
       const hasToolResults = currentMessages.some(message => Array.isArray(message.content)
         && message.content.some(block => block.type === 'tool_result'));
@@ -271,4 +293,126 @@ export function estimateRequestChars(messages: readonly LLMMessage[], tools: rea
 export function formatRequestSizeStatus(measurement: RequestSizeMeasurement): string {
   return `ctx ${measurement.requestChars.toLocaleString()} chars / ${measurement.maxChars.toLocaleString()}`
     + (measurement.compacted ? ` · compact ${measurement.reason}` : '');
+}
+
+// ── REQUEST-SIZE-FLOOR (CEO 11-27 · `eln fed snapshot --anomalies`: TC-H-POOL-2 lost 3 turns in 60 m to
+// `llm.request request-size-limit-blocked` — 401 499 · 402 821 · 402 080 chars vs the 400 000 cap; compaction was a no-op
+// or still over by ~2k (`archive-tool-result`) and the turn was thrown away). After compaction, a request still over the
+// cap is brought under it here instead of failing: the largest tool outputs outside the last `keepTail` input items are
+// replaced, one at a time, by a stub that keeps their size and first line (re-runnable). Message text is never touched.
+
+type FloorItem = Record<string, unknown>;
+const FLOOR_STUB_MIN_CHARS = 600;
+
+// Only tool outputs: a tool can be re-run, a person's or a model's text cannot be recovered (the fail-closed contract for
+// message text stays — `chat-request-size.test.ts` «fails closed without altering large text»).
+const textOf = (item: FloorItem): { path: 'output'; size: number } | null =>
+  item.type === 'function_call_output' && typeof item.output === 'string' ? { path: 'output', size: item.output.length } : null;
+
+const stubText = (text: string, kind: string): string =>
+  `[${kind} held back — over the request size cap · ${text.length.toLocaleString('en-US')} chars · first line: ${text.split('\n', 1)[0]!.slice(0, 160)}] Re-run the tool if you still need it.`;
+
+/**
+ * Pure. Stubs the largest tool outputs, never touching the last `keepTail` items or any message text,
+ * until `measure(input) <= maxChars`. Returns null when nothing could be stubbed or it still does not fit.
+ */
+export function floorRequestInput<T extends FloorItem>(input: readonly T[], measure: (input: T[]) => number, maxChars: number, keepTail = 2): { input: T[]; chars: number; stubbed: number } | null {
+  const out = [...input];
+  let chars = measure(out); let stubbed = 0;
+  const candidates = out.map((item, i) => ({ i, t: textOf(item) }))
+    .filter((c) => c.i < out.length - keepTail && c.t !== null && c.t.size >= FLOOR_STUB_MIN_CHARS)
+    .sort((a, b) => b.t!.size - a.t!.size);
+  for (const c of candidates) {
+    if (chars <= maxChars) break;
+    const item = out[c.i]!;
+    out[c.i] = { ...item, output: stubText(item.output as string, 'tool output') };
+    stubbed++;
+    chars = measure(out);
+  }
+  return stubbed && chars <= maxChars ? { input: out, chars, stubbed } : null;
+}
+
+// ── TURN-REQUEST-SIZE-LOSS (0.3.38 P0 · 11-27 15:27: OP 7 · TC-H-POOL-3 4 · CC-1 3 · POOL-1 3 · POOL-2 3 · CX-6 2 · TUI-D 1 ·
+// CC-2 1 turns lost in 60 m to `llm.request request-size-limit-blocked`, 401–406k chars vs the 400k cap, reasons
+// `compaction-no-op` / `compaction-still-over-cap:archive-tool-result`). The wire was hundreds of SMALL messages (seat mail,
+// short replies): the mixed-text rung only touches texts > 8k, the tool-result rung and the floor only tool outputs — so no
+// rung could take anything off. This last rung drops the OLDEST whole messages instead, pair-safe, archived first.
+
+const TRIM_MARKER_PREFIX = '[Earlier conversation held back — over the request size cap · ';
+
+/** Cut points c where messages[0..c) can go without leaving a tool_result whose tool_use went with them. System messages
+ *  and everything from the current user turn on (or the last `keepTail`) are never dropped. Ascending. */
+function trimCutPoints(messages: readonly LLMMessage[], keepTail: number): number[] {
+  const current = currentUserTextIndex(messages as LLMMessage[]);
+  const protectFrom = Math.min(current >= 0 ? current : messages.length, Math.max(0, messages.length - keepTail));
+  const useAt = new Map<string, number>();
+  const resultAt = new Map<string, number>();
+  messages.forEach((message, index) => {
+    if (!Array.isArray(message.content)) return;
+    for (const block of message.content) {
+      if (block.type === 'tool_use') useAt.set(block.id, index);
+      else if (block.type === 'tool_result') resultAt.set(block.tool_use_id, Math.max(resultAt.get(block.tool_use_id) ?? -1, index));
+    }
+  });
+  const cuts: number[] = [];
+  let droppable = 0;
+  for (let c = 1; c <= protectFrom; c++) {
+    if (messages[c - 1]!.role !== 'system') droppable++;
+    if (droppable === 0) continue;
+    let safe = true;
+    for (const [id, at] of useAt) if (at < c && (resultAt.get(id) ?? -1) >= c) { safe = false; break; }
+    for (const [id, at] of resultAt) if (at >= c && (useAt.get(id) ?? Infinity) < c) { safe = false; break; }
+    if (safe) cuts.push(c);
+  }
+  return cuts;
+}
+
+function trimmedAt(messages: readonly LLMMessage[], cut: number, marker: string): LLMMessage[] {
+  const head = messages.slice(0, cut);
+  return [
+    ...head.filter(message => message.role === 'system'),
+    { role: 'user', content: marker, speaker: 'system' } as LLMMessage,
+    ...messages.slice(cut),
+  ];
+}
+
+/**
+ * Drop the fewest oldest messages (whole, tool pairs together) that bring `measure(result) <= targetChars`, replacing
+ * them with one marker that names the archive holding them. System messages, the current user turn and the last
+ * `keepTail` messages stay. The dropped messages are archived first; no archive (disabled or write failure) → null,
+ * nothing changes (fail closed). null also when no cut reaches the target.
+ */
+export async function trimOldestMessages(
+  messages: readonly LLMMessage[],
+  measure: (messages: LLMMessage[]) => number,
+  targetChars: number,
+  opts: { sessionId?: string; archiveEnabled?: boolean; archiveDir?: string; keepTail?: number } = {},
+): Promise<{ messages: LLMMessage[]; reason: string; dropped: number } | null> {
+  if (opts.archiveEnabled === false) return null;
+  const cuts = trimCutPoints(messages, opts.keepTail ?? 2);
+  if (cuts.length === 0) return null;
+  const sessionId = opts.sessionId ?? 'default';
+  const dir = opts.archiveDir ?? getDefaultArchiveDir();
+  const markerFor = (cut: number): string => {
+    const dropped = messages.slice(0, cut).filter(message => message.role !== 'system');
+    const chars = JSON.stringify(dropped).length;
+    return `${TRIM_MARKER_PREFIX}${dropped.length} message(s) · ${chars.toLocaleString('en-US')} chars · saved to: ${archiveReferencePath(sessionId, dir)}] Ask for them or read the archive if you need them.`;
+  };
+  // Monotone: a later cut drops more. Binary search the first cut that fits.
+  const fits = (cut: number) => measure(trimmedAt(messages, cut, markerFor(cut))) <= targetChars;
+  if (!fits(cuts[cuts.length - 1]!)) return null;
+  let lo = 0; let hi = cuts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (fits(cuts[mid]!)) hi = mid; else lo = mid + 1;
+  }
+  const cut = cuts[lo]!;
+  const marker = markerFor(cut);
+  const droppedMessages = messages.slice(0, cut).filter(message => message.role !== 'system');
+  if (!appendArchiveEntry({
+    ts: Date.now(), layer: 'truncate-proportional', sessionId,
+    origin: { kind: 'truncated_tail', messageIndex: 0 },
+    content: JSON.stringify(droppedMessages), replacement: marker,
+  }, dir)) return null;
+  return { messages: trimmedAt(messages, cut, marker), reason: 'trim-oldest', dropped: droppedMessages.length };
 }

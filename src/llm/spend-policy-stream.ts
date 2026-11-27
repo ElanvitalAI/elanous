@@ -3,6 +3,23 @@ import type { LLMMessage, LLMOpts, LLMProvider, LLMStreamEvent } from '../llm.js
 import { withCodexAccountOverride } from '../oauth/codex-account-override.js';
 import type { LlmCallGateResult, LlmCallOutcome, LlmCallHandle } from '../oauth/llm-call-gate.js';
 
+/** A gate stop whose every skipped row failed only for a missing / unissued vault lease (`row:no-lease…`). */
+export function spendStopIsLeaseOnly(reason: string): boolean {
+  const m = /^no-candidate\(걷는 순서 전부 불가 — (.*)\)$/su.exec(reason.trim());
+  if (!m || !m[1]) return false;
+  // split on the top-level « · » only — a row's own reason may contain « · » inside its parentheses
+  const parts: string[] = []; let depth = 0; let cur = '';
+  const body = m[1];
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i]!;
+    if (ch === '(') depth++; else if (ch === ')') depth = Math.max(0, depth - 1);
+    if (depth === 0 && body.startsWith(' · ', i)) { parts.push(cur.trim()); cur = ''; i += 2; continue; }
+    cur += ch;
+  }
+  if (cur.trim()) parts.push(cur.trim());
+  return parts.length > 0 && parts.every(p => /^[^:\s]+:no-lease/u.test(p));
+}
+
 /** A policy stop must never enter the ordinary provider fallback chain. */
 export class SpendPolicyStopError extends Error {
   constructor(message: string) { super(message); this.name = 'SpendPolicyStopError'; }
@@ -43,7 +60,13 @@ export function spendPolicyStream(input: SpendPolicyStreamInput): AsyncIterableI
     let selection: LlmCallGateResult;
     try { selection = await input.select(); } catch { throw new SpendPolicyStopError('LLM spend guard selection failed'); }
     input.onDecision?.(selection.outcome);
-    if (selection.outcome === 'stop') throw new SpendPolicyStopError(`LLM spend guard stop: ${selection.reason}`);
+    if (selection.outcome === 'stop') {
+      // SPEND-NO-LEASE-FALLBACK — a stop caused only by missing vault leases does not block the work (capsules · tool turns):
+      // the original provider runs, one warn row.
+      if (!spendStopIsLeaseOnly(selection.reason)) throw new SpendPolicyStopError(`LLM spend guard stop: ${selection.reason}`);
+      try { (await import('../debug/log.js')).debug.log('llm.spend', 'no-lease-fallback', { site: 'tool-stream', reason: selection.reason.slice(0, 200) }, { level: 'warn' }); } catch { /* observe only */ }
+      selection = { outcome: 'pass-through', ledgerLines: [], skipped: [] };
+    }
     if (selection.outcome === 'go') handle = selection.handle;
     if (closed || input.opts.signal?.aborted) { await finish({ status: 'not-called' }); return; }
     const chosen = selection.outcome === 'go' ? input.providerForName(selection.provider) : input.original;

@@ -132,10 +132,10 @@ test('immediate rerun after a real migration: both update-all calls report the s
   expect(second.rows.map(row => row.result)).toEqual(['updated']);
   expect(second.rows[0]?.detail).toBe(desired.slice(0, 12));  // 두 번째 결과도 최신: desired 빌드 12자리
   expect([...first.rows, ...second.rows].filter(row => row.detail.includes('live TUI missing'))).toEqual([]);  // live TUI missing 0
+  // UPDATE-ALL-SKIP-CURRENT (11-26): the rerun finds tui:106 already on the desired install — it reports «updated» and
+  // sends no second seat-stop (the second wave used to relaunch every hand a second time).
   expect(sent).toEqual([['tui:10', 'seat-stop', { mode: 'migrate', sender: 'OP', expected: {
     id: 'tui:10', ownerPid: 10, sessionId: 'same-session', workdir: '/seats/TC',
-  } }, { timeoutMs: SEAT_STOP_OWNER_WINDOW_MS }], ['tui:106', 'seat-stop', { mode: 'migrate', sender: 'OP', expected: {
-    id: 'tui:106', ownerPid: 106, sessionId: 'same-session', workdir: '/seats/TC',
   } }, { timeoutMs: SEAT_STOP_OWNER_WINDOW_MS }]]);
 });
 
@@ -186,7 +186,8 @@ test('request acceptance is not completion: same process, changed session and ti
   const result = await updateAllElsTabs({
     sender: () => 'OP', target: () => ({ desired, installed: desired }),
     list: async () => ({ hosts: [{ name: 'node-b', reach: 'local' }], panes: [pane('TC')] }),
-    seats: () => [{ id: 'tui:10', ownerPid: 10, alive: true, kind: 'tui', seat: 'TC', workdir: '/seats/TC', sessionId: ticks ? 'different' : 'original', build: { sha: desired, source: 'installed' } }],
+    // Starts on an older build (a TUI already on the desired build is not migrated — UPDATE-ALL-SKIP-CURRENT).
+    seats: () => [{ id: 'tui:10', ownerPid: 10, alive: true, kind: 'tui', seat: 'TC', workdir: '/seats/TC', sessionId: ticks ? 'different' : 'original', build: { sha: ticks ? desired : 'b'.repeat(40), source: 'installed' } }],
     migrate: async () => ({ status: 'success', reason: 'accepted' }),
     sleep: async () => { ticks++; }, now: () => ticks * 1_000, timeoutMs: 2_000,
   });
@@ -391,7 +392,7 @@ test('exec-in-place restart (same pid, newer registration) counts as done and ex
 test('same pid with the same registration time is not a restart and stays a straggler', async () => {
   let time = 0; const progress: string[] = [];
   const row = { id: 'tui:10', ownerPid: 10, alive: true, kind: 'tui', seat: 'TC', workdir: '/seats/TC', sessionId: 's-TC', startedAt: 1000,
-    build: { sha: desired, source: 'installed' } };
+    build: { sha: 'b'.repeat(40), source: 'installed' } }; // an older build that never restarts (UPDATE-ALL-SKIP-CURRENT)
   const result = await updateAllElsTabs({
     sender: () => 'OP', target: () => ({ desired, installed: desired }),
     list: async () => ({ hosts: [{ name: 'node-b', reach: 'local' }], panes: [pane('TC')] }),
@@ -400,7 +401,7 @@ test('same pid with the same registration time is not a restart and stays a stra
     progress: message => progress.push(message),
   });
   expect(result.rows.map(r => r.result)).toEqual(['waiting']);
-  expect(progress.at(-1)).toBe('Stragglers at deadline: TC (still aaaaaaaaaaaa)');
+  expect(progress.at(-1)).toBe('Stragglers at deadline: TC (still bbbbbbbbbbbb)');
 });
 
 test('three fake seats: slow done, exited skipped, remote unreachable fails the run', async () => {
@@ -425,3 +426,24 @@ test('three fake seats: slow done, exited skipped, remote unreachable fails the 
   expect(progress).toEqual(['Migration requested: node-b:w/t/SLOW · SLOW', 'Seat skipped: GONE · node-b:w/t/GONE (exited)',
     'Remaining seats: 1 · 570s remaining', 'Seat done: SLOW · cccccccccccc→aaaaaaaaaaaa']);
 });
+
+// SIM — UPDATE-ALL-SKIP-CURRENT (11-26 21:30–23:58 · 14 of 34 hand relaunches were «same-as-installed»: a second update-all
+// wave 2–3 min after the first re-migrated hands that had just relaunched). Seeds 1–5 vary how many hands already moved.
+for (const seed of [1, 2, 3, 4, 5]) {
+  test(`sim seed ${seed}: a second wave migrates only the hands still on the old build`, async () => {
+    let a = seed; const r = () => { a = (a * 1103515245 + 12345) % 2147483648; return a / 2147483648; };
+    const hands = Array.from({ length: 6 + Math.floor(r() * 10) }, (_, i) => `TC-H${i}`);
+    const moved = new Set(hands.filter(() => r() < 0.7));
+    const sent: string[] = []; let clock = 0;
+    const result = await updateAllElsTabs({
+      sender: () => 'OP', target: () => ({ desired, installed: desired }),
+      list: async () => ({ hosts: [{ name: 'node-b', reach: 'local' }], panes: hands.map((h, i) => ({ ...pane(h, `node-b:w/t/${h}`), pid: 100 + i, cwd: `/seats/${h}` })) }),
+      seats: () => hands.map((h, i) => ({ id: `tui:${100 + i}`, ownerPid: 100 + i, alive: true, kind: 'tui', seat: h, workdir: `/seats/${h}`, sessionId: `s-${h}`,
+        build: { sha: moved.has(h) ? desired : 'b'.repeat(40), source: 'installed' } })),
+      migrate: async (seat) => { sent.push(seat); return { status: 'success', reason: 'waiting' }; },
+      sleep: async (ms) => { clock += ms ?? 1_000; }, now: () => clock, timeoutMs: 2_000,
+    });
+    expect(sent.sort()).toEqual(hands.filter(h => !moved.has(h)).sort());
+    expect(result.rows.filter(row => moved.has(row.seat)).every(row => row.result === 'updated' && row.detail === desired.slice(0, 12))).toBe(true);
+  });
+}

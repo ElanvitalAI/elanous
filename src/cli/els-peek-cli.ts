@@ -6,7 +6,7 @@
 
 import type { Command } from 'commander';
 import { spawnSync } from 'node:child_process';
-import { closeSync, existsSync, openSync, readFileSync, readSync, statSync, watch, type FSWatcher } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readSync, statSync, watch, writeSync, type FSWatcher } from 'node:fs';
 import { sessionFile, sessionRoot } from '../session/index.js';
 import { listPtyManifestRowsAt, ptyManifestDbPath } from '../pty-shell/pty-manifest.js';
 import { openMsgStoreReadOnly } from '../msg/msg-store.js';
@@ -164,10 +164,37 @@ export function parseInterval(value: string | undefined): number {
   return Math.max(500, Math.round(ms));
 }
 
-/** `els watch` — streams until the signal aborts (Ctrl-C). Returns the exit code. */
+/** ELS-WATCH-UNBUFFERED (대표 11-27): one synchronous write(2) per line on the raw fd, TTY or not — a pipe or a file
+ *  (`els watch p.. | grep --line-buffered …`, a Monitor's output file) gets each line the moment it is made, never a
+ *  batch held in a stream buffer. EAGAIN (a non-blocking pipe that is full) waits for the reader; EPIPE/EBADF (the reader
+ *  is gone) is quiet: `onClosed` fires once and later lines are dropped. */
+export function lineWriter(fd: number, onClosed: () => void = () => {}): (line: string) => void {
+  let closed = false;
+  return (line: string): void => {
+    if (closed) return;
+    let rest = Buffer.from(`${line}\n`, 'utf8');
+    let spins = 0;
+    while (rest.length > 0) {
+      try {
+        const n = writeSync(fd, rest);
+        rest = rest.subarray(n);
+        spins = 0;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'EAGAIN' && ++spins < 2_000) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); continue; }
+        closed = true;
+        if (code === 'EPIPE' || code === 'EBADF' || code === 'EAGAIN') { onClosed(); return; }
+        throw error;
+      }
+    }
+  };
+}
+
+/** `els watch` — streams until the signal aborts (Ctrl-C) or the reader of stdout goes away. Returns the exit code. */
 export async function runWatch(ref: string, opts: WatchOptions, deps: PeekDeps): Promise<number> {
-  const out = deps.out ?? ((line: string) => process.stdout.write(`${line}\n`));
-  const err = deps.err ?? ((line: string) => process.stderr.write(`${line}\n`));
+  let readerGone = false;
+  const out = deps.out ?? lineWriter(1, () => { readerGone = true; });
+  const err = deps.err ?? lineWriter(2);
   const now = deps.now ?? (() => new Date());
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   let interval: number, msgLines: number;
@@ -227,7 +254,7 @@ export async function runWatch(ref: string, opts: WatchOptions, deps: PeekDeps):
   let tick = 0;
   let readFailures = 0;
   try {
-    while (!signal?.aborted) {
+    while (!signal?.aborted && !readerGone) {
       if (tick > 0 && tick % 20 === 0) {
         const again = await findPane(row.address, deps);
         if ('row' in again) row = again.row;
@@ -284,7 +311,7 @@ export function registerPeekWatchCommands(group: Command, deps: () => PeekDeps):
       const stop = (): void => { controller.abort(); };
       process.once('SIGINT', stop); process.once('SIGTERM', stop);
       try { process.exitCode = await runWatch(pane, opts, { ...deps(), signal: controller.signal, sleep: (ms) => abortableSleep(ms, controller.signal) }); }
-      finally { process.off('SIGINT', stop); process.off('SIGTERM', stop); process.stdout.write('\n'); }
+      finally { process.off('SIGINT', stop); process.off('SIGTERM', stop); lineWriter(1)(''); }
     });
 }
 

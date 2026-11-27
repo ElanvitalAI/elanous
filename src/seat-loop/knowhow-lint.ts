@@ -1,3 +1,4 @@
+import { parseKnowhowDoc } from '../kit/knowhow/index.js';
 import { seatPackLeakPatterns } from './seat-pack.js';
 
 /** 필수 칸 — 형식 v2 선언(각 자리 KNOWHOW 머리글)의 공통 아홉. 괄호 수식어(신호(관측) 등)는 정규화해서 비교한다. */
@@ -138,39 +139,13 @@ interface KnowhowCard {
   lines: Array<[number, string]>;
 }
 
-/** 카드 제목 — `## K-<자리>-<번호>` 뒤에는 줄 끝·공백·콜론·em 대시만 온다. */
-const CARD_HEADING = /^[ \t]{0,3}##\s+(K-[A-Za-z]+(?:-[A-Za-z]{1,4})?-\d+)(?=$|\s|:|—)/u;
-/** 카드처럼 보이는 `##` 제목(예: `## K-OP-7a`) — CARD_HEADING 을 벗어나면 인식 실패로 명시 거부한다. */
-const CARD_HEADING_LIKE = /^[ \t]{0,3}##\s*(K-[^\s:]*)/iu;
-
+/** Cards via kit/knowhow in lint mode (every heading ends a card) — a card-like heading that breaks
+ *  `K-<자리>-<번호>` is refused by name instead of silently dropped. */
 function parseCards(body: string, file: string): KnowhowCard[] {
-  const cards: KnowhowCard[] = [];
-  let current: KnowhowCard | null = null;
-  let fence: { marker: string; length: number } | null = null;
-  for (const [index, line] of body.split(/\r?\n/u).entries()) {
-    const fenceLine = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/u);
-    if (fence) {
-      if (fenceLine && fenceLine[1]![0] === fence.marker && fenceLine[1]!.length >= fence.length
-        && /^[ \t]*$/u.test(fenceLine[2]!)) fence = null;
-      continue;
-    }
-    if (fenceLine) {
-      fence = { marker: fenceLine[1]![0]!, length: fenceLine[1]!.length };
-      continue;
-    }
-    const heading = line.match(CARD_HEADING);
-    if (heading) {
-      current = { id: heading[1]!, lines: [] };
-      cards.push(current);
-      continue;
-    }
-    if (/^[ \t]{0,3}#/u.test(line)) {
-      const like = line.match(CARD_HEADING_LIKE);
-      if (like) throw new KnowhowLintError(file, like[1]!, '카드 제목 형식이 K-<자리>-<번호>를 벗어남');
-      current = null;
-    } else if (current) current.lines.push([index + 1, line]);
-  }
-  return cards;
+  const doc = parseKnowhowDoc(body, { endAtAnyHeading: true });
+  const bad = doc.malformed[0];
+  if (bad) throw new KnowhowLintError(file, bad.id, '카드 제목 형식이 K-<자리>-<번호>를 벗어남');
+  return doc.cards.map((card) => ({ id: card.id, lines: card.prose }));
 }
 
 function parseField(line: string): { label: string; value: string } | null {

@@ -376,7 +376,7 @@ export async function runArm(arm: Arm, world: World, deps: { storePath: string; 
     assign: (_v, cellId, seat) => { const from = cellOwner.get(cellId) ?? null; return { from, outcome: from === seat ? 'same' : 'assigned' }; },
     post: (mail) => { at(s); return { id: store.append({ ...mail, intent: 'request' }).id }; },
     wake: async () => ({ result: 'woken' }),
-    pool: () => ({ hosts: ['minim5', 'node-b', 'node-c'], scope: 'read-only test-universe runs', source: 'code-default' }),
+    pool: () => ({ hosts: ['minim5', 'node-b', 'node-c'], scope: 'test-universe runs (own temp HOME/TMPDIR · mkdtemp · SQLite/file writes there · head fetch/push to the pool host)', source: 'code-default' }),
   });
   // seatAssign is async only for wake(); the sim awaits it synchronously via a settled flag
   const runAssign = async (actor: string, seat: string, cellId: string, s: number): Promise<{ ok: boolean; reason?: string; code?: string }> => {

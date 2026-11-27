@@ -889,7 +889,9 @@ export function buildCliAgentTools(
   // ★ turn 조립기 통일 Phase 0(2026-07-22) — L2 core + L3 finance(gated) 공통 조립을 buildSharedAppTools
   //   단일 헬퍼로. 종전 core/finance 를 각자 조립하던 것 통일(specs 순서 보존·무회귀). finance=financeEnabled
   //   게이트. [[project_skill_native_duplication_surface_gating]].
-  const shared = (require('../agent/shared-app-tools.js') as typeof import('../agent/shared-app-tools.js')).buildSharedAppTools(cfg);
+  const shared = (require('../agent/shared-app-tools.js') as typeof import('../agent/shared-app-tools.js')).buildSharedAppTools(cfg,
+    // APP-BUILD-LOCAL-PATH: only a host that opted in (localAppBuildCwd) builds locally without a member connection.
+    pluginRuntimeOptions?.localAppBuildCwd ? { localAppBuildCwd: dispatchWorkingDirectory() } : {});
   for (const s of shared.specs) specs.push(s);
   for (const name of shared.names) dispatchByName.set(name, async (args, signal) => shared.dispatch(name, args, { surface: 'tui', signal }));
   // Installed knowledge is queryable in CLI chat as well as the dashboard runtime.

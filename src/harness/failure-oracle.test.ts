@@ -25,6 +25,9 @@ import { buildUserConfig } from '../user-config.js';
 
 type LogLine = { category: string; event: string; data: Record<string, unknown> };
 
+// 칸 43(SMART-ROUTER-TIER-FULL-WIRE) — failure_oracle_gen 은 advanced 전용: 게이트를 통과하는 등급 원천.
+const advancedMembership = { currentTier: () => 'advanced' };
+
 function wired(overrides: Partial<FailureOracleImplementInput> = {}): { section: string | undefined; logs: LogLine[] } {
   const logs: LogLine[] = [];
   const section = failureOracleSectionForImplement({
@@ -220,11 +223,13 @@ describe('featurePrompt — 주입 자리', () => {
 });
 
 describe('harness.failureOracle flag', () => {
-  test('생략·무효값 = shadow · on 만 on', () => {
-    expect(resolveFailureOracleMode(undefined)).toBe('shadow');
-    expect(resolveFailureOracleMode({ harness: {} })).toBe('shadow');
-    expect(resolveFailureOracleMode({ harness: { failureOracle: 'live' } })).toBe('shadow');
-    expect(resolveFailureOracleMode({ harness: { failureOracle: 'on' } })).toBe('on');
+  test('생략·무효값 = shadow · on 만 on(허용 등급 원천)', () => {
+    expect(resolveFailureOracleMode(undefined, advancedMembership)).toBe('shadow');
+    expect(resolveFailureOracleMode({ harness: {} }, advancedMembership)).toBe('shadow');
+    expect(resolveFailureOracleMode({ harness: { failureOracle: 'live' } }, advancedMembership)).toBe('shadow');
+    expect(resolveFailureOracleMode({ harness: { failureOracle: 'on' } }, advancedMembership)).toBe('on');
+    // 칸 43 — free 미달이면 on 요청도 shadow 강등(fail-closed · 진입점 행렬은 full-wire 시험이 잰다).
+    expect(resolveFailureOracleMode({ harness: { failureOracle: 'on' } }, { currentTier: () => 'free' })).toBe('shadow');
   });
 
   test('설정 파일 정규화: on 은 남고 그 밖은 칸이 없다', () => {
@@ -235,7 +240,7 @@ describe('harness.failureOracle flag', () => {
         writeFileSync(path, JSON.stringify({ harness: raw === undefined ? {} : { failureOracle: raw } }));
         const config = buildUserConfig(path);
         expect(config.harness?.failureOracle).toBe(expected);
-        expect(resolveFailureOracleMode(config)).toBe(expected ?? 'shadow');
+        expect(resolveFailureOracleMode(config, advancedMembership)).toBe(expected ?? 'shadow');
       }
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -248,7 +253,9 @@ describe('implementFailureOracleSection — implement seam 배선(골 문서 →
   const run = (config: { harness?: { failureOracle?: 'shadow' | 'on' } }, firstRound: boolean) => {
     const logs: LogLine[] = [];
     const section = implementFailureOracleSection(goal, { firstRound, runId: 'run-seam' }, {
-      readConfig: () => config, log: (category, event, data) => logs.push({ category, event, data }) });
+      readConfig: () => config, log: (category, event, data) => logs.push({ category, event, data }),
+      // 칸 43 — 허용 등급 원천 주입: free 면 on 요청이 shadow 로 강등돼 배선 원본을 못 잰다.
+      membership: advancedMembership });
     return { section, logs };
   };
 

@@ -31,6 +31,7 @@ import type { SpawnParent } from './server-auth.js';
 import type { WheelRoute } from '../pty-shell/registry.js';
 import { grepScreens, type GrepHit } from './pane-grep.js';
 import { readUnreadMailBadges, type UnreadMailBadge } from '../msg/msg-store.js';
+import { ELN_BUSY_SCREEN, elnApprovalPending } from './runtime-adapters/eln.js';
 
 export type QueueAudit = (result: 'queued' | 'delivering' | 'delivered' | 'delivery-failed' | 'discarded', reason?: string) => boolean;
 
@@ -140,9 +141,9 @@ export interface ElsNewInput {
 // this owner can hold (the registry caps live PTYs per process).
 const ID_ATTEMPTS = 16;
 
-// 출처: eln's own working line shows «Turn running» (Korean UI: «응답 중») while a turn is in flight; typing into the
-// prompt then would interleave with it, so `do` waits (queues) instead.
-export const BUSY_SCREEN = /Turn running|응답 중/;
+// eln's own working line shows «Turn running» (Korean UI: «응답 중») while a turn is in flight; typing into the prompt then
+// would interleave with it, so `do` waits (queues) instead. ELS-RUNTIME-ADAPTERS: the rule lives in the eln adapter.
+export const BUSY_SCREEN = ELN_BUSY_SCREEN;
 // Observed Claude/Codex working hint; limit to the status area, not scrollback.
 const turnStarted = (screen: string): boolean => BUSY_SCREEN.test(screen) || /(?:esc|ctrl\+c) to interrupt/i.test(screen.split('\n').slice(-6).join('\n'));
 // D10 (els-round1b-a110): a fast turn (mock provider, 0s) finishes before the first 100ms poll renders
@@ -160,13 +161,8 @@ const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;   // C0 + DEL + C1 (0x9b is a o
 export const clean = (value: string): string => value.replace(CONTROL, ' ').replace(/ {2,}/g, ' ').trim();
 /** Any control in a send-text payload can leave an approval key behind after cleaning. */
 const SEND_TEXT_CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
-/** The choice row is pinned to the visible bottom; a long command may scroll its title out of view. */
-export const hitlApprovalPending = (screen: string): boolean => {
-  const bottom = screen.split('\n').slice(-8).join('').replace(/\s/g, '');
-  return /(?:EnterdefaultN|Enter기본N)/.test(bottom)
-    && /(?:yrun|yapprove|y실행|y승인)/.test(bottom)
-    && /(?:Escdeny|Esc거부)/.test(bottom);
-};
+/** The choice row is pinned to the visible bottom; a long command may scroll its title out of view (eln adapter's rule). */
+export const hitlApprovalPending = elnApprovalPending;
 
 // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «attach» — a terminal grid outside these bounds is a client bug, not a size.
 const MIN_COLS = 10;
@@ -1209,9 +1205,10 @@ export function createElsCore(deps: ElsCoreDeps) {
       const pty = livePty(hit.pane);
       let screen: string | undefined;
       if (pty) { try { screen = await pty.renderScreen(); } catch { screen = undefined; } }
-      const status = paneStatus({ pane: hit.pane.id, alive: pty !== undefined, exited: hit.pane.state === 'exited',
-        screen, lastOutputAt: pty?.lastOutputAt?.(), now: now() });
       const fg = pty ? foregrounds.get(hit.pane.id) : undefined;
+      // ELS-RUNTIME-ADAPTERS: the screen is read with the foreground runtime's own rules (unknown → every runtime's).
+      const status = paneStatus({ pane: hit.pane.id, alive: pty !== undefined, exited: hit.pane.state === 'exited',
+        screen, lastOutputAt: pty?.lastOutputAt?.(), now: now(), ...(fg ? { kind: fg.kind } : {}) });
       const reason = unavailableCwds.get(hit.pane.id);
       return { exitCode: 0, message: JSON.stringify(fg ? { ...status, kind: fg.kind, pid: fg.pid } : reason ? { ...status, reason } : status) };
     },

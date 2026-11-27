@@ -1,0 +1,135 @@
+# 발행 매니저 (release-rocket) — LOOP-AGENT v3 YAML definition (YAML-SUPERVISORS-DEF · 대표 11-27 12:0x «감독자들도 다 로직·정책 등을 yaml 로»).
+# Schema: src/loop-agent/v3/agent-yaml.ts · executor: src/loop-agent/v3/supervisor.ts · lint: eln loop agent lint release-rocket
+# Tiers: ① rules / thresholds / routing = this file (policies · body edges) · ② deterministic logic = the node kinds it requires
+# (provides.nodes · their tests and the supervisors sim world are the spec) · ③ fuzzy judgment = the voice block (one LLM turn when spoken to · role router · facts-only fold).
+# The ONE definition (YAML-SUPERVISORS-RUNTIME): the trigger registry reads wake: from here (graphs/triggers/<registered_as>.yaml is only the tick shim) and goal.yaml is GENERATED from this file (eln loop agent gen) — only the fallback when this file is refused.
+apiVersion: elanous/loop-agent@3
+manifest:
+  name: release-rocket
+  version: 1.0.0
+  description: "예행·컷·발행 이정표가 모두 시각(유예 15분) 안에 시작/완료된다"
+  requires:
+    executor: loop-agent@3
+    kits: [kpi]
+    node_kinds: [release-rocket.observe, loop-agent.act, loop-agent.learn, loop-agent.judge, loop-agent.finish, gate, reflect, plan, learn-knowhow, retro]
+    facts: []
+  provides:
+    agent: release-rocket
+    kpis: [late_milestones]
+    nodes: [release-rocket.observe]   # tier ② — src/loop-agent/bodies/release-rocket.ts (+ its tests · sim world supervisors)
+identity:
+  id: release-rocket
+  address: RELEASE-ROCKET
+  rank: supervisor
+  soul: soul.md
+supervisor:
+  duty: release-supervision
+# v2 card fields that live only here — graphs/loop-agents/release-rocket/goal.yaml is GENERATED from this file (eln loop agent gen release-rocket)
+card:
+  name: 발행 매니저
+  role: &purpose 지금 판의 이정표(예행 22:00 · 컷 04:00 · 발행 06:00)를 시각에 맞춘다 — 예행을 열고, 면제를 제안하고, 늦으면 OP 에 올린다
+  temperament: &voice 카운트다운처럼 말한다. 시각·단계·판 번호를 늘 붙인다
+  values: &values
+    - 늦은 이정표 0 — 예행은 먼저(22:00), 컷은 늦게(04:00)
+    - 크리티컬 아닌 노랑은 면제하고 정시 발행 — 다만 면제는 OP 가 정한다(나는 제안만)
+    - 컷·발행·NO-GO 는 내가 하지 않는다
+  subject: 지금 판의 발행 — release.graph.version(→ plan → 일정) · release-graph 런 상태(발행 런 ⊕ 예행 런) · 체크리스트 노랑 칸
+  actions:
+    - start-rehearsal
+    - archive-rehearsal
+    - propose-waiver
+  wake_events:
+    - 예행 시각 22:15
+    - 컷 시각 04:15
+    - 발행 시각 06:15
+    - 발행 2시간 전 04:00
+    - release-graph 런 상태 변경
+  voice_role: coordinator
+  fallback_seat: OP
+goal: "예행·컷·발행 이정표가 모두 시각(유예 15분) 안에 시작/완료된다"
+policies:   # tier ① — the only numbers (the body reads them through pv() · change behaviour here, not in code)
+  late_milestones_max: 0
+  max_per_tick: 2
+  cooldown_min: 60
+  escalate_after_min: 30
+  heartbeat_every_min: 30
+  subject_lost_ticks: 3   # unreadable subject this many ticks → reattach proposal to the L0
+  grace_min: 15   # 마일스톤 늦음 판정 유예
+  waiver_window_min: 120   # 발행 전 면제 제안 창
+  # v3 smartness (LOOP-AGENT-V3-SMART-2 · src/loop-agent/v3/smart.ts) — reflect · plan · learn-knowhow · retro read only these
+  act_grace_min: 0   # an action's outcome is known when it returns (acted | failed) — no waiting
+  lesson_repeat_min: 3   # the same action failing 3× in a row on one kind of subject → ONE lesson with the cause
+  reflect_window_min: 60
+  lesson_cap: 12   # active lessons kept (oldest evicted)
+  knowhow_promote_min: 1   # the lesson becomes one knowhow line at once (marker-deduped · plan reads it next tick)
+  knowhow_cap: 5   # learned knowhow lines per agent, total
+  plan_ambiguity_margin: 0   # the shell plan is deterministic (body plan ⊕ knowhow ⊕ fallback)
+  unacted_penalty: 0.25
+  plan_llm_per_hour: 0
+  retro_every_h: 6   # retro (회고): journal ⊕ KPI window → what worked · what failed and why · one change to try
+  cost_act: 0
+kpis:
+  - { name: late_milestones, at_most: $policies.late_milestones_max, unit: "개" }
+done_when:
+  - "판 발행 완료(release.json publishedAt)"
+  - "late_milestones == 0 for one tick"
+never_auto: &never
+  - "컷 실행"
+  - "발행 실행"
+  - "NO-GO·hard stop"
+  - "면제 기록(checklist disposition 쓰기)"
+  - "release.graph.version 바꾸기"
+  - "발행 런 삭제"
+soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan and voice load it · aliases = one definition with the card
+  purpose: *purpose
+  values: *values
+  do_not: *never
+  voice: *voice
+  serves:
+    - "OP (L0 · release-supervision)"
+    - "REL (발행국)"
+wake:
+  registered_as: release-rocket-agent
+  trigger:
+    condition:
+      predicate: {"kind":"state-changed","parts":[{"file":"{stateRoot}/release-graph/last-tick.json"}]}
+      cooldown_min: 2
+      max_wait_min: 30
+      on_max_wait: fire
+  failure: { goal_deadline_min: 30, max_attempts: 2, backoff_sec: [60] }   # the registry's goal deadline · attempts · backoff (was graphs/triggers/release-rocket-agent.yaml)
+body:   # tier ① routing — observe outcome → steps (ok · breach · unknown → act; off · error → finish)
+  entry_node: observe
+  terminal_nodes: [done]
+  nodes:
+    - { node_id: observe, kind: release-rocket.observe, max_visits: 1 }
+    - { node_id: act, kind: loop-agent.act, max_visits: 1 }
+    - { node_id: learn, kind: loop-agent.learn, max_visits: 1 }
+    - { node_id: judge, kind: loop-agent.judge, max_visits: 1 }
+    - { node_id: finish, kind: loop-agent.finish, max_visits: 1 }
+    - { node_id: done, kind: gate }
+    - { node_id: reflect, kind: reflect, optional: true }        # v3: did my actions work? same failure N× → a pattern with its cause
+    - { node_id: plan, kind: plan, optional: true }              # v3: the body plan ⊕ learned knowhow → fallback · soul do_not · cited memory
+    - { node_id: learn-knowhow, kind: learn-knowhow, optional: true } # v3: one lesson → one knowhow line
+    - { node_id: retro, kind: retro, optional: true }            # v3: every retro_every_h → retro entry in memory (the voice quotes it)
+  edges:
+    - { from: observe, on: outcome, map: { ok: act, breach: act, unknown: act, off: finish, error: finish } }
+    - { from: act, on: outcome, map: { ok: learn } }
+    - { from: learn, on: outcome, map: { ok: judge } }
+    - { from: judge, on: outcome, map: { ok: finish } }
+    - { from: finish, on: outcome, map: { ok: done } }
+actions:   # v3 plan (LOOP-AGENT-V3-SMART-2): the card rights as plan choices · fallback = what the plan runs once a knowhow line says the action keeps failing
+  - { id: start-rehearsal, channel: self, target: self, serves: [late_milestones], cost: $policies.cost_act, default: true }
+  - { id: archive-rehearsal, channel: self, target: self, serves: [late_milestones], cost: $policies.cost_act }
+  - { id: propose-waiver, channel: self, target: self, serves: [late_milestones], cost: $policies.cost_act }
+voice:   # tier ③ — one LLM turn only when spoken to (role router · coordinator) · facts-only fold over budget
+  channel: loop:release-rocket
+  speak_on: [kpi-breach, kpi-recovered, subject-lost]
+  mail: l0-only
+  per_hour_max: 6
+memory:
+  knowhow: knowhow.md
+budget:
+  llm_turns_per_hour: 6
+levels:
+  start: live
+  values: [live, L1, shadow, off]

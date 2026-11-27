@@ -156,7 +156,12 @@ describe('self-update --catch-up (real installer, real git; only restart + healt
   test('OP approval continues through the real installer and pinned local migrate in one update-all path', async () => {
     const r = realRig();
     let approvals = 0;
+    let registrations = 0;
+    // update-all's catch-up is install-only; the rail wrapper owns registration.
+    // Count the real hook on both rejected and approved installer paths.
+    r.deps.triggerRegisterRunner = () => { registrations++; return { status: 0 }; };
     const denied = await runCatchUp({ seat: 'OP', restart: false }, { ...r.deps, approveOp: async () => { approvals++; return false; } });
+    expect(registrations).toBe(0);
     expect(denied.exitCode).toBe(1);
     expect(r.installedCommit()).toBe(r.one);
     let rows: UpdateSeatRow[] = [{ id: 'tui:10', ownerPid: 10, alive: true, kind: 'tui', seat: 'TC', workdir: '/seats/TC', sessionId: 'same', build: { sha: r.one, source: 'installed' } }];
@@ -181,13 +186,20 @@ describe('self-update --catch-up (real installer, real git; only restart + healt
     expect(sent).toEqual(['tui:10']);
     expect(r.installedCommit()).toBe(r.two);
     expect(approvals).toBe(2);
+    expect(registrations).toBe(0);
     // OP's own terminal answer is the decision: no hold notice (no CEO card), one OP-decided trace for the approved run.
     expect(r.raised.length).toBe(0);
     expect(r.opDecisions.length).toBe(1);
   });
   test('behind: real install.sh installs desiredSha (content, record, current link — none written by the test), checkout restored to its branch, restart verified, gate opens', async () => {
     const r = realRig();
+    const events: string[] = [];
+    const verify = r.deps.verifyRestart!;
+    r.deps.verifyRestart = async (commit) => { const result = await verify(commit); events.push('health'); return result; };
+    r.deps.triggerRegisterRunner = () => { events.push('register'); return { status: 0 }; };
     const res = await runCatchUp({ seat: 'TC', restart: true }, r.deps);
+    expect(events.at(-1)).toBe('register');
+    expect(events.at(-2)).toBe('health');
     expect(res.reason).toContain('gate open');
     expect(res.exitCode).toBe(0);
     expect(r.installedCommit()).toBe(r.two);
@@ -480,4 +492,17 @@ describe('update --auto on --catch-up service shape', () => {
     const t = renderUpdateUnits(['x'], '/h', { seat: 'TC' }).timer;
     expect(t).toContain('OnBootSec=1min\nOnUnitActiveSec=15min');
   });
+});
+
+test('trigger hook: identical catch-up build never registers even after successful restart health', async () => {
+  for (const healthy of [false, true]) {
+    const r = rig({ installed: NEW, daemon: OLD });
+    const events: string[] = [];
+    r.deps.restartEdgeRail = async () => { events.push('restart'); return true; };
+    r.deps.verifyRestart = async () => { events.push('health'); return events.includes('restart') && healthy ? { ok: true, daemonSha: NEW } : { ok: false }; };
+    r.deps.triggerRegisterRunner = (command, args) => { events.push([command, ...args].join(' ')); return { status: 0 }; };
+    const result = await runCatchUp({ seat: 'TC', restart: true }, r.deps);
+    expect(result.exitCode).toBe(healthy ? 0 : 1);
+    expect(events).toEqual(['health', 'restart', 'health']);
+  }
 });

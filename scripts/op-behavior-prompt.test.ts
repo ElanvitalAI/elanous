@@ -1,3 +1,4 @@
+import { tierModel } from '../src/llm/model-defaults.js';
 import { expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,7 +10,7 @@ test('a reused isolated fixture yields identical assembled prompt snapshots', ()
     const fixture = join(root, 'fixture'), state = join(root, 'state');
     mkdirSync(fixture); mkdirSync(state);
     const run = (output: string) => Bun.spawnSync({
-      cmd: [process.execPath, join(import.meta.dir, 'op-behavior-prompt.ts'), output, 'gpt-6.1-terra', fixture],
+      cmd: [process.execPath, join(import.meta.dir, 'op-behavior-prompt.ts'), output, tierModel('balanced'), fixture],
       env: { ...process.env, ELANOUS_STATE_DIR: state, ELANOUS_SKIP_LOGIN_ENV: '1' }, stdout: 'pipe', stderr: 'pipe',
     });
     const a = join(root, 'a.txt'), b = join(root, 'b.txt');

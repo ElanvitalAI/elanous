@@ -83,14 +83,14 @@ describe('COACH-REPLY-AS-MAIL', () => {
   test('an unsolicited CLAUDE-OP post still becomes a coach note (no row · watch not met)', async () => {
     const f = fixture();
     const armedAt = new Date(Date.now() - 60_000).toISOString();
-    await f.run('post', 'board looks fine', '--from', 'CLAUDE-OP', '--to', 'OP', '--kind', 'info');
+    await f.run('post', 'board looks fine', '--from', 'CLAUDE-OP', '--to', 'OP', '--kind', 'coach');
     expect(f.stdout.at(-1)).toBe('msg post: coach injection → coach note for OP (one line per 30 min in its next turn · not mail)');
     expect(pendingDiverted('coach-note', 'OP', f.divertedRoot).map((e) => e.body)).toEqual(['board looks fine']);
     // a --reply-to pointing at a mail OP did NOT send is not an answer to OP's ask
     const seed = f.store();
     const other = seed.post({ from: 'TC', to: 'CLAUDE-OP', kind: 'question', needsAck: true, body: 'TC asks' });
     seed.close();
-    await f.run('post', 'fyi for OP', '--from', 'CLAUDE-OP', '--to', 'OP', '--reply-to', String(other.id), '--kind', 'info');
+    await f.run('post', 'fyi for OP', '--from', 'CLAUDE-OP', '--to', 'OP', '--reply-to', String(other.id), '--kind', 'coach');
     expect(f.stdout.at(-1)).toBe('msg post: coach injection → coach note for OP (one line per 30 min in its next turn · not mail)');
     const store = f.store();
     try {

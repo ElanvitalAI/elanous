@@ -1,7 +1,7 @@
 import { resolveModelAlias } from '../intelligence-map/model-alias.js';
 import { describe, expect, spyOn, test, afterAll } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getProvider, getProviderForConfig, streamLLM } from '../llm.js';
@@ -29,6 +29,43 @@ afterAll(() => { if (__originalLlmMode === undefined) delete process.env.ELANOUS
 const A = { model: 'gpt-5.6-sol', provider: getProvider('gpt-5.6-sol')!, label: 'codex' };
 const B = { model: 'grok-4', provider: getProvider('grok-4')!, label: 'grok' };
 const C = { model: 'claude-opus', provider: getProvider('claude-opus')!, label: 'claude' };
+
+test('GLM cannot be selected as primary or fallback reviewer', () => {
+  const glm = { model: 'z-ai/glm-5.3', label: 'glm' };
+  expect(() => buildReviewProviderAttempts(glm, [B])).toThrow('GLM review is prohibited');
+  expect(buildReviewProviderAttempts(A, [glm, B]).map((attempt) => attempt.model)).toEqual([A.model, B.model]);
+});
+
+test('runner rejects a direct GLM attempt before calling a provider', async () => {
+  let calls = 0;
+  // The rejection precedes provider use; avoid credential-dependent GLM resolution.
+  const glm = { model: 'z-ai/glm-5.3', label: 'glm', provider: B.provider };
+  await expect(runReviewWithFallback([glm], async () => { calls++; return 'VERDICT: PASS'; }))
+    .rejects.toThrow('GLM review is prohibited');
+  expect(calls).toBe(0);
+});
+
+test('review retries Terra exactly once on overload before Grok, never Claude', async () => {
+  const terra = { model: 'gpt-6.1-terra', provider: getProvider('gpt-6.1-terra')!, label: 'terra' };
+  const calls: string[] = [];
+  const result = await runReviewWithFallback([terra, B, C], async (attempt) => {
+    calls.push(attempt.label);
+    if (attempt.label === 'terra') throw new Error('server overloaded');
+    return 'VERDICT: PASS';
+  }, undefined, { terraOverloadOnly: true, maxCalls: 3 }); // 출처: #38365 — Terra 두 번과 Grok 한 번.
+  expect(calls).toEqual(['terra', 'terra', 'grok']);
+  expect(result.used.label).toBe('grok');
+});
+
+test('a non-overload Terra failure is returned without fallback', async () => {
+  const terra = { model: 'gpt-6.1-terra', provider: getProvider('gpt-6.1-terra')!, label: 'terra' };
+  const calls: string[] = [];
+  await expect(runReviewWithFallback([terra, B], async (attempt) => {
+    calls.push(attempt.label);
+    throw new Error('connection timeout');
+  }, undefined, { terraOverloadOnly: true, maxCalls: 3 })).rejects.toThrow('connection timeout'); // 출처: #38365 — Terra 두 번과 Grok 한 번.
+  expect(calls).toEqual(['terra']);
+});
 
 describe('Claude ACP subscription review', () => {
   const cct = { provider: 'claude-acp' as const };
@@ -232,7 +269,7 @@ describe('classifyReviewProviderFailure — 「제공자가 아픈가」만 문�
 });
 
 describe('self review isolated CLI model routing', () => {
-  test('--model glm sends the OpenRouter model and does not call Codex OAuth', () => {
+  test('--model glm is rejected without a provider call', () => {
     const root = mkdtempSync(join(tmpdir(), 'elanous-review-glm-'));
     const configDir = join(root, '.elanous-test');
     const binDir = join(root, 'bin');
@@ -248,65 +285,47 @@ describe('self review isolated CLI model routing', () => {
       delete childEnv.ELANOUS_TEST_FAKE_LLM;
       const run = spawnSync(process.execPath, ['--preload', preload, join(import.meta.dir, '..', '..', 'bin/elanous.mjs'), `--test=${configDir}`, '--config-dir', configDir, 'self', 'review', '1', '--json', '--model', 'glm'],
         { cwd: root, env: childEnv, encoding: 'utf8', timeout: 90_000 });
-      expect(run.status, `stdout=${run.stdout}\nstderr=${run.stderr}`).toBe(0);
-      const requests = JSON.parse(readFileSync(capture, 'utf8')) as Array<{ url: string; body: { model: string } }>;
-      expect(requests).toHaveLength(1);
-      expect(requests[0]!.url).toContain('openrouter.ai');
-      expect(requests[0]!.body.model).toBe('z-ai/glm-5.3');
-      const result = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as Record<string, unknown>;
-      expect(result).toMatchObject({ requestedModel: 'glm', model: 'openrouter/z-ai/glm-5.3', respondedProvider: 'openrouter' });
+      expect(run.status, `stdout=${run.stdout}\nstderr=${run.stderr}`).not.toBe(0);
+      expect(existsSync(capture)).toBe(false);
+      expect(`${run.stdout}\n${run.stderr}`).toContain('GLM');
       const rejected = spawnSync(process.execPath, [join(import.meta.dir, '..', '..', 'bin/elanous.mjs'), `--test=${configDir}`, '--config-dir', configDir, 'self', 'review', '1', '--json', '--model', 'glm-5.3'],
         { cwd: root, env: childEnv, encoding: 'utf8', timeout: 90_000 });
       expect(rejected.status).not.toBe(0);
-      expect(rejected.stdout).toContain('openrouter/z-ai/glm-5.3');
+      expect(`${rejected.stdout}\n${rejected.stderr}`).toContain('GLM');
+      expect(existsSync(capture)).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
   }, 120_000);
 });
 
 describe('self implement reviewDiff fallback route', () => {
-  test('primary overload reaches OpenRouter glm request with the canonical model', async () => {
+  test('primary overload does not call a configured GLM fallback', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'elanous-review-fallback-seam-'));
-    const originalFetch = globalThis.fetch;
     const originalOpenRouterKey = process.env.OPENROUTER_API_KEY;
-    const originalOpenAIKey = process.env.OPENAI_API_KEY;
-    const requests: Array<{ url: string; model: string }> = [];
+    const calls: string[] = [];
     try {
       clearLaunchRoleLlmOverrides();
       process.env.OPENROUTER_API_KEY = 'test-review-openrouter-key';
-      process.env.OPENAI_API_KEY = 'test-review-openai-key';
       writeFileSync(join(repo, 'changed.ts'), 'export const changed = true;\n');
       setUserConfigOverlay((config) => ({ ...config,
-        roleLlm: {}, roleModelTiers: {}, roleModels: { review: 'gpt-5.6-sol' },
-        llm: { ...config.llm, provider: 'openai-codex', reviewFallbackModels: ['glm'] },
+        roleLlm: {}, roleModelTiers: {}, roleModels: { review: 'openrouter/qwen/qwen3.5-plus-02-15' },
+        llm: { ...config.llm, provider: 'openrouter', reviewFallbackModels: ['glm'] },
       }));
-      globalThis.fetch = (async (input, init) => {
-        const url = String(input);
-        const body = JSON.parse(String(init?.body)) as { model: string };
-        requests.push({ url, model: body.model });
-        if (!url.startsWith('https://openrouter.ai/')) throw new Error('Our servers are currently overloaded.');
-        return new Response('data: {"choices":[{"delta":{"content":"VERDICT: PASS"}}]}\n\ndata: [DONE]\n\n', {
-          status: 200, headers: { 'content-type': 'text/event-stream' },
-        });
-      }) as typeof fetch;
+      const fakeStream = (async (_messages: unknown, _chunk: unknown, opts: { model?: string }) => {
+        calls.push(opts.model ?? 'none');
+        throw new Error('Our servers are currently overloaded.');
+      }) as unknown as typeof streamLLM;
       const seams = await buildDefaultSelfImplementSeams(planDevPipeline({ input: { text: 'review fallback' } }), {
         toolReviewerRate: 0,
-        streamLLM,
+        streamLLM: fakeStream,
         reviewScopeDiff: async () => 'diff --git a/changed.ts b/changed.ts\n+export const changed = true;\n',
       });
       const review = await seams.reviewDiff!(repo, { goal: 'review fallback' });
-      expect(review.reviewed, JSON.stringify({ review, requests })).toBe(true);
-      expect(requests.length).toBeGreaterThan(1);
-      expect(requests.slice(0, -1).every(({ url, model }) =>
-        !url.startsWith('https://openrouter.ai/') && model === 'gpt-5.6-sol')).toBe(true);
-      expect(requests.at(-1)).toEqual({
-        url: 'https://openrouter.ai/api/v1/chat/completions', model: 'z-ai/glm-5.3',
-      });
+      expect(review.reviewed).toBe(false);
+      expect(review.failureReason).toContain('overloaded');
+      expect(calls).toEqual(['openrouter/qwen/qwen3.5-plus-02-15']);
     } finally {
-      globalThis.fetch = originalFetch;
       if (originalOpenRouterKey === undefined) delete process.env.OPENROUTER_API_KEY;
       else process.env.OPENROUTER_API_KEY = originalOpenRouterKey;
-      if (originalOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
-      else process.env.OPENAI_API_KEY = originalOpenAIKey;
       setUserConfigOverlay(null);
       clearLaunchRoleLlmOverrides();
       rmSync(repo, { recursive: true, force: true });
@@ -316,7 +335,7 @@ describe('self implement reviewDiff fallback route', () => {
 
 describe('buildReviewProviderAttempts — 순서와 중복 제거', () => {
   test('Pod 리뷰 정책은 기본·설정 폴백 중 Codex 이외 provider를 모두 제외한다', () => {
-    const glm = { model: 'glm', label: 'primary' };
+    const glm = { model: 'openrouter/qwen/qwen3.5-plus-02-15', label: 'primary' };
     const config = getUserConfig();
     const codexModel = 'gpt-6.1-sol';
     const codex = {
@@ -338,7 +357,7 @@ describe('buildReviewProviderAttempts — 순서와 중복 제거', () => {
   });
 
   test('Pod 리뷰에서 허용되지 않은 후보만 있으면 사유를 남기고 호출 후보를 비운다', () => {
-    const plan = planReviewProviderAttempts({ model: 'glm', label: 'primary' }, [B], {
+    const plan = planReviewProviderAttempts({ model: 'openrouter/qwen/qwen3.5-plus-02-15', label: 'primary' }, [B], {
       skipUnavailableProviders: true,
       allowedProviderNames: ['openai-codex'],
       isAvailable: () => true,
@@ -388,11 +407,9 @@ describe('buildReviewProviderAttempts — 순서와 중복 제거', () => {
     expect(defaultReviewFallbackModel('openrouter')).toBe('grok-4.7');
   });
 
-  test('self review --model glm resolves the OpenRouter model before routing, not Codex OAuth', () => {
-    const attempts = buildReviewProviderAttempts({ model: 'glm', label: 'primary' }, [A]);
-    expect(attempts[0]).toMatchObject({ model: 'openrouter/z-ai/glm-5.3', provider: { name: 'openrouter' }, label: 'primary' });
-    expect(attempts[0]!.provider?.name).not.toBe('openai-codex');
-    expect(attempts[1]).toBe(A);
+  test('self review rejects glm before routing while preserving other model routing', () => {
+    expect(() => buildReviewProviderAttempts({ model: 'glm', label: 'primary' }, [A]))
+      .toThrow('GLM review is prohibited');
     for (const fallbacks of [[], [B]]) {
       for (const model of ['claude', 'unregistered-review-model']) {
         const attempts = buildReviewProviderAttempts({ model, label: 'primary' }, fallbacks);
@@ -407,41 +424,35 @@ describe('buildReviewProviderAttempts — 순서와 중복 제거', () => {
   });
 
   test('명시한 primary provider 객체의 사용자 설정을 보존한다', () => {
-    const custom = { ...getProvider('openrouter/z-ai/glm-5.3'), available: () => true };
-    const attempts = buildReviewProviderAttempts({ model: 'glm', provider: custom, label: 'custom' }, [B]);
-    expect(attempts[0]?.model).toBe('openrouter/z-ai/glm-5.3');
+    const custom = { ...getProvider('grok-4'), available: () => true };
+    const attempts = buildReviewProviderAttempts({ model: 'grok-4', provider: custom, label: 'custom' }, [A]);
+    expect(attempts[0]?.model).toBe('grok-4');
     expect(attempts[0]?.provider).toBe(custom);
   });
 
-  test('primary 실패 뒤 glm fallback을 OpenRouter의 정식 모델로 실행한다', async () => {
+  test('primary overload does not call the prohibited GLM fallback', async () => {
     const attempts = buildReviewProviderAttempts(A, [{ model: 'glm', label: 'glm' }]);
-    const calls: Array<{ model: string; provider?: string }> = [];
-    const result = await runReviewWithFallback(attempts, async (attempt) => {
-      calls.push({ model: attempt.model, provider: attempt.provider?.name });
-      if (attempt.label === 'codex') throw new Error('Our servers are currently overloaded.');
-      return 'VERDICT: PASS';
-    });
-    expect(result.used).toMatchObject({ model: 'openrouter/z-ai/glm-5.3', provider: { name: 'openrouter' } });
-    expect(calls).toEqual([
-      { model: A.model, provider: A.provider.name },
-      { model: 'openrouter/z-ai/glm-5.3', provider: 'openrouter' },
-    ]);
+    const calls: string[] = [];
+    await expect(runReviewWithFallback(attempts, async (attempt) => {
+      calls.push(attempt.model);
+      throw new Error('Our servers are currently overloaded.');
+    })).rejects.toThrow('Our servers are currently overloaded.');
+    expect(calls).toEqual([A.model]);
   });
 
   test('fallback의 모호한 모델과 잘못 지정된 provider는 명시 거부한다', () => {
     expect(() => buildReviewProviderAttempts(A, [{ model: 'unregistered-review-model', label: 'unknown' }]))
       .toThrow(/ambiguous or unsupported fallback model/);
-    expect(() => buildReviewProviderAttempts(A, [{ model: 'glm', provider: A.provider, label: 'wrong' }]))
+    expect(() => buildReviewProviderAttempts(A, [{ model: 'grok-4', provider: A.provider, label: 'wrong' }]))
       .toThrow(/unsupported provider/);
   });
 
-  test('primary glm과 같은 별칭 fallback은 정규화한 모델 기준으로 한 번만 시도한다', () => {
-    const attempts = buildReviewProviderAttempts({ model: 'glm', label: 'primary' }, [
+  test('GLM primary is rejected even when aliases or other fallback candidates exist', () => {
+    expect(() => buildReviewProviderAttempts({ model: 'glm', label: 'primary' }, [
       { model: 'glm', label: 'duplicate-alias' },
       { model: 'openrouter/z-ai/glm-5.3', label: 'duplicate-canonical' },
       B,
-    ]);
-    expect(attempts.map((attempt) => attempt.label)).toEqual(['primary', 'grok']);
+    ])).toThrow('GLM review is prohibited');
   });
 
   test('기본이 «맨 앞»이고 중복 모델은 빠진다', () => {
@@ -544,7 +555,7 @@ describe('runReviewWithFallback — 계약 넷', () => {
   });
 
   test('OpenRouter 자격이 없으면 설정된 다음 제공자를 시도한다', async () => {
-    const openrouter = { model: 'openrouter/z-ai/glm-5.3', provider: getProvider('openrouter/z-ai/glm-5.3')!, label: 'openrouter' };
+    const openrouter = { model: 'openrouter/qwen/qwen3.5-plus-02-15', provider: getProvider('openrouter/qwen/qwen3.5-plus-02-15')!, label: 'openrouter' };
     const calls: string[] = [];
     const seen: Array<{ event: string; data: ReviewFallbackObservation }> = [];
     const result = await runReviewWithFallback([openrouter, B], async (attempt) => {
@@ -595,7 +606,7 @@ describe('runReviewWithFallback — 계약 넷', () => {
       skipUnavailable: (attempt) => ({ label: attempt.label, model: attempt.model,
         provider: attempt.provider!.name, why: 'availability-check-failed' }),
     }))
-      .rejects.toThrow('no-usable-provider: openrouter(openrouter/z-ai/glm-5.3)=no-credential, openai(gpt-5.6-sol)=availability-check-failed, grok(grok-4)=availability-check-failed');
+      .rejects.toThrow(`no-usable-provider: openrouter(openrouter/z-ai/glm-5.3)=no-credential, ${A.provider.name}(${A.model})=availability-check-failed, grok(${B.model})=availability-check-failed`);
     expect(calls).toEqual(['grok']);
   });
 
