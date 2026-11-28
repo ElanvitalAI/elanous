@@ -14,7 +14,7 @@ const fixture = (version = '0.2.4', runId = 'run-tui-subcheck') => {
   writeFileSync(join(repo, '.bun-version'), `${Bun.version}\n`);
   for (let n = 0; n < 5; n++) writeFileSync(join(out, 'dist', `file-${n}`), 'fixture');
   const context: GraphContext = { runId, input: { version, previousVersion: '0.2.3' }, outputs: {
-    gate: { outcome: 'ok', introduced: [] }, prepare: { outcome: 'ok', out, candidate: join(out, 'dist', 'elanous.tgz'), commit: 'a'.repeat(40) },
+    gate: { outcome: 'ok', verdict: 'pass', introduced: [] }, prepare: { outcome: 'ok', out, candidate: join(out, 'dist', 'elanous.tgz'), commit: 'a'.repeat(40) },
     upgrade: { outcome: 'ok' }, tui: { outcome: 'ok', regress: { pass: 7, fail: 0,
       results: Array.from({ length: 7 }, (_, i) => ({ id: `R${i + 1}`, title: 'check', ok: true, reason: 'passed' })) } },
     docs: { outcome: 'ok', notes: '/tmp/0.2.4.md', flipped: [] }, 'notes-check': { outcome: 'ok' },
@@ -94,6 +94,22 @@ test('absent gate is unmeasured, never approved', () => {
     expect(absent.outcome).toBe('fail');
     expect(absent.metrics[0]?.verdict).toBe('unmeasured');
     expect(readFileSync(absent.report, 'utf8')).toContain('unmeasured');
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('a full gate without a measured pass verdict cannot authorize auto approval', () => {
+  const f = fixture();
+  try {
+    for (const [gate, verdict] of [
+      [{ outcome: 'ok', introduced: [] }, 'unmeasured'],
+      [{ outcome: 'ok', verdict: 'fail', introduced: [] }, 'fail'],
+    ] as const) {
+      f.context.outputs.gate = gate;
+      const decision = f.run();
+      expect(decision).toMatchObject({ outcome: 'fail', verdict: 'fail' });
+      expect(decision.metrics[0]).toMatchObject({ name: BLOCKING_METRIC_NAMES[0], verdict });
+      expect(decision).not.toHaveProperty('decidedBy');
+    }
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 

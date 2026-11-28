@@ -6,12 +6,60 @@ import { join } from 'node:path';
 import { TaskNotificationQueue } from '../agent/task-notification.js';
 import { dispatchRunShellCapsule, runShellCapsuleNoticeText, runShellCapsuleStatus } from '../skills/tools/shell.js';
 import type { CapsuleEvent, CapsulePolicy } from './contract.js';
-import { installShellCapsuleSink, listDetachedShellCapsules, runShellCapsule } from './shell-capsule.js';
+import { installShellCapsuleSink, listDetachedShellCapsules, stopDetachedShellCapsule, runShellCapsule } from './shell-capsule.js';
 
 const capPolicy = (syncCapMs: number): CapsulePolicy => ({ decide: () => ({ mode: 'sync', syncCapMs, reason: 'capsule-sync-cap' }) });
 const noCapPolicy: CapsulePolicy = { decide: () => ({ mode: 'sync', syncCapMs: Infinity, reason: 'sync-cap-zero' }) };
 const queue = () => new TaskNotificationQueue(mkdtempSync(join(tmpdir(), 'a2b-capsule-')));
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe('approval wait turn budget', () => {
+  test('seat yields at 30s without approving; stopping prevents late spawn', async () => {
+    let fire!: () => void;
+    let signal!: AbortSignal;
+    let finish!: (value: string) => void;
+    let launches = 0;
+    let approve!: () => void;
+    const sink = installShellCapsuleSink('approval-30s', () => {});
+    const pending = runShellCapsule({
+      tool: 'RunShell', command: 'approval-pending', clockFromSpawn: true,
+      start: (s, spawned) => { signal = s!; return new Promise<string>((resolve) => {
+        finish = resolve;
+        approve = () => { if (!signal.aborted) { launches++; spawned(); } resolve('settled'); };
+      }); },
+      describe: () => ({ status: 'ok', output: '' }), started: (id) => id,
+    }, { policy: capPolicy(60_000), seatTurn: true, queue: queue(), log: () => {},
+      setTimer: (fn, ms) => { expect(ms).toBe(30_000); fire = fn; return 1; }, clearTimer: () => {} });
+    expect(launches).toBe(0);
+    fire();
+    const id = await pending;
+    expect(id).toMatch(/^shell-/);
+    expect(launches).toBe(0);
+    expect(stopDetachedShellCapsule(id)).toBe(true);
+    expect(signal.aborted).toBe(true);
+    approve();
+    await tick();
+    expect(launches).toBe(0);
+    sink.dispose();
+  });
+
+  test('the default turn budget is armed while approval is pending', async () => {
+    let armed = 0;
+    let finish!: (value: string) => void;
+    const sink = installShellCapsuleSink('approval-budget', () => {});
+    const pending = runShellCapsule({
+      tool: 'RunShell', command: 'approval-pending', clockFromSpawn: true,
+      start: () => new Promise<string>((resolve) => { finish = resolve; }),
+      describe: () => ({ status: 'ok', output: '' }), started: () => 'background',
+    }, { policy: capPolicy(30_000), seatTurn: true, queue: queue(), log: () => {},
+      setTimer: () => { armed++; return 1; }, clearTimer: () => {} });
+    await tick();
+    finish('done');
+    await pending;
+    sink.dispose();
+    expect(armed).toBe(1);
+  });
+});
 
 describe('CAPSULE-A2 RunShell — the sync clock starts at spawn', () => {
   test('an approval wait longer than the cap never detaches; the cap counts from spawned()', async () => {

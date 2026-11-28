@@ -54,7 +54,19 @@ export interface SeatDecisionRecord {
 }
 export type SeatDecisionInput = Pick<SeatDecisionRecord, 'title' | 'decision' | 'seat' | 'delegation' | 'refs'> & { decidedAt?: string };
 type Event = { type: 'raised'; entry: DecisionEntry } | { type: 'seat-recorded'; entry: SeatDecisionRecord } | { type: 'options-added'; id: string; at: string; options: DecisionOption[]; by: string } | { type: 'decided'; id: string; at?: string; by: DecisionActor; choice?: string; version?: Versions; note?: string; proof?: HumanProof } | { type: 'withdrawn'; id: string; at: string; reason: string; version: Versions };
-export interface DecisionLedgerOptions extends VersionOptions { stateDir?: string; now?: () => Date; resolveVersion?: (at: string) => Versions; writeAnswer?: typeof writePendingQuestionAnswer; postDecisionNotice?: (entry: DecisionEntry, stateDir: string, seat: string) => number }
+export interface DecisionLedgerOptions extends VersionOptions { stateDir?: string; now?: () => Date; resolveVersion?: (at: string) => Versions; writeAnswer?: typeof writePendingQuestionAnswer; postDecisionNotice?: (entry: DecisionEntry, stateDir: string, seat: string) => number;
+  /** DECISION-TO-BUS-AUTO — the decided card's pointer onto the HQ context bus (default kit/decision-bus · fail-open · the sweep retries). */
+  pointToBus?: (entry: DecisionEntry, stateDir: string, nowMs: number) => void }
+
+/** DECISION-TO-BUS-AUTO: the effect stays here; the bus gets a pointer (AGENT-PLUGIN-GRAPH-WORKFLOW §1a #7). Never throws. */
+function pointDecidedToBus(entry: DecisionEntry, stateDir: string, nowMs: number): void {
+  try {
+    const { pointDecisionToBus } = require('../kit/decision-bus/index.js') as typeof import('../kit/decision-bus/index.js');
+    const { BUS_HQ_SPACE } = require('../op-context-bus/spaces.js') as typeof import('../op-context-bus/spaces.js');
+    const { BUS_COORDINATOR_SEAT } = require('../op-context-bus/seat-turn.js') as typeof import('../op-context-bus/seat-turn.js');
+    pointDecisionToBus(stateDir, entry, BUS_HQ_SPACE, BUS_COORDINATOR_SEAT, nowMs);
+  } catch { /* fail-open: the decision-bus sweep posts it on its next tick */ }
+}
 
 /** null = the decision resumes no run; otherwise whether the answer file was written (or already matched). */
 export type AnswerDelivery = null | { ok: true; questionId: string } | { ok: false; questionId: string; reason: string };
@@ -203,16 +215,49 @@ export function readDecisionTrustRoots(stateDir: string): DecisionTrustRoot[] {
       if (!k || typeof k !== 'object') return false;
       const key = k as Partial<DecisionTrustRoot>;
       return typeof key.keyId === 'string' && key.keyId.trim() !== '' && typeof key.publicKey === 'string' && /BEGIN PUBLIC KEY/.test(key.publicKey);
-    });
+    }).map(k => ({ keyId: k.keyId, publicKey: k.publicKey }));
   } catch { return []; }
 }
-/** Out-of-band human proof: a trust-root signature over this exact binding. No roots, no proof, no approval. */
-export function verifyHumanApprovalProof(ref: string, proof: HumanProof | undefined, trustRoots: readonly DecisionTrustRoot[] | undefined): boolean {
-  if (!proof || !trustRoots?.length) return false;
+/**
+ * RELEASE-HUMAN-PROOF-TRUST-ROOT (대표 11-28 YES) — what the signer signs: the approval ref ⊕ the card (id ⊕ raisedAt = nonce)
+ * ⊕ the choice ⊕ where it came in (via ⊕ platform user id). A proof copied onto another card, a declined card or another
+ * actor no longer matches. approver·at stay on the ledger row (decidedBy · decidedAt).
+ */
+export const APPROVAL_PROOF_VERSION = 'elanous-approval/v2';
+export interface ApprovalProofBinding { ref: string; cardId: string; raisedAt: string; choice: string; via: string; platformUserId: string }
+export function approvalProofPayload(b: ApprovalProofBinding): string {
+  const fields = [b.ref, b.cardId, b.raisedAt, b.choice, b.via, b.platformUserId];
+  if (fields.some(f => typeof f !== 'string' || !f || /[|\r\n]/.test(f))) throw new Error('approval proof binding: every field must be one nonempty line without «|»');
+  return [APPROVAL_PROOF_VERSION, ...fields].join('|');
+}
+/** Why a human marker is not proven — printed as-is by critpath and `decisions verify`. */
+export type HumanProofFailure = 'no-proof' | 'no-roots' | 'unknown-key' | 'bad-sig' | 'not-human' | 'incomplete-binding';
+export type HumanProofCheck = { ok: true; keyId: string } | { ok: false; reason: HumanProofFailure; keyId?: string };
+/** The slice of a decision the proof binds (a DecisionEntry fits). */
+export interface HumanProofSubject {
+  id: string; raisedAt?: string; choice?: string; proof?: HumanProof;
+  decidedBy?: { kind: string; via?: string; platformUserId?: string };
+}
+/** Rebuild the v2 binding from the ledger row and check the signature against the trust roots. No roots, no proof, no approval. */
+export function checkHumanApprovalProof(entry: HumanProofSubject, ref: string, trustRoots: readonly DecisionTrustRoot[] | undefined): HumanProofCheck {
+  if (entry.decidedBy?.kind !== 'human') return { ok: false, reason: 'not-human' };
+  const proof = entry.proof;
+  if (!proof) return { ok: false, reason: 'no-proof' };
+  if (!trustRoots?.length) return { ok: false, reason: 'no-roots', keyId: proof.keyId };
   const root = trustRoots.find(k => k.keyId === proof.keyId);
-  if (!root) return false;
-  try { return cryptoVerify(null, Buffer.from(ref, 'utf8'), createPublicKey(root.publicKey), Buffer.from(proof.sig, 'hex')); }
-  catch { return false; }
+  if (!root) return { ok: false, reason: 'unknown-key', keyId: proof.keyId };
+  let payload: string;
+  try {
+    payload = approvalProofPayload({ ref, cardId: entry.id, raisedAt: entry.raisedAt ?? '', choice: entry.choice ?? '',
+      via: entry.decidedBy.via ?? '', platformUserId: entry.decidedBy.platformUserId ?? '' });
+  } catch { return { ok: false, reason: 'incomplete-binding', keyId: proof.keyId }; }
+  try {
+    return cryptoVerify(null, Buffer.from(payload, 'utf8'), createPublicKey(root.publicKey), Buffer.from(proof.sig, 'hex'))
+      ? { ok: true, keyId: proof.keyId } : { ok: false, reason: 'bad-sig', keyId: proof.keyId };
+  } catch { return { ok: false, reason: 'bad-sig', keyId: proof.keyId }; }
+}
+export function verifyHumanApprovalProof(entry: HumanProofSubject, ref: string, trustRoots: readonly DecisionTrustRoot[] | undefined): boolean {
+  return checkHumanApprovalProof(entry, ref, trustRoots).ok;
 }
 export class DecisionLedger {
   readonly path: string;
@@ -220,6 +265,7 @@ export class DecisionLedger {
   private readonly now: () => Date;
   private readonly writeAnswer: typeof writePendingQuestionAnswer;
   private readonly postDecisionNotice: NonNullable<DecisionLedgerOptions['postDecisionNotice']>;
+  private readonly pointToBus: NonNullable<DecisionLedgerOptions['pointToBus']>;
   private readonly stateDir: string;
   private versionResolver?: (at: string) => Versions;
   private resolverSnapshotHead?: string | null;
@@ -231,6 +277,7 @@ export class DecisionLedger {
     this.now = options.now ?? (() => new Date());
     this.writeAnswer = options.writeAnswer ?? writePendingQuestionAnswer;
     this.postDecisionNotice = options.postDecisionNotice ?? postDecisionNotice;
+    this.pointToBus = options.pointToBus ?? pointDecidedToBus;
     this.versionOptions = options;
     this.versionResolver = options.resolveVersion;
   }
@@ -520,6 +567,7 @@ export class DecisionLedger {
       this.append({ type: 'decided', id, at, by, choice, version: this.version(at), ...(note ? { note: safe(single(note, 'note')) } : {}), ...(proof ? { proof } : {}) });
       debug.log('decisions', 'decided', { id, category: old.category, by: by.kind });
       const decided = this.show(id);
+      try { this.pointToBus(decided, this.stateDir, this.now().getTime()); } catch { /* fail-open — the decision is durable */ }
       return { entry: decided, delivery: this.deliverAnswer(decided), notice: this.notifyDecided(decided) };
     });
   }

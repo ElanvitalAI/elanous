@@ -87,7 +87,7 @@ describe('release critpath', () => {
     const r = await runCritpath(opts(), w.deps);
     expect(r.status).toBe('waiting-approval');
     expect(r.exitCode).toBe(CRITPATH_WAITING_EXIT);
-    expect(r.approval).toEqual({ state: 'unverified', id: 'D-OK' });
+    expect(r.approval).toEqual({ state: 'unverified', id: 'D-OK', reason: 'no-proof' });
     expect(w.calls).toEqual(['prepare']);
     expect(ledger().entries.map((e) => `${e.step}:${e.outcome}`)).toEqual(['prepare:ok', 'approval:waiting-approval']);
     expect(ledger().entries.every((e) => e.cmd && e.at)).toBe(true);
@@ -376,5 +376,67 @@ describe('release critpath auto-publish on green (owner opt-in)', () => {
     const r = await runCritpath(opts(), w.deps);
     expect(r.status).toBe('waiting-approval');
     expect(w.lines.find((l) => l.startsWith('· release.auto-publish skipped {'))).toContain('dry run was for another cut/notes');
+  });
+});
+
+describe('release critpath CEO pre-signature (RELEASE-PRESIGNED-AUTO)', () => {
+  /** A stub gate (the kit is tested in src/kit/release-preauth): records what critpath asked and answers a fixed outcome. */
+  function preWorld(outcome: 'hit' | 'miss' | 'throw', extra: { records?: ApprovalRecord[]; autoOn?: boolean } = {}) {
+    const w = world(extra.records ? { records: extra.records } : {});
+    const asked: Array<{ record: boolean; cut: string; branchHead: string; dry: boolean; waive?: string }> = [];
+    const lines: string[] = [];
+    const notices: string[] = [];
+    w.deps.log = (line) => lines.push(line);
+    const use = { preAuthId: 'D-20261128-03', version: VERSION, mode: 'surgery' as const, keyId: 'nexus-mshq-20261128', ref: 'release-preauth/9.9.9/surgery/x/y/z',
+      cutSha: CUT, notesSha256: notesSha(), conditions: { 'critical-red-0': 'critical 🔴 0' }, waivers: [{ id: 'C', reason: 'Old theme until reload.' }], at: '2026-11-19T00:00:00.000Z', by: 'critpath' };
+    w.deps.preAuth = {
+      gate: async (input, o) => {
+        asked.push({ record: o.record, cut: input.binding.cutSha, branchHead: String(input.branchHead), dry: Boolean(input.dryRunPass), ...(input.waiveReason ? { waive: input.waiveReason } : {}) });
+        if (outcome === 'throw') throw new Error('ledger exploded');
+        return outcome === 'hit' ? { ok: true, use, fresh: true, hit: { id: use.preAuthId, mode: use.mode, keyId: use.keyId, ref: use.ref, window: { from: 'x', to: 'y' }, result: { ok: true, failures: [], snapshot: use.conditions, waivers: use.waivers } } }
+          : { ok: false, reasons: ['D-20261128-03(auto): window-passed'] };
+      },
+    };
+    if (extra.autoOn) w.deps.autoPublish = { mode: () => 'on-green', redCount: () => 0, openHolds: () => [], decide: () => { throw new Error('on-green must not decide when a pre-signature was used'); }, notify: (b) => notices.push(b) };
+    return { ...w, asked, lines, notices };
+  }
+
+  test('a usable pre-signature approves this cut: no card · publish → npm → verify · ledger keeps the use', async () => {
+    const w = preWorld('hit', { autoOn: true });
+    await runCritpath(opts({ dryRun: true, waiveReason: 'Two minor display issues remain.' }), w.deps);
+    const r = await runCritpath(opts({ waiveReason: 'Two minor display issues remain.' }), w.deps);
+    expect(r.status).toBe('done');
+    expect(w.calls).toEqual(['prepare', 'publish preview', 'npm --dry-run', 'resolve branch', 'resolve branch', 'publish --yes', 'npm publish', 'verify']);
+    expect(w.asked).toEqual([{ record: false, cut: CUT, branchHead: CUT, dry: true, waive: 'Two minor display issues remain.' }, { record: true, cut: CUT, branchHead: CUT, dry: true, waive: 'Two minor display issues remain.' }]);
+    const approval = ledger().entries.filter((e) => e.step === 'approval');
+    expect(approval.map((e) => [e.outcome, e.detail])).toEqual([['ok', 'preauth D-20261128-03 · mode surgery · proof nexus-mshq-20261128 · waived C']]);
+    expect(ledger().preAuthUse?.preAuthId).toBe('D-20261128-03');
+    expect(w.notices).toEqual([`auto-published v9.9.9 · cut ${CUT.slice(0, 12)} · checks preauth D-20261128-03 (surgery) · critical 🔴 0`]);
+    expect(w.lines).toContain('· preauth D-20261128-03 (surgery) would authorize this cut · critical 🔴 0');
+  });
+
+  test('no usable pre-signature: the normal card waits and the waiting row names why', async () => {
+    const w = preWorld('miss');
+    const r = await runCritpath(opts(), w.deps);
+    expect(r.status).toBe('waiting-approval');
+    expect(w.calls).toContain('request approval');
+    expect(w.calls).not.toContain('publish --yes');
+    expect(ledger().entries.at(-1)?.detail).toBe('card D-NEW · preauth skipped {D-20261128-03(auto): window-passed}');
+  });
+
+  test('a throwing gate = no pre-signature (fail closed) · the card waits', async () => {
+    const w = preWorld('throw');
+    const r = await runCritpath(opts(), w.deps);
+    expect(r.status).toBe('waiting-approval');
+    expect(ledger().entries.at(-1)?.detail).toBe('card D-NEW · preauth skipped {gate failed: ledger exploded}');
+  });
+
+  test('the CEO declined this exact cut: a pre-signature never overrides it', async () => {
+    const declined: ApprovalRecord = { id: 'D-NO', refs: [approvalRef(binding())], status: 'decided', choice: 'b', decidedBy: { kind: 'human' } };
+    const w = preWorld('hit', { records: [declined] });
+    const r = await runCritpath(opts(), w.deps);
+    expect(r.status).toBe('failed');
+    expect(w.asked).toEqual([]);
+    expect(w.calls).not.toContain('publish --yes');
   });
 });

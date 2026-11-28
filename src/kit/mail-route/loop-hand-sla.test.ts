@@ -20,16 +20,16 @@ const hand198743 = (block = 'blk-mwz45o10-1', reason = 'DEPENDENCY_WAIT', seat =
   body: `[✋ NEED HUMAN · ${seat}] 기존 수집기 시간 초과로 rc와 영수가 확보되지 않았으며, TC에 기존 원격 실행의 자료 복구 담당선 연결을 요청함(#198742). 중복 시험 금지 유지. · 원하는 것: 이 막힘을 풀 결정·입력 (답장하면 그대로 재개) · 선택지: 재개/중단/다른 방법`,
 });
 
-test('table: the built-in loopHands reads with no problems — GUARDIAN · 10 min · dependency/design back to the routed-from rung · else OP', () => {
+test('table: the built-in loopHands reads with no problems — GUARDIAN · 10 min · every reason to the hand\'s coordinator', () => {
   const t = readHandRoutes([BUILTIN_HAND_ROUTES_FILE]);
   expect(t.problems).toEqual([]);
   expect([...t.loopHands.receivers]).toEqual(['GUARDIAN']);
   expect(t.loopHands.slaMs).toBe(600_000);
-  expect(t.loopHands.byReason).toEqual({ DEPENDENCY_WAIT: 'routed-from', HUMAN_DECISION: 'routed-from', OWNER_UNKNOWN: 'routed-from' });
-  expect(t.loopHands.otherwise).toBe('OP');
+  expect(t.loopHands.byReason).toEqual({});
+  expect(t.loopHands.otherwise).toBe('coordinator');
   // an invalid taker is dropped with a reason; a missing section = no receivers (nothing moves)
   const bad = handRoutesFrom({ version: 1, loopHands: { receivers: ['GUARDIAN'], byReason: { X: 'not an address!' } } });
-  expect(bad.problems).toEqual(['loopHands.byReason.X: not an address! is neither routed-from nor an address']);
+  expect(bad.problems).toEqual(['loopHands.byReason.X: not an address! is neither coordinator, routed-from nor an address']);
   expect(handRoutesFrom({ version: 1 }).loopHands.receivers.size).toBe(0);
 });
 
@@ -62,7 +62,7 @@ test('#198743 shape: DEPENDENCY_WAIT at GUARDIAN past 10 min → re-routed once 
   } finally { s.close(); }
 });
 
-test('SLA edges: young ✋ waits · answered ✋ untouched · env-only reason → left to the HQ beacon card · same cause = one forward', () => {
+test('SLA edges: young ✋ waits · answered ✋ untouched · TOOL_DENIED also back to the coordinator (no ladder → its routed-from rung) · same cause = one forward', () => {
   const s = store();
   try {
     const young = s.append(hand198743('blk-young'));
@@ -76,17 +76,17 @@ test('SLA edges: young ✋ waits · answered ✋ untouched · env-only reason �
     const b = s.append(hand198743('blk-b', 'DEPENDENCY_WAIT', 'TC-H-CC-2'));
     back(s, a.id, 30); back(s, b.id, 25);
     const r = sweepLoopHandSla(s);
-    expect(r.moved.map((m) => [m.msgId, m.to, m.members])).toEqual([[a.id, 'TC', 2]]);
-    expect(r.toBeacon.map((m) => [m.msgId, m.to])).toEqual([[env.id, 'OP']]);
-    const fwd = s.getMessage(r.moved[0]!.mailId!)!;
+    expect(r.moved.map((m) => [m.msgId, m.to, m.members]).sort((x, y) => Number(x[0]) - Number(y[0]))).toEqual([[env.id, 'TC', 1], [a.id, 'TC', 2]]);
+    expect(r.toBeacon).toEqual([]);
+    const fwd = s.getMessage(r.moved.find((m) => m.msgId === a.id)!.mailId!)!;
     expect(fwd.refs).toContain(`hand-escalated-from:${b.id}`); // the repeat closes with the lead
     expect(handClosedOn(s, readHandMail(s, b.id)!)).toBe('escalated');
     expect(handClosedOn(s, readHandMail(s, young.id)!)).toBeNull();
-    expect(handClosedOn(s, readHandMail(s, env.id)!)).toBeNull(); // the beacon (same tick, after this sweep) cards it
+    expect(handClosedOn(s, readHandMail(s, env.id)!)).toBe('escalated');
   } finally { s.close(); }
 });
 
-test('no routed-from ref (✋ sent straight to GUARDIAN) → the else taker; a ✋ to a non-loop address is never touched', () => {
+test('no routed-from ref (✋ sent straight to GUARDIAN) → the ladder coordinator, else the HQ beacon; a ✋ to a non-loop address is never touched', () => {
   const s = store();
   try {
     const direct = s.append({ ...hand198743('blk-direct'), refs: ['block:blk-direct', 'seat:TC-H-POOL-3', 'reason:DEPENDENCY_WAIT'] });
@@ -95,6 +95,8 @@ test('no routed-from ref (✋ sent straight to GUARDIAN) → the else taker; a �
     const r = sweepLoopHandSla(s);
     expect(r.moved).toEqual([]);
     expect(r.toBeacon.map((m) => [m.msgId, m.to])).toEqual([[direct.id, 'OP']]);
+    // with the federation ladder the coordinator is known: shadow names TC
+    expect(sweepLoopHandSla(s, { live: false, parentOf: (seat) => (seat === 'TC-H-POOL-3' ? 'TC' : 'OP') }).moved.map((m) => [m.msgId, m.to])).toEqual([[direct.id, 'TC']]);
     const custom = handRoutesFrom({ version: 1, loopHands: { receivers: ['GUARDIAN'], else: 'TC' } });
     expect(sweepLoopHandSla(s, { table: custom }).moved.map((m) => [m.msgId, m.to])).toEqual([[direct.id, 'TC']]);
   } finally { s.close(); }

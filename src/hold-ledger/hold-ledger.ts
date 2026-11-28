@@ -94,6 +94,13 @@ export function holdsCovering(holds: readonly Hold[], cell: string, now: Date): 
   return holds.filter(h => covers(h, cell, now));
 }
 
+/** SUPERVISORS-EXECUTE-NOT-PROPOSE: the HOLD a loop agent's own act on `target` waits for — a wildcard HOLD, or one naming the
+ *  target's cell («<CELL>» · «<CELL>@<SEAT>»; a lane / PR target names no cell, so only a wildcard holds it) · null = free. */
+export function holdOverTarget(holds: readonly Hold[], target: string, now: Date): Hold | null {
+  const cell = /^([A-Z0-9][A-Z0-9._-]*)(?:@[A-Za-z0-9._-]+)?$/u.exec(target.trim())?.[1] ?? null;
+  return activeHolds(holds, now).find(h => h.cells.includes(WILDCARD) || (cell !== null && h.cells.includes(cell))) ?? null;
+}
+
 // ── unlock conditions (structured; anything else is free text and only the expiry lifts it) ─────────────────────────
 
 export type Unlock = { kind: 'merged'; pr: number } | { kind: 'green'; cell: string } | { kind: 'text'; text: string };

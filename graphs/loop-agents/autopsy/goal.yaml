@@ -25,6 +25,7 @@ rights:
   actions:
     - classify
     - open-cell
+    - reclassify
   never_auto:
     - PR 다시 열기·닫기
     - 런 재발사
@@ -43,3 +44,26 @@ voice:
   per_hour_max: 6
   role: coordinator
 escalate_after_min: 120
+policies:
+  unclassified_deaths_max: 0
+  max_per_tick: 3
+  cooldown_min: 10
+  escalate_after_min: 120
+  heartbeat_every_min: 15
+  subject_lost_ticks: 3
+  window_h: 24
+  classify_batch: 50
+  cell_repeat: 3
+  cell_window_days: 7
+  cells_per_day: 2
+  act_grace_min: 0
+  lesson_repeat_min: 3
+  reflect_window_min: 60
+  lesson_cap: 12
+  knowhow_promote_min: 1
+  knowhow_cap: 5
+  plan_ambiguity_margin: 0
+  unacted_penalty: 0.25
+  plan_llm_per_hour: 0
+  retro_every_h: 6
+  cost_act: 0

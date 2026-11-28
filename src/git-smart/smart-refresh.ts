@@ -25,7 +25,7 @@
 import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { gitAt, SMART_MERGE_IDENTITY, type GitRun } from '../git-fs/smart-run.js';
+import { gitAt, isAncestor, SMART_MERGE_IDENTITY, type GitRun } from '../git-fs/smart-run.js';
 import { conflictCard, forgetOwnResolutions, NO_RERERE_ARGS, RERERE_ARGS, runLadderLlm, runLadderSync, type FileConflict, type LadderResult, type LlmResolve } from './conflict-ladder.js';
 import { revertGuard } from './revert-guard.js';
 import { SHA40 } from './delta.js';
@@ -91,7 +91,7 @@ export function relevantParents(git: GitRun, head: string, main: string, parentH
   for (const p of new Set(parentHeads.map(x => x.toLowerCase()))) {
     if (!SHA40.test(p) || p === head || git(['cat-file', '-e', `${p}^{commit}`]).status !== 0) continue;
     const mb = git(['merge-base', head, p]).stdout.trim();
-    if (!SHA40.test(mb) || git(['merge-base', '--is-ancestor', mb, main]).status === 0) continue;
+    if (!SHA40.test(mb) || isAncestor(git, mb, main)) continue;
     out.push(p);
   }
   return out;
@@ -110,7 +110,7 @@ export function discoverParents(git: GitRun, head: string, mainRef: string, merg
   for (const c of r.stdout.split('\n').filter(Boolean)) {
     if (looked++ >= max) break;
     // a commit already inside a found parent adds nothing new
-    if (found.some(p => git(['merge-base', '--is-ancestor', c, p]).status === 0)) continue;
+    if (found.some(p => isAncestor(git, c, p))) continue;
     let h: string | null = null;
     try { h = mergedHeadOf(c); } catch { h = null; }
     if (h && SHA40.test(h.toLowerCase())) found.push(h.toLowerCase());
@@ -144,7 +144,7 @@ function* refreshSteps(o: SmartRefreshInput): Generator<Step, SmartRefreshResult
       if (rd.status !== 0 || rd.stdout.trim()) { parents = []; break; }
     }
   }
-  if (!parents.length && repo(['merge-base', '--is-ancestor', main, head]).status === 0) return { result: 'up-to-date' };
+  if (!parents.length && isAncestor(repo, main, head)) return { result: 'up-to-date' };
   const method: RefreshMethod = parents.length ? 'rebuild' : 'merge';
   const ownRevs = [head, `^${main}`, ...parents.map(p => `^${p}`)];
   const parentLabel = parents.map(p => p.slice(0, 12)).join(',');

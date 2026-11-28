@@ -1,0 +1,33 @@
+#!/bin/sh
+# eln-gh-shim — GH-PROXY-LAYER ① (0.3.40 P0). Put this directory first on a seat shell's PATH: every `gh …` then goes through
+# `eln gh` (the governed door: secondary-limit cooldown · per-seat budget · shared read cache · src/kit/gh-proxy/door.ts) with the
+# same argv, stdin/stdout, and exit code as the real gh.
+#   · never loops: a gh child of a governed door carries ELN_GH_DOOR=1, and the shim's own `eln gh` child carries
+#     ELN_GH_SHIM_ACTIVE=1 — either one → exec the real gh at once. The real gh = the first `gh` on PATH that is not a shim.
+#   · fail-open: no `eln` on PATH, or eln cannot start (exit 126/127) → the real gh runs ungoverned.
+#   · rollback: take this directory off PATH (or delete this file) — nothing else changes.
+self_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)
+real=${ELN_GH_REAL:-}
+if [ -n "$real" ] && head -c 512 "$real" 2>/dev/null | grep -q 'eln-gh-shim'; then real=''; fi
+if [ -z "$real" ] || [ ! -x "$real" ]; then
+  real=''
+  old_ifs=$IFS; IFS=:
+  for d in $PATH; do
+    [ -n "$d" ] || continue
+    [ -x "$d/gh" ] || continue
+    dd=$(cd "$d" 2>/dev/null && pwd -P) || continue
+    [ "$dd" = "$self_dir" ] && continue
+    head -c 512 "$d/gh" 2>/dev/null | grep -q 'eln-gh-shim' && continue
+    real="$d/gh"; break
+  done
+  IFS=$old_ifs
+fi
+if [ -z "$real" ]; then echo "eln-gh-shim: real gh not found on PATH (shims skipped)" >&2; exit 127; fi
+if [ -n "${ELN_GH_DOOR:-}" ] || [ -n "${ELN_GH_SHIM_ACTIVE:-}" ]; then exec "$real" "$@"; fi
+eln=${ELN_GH_ELN:-}
+[ -n "$eln" ] || eln=$(command -v eln 2>/dev/null)
+if [ -z "$eln" ] || [ ! -x "$eln" ]; then exec "$real" "$@"; fi
+ELN_GH_SHIM_ACTIVE=1 ELN_GH_REAL="$real" "$eln" gh "$@"
+rc=$?
+if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then exec "$real" "$@"; fi
+exit "$rc"

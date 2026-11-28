@@ -1,0 +1,30 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "judge-butler",
+  "name": "judge-butler",
+  "version": "1.0.0",
+  "description": "Judge queue butler — signs greens from same-head evidence, keeps the HOLD ledger honest, answers judge-domain hands; learns which receivers never act on its mail.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "judge-butler",
+          "agent": "../../graphs/loop-agents/judge-butler/agent.yaml",
+          "trigger": "../../graphs/triggers/judge-butler.yaml",
+          "kpis": [
+            "greens_per_hour",
+            "judge_queue_median_wait",
+            "frozen_hands",
+            "hand_answer_sla"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -5,8 +5,9 @@ import { spawnSync } from 'node:child_process';
 import { Database } from 'bun:sqlite';
 import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
+import { readRemoteUrl } from '../../src/git-fs/origin-url.js';
 import { listSchedules } from '../../src/release-loop/release-schedule.js';
-import { checklistDevVersion, devVersion, listChecklist } from '../../src/release-loop/checklist.js';
+import { listChecklist } from '../../src/release-loop/checklist.js';
 import { DecisionLedger } from '../../src/decisions/decision-ledger.js';
 import { selectProact1Lite, type ProactSignals } from '../../src/decisions/proact1-lite.js';
 import { trafficTick, seatOfTree } from '../../src/loops/orchestrator/traffic.js';
@@ -23,6 +24,7 @@ import { debug } from '../../src/debug/log.js';
 import { retroBriefingLines } from '../../src/retro/daily.js';
 import { dispatchCooAdmin } from '../../src/domains/coo-admin-tool.js';
 import { runLinearProgressSync, type ProgressSyncResult } from './linear-progress-sync.js';
+import { boardVersion } from '../../src/release-loop/board-version.js';
 
 export type Section<T> = { status: 'ok'; value: T } | { status: 'unreadable'; reason: string };
 export type Landing = { title: string; seat: string; mergedAt: string; prNumber?: number };
@@ -214,8 +216,8 @@ export async function collectLandings(now: Date, window?: { from: Date; to: Date
   const tree = configuredTree || repo;
   const remote = source?.repoName ?? (() => {
     if (!existsSync(join(tree, '.git'))) return null;
-    const result = spawnSync('git', ['-C', tree, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 5_000 });
-    const path = result.status === 0 ? /(?:github\.com[:/])([^/\s]+\/[^/\s]+)\s*$/.exec(result.stdout)?.[1] : null;
+    const url = readRemoteUrl(tree, { timeoutMs: 5_000 }); // GH-MIRROR-ORIGIN-URL-SAFE: raw configured URL, not the insteadOf mirror
+    const path = url !== null ? /(?:github\.com[:/])([^/\s]+\/[^/\s]+)\s*$/.exec(url)?.[1] : null;
     return path?.replace(/\.git$/, '') ?? null;
   })();
   if (!remote) throw new Error('저장소 미지정');
@@ -256,7 +258,7 @@ export async function collectRelease(): Promise<Release> {
   const root = effectiveInstanceRoot();
   if (!existsSync(join(root, 'release', 'features.sqlite'))) throw new Error('판 원장 없음');
   const schedules = listSchedules(root).sort((a, b) => a.cutAt.localeCompare(b.cutAt));
-  const version = devVersion().replace(/-dev\.\d+$/, '');
+  const version = boardVersion();
   const index = schedules.findIndex(s => s.version === version);
   if (index < 0) throw new Error(`판 일정 없음: ${version}`);
   const current = listChecklist(version, root).items;
@@ -287,7 +289,7 @@ export async function collectGrid(): Promise<Seat[]> {
   if (!existsSync(join(root, 'release', 'features.sqlite'))) throw new Error('판 원장 없음');
   const observation = defaultListHarnessProcesses();
   if (observation.status !== 'ok') throw new Error(`process observation ${observation.status}`);
-  const version = devVersion().replace(/-dev\.\d+$/, '');
+  const version = boardVersion();
   const result = trafficTick({ now: new Date(), caps: cfg.seatCaps, openCells: listChecklist(version, root).items,
     processes: observation.records.map(p => ({ ...p, seat: seatOfTree(p.cwdStatus === 'unknown' ? undefined : p.cwd, cfg) })) });
   return result.seats.map(r => ({ name: r.seat, running: r.running, cap: r.cap, idle: r.idle,
@@ -631,7 +633,7 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
             if (deps.log) deps.log('loop.rhythm-daily', 'linear-progress-config-blocked', { reason: 'issue-allowlist-missing' });
             else loopEvent('rhythm-daily', 'linear-progress-config-blocked', { reason: 'issue-allowlist-missing' });
           } else {
-            linearProgress = await (deps.linearProgressSync ?? runLinearProgressSync)({ version: checklistDevVersion(devVersion()), now, root: deps.root, runId,
+            linearProgress = await (deps.linearProgressSync ?? runLinearProgressSync)({ version: boardVersion(), now, root: deps.root, runId,
               apply: true, allowIssueIdentifiers,
               log: (event, data) => deps.log ? deps.log('loop.rhythm-daily.linear-progress', event, data)
                 : loopEvent('rhythm-daily.linear-progress', event, data) });
@@ -701,8 +703,8 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
     try {
       const remote = deps.repoName ?? (deps.root ? undefined : (() => {
         const tree = deps.repoRoot ?? getUserConfig().ops?.cronRepoRoot ?? repo;
-        const result = spawnSync('git', ['-C', tree, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 5_000 });
-        return result.status === 0 ? /(?:github\.com[:/])([^/\s]+\/[^/\s]+)\s*$/.exec(result.stdout)?.[1]?.replace(/\.git$/, '') : undefined;
+        const url = readRemoteUrl(tree, { timeoutMs: 5_000 }); // GH-MIRROR-ORIGIN-URL-SAFE: raw configured URL
+        return url !== null ? /(?:github\.com[:/])([^/\s]+\/[^/\s]+)\s*$/.exec(url)?.[1]?.replace(/\.git$/, '') : undefined;
       })());
       if (remote) {
         const inventory = cli('gh', 'pr', 'list', '--repo', remote, '--state', 'open', '--limit', '500', '--json', 'number,title,isDraft');

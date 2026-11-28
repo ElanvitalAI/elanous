@@ -2836,6 +2836,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         try {
           const { catchUpTriggerJobs } = await import('../domains/schedule-migrate.js');
           const { defaultSpawnJob } = await import('../domains/schedule-runner.js');
+          const { listSchedules: listScheduleRows } = await import('../domains/schedule-registry.js');
           const runCatchUp = () => catchUpTriggerJobs(bridgeScheduleDb, { spawn: defaultSpawnJob })
             .then((cu) => {
               if (cu.recovered.length > 0) {
@@ -2849,8 +2850,14 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
           if (typeof (bootCuTimer as { unref?: () => void }).unref === 'function') {
             (bootCuTimer as { unref: () => void }).unref();
           }
+          // LOOP-AGENTS-AS-PLUGINS P1 — the outside clock of the trigger registry tick rides the same sweep (src/loops/trigger-clock.ts ·
+          // graphs/policies/trigger-clock.yaml): every loop agent runs on that one crontab tick, so nothing it fires can notice it stop.
+          const runTriggerClock = () => import('../loops/trigger-clock.js')
+            .then(({ sweepTriggerClock }) => sweepTriggerClock({ stateRoot: effectiveInstanceRoot(), schedules: listScheduleRows(bridgeScheduleDb), spawn: defaultSpawnJob }))
+            .then((r) => { if (r.status !== 'ok' && r.status !== 'not-installed') console.log(`[nexus] trigger-clock ${r.status}: ${r.line}`); })
+            .catch(() => { /* best-effort */ });
           // 주기 sweep(데몬 wake-from-sleep 복구) — 5분마다.
-          const cuTimer = setInterval(() => { void runCatchUp(); }, 5 * 60_000);
+          const cuTimer = setInterval(() => { void runCatchUp(); if (process.env.NODE_ENV !== 'test') void runTriggerClock(); }, 5 * 60_000);
           if (typeof (cuTimer as { unref?: () => void }).unref === 'function') {
             (cuTimer as { unref: () => void }).unref();
           }

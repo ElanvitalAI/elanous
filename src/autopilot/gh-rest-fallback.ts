@@ -1,4 +1,5 @@
 import { debug } from '../debug/log.js';
+import { remoteUrlVia } from '../git-fs/origin-url.js';
 import type { CmdResult, CmdRunner } from './pr-manager.js';
 
 type Pull = Record<string, unknown>;
@@ -17,9 +18,9 @@ function hasOnlyFlags(args: readonly string[], start: number, valued: readonly s
 }
 
 function repoFromOrigin(run: CmdRunner, opts?: { cwd?: string }): { owner: string; repo: string } | null {
-  const remote = run('git', ['remote', 'get-url', 'origin'], opts);
-  if (!remote.ok) return null;
-  const value = remote.out.trim();
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+  const value = remoteUrlVia((argv) => { const r = run('git', argv, opts); return r.ok ? r.out : null; });
+  if (!value) return null;
   let path: string;
   try {
     const url = new URL(value);

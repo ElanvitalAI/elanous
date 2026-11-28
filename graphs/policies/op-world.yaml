@@ -34,6 +34,10 @@ helpers:
   - { id: throughput, ledger: loops/throughput-controller.jsonl, max_age_min: 130 }
   - { id: next-action, ledger: loops/op-next-action.jsonl, max_age_min: 130 }
   - { id: fed-turns, ledger: fed-state/facts.jsonl, match: { type: turn, seat: OP }, max_age_min: 180 }
+  # FED-ANALYST-LOOP-AGENT: the 30-min analyst (cron 2,32) — two windows ⊕ slack
+  - { id: fed-analyst, trigger: fed-analyst-agent, max_age_min: 70 }
+  - { id: supervisor-auditor, trigger: supervisor-auditor-agent, max_age_min: 70 }   # SUPERVISOR-AUDITOR-LOOP · cron every 15 ⊕ audit_age_max_min
+  - { id: rail-canary, trigger: rail-canary-agent, max_age_min: 15 }   # RAIL-CANARY-AUTO-ROLLBACK · install.json change ⊕ max_wait 5 · two missed ticks ⊕ slack
 # The OP cheat lines that ride every card (CLI forms OP misused on 11-27 · copied from the installed `--help`).
 # Full card ⊕ the 11-27 decisions = 내부 문서 `KNOWHOW` K-OP-158. Keep ≤ 8 lines; one command per line.
 cheat:

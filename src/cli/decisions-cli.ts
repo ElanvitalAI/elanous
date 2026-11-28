@@ -15,13 +15,16 @@ import { CROWN_MARK, CROWN_THRESHOLD_CATEGORIES, CONSENSUS_CATEGORIES, Consensus
 import { writeStdoutFully } from './stdout-flush.js';
 import { readFileSync } from 'node:fs';
 import { createPrivateKey, sign as cryptoSign } from 'node:crypto';
-import { readDecisionTrustRoots, verifyHumanApprovalProof } from '../decisions/decision-ledger.js';
+import { approvalProofPayload, checkHumanApprovalProof, readDecisionTrustRoots, type HumanProofCheck } from '../decisions/decision-ledger.js';
 import { readQueryCache } from '../storage/short-lived-read-cache.js';
 import { formatDecisionRow } from './decision-list-format.js';
 import { decisionListSince, filterDecisionListSince } from './decision-list-since.js';
 import { openMsgStore } from '../msg/msg-store.js';
 import { resolveSeat } from '../seat-address/seat-address.js';
 import { recordAction } from '../fed-state/actions.js';
+import { crownRecordInput, pointDecisionToBus } from '../kit/decision-bus/index.js';
+import { BUS_HQ_SPACE } from '../op-context-bus/spaces.js';
+import { BUS_COORDINATOR_SEAT } from '../op-context-bus/seat-turn.js';
 // Preserve the formatter export for existing consumers of this CLI module.
 export { formatDecisionRow } from './decision-list-format.js';
 
@@ -60,7 +63,7 @@ export function formatDecisionDetail(e: DecisionEntry): string {
     `올림: ${e.raisedAt ? kst(e.raisedAt) : '시각 미상'} · ${e.raisedBy.agent} · ${version(e.version)}`,
     ...(e.dueAt ? [`기한: ${kst(e.dueAt)}`] : []),
     ...(e.importedAt ? [`가져옴: ${kst(e.importedAt)}`] : []),
-    ...(e.status === 'decided' ? [`결정: ${e.decidedAt ? kst(e.decidedAt) : '시각 미상'} · ${e.decidedBy?.kind === 'auto' ? `AUTO ${e.decidedBy.agent} (${e.decidedBy.delegation})${e.decidedBy.origin ? ` · origin=${e.decidedBy.origin}` : ''}` : e.decidedBy?.kind === 'human' ? `human${e.decidedBy.via ? ` · ${e.decidedBy.via}` : ''}` : e.decidedBy?.kind === 'imported' ? `IMPORTED ${e.decidedBy.source}` : '주체 미상'} · ${e.choice ?? '선택 키 미상'} · ${e.versionAtDecision ? version(e.versionAtDecision) : '결정 당시 판 미상'}`,
+    ...(e.status === 'decided' ? [`결정: ${e.decidedAt ? kst(e.decidedAt) : '시각 미상'} · ${e.decidedBy?.kind === 'auto' ? `AUTO ${e.decidedBy.agent} (${e.decidedBy.delegation})${e.decidedBy.origin ? ` · origin=${e.decidedBy.origin}` : ''}` : e.decidedBy?.kind === 'human' ? `human${e.decidedBy.via ? ` · ${e.decidedBy.via}` : ' · 경로 미기록'}${e.decidedBy.platformUserId ? ` · ${e.decidedBy.platformUserId}` : ''}${e.proof ? ` · 증명 ${e.proof.keyId}` : ''}` : e.decidedBy?.kind === 'imported' ? `IMPORTED ${e.decidedBy.source}` : '주체 미상'} · ${e.choice ?? '선택 키 미상'} · ${e.versionAtDecision ? version(e.versionAtDecision) : '결정 당시 판 미상'}`,
       ...(e.note ? [`메모: ${e.note}`] : [])] : []),
     ...(e.withdrawnAt ? [`철회: ${kst(e.withdrawnAt)} · ${e.withdrawReason}`] : []),
     '이력:', ...e.history.map(h => `  ${h.type} · ${h.at ? kst(h.at) : '시각 미상'} · ${h.by}${h.choice ? ` · ${h.choice}` : ''}${h.reason ? ` · ${h.reason}` : ''} · ${h.version ? version(h.version) : '판 미상'}`),
@@ -87,7 +90,15 @@ export function isHumanTerminal(env: Readonly<Record<string, string | undefined>
 
 export const HUMAN_DECIDE_REFUSED = 'CLI는 사람 신원을 검증할 수 없어 human 결정을 기록하지 않는다 — 자동화 결정은 --auto --agent <이름> --delegation <근거>';
 
-export function registerDecisionsCommands(program: Command, config: DecisionLedgerOptions & { humanTerminal?: () => boolean } = {}, out: Pick<Console, 'log'> = console, hqDeps: HqDeps = {}): void {
+/** Injection seams for `decisions signer rotate|revoke` (tests): the person's-terminal check, the typed code, the OP notice. */
+export interface SignerCliSeams {
+  terminal?: () => { ok: true } | { ok: false; line: string };
+  ask?: (prompt: string) => Promise<string>;
+  notify?: (line: string) => void;
+  ownerLedgerPath?: string;
+  host?: string;
+}
+export function registerDecisionsCommands(program: Command, config: DecisionLedgerOptions & { humanTerminal?: () => boolean; signer?: SignerCliSeams } = {}, out: Pick<Console, 'log'> = console, hqDeps: HqDeps = {}): void {
   const noXcheck = new Option('--no-xcheck <이유>', '교차 확인 생략 이유');
   // This flag takes a reason, not Commander's negated boolean default.
   noXcheck.negate = false;
@@ -227,6 +238,34 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       recordAction({ kind: 'decision', verb: 'record', by: o.seat, ref: entry.id, why: o.title, source: 'decisions' });
       return emit(entry, o.json, formatSeatDecisionRow(entry));
     }));
+  // DECISION-TO-BUS-AUTO — Claude OP's one line: record a CEO decision once (ledger = the effect) → the HQ bus pointer follows.
+  root.command('crown <summary...>').description('\u{1F451} 결정 한 줄 기록 — 원장(효력) 한 줄 ⊕ HQ 맥락 버스 포인터 자동 (같은 원문·시각 재실행 = 그대로)')
+    .requiredOption('--quote <text>', '\u{1F451} 원문 그대로').option('--at <when>', '결정 시각 UTC ISO (기본 지금)').option('--doc <path>', '정본 문서 경로 (예: docs/conductor/X.md §8b)')
+    .option('--category <category>', '기본 other')
+    // ELN-OP-CROWN-MEMORY — a directive that binds seats: eln OP's assign / owner handoff is checked against it until it expires.
+    .option('--seat <SEAT>', '지시 대상 자리 (반복 · 그 자리의 손 포함)', repeat, [] as string[])
+    .option('--only <pattern>', '대상 자리가 가질 수 있는 칸 (정확한 id 또는 접두 DOCS-* · 반복)', repeat, [] as string[])
+    .option('--never <pattern>', '대상 자리에게 주면 안 되는 칸 (반복)', repeat, [] as string[])
+    .option('--until <when>', '지시 만료 UTC ISO 또는 +Nh (기본 = 정책 default_expiry_h)')
+    .option('--json').option('--hq-override')
+    .action((summary: string[], o: { quote: string; at?: string; doc?: string; category?: DecisionCategory; seat: string[]; only: string[]; never: string[]; until?: string; json?: boolean; hqOverride?: boolean }) => fail(() => {
+      if (!mayWrite('crown', o.hqOverride)) return;
+      const at = new Date(o.at?.trim() ? o.at.trim() : (config.now?.() ?? new Date()).toISOString());
+      if (!Number.isFinite(at.getTime())) throw new Error(`invalid --at: ${o.at}`);
+      const seat = actorSeat(process.env.AI_AGENT?.trim() || 'CLAUDE-OP');
+      if (!o.seat.length && (o.only.length || o.never.length || o.until)) throw new Error('--only/--never/--until need --seat <SEAT>');
+      const until = o.until ? new Date(dueAt(o.until)) : undefined;
+      if (until && !Number.isFinite(until.getTime())) throw new Error(`invalid --until: ${o.until}`);
+      const directive = o.seat.length ? { seats: o.seat.map(s => s.trim().toUpperCase()), only: o.only, never: o.never, ...(until ? { until: until.toISOString() } : {}) } : null;
+      const { input, ref, note, source } = crownRecordInput({ summary: summary.join(' '), quote: o.quote, at: at.toISOString(), ...(o.doc ? { doc: o.doc } : {}), seat, ...(o.category ? { category: o.category } : {}), directive });
+      const ledger = new DecisionLedger(config);
+      const existing = ledger.list({ status: 'all' }).find(e => e.refs?.includes(ref));
+      const entry = existing ?? ledger.importRecorded(input, undefined, { kind: 'imported', source }, note);
+      if (!existing) recordAction({ kind: 'decision', verb: 'record', by: seat, ref: entry.id, why: entry.title, source: 'decisions' });
+      const bus = pointDecisionToBus(config.stateDir ?? elanousStateRoot(), entry, BUS_HQ_SPACE, BUS_COORDINATOR_SEAT, (config.now?.() ?? new Date()).getTime());
+      const busLine = bus?.kind === 'posted' ? `버스 ${bus.entry.id} @${BUS_HQ_SPACE}` : bus ? `버스 이미 있음 ${bus.id}` : '버스 실패 — 다음 decision-bus 틱이 다시 올린다';
+      return emit({ entry, existing: !!existing, bus }, o.json, `${existing ? '이미 기록됨' : '기록'}: ${entry.id} · ${entry.title} · ${busLine}`);
+    }));
   root.command('seat-report').description('밤사이 자리들의 사후 결정을 한 번에 조회 (기본 최근 24시간)')
     .option('--since <date>', '조회 시작 UTC ISO 또는 Nd', '1d').option('--seat <OP|MK|TC|UX>').option('--json')
     .action((o: { since: string; seat?: Seat; json?: boolean }) => fail(() => {
@@ -302,27 +341,124 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
     }));
   root.command('withdraw <id>').description('결정 철회도 원장에 남긴다').requiredOption('--reason <reason>').option('--json').option('--hq-override')
     .action((id: string, o: { reason: string; json?: boolean; hqOverride?: boolean }) => fail(() => { if (!mayWrite('withdraw', o.hqOverride)) return; const entry = new DecisionLedger(config).withdraw(id, o.reason); return emit(entry, o.json, `철회: ${formatDecisionDetail(entry)}`); }));
-  root.command('verify').description('결정 원장 사슬 검증 · 대역 밖 사람 증명 재확인 (사슬 파손·미확인 증명 시 exit 1)')
+  const proofLine = (id: string, c: HumanProofCheck | null): string => !c ? `human 결정 ${id}: 증명 대상 아님`
+    : c.ok ? `human 결정 ${id}: 증명 확인(${c.keyId})` : `human 결정 ${id}: 증명 미확인(reason=${c.reason}${c.keyId ? ` · ${c.keyId}` : ''})`;
+  root.command('verify [id]').description('결정 원장 사슬 검증 · 대역 밖 사람 증명 재확인 (id 를 주면 그 결정만 · 사슬 파손·미확인 증명 시 exit 1)')
     .option('--json')
-    .action((o: { json?: boolean }) => fail(() => {
+    .action((id: string | undefined, o: { json?: boolean }) => fail(() => {
       const led = new DecisionLedger(config);
       const chain = led.verifyChain();
       const roots = readDecisionTrustRoots(config.stateDir ?? elanousStateRoot());
-      const humans = led.list({ status: 'all' }).filter(e => e.decidedBy?.kind === 'human');
-      const proofs = humans.map(e => ({ id: e.id, proof: e.proof ? { keyId: e.proof.keyId, verified: e.refs?.some(ref => verifyHumanApprovalProof(ref, e.proof, roots)) ?? false } : null }));
-      const unverified = proofs.filter(p => !p.proof?.verified);
-      if (!chain.ok || unverified.length) process.exitCode = 1;
+      const all = led.list({ status: 'all' });
+      const humans = id ? [led.show(id)] : all.filter(e => e.decidedBy?.kind === 'human');
+      // RELEASE-HUMAN-PROOF-TRUST-ROOT: the reason code is printed as-is (no-proof · no-roots · unknown-key · bad-sig · …).
+      const proofs = humans.map(e => {
+        const checks = (e.refs ?? []).map(ref => checkHumanApprovalProof(e, ref, roots));
+        const check = checks.find(c => c.ok) ?? checks[0] ?? (e.decidedBy?.kind === 'human' ? checkHumanApprovalProof(e, '', roots) : null);
+        return { id: e.id, via: e.decidedBy?.kind === 'human' ? e.decidedBy.via ?? null : null, proof: check, ...(e.proof ? { keyId: e.proof.keyId } : {}) };
+      });
+      const unverified = proofs.filter(p => p.proof !== null && !p.proof.ok);
+      if (!chain.ok || unverified.length) process.exitCode = 1; // a broken chain fails a single-id check too (Terra r1)
       return emit({ chain, trustRoots: roots.length, proofs }, o.json,
         `사슬 ${chain.ok ? '양호' : '파손'}${chain.problems.length ? ` · ${chain.problems.join(' · ')}` : ''} · 과거(무사슬) 행 ${chain.legacy} · 신뢰 뿌리 ${roots.length}개\n` +
-        (proofs.length ? proofs.map(p => `human 결정 ${p.id}: ${p.proof ? (p.proof.verified ? `증명 확인(${p.proof.keyId})` : `증명 미확인(${p.proof.keyId})`) : '증명 없음 — unverified'}`).join('\n') : 'human 결정 0건'));
+        (proofs.length ? proofs.map(p => proofLine(p.id, p.proof)).join('\n') : 'human 결정 0건'));
     }));
-  root.command('sign-approval').description('대역 밖 승인 서명 — 사람 키 장치에서만 실행 (개인 키는 우편·보고에 올리지 않는다)')
+  root.command('sign-approval').description('대역 밖 승인 서명(elanous-approval/v2) — 사람 키 장치에서만 실행 (개인 키는 우편·보고에 올리지 않는다)')
     .requiredOption('--ref <approvalRef>', '서명할 승인 묶음 참조 (release-critpath/<v>/<cut>/<notesSha>)')
+    .requiredOption('--card <id>', '결정 카드 id').requiredOption('--raised-at <iso>', '카드 raisedAt')
+    .requiredOption('--choice <key>').requiredOption('--via <via>').requiredOption('--platform-user <id>')
     .requiredOption('--key <private-pem>', '사람 개인 키 PEM 경로')
     .option('--json')
-    .action((o: { ref: string; key: string; json?: boolean }) => fail(() => {
-      const sig = cryptoSign(null, Buffer.from(o.ref, 'utf8'), createPrivateKey(readFileSync(o.key, 'utf8'))).toString('hex');
-      return emit({ ref: o.ref, sig }, o.json, `ref: ${o.ref}\nsig: ${sig}`);
+    .action((o: { ref: string; card: string; raisedAt: string; choice: string; via: string; platformUser: string; key: string; json?: boolean }) => fail(() => {
+      const payload = approvalProofPayload({ ref: o.ref, cardId: o.card, raisedAt: o.raisedAt, choice: o.choice, via: o.via, platformUserId: o.platformUser });
+      const sig = cryptoSign(null, Buffer.from(payload, 'utf8'), createPrivateKey(readFileSync(o.key, 'utf8'))).toString('hex');
+      return emit({ ref: o.ref, card: o.card, sig }, o.json, `ref: ${o.ref}\ncard: ${o.card}\nsig: ${sig}`);
+    }));
+  // RELEASE-HUMAN-PROOF-TRUST-ROOT ④ — the release approval signer. status is read-only; rotate/revoke only from a person's terminal.
+  const signer = root.command('signer').description('발행 승인 서명 키(nexus · TG 봇 주인) — status · rotate · revoke(사람 터미널만)');
+  const seams = config.signer ?? {};
+  const signerOpts = () => ({ stateDir: config.stateDir, ...(seams.ownerLedgerPath ? { ownerLedgerPath: seams.ownerLedgerPath } : {}), ...(seams.host ? { host: seams.host } : {}) });
+  const personTerminal = async (command: string): Promise<{ ok: true } | { ok: false; line: string }> => {
+    if (seams.terminal) return seams.terminal();
+    const { humanTerminalPreflight, defaultProcLookup, defaultProcMeta } = await import('../proxy/proxy-identity.js');
+    const pre = humanTerminalPreflight({ selfPid: process.pid, stdinIsTTY: process.stdin.isTTY === true, lookup: defaultProcLookup(), meta: defaultProcMeta(), command });
+    return pre.ok ? { ok: true } : { ok: false, line: pre.line };
+  };
+  const confirmCode = async (prompt: string): Promise<boolean> => {
+    const { grantConfirmCode } = await import('../proxy/proxy-identity.js');
+    const code = grantConfirmCode();
+    const ask = seams.ask ?? (async (p: string) => {
+      const { createInterface } = await import('node:readline');
+      const rl = createInterface({ input: process.stdin, output: process.stderr, terminal: true });
+      try { return await new Promise<string>((resolve) => rl.question(p, resolve)); } finally { rl.close(); }
+    });
+    return (await ask(`${prompt}\nType ${code} to continue: `)).trim().toUpperCase() === code;
+  };
+  const signerNotice = (line: string) => {
+    try {
+      if (seams.notify) return seams.notify(line);
+      const store = openMsgStore(join(config.stateDir ?? elanousStateRoot(), 'msg', 'messages.db'));
+      try { store.post({ from: 'RELEASE-PROOF', to: 'OP', kind: 'info', body: line }); } finally { store.close(); }
+    } catch { /* the signer audit row is the record */ }
+  };
+  signer.command('status').description('서명 키 상태 (키 내용은 출력하지 않는다)').option('--json')
+    .action((o: { json?: boolean }) => fail(async () => {
+      const { signerStatus, signerKeyMode, signerPaths } = await import('../decisions/approval-signer.js');
+      const status = signerStatus(signerOpts());
+      const mode = signerKeyMode(config.stateDir ?? elanousStateRoot());
+      const paths = signerPaths(config.stateDir ?? elanousStateRoot());
+      const row = { ...status, keyMode: mode ? { dir: mode.dir.toString(8), key: mode.key.toString(8) } : null, trustRoot: paths.trustRoot };
+      return emit(row, o.json, `서명자 ${status.state}${status.keyId ? ` · ${status.keyId}` : ''} · 신뢰 뿌리 ${status.roots}개 · 주인 ${status.ownerHost ?? '미등록'}${mode ? ` · 권한 ${mode.dir.toString(8)}/${mode.key.toString(8)}` : ''}${status.detail ? ` · ${status.detail}` : ''}`);
+    }));
+  signer.command('rotate').description('새 키로 교체 — 옛 keyId 는 신뢰 뿌리에 남아 과거 증명을 계속 확인한다 (사람 터미널만)')
+    .action(() => fail(async () => {
+      const gate = await personTerminal('eln decisions signer rotate');
+      if (!gate.ok) { process.exitCode = 1; return emit(null, false, gate.line); }
+      if (!(await confirmCode('Rotate the release approval signer? A new key signs from now; old proofs keep verifying.'))) { process.exitCode = 1; return emit(null, false, 'eln decisions signer rotate: not rotated (code mismatch)'); }
+      const { rotateApprovalSigner } = await import('../decisions/approval-signer.js');
+      const r = rotateApprovalSigner(signerOpts());
+      signerNotice(`[release.proof] 서명 키 회전 · 새 ${r.keyId}${r.previous ? ` · 옛 ${r.previous}(뿌리에 남김)` : ''}`);
+      return emit(r, false, `rotated → ${r.keyId}${r.previous ? ` (previous ${r.previous} kept in the trust root)` : ''}`);
+    }));
+  signer.command('revoke <keyId>').description('keyId 를 신뢰 뿌리에서 지운다 — 그 키의 증명은 더 확인되지 않는다 (사람 터미널만)')
+    .action((keyId: string) => fail(async () => {
+      const gate = await personTerminal('eln decisions signer revoke');
+      if (!gate.ok) { process.exitCode = 1; return emit(null, false, gate.line); }
+      if (!(await confirmCode(`Revoke ${keyId}? Proofs signed by it stop verifying.`))) { process.exitCode = 1; return emit(null, false, 'eln decisions signer revoke: not revoked (code mismatch)'); }
+      const { revokeApprovalSigner } = await import('../decisions/approval-signer.js');
+      const r = revokeApprovalSigner(keyId, signerOpts());
+      if (!r.revoked) { process.exitCode = 1; return emit(r, false, `${keyId}: not in the trust root`); }
+      signerNotice(`[release.proof] 서명 키 폐기 · ${keyId}${r.deletedPrivateKey ? ' · 개인 키 삭제' : ''}`);
+      return emit(r, false, `revoked ${keyId}${r.deletedPrivateKey ? ' (private key deleted)' : ''}`);
+    }));
+  // RELEASE-PRESIGNED-AUTO — the CEO's pre-authorization card (kit/release-preauth): raise · list · revoke.
+  // The signature comes only from the owner's TG/PWA tap (two-step confirm · nexus signer); this CLI never signs.
+  const preauth = root.command('preauth').description('발행 사전 승인(대표가 미리 서명) — raise · list · revoke · 서명은 TG/PWA 소유자 탭만');
+  const preauthState = () => config.stateDir ?? elanousStateRoot();
+  preauth.command('raise').description('사전 승인 카드를 올린다 — 판 · 모드(auto|surgery) · 창(기본 = 다음 발행 시각 ±정책 분) · 조건은 정책 YAML')
+    .requiredOption('--version <x.y.z>').requiredOption('--mode <auto|surgery>').option('--from <iso>').option('--to <iso>').option('--json').option('--hq-override')
+    .action((o: { version: string; mode: string; from?: string; to?: string; json?: boolean; hqOverride?: boolean }) => fail(async () => {
+      if (!mayWrite('preauth raise', o.hqOverride)) { process.exitCode = 1; return; }
+      const { loadPreAuthPolicy, raisePreAuth } = await import('../kit/release-preauth/index.js');
+      const { getSchedule } = await import('../release-loop/release-schedule.js');
+      let publishAt: string | null = null;
+      try { publishAt = getSchedule(o.version)?.publishAt ?? null; } catch { publishAt = null; }
+      const r = raisePreAuth(new DecisionLedger(config), loadPreAuthPolicy(), { version: o.version, mode: o.mode as 'auto' | 'surgery', from: o.from, to: o.to, publishAt, now: new Date(), raisedBy: 'release-preauth' });
+      return emit(r, o.json, `${r.id} · ${r.status} · ${r.ref} — 대표가 TG/PWA 에서 A → 확인을 누르면 서명된다`);
+    }));
+  preauth.command('list').description('사전 승인 카드와 지금 상태(서명 대기 · 예정 · 활성 · 사용됨 · 취소 · 만료)').option('--version <x.y.z>').option('--json')
+    .action((o: { version?: string; json?: boolean }) => fail(async () => {
+      const { listPreAuth, formatPreAuthRow, readPreAuthUses, readPreAuthRevocations } = await import('../kit/release-preauth/index.js');
+      const rows = listPreAuth({ records: new DecisionLedger(config).list({ status: 'all' }), trustRoots: readDecisionTrustRoots(preauthState()),
+        uses: readPreAuthUses(preauthState()), revocations: readPreAuthRevocations(preauthState()), now: new Date(), ...(o.version ? { version: o.version } : {}) });
+      return emit(rows, o.json, rows.length ? rows.map(formatPreAuthRow).join('\n') : '사전 승인 없음');
+    }));
+  preauth.command('revoke <id>').description('사전 승인 취소 — 권한을 줄이기만 하므로 누구나 · 언제든').requiredOption('--reason <text>').option('--json').option('--hq-override')
+    .action((id: string, o: { reason: string; json?: boolean; hqOverride?: boolean }) => fail(async () => {
+      if (!mayWrite('preauth revoke', o.hqOverride)) { process.exitCode = 1; return; }
+      const { revokePreAuth } = await import('../kit/release-preauth/index.js');
+      const r = revokePreAuth(preauthState(), id, process.env.ELANOUS_TRACK ? `cli:${process.env.ELANOUS_TRACK}` : 'cli', o.reason, new Date());
+      return emit({ id, ...r }, o.json, `${id} ${r.already ? '이미 취소됨' : '취소됨'}`);
     }));
   root.command('import-markdown <file>').description('기존 대표 결정 문서 씨앗을 가져온다 (재실행 안전)').option('--json').option('--hq-override')
     .action((file: string, o: { json?: boolean; hqOverride?: boolean }) => fail(() => {

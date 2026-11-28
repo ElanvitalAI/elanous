@@ -30,7 +30,7 @@ import { LAUNCH_DOOR_RECEIPT_ENV, TA_PREFLIGHT_RECEIPT_ENV, TA_PREFLIGHT_SHA_ENV
 import { withFileLockSync } from '../storage/file-lock.js';
 import { checkCompletionEvidence, deliverableReceiptEvidence } from './completion-evidence.js';
 import { judgeNextMove } from './judge.js';
-import { checklistDevVersion, listChecklist } from '../release-loop/checklist.js';
+import { listChecklist } from '../release-loop/checklist.js';
 import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 import { POD_DISTRIBUTOR_ENTRY_ENV, TASK_HAND_POD_DISTRIBUTOR_ENTRY } from './pod-distributor-entry.js';
 // Keep doctor-visit recording synchronous: updateTaskCard callers observe it before the transition returns.
@@ -56,6 +56,7 @@ import type { TaskAgentStateFile } from './task-card-state.js';
 export { TASK_SEATS, TaskAgentStateError, cardPrNumber, readTaskAgentState, readTaskCard, taskAgentStatePath, updateTaskCard, updateTaskCardsAtomically, writeTaskCards, TaskCardSupersededError } from './task-card-state.js';
 import { childLlmEffortProblem } from '../intelligence-map/model-catalog.js';
 import { isImageDigestPin } from '../task-orchestrator/surfaces/pod-image-digest-check.js';
+import { boardVersion as currentBoardVersion } from '../release-loop/board-version.js';
 
 export interface ResolveHandTextDeps {
   cwd: string;
@@ -970,7 +971,7 @@ export function runTagChange(id: string, input: { tag: string; by: string; reaso
 /** RUN-IDENTITY-TAGS — 칸 읽기(기본): 칸보드 `version`(기본 = 개발 판)에서 `checklistId` 로 읽는다. 읽기 실패·빠칸은 조용히 `undefined`(= «모른다») — 호출자는 기본 신분을 세우지 않고 명시 태그만 담는다(나머지 «미기록»). */
 export function readChecklistCellForBirth(checklistId: string, boardVersion?: string): { title?: string; priority?: string; version?: string } | undefined {
   try {
-    const version = boardVersion ?? checklistDevVersion();
+    const version = boardVersion ?? currentBoardVersion();
     const cell = listChecklist(version).items.find((item) => item.id === checklistId);
     return cell ? { title: cell.title, priority: cell.priority, version } : undefined;
   } catch { return undefined; }

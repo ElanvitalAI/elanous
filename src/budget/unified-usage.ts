@@ -7,6 +7,10 @@
 // (credits axis) + 7-day window (subscription axis), from the OAuth usage endpoint.
 // Gemini is intentionally out of this landing.
 
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { decodeJWTPayload } from '../oauth/jwt.js';
 import { createCodexFetcher, type CodexFetcherOpts } from './fetchers/codex.js';
 import { createClaudeFetcher, resolveClaudeAccessToken } from './fetchers/claude.js';
 import {
@@ -51,6 +55,8 @@ export interface UnifiedUsageDeps {
   /** Test seam — same injection convention as listCodexAccounts. */
   readonly resolveGrokCredential?: () => unknown;
   readonly loadCodexHome?: (storeKey: string) => string | undefined;
+  /** KEYS-PROACTIVE-REFRESH: `<home>/auth.json` text (test seam · default = the file). */
+  readonly readCodexAuth?: (home: string) => string;
   readonly fetchCodex?: (opts: CodexFetcherOpts) => Promise<UsageSnapshot>;
   /** Reads a Codex account's reset credits without consuming them. */
   readonly listCodexResetCredits?: (opts: { env?: NodeJS.ProcessEnv }) => Promise<CodexResetCreditsResult>;
@@ -315,6 +321,8 @@ async function collectCodexRows(deps: UnifiedUsageDeps): Promise<AccountUsageRow
   const rows: AccountUsageRow[] = [];
   for (const account of accounts) {
     const home = loadHome(account.storeKey);
+    // the default account's home is ~/.codex (or CODEX_HOME) on a live read only — an injected fetcher (tests) never reads the host's
+    const token = codexTokenAxis(home ?? (account.name === 'default' && !deps.fetchCodex ? (process.env.CODEX_HOME?.trim() || join(homedir(), '.codex')) : undefined), deps.readCodexAuth);
     const resetCreditsPromise = collectResetCreditExpiry(listResetCredits, home, warningWindowMs, nowMs)
       .catch((error): ResetCreditExpiryAxis => ({
         status: 'unavailable',
@@ -330,6 +338,7 @@ async function collectCodexRows(deps: UnifiedUsageDeps): Promise<AccountUsageRow
         credits: creditsFromCodexSnapshot(snap),
         subscription: subscriptionFromCodexSnapshot(snap),
         resetCredits: await resetCreditsPromise,
+        ...(token ? { token } : {}),
       });
     } catch (err) {
       rows.push({
@@ -340,10 +349,22 @@ async function collectCodexRows(deps: UnifiedUsageDeps): Promise<AccountUsageRow
         credits: { status: 'error', detail: err instanceof Error ? err.message : String(err) },
         subscription: { status: 'unavailable', reason: 'query-does-not-supply' },
         resetCredits: await resetCreditsPromise,
+        ...(token ? { token } : {}),
       });
     }
   }
   return rows;
+}
+
+/** The login's own expiry from `<home>/auth.json`: access JWT `exp` ⊕ `last_refresh` — times only, the token never leaves. */
+export function codexTokenAxis(home: string | undefined, read: (home: string) => string = (h) => readFileSync(join(h, 'auth.json'), 'utf8')): AccountUsageRow['token'] | undefined {
+  if (!home) return undefined;
+  try {
+    const j = JSON.parse(read(home)) as { last_refresh?: unknown; tokens?: { access_token?: unknown } };
+    const tok = typeof j.tokens?.access_token === 'string' ? j.tokens.access_token : null;
+    const exp = tok ? decodeJWTPayload(tok)?.exp : undefined;
+    return { home: home.replace(homedir(), '~'), accessExpiresAt: typeof exp === 'number' ? new Date(exp * 1000).toISOString() : null, lastRefresh: typeof j.last_refresh === 'string' ? j.last_refresh : null };
+  } catch { return undefined; }
 }
 
 async function collectGrokRows(deps: UnifiedUsageDeps): Promise<AccountUsageRow[]> {
@@ -657,7 +678,8 @@ function formatRow(row: AccountUsageRow): string {
   const resetsIn = formatWindowResetsIn(row.credits);
   const resetCredits = formatResetCreditExpiryCell(row.resetCredits);
   const subscription = formatSubscriptionCell(row.subscription);
-  return `  ${row.provider.padEnd(10)} ${safeUsageAccountName(row.accountName).padEnd(11)} ${String(row.accountCount).padEnd(8)} ${credits.padEnd(20)} ${window.padEnd(26)} ${resetsIn.padEnd(22)} ${resetCredits.padEnd(36)} ${subscription}${row.note ? `  — ${row.note}` : ''}`;
+  const token = row.token ? `  — token ${row.token.home} access exp=${row.token.accessExpiresAt ?? 'unknown'} · last_refresh=${row.token.lastRefresh ?? 'unknown'}` : '';
+  return `  ${row.provider.padEnd(10)} ${safeUsageAccountName(row.accountName).padEnd(11)} ${String(row.accountCount).padEnd(8)} ${credits.padEnd(20)} ${window.padEnd(26)} ${resetsIn.padEnd(22)} ${resetCredits.padEnd(36)} ${subscription}${row.note ? `  — ${row.note}` : ''}${token}`;
 }
 
 function formatResetCreditExpiryCell(expiry: ResetCreditExpiryAxis): string {
@@ -666,9 +688,10 @@ function formatResetCreditExpiryCell(expiry: ResetCreditExpiryAxis): string {
     case 'unavailable': return `unavailable (${expiry.detail})`;
     case 'none': return 'none';
     case 'unknown-expiry': return 'available expiry=unknown';
-    case 'available': return `available expires=${expiry.expiresAt}${expiry.hasUnknownExpiry ? ' +unknown' : ''}`;
-    case 'expiring-soon': return `EXPIRING-SOON expires=${expiry.expiresAt}${expiry.hasUnknownExpiry ? ' +unknown' : ''}`;
-    case 'expired': return `EXPIRED expires=${expiry.expiresAt}${expiry.hasUnknownExpiry ? ' +unknown' : ''}`;
+    // KEYS-PROACTIVE-REFRESH: «reset-credit» in the cell — 11-28 the bare «expires=» was read as the login token's expiry.
+    case 'available': return `available reset-credit expires=${expiry.expiresAt}${expiry.hasUnknownExpiry ? ' +unknown' : ''}`;
+    case 'expiring-soon': return `EXPIRING-SOON reset-credit expires=${expiry.expiresAt}${expiry.hasUnknownExpiry ? ' +unknown' : ''}`;
+    case 'expired': return `EXPIRED reset-credit expires=${expiry.expiresAt}${expiry.hasUnknownExpiry ? ' +unknown' : ''}`;
   }
 }
 

@@ -3,8 +3,9 @@
 // (run-lifecycle.ts · hygiene.ts · flow.ts); here:
 //   SUP-SUBJECT-LOST  — «환자를 잃은 의사»: every supervisor whose subject cannot be read 3 ticks in a row proposes a reattach
 //                       to its L0 once (never idle), says it in its channel, and keeps the KPI unknown (not 0).
-//   SUP-GUARDIAN-PULSE — the guardian's resident pulse (src/guardian-agent/pulse.ts · #40362): dead supervisor → one restart ⊕
-//                       owner line · bad 90 min → reattach proposal to its owner (never retire) · healthy untouched.
+//   SUP-GUARDIAN-PULSE — the guardian's resident pulse (src/guardian-agent/pulse.ts · #40362): dead supervisor → counted in the
+//                       맥박 KPI only (the trigger registry refires and cards · P1) · bad 90 min → reattach proposal to its owner
+//                       (never retire) · healthy untouched.
 // Expectations are independent literals (rule 11): the seat names and counts below are written out, not read from the cards.
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -15,6 +16,7 @@ import { tickAgent, type AgentBody, type AgentPorts } from '../../../loop-agent/
 import { fileMemory } from '../../../judge-butler/memory.js';
 import { GUARDIAN_DEMOTERS, GUARDIAN_ID, GUARDIAN_SUPERVISOR, type GuardianPorts, type GuardianView } from '../../../guardian-agent/body.js';
 import { runResidentPulse, type PulseDeps } from '../../../guardian-agent/pulse.js';
+import { readPulseSnapshot } from '../../../guardian-agent/world.js';
 import type { SimWorldScenario, SimWorldScenarioOutcome } from '../types.js';
 
 const fail = (reason: string, diff: string): SimWorldScenarioOutcome => ({ ok: false, reason, diff });
@@ -62,7 +64,7 @@ export const simWorldScenarios: readonly SimWorldScenario[] = [
   },
   {
     id: 'SUP-GUARDIAN-PULSE',
-    title: 'guardian pulse (수호자 맥박): a dead supervisor is restarted once and its owner told · a long-bad one gets a reattach proposal to its owner · healthy ones untouched',
+    title: 'guardian pulse (수호자 맥박): a dead supervisor is counted, never restarted or carded here (the trigger registry owns it · LOOP-AGENTS-AS-PLUGINS P1) · a long-bad one gets a reattach proposal to its owner · healthy ones untouched',
     async run(ctx) {
       // Literal cases per seed: which supervisor is dead, its owner, and which one has been bad for 90 min.
       const CASES = [
@@ -78,7 +80,7 @@ export const simWorldScenarios: readonly SimWorldScenario[] = [
         const memory = fileMemory(root, { agent: GUARDIAN_ID, supervisor: GUARDIAN_SUPERVISOR, demoters: GUARDIAN_DEMOTERS });
         const now = new Date(Date.parse('2026-11-27T10:00:00Z') + seed * 60_000);
         const at = (min: number) => new Date(now.getTime() - min * 60_000).toISOString();
-        const posts: Array<{ to: string; body: string }> = []; const restarts: string[] = [];
+        const posts: Array<{ to: string; body: string }> = [];
         const view: GuardianView = { now, probes: [{ host: 'minim5', reachable: true, load1: 2, ncpu: 18 }], procs: new Map(), registry: new Map(), ready: { total: 0, p0: 0 }, hands: [] };
         const ports: GuardianPorts = { memory, kill: () => ({ killed: [], skipped: [] }), writeRoute: () => {}, post: (_k, to, body) => { posts.push({ to, body }); return posts.length; }, audit: () => {} };
         const ids = ['land-graph', 'judge-butler', 'op-bulletin'];
@@ -88,16 +90,16 @@ export const simWorldScenarios: readonly SimWorldScenario[] = [
           probes: () => [...view.probes], fuelSnapshot: () => null, refreshFuel: () => {}, credentials: () => [], scanSecrets: () => [],
           supervisors: () => ids.map(id => ({ id, owner: owners[id]!, everyMin: 10, via: 'trigger' as const, lastStatus: 'done',
             lastAt: at(id === c.dead ? 120 : 3), badSince: id === c.bad ? at(90) : null })),
-          restart: id => { restarts.push(id); },
           post: (_k, to, body) => { posts.push({ to, body }); return posts.length; },
           heavy: () => ({ view, ports, close: () => {} }),
           beat: () => {},
         };
         runResidentPulse(deps);
-        runResidentPulse({ ...deps, now: new Date(now.getTime() + 2 * 60_000) }); // the next pulse must not restart it again
-        rows.push({ seed, restarts, to: posts.map(p => p.to) });
-        if (JSON.stringify(restarts) !== JSON.stringify([c.dead])) return fail('wrong-restart', `seed ${seed}: restarted ${JSON.stringify(restarts)} (want ["${c.dead}"] once)`);
-        if (!posts.some(p => p.to === c.owner && p.body.includes('감독자 재기동') && p.body.includes(c.dead))) return fail('owner-not-told', `seed ${seed}: no restart line to ${c.owner} about ${c.dead}: ${JSON.stringify(posts.map(p => [p.to, p.body.slice(0, 80)]))}`);
+        runResidentPulse({ ...deps, now: new Date(now.getTime() + 2 * 60_000) });
+        const kpi = readPulseSnapshot(root)?.kpi.find(k => k.agent === 'pulse')?.value ?? null;
+        rows.push({ seed, to: posts.map(p => p.to), kpi });
+        if (posts.some(p => p.body.includes(c.dead) && !p.body.includes('재부착 제안'))) return fail('guardian-carded-dead', `seed ${seed}: the guardian carded ${c.dead} — the registry owns a dead trigger: ${JSON.stringify(posts.map(p => [p.to, p.body.slice(0, 80)]))}`);
+        if (kpi !== '감독자 결손 2/3 · 호스트 미응답 0') return fail('kpi', `seed ${seed}: 맥박 KPI ${kpi} (want 감독자 결손 2/3 · 호스트 미응답 0)`);
         if (!posts.some(p => p.to === c.badOwner && p.body.includes('재부착 제안') && p.body.includes(c.bad))) return fail('no-reattach', `seed ${seed}: no reattach proposal to ${c.badOwner} for ${c.bad}: ${JSON.stringify(posts.map(p => [p.to, p.body.slice(0, 80)]))}`);
       }
       ctx.recorder.event('sup:guardian-pulse', { rows });

@@ -1,11 +1,11 @@
 /** 레지스트리의 local-repo 출처를 거울 목록으로 결정적으로 만든다.
  *
- *  upstream 은 `readOrigin(path)`(기본 `git -C <path> remote get-url origin`).
+ *  upstream 은 `readOrigin(path)`(기본 `src/git-fs/origin-url.ts` readRemoteUrl — raw `remote.origin.url`, 미러 insteadOf 를 따르지 않는다).
  *  자격·사설·금지 경로는 `validateMirrorManifest` 가 거절한다.
  *  upstream 없는 로컬 전용은 출처에 `mirror: true` 가 있을 때만 넣는다.
  */
-import { spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
+import { readRemoteUrl } from '../git-fs/origin-url.js';
 import {
   renderMirrorList,
   validateMirrorManifest,
@@ -79,11 +79,6 @@ export function exportMirrorManifest(
 }
 
 function gitOrigin(repoPath: string): string | undefined {
-  const result = spawnSync('git', ['-C', repoPath, 'remote', 'get-url', 'origin'], {
-    encoding: 'utf8',
-    timeout: 10_000,
-  });
-  if (result.status !== 0) return undefined;
-  const url = (result.stdout ?? '').trim();
-  return url.length > 0 ? url : undefined;
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+  return readRemoteUrl(repoPath) ?? undefined;
 }

@@ -19,15 +19,10 @@ import type { BodyEnv } from '../registry.js';
 import type { ActionResult, AgentBody, BodyCtx, Observation, PlannedAction, Subject } from '../runtime.js';
 import { agentHome } from '../memory.js';
 import { admittedPregateHosts, pregateLane, readJsonlFile, scanPregateLane, scanRunLedgers, seatStateRoot } from './run-lifecycle-shared.js';
-import { pv } from '../policy-context.js';
+import { pn } from '../policy-context.js';
 import { LOOP_CASE_DOMAIN, liveLoopDeps, loopCardBody, loopCardKey, loopDecision, loopFactLine, loopTarget, reconcileLoopCases, type LoopExceptionDeps, type LoopFault } from './loop-exceptions.js';
 import { attemptsOf, moveCase, readCases, type Case } from '../../kit/case-ledger/index.js';
 
-export const WINDOW_H = 24;
-/** A RED younger than this is not yet counted in the ratio (the retry needs time). */
-export const SETTLE_MIN = 60;
-/** Infra REDs older than this are not retried (the head has probably moved). */
-export const RETRY_MAX_AGE_H = 6;
 
 export interface RedGate {
   readonly id: string; readonly pr: number | null; readonly head: string; readonly host: string; readonly at: number;
@@ -106,7 +101,7 @@ export function liveDeps(stateRoot: string, address = 'RUN-DOCTOR'): RunDoctorDe
   const factCache = new Map<string, { exit: number | null; failure: string | null; focused: string[] }>();
   return {
     redGates(now) {
-      const reds = scanPregateLane(pregateLane('PREGATE-RED', seat), now.getTime() - pv('window_h', WINDOW_H) * 3_600_000);
+      const reds = scanPregateLane(pregateLane('PREGATE-RED', seat), now.getTime() - pn('window_h') * 3_600_000);
       if (!reds) return null;
       return reds.map(s => {
         let f = factCache.get(s.dir);
@@ -115,16 +110,16 @@ export function liveDeps(stateRoot: string, address = 'RUN-DOCTOR'): RunDoctorDe
       });
     },
     greens(now) {
-      const g = scanPregateLane(pregateLane('PREGATE-GREEN', seat), now.getTime() - 2 * pv('window_h', WINDOW_H) * 3_600_000);
+      const g = scanPregateLane(pregateLane('PREGATE-GREEN', seat), now.getTime() - 2 * pn('window_h') * 3_600_000);
       if (!g) return null;
       const m = new Map<number, number>();
       for (const s of g) if (s.pr !== null && (m.get(s.pr) ?? 0) < s.at) m.set(s.pr, s.at);
       return m;
     },
     failedRuns(now) {
-      const runs = scanRunLedgers(join(stateRoot, 'run-ledger'), now.getTime() - pv('window_h', WINDOW_H) * 3_600_000);
+      const runs = scanRunLedgers(join(stateRoot, 'run-ledger'), now.getTime() - pn('window_h') * 3_600_000);
       if (!runs) return null;
-      return runs.filter(r => r.terminal?.failed && Date.parse(r.terminal.at) >= now.getTime() - pv('window_h', WINDOW_H) * 3_600_000)
+      return runs.filter(r => r.terminal?.failed && Date.parse(r.terminal.at) >= now.getTime() - pn('window_h') * 3_600_000)
         .map(r => ({ runId: r.runId, graphId: r.graphId, at: r.terminal!.at, cls: r.terminal!.kind === 'stop' ? r.terminal!.cls : (r.lastNodeOutcome ?? r.terminal!.cls), stage: r.stage }));
     },
     hosts: () => admittedPregateHosts(seat),
@@ -195,13 +190,13 @@ export function createBody(env: BodyEnv, deps: RunDoctorDeps = liveDeps(env.stat
     const subjects: Subject[] = []; const facts: string[] = []; const patterns: { key: string; lesson: string }[] = [];
     let kpi: number | null = null;
     if (reds && greens) {
-      // ratio: per PR, its first RED in the window, settled ≥ SETTLE_MIN
+      // ratio: per PR, its first RED in the window, settled ≥ settle_min
       const first = new Map<number, number>();
       for (const g of reds) if (g.pr !== null && (!first.has(g.pr) || first.get(g.pr)! > g.at)) first.set(g.pr, g.at);
-      const settled = [...first].filter(([, at]) => nowMs - at >= pv('settle_min', SETTLE_MIN) * 60_000);
+      const settled = [...first].filter(([, at]) => nowMs - at >= pn('settle_min') * 60_000);
       const recovered = settled.filter(([pr, at]) => (greens.get(pr) ?? 0) > at).length;
       kpi = settled.length ? Math.round((recovered / settled.length) * 100) / 100 : 1;
-      facts.push(`RED ${reds.length}(PR ${first.size}) · 재성공 ${recovered}/${settled.length} (창 ${pv('window_h', WINDOW_H)}h · 1h 지난 것)`);
+      facts.push(`RED ${reds.length}(PR ${first.size}) · 재성공 ${recovered}/${settled.length} (창 ${pn('window_h')}h · 1h 지난 것)`);
     } else facts.push(`pregate 증거 읽기 실패(${reds ? '' : 'RED '}${greens ? '' : 'GREEN'}) — 모름`);
     // a pattern counts an event once: only failures that appeared since the previous tick
     const lastTick = ctx.state.lastTickAt ? Date.parse(ctx.state.lastTickAt) : 0;
@@ -215,7 +210,7 @@ export function createBody(env: BodyEnv, deps: RunDoctorDeps = liveDeps(env.stat
       subjects.push({ id: `red:${g.id}`, kind: `red-${d.kind}`, summary: `#${g.pr ?? '?'} ${g.head.slice(0, 8)} @${g.host} ${g.stage}${g.exit !== null ? ` exit ${g.exit}` : ''} → ${d.cls}${tags ? ` (${tags})` : ''}`, ageMin });
     }
     if (runs) {
-      facts.push(`실패 런 ${runs.length} (창 ${pv('window_h', WINDOW_H)}h)`);
+      facts.push(`실패 런 ${runs.length} (창 ${pn('window_h')}h)`);
       for (const r of runs) {
         const d = diagnoseRun(r);
         if (Date.parse(r.at) > lastTick) patterns.push({ key: d.cls, lesson: `${d.cls} 런 실패가 반복된다 — ${d.rx}` });
@@ -232,6 +227,7 @@ export function createBody(env: BodyEnv, deps: RunDoctorDeps = liveDeps(env.stat
       cases = rec ? readCases(deps.loops.caseRoot, LOOP_CASE_DOMAIN) : [];
       facts.push(loopFactLine(lf, nowMs, rec ? rec.unresolved : null));
       if (rec?.resolved.length) facts.push(`정상으로 돌아온 루프 사건 ${rec.resolved.length}: ${rec.resolved.slice(0, 3).join(' · ')}`);
+      if (rec?.settled.length) facts.push(`은퇴한 루프의 사건 정리 ${rec.settled.length}: ${rec.settled.slice(0, 3).join(' · ')}`);
       for (const f of lf?.faults ?? []) {
         loops.set(loopTarget(f), f);
         subjects.push({ id: loopTarget(f), kind: 'loop-exception', summary: `${f.graphId} 예외 (창 ${f.window} · 런 ${f.runId ?? '?'} · 노드 ${f.node ?? '?'})${f.tail ? '' : ' · 이유 없음'}`, ageMin: (nowMs - f.at) / 60_000 });
@@ -265,7 +261,7 @@ export function createBody(env: BodyEnv, deps: RunDoctorDeps = liveDeps(env.stat
       }
       if (s.kind === 'red-infra') {
         const g = reds.get(s.id as `red:${string}`);
-        if (g && !retried.has(retryKey(g)) && (s.ageMin ?? 0) <= pv('retry_max_age_h', RETRY_MAX_AGE_H) * 60) {
+        if (g && !retried.has(retryKey(g)) && (s.ageMin ?? 0) <= pn('retry_max_age_h') * 60) {
           repairs.push({ action: 'retry-other-host', target: s.id, why: `${s.summary} — 기반 RED 는 다른 호스트로 한 번(L5)` });
           continue; // the retry writes its own diagnosis card
         }

@@ -15,7 +15,8 @@ import { elsJournalPath } from './journal.js';
 import { readActiveBaton } from './baton.js';
 import { isServerAway, noteAfterFrame, RECONNECT_NOTE, type AttachFrame, type AttachHandlers, type Attached } from './attach-client.js';
 import { createKeyRouter, type KeyAction } from './attach-keys.js';
-import { composeView, emptyCoordinatorSpaces, emptyRemoteCoordinators, FIRST_RUN_HINT, NARROW_BELOW_COLS, parsePaneRows, parseRemoteRows, SIDEBAR_HELP, sidebarWidthFor, UNREACHABLE_MARK, type PaneRow } from './attach-view.js';
+import { AFTER_PREFIX, tileActionOf, type ShortcutContext } from './key-bindings.js';
+import { composeView, emptyCoordinatorSpaces, emptyRemoteCoordinators, FIRST_RUN_HINT, NARROW_BELOW_COLS, parsePaneRows, parseRemoteRows, sidebarWidthFor, UNREACHABLE_MARK, type PaneRow } from './attach-view.js';
 import { withLoopStates } from './loop-agents.js';
 import { buildTabDropdown, layoutSpaceList, isActiveSeat, buildTabRow, dropdownTargets, withCommands, type DropdownTarget } from './space-tabs-view.js';
 import { interpretMouse, wheelBytes, type MouseLayout, type MouseReport } from './attach-mouse.js';
@@ -515,7 +516,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     const label = tileLevel === 'all' ? 'ALL' : tileLevel === 'spaces' ? 'SPACES' : `TILE ${tileRows()[0]?.workspace ?? tileWs ?? ''}`;
     const nav = tileLevel === 'spaces' ? 'Enter open space · Esc all' : `Enter zoom${tileLevel === 'space' ? ' · Esc spaces' : ''}`;
     const status = live === 0 ? `${label} · ${tileWs && tileLevel === 'space' ? `no panes in «${tileWs}»` : 'no panes'} · waiting · ctrl+b q quit`
-      : `${label} · ${live} ${tileLevel === 'spaces' ? 'spaces' : 'panes'} · arrows/hjkl focus · ${nav} · ctrl+b q quit${note ? ` · ${note}` : ''}`;
+      : `${label} · ${live} ${tileLevel === 'spaces' ? 'spaces' : 'panes'} · arrows/hjkl focus · ${nav} · ctrl+b ? shortcuts · ctrl+b q quit${note ? ` · ${note}` : ''}`;
     const stage = stageView();
     return { cols, rows: height, tiles, focus: tileFocus, grid: tileGridSpec, status, page: tilePage, fold: stageCfg !== undefined && tileLevel !== 'spaces', ...(stage ? { stage } : {}) };
   };
@@ -607,47 +608,50 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   const tileKey = (keys: string): void => {
     let text = keys;
     if (!tileArmed) {                                              // ELS-ZAXIS S2: a focused layer over the grid takes keys first
-      const rest = overlayKey(text);
-      if (rest !== undefined) { if (!rest) return; text = rest; }
+      // ELS-SHORTCUTS-POPUP: ctrl+b is never a layer's key — the prefix stays the grid's, as it is over a tab (the key
+      // router arms it before any layer), so ctrl+b ? / q / ` work while a popup over the grid has the keys.
+      const at = text.indexOf('\u0002');
+      const head = at < 0 ? text : text.slice(0, at);
+      const rest = head ? overlayKey(head) : undefined;
+      if (rest !== undefined) { text = rest + (at < 0 ? '' : text.slice(at)); if (!text) return; }
     }
     let rest = text;
     while (rest) {
       if (tileArmed) {
         tileArmed = false;
         const char = rest[0]!; rest = rest.slice(1);
-        if ((char === 'q' || char === '\u001b') && termFocused()) { hideTerm(); continue; }   // ELS-POPUP-TERM over the grid
-        if (char === 'x' && termFocused()) { killTerm(); continue; }
-        if (char === 'm' && termFocused()) { dockTerm(); continue; }   // to a tab: it joins this grid
-        if (char === '`') { toggleTerm(); continue; }
-        if (char === 'q') { finish(0, ''); return; }
-        if (char === 'f') { openFiles(); continue; }              // ELS-FILES: over the grid too
-        continue;                                               // t (already tiled) and every other prefix key: nothing
+        const action = Object.hasOwn(AFTER_PREFIX, char) ? AFTER_PREFIX[char] : undefined;   // the one key table (key-bindings.ts)
+        if (action && termAction(action)) { /* ELS-POPUP-TERM over the grid: q/Esc hide · x close · m to a tab (joins this grid) */ }
+        else if (action === 'popup-term') toggleTerm();
+        else if (action === 'detach') { finish(0, ''); return; }
+        else if (action === 'files') openFiles();                 // ELS-FILES: over the grid too
+        else if (action === 'help') toggleShortcuts();             // ELS-SHORTCUTS-POPUP: over the grid too
+        // t (already tiled) and every other prefix key: nothing
+        if (rest) tileKey(rest);                                  // what follows goes through the layer route again
+        return;
       }
-      const arrow = /^\u001b(?:\[|O)([ABCD])/.exec(rest);
-      if (arrow) {
-        const dir = ({ A: 'up', B: 'down', C: 'right', D: 'left' } as const)[arrow[1] as 'A' | 'B' | 'C' | 'D'];
-        const layout = frameLayout(frameInput());
-        tileFocus = moveFocus(tileFocus, dir, layout.visible.length, layout.c);
-        rest = rest.slice(arrow[0].length); note = ''; renderTile(); continue;
-      }
-      const char = rest[0]!; rest = rest.slice(1);
-      if (char === '\u0002') { tileArmed = true; continue; }
-      const dir = ({ h: 'left', j: 'down', k: 'up', l: 'right' } as const)[char as 'h' | 'j' | 'k' | 'l'];
+      // ELS-SHORTCUTS-POPUP: the grid's keys are rows of the one key table (key-bindings.ts · tileActionOf).
+      const arrow = /^\u001b(?:\[|O)[ABCD]/.exec(rest)?.[0];
+      const key = arrow ?? rest[0]!;
+      rest = rest.slice(key.length);
+      if (key === '\u0002') { tileArmed = true; continue; }
+      const action = tileActionOf(key);
+      const dir = action === 'tile-left' ? 'left' : action === 'tile-down' ? 'down' : action === 'tile-up' ? 'up' : action === 'tile-right' ? 'right' : undefined;
       if (dir) {
         const layout = frameLayout(frameInput());
         tileFocus = moveFocus(tileFocus, dir, layout.visible.length, layout.c);
         note = ''; renderTile(); continue;
       }
-      if (char === '\r' || char === '\n') { zoomTile(); return; }
-      if (char === '[' || char === ']') {                        // ① pages
+      if (action === 'tile-zoom') { zoomTile(); return; }
+      if (action === 'tile-page-prev' || action === 'tile-page-next') {   // ① pages
         const pages = frameLayout(frameInput()).pages;
-        tilePage = (tilePage + (char === ']' ? 1 : pages - 1)) % pages; tileFocus = 0; tilePageAt = now(); note = ''; renderTile(); void pollTiles(); continue;
+        tilePage = (tilePage + (action === 'tile-page-next' ? 1 : pages - 1)) % pages; tileFocus = 0; tilePageAt = now(); note = ''; renderTile(); void pollTiles(); continue;
       }
-      if (char === '\u001b' && (rest === '' || !/^[\[O]/.test(rest))) {   // a lone Esc: up one level (space → spaces → all)
+      if (action === 'tile-level-up' && (rest === '' || !/^[\[O]/.test(rest))) {   // a lone Esc: up one level (space → spaces → all)
         if (tileLevel === 'all') continue;
         tileLevel = tileLevel === 'space' ? 'spaces' : 'all'; tileFocus = 0; tilePage = 0; tileScreens.clear(); note = ''; renderTile(); void pollTiles(); continue;
       }
-      if (char === '\u001b') { rest = rest.replace(/^[\[O][0-9;<>?]*[@-~]?/, ''); continue; }   // other escapes (mouse…) dropped
+      if (key === '\u001b') { rest = rest.replace(/^[\[O][0-9;<>?]*[@-~]?/, ''); continue; }   // other escapes (mouse…) dropped
       // Every other key: tile mode is read-only.
     }
   };
@@ -660,6 +664,18 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     const ws = overlayWs();
     const shown = visibleLayers(overlay, ws).filter((layer) => layer.kind === 'obsidian').at(-1);
     void deps.request(shown ? { op: 'overlay', action: 'close', id: shown.id } : { op: 'overlay', action: 'open', kind: 'obsidian', props: {}, ...(ws ? { ws } : {}) }).catch(() => undefined);
+  };
+  /** ELS-SHORTCUTS-POPUP (대표 11-28): ctrl+b ? toggles the shortcuts popup of this view's workspace — close the one shown here,
+   *  else open one (one per workspace) that puts the keys of where you are first (tile grid · popup terminal · a popup). */
+  const shortcutsContext = (): ShortcutContext => tileMode ? 'tile' : termFocused() ? 'popup-term' : overlayFocused() ? 'overlay' : 'normal';
+  const toggleShortcuts = (): void => {
+    const ws = overlayWs();
+    const shown = visibleLayers(overlay, ws).filter((layer) => layer.kind === 'shortcuts').at(-1);
+    if (shown) { overlay = closeLayer(overlay, shown.id); deps.overlays?.act?.({ action: 'close', id: shown.id }); render(); return; }
+    const key = ws ? `ws-${ws.replace(/[^A-Za-z0-9._-]/g, '_')}`.slice(0, 64) : 'default';
+    void deps.request({ op: 'overlay', action: 'open', kind: 'shortcuts', key, props: { context: shortcutsContext(), scroll: 0 }, ...(ws ? { ws } : {}) }).then((answer) => {
+      if (answer.exitCode !== 0 && !finished) { note = answer.message; render(); }
+    }, () => { if (!finished) { note = 'Shortcuts did not open (els server unreachable)'; render(); } });
   };
   /** ELS-POPUP-TERM: the visible term layer (if any) and its box for this view size. */
   const termLayer = (cols: number, height: number) => {
@@ -734,7 +750,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   /** The prefix actions the popup terminal takes while it has focus (true = handled). */
   const termAction = (action: KeyAction): boolean => {
     if (!termFocused()) return false;
-    if (action === 'detach') { hideTerm(); return true; }
+    if (action === 'detach' || action === 'escape') { hideTerm(); return true; }   // ctrl+b q · ctrl+b Esc
     if (action === 'close') { killTerm(); return true; }
     if (action === 'move-tab') { dockTerm(); return true; }
     return false;
@@ -1326,13 +1342,32 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     for (let n = 2; ; n++) if (!taken.has(`${base}-${n}`)) return `${base}-${n}`;
   };
 
+  /** The ctrl+b keys that open things over the view (they work on an empty workspace too). true = handled. */
+  const viewAction = (action: KeyAction): boolean => {
+    switch (action) {
+      case 'help': toggleShortcuts(); return true;               // ELS-SHORTCUTS-POPUP: every key at a glance
+      case 'voice': voice.open(); return true;                   // ELS-VOICE-CONTROL-POPUP: say it to els
+      case 'sidechat': { const over = current(); void deps.request({ op: 'overlay', action: 'open', kind: 'sidechat', props: over && !over.remote ? { pane: over.pane } : {} }).catch(() => undefined); return true; }   // ELS-SIDECHAT · A1: the pane under it, for ctrl+o context
+      case 'obsidian': toggleObsidian(); return true;            // ELS-OBSIDIAN-KEY: open/close this workspace's Obsidian popup
+      case 'cycle-focus': cycleFocus(); return true;             // ELS-SIDECHAT-EDGE A2: focus ring over the layers and the pane
+      case 'memo': void deps.request({ op: 'overlay', action: 'open', kind: 'memo', props: {} }).catch(() => undefined); return true;   // ELS-MEMO: the memo pad
+      case 'files': openFiles(); return true;                    // ELS-FILES: the file browser popup
+      case 'popup-term': toggleTerm(); return true;              // ELS-POPUP-TERM: show / hide the popup terminal
+      case 'escape': return true;                                // ctrl+b Esc: only the popup terminal reads it (termAction)
+      case 'move-layer': startLayerMove(); return true;          // ELS-POPUP-MOVE/RESIZE: move · resize the focused layer
+      case 'quit': quitSpace(); return true;                     // ELS-EXIT-BG-BUTTONS: ✕ Quit by key (ctrl+b q = ⏏ Background)
+      default: return false;
+    }
+  };
+
   const act = (action: KeyAction, n?: number): void => {
+    if (viewAction(action)) return;
     note = '';
     if (dropdown && action !== 'toggle-sidebar') dropdown = false;
     const row = current();
     if (selectedEmpty && action === 'next-workspace') { nextWorkspace(); return; }
     if (selectedEmpty && ['next', 'previous'].includes(action)) { select(everyRow()[0]?.pane); return; }
-    if (selectedEmpty && !['detach', 'toggle-sidebar', 'help', 'new', 'new-chat', 'new-workspace', 'close-workspace', 'toggle-agents-order', 'expand-all', 'collapse-all', 'toggle-active', 'tile'].includes(action)) { note = '빈 작업공간에는 pane이 없습니다'; render(); return; }
+    if (selectedEmpty && !['detach', 'toggle-sidebar', 'new', 'new-chat', 'new-workspace', 'close-workspace', 'toggle-agents-order', 'expand-all', 'collapse-all', 'toggle-active', 'tile'].includes(action)) { note = '빈 작업공간에는 pane이 없습니다'; render(); return; }
     switch (action) {
       case 'detach': finish(0, ''); return;
       case 'tile': enterTile(); return;
@@ -1365,7 +1400,6 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
         if (target) { confirm = { what: 'close-workspace', target, prompt: `작업공간 «${empty?.name ?? row?.workspace}» 와 그 안의 pane 모두 닫기?` }; render(); }
         return;
       }
-      case 'help': note = SIDEBAR_HELP; render(); return;
       case 'scroll-up': scrollPane(Math.max(1, deps.size().rows - 4)); return;
       case 'scroll-down': scrollPane(-Math.max(1, deps.size().rows - 4)); return;
       case 'list-page-up': scrollList((listScroll?.start ?? 0) - Math.max(1, (listScroll?.room ?? 1) - 1)); return;
@@ -1455,17 +1489,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
           if (current()?.remote) { note = `⇄${current()!.remote} pane 은 읽기 전용 — 입력은 els do ${current()!.pane} <글>`; render(); } else attached?.input(input.kind === 'input' ? input.bytes : event.bytes);
         }
         else if (event.kind === 'action') { if (!termAction(event.action)) act(event.action, event.n); }
-        else if (event.key === ':') voice.open();                  // ELS-VOICE-CONTROL-POPUP: say it to els
-        else if (event.key === '/') { const over = current(); void deps.request({ op: 'overlay', action: 'open', kind: 'sidechat', props: over && !over.remote ? { pane: over.pane } : {} }).catch(() => undefined); }   // ELS-SIDECHAT (? = help) · A1: the pane under it, for ctrl+o context
-        else if (event.key === 'o') toggleObsidian();             // ELS-OBSIDIAN-KEY: open/close this workspace's Obsidian popup
-        else if (event.key === '\t') cycleFocus();                 // ELS-SIDECHAT-EDGE A2: focus ring over the layers and the pane
-        else if (event.key === 'M') void deps.request({ op: 'overlay', action: 'open', kind: 'memo', props: {} }).catch(() => undefined);   // ELS-MEMO: the memo pad
-        else if (event.key === 'f') openFiles();                 // ELS-FILES: the file browser popup
-        else if (event.key === '`') toggleTerm();                 // ELS-POPUP-TERM: show / hide the popup terminal
-        else if (event.key === '\u001b') { if (termFocused()) hideTerm(); }   // ctrl+b Esc: hide it (a lone Esc goes to the PTY)
-        else if (event.key === 'r') startLayerMove();             // ELS-POPUP-MOVE/RESIZE: move · resize the focused layer
-        else if (event.key === 'Q') quitSpace();                  // ELS-EXIT-BG-BUTTONS: ✕ 종료 by key (ctrl+b q = ⏏ 백그라운드)
-        else { note = `ctrl+b ${event.key} 는 아직 없음`; render(); }
+        else { note = `ctrl+b ${event.key}: no such key`; render(); }   // every key is a row of key-bindings.ts (the hint after it says ? shortcuts)
       }, !newTab.isOpen() && !movePicker && !dropdown && !confirm && !voice.isOpen() && !overlayFocused());
       wasSavingAtInput = newTab.isSaving();
   };

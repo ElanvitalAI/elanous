@@ -835,7 +835,7 @@ export function createElsCore(deps: ElsCoreDeps) {
         return { exitCode: 2, message: 'els hq coordinator: valid seat required' };
       if (journal.hqCoordinatorSeat === seat) return { exitCode: 0, message: `els hq coordinator: ${seat} (unchanged)` };
       if (journal.hqCoordinatorSeat) return { exitCode: 1, message: `els hq coordinator: already assigned to ${journal.hqCoordinatorSeat}; cannot assign ${seat}` };
-      const matches = journal.panes.filter(p => p.kind === 'pty' && !p.parentPane && (p.seatIdentity ?? seatOf(p.cwd)) === seat);
+      const matches = journal.panes.filter(p => paneSeat(p) === seat);
       if (matches.length !== 1) return { exitCode: 1, message: `els hq coordinator: seat ${seat} ${matches.length ? 'is duplicated' : 'not found'}` };
       try { commit({ ...journal, hqCoordinatorSeat: seat }); }
       catch (error) { return { exitCode: 1, message: `els hq coordinator: not saved: ${message(error)}` }; }
@@ -848,7 +848,7 @@ export function createElsCore(deps: ElsCoreDeps) {
         return { exitCode: 2, message: 'els ws coordinator: workspace and valid seat required' };
       const ws = findWorkspace(journal, ref);
       if (!ws) return { exitCode: 1, message: `els ws coordinator: unknown workspace ${ref}` };
-      const matches = journal.panes.filter(pane => pane.kind === 'pty' && !pane.parentPane && seatOf(pane.cwd) === seat);
+      const matches = journal.panes.filter(pane => pane.kind === 'pty' && paneSeat(pane) === seat);
       if (matches.length !== 1) return { exitCode: 1, message: `els ws coordinator: seat ${seat} ${matches.length ? 'is duplicated' : 'not found'}` };
       const tab = journal.tabs.find(row => row.id === matches[0]!.tabId);
       if (tab?.workspaceId !== ws.id) return { exitCode: 1, message: `els ws coordinator: seat ${seat} is not in ${ws.name}` };
@@ -893,7 +893,7 @@ export function createElsCore(deps: ElsCoreDeps) {
       const isSpaceCoordinatorTab = (tab: Tab): boolean => {
         const seat = journal.workspaces.find(ws => ws.id === tab.workspaceId)?.coordinatorSeat;
         if (!seat) return false;
-        const matches = journal.panes.filter(pane => pane.kind === 'pty' && !pane.parentPane && seatOf(pane.cwd) === seat);
+        const matches = journal.panes.filter(pane => pane.kind === 'pty' && paneSeat(pane) === seat);
         return matches.length === 1 && matches[0]!.tabId === tab.id;
       };
       const ordered = journal.panes.map((pane, index) => ({ pane, index, tab: journal.tabs.find((row) => row.id === pane.tabId) }))
@@ -903,7 +903,7 @@ export function createElsCore(deps: ElsCoreDeps) {
       // JUD #39000 FU: the mail ledger is read once per listing for all seats (not once per pane), with a short wait.
       // ELS-SERVER-MAINLOOP-STARVATION: in the server this is the cached answer of the badge worker (no ledger read here).
       const displayCwd = (pane: Pane) => livePty(pane) ? foregroundCwds.get(pane.id) ?? pane.cwd : pane.cwd;
-      const badges = (deps.mailBadges ?? mailBadgesOf)(ordered.map(({ pane }) => pane.seatIdentity ?? seatOf(displayCwd(pane))).filter((seat): seat is string => seat !== null));
+      const badges = (deps.mailBadges ?? mailBadgesOf)(ordered.map(({ pane }) => paneSeat(pane)).filter((seat): seat is string => seat !== null));
       // ELS-GIT-AWARENESS-HERDR (OP #139752): refresh is a debounced, fire-and-forget macrotask — the rows below read
       // the cache only, so a listing never queues behind git (#39546: typing latency stays zero).
       gitLabels.refresh([...new Set(ordered.map(({ pane }) => displayCwd(pane)))]);
@@ -920,7 +920,7 @@ export function createElsCore(deps: ElsCoreDeps) {
         const cwd = displayCwd(pane);
         const git = gitLabels.labelFor(cwd);   // ELS-GIT-AWARENESS-HERDR: cache read only — no git on the request path
         // A worker child sits in its parent's folder but is not that seat (DEMO-FANOUT-LIVE-OP-SEAT).
-        const seat = pane.seatIdentity ?? (pane.parentPane ? null : seatOf(cwd));
+        const seat = paneSeat(pane);
         const unreadMail = seat !== null ? badges.get(seat) ?? null : null;
         // ELS-TAB-STATE-BADGE: the badge is the contract state; a working pane with no output, `do` or first sight for the
         // stall window reads `stalled`. The server computes it (one clock), so every client — `els ls`, sidetab — shows the same.
@@ -954,7 +954,7 @@ export function createElsCore(deps: ElsCoreDeps) {
           cwd, ...(git ? { git } : {}), command: pane.command, state: listedState, activityState, ...(unavailableReason ? { unavailableReason } : {}),
           size: sizes.get(pane.id) ?? { cols: DEFAULT_PANE_COLS, rows: DEFAULT_PANE_ROWS },
           ptyId: live ? pane.ptyId : '', ...(live?.pid ? { pid: live.pid } : {}), restore: pane.restore, seat, unreadMail,
-          ...(ws.coordinatorSeat && !pane.parentPane && seatOf(pane.cwd) === ws.coordinatorSeat && isSpaceCoordinatorTab(tab) ? { spaceCoordinator: true } : {}),
+          ...(ws.coordinatorSeat && paneSeat(pane) === ws.coordinatorSeat && isSpaceCoordinatorTab(tab) ? { spaceCoordinator: true } : {}),
           ...(live && foregrounds.has(pane.id) ? { kind: foregrounds.get(pane.id)!.kind, fgCommand: foregrounds.get(pane.id)!.command } : {}),
           ...(pane.place ? { place: pane.place } : {}),
           ...(pane.state === 'exited' && pane.exitReason !== undefined ? { exit: { code: pane.exitCode ?? null, reason: pane.exitReason, tail: pane.exitTail ?? [] } } : {}),
@@ -1690,6 +1690,24 @@ export function createElsCore(deps: ElsCoreDeps) {
 }
 
 export type ElsCore = ReturnType<typeof createElsCore>;
+
+/** Observers share a seat's cwd, but are not the seat and must not receive its badges or coordinator role. */
+function paneSeat(pane: Pane): string | null {
+  if (pane.kind !== 'pty' || pane.parentPane) return null;
+  const args = pane.command;
+  if (pane.title.startsWith('▦ ') || args.some(arg => /(?:^|\/)fed-board\.sh$/.test(arg)) ||
+      args.some((arg, i) => arg === 'release' && args[i + 1] === 'graph' && args[i + 2] === 'board') ||
+      args.some((arg, i) => arg === 'side' && args[i + 1] === 'channel' && args[i + 2] === 'view') ||
+      args.some((arg, i) => arg === 'side' && args[i + 1] === 'element' && args[i + 2] === 'host')) return null;
+  if (pane.seatIdentity) return pane.seatIdentity;
+  // Legacy seat tabs lack explicit identity. Hands run `…/bin/elanous --resume <id>`, `…/bun …/elanous.mjs …` or
+  // `codex -p seat`, so any agent command in a seat directory is that seat — only a plain shell there is not.
+  const executable = (args[0] ?? '').split('/').pop() ?? '';
+  return PLAIN_SHELLS.has(executable) ? null : seatOf(pane.cwd);
+}
+
+/** Interactive shells opened in a seat directory are terminals, not the seat (`-zsh`/`login` = login-shell argv0). */
+const PLAIN_SHELLS: ReadonlySet<string> = new Set(['sh', 'zsh', '-zsh', 'bash', 'fish', 'login']);
 
 /** The seat a pane belongs to by its cwd (`…/seats/<SEAT>/…`), or null when the pane has no seat folder — the OP seat-mail badge (#22 주소록 cwd 규약). */
 function seatOf(cwd: string): string | null {

@@ -20,6 +20,10 @@
  */
 import type { BusItem, BusType } from './bus.js';
 import { ackCursor, busAck, busSince, readAcks, readBus, BUS_DEFAULT_SPACE } from './bus.js';
+import { readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { parse as parseYaml } from 'yaml';
+import { liveBusSpacesForSeat, type BusView, type SeatBusSpace } from './spaces.js';
 import { MAIL_ROUTE_POLICY_DEFAULTS, mailBypassesWindow, readMailRoutePolicy, windowDue } from '../kit/mail-route/policy.js';
 
 /** One bus-driven wake per seat per this window (CEO 11:1x) — the bus wake window — the default of the shared mail-route policy (KIT mail-route · one cadence for every fold). */
@@ -31,8 +35,25 @@ export const BUS_STALE_LOOKBACK_MS = 24 * 60 * 60_000;
 export const BUS_DIGEST_MAX_TODO = 5;
 export const BUS_DIGEST_MAX_RAW = 3;
 export const BUS_DIGEST_MAX_OTHER = 3;
-/** The seat that sees raw CEO words and the «미소화» line (other seats see only items addressed to them). */
+/** The seat that sees raw CEO words and the «미소화» line in the OP space (other seats see only items addressed to them there). */
 export const BUS_COORDINATOR_SEAT = 'OP';
+/** CONTEXT-BUS-FEDERATION — block bounds: graphs/policies/context-bus.yaml `digest` (own space block · every further block). */
+export interface BusDigestPolicy { readonly ownMaxChars: number; readonly otherMaxChars: number }
+export const contextBusPolicyPath = (root = resolve(import.meta.dir, '../..')): string => join(root, 'graphs', 'policies', 'context-bus.yaml');
+/** Pure: pack text → bounds. Throws on a missing / non-positive key (never a silent default). */
+export function parseBusDigestPolicy(text: string): BusDigestPolicy {
+  const y = (parseYaml(text) ?? {}) as { version?: unknown; digest?: Record<string, unknown> };
+  if (y.version !== 1) throw new Error('context-bus policy: version must be 1');
+  const num = (k: string): number => {
+    const v = y.digest?.[k];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v <= 0) throw new Error(`context-bus policy: digest.${k} must be a positive integer`);
+    return v;
+  };
+  return { ownMaxChars: num('own_max_chars'), otherMaxChars: num('other_max_chars') };
+}
+export function loadBusDigestPolicy(path = contextBusPolicyPath()): BusDigestPolicy {
+  return parseBusDigestPolicy(readFileSync(path, 'utf8'));
+}
 
 const DIGESTED: ReadonlySet<string> = new Set<BusType>(['handoff', 'commitment', 'decision']);
 const up = (s: string): string => s.trim().toUpperCase();
@@ -74,6 +95,9 @@ export interface SeatDigestOptions {
   /** Override the seat's ack cursor (tests). */
   readonly sinceId?: string | null;
   readonly maxChars?: number;
+  /** CONTEXT-BUS-FEDERATION — full = every item of the space (its own space · HQ for coordinators) · addressed = only items
+   *  addressed to the seat. Default: full for OP, addressed for everyone else (the OP space as it always was). */
+  readonly view?: BusView;
 }
 
 export interface SeatDigest {
@@ -87,7 +111,7 @@ export interface SeatDigest {
 /** Pure: the seat's digest over the full log `items` and its `acks`-derived cursor. */
 export function buildSeatDigest(items: readonly BusItem[], cursor: string | null, opts: SeatDigestOptions, space = BUS_DEFAULT_SPACE): SeatDigest {
   const seat = up(opts.seat);
-  const coordinator = seat === BUS_COORDINATOR_SEAT;
+  const coordinator = opts.view ? opts.view === 'full' : seat === BUS_COORDINATOR_SEAT;
   const disp = dispositions(items);
   const fresh = busSince(items, opts.sinceId !== undefined ? opts.sinceId : cursor);
   const newest = (a: BusItem, b: BusItem) => (a.id < b.id ? 1 : -1);
@@ -98,8 +122,8 @@ export function buildSeatDigest(items: readonly BusItem[], cursor: string | null
   const raw = coordinator ? rawAll.filter((i) => !disp.has(i.id)).sort(newest) : [];
   const handled = coordinator ? rawAll.filter((i) => disp.has(i.id)).sort(newest) : [];
   const other = fresh.filter((i) => !(DIGESTED.has(i.type) && addressedTo(i, seat)) && i.type !== 'ceo-request')
-    // Non-coordinator seats see only what is addressed to them.
-    .filter(() => coordinator).sort(newest);
+    // An addressed view sees only what is addressed to it; nobody is shown its own writes back.
+    .filter((i) => coordinator && up(i.from) !== seat).sort(newest);
   const staleFloor = opts.now - BUS_STALE_LOOKBACK_MS;
   const stale = coordinator
     ? items.filter((i) => i.type === 'ceo-request' && !disp.has(i.id) && opts.now - Date.parse(i.at) >= BUS_STALE_RAW_MS && Date.parse(i.at) >= staleFloor).length
@@ -145,7 +169,7 @@ export function seatBusDigest(stateRoot: string, opts: SeatDigestOptions, space 
   try {
     const items = readBus(stateRoot, space);
     const d = buildSeatDigest(items, ackCursor(readAcks(stateRoot, space), opts.seat), opts, space);
-    if (d.text) log('bus.seat-digest', { seat: up(opts.seat), ...d.counts, chars: d.text.length });
+    if (d.text) log('bus.seat-digest', { seat: up(opts.seat), space, ...d.counts, chars: d.text.length });
     return d;
   } catch (error) {
     log('bus.seat-digest-failed', { seat: opts.seat, error: String(error).slice(0, 160) });
@@ -158,6 +182,38 @@ export function ackSeatDigest(stateRoot: string, seat: string, ackTo: string | n
   if (!ackTo) return false;
   try { busAck(stateRoot, ackTo, seat, { space }); log('bus.seat-ack', { seat: up(seat), id: ackTo }); return true; }
   catch (error) { log('bus.seat-ack-failed', { seat, error: String(error).slice(0, 160) }); return false; }
+}
+
+export interface SeatSpacesDigest {
+  /** The blocks joined (own space first) — null when no space has anything to carry. */
+  readonly text: string | null;
+  /** Per space: ack through `ackTo` after the turn completes. */
+  readonly blocks: readonly { readonly space: string; readonly view: BusView; readonly ackTo: string | null; readonly text: string | null }[];
+}
+
+/**
+ * CONTEXT-BUS-FEDERATION — every space the seat reads (own space · HQ for coordinators · OP for the rest, addressed only),
+ * one `<op_context_bus>` block each, own space first. `spaces` overrides the org-map resolution (tests · sims). Fail-open.
+ */
+export function seatBusDigests(stateRoot: string, opts: SeatDigestOptions & { readonly spaces?: readonly SeatBusSpace[] }): SeatSpacesDigest {
+  let spaces: readonly SeatBusSpace[];
+  try { spaces = opts.spaces ?? liveBusSpacesForSeat(opts.seat); } catch { spaces = [{ space: BUS_DEFAULT_SPACE, view: up(opts.seat) === BUS_COORDINATOR_SEAT ? 'full' : 'addressed' }]; }
+  let bounds: BusDigestPolicy | null = null;
+  if (opts.maxChars === undefined) {
+    try { bounds = loadBusDigestPolicy(); } catch (error) { log('bus.digest-policy-unreadable', { seat: opts.seat, error: String(error).slice(0, 160) }); return { text: null, blocks: [] }; }
+  }
+  const blocks = spaces.map((s, i) => {
+    const d = seatBusDigest(stateRoot, { seat: opts.seat, now: opts.now, view: s.view,
+      maxChars: opts.maxChars ?? (i === 0 ? bounds!.ownMaxChars : bounds!.otherMaxChars) }, s.space);
+    return { space: s.space, view: s.view, ackTo: d.ackTo, text: d.text };
+  });
+  const texts = blocks.flatMap((b) => (b.text ? [b.text] : []));
+  return { text: texts.length ? texts.join('\n') : null, blocks };
+}
+
+/** After the turn completed: advance the seat's cursor in every space it read. Fail-open; returns the spaces acked. */
+export function ackSeatDigests(stateRoot: string, seat: string, d: SeatSpacesDigest): string[] {
+  return d.blocks.filter((b) => ackSeatDigest(stateRoot, seat, b.ackTo, b.space)).map((b) => b.space);
 }
 
 /** Does this new item wake `seat`? urgent = now · normal = coalesced · null = context only (raw CEO words never wake). */
@@ -246,19 +302,28 @@ export function recordCeoRequestMemory(entry: BusItem | import('./bus.js').BusEn
       const hit = ['events', 'signals'].some((t) => {
         try { return own.query(`SELECT 1 FROM ${t} WHERE trim(text) = ? AND ts >= ? LIMIT 1`).get(text, from) !== null; } catch { return false; }
       });
-      if (hit) { log('bus.memory', { id: entry.id, result: 'duplicate' }); return 'duplicate'; }
+      if (hit) { log('bus.memory', { id: entry.id, result: 'duplicate' }); traceBusMemoryWrite(entry.id, 'duplicate'); return 'duplicate'; }
       se.recordEvent(own, {
         surface: entry.source ?? 'bus', direction: 'inbound', kind: 'utterance', category: 'utterance', domain: 'elanous',
         text, summary: text.slice(0, 150), importance: 6, ts: entry.at,
         refs: JSON.stringify({ origin: 'human', utteranceOrigin: 'human', bus: entry.id }), tags: 'origin:human ceo-request',
       });
       log('bus.memory', { id: entry.id, result: 'recorded' });
+      traceBusMemoryWrite(entry.id, 'recorded');
       return 'recorded';
     } finally { if (!db) own.close(); }
   } catch (error) {
     log('bus.memory-failed', { id: entry.id, error: String(error).slice(0, 160) });
     return 'skipped';
   }
+}
+
+/** MEMORY-OBSERVABILITY — a CEO line persisted into the episodic store shows under `memory.write` too. */
+function traceBusMemoryWrite(id: string, action: 'recorded' | 'duplicate'): void {
+  try {
+    (require('../seat-memory/memory-trace.js') as typeof import('../seat-memory/memory-trace.js'))
+      .traceMemoryWrite({ store: 'surface-events', action, id, origin: 'bus' });
+  } catch { /* fail-open */ }
 }
 
 function log(event: string, data: Record<string, unknown>): void {

@@ -20,6 +20,7 @@ import { spawnElanousSync } from '../instance/spawn-elanous.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { getUserConfig } from '../user-config/reader.js';
 import { debug } from '../debug/log.js';
+import { boardVersion } from '../release-loop/board-version.js';
 
 export const RETRO_DAILY_GRAPH_ID = 'retro-daily';
 export const RETRO_MAX_ACTIONS = 3;
@@ -259,9 +260,9 @@ function readFactsViaCli(since: string, root: string, configDir: string, repo = 
 
 /** 최근 판 열 개의 체크리스트에서 green/done 칸을 모은다(예: DRAFT3 0.2.12 · DRAFT-TRIAGE 0.2.18). 못 읽은 판은 건너뛴다. */
 async function readGreenCellsFromChecklist(span = 10): Promise<GreenCell[]> {
-  const { listChecklist, checklistDevVersion } = await import('../release-loop/checklist.js');
-  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(checklistDevVersion());
-  if (!match) throw new Error(`unparseable version: ${checklistDevVersion()}`);
+  const { listChecklist } = await import('../release-loop/checklist.js');
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(boardVersion());
+  if (!match) throw new Error(`unparseable version: ${boardVersion()}`);
   const cells: GreenCell[] = [];
   for (let patch = Number(match[3]); patch >= Math.max(0, Number(match[3]) - span); patch--) {
     const version = `${match[1]}.${match[2]}.${patch}`;

@@ -6,6 +6,9 @@ import { elanousConfigDir, userConfigPath } from '../paths.js';
 import { parseCredentialSlotId } from './cred-slot-schema.js';
 
 export const CODEX_CREDENTIAL_SLOT = 'cred:codex-login';
+/** RELEASE-HUMAN-PROOF-TRUST-ROOT (대표 11-28) — the release approval signing key: one owner host, never mirrored. */
+export const RELEASE_APPROVAL_SIGNER_SLOT = 'release-approval-signer';
+const NO_MIRROR_SLOTS: ReadonlySet<string> = new Set([RELEASE_APPROVAL_SIGNER_SLOT]);
 /** @deprecated Legacy compatibility label only. Ownership is resolved from the setting or lease. */
 export const CODEX_CREDENTIAL_OWNER_HOST = 'mbp';
 
@@ -28,7 +31,7 @@ export function normalizeCredentialHost(value: string): string {
 }
 
 function assertSlot(slot: string): void {
-  if (slot !== CODEX_CREDENTIAL_SLOT && !parseCredentialSlotId(slot)) throw new Error('CREDENTIAL_OWNER_SLOT_INVALID');
+  if (slot !== CODEX_CREDENTIAL_SLOT && !NO_MIRROR_SLOTS.has(slot) && !parseCredentialSlotId(slot)) throw new Error('CREDENTIAL_OWNER_SLOT_INVALID');
 }
 
 export function credentialOwnerLedgerPath(root = elanousConfigDir()): string {
@@ -53,7 +56,8 @@ function readLedger(path: string): OwnerLedger {
         throw new Error('CREDENTIAL_OWNER_LEDGER_CORRUPT');
       return { host: normalizeCredentialHost(mirror.host), mode: 'access-only' as const, recordedAt: mirror.recordedAt };
     });
-    if (new Set(mirrors.map((mirror) => mirror.host)).size !== mirrors.length || mirrors.some((mirror) => mirror.host === ownerHost))
+    if (new Set(mirrors.map((mirror) => mirror.host)).size !== mirrors.length || mirrors.some((mirror) => mirror.host === ownerHost)
+      || (NO_MIRROR_SLOTS.has(row.slot) && mirrors.length))
       throw new Error('CREDENTIAL_OWNER_LEDGER_CORRUPT');
     return { slot: row.slot, ownerHost, mirrors };
   });
@@ -132,6 +136,7 @@ export function recordCredentialMirror(input: {
   readonly recordedAt?: string;
 }, path = credentialOwnerLedgerPath()): CredentialOwnerRecord {
   assertSlot(input.slot);
+  if (NO_MIRROR_SLOTS.has(input.slot)) throw new Error('CREDENTIAL_OWNER_SLOT_NO_MIRROR');
   const ownerHost = normalizeCredentialHost(input.ownerHost);
   const mirrorHost = normalizeCredentialHost(input.mirrorHost);
   if (ownerHost === mirrorHost) throw new Error('credential owner cannot be a mirror');
@@ -162,6 +167,34 @@ export function recordCredentialMirror(input: {
       renameSync(temporary, path);
       const dirFd = openSync(dirname(path), 'r');
       try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+    } finally { if (existsSync(temporary)) unlinkSync(temporary); }
+    return copyRecord(next);
+  } finally { release(); }
+}
+
+/** Register a no-mirror slot's single owner (mirrors stay []). Same owner = no-op · another owner = refused. */
+export function registerCredentialOwner(input: { readonly slot: string; readonly ownerHost: string }, path = credentialOwnerLedgerPath()): CredentialOwnerRecord {
+  assertSlot(input.slot);
+  if (!NO_MIRROR_SLOTS.has(input.slot)) throw new Error('CREDENTIAL_OWNER_SLOT_NOT_REGISTRABLE');
+  const ownerHost = normalizeCredentialHost(input.ownerHost);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const release = acquireLockSync(`${path}.lock`);
+  try {
+    const rows = readLedger(path).slots.map(copyRecord);
+    const previous = rows.find((row) => row.slot === input.slot);
+    if (previous) {
+      if (previous.ownerHost !== ownerHost) throw new Error('credential slot already has another owner host');
+      return copyRecord(previous);
+    }
+    const next: CredentialOwnerRecord = { slot: input.slot, ownerHost, mirrors: [] };
+    rows.push(next);
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temporary, JSON.stringify({ version: 1, slots: rows }), { flag: 'wx', mode: 0o600 });
+      chmodSync(temporary, 0o600);
+      const fd = openSync(temporary, 'r');
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+      renameSync(temporary, path);
     } finally { if (existsSync(temporary)) unlinkSync(temporary); }
     return copyRecord(next);
   } finally { release(); }

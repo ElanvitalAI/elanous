@@ -16,6 +16,7 @@
  * - `syncCapMs` = Infinity (`syncCapMs: 0` config): same — inline.
  * - A detached capsule's notification always carries its session (`parentSessionId`): it never reaches another session.
  */
+import { seatFromEnv } from '../acp/turn-budget.js';
 import { judgeStop } from '../agent/stop-door.js';
 import type { StopOutcome } from '../agent/stop-door.js';
 import { globalTaskNotificationQueue, TASK_NOTIFICATION_OUTPUT_CAP, type TaskNotificationQueue } from '../agent/task-notification.js';
@@ -48,6 +49,8 @@ export interface ShellCapsuleCall<R> {
 
 export interface ShellCapsuleDeps {
   readonly policy: CapsulePolicy;
+  /** Override seat detection for isolated simulations. */
+  readonly seatTurn?: boolean;
   readonly queue?: TaskNotificationQueue;
   readonly now?: () => number;
   readonly setTimer?: (fn: () => void, ms: number) => unknown;
@@ -134,6 +137,7 @@ export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellC
   const startedAt = now();
   const own = new AbortController();
   let timer: unknown;
+  let approvalTimer: unknown;
   let arm = (): void => {};
   let hit: (why: 'cap' | 'turn-cap' | 'urgent') => void = () => {};
   const capHit = new Promise<'cap' | 'turn-cap' | 'urgent'>((resolve) => {
@@ -154,10 +158,15 @@ export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellC
     if (!launched) { urgentBeforeLaunch = true; own.abort('urgent decision before shell spawn'); }
     hit('urgent');
   });
-  // RUNSHELL-BG-ENDS-TURN ① — an urgent steer (person · crown · decision/alert mail) during the foreground wait detaches
-  // the started command now; before the spawn it changes nothing (the approval wait is not the cap clock).
+  // A steer must also reach the turn while approval is pending. Before spawn withdraw the approval
+  // synchronously rather than detaching unapproved work; after spawn keep the existing detach path.
   let preempted = false;
-  const offPreempt = onShellPreempt(at.sessionId, () => { if (launched && !capped) { preempted = true; hit('urgent'); } });
+  const offPreempt = onShellPreempt(at.sessionId, () => {
+    if (capped) return;
+    preempted = true;
+    if (!launched) { urgentBeforeLaunch = true; own.abort('steer before shell spawn'); }
+    hit('urgent');
+  });
   // OP #122497 — a pre-start cap cancels the child signal synchronously, inside this handler: a queued approval
   // continuation (allow resolved before the cap in the same tick) must never observe a live signal and spawn
   // past the cap. A started call keeps the detach path untouched.
@@ -171,35 +180,40 @@ export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellC
   else turnSignal?.addEventListener('abort', forward, { once: true });
   const work = call.start(own.signal, () => {
     if (capped || urgentBeforeLaunch) return; // A pre-launch cap or decision cancels this report.
-    launched = true; arm();
+    launched = true; if (approvalTimer !== undefined) clearTimer(approvalTimer); arm();
   });
   if (!call.clockFromSpawn) arm();
+  else if ((deps.seatTurn ?? seatFromEnv(process.env) !== null) && !launched && !capped && !urgentBeforeLaunch) {
+    approvalTimer = setTimer(() => hit('cap'), 30_000);
+  }
   let raced: { value: R } | 'cap' | 'turn-cap' | 'urgent';
   try {
     raced = await Promise.race([work.then((value) => ({ value })), capHit]);
   } catch (error) {
-    clearTimer(timer);
+    clearTimer(timer); clearTimer(approvalTimer);
     turnSignal?.removeEventListener('abort', forward);
     offUrgent(); offPreempt();
     throw error;
   }
-  if ((raced === 'turn-cap' || raced === 'urgent') && !launched) {
+  if ((raced === 'turn-cap' || raced === 'urgent' || (raced === 'cap' && capped)) && !launched) {
     // JUD #39435 must: the cap won before the process started — the pending approval/work is cancelled (no
     // capsule, no frame, no notification) and the cap reason goes back to the caller.
-    clearTimer(timer);
+    clearTimer(timer); clearTimer(approvalTimer);
     turnSignal?.removeEventListener('abort', forward);
     offUrgent(); offPreempt();
     work.then(() => {}, () => {}); // the cancelled wait's own outcome never surfaces — the cap is the answer
     own.abort(raced === 'urgent' ? 'urgent decision before shell spawn' : turnSignal?.reason);
-    throw raced === 'urgent' ? new Error('RunShell deferred before spawn for urgent decision') : turnSignal?.reason;
+    throw raced === 'urgent' ? new Error(preempted ? 'RunShell deferred before spawn for steer' : 'RunShell deferred before spawn for urgent decision') : turnSignal?.reason;
   }
   if (raced !== 'cap' && raced !== 'turn-cap' && raced !== 'urgent') {
-    clearTimer(timer);
+    clearTimer(timer); clearTimer(approvalTimer);
     turnSignal?.removeEventListener('abort', forward);
     offUrgent(); offPreempt();
     return raced.value;
   }
 
+  // A pending approval is kept fail-closed; only its wait moves to the session capsule.
+  clearTimer(timer); clearTimer(approvalTimer);
   // Past the cap: the process now belongs to the session, not the turn.
   turnSignal?.removeEventListener('abort', forward);
   offUrgent(); offPreempt();

@@ -56,6 +56,24 @@ export function seatMailTrustFor(input: SeatMailTrustInput, declaredSeats: Reado
   return trust;
 }
 
+/** Uncached complete declaration for capacity decisions. Missing or invalid sources are unknown, not an empty federation. */
+export function declaredFederationSeatsStrict(deps: { stateRoot: string; cwd: string; home: string }): ReadonlySet<string> | null {
+  try {
+    const registry = readSeatRegistryV2(seatRegistryPath(deps.stateRoot));
+    const workspace = readWorkspaceFile(deps.cwd, deps.home);
+    if (registry.status !== 'ready' || !workspace.path || workspace.errors.length > 0 || !workspace.config) return null;
+    const seats = new Set<string>();
+    const add = (value: unknown) => {
+      if (typeof value === 'string' && SEAT.test(value.trim().toUpperCase())) seats.add(value.trim().toUpperCase());
+    };
+    for (const entry of registry.registry.seats) add(entry.address);
+    for (const id of Object.keys(workspace.config.seats)) add(id);
+    add(workspace.config.hq?.coordinator);
+    for (const space of Object.values(workspace.config.spaces)) { add(space.coordinator); for (const id of space.seats) add(id); }
+    return seats;
+  } catch { return null; }
+}
+
 const CACHE_MS = 30_000;
 let cache: { key: string; at: number; seats: ReadonlySet<string> } | null = null;
 

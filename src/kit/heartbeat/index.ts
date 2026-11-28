@@ -116,10 +116,13 @@ export function readBeats(path = beatLedgerPath()): Beat[] {
 /** Head of a source (e.g. msg store max id); null = unknown source or unreadable. */
 export type SourceHead = (source: string) => number | null;
 
-export function judgeWatchers(beats: readonly Beat[], now: Date, sourceHead: SourceHead = () => null, opts: { includeSignals?: boolean } = {}): WatcherVerdict[] {
+/** `retired` = ids of retired (absorbed) triggers (trigger-registry `retiredTriggerIds`) — their old beat is history, not a
+ *  watcher: an absorbed job never beats again, so it would read DEAD forever (11-28 guardian `beat:watchers-check`). */
+export function judgeWatchers(beats: readonly Beat[], now: Date, sourceHead: SourceHead = () => null, opts: { includeSignals?: boolean; retired?: ReadonlySet<string> | null } = {}): WatcherVerdict[] {
   const byName = new Map<string, Beat[]>();
   for (const b of beats) {
     if (b.kind === 'loop-signal' && !opts.includeSignals) continue;
+    if (opts.retired?.has(b.name)) continue;
     const list = byName.get(b.name) ?? []; list.push(b); byName.set(b.name, list); }
   const verdicts: WatcherVerdict[] = [];
   for (const [name, list] of byName) {

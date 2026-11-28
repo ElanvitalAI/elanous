@@ -8,9 +8,13 @@
 //   budget        budget/unified-usage collectUnifiedUsage() — codex/openrouter rows
 //   crown mails   msg store listCreatedBetween(since, now)
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { elanousCliArgv, installedBin } from '../instance/cli-bin.js';
 import { median, type PulseMeasure, type SpaceMeasure } from './op-pulse.js';
 import type { PulseExtra, PulseProbes } from './op-pulse-run.js';
+import type { BurstLaunch, BurstState } from './op-pulse-burst.js';
+import type { BurstActuatorPolicy, BurstActuators, BurstUnit } from './op-pulse-burst-actuate.js';
 
 const short = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 80);
 const HOUR = 3_600_000;
@@ -32,7 +36,74 @@ export function livePulseProbesWithPlanner(roots: { stateRoot: string; seatState
     throughput: async (now: Date, stage: string) => (await (await import('./throughput-controller-live.js')).runThroughputLive(roots, now, stage)).block,
     // OP-WORLD-LENS — the world card rides the brief (computed fresh · cache refreshed · Δ against OP's last turn, not advanced).
     worldCard: async (now: Date) => (await import('../op-world/world-lens.js')).freshLensLines('OP', now),
+    // BURST-ACTUATOR-WIRED — the lane doors a live burst launches through (els new · eln hosts start · els close).
+    burstActuators: (policy: BurstActuatorPolicy) => liveBurstActuators(policy),
   };
+}
+
+const inScope = (state: Pick<BurstState, 'scope'>, home: string, seat: string) =>
+  state.scope.length === 0 || state.scope.some(s => { const u = s.toUpperCase(); return u === 'ALL' || u === home.toUpperCase() || u === seat.toUpperCase(); });
+
+/** Close one burst launch by its exact id — existing commands only; a lane without one throws (kept as closeFailed). */
+export async function liveBurstCloser(l: BurstLaunch): Promise<void> {
+  if (l.lane === 'hands' || l.lane === 'remote') {
+    const r = spawnSync(installedBin('els'), ['close', l.id], { encoding: 'utf8', timeout: 30_000 }); // Source: one exact pane close per launch · absolute els (cron PATH)
+    if (r.status !== 0) throw new Error(`els close ${l.id} exit ${r.status}: ${String(r.stderr).trim().slice(0, 120)}`);
+    return;
+  }
+  if (l.lane === 'ta' || l.lane === 'review') return; // A harness/review child ends on its own; nothing to kill (in-flight work finishes).
+  // TODO(OP-PULSE-BURST-VM-STOP): no `eln hosts stop` yet — the receipt lists the VM so OP stops it by hand.
+  throw new Error(`${l.lane} ${l.id}: no stop command wired — stop it by hand`);
+}
+
+/**
+ * The live doors (graphs/policies/burst-actuators.yaml `lanes`):
+ *   hands (els-new)     a federation hand seat with no live pane (hand pool «no-pane», in the burst scope) gets one pane:
+ *                       els new --ws <home> --cwd <seat-state root>/../<seats_dir>/<SEAT> --title <SEAT> -- <command…> → the pane id is the unit id
+ *   vm (hosts-start)    eln hosts start <host> for the first registry burst host (paidHostsFor) the burst has not started — planScale reaches this
+ *                       only when local/LAN are full, the forecast misses and the cloud budget (or a CEO card) covers it
+ */
+export function liveBurstActuators(policy: BurstActuatorPolicy): BurstActuators {
+  const up: BurstActuators['up'] = {};
+  const hands = policy.lanes.hands;
+  if (hands.door === 'els-new' && hands.command?.length && hands.seatsDir) {
+    up.hands = async ({ count, state }) => {
+      const { resolveSeatStateRoot } = await import('./msg-wake.js');
+      const seatsRoot = join(dirname(resolveSeatStateRoot()), hands.seatsDir!);
+      const pool = await (await import('../seat/hand-pool-live.js')).liveHandPool({});
+      const free = pool.filter(h => h.state === 'no-pane' && inScope(state, h.home, h.seat)).sort((a, b) => a.seat.localeCompare(b.seat));
+      const units: BurstUnit[] = []; const skipped: string[] = [];
+      for (const h of free) {
+        if (units.length >= count) break;
+        const cwd = join(seatsRoot, h.seat);
+        if (!existsSync(cwd)) { skipped.push(`${h.seat} (no folder)`); continue; }
+        const r = spawnSync(installedBin('els'), ['new', '--ws', h.home, '--cwd', cwd, '--title', h.seat, '--', ...hands.command!],
+          { encoding: 'utf8', timeout: hands.timeoutSec! * 1000 }); // Source: one pane per hand seat through the els new door · timeout from the policy
+        let pane: string | undefined;
+        try { pane = (JSON.parse(String(r.stdout)) as { pane?: string }).pane; } catch { pane = undefined; }
+        if (r.status !== 0 || !pane) { skipped.push(`${h.seat} (els new exit ${r.status}: ${String(r.stderr || r.stdout).trim().slice(0, 80)})`); continue; }
+        units.push({ id: pane, host: h.seat });
+      }
+      const note = units.length < count ? `free hand seats ${free.length}${skipped.length ? ` · skipped ${skipped.join(', ')}` : ''}` : undefined;
+      return { units, ...(note ? { note } : {}) };
+    };
+  }
+  const vm = policy.lanes.vm;
+  if (vm.door === 'hosts-start') {
+    up.vm = async ({ count, state }) => {
+      const started = new Set(state.launches.filter(l => l.lane === 'vm' && !l.closedAt).map(l => l.id));
+      const units: BurstUnit[] = []; const failed: string[] = [];
+      const { paidHostsFor } = await import('../kit/resource-facts/route.js');
+      for (const host of paidHostsFor('burst').filter(h => !started.has(h))) {
+        if (units.length >= count) break;
+        const [bin, ...pre] = elanousCliArgv();
+        const r = spawnSync(bin!, [...pre, 'hosts', 'start', host], { encoding: 'utf8', timeout: vm.timeoutSec! * 1000 }); // Source: the cost-ledger VM door · timeout from the policy
+        if (r.status === 0) units.push({ id: host, host }); else failed.push(`${host} exit ${r.status}`);
+      }
+      return { units, ...(failed.length ? { note: `hosts start failed: ${failed.join(', ')}` } : {}) };
+    };
+  }
+  return { up, close: liveBurstCloser };
 }
 
 export function livePulseProbes(): PulseProbes {

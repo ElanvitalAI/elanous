@@ -11,9 +11,16 @@
 //      · one row in `<state>/steward/cell-blocks.jsonl` · one `steward-exception` mail to the awaited seat's coordinator
 //        (once per cell × awaited seat while the block is open — a repeat block only refreshes the reason)
 //      · `eln work next`: an OPEN block is a wait ('blocked-on') — never READY, never held for WIP 1.
-//    The block RESOLVES when the awaited seat mails after the block (a reply to the exception mail, or any mail to the
-//    holder or its coordinator — structured: sender ⊕ id order, never the text). A resolved cell is re-offered to its last
-//    holder first: READY for it (ranked first), withheld from other hands for {@link REOFFER_GRACE_MS}, then plain READY.
+//    The block RESOLVES when the awaited seat answers ABOUT the cell after the block — graphs/policies/work-pull.yaml
+//    `block.resolve_on` (structured: sender ⊕ id order ⊕ reply_to ⊕ refs ⊕ the board's updatedBy, never the text):
+//    reply-to = a reply to the exception mail · cell-ref = a mail whose refs carry cell:<ID> · cell-touch = the awaited
+//    seat changed the cell. A resolved cell is re-offered to its last holder first: READY for it (ranked first), withheld
+//    from other hands for {@link REOFFER_GRACE_MS}, then plain READY.
+//    WORK-PULL-REACHES-ROSTER (audit 11-28 00:47–01:47Z): the old rule also took ANY later mail from the awaited seat to
+//    the holder or its coordinator (`addressed-mail`) — 105 of 139 blocks waited on the hand's own coordinator, which mails
+//    its hands all the time: 118 blocks «resolved» in a median 7 min and 93 of the hour's 149 claims were the same hand
+//    re-taking the cell it had just parked (PWA-ELN-CONTRACT 8×), unchanged. A block on a WRITER cell (coordinator-held ·
+//    the hand is its writer) releases the writer; the coordinator stays owner.
 //
 // 세 얼굴: 관측 = cell-blocks.jsonl (block · resume rows) ⊕ checklist history (claim row «work block · blocked-on:<seat>»)
 //          ⊕ work-next.jsonl · 판단 근거 = {@link openBlocks} ⊕ {@link blockState} (rules, no LLM) · 수복과 인계 = the exception
@@ -83,11 +90,13 @@ export function blockState(block: CellBlockRow, seat: string, repliedAtMs: numbe
 export interface WorkBlockDeps {
   readonly now: () => number;
   readonly version: string;
-  readonly cells: () => readonly { readonly id: string; readonly status: string; readonly owner?: string }[];
+  readonly cells: () => readonly { readonly id: string; readonly status: string; readonly owner?: string; readonly writer?: { readonly seat: string } }[];
   /** seat → its coordinator scope (federation ladder). */
   readonly scopeOf: (seat: string) => string;
   readonly blocks: () => readonly CellBlockRow[];
   readonly swap: (id: string, input: { expectedOwner: string | null; to: string | null; actor: string; reason: string }) => { outcome: 'swapped' | 'lost' | 'missing' };
+  /** WORK-PULL-REACHES-ROSTER — release the caller's writer claim on a coordinator-held cell (owner stays). */
+  readonly setWriter?: (id: string, input: { expectedOwner: string | null; expectedWriter: string | null; to: string | null; actor: string; reason: string }) => { outcome: 'swapped' | 'lost' | 'missing' };
   /** HQ coordinator: block notices to it go to the fed-state ledger + the 30-min steward digest, not one mail each
    *  (top OP inbound stream 11-25). Resume is unchanged: any later mail from the awaited seat to the hand/board. */
   readonly hq?: string;
@@ -112,9 +121,14 @@ export function workBlock(seatRaw: string, cellId: string, input: { on: string; 
   const cell = deps.cells().find((c) => c.id === cellId);
   if (!cell) return { code: 5, line: `work block: no cell ${cellId} in ${deps.version}` };
   if (cell.status !== 'yellow') return { code: 5, line: `work block: ${cellId} is ${cell.status} — only an open (yellow) cell blocks` };
-  if (ownerSeat(cell.owner) !== seat) return { code: 5, line: `work block: ${cellId} is held by ${cell.owner ?? 'nobody'}, not ${seat}` };
-  const board = deps.scopeOf(seat).trim().toUpperCase();
-  const swapped = deps.swap(cellId, { expectedOwner: cell.owner ?? null, to: board, actor: seat, reason: `work block · blocked-on:${on} · ${reason}` });
+  const writing = !!deps.setWriter && cell.writer?.seat?.trim().toUpperCase() === seat && ownerSeat(cell.owner) !== seat;
+  if (!writing && ownerSeat(cell.owner) !== seat) return { code: 5, line: `work block: ${cellId} is held by ${cell.owner ?? 'nobody'}, not ${seat}` };
+  // A writer cell goes back to its owner's board (the coordinator stays owner) · an owned cell to the hand's coordinator.
+  const board = writing ? ownerSeat(cell.owner) : deps.scopeOf(seat).trim().toUpperCase();
+  const why = `work block · blocked-on:${on} · ${reason}`;
+  const swapped = writing
+    ? deps.setWriter!(cellId, { expectedOwner: cell.owner ?? null, expectedWriter: cell.writer!.seat, to: null, actor: seat, reason: why })
+    : deps.swap(cellId, { expectedOwner: cell.owner ?? null, to: board, actor: seat, reason: why });
   if (swapped.outcome !== 'swapped') return { code: 5, line: `work block: ${cellId} changed under you (${swapped.outcome}) — read the board and retry` };
   const prior = openBlocks(deps.blocks(), deps.version).get(cellId);
   const at = new Date(deps.now()).toISOString();

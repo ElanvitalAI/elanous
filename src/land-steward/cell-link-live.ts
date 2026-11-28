@@ -10,7 +10,7 @@ interface GhMerged { number: number; title: string; body?: string; headRefName?:
 export function liveSweepDeps(stateRoot: string, o: { dry?: boolean; since?: string } = {}): SweepDeps {
   /* eslint-disable @typescript-eslint/no-require-imports */
   const { ghInvocation, resolveLandRepo } = require('../cli/land-graph-cli.js') as typeof import('../cli/land-graph-cli.js');
-  const { readReleaseGraphVersion } = require('../ops-dashboard/current-version.js') as typeof import('../ops-dashboard/current-version.js');
+  const { readBoardPointer } = require('../ops-dashboard/current-version.js') as typeof import('../ops-dashboard/current-version.js');
   const { listChecklist } = require('../release-loop/checklist.js') as typeof import('../release-loop/checklist.js');
   /* eslint-enable @typescript-eslint/no-require-imports */
   const repo = resolveLandRepo({ defaultRoot: join(homedir(), 'elanous-hq', 'repo.git') });
@@ -27,7 +27,7 @@ export function liveSweepDeps(stateRoot: string, o: { dry?: boolean; since?: str
       }));
     },
     checklist() {
-      const version = readReleaseGraphVersion();
+      const version = readBoardPointer();
       return version ? { version, items: listChecklist(version).items } : null;
     },
     attach(version, cell, pr) {

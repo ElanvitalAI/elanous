@@ -77,6 +77,11 @@
       "greenSince": "2026-11-27 REVERT-GUARD-DECLARED-SUPERSEDE",
       "reason": "content supersede refused until 의도된 삭제 is declared; an own-commit deletion passes without a line"
     },
+    "smart-merge/SM-OWN-REWRITE-DECLARATION": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LAND-REVERT-GUARD-OWN",
+      "reason": "own rewrite refusal includes a reviewable declaration candidate"
+    },
     "smart-merge/SM-RESTRUCTURE-PLUS-INSERT": {
       "expect": "green",
       "greenSince": "2026-11-27 SMART-MERGE-REFRESH-ALL",
@@ -86,6 +91,66 @@
       "expect": "green",
       "greenSince": "2026-11-27 SMART-MERGE-REFRESH-ALL",
       "reason": "rebuilt branch (Smart-Merge trailer) passes the review preflight; review reads the own delta"
+    },
+    "smart-merge/SM-CARRY-CONTEXT-MOVED": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LAND10-FINISHER-WAIT",
+      "reason": "smart-merge merged main that touched the hunk context: patch-id moved, own-diff carry keeps the receipt, 0 rechecks, decide lands"
+    },
+    "smart-merge/SM-CARRY-OWN-CHANGED": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LAND10-FINISHER-WAIT",
+      "reason": "own commit after the receipt and a -X ours resolved merge: no carry, stale-head, 1 finisher pregate each"
+    },
+    "smart-merge/SM-L3-LIGHT-LAND": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LAND10-FINISHER-WAIT",
+      "reason": "gate-tier.yaml L3 = rehearsal, L0..L2 = land; old L3 and rehearsal-tier L2 receipts both land"
+    },
+    "smart-merge/SM-REHEARSAL-REGRESSION-CELL": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LAND10-FINISHER-WAIT",
+      "reason": "rehearsal full gate fails after two light lands: gate bisect names the culprit squash, its PR gets one delivered owner cell"
+    },
+    "smart-merge/SM-GH-SNAPSHOT-5SEATS": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GH-BUDGET-GOVERNOR",
+      "reason": "five seat processes ask the full open-PR list at once: one real GitHub list read, one fresh and four cache reads"
+    },
+    "smart-merge/SM-GH-SECONDARY-COOLDOWN": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GH-BUDGET-GOVERNOR",
+      "reason": "rate limit already exceeded: global cooldown, five seats skip without a call, land graph tick skipped once then normal"
+    },
+    "smart-merge/SM-GH-HEAD-MOVED-MID-REFRESH": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GH-BUDGET-GOVERNOR moved-head hotfix",
+      "reason": "one PR pushed between the list and its files read: snapshot written without it, meta skipped 1, next refresh has it"
+    },
+    "smart-merge/SM-GH-SEAT-BUDGET": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GH-BUDGET-GOVERNOR",
+      "reason": "a seat over its hourly GraphQL budget gets one refusal naming the git alternative; writes and other seats pass"
+    },
+    "smart-merge/SM-GH-MIRROR-20FETCH": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GH-PROXY-LAYER",
+      "reason": "GitHub main moves: one mirror refresh, 20 seat repositories fetch at once through insteadOf: GitHub fetches 1, every seat at the new main, push URL still GitHub"
+    },
+    "smart-merge/SM-GH-MIRROR-STALE-FALLBACK": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GH-PROXY-LAYER",
+      "reason": "refresher cannot reach GitHub past stale_fallback_min: every consumer fetches GitHub directly; GitHub back: the next tick restores the mirror"
+    },
+    "smart-merge/SM-GH-SHIM-COOLDOWN-VIEW": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GH-PROXY-LAYER",
+      "reason": "hand shell gh pr view during the cooldown: exit 75, one clean line, no GitHub call; gh auth status passes through; a door child is not governed twice"
+    },
+    "smart-merge/SM-GH-SHIM-100-VIEWS": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GH-PROXY-LAYER",
+      "reason": "100 hand-shell gh pr view of one PR inside a minute: at most one GitHub read per read-cache window, every answer identical"
     }
   }
 }

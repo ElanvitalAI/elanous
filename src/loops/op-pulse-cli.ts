@@ -11,7 +11,6 @@
 //   throughput [--json] [--snapshot f] [--save-snapshot f] [--execute]   lands/h · greens/h → binding constraint → lever
 //   dismiss <msgId> --why <line>                       a directive mail needs no cell (the planner stops asking)
 //   enforce --since <iso> [--promise] [--tui-progress] turn-end enforcement (called by the OP TUI)
-import { installedBin } from '../instance/cli-bin.js';
 import type { Command } from 'commander';
 import { join } from 'node:path';
 import { pulsePaths, readPulseState, rhythmLine, rhythmRow } from './op-pulse.js';
@@ -24,19 +23,6 @@ const day = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart
 
 async function stateRoot(): Promise<string> { return (await import('../instance/resolve.js')).effectiveInstanceRoot(); }
 async function paths(now = new Date()) { return pulsePaths(seatState(), await stateRoot(), day(now)); }
-
-/** Closer for a burst launch — existing commands only; a lane without one throws (kept in the receipt as closeFailed). */
-async function liveCloser(l: BurstLaunch): Promise<void> {
-  const { spawnSync } = await import('node:child_process');
-  if (l.lane === 'hands' || l.lane === 'remote') {
-    const r = spawnSync(installedBin('els'), ['close', l.id], { encoding: 'utf8', timeout: 30_000 }); // Source: one exact pane close per launch · absolute els (cron PATH)
-    if (r.status !== 0) throw new Error(`els close ${l.id} exit ${r.status}: ${String(r.stderr).trim().slice(0, 120)}`);
-    return;
-  }
-  if (l.lane === 'ta' || l.lane === 'review') return; // A harness/review child ends on its own; nothing to kill (in-flight work finishes).
-  // TODO(OP-PULSE-BURST-VM-STOP): no `eln hosts stop` yet — the receipt lists the VM so OP stops it by hand.
-  throw new Error(`${l.lane} ${l.id}: no stop command wired — stop it by hand`);
-}
 
 export function registerPulseCommands(program: Command): void {
   const pulse = program.command('pulse').description('OP structural pulse — phase · rhythm · gaps · burst (replaces the pinned standing goal)');
@@ -120,17 +106,20 @@ export function registerPulseCommands(program: Command): void {
     const { measure, extra } = await probes.measure(now);
     const active = readActiveBurst(p.burst);
     const row = rhythmRow(rhythm, active ? 'burst' : currentPhase(probes, rhythm, p, now).phase);
+    const { liveBurstActuatorPolicy, executedLevels } = await import('./op-pulse-burst-actuate.js');
+    const actPolicy = liveBurstActuatorPolicy(); const pt = actPolicy.pressureTargets;
     const press = pressures({ targetGapRatio: measure.landedPerH && row.targets.landedPerH ? row.targets.landedPerH / Math.max(0.1, measure.landedPerH) : null,
-      readyBacklog: extra.readyBacklog, hands: measure.spaces.reduce((n, s) => n + (s.hands ?? 0), 0) || null, readyPerHand: row.targets.readyPerHand ?? 2,
-      judgeWaitMin: measure.judgeWaitMedianMin, judgeWaitTargetMin: row.targets.judgeWaitMedianMin ?? 30, judgeQueue: measure.judgeQueue,
-      gateWaitMin: extra.gateWaitMin, gateWaitTargetMin: 10, reviewWaitMin: extra.reviewWaitMin, reviewWaitTargetMin: 20, landQueue: extra.landQueue, landQueueTarget: 6, hoursToDeadline: null });
-    const plan = planScale({ levels: active?.levels ?? {}, lastChangeAt: active?.lastChangeAt ?? {}, pressures: press, now, config: cfg, spentUsd: active?.spentUsd ?? 0,
+      readyBacklog: extra.readyBacklog, hands: measure.spaces.reduce((n, s) => n + (s.hands ?? 0), 0) || null, readyPerHand: row.targets.readyPerHand ?? pt.readyPerHandDefault,
+      judgeWaitMin: measure.judgeWaitMedianMin, judgeWaitTargetMin: row.targets.judgeWaitMedianMin ?? pt.judgeWaitMinDefault, judgeQueue: measure.judgeQueue,
+      gateWaitMin: extra.gateWaitMin, gateWaitTargetMin: pt.gateWaitMin, reviewWaitMin: extra.reviewWaitMin, reviewWaitTargetMin: pt.reviewWaitMin, landQueue: extra.landQueue, landQueueTarget: pt.landQueue, hoursToDeadline: null });
+    const plan = planScale({ levels: active ? executedLevels(active) : {}, lastChangeAt: active?.lastChangeAt ?? {}, pressures: press, now, config: cfg, spentUsd: active?.spentUsd ?? 0,
       budgetUsd: active?.budgetUsd ?? Infinity, cloudApprovedUsd: active?.cloudApprovedUsd ?? 0, hoursLeft: active ? (Date.parse(active.until) - now.getTime()) / 3_600_000 : 4,
       forecastMisses: true, ...(active?.allIn ? { allIn: true } : {}), ...(extra.hosts ? { hosts: extra.hosts } : {}) });
     if (o.json) { console.log(JSON.stringify({ pressures: press, plan })); return; }
     for (const x of press) console.log(`압력 ${x.lane.padEnd(7)} ${x.pressure ?? '?'} · ${x.why}`);
     console.log(plan.length ? plan.map(d => `→ ${d.lane}: ${d.from} → ${d.to}${d.blocked ? ` (막힘 ${d.blocked})` : ''} · ${d.why}`).join('\n') : '→ 확장 없음 (압력 목표 안)');
-    console.log('actuators: hands = els new (wired) · ta = eln harness ask (wired) · review = eln self review --model gpt-6.1-terra (wired) · vm = eln hosts start (wired, stop TODO) · remote/pregate/judge/land = TODO');
+    // The door table is the policy file — never a hand-written «wired» claim (11-28: this line said wired while nothing ran).
+    console.log(`doors (graphs/policies/burst-actuators.yaml · the live pulse executes): ${BURST_LANES.map(l => `${l} = ${actPolicy.lanes[l].door === 'none' ? '미배선' : actPolicy.lanes[l].door}`).join(' · ')}`);
   });
   burst.command('start').requiredOption('--goal <g>', 'implement | land | green').requiredOption('--until <iso>').option('--scope <spaces>', 'comma list of spaces/cells', 'ALL')
     .option('--preset <p>', '2h | 4h | 8h').option('--budget-usd <n>').option('--by <seat>', 'who declares it', 'OP').option('--ceo-msg <id>').option('--crown <id>')
@@ -144,7 +133,7 @@ export function registerPulseCommands(program: Command): void {
           ...(o.budgetUsd !== undefined ? { budgetUsd: Number(o.budgetUsd) } : {}), trigger: o.ceoMsg ? 'ceo-urgent' : `manual:${o.by}`,
           ...(o.ceoMsg ? { ceoLine: { msgId: Number(o.ceoMsg), crownDirective: o.crown ?? '?' } } : {}) }, readActiveBurst(p.burst));
         writeBurst(p.burst, state);
-        console.log(`burst ${state.id} started · ${state.goal} · until ${state.until} · budget $${state.budgetUsd} · levels ${JSON.stringify(state.levels)} — record each launch: eln pulse burst launched --lane <lane> --id <exact id>`);
+        console.log(`burst ${state.id} started · ${state.goal} · until ${state.until} · budget $${state.budgetUsd} · targets ${JSON.stringify(state.targets ?? {})} · running 0 — the next burst pulse launches through the lane doors (eln pulse burst plan); a hand-made launch: eln pulse burst launched --lane <lane> --id <exact id>`);
       } catch (e) { console.error(`pulse burst start: ${e instanceof Error ? e.message : String(e)}`); process.exitCode = 2; }
     });
   burst.command('launched').requiredOption('--lane <lane>').requiredOption('--id <id>').option('--host <h>').option('--cost-usd <n>', 'estimated cost', '0')
@@ -162,7 +151,7 @@ export function registerPulseCommands(program: Command): void {
     const active = readActiveBurst(p.burst);
     if (!active) { console.log('no active burst'); return; }
     const { appendPulseLedger } = await import('./op-pulse.js');
-    const { state, receipt } = await exitBurst(active, { now, reason: o.reason, closer: liveCloser, landedNow: null, greenNow: null });
+    const { state, receipt } = await exitBurst(active, { now, reason: o.reason, closer: (await import('./op-pulse-live.js')).liveBurstCloser, landedNow: null, greenNow: null });
     writeBurst(p.burst, state); appendPulseLedger(p.burstLedger, { ...receipt });
     console.log(`burst ${receipt.id} exited (${receipt.reason}) · launched ${receipt.launched} · closed ${receipt.closed}${receipt.closeFailed.length ? ` · close failed: ${receipt.closeFailed.map(f => `${f.lane} ${f.id}`).join(', ')}` : ''} · $${receipt.costUsd} · ${receipt.minutes}m${receipt.ceoLine ? ` · CEO #${receipt.ceoLine.msgId}` : ''}`);
   });

@@ -1,0 +1,33 @@
+graph_id: gh-mirror
+version: 1
+loop:
+  title: GitHub 앞 공용 층 · git fetch 미러 (GH-PROXY-LAYER ②) — only the mirror fetches GitHub, consumers fetch the mirror
+  root: 수호자
+  managed_by: trigger-registry
+  description: >-
+    GH-PROXY-LAYER (0.3.40 P0 · CEO 11-28 21:0x «git 문제가 너무 많이 · proxy 등 기본 조치»). Every 2 min, LLM 0: up to
+    mirror.refreshes_per_tick fetches of GitHub into the one bare mirror (refresh_min_interval_sec apart · graphs/policies/gh-proxy.yaml),
+    then every registered consumer repository follows freshness — url.<mirror>.insteadOf while the mirror is fresh, removed
+    (fetch goes to GitHub) once it is older than stale_fallback_min, restored by the next good refresh. Push stays GitHub
+    (url.<upstream>.pushInsteadOf). No mirror registered (`mirror-node.ts setup`) = a no-op tick. Done-when = mirror-tick.json rewritten.
+  owner: OP # infrastructure in front of GitHub; failure cards → OP
+  trigger:
+    cron: '*/2 * * * *'
+  goal:
+    kind: file-mtime
+    path: '{stateRoot}/gh-proxy/mirror-tick.json'
+  failure:
+    goal_deadline_min: 15
+    max_attempts: 2
+    backoff_sec: [60]
+entry_node: refresh
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: refresh
+    kind: agent
+    recipe: 'cmd:gh-mirror-refresh'
+    max_visits: 1
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: refresh, on: outcome, map: { ok: done, fail: failed, error: failed } }

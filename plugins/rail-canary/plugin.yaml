@@ -1,0 +1,10 @@
+# Loop agent rail-canary as a plugin (LOOP-AGENTS-AS-PLUGINS P3 · RAIL-CANARY-AUTO-ROLLBACK). The ONE definition is the agent.yaml this
+# points at — the plugin id · name · version · description are compiled from its manifest (src/plugins/core/plugin-yaml.ts
+# readLoopAgentRef) and are never repeated here. Its body is the shared executor kind canary.check and its probes are the pack
+# graphs/policies/rail-canary.yaml (no agent code in this package). Install (eln plugin add plugins/rail-canary --yes) bundles the
+# package and its tick shim and registers the trigger; remove retires it. plugin.json is GENERATED
+# (bun scripts/plugins/generate-plugin-json.ts --plugin-dir plugins/rail-canary).
+apiVersion: elanous.dev/plugin/v2
+loopAgent: ../../graphs/loop-agents/rail-canary/agent.yaml
+trust: builtin
+capabilities: [proc:elanous]

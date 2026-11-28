@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { withPolicies } from '../policy-context.js';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -9,6 +10,8 @@ import { tickAgent, type AgentPorts } from '../runtime.js';
 import type { Proc, ReapCandidate } from '../../guardian-agent/reaper.js';
 import { createBody, type MacrophageDeps } from './macrophage.js';
 import { scrapFacts, type ScrapDeps, type WorktreeInfo } from './macrophage-scrap.js';
+/** scrapFacts reads the macrophage policies (stale_* · oneshot_grace_h) — run it under the card's own values. */
+const scrapUnder = (deps: ScrapDeps, nowMs: number): Promise<string[]> => withPolicies(loadCard('macrophage').policies, async () => scrapFacts(deps, nowMs));
 
 // The body delegates to the guardian reaper (decision 11-27): these tests fake the reaper's plan · kill · audit · lock and
 // check the card's own contract — one reap per target, a guardian-reaped target skipped, a kill mismatch is a failure.
@@ -93,7 +96,7 @@ describe('macrophage observation parity (Terra #40447 must-fix 4 · 5)', () => {
     };
     const r = await tickAgent(h.card, h.body, h.ports, T0);
     expect(r.acted).toEqual(['reap:mbp:4101']);
-    const facts = (await h.body.observe({ now: T0, card: h.card, state: h.memory.readState(), recall: null, level: 'live' })).facts.join(' | ');
+    const facts = (await withPolicies(h.card.policies, async () => h.body.observe({ now: T0, card: h.card, state: h.memory.readState(), recall: null, level: 'live' }))).facts.join(' | ');
     expect(facts).toContain('지난 일회성 launchd 1 (com.elanous.resinfra.pinch124662)');
     expect(facts).toContain('지난 날짜 크론 1');
     expect(facts).toContain('14일 넘은 깨끗한 worktree 1 · 14일 넘은 stash 1');
@@ -106,13 +109,13 @@ describe('macrophage scrap: a partial read is «모름», never a partial count 
     launchdJobs: () => [], crontab: () => '', stashes: () => [], knownWorktreePath: () => true,
     worktrees: (): WorktreeInfo[] => [{ path: '/Users/u/elanous-hq/worktrees/old', branch: 'feat/old', head: 'a'.repeat(40), lastCommitMs: T0.getTime() - 20 * day, clean: true }],
   };
-  test('launchd reader returns null (one plist unreadable) → «지난 일회성 launchd 모름»', () => {
-    expect(scrapFacts({ ...base, launchdJobs: () => null }, T0.getTime())[0]).toContain('지난 일회성 launchd 모름');
+  test('launchd reader returns null (one plist unreadable) → «지난 일회성 launchd 모름»', async () => {
+    expect((await scrapUnder({ ...base, launchdJobs: () => null }, T0.getTime()))[0]).toContain('지난 일회성 launchd 모름');
   });
-  test('an old worktree whose git status failed → the worktree count is «모름», not the readable ones', () => {
-    const facts = scrapFacts({ ...base, worktrees: () => [...base.worktrees(), { path: '/Users/u/elanous-hq/worktrees/locked', branch: 'feat/x', head: 'b'.repeat(40), lastCommitMs: T0.getTime() - 30 * day, clean: null }] }, T0.getTime());
+  test('an old worktree whose git status failed → the worktree count is «모름», not the readable ones', async () => {
+    const facts = await scrapUnder({ ...base, worktrees: () => [...base.worktrees(), { path: '/Users/u/elanous-hq/worktrees/locked', branch: 'feat/x', head: 'b'.repeat(40), lastCommitMs: T0.getTime() - 30 * day, clean: null }] }, T0.getTime());
     expect(facts[1]).toContain('14일 넘은 깨끗한 worktree 모름');
-    expect(scrapFacts(base, T0.getTime())[1]).toContain('14일 넘은 깨끗한 worktree 1');
+    expect((await scrapUnder(base, T0.getTime()))[1]).toContain('14일 넘은 깨끗한 worktree 1');
   });
 });
 

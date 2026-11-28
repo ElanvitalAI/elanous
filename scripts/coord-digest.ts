@@ -4,7 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../src/debug/log.js';
-import { devVersion, listChecklist, statusChangesSince } from '../src/release-loop/checklist.js';
+import { listChecklist, statusChangesSince } from '../src/release-loop/checklist.js';
+import { boardVersion } from '../src/release-loop/board-version.js';
 
 interface Report { id: number | string; created_at: string; login: string; body: string }
 interface Change { version: string; at: string; from: unknown; to: unknown }
@@ -35,7 +36,7 @@ function options(args: string[]): { track: string; hours: number; versions: stri
     else throw new Error(`모르는 인자: ${arg}`);
   }
   if (!/^[A-Za-z][A-Za-z0-9]*$/.test(track)) throw new Error('--track <ID> 가 필요하다');
-  return { track, hours, versions: versions.length ? [...new Set(versions)] : [devVersion().replace(/-dev\.\d+$/, '')], json, explicitSince };
+  return { track, hours, versions: versions.length ? [...new Set(versions)] : [boardVersion()], json, explicitSince };
 }
 
 function reportCell(body: string): { id: string; sender: string } | null {

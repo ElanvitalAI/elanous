@@ -93,7 +93,7 @@ test('real terminal: bare els writes ENTER_VIEW (alt screen + mouse 1000/1006) o
     root, rows: 24, cols: 120,
     env: { SHELL: '/bin/sh', NODE_ENV: 'development' },
     ready: { label: 'shell-attached', timeoutMs: 30_000, until: (screen) => screen.split('\n').some((line) => line.includes('│') && line.includes('$')) }, // 출처: #37153 live PTY readiness bound
-    steps: [{ label: 'hint-line', text: '', until: 'ctrl+b c new shell', timeoutMs: 5_000 }], // 출처: #37153 live PTY step bound — static hint line, no round trip
+    steps: [{ label: 'hint-line', text: '', until: 'ctrl+b ? shortcuts · c new shell', timeoutMs: 5_000 }], // 출처: #37153 live PTY step bound — static hint line, no round trip
     quitKeys: '\u0002q',
     onOutput: (chunk) => { wire += chunk; },
   });

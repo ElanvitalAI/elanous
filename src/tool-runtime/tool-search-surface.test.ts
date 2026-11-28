@@ -1,6 +1,5 @@
 import { expect, test } from 'bun:test';
 import type { LLMToolRouteMetadata, LLMToolSpec } from '../llm/tool-spec.js';
-import { dispatchClassicTuiTool, prioritizeDashboardTuiToolSearch } from '../dashboard/classic-tui-dispatch.js';
 import { withCapabilityDiscoveryDescription } from '../plugins/core/capability-discovery.js';
 import { HYDRATED_TOOLS_KEY } from '../skills/tools/tool-search-spec.js';
 import { dispatchToolByName, registerToolRuntime } from './registry.js';
@@ -35,47 +34,8 @@ test('classic ToolSearch dispatch searches and hydrates route tools from the cur
   expect(result[HYDRATED_TOOLS_KEY]).toEqual([gcpArchitectSpec]);
 });
 
-test('classic dashboard dispatcher discovers and hydrates route specs, and scopes them to ToolSearch', async () => {
-  registerToolRuntime(toolSearchRuntime);
-  const result = await dispatchClassicTuiTool(
-    dispatchToolByName,
-    'ToolSearch',
-    { query: 'route:용량 부족 GCP 확장안' },
-    { surface: 'tui' },
-    [gcpArchitectSpec],
-  ) as ToolSearchRunResult;
-
-  expect(result.matched).toEqual(['gcp_architect_expand']);
-  expect(result[HYDRATED_TOOLS_KEY]).toEqual([gcpArchitectSpec]);
-
-  let otherToolContext: ToolRuntimeContext | undefined;
-  const inheritedCatalogContext: ToolRuntimeContext = { surface: 'tui', surfaceSpecs: [gcpArchitectSpec] };
-  await dispatchClassicTuiTool(async (_name, _input, context) => {
-    otherToolContext = context;
-    return { output: 'ok' };
-  }, 'SomeOtherTool', {}, inheritedCatalogContext, [gcpArchitectSpec]);
-  expect(otherToolContext).toEqual({ surface: 'tui' });
-});
-
-test('dashboard TUI catalogs keep ToolSearch within the measured provider-visible prefix', () => {
-  // Source: seat-state/R-GCPX/classic-pty-toolsearch-stack-receipt.json records 50 advertised tools without ToolSearch.
-  const providerToolCap = 50;
-  const commonTools = Array.from({ length: providerToolCap }, (_, index) => ({
-    name: `Common${index}`, description: 'common', parameters: { type: 'object', properties: {} },
-  }));
-  const catalog = prioritizeDashboardTuiToolSearch([...commonTools, {
-    name: 'ToolSearch', description: 'search', parameters: { type: 'object', properties: {} },
-  }]);
-
-  expect(catalog.slice(0, providerToolCap).map((tool) => tool.name)).toContain('ToolSearch');
-});
-
-test('capability_search classic dispatch hydrates only this turn catalog and has no global fallback', async () => {
+test('capability_search has no global fallback beyond the dispatching surface catalog', async () => {
   registerToolRuntime(capabilitySearchRuntime);
-  const result = await dispatchClassicTuiTool(dispatchToolByName, 'capability_search',
-    { query: 'route:용량 부족 GCP 확장안' }, { surface: 'tui' }, [gcpArchitectSpec]) as ToolSearchRunResult;
-  expect(result.matched).toEqual(['gcp_architect_expand']);
-  expect(result[HYDRATED_TOOLS_KEY]).toEqual([gcpArchitectSpec]);
   const absent = await capabilitySearchRuntime.run({ query: 'select:gcp_architect_expand' }, { surface: 'tui' });
   expect(absent.matched).toEqual([]);
   expect(absent[HYDRATED_TOOLS_KEY]).toBeUndefined();

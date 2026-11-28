@@ -167,6 +167,9 @@ export interface AccountUsageRow {
   readonly credits: CreditAxis;
   readonly subscription: SubscriptionAxis;
   readonly resetCredits: ResetCreditExpiryAxis;
+  /** KEYS-PROACTIVE-REFRESH (대표 11-28): the login's OWN expiry — the access JWT `exp` and `last_refresh` of the CODEX_HOME this row
+   *  read (times only). Distinct from `resetCredits` (the expiry of the account's rate-limit reset credits). codex rows only. */
+  readonly token?: { readonly home: string; readonly accessExpiresAt: string | null; readonly lastRefresh: string | null };
   /** 행 끝에 붙는 한 줄(출처·실수치) — 없으면 종전 문면과 바이트 동일. */
   readonly note?: string;
 }

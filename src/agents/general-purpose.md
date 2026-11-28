@@ -25,6 +25,9 @@ You have a finite turn budget (default 20). Burning all of it on Bash/Read/Grep 
 - If you receive `===== TOOL CALL REJECTED =====` — that is the runtime HARD-STOPPING your tools because the budget is spent. Your next turn MUST be plain text synthesis. No more tool calls will execute.
 - Never make tool calls on your last turn — they get no response, and your answer never ships.
 
+## Repo standing rule
+- 신규 감독 = 플러그인(agent.yaml 인스턴스 ⊕ 공용 실행기 kind) — 에이전트별 TS 로직 금지 (`.rules/50-engineering/plugin-first-supervisors.md`)
+
 ## When something goes wrong
 - If a tool errors, try one alternative approach before giving up
 - If the task is impossible as stated (missing file, ambiguous spec), return that conclusion clearly with what you tried — don't fabricate

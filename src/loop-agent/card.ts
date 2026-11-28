@@ -43,6 +43,11 @@ export interface AgentCard {
   readonly focus: string;
   /** Level before any L0/HQ sets one (level.json absent): a new body with a destructive action starts in shadow. */
   readonly startLevel: 'live' | 'L1' | 'shadow';
+  /** YAML-MIGRATION-WAVE1 ②: the body policies (agent.yaml `policies:` · the generated goal.yaml carries a copy for the
+   *  refused-agent.yaml fallback) — the tick and the voice run under these when no compiled agent.yaml supplies them. */
+  readonly policies?: Readonly<Record<string, number>>;
+  /** SUPERVISORS-EXECUTE-NOT-PROPOSE: agent.yaml `authority:` (acts it runs itself · undo · limits · HOLD) — absent = none. */
+  readonly authority?: import('./v3/agent-yaml.js').AgentAuthority;
 }
 
 export const CARD_ID_RE = /^[a-z][a-z0-9-]{0,62}$/;
@@ -89,6 +94,19 @@ export function parseCard(goalYaml: string, soulText = '', where = 'card'): Agen
     escalateAfterMin: Math.max(5, num(j.escalate_after_min, 60)),
     soulText: soulText.trim(), focus: '',
     startLevel: j.start_level === 'shadow' || j.start_level === 'L1' ? j.start_level : 'live',
+    ...((): { policies?: Record<string, number> } => {
+      const p = j.policies && typeof j.policies === 'object' && !Array.isArray(j.policies) ? j.policies as Record<string, unknown> : null;
+      if (!p) return {};
+      const out: Record<string, number> = {};
+      for (const [k, v] of Object.entries(p)) if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+      return { policies: out };
+    })(),
+    ...((): { authority?: NonNullable<AgentCard['authority']> } => {
+      const a = j.authority && typeof j.authority === 'object' && !Array.isArray(j.authority) ? j.authority as Record<string, unknown> : null;
+      if (!a) return {};
+      const undo = a.undo && typeof a.undo === 'object' && !Array.isArray(a.undo) ? Object.fromEntries(Object.entries(a.undo as Record<string, unknown>).map(([k, v]) => [k, String(v)])) : {};
+      return { authority: { executes: strs(a.executes), undo, limits: strs(a.limits), respectHold: a.respect_hold !== false } };
+    })(),
   };
 }
 

@@ -434,6 +434,8 @@ export interface LLMOpts {
    *  is opt-in; providers without a serializer hook preserve their wire path. */
   requestSizeGuard?: {
     maxChars: number;
+    /** Recovery is bound by the host guard to its session and archive policy. */
+    recoverToolOutput?: (args: Record<string, unknown>) => unknown;
     /** Optional proactive compaction threshold; the hard cap stays maxChars. */
     compactAtChars?: number;
     compactMessages: (
@@ -9008,6 +9010,14 @@ export async function streamLLMWithTools(
   // HYDRATED_TOOLS_KEY) and they join the declared list for the REMAINING
   // turns. Dedup by name so a repeat summon is a no-op.
   const activeTools: LLMToolSpec[] = [...(opts.tools ?? [])];
+  const recoveryTool: LLMToolSpec | undefined = opts.requestSizeGuard?.recoverToolOutput
+    ? { name: 'restore_tool_output_chunk', description: 'Restore a bounded chunk of an archived tool result from the current session using the tool_use_id and sha256-utf16le in its pointer.', parameters: { type: 'object', properties: { tool_use_id: { type: 'string' }, sha256: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 5000 } }, required: ['tool_use_id', 'sha256', 'offset', 'limit'], additionalProperties: false } }
+    : undefined;
+  if (recoveryTool) {
+    const existing = activeTools.findIndex(t => t.name === recoveryTool.name);
+    if (existing < 0) activeTools.push(recoveryTool);
+    else activeTools[existing] = recoveryTool;
+  }
   const activeToolNames = new Set(activeTools.map((t) => t.name));
   let codexInspectExemptFlag = false;
   try {
@@ -9535,7 +9545,9 @@ export async function streamLLMWithTools(
         maxTokensExplicit: opts.maxTokens !== undefined || opts.maxTokensExplicit === true,
         tools: completionNeedsFinalTurn && !keepToolsNoCall
           ? []
-          : turn === 0 && opts.firstTurnTools ? opts.firstTurnTools : activeTools,
+          : turn === 0 && opts.firstTurnTools
+            ? recoveryTool ? [...opts.firstTurnTools.filter(t => t.name !== recoveryTool.name), recoveryTool] : opts.firstTurnTools
+            : activeTools,
         remainingFallbacks,
       };
       if (keepToolsNoCall) return { ...base, toolChoice: 'none' as const };
@@ -11753,7 +11765,9 @@ export async function streamLLMWithTools(
         }, opts.slowToolTickMs ?? SLOW_TOOL_TICK_MS);
         (slowTimer as unknown as { unref?: () => void }).unref?.();
         try {
-          result = await handlers.dispatchTool(call.name, call.args, { callId: call.id, turnIndex: turn });
+          result = call.name === 'restore_tool_output_chunk' && opts.requestSizeGuard?.recoverToolOutput
+            ? await opts.requestSizeGuard.recoverToolOutput(call.args as Record<string, unknown>)
+            : await handlers.dispatchTool(call.name, call.args, { callId: call.id, turnIndex: turn });
         } catch (err: any) {
           result = { error: err?.message || String(err) };
           isError = true;
@@ -11776,7 +11790,8 @@ export async function streamLLMWithTools(
         // 스펙을 프로바이더에 선언하지 않는다는 의도가 우회되지 않게.
         const resultSignalsError = !!result && typeof result === 'object'
           && typeof (result as { error?: unknown }).error === 'string';
-        if (!!result && typeof result === 'object' && (result as { isError?: unknown }).isError === true) isError = true;
+        if (!!result && typeof result === 'object' && ((result as { isError?: unknown }).isError === true ||
+          (call.name === 'restore_tool_output_chunk' && opts.requestSizeGuard?.recoverToolOutput && (result as { ok?: unknown }).ok === false))) isError = true;
         const resultRecord = result && typeof result === 'object' ? result as Record<string, unknown> : undefined;
         const surfacedFailure = [resultRecord?.reason, resultRecord?.error, resultRecord?.message, resultRecord?.output]
           .find((value): value is string => typeof value === 'string' && value.length > 0)

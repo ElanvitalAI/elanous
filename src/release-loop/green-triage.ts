@@ -3,6 +3,8 @@ import { existsSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { ChecklistItem } from './checklist.js';
+import type { PrCellBinding } from '../land-graph/cell-link.js';
+import { bindingOf, boundPrs, liveBindingContext, readPrMetaCache, type BindingContext, type PrMetaIn } from '../land-graph/pr-binding.js';
 
 /**
  * GREEN-TRIAGE (OP 11-24): one deterministic call that sorts every 🟡 cell into what to do next.
@@ -11,9 +13,22 @@ import type { ChecklistItem } from './checklist.js';
  *   supply   — no cited PR is merged → supply (implement / land)
  * No LLM and no network: merged state = local `git log origin/main` squash subjects «… (#N)»;
  * receipts = a receipt path in the cell evidence bound to that PR, or a pregate GREEN lane directory `<PR>-<head12>-<host>`.
+ * JUDGE-GREEN-PR-BINDING-LEGACY (11-28 · «judge 37» here while the butler said «no merged PR of …»): «a cited PR» = a PR bound to
+ * the cell by the ONE rule the judge butler signs on (src/land-graph/pr-binding.ts boundPrs · graphs/policies/pr-binding.yaml)
+ * over the same facts (the butler's merged-PR cache · cell-link.jsonl · the evidence trail). Unbound PRs are named, not counted.
+ * Only a source without `binding` (test fixtures) keeps the bare mention rule.
  */
 export type GreenTriageBucket = 'judge' | 'evidence' | 'supply';
-export interface GreenTriageRow { id: string; owner: string | null; bucket: GreenTriageBucket; prs: number[]; mergedPrs: number[]; receipt: string | null; reason: string }
+export interface GreenTriageRow { id: string; owner: string | null; bucket: GreenTriageBucket; prs: number[]; mergedPrs: number[]; receipt: string | null; reason: string;
+  /** Merged PRs the cell cites that are not its own (binding) — named, never judged. */
+  notMine?: string[] }
+/** JUDGE-GREEN-PR-BINDING: the facts a PR's binding is built from (the same ones the judge butler reads). */
+export interface GreenTriageBinding {
+  /** PR title/body/branch (the butler's merged-PR cache) · undefined = not read yet → binding unknown. */
+  readonly meta: (pr: number) => PrMetaIn | undefined;
+  /** Sweep rows ⊕ evidence trails ⊕ policy for the release's items. */
+  readonly context: (items: readonly ChecklistItem[]) => BindingContext;
+}
 export interface GreenTriageResult {
   version: string;
   counts: Record<GreenTriageBucket, number>;
@@ -27,6 +42,8 @@ export interface GreenTriageSources {
   greenLanes: readonly string[];
   /** Where the merge log came from; a shallow history can miss old merges (they then read as supply). */
   history?: { repo: string; shallow: boolean };
+  /** PR ↔ cell binding facts (every live reader passes them · readGreenTriageSources). Absent → a merged mention counts. */
+  binding?: GreenTriageBinding;
 }
 
 export const GREEN_TRIAGE_ROW_LIMIT = 20;
@@ -69,14 +86,20 @@ export function receiptFor(pr: number, evidence: string, greenLanes: readonly st
 
 export function triageGreen(version: string, items: readonly ChecklistItem[], sources: GreenTriageSources): GreenTriageResult {
   const rows: Record<GreenTriageBucket, GreenTriageRow[]> = { judge: [], evidence: [], supply: [] };
+  const ctx = sources.binding ? sources.binding.context(items) : null;
+  const memo = new Map<number, PrCellBinding | null>();
+  const bindingFor = (pr: number): PrCellBinding | null => { if (!memo.has(pr)) memo.set(pr, bindingOf(pr, sources.binding!.meta(pr), ctx!)); return memo.get(pr) ?? null; };
   for (const item of items) {
     if (item.status !== 'yellow') continue;
     const evidence = item.evidence ?? '';
     const prs = evidencePrRefs(evidence);
-    const mergedPrs = prs.filter((pr) => sources.merged.has(pr));
-    const base = { id: item.id, owner: item.owner ?? null, prs, mergedPrs };
+    const citedMerged = prs.filter((pr) => sources.merged.has(pr));
+    const split = ctx ? boundPrs(item.id, citedMerged, bindingFor) : null;
+    const mergedPrs = split ? split.bound : citedMerged;
+    const base = { id: item.id, owner: item.owner ?? null, prs, mergedPrs, ...(split?.notMine.length ? { notMine: split.notMine } : {}) };
     if (!mergedPrs.length) {
-      rows.supply.push({ ...base, bucket: 'supply', receipt: null, reason: prs.length ? `no merged PR (cited ${prs.map((pr) => `#${pr}`).join(' ')})` : 'no PR in evidence' });
+      const reason = citedMerged.length ? `no merged PR of ${item.id} — ${split!.notMine.join(' · ')}` : prs.length ? `no merged PR (cited ${prs.map((pr) => `#${pr}`).join(' ')})` : 'no PR in evidence';
+      rows.supply.push({ ...base, bucket: 'supply', receipt: null, reason });
       continue;
     }
     const withReceipt = mergedPrs.map((pr) => ({ pr, receipt: receiptFor(pr, evidence, sources.greenLanes) })).find((entry) => entry.receipt);
@@ -104,7 +127,7 @@ export function renderGreenTriage(result: GreenTriageResult, limit = GREEN_TRIAG
   return lines.join('\n');
 }
 
-export interface GreenTriageReadDeps { gitLog?: () => string; greenLanes?: () => string[] }
+export interface GreenTriageReadDeps { gitLog?: () => string; greenLanes?: () => string[]; binding?: () => GreenTriageBinding | undefined }
 /** HQ canonical checkout — used when the current directory is not a full-history clone (a seat cwd, a shallow worker). */
 export const HQ_REPO_DIR = join(homedir(), 'elanous-hq/repo.git');
 
@@ -134,5 +157,13 @@ export function readGreenTriageSources(deps: GreenTriageReadDeps = {}): GreenTri
   let history: GreenTriageSources['history'];
   const log = deps.gitLog ? deps.gitLog() : (() => { const read = defaultGreenTriageGitLog(); history = { repo: read.repo, shallow: read.shallow }; return read.log; })();
   const greenLanes = deps.greenLanes ?? (() => existsSync(PREGATE_GREEN_DIR) ? readdirSync(PREGATE_GREEN_DIR) : []);
-  return { merged: parseMergeLog(log), greenLanes: greenLanes(), ...(history ? { history } : {}) };
+  const binding = deps.binding ? deps.binding() : liveGreenTriageBinding();
+  return { merged: parseMergeLog(log), greenLanes: greenLanes(), ...(history ? { history } : {}), ...(binding ? { binding } : {}) };
+}
+
+/** The live binding facts — the judge butler's own: its merged-PR cache ⊕ cell-link.jsonl ⊕ the evidence trail (read-only). */
+export function liveGreenTriageBinding(stateRoot?: string): GreenTriageBinding {
+  const root = stateRoot ?? (require('../instance/resolve.js') as typeof import('../instance/resolve.js')).effectiveInstanceRoot();
+  const cache = readPrMetaCache(root);
+  return { meta: (pr) => cache[String(pr)], context: (items) => liveBindingContext(root, items) };
 }

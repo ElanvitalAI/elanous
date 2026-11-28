@@ -13,7 +13,7 @@ import { planReap, type Proc, type ReapCandidate } from '../../../guardian-agent
 import { GUARDIAN_DEMOTERS, GUARDIAN_ID, GUARDIAN_SUPERVISOR, runGuardian, type GuardianPorts } from '../../../guardian-agent/body.js';
 import { fileMemory as butlerFileMemory } from '../../../judge-butler/memory.js';
 import { tickLand, type LandDeps, type LedgerRow, type PrInfo, type Receipt } from '../../../land-graph/land-graph.js';
-import { loadLandPolicy, parseLandPolicy, pinOrder } from '../../../land-steward/policy.js';
+import { loadLandPolicy, parseLandPolicy, pinOrder } from '../../../land-graph/lane-order.js';
 import { loadCard } from '../../../loop-agent/card.js';
 import { fileAgentMemory } from '../../../loop-agent/memory.js';
 import { tickAgent, type AgentPorts } from '../../../loop-agent/runtime.js';
@@ -78,7 +78,7 @@ function reaperWorld(seed: number, opts: { unkillable?: boolean; slowDeath?: boo
 
 // ── land world (real tickLand · fake gh / receipts / land) ────────────────────────────────────────────────────────────
 const hx = (n: number): string => `${String(n).padStart(6, '0')}${'b'.repeat(34)}`;
-function landWorld(stateRoot: string, prs: PrInfo[], order: LandDeps['order'] | undefined): { deps: LandDeps; landed: number[] } {
+export function landWorld(stateRoot: string, prs: PrInfo[], order: LandDeps['order'] | undefined): { deps: LandDeps; landed: number[] } {
   const org = join(stateRoot, 'federation.yaml');
   mkdirSync(stateRoot, { recursive: true });
   writeFileSync(org, 'org:\n  duties:\n    landing: TC\n    veto: JUD\n');
@@ -96,7 +96,7 @@ function landWorld(stateRoot: string, prs: PrInfo[], order: LandDeps['order'] | 
   };
   return { deps, landed };
 }
-const pr = (n: number, files: string[]): PrInfo => ({ number: n, head: hx(n), base: 'main', draft: false, state: 'OPEN', title: `pr ${n}`, author: 'UX', files, headRef: `b${n}`, createdAt: '2026-11-27T05:00:00Z' });
+export const pr = (n: number, files: string[]): PrInfo => ({ number: n, head: hx(n), base: 'main', draft: false, state: 'OPEN', title: `pr ${n}`, author: 'UX', files, headRef: `b${n}`, createdAt: '2026-11-27T05:00:00Z' });
 
 export const simWorldScenarios: readonly SimWorldScenario[] = [
   {

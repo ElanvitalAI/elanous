@@ -1,12 +1,13 @@
 // `eln loop agent list` · `eln loop agent <id> card|status|tick|voice|memory|knowhow|lesson|level|policy` — the generic doors of
 // every LOOP-AGENT v2 agent (내부 문서 `LOOP-AGENT`). memory/knowhow/lesson also work for the bespoke agents
 // (judge-butler) because they share the home <stateRoot>/loop-agents/<id>/.
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import { applyPolicyChange, CARD_ID_RE, kpiLine, listCards, loadCard, policySeats, HQ_POLICY_SEATS, type AgentCard } from './card.js';
 import { AGENT_LEVELS, addLesson, agentHome, decideLesson, fileAgentMemory, grepMemory, recall, type AgentLevel } from './memory.js';
-import { BESPOKE_AGENTS, hasBody, loadBody } from './registry.js';
+import { BESPOKE_AGENTS, hasBody, loadBody, VOICE_DOORS } from './registry.js';
 import { livePorts, liveStateRoot, refreshHome } from './live.js';
 import { levelOf } from './runtime.js';
 
@@ -18,6 +19,26 @@ const byOf = (by?: string): string => { const who = (by ?? process.env.ELANOUS_T
 function cardOrNull(id: string): AgentCard | null { try { return loadCard(id); } catch { return null; } }
 function supervisorOf(id: string, card: AgentCard | null): string { return card?.supervisor ?? (id === 'judge-butler' ? 'JUD' : 'OP'); }
 function mayDecide(id: string, card: AgentCard | null, by: string): boolean { return card ? policySeats(card).has(by) : new Set([supervisorOf(id, null), ...HQ_POLICY_SEATS]).has(by); }
+
+/** A bespoke agent's own voice door (judge-butler · guardian): the same one JSON line in, the last reply line out. */
+function voiceDoor(argv: readonly string[], input: import('./channel.js').LoopVoiceInput): { text: string; evidence: readonly string[]; actions: readonly string[] } {
+  const { selfCommand } = require('../els/channel-cli.js') as typeof import('../els/channel-cli.js');
+  const { parseVoiceReply } = require('../els/loop-voice.js') as typeof import('../els/loop-voice.js');
+  const [cmd, ...pre] = selfCommand();
+  const r = spawnSync(cmd!, [...pre, ...argv], { input: `${JSON.stringify(input)}\n`, encoding: 'utf8', timeout: 100_000, maxBuffer: 4 * 1024 * 1024 });
+  const reply = parseVoiceReply(r.stdout ?? '');
+  if (!reply) throw new Error(`${argv.join(' ')}: ${r.error?.message ?? (r.stderr || `exit ${r.status} · no reply line`).trim().split('\n').pop()}`);
+  return { text: reply.text, evidence: reply.evidence ?? [], actions: reply.actions ?? [] };
+}
+
+/** The listed v3 row of an agent.yaml-only agent (null = a v2 card, no agent.yaml, or a refused one). */
+async function listedOf(id: string, stateRoot: string): Promise<import('./v3/listed.js').ListedAgent | null> {
+  const { lintAgentDir } = await import('./v3/agent-yaml.js');
+  const { listedRow } = await import('./v3/listed.js');
+  const root = (await import('./card.js')).cardsRoot();
+  const r = lintAgentDir(join(root, id), { triggersDir: join(root, '..', 'triggers') });
+  return r.ok && r.compiled ? listedRow(r.compiled, stateRoot) : null;
+}
 
 /** Read-only recall across every agent home (for `eln self recall` and `eln loop agent list --grep`). */
 export function loopAgentRecall(query: string, limit = 8, stateRoot = liveStateRoot()): Array<{ agent: string; where: string; at: string; text: string; score: number }> {
@@ -55,16 +76,30 @@ async function agentVerb(id: string, verb: string, args: string[], o: AgentOpts)
     case 'status': {
       const c = card; const s = mem.readState(); const lvl = c ? levelOf(c, mem) : mem.level(); const pol = mem.policy();
       const lessons = mem.lessons(); const kh = mem.knowhow();
-      const k = { id, level: lvl, lastTickAt: s.lastTickAt, ticks: s.ticks, kpi: s.lastKpi, kpiOk: s.kpiOk, breachSince: s.breachSince, kpiLine: c ? kpiLine(c.kpi, s.lastKpi) : null,
-        lessons: { active: lessons.filter(l => l.status === 'active').length, candidate: lessons.filter(l => l.status === 'candidate').length }, knowhow: { items: kh.items.length, version: kh.meta.version }, policy: pol, body: hasBody(id) };
+      // JUDGE-BUTLER-V3-LISTED: an agent.yaml without a v2 card (judge-butler · land-steward · guardian) reads its KPIs from its tick file (kpis[].from)
+      const v3 = c ? null : await listedOf(id, stateRoot);
+      const k = { id, level: lvl, lastTickAt: s.lastTickAt ?? v3?.lastTickAt ?? null, ticks: s.ticks, kpi: s.lastKpi, kpiOk: s.kpiOk ?? v3?.kpiOk ?? null, breachSince: s.breachSince, kpiLine: c ? kpiLine(c.kpi, s.lastKpi) : v3?.kpi ?? null, ...(v3 ? { kpis: v3.kpis, runtime: 'v3', supervisor: v3.supervisor, node: v3.body } : {}),
+        lessons: { active: lessons.filter(l => l.status === 'active').length, candidate: lessons.filter(l => l.status === 'candidate').length }, knowhow: { items: kh.items.length, version: kh.meta.version }, policy: pol, body: hasBody(id), bespoke: BESPOKE_AGENTS[id] ?? null };
       const recent = mem.cases(10);
-      print({ ...k, recent }, o.json, [`${c?.name ?? id} (${id}) · level ${lvl.level} (by ${lvl.by} ${lvl.at}) · last tick ${s.lastTickAt ?? '—'} · ticks ${s.ticks} · body ${hasBody(id) ? 'yes' : BESPOKE_AGENTS[id] ? `bespoke (${BESPOKE_AGENTS[id]})` : 'none'}`,
+      print({ ...k, recent }, o.json, [`${c?.name ?? v3?.name ?? id} (${id}) · level ${lvl.level} (by ${lvl.by} ${lvl.at}) · last tick ${k.lastTickAt ?? '—'} · ticks ${s.ticks} · body ${hasBody(id) ? 'yes' : v3 ? `v3 ${v3.body} · L0 ${v3.supervisor}` : BESPOKE_AGENTS[id] ? `bespoke (${BESPOKE_AGENTS[id]})` : 'none'}`,
         `${k.kpiLine ?? `KPI ${s.lastKpi ?? '?'}`}${s.breachSince ? ` · 위반 시작 ${s.breachSince}` : ''} · 이력 ${s.kpiHistory.slice(-8).map(h => h.v ?? '?').join(' ')}`,
         `lessons active ${k.lessons.active} · candidate ${k.lessons.candidate} · knowhow ${k.knowhow.items} items v${k.knowhow.version}${pol.focus ? ` · focus «${pol.focus}»` : ''}${Object.keys(pol.values).length ? ` · policy ${JSON.stringify(pol.values)}` : ''}${pol.disabled.length ? ` · disabled ${pol.disabled.join(',')}` : ''}`,
         ...recent.map(r => `  ${r.at.slice(5, 16)} ${r.kind} ${r.subject} — ${r.why.slice(0, 110)}`)].join('\n'));
       return;
     }
     case 'tick': {
+      if (!card) {
+        // JUDGE-BUTLER-V3-LISTED: the shared v3 door — agent.yaml body.entry_node kind → its runner (the bespoke door is an alias)
+        const v3 = await listedOf(id, stateRoot);
+        if (v3) {
+          const { KIND_RUNNERS, KIND_DOORS } = await import('./v3/kind-runners.js');
+          const run = KIND_RUNNERS[v3.body];
+          if (!run) throw new Error(`${id}: node kind ${v3.body} has no runner on the shared door yet — ${KIND_DOORS[v3.body] ?? 'no door'}`);
+          const r = await run({ stateRoot });
+          print(r.summary, o.json, r.text);
+          return;
+        }
+      }
       const c = needCard();
       const ports = livePorts(c, { stateRoot, speak: (await import('./speak.js')).channelSpeaker(c.id) });
       try {
@@ -96,7 +131,6 @@ async function agentVerb(id: string, verb: string, args: string[], o: AgentOpts)
     case 'voice': {
       let reply: { text: string; evidence: readonly string[]; actions: readonly string[] };
       try {
-        const c = needCard();
         const ch = await import('./channel.js');
         // `--text "<말>"` = a person at the terminal (CEO 11-27 live test: the door read stdin only → empty stdin → «JSON Parse
         // error: Unexpected EOF»). Without --text the els channel adapter pipes one #40331 JSON line on stdin.
@@ -107,11 +141,16 @@ async function agentVerb(id: string, verb: string, args: string[], o: AgentOpts)
           if (!line) throw new Error('nothing to answer — --text "<말>" or one JSON line on stdin {loop, from, channel, text, refs, messageId}');
           input = ch.parseLoopVoiceInput(line, id);
         }
-        const { voiceAgent } = await import('./runtime.js');
-        const ports = livePorts(c, { stateRoot });
-        const def = (await import('./v3/supervisor.js')).supervisorDef(c);
-        try { reply = ch.toLoopVoiceReply(await voiceAgent({ card: def.card, body: await loadBody(id, { stateRoot, card: def.card }), ports, now, ...(def.policies ? { policies: def.policies } : {}), ...(def.soul ? { soul: def.soul } : {}) }, ch.toVoiceMessage(input, now))); }
-        finally { ports.close(); }
+        // GUARDIAN-V3-SMART: a bespoke agent (guardian · judge-butler) answers through its own door — the same JSON line in/out
+        if (!card && VOICE_DOORS[id]) reply = voiceDoor(VOICE_DOORS[id]!, input);
+        else {
+          const c = needCard();
+          const { voiceAgent } = await import('./runtime.js');
+          const ports = livePorts(c, { stateRoot });
+          const def = (await import('./v3/supervisor.js')).supervisorDef(c);
+          try { reply = ch.toLoopVoiceReply(await voiceAgent({ card: def.card, body: await loadBody(id, { stateRoot, card: def.card }), ports, now, ...(def.policies ? { policies: def.policies } : {}), ...(def.soul ? { soul: def.soul } : {}) }, ch.toVoiceMessage(input, now))); }
+          finally { ports.close(); }
+        }
       } catch (e) { reply = { text: `[${id}] 목소리 실패 — ${e instanceof Error ? e.message : String(e)} · L0 ${supervisorOf(id, card)} 에 직접`, evidence: [], actions: [] }; process.exitCode = 1; }
       process.stdout.write(`${JSON.stringify(reply)}\n`);
       return;
@@ -265,8 +304,13 @@ export function registerAgentCommands(loop: Command): void {
         if (id === 'list') {
           const { cards, errors } = listCards();
           const rows = cards.map(c => { const m = fileAgentMemory(liveStateRoot(), c.id, c.supervisor); const s = m.readState(); return { id: c.id, name: c.name, address: c.address, supervisor: c.supervisor, kpi: kpiLine(c.kpi, s.lastKpi), level: levelOf(c, m).level, lastTickAt: s.lastTickAt, body: hasBody(c.id) }; });
-          print({ agents: rows, bespoke: BESPOKE_AGENTS, errors }, o.json, ['id\tname\tL0\tlevel\tbody\tlast tick\tKPI', ...rows.map(r => `${r.id}\t${r.name}\t${r.supervisor}\t${r.level}\t${r.body ? 'yes' : 'none'}\t${r.lastTickAt ?? '—'}\t${r.kpi}`),
-            ...Object.entries(BESPOKE_AGENTS).map(([k, v]) => `${k}\t(bespoke)\t-\t-\t${v}`), ...errors.map(e => `⚠️ ${e}`)].join('\n'));
+          // JUDGE-BUTLER-V3-LISTED: every agent.yaml without a v2 card is a listed v3 agent (L0 by duty · level · last tick · KPI from kpis[].from)
+          const { listedAgents } = await import('./v3/listed.js');
+          const v3 = listedAgents({ cardsRoot: (await import('./card.js')).cardsRoot(), stateRoot: liveStateRoot(), skip: new Set(cards.map(c => c.id)) });
+          const bespoke = Object.fromEntries(Object.entries(BESPOKE_AGENTS).filter(([k]) => !v3.agents.some(a => a.id === k)));
+          print({ agents: [...rows, ...v3.agents], bespoke, errors: [...errors, ...v3.errors] }, o.json, ['id\tname\tL0\tlevel\tbody\tlast tick\tKPI', ...rows.map(r => `${r.id}\t${r.name}\t${r.supervisor}\t${r.level}\t${r.body ? 'yes' : BESPOKE_AGENTS[r.id] ? 'bespoke' : 'none'}\t${r.lastTickAt ?? '—'}\t${r.kpi}`),
+            ...v3.agents.map(a => `${a.id}\t${a.name}\t${a.supervisor}\t${a.level}\tv3 ${a.body}\t${a.lastTickAt ?? '—'}\t${a.kpi}`),
+            ...Object.entries(bespoke).map(([k, v]) => `${k}\t(bespoke)\t-\t-\t${v}`), ...[...errors, ...v3.errors].map(e => `⚠️ ${e}`)].join('\n'));
           return;
         }
         await agentVerb(id, verb ?? 'status', args, o);

@@ -5,8 +5,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { debug } from '../debug/log.js';
 import { ExecRequestStore, type ExecRequest } from '../exec-requests/store.js';
-import { devVersion, listChecklist, type ChecklistItem } from '../release-loop/checklist.js';
+import { listChecklist, type ChecklistItem } from '../release-loop/checklist.js';
 import { resolveSeat } from '../seat-address/seat-address.js';
+import { boardVersion } from '../release-loop/board-version.js';
 
 const ROLE_CHARS = 6_000;
 
@@ -38,7 +39,7 @@ function nextPatch(version: string): string | null {
 
 /** Items this seat owns in the dev version's checklist and the next one (where 10-28 work lives). */
 function defaultOwnedItems(seatId: string): ChecklistItem[] {
-  const versions = [devVersion().replace(/-.*$/, '')];
+  const versions = [boardVersion()];
   const next = nextPatch(versions[0]!);
   if (next) versions.push(next);
   const items: ChecklistItem[] = [];

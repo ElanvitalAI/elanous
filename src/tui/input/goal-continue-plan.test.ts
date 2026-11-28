@@ -9,7 +9,9 @@ const harness = (extra: { planNudge?: boolean; planContinueLimit?: number } = {}
   const notices: string[] = [];
   const planOutcomes: unknown[] = [];
   const planArgs: PlanWire[] = [];
+  const blocks: unknown[][] = [];
   const gc = createGoalContinue({
+    onBlocked: (...args) => blocks.push(args),
     startTurnIfIdle: (text: string, opts: StartTurnIfIdleOptions): StartTurnIfIdleResult => {
       opened.push({ text, origin: opts.origin });
       return { opened: true, turnId: `t${opened.length}` } as StartTurnIfIdleResult;
@@ -21,7 +23,7 @@ const harness = (extra: { planNudge?: boolean; planContinueLimit?: number } = {}
     seat: 'D',
     ...extra,
   });
-  return { gc, opened, events, notices, planOutcomes, planArgs };
+  return { gc, opened, events, notices, planOutcomes, planArgs, blocks };
 };
 // A plan the turn touched: version moved past the turn start.
 const plan = (steps: PlanWireStep[]): PlanWire => ({ version: 2, versionAtTurnStart: 1, steps });
@@ -157,4 +159,63 @@ test('ELN-SEAT-TURN-PACING: a minimum-interval refusal keeps the arm and measure
   capped.check();
   expect(deferred).toHaveLength(1); // no retry armed — rest until an event or a person
   expect(capped.check()).toEqual({ opened: false, reason: 'not-armed' });
+});
+
+test('plan cap resumes once on successful artifact progress, then stops without new progress', () => {
+  const h = harness({ planContinueLimit: 1 });
+  const openPlan = plan([{ status: 'pending', step: 'build' }]);
+  h.gc.noteTurnEnded({ lines: [], plan: openPlan });
+  expect(h.gc.check()).toEqual({ opened: true, reason: 'plan-open' });
+  h.gc.noteTurnEnded({ lines: [], plan: openPlan, rows: [{ role: 'tool', toolName: 'Edit', toolResult: { ok: true } }] });
+  expect(h.gc.check()).toEqual({ opened: true, reason: 'plan-open' });
+  h.gc.noteTurnEnded({ lines: [], plan: openPlan });
+  expect(h.gc.check()).toEqual({ opened: false, reason: 'plan-limit' });
+});
+
+test('failed edits and successful mail do not waive the plan cap', () => {
+  const h = harness({ planContinueLimit: 1 });
+  const openPlan = plan([{ status: 'pending', step: 'build' }]);
+  h.gc.noteTurnEnded({ lines: [], plan: openPlan });
+  expect(h.gc.check().opened).toBe(true);
+  h.gc.noteTurnEnded({ lines: [], plan: openPlan, rows: [
+    { role: 'tool', toolName: 'Edit', toolResult: { ok: false } },
+    { role: 'tool', toolName: 'MsgPost', toolResult: { ok: true } },
+  ] });
+  expect(h.gc.check()).toEqual({ opened: false, reason: 'plan-limit' });
+});
+
+test('progress across a ten-turn window resumes once, then routes stagnation to the steward', () => {
+  const h = harness();
+  const openPlan = plan([{ status: 'pending', step: 'build' }]);
+  for (let n = 0; n < DEFAULT_PLAN_CONTINUE_LIMIT; n++) {
+    h.gc.noteTurnEnded({ lines: [], plan: openPlan, rows: n === 5 ? [{ role: 'tool', toolName: 'Edit', toolResult: { ok: true } }] : [] });
+    expect(h.gc.check().opened).toBe(true);
+  }
+  h.gc.noteTurnEnded({ lines: [], plan: openPlan });
+  expect(h.gc.check()).toEqual({ opened: true, reason: 'plan-open' });
+  expect(h.blocks).toHaveLength(0);
+  for (let n = 1; n < DEFAULT_PLAN_CONTINUE_LIMIT; n++) {
+    h.gc.noteTurnEnded({ lines: [], plan: openPlan });
+    expect(h.gc.check().opened).toBe(true);
+  }
+  h.gc.noteTurnEnded({ lines: [], plan: openPlan });
+  expect(h.gc.check()).toEqual({ opened: false, reason: 'plan-limit' });
+  expect(h.blocks).toHaveLength(1);
+  expect(h.blocks[0]).toEqual(['HUMAN_DECISION', 'plan-limit', expect.stringContaining('10/10'), 'plan-limit']);
+});
+
+test('plan cap policy may be disabled even when an artifact changed', () => {
+  const old = process.env.ELANOUS_TUI_PLAN_CAP_AUTO_RESUME;
+  process.env.ELANOUS_TUI_PLAN_CAP_AUTO_RESUME = '0';
+  try {
+    const h = harness({ planContinueLimit: 1 });
+    const openPlan = plan([{ status: 'pending', step: 'build' }]);
+    h.gc.noteTurnEnded({ lines: [], plan: openPlan });
+    expect(h.gc.check().opened).toBe(true);
+    h.gc.noteTurnEnded({ lines: [], plan: openPlan, rows: [{ role: 'tool', toolName: 'Edit', toolResult: { ok: true } }] });
+    expect(h.gc.check()).toEqual({ opened: false, reason: 'plan-limit' });
+  } finally {
+    if (old === undefined) delete process.env.ELANOUS_TUI_PLAN_CAP_AUTO_RESUME;
+    else process.env.ELANOUS_TUI_PLAN_CAP_AUTO_RESUME = old;
+  }
 });

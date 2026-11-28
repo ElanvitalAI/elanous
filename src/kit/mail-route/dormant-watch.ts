@@ -16,7 +16,7 @@
 import type { Message, MsgStore } from '../../msg/msg-store.js';
 import { REROUTED_FROM_REF } from '../../msg/op-machine-digest.js';
 import { buildFederationLadder, dedupeHands, forwardOnce, openHands } from '../../msg/hand-raise-ladder.js';
-import { LOOP_HAND_ROUTED_FROM, readHandRoutes, type HandRoutesTable } from './hand-routes.js';
+import { HAND_COORDINATOR, LOOP_HAND_ROUTED_FROM, readHandRoutes, type HandRoutesTable } from './hand-routes.js';
 
 export const DORMANT_UNANSWERED_REF = 'dormant-unanswered:';
 export const DORMANT_CARD_REF = 'dormant-card';
@@ -92,9 +92,12 @@ export function sweepDormantUnanswered(store: MsgStore, deps: { readonly nowMs?:
 // C: stateless over the ledger · exactly once per ✋ (the ladder's own `hand-escalate:<id>` provenance) · one forward per
 //    cause (dedupeHands) · the table decides, not TypeScript (hand-routes.yaml `loopHands`).
 // A: an open ✋ at a `loopHands.receivers` address older than `slaMinutes` is forwarded to its reason's taker —
+//    `coordinator` = the blocked hand's own coordinator (federation ladder parent · falls back to `routed-from`) ·
 //    `routed-from` = the rung the table moved it from (its leader · TC for dependency/design waits) · an address = there ·
 //    the HQ seat = left to the HQ beacon card on the same tick (counted, not written here). The forward is itself a ✋, so
 //    the taker's 10-min ladder applies from there.
+//    HAND-ROUTE-GUARDIAN-MISROUTE (11-28): the steward graph was this sweep's only carrier and died at R1 for 14 ticks —
+//    every eln TUI's minute ✋ tick now runs it too (`involving` = that seat: the ✋ it sent, holds or would take).
 //
 // 세 얼굴: 관측 = debug `msg.loop-hand-sla` {msgId, from, to, waitedMin, mailId} ⊕ the forward's `hand-escalated-from:` /
 // `hand-loop-sla` refs · 판단 근거 = openHands (no outcome / reply / escalation) ⊕ hand-routes.yaml loopHands · 수복과 인계 =
@@ -108,13 +111,46 @@ export interface LoopHandReport { readonly moved: readonly LoopHandMove[]; reado
 const refOf = (refs: readonly string[] | undefined, prefix: string): string | undefined => refs?.find((r) => r.startsWith(prefix))?.slice(prefix.length);
 
 /** One tick. `live=false` computes the same moves without writing. `hq` = the HQ seat (its ✋ go through the beacon card). */
-export function sweepLoopHandSla(store: MsgStore, deps: { readonly nowMs?: number; readonly live?: boolean; readonly hq?: string; readonly table?: HandRoutesTable; readonly log?: (event: string, data: Record<string, unknown>) => void } = {}): LoopHandReport {
+export interface LoopHandSlaDeps {
+  readonly nowMs?: number;
+  readonly live?: boolean;
+  readonly hq?: string;
+  readonly table?: HandRoutesTable;
+  /** The federation ladder parent of a seat (the `coordinator` taker). Absent → `coordinator` reads as `routed-from`. */
+  readonly parentOf?: ((seat: string) => string) | null;
+  /** Only the ✋ this seat sent, holds or would take (a TUI's own tick). Absent = every ✋. */
+  readonly involving?: string;
+  readonly log?: (event: string, data: Record<string, unknown>) => void;
+}
+
+/** The taker of one ✋ (upper-case address · the HQ seat = the beacon card). Pure over its inputs. */
+export function loopHandTaker(hand: { readonly reason: string; readonly refs?: readonly string[]; readonly receiver: string; readonly blockedSeat: string },
+  t: HandRoutesTable['loopHands'], hq: string, parentOf?: ((seat: string) => string) | null): string {
+  const receiver = hand.receiver.trim().toUpperCase();
+  const seat = hand.blockedSeat.trim().toUpperCase();
+  const word = t.byReason[hand.reason.trim().toUpperCase()] ?? t.otherwise;
+  const fallback = t.otherwise !== HAND_COORDINATOR && t.otherwise !== LOOP_HAND_ROUTED_FROM ? t.otherwise : undefined;
+  const routedFrom = (): string | undefined => refOf(hand.refs, 'hand-routed-from:') ?? fallback;
+  let named: string | undefined;
+  if (word === HAND_COORDINATOR) {
+    let parent = '';
+    try { parent = (parentOf?.(seat) ?? '').trim().toUpperCase(); } catch { parent = ''; }
+    named = parent && parent !== seat && parent !== receiver ? parent : routedFrom();
+  } else named = word === LOOP_HAND_ROUTED_FROM ? routedFrom() : word;
+  const to = (named ?? hq).trim().toUpperCase();
+  return !to || to === LOOP_HAND_ROUTED_FROM.toUpperCase() || to === HAND_COORDINATOR.toUpperCase() || to === receiver || to === seat ? hq : to;
+}
+
+export function sweepLoopHandSla(store: MsgStore, deps: LoopHandSlaDeps = {}): LoopHandReport {
   const t = (deps.table ?? readHandRoutes()).loopHands;
   const now = deps.nowMs ?? Date.now();
   const hq = (deps.hq ?? 'OP').trim().toUpperCase();
   const slaMin = Math.round(t.slaMs / 60_000);
   if (t.receivers.size === 0) return { moved: [], toBeacon: [], line: 'loop ✋ SLA: no receivers' };
-  const opens = openHands(store, { now }).filter((h) => t.receivers.has(h.receiver.trim().toUpperCase()));
+  const who = deps.involving?.trim().toUpperCase() || null;
+  const opens = openHands(store, { now }).filter((h) => t.receivers.has(h.receiver.trim().toUpperCase()))
+    .filter((h) => !who || h.sender.trim().toUpperCase() === who || h.receiver.trim().toUpperCase() === who || h.blockedSeat.trim().toUpperCase() === who
+      || loopHandTaker(h, t, hq, deps.parentOf) === who);
   const moved: LoopHandMove[] = [];
   const toBeacon: LoopHandMove[] = [];
   // a minimal ladder: forwardOnce reads it only on the CEO rung, which this sweep never targets
@@ -123,10 +159,7 @@ export function sweepLoopHandSla(store: MsgStore, deps: { readonly nowMs?: numbe
     const hand = group.lead;
     if (hand.waitedMs < t.slaMs) continue;
     const receiver = hand.receiver.trim().toUpperCase();
-    const taker = t.byReason[hand.reason.trim().toUpperCase()] ?? t.otherwise;
-    const named = taker === LOOP_HAND_ROUTED_FROM ? (refOf(hand.refs, 'hand-routed-from:') ?? t.otherwise) : taker;
-    let to = named.trim().toUpperCase();
-    if (to === LOOP_HAND_ROUTED_FROM.toUpperCase() || to === receiver || to === hand.blockedSeat.trim().toUpperCase()) to = hq;
+    const to = loopHandTaker(hand, t, hq, deps.parentOf);
     const waitedMin = Math.floor(hand.waitedMs / 60_000);
     const move = { msgId: hand.id, seat: hand.blockedSeat, reason: hand.reason, from: receiver, to, waitedMin, mailId: null, members: group.members.length };
     if (to === hq) { toBeacon.push(move); continue; }

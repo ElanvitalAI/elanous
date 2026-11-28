@@ -93,7 +93,8 @@ describe('release critpath CLI', () => {
     const card = ledgerAt(root, '2026-11-24T00:00:00Z').raise({ title: 'Publish?', category: 'publish', scqa: { s: 'Ready.', c: 'Irreversible.' },
       options: [{ key: 'a', label: 'Publish', consequence: 'Public.' }, { key: 'b', label: 'Hold', consequence: 'Wait.' }],
       recommendation: { skipped: true, reason: 'Person required.' }, raisedBy: { agent: 'release-critpath' }, refs: [ref] });
-    const sig = cryptoSign(null, Buffer.from(ref, 'utf8'), privateKey).toString('hex');
+    // elanous-approval/v2: ref ⊕ card ⊕ raisedAt ⊕ choice ⊕ via ⊕ platform user (RELEASE-HUMAN-PROOF-TRUST-ROOT).
+    const sig = cryptoSign(null, Buffer.from(`elanous-approval/v2|${ref}|${card.id}|${card.raisedAt}|a|telegram|owner`, 'utf8'), privateKey).toString('hex');
     ledgerAt(root, '2026-11-24T00:00:10Z').decide(card.id, 'a', { kind: 'human', via: 'telegram', platformUserId: 'owner' }, 'signed out of band', undefined, { keyId: 'human-release-1', sig });
 
     // The actual default CLI path (deps defaults — nothing injected). The #139625 defect was exactly here:
@@ -133,7 +134,7 @@ describe('release critpath CLI', () => {
         recommendation: { skipped: true, reason: 'Person required.' }, raisedBy: { agent: 'release-critpath' }, refs: [ref] });
       // The decided human marker claims out-of-band approval; the signer is the trusted root holder or an attacker key.
       const signer = wrong === null ? rootKey.privateKey : attacker.privateKey;
-      const sig = cryptoSign(null, Buffer.from(ref, 'utf8'), signer).toString('hex');
+      const sig = cryptoSign(null, Buffer.from(`elanous-approval/v2|${ref}|${card.id}|${card.raisedAt}|a|telegram|owner`, 'utf8'), signer).toString('hex');
       ledgerAt(root, '2026-11-24T00:00:10Z').decide(card.id, 'a', { kind: 'human', via: 'telegram', platformUserId: 'owner' }, 'claimed out of band', undefined,
         wrong === null ? undefined : { keyId: 'human-release-1', sig });
       const deps = await defaultCritpathDeps(() => {});
@@ -143,7 +144,7 @@ describe('release critpath CLI', () => {
         out: join(root, 'critpath-prepared'), ledgerPath: join(root, 'critpath.json') }, drivenDeps(deps, root, calls));
       expect(result.status).toBe('waiting-approval');
       expect(result.exitCode).toBe(CRITPATH_WAITING_EXIT); // 75 — healthy run, waiting for a trusted human decision
-      expect(result.approval).toEqual({ state: 'unverified', id: card.id });
+      expect(result.approval).toEqual({ state: 'unverified', id: card.id, reason: wrong === null ? 'no-proof' : 'bad-sig' });
       expect(calls).toEqual([]); // publish/npm/verify never run
     }
   });

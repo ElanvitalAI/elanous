@@ -1,0 +1,32 @@
+# DEV-REVIEW-COMMON cell-review@1 — JUDGE-LOAD-REDUCTION §1 (판정식 3절) applied to a cell's doneCriterion, on the judge's line.
+# Called by: the TA journey (graphs/implement-loop.yaml node `cell-review`, after author) · the hand path (`eln work next` claim
+# → detached `eln work review cell <id>` · graphs/policies/dev-review.yaml cell_review). Handlers = src/kit/dev-review.
+#   criterion  — empty → write · judge decomposition uncertain / no must / a section missing → strengthen (append-only) ·
+#                the new text is re-split by decomposeDoneCriterion (the function the judge butler signs with) before it counts
+#   record     — writes the criterion (snapshot-guarded · by DEV-REVIEW) and one ledger row (dev-review/ledger.jsonl)
+graph_id: cell-review
+version: 1
+unit:
+  inputs: [cell, version]
+  outputs: [criterion, requirements]
+  exits: [pass, written, strengthened, untrusted]
+entry_node: criterion
+terminal_nodes: [pass, written, strengthened, untrusted]
+nodes:
+  - node_id: criterion
+    kind: judge
+    recipe: 'handler:dev-review-criterion'
+    max_visits: 1
+    contract: { inputs: [cell], tools: read-only, outputs: [criterion, requirements] }
+  - node_id: record
+    kind: agent
+    recipe: 'handler:dev-review-record-cell'
+    max_visits: 1
+    contract: { inputs: [criterion], tools: checklist-write, outputs: [criterion, requirements] }
+  - { node_id: pass, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: written, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: strengthened, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: untrusted, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: criterion, on: outcome, map: { pass: record, written: record, strengthened: record, untrusted: record, fail: record, error: record } }
+  - { from: record, on: outcome, map: { pass: pass, written: written, strengthened: strengthened, untrusted: untrusted, fail: untrusted, error: untrusted } }

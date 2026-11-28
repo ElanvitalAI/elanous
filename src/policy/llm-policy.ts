@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { isScalar, parseDocument } from 'yaml';
+import { isScalar } from 'yaml';
+import { readDefinitionYaml } from '../definitions/yaml.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { DEFAULT_FALLBACK_CHAIN, isFallbackStep, type FallbackStep } from '../oauth/fallback-chain.js';
 import { isCodexQuotaPolicy } from '../oauth/codex-quota-policy.js';
@@ -255,10 +256,10 @@ export function loadLlmPolicy(opts: LoadLlmPolicyOptions = {}): LoadedLlmPolicy 
   }
   // Read directly: `existsSync` is also false when the folder cannot be searched (EACCES), which would
   // report an unreadable policy as «no file · valid». Only ENOENT/ENOTDIR mean the file is absent.
-  let raw: string | undefined;
+  let doc: ReturnType<typeof readDefinitionYaml>['doc'] | undefined;
   let filePresent = false;
   try {
-    raw = readFileSync(path, 'utf8');
+    ({ doc } = readDefinitionYaml(path));
     filePresent = true;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -267,9 +268,8 @@ export function loadLlmPolicy(opts: LoadLlmPolicyOptions = {}): LoadedLlmPolicy 
       errors.push(`cannot read policy file ${path}: ${code ?? (error instanceof Error ? error.message : String(error))}`);
     }
   }
-  if (raw !== undefined) {
+  if (doc !== undefined) {
     try {
-      const doc = parseDocument(raw, { uniqueKeys: true });
       if (doc.errors.length) throw new Error(doc.errors.map(e => e.message).join('; '));
       const emptyDocument = doc.contents === null || (isScalar(doc.contents) && doc.contents.type === 'PLAIN' && doc.contents.source === '');
       const parsed: unknown = emptyDocument ? {} : doc.toJS();

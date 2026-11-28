@@ -62,5 +62,12 @@ export async function liveHandPool(input: { panes?: readonly { seat?: unknown; s
     try { panes = await (require('../cli/els-cli.js') as typeof import('../cli/els-cli.js')).federationPanesForPool(); } catch { panes = null; }
   }
   const hours = idleCloseHours();
-  return buildHandPool({ now, seats, ladder, cells, history, landedPrs, ...(panes ? { panes: paneStatesOf(panes) } : {}), ...(hours ? { idleCloseHours: hours } : {}) });
+  const pool = buildHandPool({ now, seats, ladder, cells, history, landedPrs, ...(panes ? { panes: paneStatesOf(panes) } : {}), ...(hours ? { idleCloseHours: hours } : {}) });
+  // SEAT-AREA-GUARD — a seat whose role says pool: false (graphs/policies/seat-roles.yaml) is not a hand, whatever its depth.
+  // Pool seats with areas (MK · UX) stay; which cells fit them is the area rule at every pairing site (kit/seat-area).
+  try {
+    const sa = require('../kit/seat-area/index.js') as typeof import('../kit/seat-area/index.js');
+    const { policy } = sa.liveSeatRoles();
+    return pool.filter((h) => sa.isPoolSeat(h.seat, policy));
+  } catch { return pool; }
 }

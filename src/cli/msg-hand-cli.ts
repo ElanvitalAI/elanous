@@ -80,7 +80,7 @@ export function registerMsgHandCommands(msg: Command, deps: MsgHandCliDeps): voi
           const { liveDormantSeats } = await import('../steward/space/tick.js');
           const { sweepDormantUnanswered, sweepLoopHandSla } = await import('../kit/mail-route/dormant-watch.js');
           // GUARDIAN-HAND-SLA — first, as the steward HQ tick does: loop-agent ✋ past their SLA back to the domain owner.
-          const loopSla = sweepLoopHandSla(store, { hq: ladder.hq, log: (event, data) => { try { debug.log('msg', event, data); } catch { /* fail-open */ } } });
+          const loopSla = sweepLoopHandSla(store, { hq: ladder.hq, parentOf: ladder.parentOf, log: (event, data) => { try { debug.log('msg', event, data); } catch { /* fail-open */ } } });
           const report = ladderModule.beaconHands(store, { ...ladderDeps, dormantSeats: liveDormantSeats() });
           // DORMANT-SEAT-ROUTE — the same one shot: rerouted dormant-seat mail unanswered for 10 min → one OP card.
           const dormant = sweepDormantUnanswered(store, { log: (event, data) => { try { debug.log('msg', event, data); } catch { /* fail-open */ } } });

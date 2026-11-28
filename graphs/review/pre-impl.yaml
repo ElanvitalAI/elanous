@@ -1,0 +1,29 @@
+# DEV-REVIEW-COMMON pre-impl@1 — JUDGE-LOAD-REDUCTION §1 쪼개기 ⊕ §5 필수/엣지: core (must) stays in this PR, every independent
+# edge becomes its FU cell NOW with the judge's own id «<cell>-FU-<sha8>» (sign-decision edgeFus) — the later sign adds nothing.
+# A TA goal document also goes through the TA's own precheckGoalDocument ⊕ scoreGoalRubric (ask-launch-flow's functions).
+# Called by: implement-loop node `pre-impl` (after decompose) · `eln work review cell` right after cell-review.
+graph_id: pre-impl
+version: 1
+unit:
+  inputs: [cell, requirements]
+  outputs: [core, edge_fus]
+  exits: [core, split, hold]
+entry_node: core-edge
+terminal_nodes: [core, split, hold]
+nodes:
+  - node_id: core-edge
+    kind: judge
+    recipe: 'handler:dev-review-split'
+    max_visits: 1
+    contract: { inputs: [cell, requirements], tools: read-only, outputs: [core, edge_fus] }
+  - node_id: open-fu
+    kind: agent
+    recipe: 'handler:dev-review-open-fu'
+    max_visits: 1
+    contract: { inputs: [edge_fus], tools: checklist-write, outputs: [core, edge_fus] }
+  - { node_id: core, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: split, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: hold, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: core-edge, on: outcome, map: { core: open-fu, split: open-fu, hold: open-fu, fail: open-fu, error: open-fu } }
+  - { from: open-fu, on: outcome, map: { core: core, split: split, hold: hold, fail: hold, error: hold } }

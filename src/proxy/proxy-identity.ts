@@ -209,8 +209,14 @@ function procNames(p: ProcInfo, meta: ProcMetaLookup | undefined): string[] {
   return names;
 }
 
-export function grantPreflight(input: { readonly selfPid: number; readonly stdinIsTTY: boolean; readonly runtimePid: number; readonly lookup: ProcLookup; readonly meta?: ProcMetaLookup; readonly selfUid?: number }): GrantPreflight {
-  if (!input.stdinIsTTY) return { ok: false, reason: 'not-a-terminal', line: 'eln proxy grant: run this yourself in a terminal (stdin is not a TTY) — an agent cannot grant itself proxy authority' };
+/** A person's terminal: stdin is a TTY and no agent runtime sits among the ancestors (fail closed on any unobserved hop).
+ *  Shared by `eln proxy grant` and `eln decisions signer rotate|revoke` (RELEASE-HUMAN-PROOF-TRUST-ROOT). */
+export type HumanTerminalPreflight =
+  | { readonly ok: true; readonly chain: readonly ProcInfo[] }
+  | { readonly ok: false; readonly reason: 'not-a-terminal' | 'agent-ancestor' | 'ancestry-unknown'; readonly line: string };
+export function humanTerminalPreflight(input: { readonly selfPid: number; readonly stdinIsTTY: boolean; readonly lookup: ProcLookup; readonly meta?: ProcMetaLookup; readonly command?: string }): HumanTerminalPreflight {
+  const cmd = input.command ?? 'eln proxy grant';
+  if (!input.stdinIsTTY) return { ok: false, reason: 'not-a-terminal', line: cmd === 'eln proxy grant' ? 'eln proxy grant: run this yourself in a terminal (stdin is not a TTY) — an agent cannot grant itself proxy authority' : `${cmd}: run this yourself in a terminal (stdin is not a TTY) — an agent cannot do this` };
   // Walk the whole ancestry; fail closed when any hop cannot be observed. The walk ends at launchd (ppid ≤ 1) or at the
   // first ancestor owned by another account (login · sshd run as root) — those are not agent runtimes of this user.
   // proc_pidinfo cannot read a root-owned ancestor: its owner is then read with `ps` (meta); another account = complete.
@@ -237,19 +243,26 @@ export function grantPreflight(input: { readonly selfPid: number; readonly stdin
     chain.push(p);
     cur = p.ppid;
   }
-  if (!complete || chain.length === 0) return { ok: false, reason: 'ancestry-unknown', line: 'eln proxy grant: refused — this terminal\'s process ancestry could not be fully observed' };
+  if (!complete || chain.length === 0) return { ok: false, reason: 'ancestry-unknown', line: `${cmd}: refused — this terminal's process ancestry could not be fully observed` };
   // argv[0] is what names a version-named Claude Code: with a meta source, an ancestor whose argv[0] cannot be read
   // could hide an agent — fail closed (Terra #40304).
-  if (input.meta && chain.some((p) => !input.meta!(p.pid)?.argv0)) return { ok: false, reason: 'ancestry-unknown', line: 'eln proxy grant: refused — a process above this terminal could not be identified (argv[0] unreadable)' };
+  if (input.meta && chain.some((p) => !input.meta!(p.pid)?.argv0)) return { ok: false, reason: 'ancestry-unknown', line: `${cmd}: refused — a process above this terminal could not be identified (argv[0] unreadable)` };
   // Only this process itself (the eln runtime: bun/node) is exempt; any runtime above it — even a same-named one — refuses.
   // A process is an agent by its kernel name OR its argv[0] (Claude Code's kernel name is its version, e.g. 2.1.331).
   const self = chain[0]!;
   const selfNames = procNames(self, input.meta);
-  if (!selfNames.some((n) => LAUNCHER_NAMES.has(n)) && selfNames.some((n) => AGENT_ANCESTOR_NAMES.includes(n))) return { ok: false, reason: 'agent-ancestor', line: `eln proxy grant: refused — launched by ${selfNames.join('/')}` };
+  if (!selfNames.some((n) => LAUNCHER_NAMES.has(n)) && selfNames.some((n) => AGENT_ANCESTOR_NAMES.includes(n))) return { ok: false, reason: 'agent-ancestor', line: `${cmd}: refused — launched by ${selfNames.join('/')}` };
   for (const p of chain.slice(1)) {
     const hit = procNames(p, input.meta).find((n) => AGENT_ANCESTOR_NAMES.includes(n));
-    if (hit) return { ok: false, reason: 'agent-ancestor', line: `eln proxy grant: refused — this terminal runs inside ${hit} (pid ${p.pid}); open your own terminal` };
+    if (hit) return { ok: false, reason: 'agent-ancestor', line: `${cmd}: refused — this terminal runs inside ${hit} (pid ${p.pid}); open your own terminal` };
   }
+  return { ok: true, chain };
+}
+
+export function grantPreflight(input: { readonly selfPid: number; readonly stdinIsTTY: boolean; readonly runtimePid: number; readonly lookup: ProcLookup; readonly meta?: ProcMetaLookup; readonly selfUid?: number }): GrantPreflight {
+  const terminal = humanTerminalPreflight(input);
+  if (!terminal.ok) return terminal;
+  const chain = terminal.chain;
   if (chain.some((p) => p.pid === input.runtimePid)) return { ok: false, reason: 'self-inside-runtime', line: 'eln proxy grant: refused — this command runs inside the runtime it would grant' };
   const runtime = input.lookup(input.runtimePid);
   if (!runtime || runtime.pid !== input.runtimePid) return { ok: false, reason: 'runtime-not-found', line: `eln proxy grant: no live process ${input.runtimePid}` };

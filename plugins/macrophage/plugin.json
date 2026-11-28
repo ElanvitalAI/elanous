@@ -1,0 +1,27 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "macrophage",
+  "name": "macrophage",
+  "version": "1.0.0",
+  "description": "2시간 넘은 고아 시험 우주 0 (수호자 reaper 계획 기준)",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "macrophage",
+          "agent": "../../graphs/loop-agents/macrophage/agent.yaml",
+          "trigger": "../../graphs/triggers/macrophage-agent.yaml",
+          "kpis": [
+            "orphans_over_2h"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -29,7 +29,7 @@ import { answerHarnessAskUserCall, HARNESS_ASK_USER_IPC_ENV, isHarnessAskUserCal
 import { getSessionTierOverride } from '../model-tier/session-override.js';
 import { serializeTurnPayload, shouldReleasePinForGoalLoop, shouldReleasePinAfterAnsweredTurn, type GoalCompletionVia } from './local-chat-turn-goalpin-wire.js';
 import { releasePinnedGoal, resolvePinnedObjective, sessionGoalPinStore } from '../core-turn/human-goal-pin.js';
-import { configForSessionProviderTurn, getSessionProvider, sessionProviderChildEnv, setSessionProvider } from './session-provider.js';
+import { clearSessionProvider, configForSessionProviderTurn, getSessionProvider, sessionProviderChildEnv, setSessionProvider } from './session-provider.js';
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawnElanousBun } from '../instance/spawn-elanous.js';
@@ -671,7 +671,9 @@ export function applySeatModelForSession(sessionId: string, seat = process.env.E
   try {
     const { applySeatModelDirective } = require('../seat/model-by-difficulty.js') as typeof import('../seat/model-by-difficulty.js');
     const d = applySeatModelDirective({ root: effectiveInstanceRoot(), seat, sessionId, lastAppliedAt: seatModelAppliedAt.get(sessionId) ?? null,
-      select: (id, sel) => setSessionProvider(id, sel as Parameters<typeof setSessionProvider>[1]) });
+      select: (id, sel) => setSessionProvider(id, sel as Parameters<typeof setSessionProvider>[1]),
+      // the directive was removed (no acceptable model) → back to the seat's own default model, once
+      clear: (id) => { clearSessionProvider(id); seatModelAppliedAt.delete(id); debug.log('seat', 'seat.model-cleared', { seat, sessionId: id }); } });
     if (d) {
       seatModelAppliedAt.set(sessionId, d.at);
       debug.log('seat', 'seat.model-applied', { seat, sessionId, cell: d.cell, tier: d.tier, model: `${d.provider}/${d.model}` });

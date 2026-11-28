@@ -20,7 +20,7 @@ import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { parse as parseYaml } from 'yaml';
+import { readDefinitionYaml } from '../definitions/yaml.js';
 import { debug } from '../debug/log.js';
 import { previousLoopFire } from './schedule-due.js';
 import { registerGraphTriggerDispatchBinding } from './graph-trigger-dispatch-lease.js';
@@ -254,7 +254,11 @@ function num(value: unknown, fallback: number): number {
 /** Read the trigger declaration from a graph's `loop:` header. Throws when a field the engine needs is missing. */
 export function readTriggerDecl(file: string, root: string): TriggerDecl {
   const path = resolve(root, file);
-  const doc = parseYaml(readFileSync(path, 'utf8')) as Record<string, unknown> | null;
+  // Trigger declarations include legacy graph forms, so share YAML syntax loading but
+  // leave graph/trigger validation to the existing consumer rather than template lint.
+  const parsed = readDefinitionYaml(path).doc;
+  if (parsed.errors.length) throw parsed.errors[0];
+  const doc = parsed.toJS() as Record<string, unknown> | null;
   if (!doc || typeof doc.graph_id !== 'string' || !SAFE_ID.test(doc.graph_id)) throw new Error(`trigger graph has no safe graph_id: ${file}`);
   let loop = (doc.loop ?? {}) as Record<string, unknown>;
   // YAML-SUPERVISORS-RUNTIME: a loop-agent shim (`loop: { from_agent: <id> }`) has no trigger of its own — the agent's
@@ -365,6 +369,27 @@ export function listTriggers(db: Database): TriggerRow[] {
   return (db.query('SELECT * FROM graph_trigger_registry ORDER BY graph_id').all() as Record<string, unknown>[]).map(raw => rowFrom(raw, db));
 }
 
+/** The triggers that still run (stage ≠ `retired`) — the ONE reader every supervisor counts loops through (watchers-check ·
+ *  run-doctor · guardian pulse · fed-analyst · OP world card): a retired (absorbed) trigger is history, never a live loop,
+ *  so its last beat · last exception is nobody's incident (11-28 #40634 → run-doctor carded watchers-check 62 min after it
+ *  was retired). The CLI list keeps `listTriggers` (it shows the retired rows on purpose). */
+export function listLiveTriggers(db: Database): TriggerRow[] {
+  return listTriggers(db).filter(r => r.stage !== 'retired');
+}
+
+/** Move one trigger between `live` and `retired` (LOOP-AGENTS-AS-PLUGINS P3: plugin remove retires · re-install revives).
+ *  The row and its fires stay — history, never ticked while retired. Returns whether the stage changed. */
+export function setTriggerStage(db: Database, graphId: string, stage: 'live' | 'retired', now = new Date()): boolean {
+  const changed = db.query(`UPDATE graph_trigger_registry SET stage = ?, updated_at = ? WHERE graph_id = ? AND stage != ?`).run(stage, now.toISOString(), graphId, stage).changes === 1;
+  if (changed) debug.log('loops.trigger-registry', 'stage', { graphId, stage });
+  return changed;
+}
+
+/** Ids of the retired triggers — what a supervisor drops from beats, fires and open cases it reads elsewhere. */
+export function retiredTriggerIds(db: Database): Set<string> {
+  return new Set(listTriggers(db).filter(r => r.stage === 'retired').map(r => r.graphId));
+}
+
 export function listFires(db: Database, graphId?: string, limit = 50): FireRow[] {
   const rows = (graphId
     ? db.query('SELECT * FROM graph_trigger_fires WHERE graph_id = ? ORDER BY window DESC LIMIT ?').all(graphId, limit)
@@ -386,6 +411,8 @@ export function expandTemplate(template: string, vars: TriggerTickDeps['vars'], 
   const out = template
     .replaceAll('{seatState}', vars.seatState)
     .replaceAll('{stateRoot}', vars.stateRoot)
+    // RAIL-CANARY-AUTO-ROLLBACK: the installed build root (install.json · versions · current) — self-update defaultInstallRoot()
+    .replaceAll('{installRoot}', join(homedir(), '.local', 'share', 'elanous'))
     .replaceAll('{window}', window)
     .replaceAll('{date}', windowDate(window, timeZone));
   return out.startsWith('~/') ? join(homedir(), out.slice(2)) : out;
@@ -533,6 +560,21 @@ export async function rollbackTrigger(db: Database, graphId: string, deps: Pick<
 export function retryWindow(db: Database, graphId: string, window: string, now = new Date()): boolean {
   return db.query(`UPDATE graph_trigger_fires SET status = 'retry-wait', attempt = 0, next_retry_at = ?, card = NULL, updated_at = ?
     WHERE graph_id = ? AND window = ? AND status = 'exception'`).run(now.toISOString(), now.toISOString(), graphId, window).changes === 1;
+}
+
+/** Ask the registry to run one live trigger on its next tick (SUPERVISOR-AUDITOR-LOOP «re-fire via the registry»): one
+ *  `retry-wait` row due now in this minute's window — the registry's own tick claims it, dispatches attempt 1 and owns the goal
+ *  check · retries · exception card from there (one door for every waker · no CLI spawn). Deduped per minute window (the
+ *  primary key); a retired or unknown trigger is refused. Returns the window, or null when nothing was queued. */
+export function requestFire(db: Database, graphId: string, now = new Date(), reason = 'requested'): { window: string } | null {
+  const row = db.query('SELECT stage FROM graph_trigger_registry WHERE graph_id = ?').get(graphId) as { stage: string } | null;
+  if (!row || row.stage === 'retired') return null;
+  const window = new Date(Math.floor(now.getTime() / 60_000) * 60_000).toISOString();
+  const at = now.toISOString();
+  const queued = db.query(`INSERT OR IGNORE INTO graph_trigger_fires (graph_id, window, stage, status, attempt, next_retry_at, updated_at, reason)
+    VALUES (?, ?, ?, 'retry-wait', 0, ?, ?, ?)`).run(graphId, window, row.stage, at, at, reason.slice(0, 300)).changes === 1;
+  if (queued) debug.log('loops.trigger-registry', 'request-fire', { graphId, window, reason: reason.slice(0, 120) });
+  return queued ? { window } : null;
 }
 
 interface ConditionState { fired_key: string | null; last_fire_at: string | null; max_wait_done: string | null }

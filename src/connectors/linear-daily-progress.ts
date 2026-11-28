@@ -4,9 +4,10 @@ import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { debug } from '../debug/log.js';
-import { listChecklist, checklistHistory, checklistDevVersion, type Checklist, type ChecklistHistory } from '../release-loop/checklist.js';
+import { listChecklist, checklistHistory, type Checklist, type ChecklistHistory } from '../release-loop/checklist.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
 import { commentLinearIssue } from './linear.js';
+import { boardVersion } from '../release-loop/board-version.js';
 
 const ISSUE_REF = /\bELA-\d+\b/g;
 const BODY_MARKER = '<!-- elanous-daily-progress:';
@@ -187,7 +188,7 @@ function withDailyLock<T>(stateDir: string, fn: () => Promise<T>): Promise<T> {
 
 /** Dry-run by default at the CLI; live delivery checks Linear first so a retry after a crash cannot duplicate a comment. */
 export async function syncLinearDailyProgress(deps: LinearDailyProgressDeps = {}): Promise<LinearDailyProgressResult> {
-  const checklist = deps.checklist ?? listChecklist(deps.version ?? checklistDevVersion());
+  const checklist = deps.checklist ?? listChecklist(deps.version ?? boardVersion());
   const decisions = deps.decisions ?? new DecisionLedger({ stateDir: deps.stateDir }).list({ status: 'all' });
   const summaries = buildLinearDailyProgressSummaries({ checklist, history: deps.history ?? checklistHistory, decisions, now: deps.now });
   const result: LinearDailyProgressResult = { posted: 0, skipped: 0, failed: 0, dryRun: deps.dryRun !== false, plan: [] };

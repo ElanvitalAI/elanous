@@ -29,7 +29,7 @@ prompt:
   instruction: Observe the failed gate; propose a bounded retry edge, validate it, verify the result, and roll back on failure.
   llm: { role: supervisor-planner, optional: true }
 graph: ./supervisor.yaml
-# supervisor/v1 definition — loaded by src/supervision/definition-loader.ts with the macrophage/heal/silence/run-doctor set.
+# supervisor/v1 definition — checked by `eln loop package verify` against src/loops/contract/loop-agent.schema.json.
 supervisor:
   apiVersion: elanous.dev/supervisor/v1
   kind: supervisor

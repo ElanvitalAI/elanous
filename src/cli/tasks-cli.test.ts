@@ -821,7 +821,7 @@ test('tasks green-sweep defaults to dry-run and --apply writes only after main E
     taskStatePath: join(dir, 'empty-task-state.json'),
     greenSweepRun: (command, args) => {
       const key = `${command} ${args.join(' ')}`;
-      if (key === 'git remote get-url origin') return { status: 0, stdout: 'https://github.com/example/repo.git' };
+      if (key === 'git config --get remote.origin.url') return { status: 0, stdout: 'https://github.com/example/repo.git' };
       if (key === 'git rev-parse origin/main' || key === 'git rev-parse HEAD') return { status: 0, stdout: sha };
       if (key === 'git ls-remote origin refs/heads/main') return { status: 0, stdout: `${sha}\trefs/heads/main` };
       if (key === 'git status --porcelain --untracked-files=all') return { status: 0, stdout: '' };

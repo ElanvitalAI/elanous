@@ -1,3 +1,4 @@
+import { liveStewardCaps } from '../steward/live-caps.js';
 // THROUGHPUT-CONTROLLER live probes and actuators (see throughput-controller.ts for the SCQA and the three faces).
 // Every probe reads an existing ledger once and fails open to null («?» — never zero):
 //   lands/h          git log origin/main --since 1h (squash subjects «(#N)») — every landing path, not only the graph
@@ -5,7 +6,9 @@
 //   judge-ready      green-triage bucket (a) — merged PR ⊕ same-head PREGATE-GREEN lane (the `green-triage` command)
 //   land             {stateRoot}/land-graph/last-tick.json ⊕ ledger.jsonl (landed/h · refusals · waits · tick spacing)
 //   slots · authors  config land.graph.{slots, authors} (the land graph's own config)
-//   open PRs         one `gh pr list --json number,headRefOid,author,files,isDraft`
+//   open PRs         one `gh pr list --json number,headRefOid,author,files,isDraft,updatedAt`
+//   fresh supply     PR-ZOMBIE-AGING (kit/pr-aging · graphs/policies/pr-aging.yaml): awaiting-pregate counts only non-draft PRs
+//                    whose head moved within supply.fresh_head_max_days (head commit time, local git · else updatedAt)
 //   receipts         seat-state/RES/evidence/PREGATE-GREEN/*/receipt.json written in the last 2 h (tsc step exit)
 //   hands · frozen   hand pool (free = idle without a cell) · hand-raise ladder open ✋ ≥ FROZEN_MIN
 // Actuators: one msg-store card per action (from OP, kind info) · dedupe ledger {stateRoot}/loops/throughput-controller.jsonl
@@ -20,6 +23,7 @@ import { ageMin, HOUR_MS, inWindow } from '../kit/kpi/index.js';
 import { boardLine, decideThroughput, executeThroughput, FROZEN_MIN, renderThroughputBlock, TARGET_GREENS_PER_H, TARGET_LANDS_PER_H,
   type ThroughputActuators, type ThroughputSnapshot, type TpOpenPr, type TpReceipt, type TpRefusal } from './throughput-controller.js';
 import { hostsFor } from '../kit/resource-facts/index.js';
+import { headCommitTimes, livePrAgingPolicy, splitSupply } from '../kit/pr-aging/index.js';
 
 const HOUR = HOUR_MS;
 const short = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/\s+/gu, ' ').slice(0, 80);
@@ -139,6 +143,12 @@ export function resolveDevRepoRoot(deps: { env?: NodeJS.ProcessEnv; configPath?:
   return null;
 }
 
+/** Resolve the checklist version exactly as the controller does, with injectable isolated roots. */
+export async function throughputChecklistVersion(hqRoot: string, ledgerRoot: string): Promise<string> {
+  const { resolveCurrentVersion } = await import('../ops-dashboard/current-version.js');
+  return resolveCurrentVersion({ hqRoot, ledgerRoot }).version;
+}
+
 /** The controller snapshot from live state. */
 export async function liveThroughputSnapshot(roots: TpRoots, now: Date): Promise<ThroughputSnapshot> {
   const nowMs = now.getTime(); const unmeasured: string[] = [];
@@ -154,8 +164,7 @@ export async function liveThroughputSnapshot(roots: TpRoots, now: Date): Promise
   try {
     const { listChecklist } = await import('../release-loop/checklist.js');
     const { releaseLedgerRoot } = await import('../instance/resolve.js');
-    const { versionInPlay } = await import('./op-next-action-live.js');
-    version = await versionInPlay(join(roots.seatState, '..'), releaseLedgerRoot());
+    version = await throughputChecklistVersion(join(roots.seatState, '..'), releaseLedgerRoot());
     items = listChecklist(version, releaseLedgerRoot()).items;
   } catch (e) { unmeasured.push(`checklist(${short(e)})`); }
   const greensLastHour = items ? items.filter(i => i.status === 'green' && inWindow(i.updatedAt, nowMs, HOUR)).length : null;
@@ -186,12 +195,17 @@ export async function liveThroughputSnapshot(roots: TpRoots, now: Date): Promise
   let openPrs: TpOpenPr[] | null = null;
   try {
     if (!repo) throw new Error('no repo');
-    const r = spawnSync('gh', ['pr', 'list', '--state', 'open', '--limit', '200', '--json', 'number,headRefOid,author,files,isDraft'], { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024 }); // Source: one list per controller run.
+    const r = spawnSync('gh', ['pr', 'list', '--state', 'open', '--limit', '200', '--json', 'number,headRefOid,author,files,isDraft,updatedAt'], { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024 }); // Source: one list per controller run.
     if (r.status !== 0) throw new Error(`gh exit ${r.status}: ${String(r.stderr).trim().slice(0, 80)}`);
-    openPrs = (JSON.parse(r.stdout) as Array<{ number: number; headRefOid: string; author?: { login?: string }; files?: Array<{ path: string }>; isDraft: boolean }>)
-      .map(p => ({ pr: p.number, head: p.headRefOid, author: cfg.authors[p.author?.login ?? ''] ?? p.author?.login ?? '', files: (p.files ?? []).map(f => f.path), draft: p.isDraft }));
+    openPrs = (JSON.parse(r.stdout) as Array<{ number: number; headRefOid: string; author?: { login?: string }; files?: Array<{ path: string }>; isDraft: boolean; updatedAt?: string }>)
+      .map(p => ({ pr: p.number, head: p.headRefOid, author: cfg.authors[p.author?.login ?? ''] ?? p.author?.login ?? '', files: (p.files ?? []).map(f => f.path), draft: p.isDraft,
+        ...(p.updatedAt ? { updatedAt: p.updatedAt } : {}) }));
   } catch (e) { unmeasured.push(`open-prs(${short(e)})`); }
-  const openHeads = openPrs ? new Map(openPrs.filter(p => !p.draft).map(p => [p.pr, p.head] as const)) : null;
+  // PR-ZOMBIE-AGING: supply = fresh PRs only (11-28 «141 waiting» was mostly week-old #36xxx–#38xxx heads).
+  const aging = livePrAgingPolicy();
+  if (!aging) unmeasured.push('pr-aging policy(graphs/policies/pr-aging.yaml)');
+  const supply = openPrs ? splitSupply(openPrs, repo ? headCommitTimes(cwd, openPrs.map(p => p.head)) : new Map(), aging, nowMs) : null;
+  const openHeads = supply ? supply.heads : null;
   const ledger = readLandLedger(roots.stateRoot, nowMs, openHeads);
   type LastTick = { at?: string; mode?: string; readyNotLanded?: number };
   const tick: LastTick | null = (() => { try { return JSON.parse(readFileSync(join(roots.stateRoot, 'land-graph', 'last-tick.json'), 'utf8')) as LastTick; } catch { unmeasured.push('land last-tick'); return null; } })();
@@ -247,11 +261,12 @@ export async function liveThroughputSnapshot(roots: TpRoots, now: Date): Promise
       .filter(c => !!items!.find(i => i.id === c.id)?.doneCriterion).length;
   }
   return {
+    throughputCards: (await liveStewardCaps())?.throughputCards ?? null,
     now: now.toISOString(), version, targets: { landsPerH: TARGET_LANDS_PER_H, greensPerH: TARGET_GREENS_PER_H },
     landsLastHour: landed ? landed.size : null, graphLandsLastHour: ledger.graphLands, greensLastHour, judgeReady, landsWithoutCell,
     land: { readyToLand: typeof tick?.readyNotLanded === 'number' ? tick.readyNotLanded : null, slots: cfg.slots, mode: tick?.mode ?? null,
       lastTickAgeMin: tick?.at ? Math.max(0, Math.round((nowMs - Date.parse(tick.at)) / 60_000)) : null, avgTickMin: ledger.avgTickMin },
-    churn, openPrs, awaitingPregate: ledger.awaiting, receipts, pregateHosts: pregateHosts(), hands, frozen, readyCells, unmeasured,
+    churn, openPrs, awaitingPregate: ledger.awaiting, staleExcluded: supply ? supply.stale : null, receipts, pregateHosts: pregateHosts(), hands, frozen, readyCells, unmeasured,
   };
 }
 

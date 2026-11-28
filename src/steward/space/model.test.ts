@@ -3,7 +3,7 @@
 import { describe, expect, test } from 'bun:test';
 import { resolveScope } from './config.js';
 import {
-  emptyScopeState, exceptionCard, minutesToNextCut, planHandoff, planJudge, planMatch, planReceipts, planWatch, rollupLine, digestCounts,
+  emptyScopeState, exceptionCard, minutesToNextCut, planHandoff, planJudge, planMatch, planReceipts, planReclaim, planWatch, rollupLine, digestCounts,
   scopeOf, scopesOf, type Snapshot,
 } from './model.js';
 import { parsePanes, parseUtil } from './sources.js';
@@ -89,6 +89,25 @@ describe('rail 30 · waiting cells ⊕ coordinator board', () => {
   test('a FAIL verdict makes the cell active again → woken on its own cell', () => {
     const plan = planMatch(waitingSnap([{ pr: 201, head12: '999999999999', kind: 'jud', verdict: 'FAIL', atMs: agoMs(5) }]), { scope: live('TC'), state: emptyScopeState() });
     expect(plan.rows.map((r) => [r.action, r.target, r.seat, r.reason])).toEqual([['wake', 'CELL-C', 'TC-H-CX-1', 'idle-owner:30m']]);
+  });
+});
+
+describe('reclaim limit boundary', () => {
+  test('explicit cap controls eligible rows; unknown, zero and invalid values fail closed', () => {
+    const s = snap({
+      cells: Array.from({ length: 40 }, (_, i) => ({ id: `CELL-${i}`, title: 'c', status: 'yellow' as const, owner: 'TC-H-CX-1', priority: 'P1', updatedAt: ago(90) })),
+      seats: [{ seat: 'TC-H-CX-1', activity: 'idle', idleForMs: 90 * 60_000 }],
+      prs: [], receipts: [],
+    });
+    const scope = live('TC');
+    expect(planReclaim(s, { scope }).length).toBe(8);
+    expect(planReclaim(s, { scope, reclaimLimit: 8 }).length).toBe(8);
+    expect(planReclaim(s, { scope, reclaimLimit: 32 }).length).toBe(32);
+    expect(planMatch(s, { scope, state: emptyScopeState(), reclaimLimit: 32 }).rows.filter((r) => r.action === 'reclaim')).toHaveLength(32);
+    expect(planMatch(s, { scope, state: emptyScopeState(), reclaimLimit: null }).rows.filter((r) => r.action === 'reclaim')).toHaveLength(0);
+    for (const reclaimLimit of [0, null, -1, NaN, Infinity, 1.5]) {
+      expect(planReclaim(s, { scope, reclaimLimit })).toEqual([]);
+    }
   });
 });
 

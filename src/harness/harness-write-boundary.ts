@@ -395,6 +395,9 @@ const READ_ONLY_GIT_SUBCOMMANDS = new Set([
 const GIT_MUTATING_SUBCOMMANDS = new Set([
   'add', 'branch', 'checkout', 'commit', 'merge', 'rebase', 'reset', 'restore', 'stash', 'switch', 'tag', 'update-ref',
 ]);
+/** `git config` read modes (one must be present) and the read-only options that may accompany them. */
+const GIT_CONFIG_READ_MODES = new Set(['--get', '--get-all', '--get-regexp', '--list', '-l']);
+const GIT_CONFIG_READ_OPTIONS = new Set(['--local', '--global', '--system', '--worktree', '--null', '-z', '--name-only', '--show-origin', '--show-scope']);
 /** Safe observation vocabulary: only known git operations may leave the process. */
 const OBSERVABLE_GIT_SUBCOMMANDS = new Set([
   ...READ_ONLY_GIT_SUBCOMMANDS,
@@ -857,6 +860,14 @@ function gitTargets(argv: readonly string[], cwd: string): CommandTargets {
   const operands = argv.slice(subcommandIndex + 1).filter((arg) => !arg.startsWith('-'));
   // ⛔ 아래 모든 뮤테이션 분기는 **refTargets 하나로** 대상을 계산한다 — 분기마다 손으로
   //    적으면 `--git-dir` 을 빠뜨린 분기가 남는다(무인 리뷰가 remote 분기에서 그걸 잡았다).
+  // GH-MIRROR-ORIGIN-URL-SAFE: origin is read as `git config --get remote.origin.url` (src/git-fs/origin-url.ts — get-url
+  // follows a fetch mirror's insteadOf). Only the pure read forms of `config` are observation; any other form stays undecided.
+  if (subcommand === 'config') {
+    const flags = argv.slice(subcommandIndex + 1).filter((arg) => arg.startsWith('-'));
+    return flags.some((flag) => GIT_CONFIG_READ_MODES.has(flag)) && flags.every((flag) => GIT_CONFIG_READ_MODES.has(flag) || GIT_CONFIG_READ_OPTIONS.has(flag))
+      ? { targets: [], known: true }
+      : unknownTargets('git config 의 읽기 아닌 형태');
+  }
   if (subcommand === 'remote') {
     const action = operands[0];
     return action === undefined || action === 'get-url' || action === 'show'

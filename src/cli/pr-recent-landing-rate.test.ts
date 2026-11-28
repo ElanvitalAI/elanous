@@ -78,7 +78,7 @@ const numstatArgs = 'diff --numstat HEAD';
 const baseLookupRun = (cmd: string, args: readonly string[]) =>
   cmd === 'git' && args.join(' ') === 'remote'
     ? { ok: true, out: 'origin\n' }
-    : cmd === 'git' && args.join(' ') === 'remote get-url origin'
+    : cmd === 'git' && args.join(' ') === 'config --get remote.origin.url'
       ? { ok: true, out: 'git@github.com:example/repo.git\n' }
       : cmd === 'git' && args.join(' ') === statusArgs
         ? { ok: true, out: '' }

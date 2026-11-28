@@ -17,11 +17,11 @@ import { createHash } from 'node:crypto';
 import { lintAgentYaml } from '../../../loop-agent/v3/agent-yaml.js';
 import { nodeKind } from '../../../loop-agent/v3/node-kinds.js';
 import { beginSmart, fileSmartStore, judge, lessonMarker, plan, type KnowhowSink, type Router, type SmartConfig, smartConfig } from '../../../loop-agent/v3/smart.js';
-import { stewardTick, type StewardPorts } from '../../../land-steward/agent.js';
+import type { LandTickPorts as StewardPorts } from '../../../loop-agent/v3/land-graph-kind.js';
 import { fileMemory, loadCards } from '../../../land-steward/memory.js';
 import { loadButlerSmart, smartButlerPorts } from '../../../judge-butler/smart.js';
 import type { ButlerPorts, ButlerView } from '../../../judge-butler/body.js';
-import { copyPkg, deps, hx, MIN, NOW, orgFile, rng, v2Cards, type World } from './loop-agent-v3.js';
+import { copyPkg, deps, hx, MIN, NOW, orgFile, rng, stewardTick, v2Cards, type World } from './loop-agent-v3.js';
 import type { SimWorldScenario, SimWorldScenarioOutcome } from '../types.js';
 
 const SEEDS = [1, 2, 3, 4, 5];

@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { readRemoteUrl } from '../git-fs/origin-url.js';
 
 const SHA40 = /^[0-9a-f]{40}$/i;
 const SHA256 = /^[0-9a-f]{64}$/i;
@@ -61,9 +62,9 @@ const defaultDeps: RepairCasDeps = {
     } catch { return null; }
   },
   originRepo(cwd) {
-    const r = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd, encoding: 'utf8', timeout: 30_000 });
-    if (r.status !== 0) return null;
-    const url = String(r.stdout).trim();
+    // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+    const url = readRemoteUrl(cwd, { timeoutMs: 30_000 });
+    if (url === null) return null;
     const match = /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(url);
     return match?.[1]?.toLowerCase() ?? null;
   },

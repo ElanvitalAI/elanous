@@ -13,6 +13,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { cleanupLogDir, type RetentionPolicy, type RetentionResult } from '../mss/logging/retention.js';
 import type { CompactArchiveEntry } from './types.js';
 
@@ -50,6 +51,40 @@ export function appendArchiveEntry(
   } catch {
     return false;
   }
+}
+
+/** Recover a bounded page from the current session's archived tool result.
+ * The caller must supply the host-owned session ID, never a model-selected one. */
+export function recoverToolOutputChunk(
+  sessionId: string, toolUseId: string, offset: number, limit: number, dir?: string, sha256?: string,
+): { ok: true; content: string; nextOffset: number; done: boolean; totalChars: number }
+  | { ok: false; error: string } {
+  if (!sessionId || !toolUseId || !Number.isSafeInteger(offset) || offset < 0 ||
+      !Number.isSafeInteger(limit) || limit < 1 || limit > 5000) {
+    return { ok: false, error: 'invalid_range' };
+  }
+  let raw: string;
+  try {
+    raw = readFileSync(archivePath(sessionId, dir), 'utf8');
+  } catch (error) {
+    return { ok: false, error: (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'archive_missing' : 'archive_read_failed' };
+  }
+  let found: string | undefined;
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let entry: CompactArchiveEntry;
+    try { entry = JSON.parse(line); } catch { return { ok: false, error: 'archive_corrupt' }; }
+    if (entry.sessionId !== sessionId || entry.origin?.kind !== 'tool_result' ||
+        entry.origin.tool_use_id !== toolUseId || typeof entry.content !== 'string') continue;
+    if (sha256 !== undefined && createHash('sha256').update(entry.content, 'utf16le').digest('hex') !== sha256) continue;
+    if (found !== undefined && found !== entry.content) return { ok: false, error: 'ambiguous_result' };
+    found = entry.content;
+  }
+  if (found === undefined) return { ok: false, error: 'not_found' };
+  if (offset > found.length) return { ok: false, error: 'invalid_range' };
+  const content = found.slice(offset, offset + limit);
+  const nextOffset = offset + content.length;
+  return { ok: true, content, nextOffset, done: nextOffset === found.length, totalChars: found.length };
 }
 
 // ── PR2 §5.2 · Archive retention (mirrors MSS M2.3 pattern) ─────────

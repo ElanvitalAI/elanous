@@ -1,3 +1,4 @@
+import { recoverToolOutputChunk } from '../compact/archive.js';
 import type { LLMToolSpec } from '../llm/tool-spec.js';
 // TUI-TOKEN-GUARD-WIRE — shared request-size guard (#32254 cap).
 //
@@ -211,6 +212,12 @@ export function createRequestSizeGuard(opts: CreateRequestSizeGuardOptions): Req
   const maxChars = opts.maxChars ?? policy.maxChars;
   return {
     maxChars,
+    recoverToolOutput: (args) => {
+      const options = opts.compactOptions();
+      if (!options.sessionId || options.archiveEnabled === false) return { ok: false, error: 'archive_disabled' };
+      if (typeof args.tool_use_id !== 'string' || typeof args.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(args.sha256)) return { ok: false, error: 'invalid_selector' };
+      return recoverToolOutputChunk(options.sessionId, args.tool_use_id, args.offset as number, args.limit as number, options.archiveDir, args.sha256);
+    },
     compactAtChars: Math.floor(maxChars * policy.compactRatio),
     trimTargetRatio: policy.trimTargetRatio,
     trimOldest: async (messages, measure, targetChars) => {

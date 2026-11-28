@@ -1,6 +1,7 @@
 import { copyFileSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
 import { runGitCommand } from '../git-fs/runner.js';
+import { isAncestor } from '../git-fs/smart-run.js';
 import { debug } from '../debug/log.js';
 import { judgeNextMove, retryMoveOf, SAME_MOVE_FAILURE_LIMIT } from './judge.js';
 import { checkCompletionEvidence } from './completion-evidence.js';
@@ -209,7 +210,7 @@ export function ownerWorktreeHarvestState(input: { pr: number; cwd: string; head
     const ownerPath = owners[0]?.split('\n').find(line => line.startsWith('worktree '))?.slice('worktree '.length);
     if (owners.length !== 1 || !ownerPath || realpathSync(ownerPath) !== cwd) return undefined;
     if (input.branch !== name || input.head.toLowerCase() === commit.toLowerCase()) return undefined;
-    if (git(cwd, ['merge-base', '--is-ancestor', input.head, commit]).status !== 0) return undefined;
+    if (!isAncestor(args => git(cwd, args), input.head, commit)) return undefined;
     return { pr: input.pr, source: 'owner-worktree-commit', head: commit };
   } catch { return undefined; }
 }

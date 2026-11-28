@@ -14,13 +14,15 @@
  *   bulletin-write — the federal bulletin's facts written by the graph (bulletin-write.ts · BULLETIN-NOW-STALE 11-26):
  *                 BULLETIN-NOW.md rewritten (old one → BULLETIN-LOG) · kind-bulletin mail to every coordinator · ONE
  *                 internal OP turn (retro-turn ledger) for the two judgement lines.
- *   watchers-check — judge every watcher heartbeat (src/kit/heartbeat/index.ts); stage `live` posts one deduped card to
- *                 CLAUDE-OP, other stages judge only.
+ *   watch-sweep — COND-WATCH R5 (src/commitment/condition-sweep.ts): measure every seat's armed condition once — met →
+ *                 close ⊕ one wake · expired → one wake · stale (horizon 30m+ past, its watcher died) → retired silently ·
+ *                 ≤ 20 wakes a tick. Stage `shadow` (or a manual run) judges only (dry-run · no write · no wake).
  *   idle-probe  — decide idle/busy for a seat from the newest mtime of its activity files and append one
  *                 triage ledger line for the window (the idle-triage goal predicate reads that line).
  *
  *   pulse-measure — OP-PULSE measure step (no LLM): phase → rhythm → measure → gaps → forecast → burst entry; writes
  *                 the pulse table/state/ledger and routes `turn` (OP must act) or `green` (heartbeat line only, no turn).
+ *   decision-bus-sync — DECISION-TO-BUS-AUTO (src/kit/decision-bus): ledger ⊕ docs change-log rows → HQ bus pointers ⊕ unread card.
  *   pulse-turn  — deliver the pulse brief as ONE origin-`pulse` internal OP turn via the pulse inbox (live) or a shadow
  *                 receipt (shadow). Not a mail and not a wake — the wake cap never coalesces it.
  *
@@ -239,11 +241,37 @@ export async function pulseTurn(ctx: NodeContext, now = new Date()): Promise<Rec
   return { outcome: 'ok', ...out };
 }
 
-export async function watchersCheck(ctx: NodeContext): Promise<Record<string, unknown>> {
-  const { runWatchCheck } = await import('../cli/watch-cli.js');
-  const r = runWatchCheck({}, { post: ctx.input?.stage === 'live' });
-  return { outcome: r.error ? 'fail' : 'ok', bad: r.verdicts.filter(v => v.status !== 'OK').map(v => `${v.status} ${v.name}`), carded: r.posted,
-    ...(r.error ? { error: r.error } : {}) };
+/** COND-WATCH R5 — one condition sweep; the report file is the graph goal (rewritten every tick, shadow included). */
+export async function watchSweep(ctx: NodeContext, deps: { sweep?: typeof import('../commitment/condition-sweep.js').sweepConditions } = {}): Promise<Record<string, unknown>> {
+  const mod = await import('../commitment/condition-sweep.js');
+  const dryRun = ctx.input?.stage !== 'live';
+  const report = await (deps.sweep ?? mod.sweepConditions)({ dryRun });
+  mod.writeSweepReport(join(vars(ctx.input ?? {}).stateRoot, 'commitments', 'watch-sweep.json'), report);
+  return { outcome: 'ok', dryRun, armed: report.armed, wakes: report.wakes, counts: report.counts, line: report.line };
+}
+
+/**
+ * DECISION-TO-BUS-AUTO — one decision-bus sweep (src/kit/decision-bus): decided ledger cards ⊕ new «변경 이력» rows on main →
+ * HQ bus pointers (keys dedupe) → unread past unread_h → one OP card. Every number = this node's YAML input. Stage `shadow`
+ * judges only (dry-run); live and manual runs post. The report file is the graph goal (rewritten every tick).
+ */
+export async function decisionBusSync(ctx: NodeContext, deps: { now?: Date; git?: import('../git-fs/smart-run.js').GitRun | null } = {}): Promise<Record<string, unknown>> {
+  const kit = await import('../kit/decision-bus/index.js');
+  const node = ctx.nodeInput ?? {};
+  const policy = kit.decisionBusPolicyOf(node);
+  const v = vars(ctx.input ?? {});
+  const { DecisionLedger } = await import('../decisions/decision-ledger.js');
+  let git = deps.git;
+  if (git === undefined) {
+    const { gitAt } = await import('../git-fs/smart-run.js');
+    // `repo:` (YAML · e.g. '{seatState}/../repo.git' — the HQ mirror an installed eln runs beside) else the code checkout.
+    const repo = typeof node.repo === 'string' && node.repo.trim() ? expandTemplate(node.repo.trim(), v, ctx.input?.window ?? 'manual') : (await import('../domains/schedule-registry.js')).repoRoot();
+    git = gitAt(repo, { timeoutMs: 30_000 });
+  }
+  const report = kit.syncDecisionBus({ stateRoot: v.stateRoot, policy, now: deps.now ?? new Date(), git, dryRun: ctx.input?.stage === 'shadow',
+    decisions: () => new DecisionLedger({ stateDir: v.stateRoot }).list({ status: 'decided' }) });
+  kit.writeDecisionBusReport(join(v.stateRoot, 'decision-bus', 'last-sync.json'), report);
+  return { outcome: 'ok', ...report };
 }
 
 if (import.meta.main) {
@@ -256,7 +284,8 @@ if (import.meta.main) {
     else if (command === 'pulse-turn') emit(await pulseTurn(ctx));
     else if (command === 'retro-draft') emit(retroDraft(ctx));
     else if (command === 'bulletin-write') emit(await (await import('./bulletin-write.js')).bulletinWrite(ctx));
-    else if (command === 'watchers-check') emit(await watchersCheck(ctx));
+    else if (command === 'watch-sweep') emit(await watchSweep(ctx));
+    else if (command === 'decision-bus-sync') emit(await decisionBusSync(ctx));
     else { emit({ outcome: 'error', error: `unknown trigger node: ${command}` }); process.exitCode = 2; }
   } catch (error) {
     emit({ outcome: 'error', error: error instanceof Error ? error.message : String(error) });

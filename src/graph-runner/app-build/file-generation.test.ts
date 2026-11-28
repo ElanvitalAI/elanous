@@ -138,7 +138,7 @@ test('starts three independent files together and supplies completed dependencie
       } finally { active--; }
     } });
     expect(result.ok).toBe(true); expect(peak).toBe(width);
-    expect(result.files.map(file => file.path)).toEqual(input.plan.map(file => file.path));
+    expect(result.files.map(file => file.path)).toEqual([...input.plan.map(file => file.path), 'ARCHITECTURE.html']);
   } finally { release(); clearTimeout(timer); }
 });
 
@@ -220,7 +220,7 @@ test('consumes the actual A contract and preserves validated architecture while 
     prompts.push(prompt); return prompts.length === 1 ? 'Which database would you like?' : reply(prompt);
   } });
   expect(result.ok).toBe(true); if (!result.ok) throw new Error(result.code);
-  expect(result.files.map(file => file.path)).toEqual(input.plan.map(file => file.path));
+  expect(result.files.map(file => file.path)).toEqual([...input.plan.map(file => file.path), 'ARCHITECTURE.html']);
   expect(result.files[0]?.content).toBe(input.architecture.markdown);
   expect(result.receipts.some(receipt => receipt.status === 'rejected' && receipt.attempt === 1)).toBe(true);
   expect(result.receipts.some(receipt => receipt.status === 'generated' && receipt.attempt === 2)).toBe(true);
@@ -348,7 +348,7 @@ test('OP fixed four cases have identical fresh and matching-hash resume decision
   ] as const) {
     const fresh = await generatePlannedFiles(input, { callLLM: async prompt => JSON.stringify({ path: JSON.parse(prompt).file.path, content }) });
     expect(fresh.ok).toBe(expected);
-    const files = good.files.map((file, index) => index === 1 ? { ...file, content, sha256: createHash('sha256').update(content).digest('hex') } : file);
+    const files = good.resume.files.map((file, index) => index === 1 ? { ...file, content, sha256: createHash('sha256').update(content).digest('hex') } : file);
     let calls = 0;
     const resumed = await generatePlannedFiles({ ...input, resume: { ...good.resume, files } }, { callLLM: async prompt => { calls++; return reply(prompt); } });
     expect(resumed.ok).toBe(expected); expect(calls).toBe(0);

@@ -86,6 +86,36 @@
       "expect": "green",
       "greenSince": "2026-11-21 (pool4-capsule-a1-sample branch wiring commit · base 3ac94594af)",
       "reason": "A1 structural-synthesis sample (NOT a verbatim replay of the 11-18 46-minute turn): the audit directly observed only the Bash·Agent axes — the harness·MCP axes are structural-synthesis probes built on the audit's capsule-family structure, dispatched in ONE main turn to measure the junction; every axis lands a turn-life:capsule-policy judgment row (tool·kind·mode·syncCapMs·reason); judgment-only, the behavioral detach stays in the A2 shell host wiring"
+    },
+    "capsule-events/TURN-GIVEUP-ROUTE-REENTER": {
+      "expect": "green",
+      "greenSince": "0.3.40 TURN-GIVES-UP-NO-WORK",
+      "reason": "TURN-GIVES-UP-NO-WORK ① (CEO field report 11-28): the CEO memory-contract line routes as a provisional research turn; when the structured route says local-only the research-allowlist first pass ends and the turn re-enters as the ordinary turn (Glob/Write in the pool), writes MEMORY-CONTRACT.md and never dispatches Agent. Real runCoreTurn, fake model and fake research."
+    },
+    "capsule-events/TURN-GIVEUP-DELEGATION-INLINE": {
+      "expect": "green",
+      "greenSince": "0.3.40 TURN-GIVES-UP-NO-WORK",
+      "reason": "TURN-GIVES-UP-NO-WORK ③: a delegation that throws (spawn refused) returns one structured result status failed, delegation failed, fallback inline, reason spawn-threw; the same turn then writes the file. Real runCoreTurn, fake model."
+    },
+    "capsule-events/TURN-GIVEUP-CONTINUE-ROWS": {
+      "expect": "green",
+      "greenSince": "0.3.40 TURN-GIVES-UP-NO-WORK",
+      "reason": "TURN-GIVES-UP-NO-WORK ④: with no plan and a reply that ends without a pledge (run B tail), a failed Agent row and no state change open exactly one continuation with the [delegation] prompt; the same rows plus a successful Write, or a plain answer with no rows, open nothing. Real goal-continue controller."
+    },
+    "capsule-events/TURN-GIVEUP-FANOUT-NOT-VERIFY": {
+      "expect": "green",
+      "greenSince": "0.3.40 TURN-GIVES-UP-NO-WORK",
+      "reason": "TURN-GIVES-UP-NO-WORK ②: in the after-fix test universe the second memory worker was refused as verify-chain only because its prompt said 확인; a fan-out sibling now spawns while a spawn named as a check of the running agent is still refused. Real AgentSpawnGuard."
+    },
+    "capsule-events/BUS-P0-BUSY-ONCE": {
+      "expect": "green",
+      "greenSince": "BUS-P0-STEER-BUSY",
+      "reason": "Simulated tool boundary and bus wake gate; not a real PTY integration."
+    },
+    "capsule-events/BUS-P0-FALLBACK-IDLE": {
+      "expect": "green",
+      "greenSince": "BUS-P0-STEER-BUSY",
+      "reason": "Simulated tool boundary and bus wake gate; not a real PTY integration."
     }
   }
 }

@@ -47,7 +47,12 @@ export function agentTriggerLoop(triggerFile: string, id: string): Record<string
     description: typeof man.description === 'string' ? man.description : '',
     owner,
     trigger: wake.trigger,
-    goal: { kind: 'file-mtime', path: agentGoalPath(id) },
+    // GUARDIAN-V3-SMART: `wake.goal` = the agent's own result file when it is not the v2 shell (the guardian pulse writes
+    // last-pulse.json) · absent = the shell's last-tick.json
+    goal: isObj(wake.goal) ? wake.goal : { kind: 'file-mtime', path: agentGoalPath(id) },
     ...(isObj(wake.failure) ? { failure: wake.failure } : {}),
+    // relation key `absorbs:` (top level · roles and triggers alike): the `kind: trigger` ids retire in the registry's registration
+    // transaction; a garbled value goes through as written so the registry refuses it loudly
+    ...(j.absorbs === undefined ? {} : { absorbs: Array.isArray(j.absorbs) ? j.absorbs.filter(a => isObj(a) && a.kind === 'trigger').map(a => (a as Record<string, unknown>).id) : j.absorbs }),
   };
 }

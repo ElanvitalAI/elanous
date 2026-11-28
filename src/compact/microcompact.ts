@@ -9,6 +9,7 @@
 // Counts a "turn" as any message with role 'user' or 'assistant'.
 // The threshold compares the message's turn-distance from the tail.
 
+import { createHash } from 'node:crypto';
 import type { ContentBlock, LLMMessage } from '../llm.js';
 import {
   appendArchiveEntry,
@@ -77,6 +78,8 @@ export function applyMicrocompact(
         block.type !== 'tool_result'
         || typeof block.content !== 'string'
         || block.content === MICROCOMPACT_PLACEHOLDER
+        || block.content.startsWith(`${MICROCOMPACT_PLACEHOLDER}\n[tool_use_id: `)
+        || /^\[Full output saved to: .*\]\n\[tool_use_id: /.test(block.content)
       ) {
         // Array content (image tool_result) is opaque to microcompact —
         // the bytes were sent for vision input and shouldn't be silently
@@ -85,24 +88,28 @@ export function applyMicrocompact(
         newBlocks.push(block);
         continue;
       }
-      // Tool result eligible for clearing.
-      if (policy.archiveEnabled) {
-        appendArchiveEntry(
-          {
-            ts: now(),
-            layer: 'microcompact',
-            sessionId,
-            origin: { kind: 'tool_result', tool_use_id: block.tool_use_id },
-            content: block.content,
-            replacement: MICROCOMPACT_PLACEHOLDER,
-          },
-          archiveDir,
-        );
+      // Keep the host-bound selector in the prompt, not just in the archive.
+      const replacement = policy.archiveEnabled
+        ? `${MICROCOMPACT_PLACEHOLDER}\n[tool_use_id: ${JSON.stringify(block.tool_use_id)}] [sha256-utf16le: ${createHash('sha256').update(block.content, 'utf16le').digest('hex')}]`
+        : MICROCOMPACT_PLACEHOLDER;
+      if (policy.archiveEnabled && !appendArchiveEntry(
+        {
+          ts: now(),
+          layer: 'microcompact',
+          sessionId,
+          origin: { kind: 'tool_result', tool_use_id: block.tool_use_id },
+          content: block.content,
+          replacement,
+        },
+        archiveDir,
+      )) {
+        newBlocks.push(block);
+        continue;
       }
       cleared += 1;
-      savedChars += block.content.length - MICROCOMPACT_PLACEHOLDER.length;
+      savedChars += block.content.length - replacement.length;
       mutated = true;
-      newBlocks.push({ ...block, content: MICROCOMPACT_PLACEHOLDER });
+      newBlocks.push({ ...block, content: replacement });
     }
     out.push(mutated ? { ...msg, content: newBlocks } : msg);
   }

@@ -30,7 +30,7 @@ async function cli(args: string[], mode: Mode = 'shadow') {
 
 test('plan --json gives the quick DAG and its critical path', async () => {
   const [out] = await cli(['plan', '0.3.36', '--rehearsal-at', '2026-11-25T13:00:00Z', '--cut-at', '2026-11-25T19:00:00Z', '--publish-at', '2026-11-25T21:00:00Z', '--json']);
-  expect((out!.steps as unknown[]).length).toBe(21);
+  expect((out!.steps as unknown[]).length).toBe(22); // 21 golden + board-flip (CURRENT-RELEASE-ONE-SOURCE)
   expect((out!.criticalPath as { minutes: number }).minutes).toBe(23.5);
 });
 

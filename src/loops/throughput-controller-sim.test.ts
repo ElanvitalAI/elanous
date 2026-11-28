@@ -183,7 +183,7 @@ describe('throughput controller — seeded 11-26 worlds', () => {
     const v = decideThroughput(seedWorld(5));
     expect(v.binding.kind).toBe('land-dead');
     expect(v.lever.commands[0]).toBe('eln land graph tick --json');
-    expect(v.active.map(a => a.kind)).toContain('land-slots');
+    expect(v.active.map(a => a.kind)).not.toContain('land-slots'); // tick capacity is unmeasured
   });
 
   test('an unmeasured probe is «?», never a reason to act', () => {

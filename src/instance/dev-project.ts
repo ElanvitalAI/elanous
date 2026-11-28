@@ -3,6 +3,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { remoteUrlVia } from '../git-fs/origin-url.js';
 import { appendBoundaryResponseLine, HARNESS_BOUNDARY_RESPONSES_ENV } from '../harness/harness-space.js';
 import { anonymousExport, suggestProjectForFolder } from '../project/project-store.js';
 
@@ -45,7 +46,8 @@ export function resolveDevProject(dir: string, deps: DevProjectDeps = {}): strin
       .filter(({ timestamp }) => Number.isFinite(timestamp))
       .sort((left, right) => left.timestamp - right.timestamp || left.commit.localeCompare(right.commit))[0]?.commit;
     if (!firstCommit) throw new Error(`Unable to resolve oldest root commit for git project at ${root}`);
-    const remote = git(root, ['remote', 'get-url', 'origin']);
+    // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+    const remote = remoteUrlVia((argv) => git(root, argv));
     identityKey = `git:${firstCommit}:${normalizeRemoteUrl(remote ?? '')}`;
   } else {
     identityKey = `path:${createHash('sha256').update(root).digest('hex')}`;

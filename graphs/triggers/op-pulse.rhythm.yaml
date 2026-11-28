@@ -71,15 +71,16 @@ phases:
 burst:
   cloud_budget_usd: 0          # burst.cloudBudget — 0 = every VM step is a CEO card
   lanes:
-    #        min max step cooldown up   down  $/unit·h   actuator (wired = an existing command; TODO otherwise)
-    hands:   { min: 0, max: 8, step: 2, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 1.5 }  # els new --ws <space> (wired) · close: els close <pane>
-    ta:      { min: 0, max: 6, step: 2, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 2 }    # eln harness ask 내부 문서 `<ASK>` (wired · burst scope only)
-    remote:  { min: 0, max: 6, step: 2, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 1.5 }  # els new on node-b/minim5/node-c (TODO: remote placement per RES caps)
-    review:  { min: 0, max: 4, step: 1, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 1 }    # eln self review <PR> --model gpt-6.1-terra (wired · one per PR)
-    pregate: { min: 0, max: 4, step: 1, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 0 }    # TODO: burst-only slot override within proven caps (minim5 4 · node-b 5 · node-c 2 · mbp 2)
-    judge:   { min: 0, max: 0, step: 1, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 1 }    # JUD-RELAX (CEO 11-26): veto only — no judge hands to scale
-    land:    { min: 0, max: 3, step: 1, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 0 }    # TODO: train width / land slots
-    vm:      { min: 0, max: 2, step: 1, cooldown_min: 30, up_at: 2, down_at: 1, cost_per_unit_hour_usd: 3 }          # eln hosts start <host> (wired · start only) · stop: TODO (no `hosts stop` yet → exit lists the VM)
+    #        min max step cooldown up   down  $/unit·h   — the doors that execute a step live in graphs/policies/burst-actuators.yaml
+    #        (BURST-ACTUATOR-WIRED 11-29: the old «wired» notes here were never called — the live pulse now executes the plan)
+    hands:   { min: 0, max: 8, step: 2, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 1.5 }
+    ta:      { min: 0, max: 6, step: 2, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 2 }
+    remote:  { min: 0, max: 6, step: 2, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 1.5 }
+    review:  { min: 0, max: 4, step: 1, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 1 }
+    pregate: { min: 0, max: 4, step: 1, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 0 }
+    judge:   { min: 0, max: 0, step: 1, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 1 }
+    land:    { min: 0, max: 3, step: 1, cooldown_min: 15, up_at: 1.5, down_at: 0.8, cost_per_unit_hour_usd: 0 }
+    vm:      { min: 0, max: 2, step: 1, cooldown_min: 30, up_at: 2, down_at: 1, cost_per_unit_hour_usd: 3 }
   presets:
     - { name: 2h, hours: 2, rate_gain: 1.5, budget_usd: 30, lanes: { hands: 2, ta: 2, remote: 2, review: 1, pregate: 1 } }
     - { name: 4h, hours: 4, rate_gain: 2, budget_usd: 80, lanes: { hands: 4, ta: 4, remote: 4, review: 2, pregate: 2, land: 1 } }

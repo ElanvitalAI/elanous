@@ -1,6 +1,7 @@
 # Memory sim world pack (SIM-WORLD-MEMORY · S0) — kernel pack schema 1 (seat-state/TC/SIM-KERNEL-API.md §1).
 # The kernel owns this file's existence and `eln sim world run memory`; the rows below belong to S0.
-# Expectations live in src/ux-sim/worlds/expect/memory.json (memory/M01 … memory/M12 and memory/M25: green except M09 and M10, which are xfail; memory/KIT-KNOWHOW-*: green).
+# Expectations live in src/ux-sim/worlds/expect/memory.json (memory/M01 … memory/M12 and memory/M25: green except M09 and M10, which are xfail; memory/KIT-KNOWHOW-*: green;
+# memory/MC*·ME*·MW*·MX*·LA* = MEMORY-CONTRACT acceptance scenes (내부 문서 `MEMORY-CONTRACT`) — red rows are the contract gap list, each naming its cell).
 schema: 1
 world: memory
 scenarios:
@@ -21,3 +22,70 @@ scenarios:
   - { id: KIT-KNOWHOW-GENERATED, module: src/ux-sim/sim-world/memory/kit-knowhow.ts }
   - { id: KIT-KNOWHOW-CALLERS-AGREE, module: src/ux-sim/sim-world/memory/kit-knowhow.ts }
   - { id: KIT-KNOWHOW-DETERMINISM, module: src/ux-sim/sim-world/memory/kit-knowhow.ts }
+  - { id: MC1-SAVE-RECALL, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC1-SAME-NAME-TWO-SCOPES, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC1-SECRET-REFUSED, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC2-CORRECT, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC2-CORRECT-SAME-SESSION, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC2-RESAVE-NOOP, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC3-FORGET, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC3-FORGET-ONE-PROJECT, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC3-FORGET-MISSING, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC4-SEAT-ISOLATION, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC4-PROJECT-ISOLATION, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC4-COMMON-LABELLED, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC5-NO-USE-FLAG, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC5-NO-USE-KEEPS-STORE, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC5-NO-USE-NEXT-TASK, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC6-WRITE-FAIL, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC6-INDEX-WRITE-FAIL, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MC6-RECALL-FAIL-NOT-EMPTY, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MW1-REPEAT-CORRECTION, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME1-DECISION-TO-CARD, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME1-DECISION-NO-SHAPE, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME1-CARD-WITH-SEAT-WORD, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME1-CARD-WITHOUT-SEAT-WORD, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME1-EXPIRY-JUST-BEFORE, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME1-EXPIRY-JUST-AFTER, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME1-SUPERSEDED, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME2-PIN-NEXT-TURN, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME2-THREE-PINS, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME2-NEW-SESSION, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME2-STALE-FLAGGED, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME3-GUARD-REFUSES, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME3-GUARD-ALLOWS-MATCH, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME3-CONFLICT-LATEST-WINS, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME3-EXPIRED-ALLOWS, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME3-POLICY-NO-RECALL, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME4-BUS-DECISION-SURVIVES, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME4-BUS-SAME-DECISION-TWICE, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME4-ACK-DIGEST-TO-SEAT, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME5-SEAT-ONE-STORE, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME5-USER-ONE-STORE, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME6-WRITE-TRACED, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME6-RECALL-TRACED, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: ME6-ACK-DIGEST-TRACED, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MV7-RESUME-SUMMARY, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MV7-SUMMARY-NOT-PROMOTED, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MV7-DIRECTIVE-CHANGE-NOT-MEMORY, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MV8-SHARE-TWO-PHASES, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MV8-DELETED-NOT-FROM-CACHE, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MV8-SHARE-FAIL-REPORTED, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MV9-SAME-NAME-TWO-AGENTS, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MV9-RENAME-KEEPS-MEMORY, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MV9-NO-FOREIGN-FALLBACK, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MV10-SEAT-SCOPE-ACROSS-PROJECTS, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MV10-PROJECT-PERSONAL, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MV10-DELETE-ONE-SCOPE-OTHER-STAYS, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MH1-INDEX-OVERFLOW-KEEPS-NEW-CROWN, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MH2-NEW-CARD-NOT-UNDER-INVALID, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MH3-HOME-ISOLATED-RECALL, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MX2-SOURCELESS-NOOP, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MX2-WITH-SOURCE-ADD, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MX3-CORE-BLOCK-CAP, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MX4-STEWARD-CANARY, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MX6-HQ-CARD-ROLE-SUBSCRIBE, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: MX7-MAIL-BODY-NO-CARD, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: LA1-INEFFECTIVE-SKIP, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: LA1-FAILURE-PARKS, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }
+  - { id: LA2-ROLE-DIRECTIVE-REFUSE, module: src/ux-sim/sim-world/memory/contract-scenarios.ts }

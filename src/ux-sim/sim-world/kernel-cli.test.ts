@@ -180,7 +180,7 @@ describe('sim world replay of a run recorded before a world was added', () => {
 
 describe('sim world registration ↔ pack files', () => {
   test('every registered world has a pack yaml on disk whose `world:` matches (literal list, not the product constant)', () => {
-    const worlds = ['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel', 'router-cost', 'toolbatch', 'els', 'els-remote', 'member-journey', 'machine-infra', 'fed-org', 'llm-route', 'smart-merge', 'alloc-budget'];
+    const worlds = ['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel', 'router-cost', 'toolbatch', 'els', 'els-remote', 'member-journey', 'machine-infra', 'fed-org', 'llm-route', 'smart-merge', 'alloc-budget', 'guardian'];
     const registered: string[] = [...SIM_WORLD_IDS];
     expect(registered).toEqual(worlds);
     for (const world of worlds) {
@@ -198,8 +198,8 @@ describe('sim world run all — full run (slow: capsule-events ~92s on node-b)',
     const result = await simCli(['sim', 'world', 'run', 'all', '--seed', '1', '--run-id', 'full'], {
       mode: 'spawn', stateRoot: root, allowPaths: RUN, timeoutMs: 900_000 }); // 1124 main-red ENOENT: 280s에 스폰 래퍼가 CLI를 살해해 summary.json 기록 직전 사망 — all 런 지속 증가(#39881 ripen 포함) 대응
     const summary = JSON.parse(readFileSync(join(root, 'sim-world', 'full', 'summary.json'), 'utf8'));
-    expect(summary.worlds).toEqual(['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel', 'router-cost', 'toolbatch', 'els', 'els-remote', 'member-journey', 'machine-infra', 'fed-org', 'llm-route', 'smart-merge', 'alloc-budget']);
-    expect(Object.keys(summary.worldWallMs).sort()).toEqual(['alloc-budget', 'capsule-events', 'els', 'els-remote', 'fed-org', 'graph', 'llm-route', 'machine-infra', 'member-journey', 'memory', 'op-channel', 'router-cost', 'seat-mail', 'seat-mail-roundtrip', 'smart-merge', 'supervisors', 'ta', 'toolbatch', 'worker']);
+    expect(summary.worlds).toEqual(['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel', 'router-cost', 'toolbatch', 'els', 'els-remote', 'member-journey', 'machine-infra', 'fed-org', 'llm-route', 'smart-merge', 'alloc-budget', 'guardian']);
+    expect(Object.keys(summary.worldWallMs).sort()).toEqual(['alloc-budget', 'capsule-events', 'els', 'els-remote', 'fed-org', 'graph', 'guardian', 'llm-route', 'machine-infra', 'member-journey', 'memory', 'op-channel', 'router-cost', 'seat-mail', 'seat-mail-roundtrip', 'smart-merge', 'supervisors', 'ta', 'toolbatch', 'worker']);
     expect(summary.events.filter((event: { kind: string }) => event.kind === 'pack-empty').map((event: { world: string }) => event.world))
       .toEqual(['ta', 'supervisors', 'seat-mail']);
     expect(JSON.parse(result.stdout.trim().split('\n').at(-1)!).ok).toBe(summary.ok);

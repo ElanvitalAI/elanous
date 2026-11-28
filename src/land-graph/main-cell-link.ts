@@ -175,3 +175,16 @@ export function formatSweep(r: SweepReport): string {
   return [`cell-link ${r.version} since ${r.since.slice(0, 16)}Z · merged ${r.scanned} · ${c}`,
     ...r.rows.map(x => `  #${x.pr} ${x.action}${x.cells.length ? ` ${x.cells.join(',')}` : ''}${x.basis ? ` (${x.basis})` : ''}${x.unknown?.length ? ` unknown ${x.unknown.join(',')}` : ''}${x.why ? ` · ${x.why}` : ''}`)].join('\n');
 }
+
+/** JUDGE-GREEN-PR-BINDING: the cells each merged PR's own post-merge sweep bound it to — `auto-cell` rows and `attach` rows
+ *  whose basis is not the «칸» line (title · branch · files · named — the «칸» line is re-read from the PR body itself).
+ *  `linked` rows are NOT a binding: they only say some cell's evidence already mentioned the PR. Pure. */
+export function pipelineCellsByPr(rows: ReadonlyArray<Pick<SweepRow, 'pr' | 'action' | 'cells' | 'basis'>>): Map<number, string[]> {
+  const out = new Map<number, string[]>();
+  for (const r of rows) {
+    const bases = (r.basis ?? '').split(',').map(b => b.trim()).filter(Boolean);
+    if (r.action !== 'auto-cell' && !(r.action === 'attach' && bases.length && !bases.includes('cell-ref'))) continue;
+    out.set(r.pr, [...new Set([...(out.get(r.pr) ?? []), ...r.cells])]);
+  }
+  return out;
+}

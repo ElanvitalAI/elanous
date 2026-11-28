@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { isCredentialKey, prepareDeterministicChildEnvironment } from './deterministic-env.js';
@@ -46,6 +46,46 @@ describe('prepareDeterministicChildEnvironment', () => {
     isolated.cleanup();
     isolated.cleanup();
     expect(existsSync(isolated.root)).toBe(false);
+  });
+
+  test('cleans a real readonly dependency tree', () => {
+    const isolated = prepareDeterministicChildEnvironment('elanous-gate-real-readonly-');
+    const deps = join(isolated.root, 'state', 'worktree-deps', 'node_modules');
+    mkdirSync(deps, { recursive: true });
+    writeFileSync(join(deps, 'file'), 'test');
+    chmodSync(deps, 0o555);
+    isolated.cleanup();
+    expect(existsSync(isolated.root)).toBe(false);
+  });
+
+  test('cleans readonly dependency directories without touching a shared symlink target', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'elanous-gate-outside-'));
+    const externalFile = join(outside, 'keep');
+    writeFileSync(externalFile, 'keep');
+    chmodSync(outside, 0o555);
+    let calls = 0;
+    const isolated = prepareDeterministicChildEnvironment('elanous-gate-readonly-', {
+      rmSync: (path, options) => {
+        if (++calls === 1) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+        rmSync(path, options);
+      },
+    });
+    const deps = join(isolated.root, 'state', 'worktree-deps', 'node_modules');
+    try {
+      mkdirSync(deps, { recursive: true });
+      writeFileSync(join(deps, 'file'), 'test');
+      symlinkSync(outside, join(deps, 'shared'));
+      chmodSync(deps, 0o555);
+      isolated.cleanup();
+      expect(calls).toBe(2);
+      expect(existsSync(isolated.root)).toBe(false);
+      expect(readFileSync(externalFile, 'utf8')).toBe('keep');
+      expect(lstatSync(outside).mode & 0o777).toBe(0o555);
+    } finally {
+      chmodSync(outside, 0o700);
+      rmSync(outside, { recursive: true, force: true });
+      isolated.cleanup();
+    }
   });
 
   test('cleanup retries after a removal failure', () => {

@@ -11,11 +11,8 @@ import type { BodyEnv } from '../registry.js';
 import type { AgentBody, Observation } from '../runtime.js';
 import type { Proc, ReapCandidate, Registration } from '../../guardian-agent/reaper.js';
 import { liveScrapDeps, scrapFacts, type ScrapDeps } from './macrophage-scrap.js';
-import { pv } from '../policy-context.js';
+import { pn } from '../policy-context.js';
 
-/** A target reaped within this window (by the guardian or by this card) is not reaped again. */
-export const RECENT_REAP_MS = 30 * 60_000;
-export const MACROPHAGE_SEAT = 'MACROPHAGE';
 
 export interface MacrophageDeps {
   hosts(): string[];
@@ -24,7 +21,7 @@ export interface MacrophageDeps {
   /** pids never to touch on this host (this process and its parents) */
   self(host: string): ReadonlySet<number>;
   plan(procs: readonly Proc[], registry: readonly Registration[], nowMs: number, self: ReadonlySet<number>): ReapCandidate[];
-  /** `${host}:${pid}` reaped within RECENT_REAP_MS (shared reaper audit · any actor) */
+  /** `${host}:${pid}` reaped within policy recent_reap_min (shared reaper audit · any actor) */
   recentReaps(nowMs: number): ReadonlySet<string>;
   kill(host: string, cand: ReapCandidate): { killed: number[]; skipped: number[] };
   audit(row: Record<string, unknown>): void;
@@ -74,7 +71,7 @@ export function createBody(env: BodyEnv, deps: MacrophageDeps = liveDeps(env.sta
             if (!found) return { ok: false, line: `${target} 은 더 이상 reaper 대상이 아니다(사라짐 · 바뀜)` };
             const r = deps.kill(host, found.c);
             if (!r.killed.includes(pid)) return { ok: false, line: `${target} 안 거둠(명령 불일치 · 이미 없음)` };
-            deps.audit({ at: ctx.now.toISOString(), host, pid, pgid: found.c.pgid, why: found.c.why, command: found.c.command.slice(0, 120), by: MACROPHAGE_SEAT });
+            deps.audit({ at: ctx.now.toISOString(), host, pid, pgid: found.c.pgid, why: found.c.why, command: found.c.command.slice(0, 120), by: env.card.address });
             return { ok: true, line: `${target} 거둠 (${found.c.why})`, ref: `reap:${target}`, undo: found.c.command.slice(0, 200) };
           });
         },
@@ -93,7 +90,7 @@ export function liveDeps(stateRoot: string): MacrophageDeps {
     self: () => new Set([process.pid, process.ppid]),
     plan: (procs, registry, nowMs, self) => reaper().planReap(procs, registry, nowMs, { self }),
     // the whole time window (not a line count): every audit row newer than recent_reap_min, whoever wrote it
-    recentReaps: (nowMs) => reaper().recentReaps(stateRoot, nowMs, pv('recent_reap_min', RECENT_REAP_MS / 60_000) * 60_000),
+    recentReaps: (nowMs) => reaper().recentReaps(stateRoot, nowMs, pn('recent_reap_min') * 60_000),
     kill: (host, cand) => reaper().killExact(host, [cand]),
     audit: (row) => reaper().auditReap(stateRoot, row),
     lock: (fn) => reaper().withReapLock(stateRoot, fn),

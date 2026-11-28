@@ -379,7 +379,8 @@ export async function collectFedSources(now: Date = new Date(), opts: { windowMi
       const { Database } = req<typeof import('bun:sqlite')>('bun:sqlite');
       const db = new Database(path, { readonly: true });
       try {
-        const fires = tr.listFires(db, undefined, 2_000).filter(f => { const t = Date.parse(f.dispatchedAt ?? f.window); return Number.isFinite(t) && t >= sinceMs; });
+        const retired = tr.retiredTriggerIds(db); // a retired (absorbed) trigger's old fires are history, not a failing loop
+        const fires = tr.listFires(db, undefined, 2_000).filter(f => { const t = Date.parse(f.dispatchedAt ?? f.window); return Number.isFinite(t) && t >= sinceMs && !retired.has(f.graphId); });
         const n = (s: string) => fires.filter(f => f.status === s).length;
         loops = { windowMin, ok: n('done'), goalNotMet: n('retry-wait'), failed: n('exception'), stale: n('stale-skipped'), running: n('running') + n('dispatched'),
           failing: [...new Set(fires.filter(f => f.status === 'exception' || f.status === 'retry-wait').map(f => f.graphId))] };

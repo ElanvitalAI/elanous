@@ -25,6 +25,7 @@
  * - 관측: `pr.land` · `overlap-evidence` (decision · reason · 잰 값).
  */
 import { createHash } from 'node:crypto';
+import { mergeTree } from '../git-smart/merge-tree.js';
 import { basename, dirname, join, resolve } from 'node:path';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { debug } from '../debug/log.js';
@@ -112,7 +113,7 @@ export function forecastPrPushConflicts(input: {
       if (resolved?.ok && resolved.out.trim().toLowerCase() === peer.head.toLowerCase()) peerHead = peer.head;
     }
     const merge = peerHead
-      ? input.run('git', ['merge-tree', '--write-tree', '-z', input.head, peerHead], { cwd: input.cwd })
+      ? mergeTree(args => input.run('git', args, { cwd: input.cwd }), input.head, peerHead, [], ['-z'])
       : { ok: false, out: '' };
     const conflictPaths = parseMergeTreeConflictPaths(merge.out, merge.ok ? 0 : 1);
     const cleanTree = merge.ok && /^[a-f0-9]{40,64}$/i.test(merge.out.trim());

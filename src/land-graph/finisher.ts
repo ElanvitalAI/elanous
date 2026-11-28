@@ -19,6 +19,10 @@
  *    PREGATE-RETRY       a receipt whose only red is `changed-tsc` exit 124 (overloaded host) → `pregate <PR> --light --host <next>`
  *                        once per head, on a host other than the one that timed out (src/land-graph/red-receipt.ts nextHost).
  *                        Still no measured receipt → `tsc-timeout` card to RES.
+ *    AUTOFIX             pregate RED whose every red step is mechanical (diff-check whitespace · NUMGUARD source comment ·
+ *                        public-export identifier key) → one fix commit on the branch (src/land-graph/autofix.ts · plain push ·
+ *                        only once the author is quiet ≥ 30 min) → new head → the pregate line above. A merge-main-only RED →
+ *                        REFRESH. Semantic → no push, the author's pregate-red card (LAND10-AUTOFIX-LANE · KPI autofix/h).
  *    STALE-PR-24H        open > 24 h with the reason · `plan --reap --apply` closes only PRs whose whole diff is already
  *                        in main (merge-tree of head into main = main's tree).
  *
@@ -28,13 +32,16 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { PrInfo, RefusalClass } from './land-graph.js';
 
+/** Pregate steps whose red the autofix lane may read (src/land-graph/autofix.ts · anything else red = not mechanical). */
+export const AUTOFIX_STEPS: ReadonlySet<string> = new Set(['diff-check', 'rules-and-ratchets', 'public-leak-check']);
+
 export const FINISH_CONCURRENCY = 3;
 /** A pregate light run is ≤ ~15 min; a job still «running» after this is dead/stuck and counts as failed. */
 export const FINISH_JOB_MAX_MS = 75 * 60_000;
 export const STALE_PR_MS = 24 * 3_600_000;
 
-export type FinishKind = 'pregate' | 'refresh' | 'retarget' | 'pregate-retry' | 'rebuild';
-export type FinishState = 'running' | 'pass' | 'failed' | 'refreshed' | 'conflict' | 'retargeted' | 'resolving';
+export type FinishKind = 'pregate' | 'refresh' | 'retarget' | 'pregate-retry' | 'rebuild' | 'autofix';
+export type FinishState = 'running' | 'pass' | 'failed' | 'refreshed' | 'conflict' | 'retargeted' | 'resolving' | 'fixed';
 export interface FinishJob {
   pr: number; head: string; kind: FinishKind; state: FinishState; at: string; pid?: number; log?: string; newHead?: string; why?: string;
   /** 'baseline' = the head already had a receipt without the A244 name diff: PASS needs a receipt that carries it. */
@@ -49,7 +56,7 @@ export interface FinishBook { jobs: Record<string, FinishJob> }
 // SMART-MERGE-REFRESH-ALL (11-27 15:4x): refresh / rebuild jobs get their own key — before, a `pass` pregate job on the
 // same head (`pr@head`) shadowed the refresh, so a PR refused for merge-conflict AFTER its green pregate never got one.
 export const jobKey = (pr: number, head: string, kind?: FinishKind) =>
-  `${pr}@${head}${kind === 'pregate-retry' ? '#retry' : kind === 'refresh' || kind === 'rebuild' ? '#refresh' : ''}`;
+  `${pr}@${head}${kind === 'pregate-retry' ? '#retry' : kind === 'refresh' || kind === 'rebuild' ? '#refresh' : kind === 'autofix' ? '#autofix' : ''}`;
 /** A refresh that ended in conflict is retried after this (main moved; the ladder may resolve it now). */
 export const REFRESH_RETRY_MS = 60 * 60_000;
 /** Refresh jobs written before SMART-MERGE (plain merge, gave up on any conflict) have no `smart` mark: retried once. */
@@ -70,8 +77,13 @@ export function writeBook(stateRoot: string, b: FinishBook): void {
 export const bookExists = (stateRoot: string) => existsSync(bookPath(stateRoot));
 
 /** Which finisher job a decision asks for (null = none: the hand or the gate owns it). */
-export function finishKindFor(cls: RefusalClass | undefined, o: { noBaselineInReceipt?: boolean; crossRepo?: boolean }): FinishKind | null {
+export function finishKindFor(cls: RefusalClass | undefined, o: { noBaselineInReceipt?: boolean; crossRepo?: boolean; redSteps?: readonly string[]; autofix?: boolean }): FinishKind | null {
   if (cls === 'no-receipt' || cls === 'stale-head') return 'pregate';
+  // LAND10-AUTOFIX-LANE: a pregate RED on mechanical steps only — merge-main → smart-merge refresh · ratchets → autofix.
+  if (cls === 'pregate-red' && !o.crossRepo && o.redSteps?.length) {
+    if (o.redSteps.every(s => s === 'merge-main')) return 'refresh';
+    if (o.autofix && o.redSteps.every(s => AUTOFIX_STEPS.has(s))) return 'autofix';
+  }
   if (cls === 'tsc-timeout') return 'pregate-retry';
   // An old receipt (before pregate A244 ③) has no focused-vs-main name diff: a fresh pregate records it.
   if (cls === 'baseline-failing-focused' && o.noBaselineInReceipt) return 'pregate';
@@ -90,10 +102,15 @@ export interface FinishDeps {
   refresh(pr: PrInfo, ctx?: { parentHeads?: readonly string[] }): { result: RefreshResult; newHead?: string; why?: string };
   /** Detached LLM capsule for the hunks rerere / structural left (`eln land smart-merge <pr> --llm`). */
   launchResolve?(pr: PrInfo, ctx?: { parentHeads?: readonly string[] }): { ok: boolean; pid?: number; log?: string; why?: string };
+  /** LAND10-AUTOFIX-LANE (src/land-graph/autofix.ts): fix the mechanical red of this RED receipt on the branch · plain push. */
+  autofix?(pr: PrInfo, red: { dir: string; failed: ReadonlyArray<{ name: string; exit: number }> }): { result: AutofixOutcome; newHead?: string; why?: string };
 }
+/** fixed = a fix commit pushed · semantic = not mechanical (the author's card) · author-active = the hand is still on it ·
+ *  the rest are transient (retried next tick). */
+export type AutofixOutcome = 'fixed' | 'semantic' | 'author-active' | 'head-moved' | 'closed' | 'busy' | 'error';
 export type RefreshResult = 'merged' | 'rebuilt' | 'up-to-date' | 'conflict' | 'guard' | 'needs-llm' | 'head-moved' | 'closed' | 'busy' | 'error';
 
-export interface FinishOutcome { pr: number; head: string; kind: FinishKind; state: FinishState | 'queued' | 'would-run' | 'busy'; why: string }
+export interface FinishOutcome { pr: number; head: string; kind: FinishKind; state: FinishState | 'queued' | 'would-run' | 'busy' | 'author-active'; why: string }
 
 /** Settle running jobs: dead pid / too old → pass (receipt on file) or failed. Returns the jobs that just finished. */
 export function settle(book: FinishBook, d: Pick<FinishDeps, 'alive' | 'hasReceipt' | 'now'> & { headNow?(pr: number): string | undefined }): FinishJob[] {
@@ -124,18 +141,37 @@ export function settle(book: FinishBook, d: Pick<FinishDeps, 'alive' | 'hasRecei
  * One finisher pass over this tick's candidates (in land order). `apply` = live: launch / push; otherwise report only.
  * Dedupe by (PR, head): a head that already had a job never gets a second one (a failed pregate → needs-finisher card).
  */
-export function runFinisher(book: FinishBook, cands: Array<{ pr: PrInfo; kind: FinishKind; need?: 'receipt' | 'baseline'; avoidHost?: string; parentHeads?: readonly string[] }>, d: FinishDeps, apply: boolean): FinishOutcome[] {
+export interface FinishCand { pr: PrInfo; kind: FinishKind; need?: 'receipt' | 'baseline'; avoidHost?: string; parentHeads?: readonly string[]; red?: { dir: string; failed: ReadonlyArray<{ name: string; exit: number }> } }
+export function runFinisher(book: FinishBook, cands: FinishCand[], d: FinishDeps, apply: boolean): FinishOutcome[] {
   const out: FinishOutcome[] = [];
   let running = Object.values(book.jobs).filter(j => j.state === 'running' || j.state === 'resolving').length;
   let refreshes = 0;
+  let autofixes = 0;
   const at = d.now().toISOString();
-  for (const { pr, kind, need, avoidHost, parentHeads } of cands) {
+  for (const { pr, kind, need, avoidHost, parentHeads, red } of cands) {
     const key = jobKey(pr.number, pr.head, kind);
     // Old book rows: a refresh used to live under `pr@head` too — only a refresh/rebuild row there counts as a refresh.
     const legacy = (kind === 'refresh' || kind === 'rebuild') ? book.jobs[jobKey(pr.number, pr.head)] : undefined;
     let prev: FinishJob | undefined = book.jobs[key] ?? (legacy && (legacy.kind === 'refresh' || legacy.kind === 'rebuild') ? legacy : undefined);
     if (prev && staleRefreshJob(prev, d.now().getTime())) prev = undefined;
     if (prev) { out.push({ pr: pr.number, head: pr.head, kind: prev.kind, state: prev.state, why: prev.why ?? prev.state }); continue; }
+    if (kind === 'autofix') {
+      if (!red || !d.autofix) { out.push({ pr: pr.number, head: pr.head, kind, state: 'busy', why: 'autofix dep or RED receipt missing' }); continue; }
+      if (autofixes >= FINISH_CONCURRENCY) { out.push({ pr: pr.number, head: pr.head, kind, state: 'busy', why: 'autofix cap this tick' }); continue; }
+      autofixes++;
+      if (!apply) { out.push({ pr: pr.number, head: pr.head, kind, state: 'would-run', why: `would autofix ${red.failed.map(s => s.name).join(', ')}` }); continue; }
+      const r = d.autofix(pr, red);
+      if (r.result === 'fixed') {
+        const why = `autofix pushed → ${r.newHead?.slice(0, 12)}${r.why ? ` · ${r.why}` : ''}`;
+        book.jobs[key] = { pr: pr.number, head: pr.head, kind, state: 'fixed', at, why, ...(r.newHead ? { newHead: r.newHead } : {}) };
+        out.push({ pr: pr.number, head: pr.head, kind, state: 'fixed', why });
+      } else if (r.result === 'semantic') {
+        const why = `not mechanical: ${r.why ?? '?'}`;
+        book.jobs[key] = { pr: pr.number, head: pr.head, kind, state: 'failed', at, why };
+        out.push({ pr: pr.number, head: pr.head, kind, state: 'failed', why });
+      } else out.push({ pr: pr.number, head: pr.head, kind, state: r.result === 'author-active' ? 'author-active' : 'busy', why: `autofix ${r.result}: ${r.why ?? '?'}` });
+      continue;
+    }
     if (kind === 'pregate' || kind === 'pregate-retry') {
       const what = kind === 'pregate-retry' ? `pregate --light retry (not ${avoidHost ?? '?'})` : 'pregate --light';
       if (running >= FINISH_CONCURRENCY) { out.push({ pr: pr.number, head: pr.head, kind, state: 'busy', why: `finisher ${running}/${FINISH_CONCURRENCY} running` }); continue; }
@@ -183,4 +219,11 @@ export function stalePrs(prs: readonly PrInfo[], reasons: ReadonlyMap<number, st
   return prs.filter(p => p.state === 'OPEN' && p.createdAt && nowMs - Date.parse(p.createdAt) > STALE_PR_MS)
     .map(p => ({ pr: p.number, ageH: Math.floor((nowMs - Date.parse(p.createdAt!)) / 3_600_000), reason: reasons.get(p.number) ?? (p.draft ? 'draft' : 'unknown') }))
     .sort((a, b) => b.ageH - a.ageH);
+}
+
+/** KPI: autofix commits pushed in the hour before `nowMs` (finisher book rows kind «autofix» state «fixed»). */
+export function autofixesPerHour(jobs: Iterable<{ kind: string; state: string; at: string }>, nowMs: number): number {
+  let n = 0;
+  for (const j of jobs) if (j.kind === 'autofix' && j.state === 'fixed' && nowMs - Date.parse(j.at) <= 3_600_000 && nowMs >= Date.parse(j.at)) n++;
+  return n;
 }

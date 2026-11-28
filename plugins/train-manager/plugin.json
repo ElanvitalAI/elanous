@@ -1,0 +1,27 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "train-manager",
+  "name": "train-manager",
+  "version": "1.0.0",
+  "description": "충돌이 난 핫파일 줄마다 착지 순서 핀(정책 팩 lane_order.pins 또는 기차 매니저가 직접 건 런타임 핀 · TTL)이 있고, 같은 파일 충돌 거부(stale-base-revert · merge-conflict · main-moved-overlap)가 0",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "train-manager",
+          "agent": "../../graphs/loop-agents/train-manager/agent.yaml",
+          "trigger": "../../graphs/triggers/train-manager-agent.yaml",
+          "kpis": [
+            "hot_file_churn_refusals"
+          ]
+        }
+      ]
+    }
+  }
+}

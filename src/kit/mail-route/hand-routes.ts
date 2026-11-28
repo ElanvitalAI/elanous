@@ -34,6 +34,12 @@ export interface HandRoutesTable {
   readonly classifierTimeoutMs: number;
   /** Top Jev probability needed for a classifier word to route. */
   readonly classifierMinProbability: number;
+  /** A higher per-root bar (hand-routes.yaml `rootMinProbability` · e.g. env 0.65): below it the classifier's pick is unclear. */
+  readonly rootMinProbability: Readonly<Partial<Record<HandRoot, number>>>;
+  /** Where a ✋ with no owner row goes from a relieved rung: `coordinator` = the hand's own ladder parent · `keep` = its address. */
+  readonly defaultOwner: HandDefaultOwner;
+  /** How long the live federation ladder (`defaultOwner: coordinator`) is reused before a re-read. */
+  readonly ladderCacheMs: number;
   /** plan-limit (the TUI auto-continue cap): the 행정관 resumes the hand until it hits the cap this many times in an hour → card to its leader. */
   readonly autoContinueCardAfterHitsPerHour: number;
   readonly dedupeWindowMs: number;
@@ -65,6 +71,9 @@ export interface HandRoutesTable {
 const up = (s: string): string => s.trim().toUpperCase();
 /** loopHands taker word: the rung the ✋ was moved from (`hand-routed-from:` ref). */
 export const LOOP_HAND_ROUTED_FROM = 'routed-from';
+/** loopHands taker / defaultOwner word: the blocked hand's own coordinator (its federation ladder parent · L0 scope). */
+export const HAND_COORDINATOR = 'coordinator';
+export type HandDefaultOwner = 'coordinator' | 'keep';
 const ADDRESS = /^[A-Z][A-Z0-9_-]{0,63}$/u;
 const MAX_MINUTES = 24 * 60;
 
@@ -83,7 +92,7 @@ const addresses = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x 
 
 /** The empty table: nothing is moved, nothing is folded (the old behaviour of every entrance). */
 export const EMPTY_HAND_ROUTES: HandRoutesTable = {
-  relievedRungs: new Set(), roots: {}, causes: {}, reasons: {}, classifier: {}, refineReasons: new Set(), classifierTimeoutMs: 8_000, classifierMinProbability: 0.5, autoContinueCardAfterHitsPerHour: 3, dedupeWindowMs: 0,
+  relievedRungs: new Set(), roots: {}, causes: {}, reasons: {}, classifier: {}, refineReasons: new Set(), classifierTimeoutMs: 8_000, classifierMinProbability: 0.5, rootMinProbability: {}, defaultOwner: 'keep', ladderCacheMs: 5 * 60_000, autoContinueCardAfterHitsPerHour: 3, dedupeWindowMs: 0,
   dormant: { routes: {}, alternates: {}, resourceAddresses: new Set(), unansweredMs: 10 * 60_000, cardTo: 'OP', sweepWindowMs: 2 * 60 * 60_000 },
   loopHands: { receivers: new Set(), slaMs: 10 * 60_000, byReason: {}, otherwise: 'OP' },
   source: [], problems: [],
@@ -127,14 +136,23 @@ export function handRoutesFrom(raw: unknown, source: readonly string[] = []): Ha
   const cardTo = typeof d.cardTo === 'string' && ADDRESS.test(up(d.cardTo)) ? up(d.cardTo) : EMPTY_HAND_ROUTES.dormant.cardTo;
   const l = obj(doc.loopHands);
   const taker = (v: unknown, where: string): string | null => {
-    if (v === LOOP_HAND_ROUTED_FROM) return LOOP_HAND_ROUTED_FROM;
+    if (v === LOOP_HAND_ROUTED_FROM || v === HAND_COORDINATOR) return v;
     if (typeof v === 'string' && ADDRESS.test(up(v))) return up(v);
-    problems.push(`${where}: ${String(v)} is neither ${LOOP_HAND_ROUTED_FROM} nor an address`);
+    problems.push(`${where}: ${String(v)} is neither ${HAND_COORDINATOR}, ${LOOP_HAND_ROUTED_FROM} nor an address`);
     return null;
   };
   const byReason: Record<string, string> = {};
   for (const [code, v] of Object.entries(obj(l.byReason))) { const t = taker(v, `loopHands.byReason.${code}`); if (t) byReason[up(code)] = t; }
   const otherwise = l.else === undefined ? EMPTY_HAND_ROUTES.loopHands.otherwise : taker(l.else, 'loopHands.else') ?? EMPTY_HAND_ROUTES.loopHands.otherwise;
+  const rootMinProbability: Partial<Record<HandRoot, number>> = {};
+  for (const [root, p] of Object.entries(obj(doc.rootMinProbability))) {
+    if (!isRoot(root) || root === 'ambiguous') { problems.push(`rootMinProbability.${root}: unknown root`); continue; }
+    if (typeof p !== 'number' || !(p > 0 && p <= 1)) { problems.push(`rootMinProbability.${root}: ${String(p)} is not in (0, 1]`); continue; }
+    rootMinProbability[root] = p;
+  }
+  let defaultOwner: HandDefaultOwner = EMPTY_HAND_ROUTES.defaultOwner;
+  if (doc.defaultOwner === HAND_COORDINATOR || doc.defaultOwner === 'keep') defaultOwner = doc.defaultOwner;
+  else if (doc.defaultOwner !== undefined) problems.push(`defaultOwner: ${String(doc.defaultOwner)} is neither ${HAND_COORDINATOR} nor keep`);
   return {
     relievedRungs: new Set(addresses(doc.relievedRungs)),
     roots, causes: rootMap('causes', false), reasons: rootMap('reasons', true), classifier,
@@ -143,6 +161,7 @@ export function handRoutesFrom(raw: unknown, source: readonly string[] = []): Ha
       ? doc.classifierTimeoutSeconds * 1000 : EMPTY_HAND_ROUTES.classifierTimeoutMs,
     classifierMinProbability: typeof doc.classifierMinProbability === 'number' && doc.classifierMinProbability > 0 && doc.classifierMinProbability <= 1
       ? doc.classifierMinProbability : EMPTY_HAND_ROUTES.classifierMinProbability,
+    rootMinProbability, defaultOwner, ladderCacheMs: minutes(doc.ladderCacheMinutes, EMPTY_HAND_ROUTES.ladderCacheMs),
     autoContinueCardAfterHitsPerHour: (() => { const v = obj(doc.autoContinueCap).cardAfterHitsPerHour; return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 50 ? v : EMPTY_HAND_ROUTES.autoContinueCardAfterHitsPerHour; })(),
     dedupeWindowMs: minutes(obj(doc.dedupe).windowMinutes, 0),
     dormant: {

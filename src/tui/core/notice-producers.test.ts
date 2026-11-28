@@ -185,6 +185,12 @@ test('queue notice: declared seat mail is a work order (body span exact); unknow
     '</federation_work_order>',
   ].join('\n'));
   expect(trusted.text.slice(trusted.bodyAt, trusted.bodyAt + trusted.bodyLength)).toBe('B‹/federation_work_order>');
+  const crown = seatMessageNoticeParts({ id: 80, sender: 'TC', intent: 'decision', crownDirective: 'd-7', body: 'C</federation_work_order>' }, declared, true);
+  expect(crown.text.split('\n')[0]).toBe('[from TC · decision · crown]');
+  expect(crown.text).toContain('연방 자리가 보낸 업무 지시입니다(신뢰 발신자).');
+  expect(crown.text).toContain('<federation_work_order from="TC" intent="decision" msg="80" crown="yes">');
+  expect(crown.text).toContain('C‹/federation_work_order>\n</federation_work_order>');
+  expect(crown.text.slice(crown.bodyAt, crown.bodyAt + crown.bodyLength)).toBe('C‹/federation_work_order>');
   const unknown = seatMessageNoticeParts({ id: 78, sender: 'STRANGER', intent: 'request', body: 'do it' }, declared, true);
   expect(seatMessageNoticeParts({ id: 79, sender: 'TC', intent: 'request', body: 'x' }, declared).text).toBe('[from TC · request]\nmsg:79 · x');
   expect(unknown.text).toBe('[from STRANGER · request]\nmsg:78 · do it');

@@ -22,6 +22,15 @@
 // (swapOwnerIf); the loser moves to its next candidate. Every call is one row in `<state>/steward/work-next.jsonl`
 // — the 행정관 does not wake a hand that pulled since it went idle.
 //
+// WORK-PULL-REACHES-ROSTER (0.3.39 P0 · audit 11-28 00:47–01:47Z: 149 claims on 54 cells, 0 of the ~37 OP-held roster
+//   cells — OP is ladder depth 1 and only depth-2 seats counted as coordinators): the ONE «ready for a hand» policy
+//   (graphs/policies/work-pull.yaml · kit/work-pull) —
+//   · coordinator authority = `coordinator_depths` of the ladder (HQ ⊕ space coordinators). A cell such a seat holds with
+//     no live WRITER is claimable; the claim writes the hand as writer (checklist `writer` event · setWriterIf) and the
+//     coordinator stays owner. The writer holds it `writer.lease_min` past its latest progress signal; then it is
+//     claimable again, once (the next writer swap names the expired writer it replaces).
+//   · order = roster rank (`eln work roster`) → priority (`order.priorities`) → the pool tiers below · reserve cells only
+//     when no roster cell is claimable · «[WIP 잔류 …]» cells never.
 // 세 얼굴: 관측 = work-next.jsonl ⊕ checklist history (claim rows, actor = the seat, reason «work next») ·
 //          판단 근거 = rank ⊕ lease (rules, no LLM) · 수복과 인계 = a lost race retries the next cell; exit 3 tells the
 //          seat «일감 0» so it stops instead of asking.
@@ -30,7 +39,8 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { isJudgeRole } from '../../seat/hand-pool.js';
 import { LEASE_MINUTES } from './model.js';
-import type { CellWait } from './cell-wait.js';
+import { handLeaseMinutes, type CellLanes, type CellWait } from './cell-wait.js';
+import { comparePull, legacyPullPolicy, liveWriter, priorityRankOf, pullClass, type PullPolicy } from '../../kit/work-pull/index.js';
 
 export interface BoardCell {
   readonly id: string;
@@ -45,6 +55,11 @@ export interface BoardCell {
   readonly updatedAt: string;
   /** Skill tags (optional) — a hand lacking any of them skips the cell. */
   readonly skills?: readonly string[];
+  /** Evidence (its first line carries the roster class marker «[예비 …]» · «[WIP 잔류 …]»). */
+  readonly evidence?: string;
+  readonly updatedBy?: string;
+  /** WORK-PULL-REACHES-ROSTER — the hand writing a coordinator-held cell (checklist `writer` event). */
+  readonly writer?: { readonly seat: string; readonly at: string };
 }
 
 export interface WorkNextDeps {
@@ -80,6 +95,20 @@ export interface WorkNextDeps {
   readonly hintOf?: (cell: BoardCell) => string | undefined;
   /** POOL-PULL-NEEDS-SPEC: policy `pull.requireDoneWhen` — true = unowned cells without a done-when are skipped. Absent = false. */
   readonly requireDoneWhen?: () => boolean;
+  /** STEWARD-READY-LANES — green-triage lanes (lane b: a hand's hold is `holdMin`, not the lease). Absent = none. */
+  readonly lanes?: () => CellLanes | undefined;
+  /** WORK-PULL-REACHES-ROSTER — graphs/policies/work-pull.yaml. Absent/throws = the pre-policy board. */
+  readonly policy?: () => PullPolicy;
+  /** OP's roster rank for this version (cell id → 0-based rank). Absent = none (roster cells by priority). */
+  readonly rosterRank?: () => ReadonlyMap<string, number> | undefined;
+  /** Writer compare-and-set on a coordinator-held cell (owner stays). Absent = the claim swaps the owner (pre-writer shape). */
+  readonly setWriter?: (id: string, input: { expectedOwner: string | null; expectedWriter: string | null; to: string | null; actor: string; reason: string }) => { outcome: 'swapped' | 'lost' | 'missing' };
+  /** Latest update of an open PR naming the cell (progress signal `pr-update`); undefined = none known. */
+  readonly prUpdatedMs?: (cell: BoardCell) => number | undefined;
+  readonly prProtected?: (cell: BoardCell) => boolean;
+  /** SEAT-AREA-GUARD (graphs/policies/seat-roles.yaml · kit/seat-area seatTakesCell): may this seat take this cell? A cell
+   *  outside the caller's areas (MK · UX) — or any cell for a non-pool seat — is not offered. Absent/throws = every cell fits. */
+  readonly seatFit?: (seat: string, cell: BoardCell) => { readonly ok: boolean };
 }
 
 export type WorkNextResult =
@@ -88,14 +117,24 @@ export type WorkNextResult =
   | { readonly code: 4; readonly cell: BoardCell; readonly line: string };
 
 const MIN = 60_000;
-const RANK: Record<string, number> = { P0: 0, P1: 1, P2: 2 };
 const ownerSeat = (owner: string | undefined): string => (owner ?? '').split('/')[0]!.trim().toUpperCase();
 const unowned = (owner: string | undefined): boolean => !owner || owner === '-' || owner.toLowerCase() === 'none';
 
-/** Owner lease end: max(cell's last change, owner's last activity) + {@link LEASE_MINUTES}. */
-export function boardLeaseUntilMs(cell: Pick<BoardCell, 'updatedAt'>, ownerLastActiveMs: number | undefined): number {
+/** Owner lease end: max(cell's last change, owner's last activity) + the lease (policy `writer.lease_min` · default
+ *  {@link LEASE_MINUTES}; a lane-b cell: the lanes' holdMin). */
+export function boardLeaseUntilMs(cell: Pick<BoardCell, 'updatedAt'> & { readonly id?: string }, ownerLastActiveMs: number | undefined, lanes?: CellLanes, leaseMin = LEASE_MINUTES): number {
   const stamps = [Date.parse(cell.updatedAt), ownerLastActiveMs ?? NaN].filter((t) => Number.isFinite(t));
-  return (stamps.length ? Math.max(...stamps) : 0) + LEASE_MINUTES * MIN;
+  return (stamps.length ? Math.max(...stamps) : 0) + (cell.id ? handLeaseMinutes(cell.id, lanes, leaseMin) : leaseMin) * MIN;
+}
+
+/** WORK-PULL-REACHES-ROSTER — the live writer of a board cell (kit/work-pull liveWriter · the caller's activity clock ⊕ PRs). */
+function liveWriterOf(cell: BoardCell, input: { nowMs: number; lastActiveMs: (seat: string) => number | undefined; prUpdatedMs?: (cell: BoardCell) => number | undefined; policy: PullPolicy }): string | undefined {
+  const seat = cell.writer?.seat?.trim().toUpperCase();
+  if (!seat) return undefined;
+  let pr: number | undefined;
+  try { pr = input.prUpdatedMs?.(cell); } catch { pr = undefined; }
+  const activityMs = input.lastActiveMs(seat);
+  return liveWriter(cell, { nowMs: input.nowMs, ...(activityMs !== undefined ? { activityMs } : {}), ...(pr !== undefined ? { prUpdatedMs: pr } : {}) }, input.policy);
 }
 
 function versionKey(v: string | undefined): number[] { return v ? v.split(/[.-]/).map((p) => Number.parseInt(p, 10) || 0) : [Number.MAX_SAFE_INTEGER]; }
@@ -106,7 +145,7 @@ function cmpVersion(a: string | undefined, b: string | undefined): number {
 }
 
 /** READY cells of `scope` for `seat`, best first. */
-export function readyCells(cells: readonly BoardCell[], input: { seat: string; scope: string; nowMs: number; scopeOf: (seat: string) => string; lastActiveMs: (seat: string) => number | undefined; waitOf?: (cell: BoardCell) => CellWait | null | undefined }): BoardCell[] {
+export function readyCells(cells: readonly BoardCell[], input: { seat: string; scope: string; nowMs: number; scopeOf: (seat: string) => string; lastActiveMs: (seat: string) => number | undefined; waitOf?: (cell: BoardCell) => CellWait | null | undefined; lanes?: CellLanes }): BoardCell[] {
   const status = new Map(cells.map((c) => [c.id, c.status]));
   return cells
     .filter((c) => c.status === 'yellow' && c.dispatchKind !== 'decision' && c.dispatchKind !== 'umbrella')
@@ -118,11 +157,15 @@ export function readyCells(cells: readonly BoardCell[], input: { seat: string; s
       if (owner === input.seat) return false;
       // The scope's own coordinator holding a yellow cell = the board (leaders route, hands work).
       if (owner === input.scope) return true;
-      return input.scopeOf(owner) === input.scope && boardLeaseUntilMs(c, input.lastActiveMs(owner)) < input.nowMs;
+      return input.scopeOf(owner) === input.scope && boardLeaseUntilMs(c, input.lastActiveMs(owner), input.lanes) < input.nowMs;
     })
-    .sort((a, b) => (RANK[a.priority ?? ''] ?? 3) - (RANK[b.priority ?? ''] ?? 3) || cmpVersion(a.deadlineVersion, b.deadlineVersion)
+    .sort((a, b) => priorityRankOf(a.priority, legacy()) - priorityRankOf(b.priority, legacy()) || cmpVersion(a.deadlineVersion, b.deadlineVersion)
       || Date.parse(a.updatedAt) - Date.parse(b.updatedAt) || a.id.localeCompare(b.id));
 }
+
+const LEGACY_LAZY: { p?: PullPolicy } = {};
+/** The pre-policy board (P0 > P1 > P2) — read lazily (model.ts ⇄ kit/work-pull load order). */
+const legacy = (): PullPolicy => (LEGACY_LAZY.p ??= legacyPullPolicy());
 
 /** POOL-PULL-NEEDS-SPEC — an unowned cell with no measurable done-when (blank doneCriterion): not offered to hands. */
 export const needsSpec = (c: Pick<BoardCell, 'owner' | 'doneCriterion'>): boolean => unowned(c.owner) && !c.doneCriterion?.trim();
@@ -136,9 +179,15 @@ export function workNext(seatRaw: string, deps: WorkNextDeps, opts: { scope?: st
   const at = new Date(nowMs).toISOString();
   const record = (row: Record<string, unknown>): void => { try { deps.record?.({ at, seat, scope, version: deps.version, ...row }); } catch { /* the ledger never blocks a claim */ } };
   const cells = deps.cells();
+  let policy: PullPolicy;
+  try { policy = deps.policy?.() ?? legacy(); } catch { policy = legacy(); }
+  // WORK-PULL-REACHES-ROSTER — a coordinator-held cell is the caller's when the caller is its live writer; a cell with
+  // another live writer is that hand's (not the coordinator's, not the board's).
+  const writerOf = (c: BoardCell): string | undefined => liveWriterOf(c, { nowMs, lastActiveMs: deps.lastActiveMs, ...(deps.prUpdatedMs ? { prUpdatedMs: deps.prUpdatedMs } : {}), policy });
+  const holderOf = (c: BoardCell): string => writerOf(c) ?? ownerSeat(c.owner);
   // WIP 1 counts ACTIVE work: the caller's own yellow cells that wait on someone else do not block a claim.
-  const mine = cells.filter((c) => c.status === 'yellow' && !unowned(c.owner) && ownerSeat(c.owner) === seat)
-    .sort((a, b) => (RANK[a.priority ?? ''] ?? 3) - (RANK[b.priority ?? ''] ?? 3) || Date.parse(a.updatedAt) - Date.parse(b.updatedAt) || a.id.localeCompare(b.id));
+  const mine = cells.filter((c) => c.status === 'yellow' && (!unowned(c.owner) || c.writer) && holderOf(c) === seat)
+    .sort((a, b) => priorityRankOf(a.priority, policy) - priorityRankOf(b.priority, policy) || Date.parse(a.updatedAt) - Date.parse(b.updatedAt) || a.id.localeCompare(b.id));
   const waits = new Map(mine.map((c) => [c.id, deps.waitOf?.(c) ?? null]));
   const held = mine.find((c) => !waits.get(c.id));
   if (held) {
@@ -156,6 +205,8 @@ export function workNext(seatRaw: string, deps: WorkNextDeps, opts: { scope?: st
   }
   const waiting = mine.map((c) => `${c.id}:${waits.get(c.id)}`);
   const isCoordinator = deps.isCoordinator ?? ((s: string) => s === scope);
+  let rank: ReadonlyMap<string, number> | undefined;
+  try { rank = deps.rosterRank?.(); } catch { rank = undefined; }
   // HAND-PULL-ON-BLOCK — a cell blocked on a seat that has not answered is never READY; once it answers, its last holder
   // gets it first (ranked first) and other hands wait out the grace window (cell-block.ts blockState).
   const blockOf = (cell: BoardCell) => { try { return deps.blockOf?.(cell); } catch { return undefined; } };
@@ -163,34 +214,51 @@ export function workNext(seatRaw: string, deps: WorkNextDeps, opts: { scope?: st
   let requireDoneWhen = false;
   try { requireDoneWhen = deps.requireDoneWhen?.() === true; } catch { requireDoneWhen = true; }
   const skippedSpec: string[] = [];
-  const candidates = poolCandidates(cells, { hintedToMe: (cell) => hintOf(cell) === seat, seat, scope, nowMs, scopeOf: deps.scopeOf, isCoordinator, lastActiveMs: deps.lastActiveMs,
+  const skippedArea: string[] = [];
+  let lanes: CellLanes | undefined;
+  try { lanes = deps.lanes?.(); } catch { lanes = undefined; }
+  const candidates = poolCandidates(cells, { ...(lanes ? { lanes } : {}), policy, ...(rank ? { rosterRank: rank } : {}), liveWriter: writerOf, prProtected: deps.prProtected, hintedToMe: (cell) => hintOf(cell) === seat, seat, scope, nowMs, scopeOf: deps.scopeOf, isCoordinator, lastActiveMs: deps.lastActiveMs,
     isJudge: deps.isJudge ?? ((s: string) => isJudgeRole(s, { parentOf: deps.scopeOf })), priorityOrder: safeOrder(deps), skills: deps.skillsOf?.(seat) ?? [], ...(deps.waitOf ? { waitOf: deps.waitOf } : {}) })
     .filter(({ cell }) => { const b = blockOf(cell); return b !== 'blocked' && b !== 'reserved'; })
-    .filter(({ cell }) => { if (!requireDoneWhen || !needsSpec(cell)) return true; skippedSpec.push(cell.id); return false; });
-  const skipped = skippedSpec.length ? { skipped: { 'needs-spec': skippedSpec.slice(0, 20) } } : {};
+    .filter(({ cell }) => { if (!requireDoneWhen || !needsSpec(cell)) return true; skippedSpec.push(cell.id); return false; })
+    .filter(({ cell }) => { let ok = true; try { ok = deps.seatFit?.(seat, cell).ok !== false; } catch { ok = true; } if (!ok) skippedArea.push(cell.id); return ok; });
+  const skipped = skippedSpec.length || skippedArea.length ? { skipped: { ...(skippedSpec.length ? { 'needs-spec': skippedSpec.slice(0, 20) } : {}), ...(skippedArea.length ? { 'off-area': skippedArea.slice(0, 20) } : {}) } } : {};
   const hintRank = (cell: BoardCell) => { const h = hintOf(cell); return h === seat ? 0 : h ? 2 : 1; };
   const reoffered = candidates.filter(({ cell }) => blockOf(cell) === 'reoffer');
-  const rest = candidates.filter(({ cell }) => blockOf(cell) !== 'reoffer');
+  // Reserve («[예비 …]») only when no roster cell is claimable (the caller's own re-offered cell comes back whatever it is).
+  const others = candidates.filter(({ cell }) => blockOf(cell) !== 'reoffer');
+  const roster = others.filter(({ cell }) => pullClass(cell.evidence, policy) === 'roster');
+  const rest = roster.length ? roster : others;
+  const reserveHeld = roster.length ? others.length - roster.length : 0;
   // stable: within each hint rank the pool order stands
   const ordered = [...reoffered, ...[0, 1, 2].flatMap((r) => rest.filter(({ cell }) => hintRank(cell) === r))];
   for (const { cell, space, tier } of ordered) {
     const from = unowned(cell.owner) ? null : cell.owner!;
     const lent = space !== null && space !== scope;
     const block = blockOf(cell);
+    // WORK-PULL-REACHES-ROSTER — a coordinator-held cell: the hand becomes its writer, the coordinator stays owner.
+    const asWriter = !!from && !!deps.setWriter && isCoordinator(ownerSeat(from));
+    const priorWriter = asWriter ? cell.writer?.seat?.trim().toUpperCase() ?? null : null;
     const base = !from ? 'work next' : block === 'reoffer' ? `work next · re-offered after block (assignedBy: ${ownerSeat(from)})`
       : isCoordinator(ownerSeat(from)) ? `work next · board cell (assignedBy: ${ownerSeat(from)})` : `work next · lease expired (owner ${ownerSeat(from)})`;
-    const reason = lent ? `${base} · pool.lend ${scope}→${space} (${tier})` : base;
-    const result = deps.swap(cell.id, { expectedOwner: cell.owner ?? null, to: seat, actor: seat, reason });
+    const withWriter = asWriter ? `${base} · writer (owner stays ${ownerSeat(from)}${priorWriter ? ` · writer ${priorWriter} silent` : ''})` : base;
+    const reason = lent ? `${withWriter} · pool.lend ${scope}→${space} (${tier})` : withWriter;
+    const result = asWriter
+      ? deps.setWriter!(cell.id, { expectedOwner: cell.owner ?? null, expectedWriter: cell.writer?.seat ?? null, to: seat, actor: seat, reason })
+      : deps.swap(cell.id, { expectedOwner: cell.owner ?? null, to: seat, actor: seat, reason });
     if (result.outcome !== 'swapped') { record({ outcome: 'lost', cell: cell.id }); continue; }
     if (block) { try { deps.resume?.(cell, seat); } catch { /* the block row only stays open */ } }
     const lend = lent ? { from: scope, to: space!, seat, cell: cell.id, via: 'work-next' as const } : null;
     if (lend) { try { deps.lend?.(lend); } catch { /* observation never blocks a claim */ } }
-    record({ outcome: 'claimed', cell: cell.id, from, tier, leaseUntil: new Date(nowMs + LEASE_MINUTES * MIN).toISOString(), ...(lend ? { event: 'pool.lend', lend } : {}), ...(waiting.length ? { waiting } : {}), ...skipped });
+    record({ outcome: 'claimed', cell: cell.id, from, tier, leaseUntil: new Date(nowMs + policy.writerLeaseMin * MIN).toISOString(), ...(asWriter ? { writer: seat, ...(priorWriter ? { replaced: priorWriter } : {}) } : {}),
+      class: pullClass(cell.evidence, policy), ...(rank?.has(cell.id) ? { rosterRank: rank.get(cell.id)! + 1 } : {}), ...(reserveHeld ? { reserveHeld } : {}),
+      ...(lend ? { event: 'pool.lend', lend } : {}), ...(waiting.length ? { waiting } : {}), ...skipped });
     return { code: 0, cell, from, line: cellLine(cell), ...(lend ? { lentTo: lend.to } : {}), ...(waiting.length ? { waiting } : {}) };
   }
   const breakdown = emptyBreakdown(cells, { seat, candidates: ordered.length, blocked: cells.filter((c) => { const b = blockOf(c); return b === 'blocked' || b === 'reserved'; }).length,
     waiting: mine.length, judge: (deps.isJudge ?? ((s: string) => isJudgeRole(s, { parentOf: deps.scopeOf })))(seat) })
-    + (skippedSpec.length ? ` · needs-spec ${skippedSpec.length} (no done-when — OP sets one)` : '');
+    + (skippedSpec.length ? ` · needs-spec ${skippedSpec.length} (no done-when — OP sets one)` : '')
+    + (skippedArea.length ? ` · off-area ${skippedArea.length} (outside your areas — graphs/policies/seat-roles.yaml)` : '');
   record({ outcome: 'empty', breakdown, ...(waiting.length ? { waiting } : {}), ...skipped });
   return { code: 3, line: `일감 0 — no READY cell in ${scope} or the pool (${deps.version})`, breakdown };
 }
@@ -228,7 +296,10 @@ export interface PoolCandidate { readonly cell: BoardCell; readonly space: strin
 /** Claim order for one hand: pool P0/priority (any space) → home board → other spaces' boards. */
 export function poolCandidates(cells: readonly BoardCell[], input: { seat: string; scope: string; nowMs: number; scopeOf: (seat: string) => string;
   isCoordinator: (seat: string) => boolean; isJudge: (seat: string) => boolean; lastActiveMs: (seat: string) => number | undefined; waitOf?: (cell: BoardCell) => CellWait | null | undefined;
-  priorityOrder: readonly string[]; skills: readonly string[]; hintedToMe?: (cell: BoardCell) => boolean }): PoolCandidate[] {
+  priorityOrder: readonly string[]; skills: readonly string[]; hintedToMe?: (cell: BoardCell) => boolean; lanes?: CellLanes;
+  policy?: PullPolicy; rosterRank?: ReadonlyMap<string, number>; liveWriter?: (cell: BoardCell) => string | undefined; prProtected?: (cell: BoardCell) => boolean }): PoolCandidate[] {
+  const policy = input.policy ?? legacy();
+  const liveWriter = (c: BoardCell): string | undefined => { try { return input.liveWriter?.(c); } catch { return undefined; } };
   const judgeHand = input.isJudge(input.seat);
   const hinted = (c: BoardCell): boolean => { try { return input.hintedToMe?.(c) === true; } catch { return false; } };
   const have = new Set(input.skills.map((s) => s.trim().toLowerCase()));
@@ -239,6 +310,10 @@ export function poolCandidates(cells: readonly BoardCell[], input: { seat: strin
     .filter((c) => (c.predecessors ?? []).every((p) => { const s = status.get(p); return s === undefined || s === 'green' || s === 'done'; }))
     .filter((c) => !input.waitOf?.(c))
     .filter((c) => (c.skills ?? []).every((t) => have.has(t.trim().toLowerCase())))
+    // WORK-PULL-REACHES-ROSTER — «[WIP 잔류 …]» never · a cell with a live writer is that writer's (the caller's own one
+    // is its WIP / waiting cell, never claimed twice).
+    .filter((c) => pullClass(c.evidence, policy) !== 'never')
+    .filter((c) => liveWriter(c) === undefined && !input.prProtected?.(c))
     // OP-PULL-HINT: a cell the OP planner hinted to this hand is claimable by it whoever holds it (the planner picked it as
     // «nobody on it» — unowned, a coordinator's, or a gone hand's), the way the old direct assign was.
     .filter((c) => hinted(c) || judgeHand === (!unowned(c.owner) && input.isJudge(ownerSeat(c.owner))))
@@ -248,10 +323,11 @@ export function poolCandidates(cells: readonly BoardCell[], input: { seat: strin
       if (owner === input.seat) return false;
       if (hinted(c)) return true;
       if (input.isCoordinator(owner)) return true; // any space's coordinator-held cell is that space's board
-      // A hand-owned cell moves only inside its own space, after the lease ran out.
-      return input.scopeOf(owner).toUpperCase() === input.scope && boardLeaseUntilMs(c, input.lastActiveMs(owner)) < input.nowMs;
+      // A hand-owned cell moves only inside its own space, after the lease ran out (lane b: after the 2 h hold).
+      return input.scopeOf(owner).toUpperCase() === input.scope && boardLeaseUntilMs(c, input.lastActiveMs(owner), input.lanes, policy.writerLeaseMin) < input.nowMs;
     });
-  const base = (a: BoardCell, b: BoardCell): number => (RANK[a.priority ?? ''] ?? 3) - (RANK[b.priority ?? ''] ?? 3) || cmpVersion(a.deadlineVersion, b.deadlineVersion)
+  // The shared order (kit/work-pull comparePull: class → roster rank → priority), then version → age → id.
+  const base = (a: BoardCell, b: BoardCell): number => comparePull(a, b, policy, input.rosterRank) || cmpVersion(a.deadlineVersion, b.deadlineVersion)
     || Date.parse(a.updatedAt) - Date.parse(b.updatedAt) || a.id.localeCompare(b.id);
   const order = input.priorityOrder;
   const inPool = (c: BoardCell): boolean => c.priority === 'P0' || priorityIndex(c, order) < order.length;
@@ -259,8 +335,11 @@ export function poolCandidates(cells: readonly BoardCell[], input: { seat: strin
   const rest = eligible.filter((c) => !inPool(c));
   const home = rest.filter((c) => { const sp = space(c); return sp === null || sp === input.scope; }).sort(base);
   const borrow = rest.filter((c) => { const sp = space(c); return sp !== null && sp !== input.scope; }).sort(base);
-  return [...pool.map((cell) => ({ cell, space: space(cell), tier: 'pool-p0' as const })), ...home.map((cell) => ({ cell, space: space(cell), tier: 'home' as const })),
+  const tiers = [...pool.map((cell) => ({ cell, space: space(cell), tier: 'pool-p0' as const })), ...home.map((cell) => ({ cell, space: space(cell), tier: 'home' as const })),
     ...borrow.map((cell) => ({ cell, space: space(cell), tier: 'borrow' as const }))];
+  // OP's roster rank leads across tiers (stable: unranked cells keep the tier order).
+  const r = (c: BoardCell): number => input.rosterRank?.get(c.id) ?? Number.POSITIVE_INFINITY;
+  return input.rosterRank?.size ? tiers.sort((a, b) => { const x = r(a.cell); const y = r(b.cell); return x === y ? 0 : x < y ? -1 : 1; }) : tiers;
 }
 
 export function appendJsonl(path: string, row: Record<string, unknown>): void {

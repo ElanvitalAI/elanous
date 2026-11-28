@@ -14,6 +14,7 @@ nodes:
   - { id: architecture-reflection, type: capability, requires: app-build.architecture-reflection@1, max_visits: 2 }
   - { id: file-plan, type: capability, requires: source-planning.file-plan@1, with: { stage: file-plan }, max_visits: 2 }
   - { id: files, type: capability, requires: source-build.files@1, with: { stage: files }, max_visits: 2 }
+  - { id: architecture-pdf, type: capability, requires: bookforge.app-docs-pdf@1, max_visits: 2 }
   - { id: classify-files, type: capability, requires: app-build.failure-cause@1, with: { phase: files }, max_visits: 2 }
   - { id: repair-plan, type: capability, requires: app-build.repair-note@1, with: { cause: plan } }
   - { id: repair-generation, type: capability, requires: app-build.repair-note@1, with: { cause: generation } }
@@ -39,7 +40,8 @@ edges:
   - { from: architecture, on: outcome, map: { done: architecture-reflection, failed: failed } }
   - { from: architecture-reflection, on: outcome, map: { done: file-plan, rework: architecture, failed: failed } }
   - { from: file-plan, on: outcome, map: { done: files, failed: failed } }
-  - { from: files, on: outcome, map: { done: verify-repair, failed: classify-files } }
+  - { from: files, on: outcome, map: { done: architecture-pdf, failed: classify-files } }
+  - { from: architecture-pdf, on: outcome, map: { done: verify-repair, failed: verify-repair } }
   - { from: classify-files, on: outcome, map: { plan: repair-plan, generation: repair-generation, verification: failed, acceptance: failed, fatal: failed, failed: failed } }
   - { from: repair-plan, on: outcome, map: { done: file-plan, failed: failed } }
   - { from: repair-generation, on: outcome, map: { done: file-plan, failed: failed } }

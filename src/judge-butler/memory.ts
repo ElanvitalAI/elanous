@@ -20,7 +20,7 @@ export const butlerHome = (stateRoot: string, agent: string = BUTLER_ID): string
 
 export interface Case {
   readonly at: string;
-  readonly kind: 'spawn' | 'world' | 'reap' | 'route' | 'hand-propose' | 'hand-scale-down' | 'paid-escalate' | 'probe' | 'sign' | 'escalation-withdrawn' | 'e4-run' | 'off-target' | 'sign-refused' | 'not-signed' | 'verify-failed' | 'escalate-cell' | 'hold-expire' | 'hold-propose' | 'hold-escalate' | 'hand-freed' | 'hand-answer' | 'hand-escalate' | 'voice' | 'lesson' | 'digest' | 'level';
+  readonly kind: 'spawn' | 'world' | 'reap' | 'route' | 'hand-propose' | 'hand-scale-down' | 'paid-escalate' | 'probe' | 'sign' | 'escalation-withdrawn' | 'e4-run' | 'sim-run' | 'fu-line-fallback' | 'off-target' | 'sign-refused' | 'not-signed' | 'verify-failed' | 'escalate-cell' | 'hold-expire' | 'hold-propose' | 'hold-escalate' | 'hand-freed' | 'hand-answer' | 'hand-escalate' | 'voice' | 'lesson' | 'digest' | 'level';
   readonly subject: string;
   readonly why: string;
   readonly refs?: readonly string[];

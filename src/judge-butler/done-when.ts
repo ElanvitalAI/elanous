@@ -7,11 +7,17 @@
 // BUTLER-SIGN-MERGED-PATCHID (11-27 · 26 «merged + receipt» cells, 0 signed): «same head» and «focused exit 0» are the land
 // graph's own receipt rules (src/land-graph/receipt-rules.ts — L0 doc-only · preexisting-on-main) ⊕ the #40358 patch-id reuse,
 // selected by graphs/loop-agents/judge-butler/goal.yaml `green_rules`; every refusal carries a one-line reason.
+// JUDGE-GREEN-PR-BINDING (11-28): «the PRs it cites» = only the PRs bound to the cell on their own word (`green_rules.pr_binding`
+// · src/land-graph/cell-link.ts bindsCell) — a mention in the evidence alone is never the cell's PR.
+// JUDGE-GREEN-PR-BINDING-LEGACY (11-28): the split is the kit's boundPrs (src/land-graph/pr-binding.ts), the same one green-triage
+// uses · a legacy PR binds by the cell's own evidence (graphs/policies/pr-binding.yaml own_evidence).
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { evidencePrRefs } from '../release-loop/green-triage.js';
 import { isDocOnly, noFocusedStage, preexistingOnly } from '../land-graph/receipt-rules.js';
+import { bindsCell, ownEvidenceCite, type PrCellBinding } from '../land-graph/cell-link.js';
+import { boundPrs, PR_BINDING_POLICY } from '../land-graph/pr-binding.js';
 import { loadGreenRules, type FocusedOkRule, type GreenRules } from './cards.js';
 
 export type Security4Class = 'auth' | 'secret' | 'remote-exec' | 'destroy';
@@ -60,7 +66,7 @@ export function security4Hits(files: readonly string[], table: Security4Table = 
   return out;
 }
 
-export interface CellIn { readonly id: string; readonly title?: string; readonly status: string; readonly owner?: string; readonly evidence?: string; readonly updatedAt?: string; readonly updatedBy?: string }
+export interface CellIn { readonly id: string; readonly title?: string; readonly status: string; readonly owner?: string; readonly evidence?: string; readonly doneCriterion?: string; readonly updatedAt?: string; readonly updatedBy?: string }
 export type FocusedIn = { readonly pass: number; readonly fail: number } | { readonly exit: number } | null;
 export interface PrFacts {
   readonly pr: number;
@@ -74,6 +80,11 @@ export interface PrFacts {
   readonly files: readonly string[] | null;
   /** Open Terra security-4 findings on that head. */
   readonly securityFindings: readonly string[];
+  /** JUDGE-GREEN-PR-BINDING: what the PR says about itself (body «칸» · title · branch · its post-merge sweep row);
+   *  null = unknown (body not read yet · not merged) → the PR counts for no cell. */
+  readonly binding: PrCellBinding | null;
+  /** JUDGE-SIM-RECEIPT: registered sim scene ids the PR body names (its scene table) — absent = none / body unknown. */
+  readonly scenes?: readonly string[];
 }
 
 /** The receipt as judged (from the land graph's Receipt · src/cli/land-graph-cli.ts defaultLandDeps().receipt). */
@@ -112,10 +123,16 @@ export function judgeCell(cell: CellIn, facts: ReadonlyMap<number, PrFacts>, rul
   const sim = simEvidenceLine(cell);
   const e4Cell = isE4Cell(cell.id);
   if (e4Cell && !sim) return { kind: 'missing', why: `E4 cell: its own E4 evidence run («E4 test|sim 층 — … · 칸 ${cell.id} · … · rc 0») — a parent PR's focused receipt is not E4 evidence`, missing: ['own E4 evidence run'] };
-  const merged = refs.map(pr => facts.get(pr)).filter((f): f is PrFacts => !!f && f.merged);
-  // an E4 cell that cites no PR closes on its own evidence run (an existing scene re-run · no code change)
-  if (e4Cell && sim && !refs.length) { const runId = e4RunId(sim); return { kind: 'sign', why: `E4 ${runId} rc 0 (own evidence run · no PR)`, evidence: [`E4:${runId}`], e4: runId }; }
-  if (!merged.length) return { kind: 'missing', why: refs.length ? `no merged PR among ${refs.map(p => `#${p}`).join(' ')}` : 'no PR in evidence', missing: ['merged PR'] };
+  const cited = refs.map(pr => facts.get(pr)).filter((f): f is PrFacts => !!f && f.merged);
+  // JUDGE-GREEN-PR-BINDING: a cited PR is judged only when it is this cell's PR (the kit's boundPrs — green-triage splits the
+  // same way); the others are named, not judged
+  const split = boundPrs(cell.id, cited.map(f => f.pr), pr => facts.get(pr)?.binding ?? null, rules.prBinding);
+  const notMine = split.notMine;
+  const merged = cited.filter(f => split.bound.includes(f.pr));
+  // an E4 cell that cites no PR of its own closes on its own evidence run (an existing scene re-run · no code change)
+  if (e4Cell && sim && (!refs.length || (cited.length && !merged.length))) { const runId = e4RunId(sim); return { kind: 'sign', why: `E4 ${runId} rc 0 (own evidence run · no PR)`, evidence: [`E4:${runId}`], e4: runId }; }
+  if (!cited.length) return { kind: 'missing', why: refs.length ? `no merged PR among ${refs.map(p => `#${p}`).join(' ')}` : 'no PR in evidence', missing: ['merged PR'] };
+  if (!merged.length) return { kind: 'missing', why: `no merged PR of ${cell.id} — ${notMine.join(' · ')} — the PR that does this cell carries «칸: ${cell.id}»`, missing: [`merged PR declaring «칸: ${cell.id}»`] };
   const missing: string[] = []; const evidence: string[] = []; const whys: string[] = []; const hits: string[] = [];
   for (const f of merged) {
     if (f.files === null) missing.push(`#${f.pr} files unknown (security-4 check needs them)`);
@@ -162,7 +179,8 @@ export function judgeCell(cell: CellIn, facts: ReadonlyMap<number, PrFacts>, rul
   if (hits.length) return { kind: 'security', why: `security-4: ${[...new Set(hits)].slice(0, 4).join(', ')} — JUD/Terra signs this one`, hits: [...new Set(hits)] };
   if (missing.length) return { kind: 'missing', why: missing.join(' · '), missing };
   const runId = sim ? e4RunId(sim) : null;
-  return { kind: 'sign', why: `${whys.join(' · ')}${runId ? ` · E4 ${runId} rc 0` : ' · E4 없음 → FU'}`, evidence: [...evidence, ...(runId ? [`E4:${runId}`] : [])], e4: runId };
+  const ignored = notMine.length ? ` · not this cell's: ${notMine.map(n => n.split(' ')[0]).join(' ')}` : '';
+  return { kind: 'sign', why: `${whys.join(' · ')}${runId ? ` · E4 ${runId} rc 0` : ' · E4 없음 → FU'}${ignored}`, evidence: [...evidence, ...(runId ? [`E4:${runId}`] : [])], e4: runId };
 }
 
 /** BUTLER-RESCAN: the judging rules' version — a change re-judges every cell the butler escalated as security-4. */
@@ -170,6 +188,6 @@ export function judgeCell(cell: CellIn, facts: ReadonlyMap<number, PrFacts>, rul
 export const signWithoutE4 = (v: Verdict): boolean => v.kind === 'sign' && v.e4 === null;
 
 export const RULES_VERSION: string = (() => {
-  const src = [SECURITY4_PATHS.map(p => `${p.cls}:${p.re.source}`).join('|'), isNonExecutablePath.toString(), judgeCell.toString(), simEvidenceLine.toString(), JSON.stringify(GREEN_RULES), isE4Cell.toString()].join('\n');
+  const src = [SECURITY4_PATHS.map(p => `${p.cls}:${p.re.source}`).join('|'), isNonExecutablePath.toString(), judgeCell.toString(), simEvidenceLine.toString(), JSON.stringify(GREEN_RULES), isE4Cell.toString(), bindsCell.toString(), boundPrs.toString(), ownEvidenceCite.toString(), JSON.stringify(PR_BINDING_POLICY)].join('\n');
   return new Bun.CryptoHasher('sha256').update(src).digest('hex').slice(0, 12);
 })();

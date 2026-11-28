@@ -10,8 +10,8 @@ manifest:
   description: "SLA 넘은 미결 요청 0 (받는 이가 결정했거나 · 보낸 이가 읽는 몸 없음을 안다)"
   requires:
     executor: loop-agent@3
-    kits: [kpi]
-    node_kinds: [silence-watch.observe, loop-agent.act, loop-agent.learn, loop-agent.judge, loop-agent.finish, gate, reflect, plan, learn-knowhow, retro]
+    kits: [kpi, bus-post]
+    node_kinds: [silence-watch.observe, loop-agent.act, loop-agent.learn, loop-agent.judge, loop-agent.finish, gate, reflect, plan, learn-knowhow, retro, bus-post]
     facts: []
   provides:
     agent: silence-watch
@@ -37,6 +37,9 @@ card:
   actions:
     - redeliver
     - bounce
+    - settle
+    - close-notice
+    - reopen-notice
   wake_events:
     - 5분마다 (cron */5)
     - 우편 원장 변경 (msg messages.db)
@@ -51,7 +54,12 @@ policies:   # tier ① — the only numbers (the body reads them through pv() ·
   heartbeat_every_min: 5
   subject_lost_ticks: 3   # unreadable subject this many ticks → reattach proposal to the L0
   sla_min: 30   # 요청 응답 SLA
+  sla_min_op: 15   # OP 가 보낸 요청의 응답 SLA (YAML-OPS-SCRIPTS-ABSORB · 옛 seat-state/K-EAST/tools/op-overdue-doorbell.py 의 15분 · 0.3.39)
   lookback_h: 24   # 미결 요청을 보는 창
+  # 무엇이 알림(회신 불필요)인지는 한 곳 — src/kit/mail-route/notice-policy.yaml (우편 게시 기본값과 같은 표 · SILENCE-NOTICE-NOT-REQUEST)
+  page_rows: 500   # 우편 원장 한 쪽 — 창 안 미결은 쪽마다 끝까지 읽는다(한 쪽에서 멈추면 KPI 가 쪽 크기가 된다 · 11-28 2,300행 중 500)
+  pages_max: 20   # 쪽 상한(= 10,000행) — 넘으면 KPI 는 하한이고 사실 줄에 적힌다
+  notice_close_max: 100   # close-notice 한 번에 한 자리 앞 알림을 닫는 최대 수(쿨다운 cooldown_min 마다 · 나머지는 다음 차례)
   # v3 smartness (LOOP-AGENT-V3-SMART-2 · src/loop-agent/v3/smart.ts) — reflect · plan · learn-knowhow · retro read only these
   act_grace_min: 0   # an action's outcome is known when it returns (acted | failed) — no waiting
   lesson_repeat_min: 3   # the same action failing 3× in a row on one kind of subject → ONE lesson with the cause
@@ -64,13 +72,14 @@ policies:   # tier ① — the only numbers (the body reads them through pv() ·
   plan_llm_per_hour: 0
   retro_every_h: 6   # retro (회고): journal ⊕ KPI window → what worked · what failed and why · one change to try
   cost_act: 0
+  bus_reader_window_h: 24   # kit/bus-post (CONTEXT-BUS-FEDERATION ③): the L0 acked a bus digest within this window = it reads the bus (else mail)
 kpis:
   - { name: unanswered_mail_past_sla, at_most: $policies.unanswered_mail_past_sla_max, unit: "mail" }
 done_when:
   - "unanswered_mail_past_sla == 0 한 틱"
   - "읽는 몸 없는 주소로 간 요청은 보낸 이가 알림을 받음"
 never_auto: &never
-  - "남의 우편 ack·done·만료 처리"
+  - "남의 요청 우편 ack·만료 처리 · 칸 원장이 답을 증명하지 않는 요청의 done (예외 = notice-policy.yaml 이 알림으로 정한 우편 닫기 · 되돌림 가능 · 사람 주소 keepOpenFor 는 그것도 안 함)"
   - "받는 자리 대신 답하기·결정하기"
   - "같은 우편 두 번 재배달"
   - "사람 탭에 키 입력·주입 (사람 탭 주입 0)"
@@ -83,6 +92,11 @@ soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan and voice 
   serves:
     - "OP (L0)"
     - "요청을 보낸 자리와 받는 자리"
+absorbs:   # 관계 키 absorbs — 역할 보존(FEDERATION-ORG §4 «역할 은퇴 0») · 코드는 지우고 역할은 이 인스턴스가 KPI 로 진다
+  - { id: op-mail-coverage-watch, kind: role, kpi: unanswered_mail_past_sla, l0: supervisor, why: "OP 가 받은 요청 중 판단(수락·거절·완료) 없는 것 — SLA 넘은 미결 요청으로 센다(초인종 → OP 카드)" }
+  - { id: supervision-silence-watch, kind: role, kpi: unanswered_mail_past_sla, l0: supervisor, why: "옛 침묵 감시(주인 없는 관찰 · supervisor/v1) — 같은 역할의 v3 판" }
+  - { id: op-overdue-doorbell, kind: script, kpi: unanswered_mail_past_sla, l0: supervisor, why: "seat-state/K-EAST/tools/op-overdue-doorbell.py (launchd 2분 · OP 발신 요청 15분 미수락 → 탭 초인종) — sla_min_op 로 흡수 · 11-28 로그 = 경로 없음 defer 만 반복" }
+  - { id: jud-doorbell, kind: script, kpi: unanswered_mail_past_sla, l0: supervisor, why: "seat-state/K-EAST/tools/jud-doorbell.py · jud-b-doorbell.py · jud-c-doorbell.py (launchd 30초 · JUD tmux 탭 초인종) — 탭이 els 로 옮겨 pane-missing 만 반복 · 초인종은 이 에이전트의 redeliver(11-27 journal redeliver:JUD · JUD-C)" }
 wake:
   registered_as: silence-watch-agent
   trigger:
@@ -106,6 +120,7 @@ body:   # tier ① routing — observe outcome → steps (ok · breach · unknow
     - { node_id: plan, kind: plan, optional: true }              # v3: the body plan ⊕ learned knowhow → fallback · soul do_not · cited memory
     - { node_id: learn-knowhow, kind: learn-knowhow, optional: true } # v3: one lesson → one knowhow line
     - { node_id: retro, kind: retro, optional: true }            # v3: every retro_every_h → retro entry in memory (the voice quotes it)
+    - { node_id: bus, kind: bus-post, optional: true }           # kit/bus-post: info notices (lesson candidates · «no reading body») → the reader's bus space
   edges:
     - { from: observe, on: outcome, map: { ok: act, breach: act, unknown: act, off: finish, error: finish } }
     - { from: act, on: outcome, map: { ok: learn } }
@@ -115,6 +130,13 @@ body:   # tier ① routing — observe outcome → steps (ok · breach · unknow
 actions:   # v3 plan (LOOP-AGENT-V3-SMART-2): the card rights as plan choices · fallback = what the plan runs once a knowhow line says the action keeps failing
   - { id: redeliver, channel: self, target: self, serves: [unanswered_mail_past_sla], cost: $policies.cost_act, default: true, fallback: bounce }
   - { id: bounce, channel: self, target: self, serves: [unanswered_mail_past_sla], cost: $policies.cost_act }
+  # DETECT-TO-ACTION (11-28): the ladder step after the one bell — a request its cell ledger already answered gets the done receipt that ledger proves
+  - { id: settle, channel: self, target: self, serves: [unanswered_mail_past_sla], cost: $policies.cost_act }
+  # SILENCE-NOTICE-NOT-REQUEST (11-28): a notice stored as a request before the notice policy is closed here, never rung · reopen-notice = its exact undo (voice)
+  - { id: close-notice, channel: self, target: self, serves: [unanswered_mail_past_sla], cost: $policies.cost_act }
+  - { id: reopen-notice, channel: self, target: self, serves: [unanswered_mail_past_sla], cost: $policies.cost_act }
+bus:   # CONTEXT-BUS-FEDERATION ③ — notices only; kpi-breach · subject-lost · act-parked cards are requests = mail
+  notices: [info]
 voice:   # tier ③ — one LLM turn only when spoken to (role router · coordinator) · facts-only fold over budget
   channel: loop:silence-watch
   speak_on: [kpi-breach, kpi-recovered, subject-lost]

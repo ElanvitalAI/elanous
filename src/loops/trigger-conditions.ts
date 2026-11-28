@@ -17,6 +17,7 @@ import { createHash } from 'node:crypto';
 import { liveFacts, parseTimeExpr, resolveTime, type Facts } from './trigger-facts.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { BURST_HOSTS as RES_BURST_HOSTS, READY_MAX_AGE_DAYS as RES_READY_MAX_AGE_DAYS, dueKey, dueLeases, releasePhase, staleHosts } from '../res-graphs/burst.js';
+import { boardVersion } from '../release-loop/board-version.js';
 
 export type Predicate =
   | { kind: 'all' | 'any'; of: Predicate[] }
@@ -407,8 +408,8 @@ export function defaultConditionProbes(): ConditionProbes {
     readJson: path => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return undefined; } },
     readLines: path => existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean) : [],
     async cells() {
-      const { checklistDevVersion, listChecklist } = await import('../release-loop/checklist.js');
-      return listChecklist(checklistDevVersion()).items.map(i => ({ id: i.id, status: i.status, owner: i.owner ?? null }));
+      const { listChecklist } = await import('../release-loop/checklist.js');
+      return listChecklist(boardVersion()).items.map(i => ({ id: i.id, status: i.status, owner: i.owner ?? null }));
     },
     async idleSeats() {
       const { spawnSync } = await import('node:child_process');

@@ -45,7 +45,7 @@ describe('done-when — evidence only, never security-4', () => {
   const h = 'a'.repeat(40);
   const cell = (evidence: string) => ({ id: 'C-1', status: 'yellow', evidence });
   const e4 = 'E4 test 층 — runId r1 · event: checklist.evidence.run · 2026-11-27T00:00:00Z · host minim5 · 칸 C-1 · 명령: bun test x · rc 0 (evidence run · synthetic/test)';
-  const facts = (over: Partial<PrFacts> = {}) => new Map([[40324, { pr: 40324, merged: true, landedHead: h, files: ['src/x.ts'], securityFindings: [],
+  const facts = (over: Partial<PrFacts> = {}) => new Map([[40324, { pr: 40324, merged: true, landedHead: h, files: ['src/x.ts'], securityFindings: [], binding: { declared: ['C-1'], title: [], branch: [], pipeline: [], selfDeclared: true, evidence: [] },
     receipt: { head: h, dir: `PREGATE-GREEN/40324-${h.slice(0, 12)}-minim5`, focusedFiles: 1, focused: { pass: 5, fail: 0 } }, ...over } satisfies PrFacts]]);
 
   test('sign needs all three; each missing piece is named with the exact step', () => {

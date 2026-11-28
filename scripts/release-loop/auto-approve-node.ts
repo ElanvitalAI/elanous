@@ -87,10 +87,11 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
   context.outputs['checklist-gate'] = { ...context.outputs['checklist-gate'], publishBlockingYellow };
   const holdReasons = publishApprovalHoldReasons(context);
   const metrics: ApprovalMetric[] = [
-    { name: BLOCKING_METRIC_NAMES[0], value: JSON.stringify({ outcome: gate?.outcome ?? null, introduced: gate?.introduced ?? null, error: gate?.error ?? null, ownerWaived: ownerWaivedGate, signedKnownIssueGate, emergencyGate }),
+    { name: BLOCKING_METRIC_NAMES[0], value: JSON.stringify({ outcome: gate?.outcome ?? null, verdict: gate?.verdict ?? null, introduced: gate?.introduced ?? null, error: gate?.error ?? null, ownerWaived: ownerWaivedGate, signedKnownIssueGate, emergencyGate }),
       verdict: !gate || gate.outcome === undefined ? 'unmeasured'
         : ownerWaivedGate || signedKnownIssueGate || emergencyGate ? 'pass' : !Array.isArray(gate.introduced) ? 'unmeasured'
-          : gate.outcome === 'ok' && gate.introduced.length === 0 && gateErrorAbsent ? 'pass' : 'fail' },
+          : gate.outcome === 'ok' && gate.verdict == null ? 'unmeasured'
+            : gate.outcome === 'ok' && gate.verdict === 'pass' && gate.introduced.length === 0 && gateErrorAbsent ? 'pass' : 'fail' },
     { name: BLOCKING_METRIC_NAMES[1], value: `running=${bunVersion}; pinned=${pinned ?? 'missing'}`,
       verdict: !pinned ? 'unmeasured' : bunVersion === pinned ? 'pass' : 'fail' },
     outcomeMetric(BLOCKING_METRIC_NAMES[2], context.outputs.upgrade),

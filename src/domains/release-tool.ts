@@ -7,13 +7,14 @@ import { contextNow, releaseFactSummary, type ContextNowAnswer, type ContextFact
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';
 import { debug } from '../debug/log.js';
 import { requestConfirmation, type ConfirmOpts, type ConfirmResult } from '../hitl/confirm.js';
-import { devVersion, checklistDevVersion, listChecklist, summarizeChecklist, type Checklist, type ChecklistItem } from '../release-loop/checklist.js';
+import { checklistDevVersion, listChecklist, summarizeChecklist, type Checklist, type ChecklistItem } from '../release-loop/checklist.js';
 import { add, move, validateVersion } from '../release-loop/feature-store.js';
 import { formatKst, formatSchedule, getSchedule, listSchedules, setSchedule, type ReleaseSchedule } from '../release-loop/release-schedule.js';
 import { mergedPrsLast24h as countMergedPrsLast24h } from '../release-loop/placement.js';
 import { readGreenTriageSources, renderGreenTriage, triageGreen, type GreenTriageSources } from '../release-loop/green-triage.js';
 import { latestGraphRun, type GraphRunState } from '../graph-runner/runner.js';
 import { formatElanousCard, type ElanousCard } from './elanous-card.js';
+import { boardVersion } from '../release-loop/board-version.js';
 
 export const RELEASE_STATUS_SPEC: LLMToolSpec = {
   name: 'release_status',
@@ -170,7 +171,7 @@ export function dispatchReleaseStatus(rawArgs: Record<string, unknown>, deps: Re
     debug.log('release.tool', 'status', { action: 'status', topic, version: requested ?? null });
     return { text: facts.length ? facts.map(fact => fact.kind === 'release' ? releaseFactSummary(fact) : JSON.stringify(fact)).join('\n') : '운영 개관: 관측된 사실 없음', structured: { facts } };
   }
-  const dev = checklistDevVersion(deps.devVersion?.() ?? devVersion());
+  const dev = checklistDevVersion(deps.devVersion?.() ?? boardVersion());
   if (args.action !== undefined) {
     const action = args.action;
     if (typeof action !== 'string' || !['schedule', 'blocked', 'landed', 'green-triage'].includes(action)) {

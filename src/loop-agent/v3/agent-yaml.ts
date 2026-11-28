@@ -22,8 +22,10 @@ import { isAbsolute, join, normalize } from 'node:path';
 import { parse } from 'yaml';
 import { DUTY_ROLES, orgDuty, type OrgDeps } from '../../org/org-map.js';
 import { parsePredicate, parseWhen, type Predicate } from '../../loops/trigger-conditions.js';
-import { EXECUTOR, EXECUTOR_TAG, INSTALLED_KITS, nodeKind } from './node-kinds.js';
+import { EXECUTOR, EXECUTOR_TAG, INSTALLED_KITS, SUB_KINDS, nodeKind } from './node-kinds.js';
 import type { SmartAction } from './smart.js';
+import { parseKpiRollup, type RollupSpec } from '../../kit/kpi/rollup.js';
+import { parseResourceCheck, type ResourceCheckSpec } from './resource-check.js';
 
 export const AGENT_API_VERSION = 'elanous/loop-agent@3';
 export const AGENT_FILE = 'agent.yaml';
@@ -33,7 +35,18 @@ const SEMVER_RE = /^\d+\.\d+\.\d+$/u;
 const REF_RE = /^\$policies\.([a-z][a-z0-9_]*)$/u;
 
 export type PolicyValue = number | { readonly fact: string; readonly default?: number };
-export interface AgentKpi { readonly name: string; readonly dir: 'at_least' | 'at_most'; readonly target: number; readonly unit: string; readonly ref: string | null }
+/** `from` (JUDGE-BUTLER-V3-LISTED): where the KPI value is in the agent's tick file (dotted path · an array counts its length) —
+ *  how `eln loop agent list|status` reads a v3 agent's KPI without its own door · absent = not read from the tick file.
+ *  GUARDIAN-KPI-FROM: `from: { file, path, where }` — the same path in another JSON file of the agent home (a body whose snapshot
+ *  is not last-tick.json, e.g. guardian last-pulse.json) · `where` (field → scalar) counts only the array rows that match. */
+export type KpiWhere = Readonly<Record<string, string | number | boolean | null>>;
+export interface AgentKpi {
+  readonly name: string; readonly dir: 'at_least' | 'at_most'; readonly target: number; readonly unit: string; readonly ref: string | null; readonly from?: string | null;
+  /** `from.file` — a JSON file name in the agent home (default last-tick.json) · `from.where` — count the array rows matching every field. */
+  readonly fromFile?: string; readonly fromWhere?: KpiWhere;
+  /** CODE-BODY-TO-KIND (kpi-voice kind): the breach key (state cursor · plan intent) and the breach line template (src/loop-agent/v3/kpi-voice.ts). */
+  readonly key?: string; readonly breach?: string;
+}
 export interface AgentNode { readonly node_id: string; readonly kind: string; readonly optional: boolean; readonly max_visits?: number }
 export interface AgentEdge { readonly from: string; readonly on: string; readonly map: Readonly<Record<string, string>> }
 export interface AgentWake {
@@ -68,6 +81,29 @@ export interface AgentSoul {
   /** Who it serves (seats · duties · roles). */
   readonly serves: readonly string[];
 }
+/** GUARDIAN-SUBS · DETECT-TO-ACTION: one detector of a sub — the normal state it looks for, the ordered normalize ladder (the
+ *  sub's own action ids), the escalation (to owner | l0 | seat · SLA since detection) and whether it is out of policy (= escalate
+ *  at once). `by` = another loop agent / trigger executes it (its own policies and case domain). */
+export interface AgentSubDetector {
+  readonly id: string; readonly normal: string; readonly normalize: readonly string[]; readonly outOfPolicy: string | null;
+  readonly escalate: { readonly to: string; readonly slaMin: number | null } | null; readonly by: string | null;
+}
+/** A sub-loop agent: the short form {id · node · knowhow} or the full one (duty · rights · policies · KPI · cadence · detectors). */
+export interface AgentSub {
+  readonly id: string; readonly node: string; readonly knowhow: string | null;
+  readonly name?: string | null; readonly duty?: string; readonly absorbs?: readonly string[]; readonly actions?: readonly string[];
+  readonly policies?: readonly string[];
+  readonly kpi?: { readonly text: string; readonly name: string | null; readonly dir: 'at_least' | 'at_most' | null; readonly target: number | null; readonly unit: string } | null;
+  readonly everyMin?: number | null; readonly ttlMin?: number | null; readonly events?: readonly string[]; readonly detectors?: readonly AgentSubDetector[];
+  /** a read of other agents' own KPI (kit/kpi rollup · src/kit/kpi/rollup.ts) — no wake: a silent peer is the trigger registry's */
+  readonly kpiRollup?: RollupSpec | null;
+  /** CODE-BODY-TO-KIND: the shared sub kind that runs this sub (SUB_KINDS · node-kinds.ts) — its params are the block named after it */
+  readonly kind?: string | null;
+  /** `kind: resource-check` params (src/loop-agent/v3/resource-check.ts) */
+  readonly resourceCheck?: ResourceCheckSpec | null;
+  /** what the spawn line leases: the local hosts (heavy view) or nothing beyond this host */
+  readonly resource?: 'hosts' | 'local';
+}
 export interface CompiledAgent {
   readonly id: string; readonly address: string; readonly name: string; readonly version: string; readonly description: string;
   readonly rank: string;
@@ -81,8 +117,10 @@ export interface CompiledAgent {
   readonly neverAuto: readonly string[];
   readonly wake: AgentWake;
   readonly body: { readonly entry: string; readonly terminal: readonly string[]; readonly nodes: readonly AgentNode[]; readonly edges: readonly AgentEdge[] };
-  readonly voice: { readonly channel: string; readonly speakOn: readonly string[]; readonly breachLineEveryMin: number | null; readonly mail: string; readonly terminalOwner: boolean; readonly perHourMax: number };
-  readonly subs: readonly { readonly id: string; readonly node: string; readonly knowhow: string | null }[];
+  readonly voice: { readonly channel: string; readonly speakOn: readonly string[]; readonly breachLineEveryMin: number | null; readonly mail: string; readonly terminalOwner: boolean; readonly perHourMax: number;
+    /** kpi-voice kind: the channel line around one breach · the L0 decision card when the plan escalates (templates). */
+    readonly line?: string; readonly l0Card?: string };
+  readonly subs: readonly AgentSub[];
   readonly budget: { readonly llmTurnsPerHour: number };
   readonly levels: { readonly start: string; readonly values: readonly string[] };
   /** v3 `actions:` — what the plan node may choose (LOOP-AGENT-V3-SMART) · empty when the agent declares none. */
@@ -93,7 +131,15 @@ export interface CompiledAgent {
   readonly knowhowText: string;
   /** `card:` — present for the v2-shell supervisors (goal.yaml generated from this file) · null otherwise. */
   readonly card: AgentCardBlock | null;
+  /** CONTEXT-BUS-FEDERATION ③ `bus:` — the mail kinds the `bus-post` node posts to the L0's bus space · null = none declared. */
+  readonly bus?: { readonly notices: readonly string[] } | null;
+  /** SUPERVISORS-EXECUTE-NOT-PROPOSE `authority:` — the bounded, reversible acts this agent runs itself · null = none declared. */
+  readonly authority?: AgentAuthority | null;
 }
+/** SUPERVISORS-EXECUTE-NOT-PROPOSE (대표 11-28 17:3x «자동으로 돌아가게 = 루프 에이전트들이 본인 임무를 문제없이 해내는 것»):
+ *  `executes` = declared actions the agent runs itself (no proposal waiting on a coordinator) · `undo` = each one's reverse
+ *  action · `limits` = the policies that bound it (caps · TTL · grace) · `respectHold` = an active HOLD over the target stops it. */
+export interface AgentAuthority { readonly executes: readonly string[]; readonly undo: Readonly<Record<string, string>>; readonly limits: readonly string[]; readonly respectHold: boolean }
 export interface LintResult { readonly ok: boolean; readonly id: string | null; readonly errors: string[]; readonly warnings: string[]; readonly compiled: CompiledAgent | null }
 
 export interface LintEnv {
@@ -213,7 +259,22 @@ export function lintAgentYaml(text: string, dir: string, env: LintEnv = {}): Lin
     const dir = k.at_least !== undefined ? 'at_least' : k.at_most !== undefined ? 'at_most' : null;
     if (!dir) { errors.push(`${at}: needs at_least | at_most`); return; }
     const r = resolve(k[dir], `${at}.${dir}`);
-    if (r) kpis.push({ name: kn, dir, target: r.n, unit: str(k.unit), ref: r.ref });
+    const fo = isObj(k.from) ? k.from : null;
+    const from = k.from === undefined ? null : str(fo ? fo.path : k.from);
+    if (from !== null && !/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/u.test(from)) { errors.push(`${at}.from must be a dotted field path into the tick file (e.g. kpi.landsLastHour)`); return; }
+    const fromFile = fo && fo.file !== undefined ? str(fo.file) : '';
+    if (fo && fo.file !== undefined && !/^[A-Za-z0-9][A-Za-z0-9_.-]*\.json$/u.test(fromFile)) { errors.push(`${at}.from.file must be a JSON file name in the agent home (e.g. last-pulse.json)`); return; }
+    let fromWhere: Record<string, string | number | boolean | null> | null = null;
+    if (fo && fo.where !== undefined) {
+      if (!isObj(fo.where) || !Object.keys(fo.where).length || Object.entries(fo.where).some(([f, v]) => !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(f) || (v !== null && !['string', 'number', 'boolean'].includes(typeof v)))) {
+        errors.push(`${at}.from.where must map field names to scalars (e.g. { ok: false })`); return;
+      }
+      fromWhere = { ...(fo.where as Record<string, string | number | boolean | null>) };
+    }
+    if (fo && Object.keys(fo).some(f => !['file', 'path', 'where'].includes(f))) { errors.push(`${at}.from takes only file · path · where`); return; }
+    const key = str(k.key); const breach = str(k.breach);
+    if (key && !ID_RE.test(key)) { errors.push(`${at}.key ${key} is not a breach key (${ID_RE})`); return; }
+    if (r) kpis.push({ name: kn, dir, target: r.n, unit: str(k.unit), ref: r.ref, ...(from ? { from } : {}), ...(fromFile ? { fromFile } : {}), ...(fromWhere ? { fromWhere } : {}), ...(key ? { key } : {}), ...(breach ? { breach } : {}) });
   });
   if (!kpis.length) errors.push('kpis: at least one KPI (the L0 is responsible for it)');
   for (const kn of strs(prov.kpis)) if (!kpis.some(k => k.name === kn)) errors.push(`manifest.provides.kpis names ${kn} but kpis: has no such KPI`);
@@ -302,15 +363,90 @@ export function lintAgentYaml(text: string, dir: string, env: LintEnv = {}): Lin
   });
   for (const n of nodes) if (!terminal.includes(n.node_id) && !n.optional && !edges.some(e => e.from === n.node_id)) errors.push(`body: node ${n.node_id} has no outgoing edge`);
 
-  // ── subs (sub-loop agents run inside a body node) ──
+  // ── subs: a full sub-loop agent (GUARDIAN-SUBS · 대표 11-27 «① 본다 ② 정상화») = duty · rights · policies · KPI · cadence ·
+  //    detectors {normal · normalize ladder (the sub's own actions) · escalate (to · SLA) · out_of_policy · by}. The short
+  //    form {id · node · knowhow} stays valid (land-steward). Lint rule: every detector declares a normalize ladder or an
+  //    escalation path — a detector that only «sees» is refused (DETECT-TO-ACTION).
+  const ESC_TO_RE = /^(owner|l0|[A-Z][A-Z0-9_-]{0,63})$/u;
+  const subFull = (s: Record<string, unknown>, at: string): Omit<Partial<AgentSub>, 'id' | 'node' | 'knowhow'> => {
+    const rich = ['name', 'duty', 'absorbs', 'actions', 'policies', 'kpi', 'every_min', 'ttl_min', 'events', 'detectors', 'kpi_rollup', 'peer_watch', 'kind', 'resource_check', 'resource'].some(k => s[k] !== undefined);
+    if (!rich) return {};
+    const duty = str(s.duty);
+    if (!duty) errors.push(`${at}.duty is required (what this sub is responsible for)`);
+    const subActions = strs(s.actions);
+    if (!subActions.length) errors.push(`${at}.actions needs at least one right (what this sub may do)`);
+    for (const a of subActions) if (!ID_RE.test(a)) errors.push(`${at}.actions: ${a} is not an action id`);
+    const pols = strs(s.policies);
+    for (const p of pols) { if (!Object.hasOwn(policies, p)) errors.push(`${at}.policies names ${p} — not under policies:`); else used.add(p); }
+    let kpi: AgentSub['kpi'] = null;
+    if (isObj(s.kpi)) {
+      const k = s.kpi; const text = str(k.text); const kn = str(k.name);
+      if (!text) errors.push(`${at}.kpi.text is required`);
+      const dir = k.at_least !== undefined ? 'at_least' as const : k.at_most !== undefined ? 'at_most' as const : null;
+      const r = dir ? resolve(k[dir], `${at}.kpi.${dir}`) : null;
+      if (kn && !/^[a-z][a-z0-9_]*$/u.test(kn)) errors.push(`${at}.kpi.name ${kn} is not a KPI name`);
+      kpi = { text, name: kn || null, dir, target: r?.n ?? null, unit: str(k.unit) };
+    } else errors.push(`${at}.kpi {text · name · at_most|at_least} is required (the L0 is responsible for it)`);
+    const every = s.every_min === undefined || s.every_min === null ? null : resolve(s.every_min, `${at}.every_min`);
+    const ttl = s.ttl_min === undefined ? null : resolve(s.ttl_min, `${at}.ttl_min`);
+    if (!ttl) errors.push(`${at}.ttl_min ($policies.<name>) is required — a spawn line without a TTL is never reaped`);
+    const events = strs(s.events);
+    for (const e of events) if (!ID_RE.test(e)) errors.push(`${at}.events: ${e} is not an event slug`);
+    const detectors: AgentSubDetector[] = [];
+    (Array.isArray(s.detectors) ? s.detectors : []).forEach((rawD, di) => {
+      const d = isObj(rawD) ? rawD : {}; const dat = `${at}.detectors[${di}]`;
+      const did = str(d.id);
+      if (!ID_RE.test(did)) { errors.push(`${dat}.id is required (${ID_RE})`); return; }
+      if (detectors.some(x => x.id === did)) errors.push(`${dat}: duplicate detector ${did}`);
+      const normal = str(d.normal);
+      if (!normal) errors.push(`${dat} ${did}: normal is required (the state the detector looks for)`);
+      const ladder = strs(d.normalize);
+      for (const a of ladder) if (!subActions.includes(a)) errors.push(`${dat} ${did}: normalize step ${a} is not one of this sub's actions (${subActions.join(', ') || '—'})`);
+      const by = str(d.by) || null;
+      if (by && !ID_RE.test(by)) errors.push(`${dat} ${did}: by ${by} is not an agent / trigger id`);
+      let escalate: AgentSubDetector['escalate'] = null;
+      const esc = isObj(d.escalate) ? d.escalate : null;
+      if (esc) {
+        const to = str(esc.to);
+        if (!ESC_TO_RE.test(to)) errors.push(`${dat} ${did}: escalate.to must be owner | l0 | a seat id (got ${to || '—'})`);
+        const sla = esc.sla_min === undefined ? null : resolve(esc.sla_min, `${dat}.escalate.sla_min`);
+        // the executor of a delegated detector (`by:`) owns its SLA in its own agent.yaml — only the guardian's own need one here
+        if (!sla && !by) errors.push(`${dat} ${did}: escalate.sla_min ($policies.<name>) is required — «not normal after the SLA» must escalate`);
+        escalate = { to, slaMin: sla?.n ?? null };
+      }
+      const outOfPolicy = str(d.out_of_policy) || null;
+      if (!ladder.length && !escalate) errors.push(`${dat} ${did}: declares neither a normalize ladder nor an escalation — a detector that only sees is refused (DETECT-TO-ACTION)`);
+      if (outOfPolicy && !escalate) errors.push(`${dat} ${did}: out_of_policy needs escalate (who decides what the agent may not)`);
+      detectors.push({ id: did, normal, normalize: ladder, outOfPolicy, escalate, by });
+    });
+    if (!detectors.length) errors.push(`${at}.detectors needs at least one detector (what this sub looks at)`);
+    if (s.peer_watch !== undefined) errors.push(`${at}.peer_watch is gone (LOOP-AGENTS-AS-PLUGINS P1) — a silent peer is the trigger registry's (goal deadline → retry → owner card) · a KPI read is kpi_rollup:`);
+    const pw = s.kpi_rollup === undefined ? null : parseKpiRollup(s.kpi_rollup, (v, a) => resolve(v, a)?.n ?? null, `${at}.kpi_rollup`);
+    if (pw) errors.push(...pw.errors);
+    // CODE-BODY-TO-KIND: `kind:` names the shared sub kind · its params are the block named after it (kpi_rollup · resource_check)
+    const kind = str(s.kind) || null;
+    if (kind && !Object.hasOwn(SUB_KINDS, kind)) errors.push(`${at}.kind ${kind} is not a sub kind of this install (${Object.keys(SUB_KINDS).join(' · ')})`);
+    if (kind) usedKinds.add(kind);
+    for (const [k, block] of Object.entries(SUB_KINDS)) if (s[block] !== undefined && kind !== k) errors.push(`${at}.${block} needs kind: ${k}`);
+    if (kind && Object.hasOwn(SUB_KINDS, kind) && s[SUB_KINDS[kind]!] === undefined) errors.push(`${at}: kind ${kind} needs its ${SUB_KINDS[kind]} block`);
+    const rc = s.resource_check === undefined ? null
+      : parseResourceCheck(s.resource_check, (v, a) => resolve(v, a)?.n ?? null, { actions: subActions, detectors: detectors.map(d => d.id) }, `${at}.resource_check`);
+    if (rc) errors.push(...rc.errors);
+    const resource = s.resource === undefined ? 'local' : str(s.resource);
+    if (resource !== 'hosts' && resource !== 'local') errors.push(`${at}.resource must be hosts | local`);
+    return { name: str(s.name) || null, duty, absorbs: strs(s.absorbs), actions: subActions, policies: pols, kpi,
+      everyMin: every?.n ?? null, ttlMin: ttl?.n ?? null, events, detectors, kpiRollup: pw?.spec ?? null,
+      kind, resourceCheck: rc?.spec ?? null, resource: resource === 'hosts' ? 'hosts' : 'local' };
+  };
   const subs = (Array.isArray(j.subs) ? j.subs : []).flatMap((raw, i) => {
     const s = isObj(raw) ? raw : {}; const sid = str(s.id); const node = str(s.node);
     if (!ID_RE.test(sid)) { errors.push(`subs[${i}].id is required`); return []; }
     if (node && !ids.has(node)) errors.push(`subs[${i}] ${sid}: node ${node} is not a body node`);
     const kh = str(s.knowhow);
     if (kh) readRef(dir, kh, `subs[${i}].knowhow`, errors);
-    return [{ id: sid, node, knowhow: kh || null }];
+    return [{ id: sid, node, knowhow: kh || null, ...subFull(s, `subs[${i}] ${sid}`) }];
   });
+  for (const [i, s] of subs.entries()) if (subs.findIndex(x => x.id === s.id) !== i) errors.push(`subs[${i}]: duplicate sub ${s.id}`);
 
   // requires.node_kinds ⇔ kinds used (an undeclared kind is a package that lies about its requirements)
   for (const k of usedKinds) if (k && !reqKinds.has(k)) errors.push(`node kind ${k} is used but not declared in manifest.requires.node_kinds`);
@@ -346,16 +482,60 @@ export function lintAgentYaml(text: string, dir: string, env: LintEnv = {}): Lin
     else if (!actions.some(x => x.id === a.fallback)) errors.push(`actions ${a.id}: fallback ${a.fallback} is not a declared action`);
     else if (card && !card.actions.includes(a.fallback)) errors.push(`actions ${a.id}: fallback ${a.fallback} is not a card right (card.actions)`);
   }
+  // GUARDIAN-SUBS: a sub's rights are agent actions (the plan and the journal speak the same ids)
+  if (actions.length) for (const s of subs) for (const a of s.actions ?? []) if (!actions.some(x => x.id === a)) errors.push(`subs ${s.id}: action ${a} is not declared under actions:`);
   if (nodes.some(n => n.kind === 'plan')) {
     if (!actions.length) errors.push('plan node needs actions: (what the plan may choose)');
     else if (actions.filter(a => a.isDefault).length !== 1) errors.push('actions: exactly one action must be default: true (the plan\'s prior)');
   } else if (actions.length) warnings.push('actions: declared but no plan node — the default action always runs');
 
+  // ── bus (CONTEXT-BUS-FEDERATION ③ · kit/bus-post): notices only — a request / ✋ is never a bus notice ──
+  let bus: { notices: string[] } | null = null;
+  if (j.bus !== undefined) {
+    const bb = isObj(j.bus) ? j.bus : {};
+    const notices = strs(bb.notices);
+    const NOTICE_KINDS = ['info', 'status'];
+    for (const k of notices) if (!NOTICE_KINDS.includes(k)) errors.push(`bus.notices: ${k} is not a notice kind (${NOTICE_KINDS.join('|')}) — requests and ✋ stay mail`);
+    if (!notices.length) errors.push('bus.notices needs at least one mail kind (info | status)');
+    if (!nodes.some(n => n.kind === 'bus-post')) errors.push('bus: declared but no bus-post node in body — add { kind: bus-post, optional: true }');
+    bus = { notices };
+  }
+
+  // ── authority (SUPERVISORS-EXECUTE-NOT-PROPOSE): every executed act is a declared action with a declared undo and limits ──
+  let authority: AgentAuthority | null = null;
+  if (j.authority !== undefined) {
+    const au = isObj(j.authority) ? j.authority : {};
+    const executes = strs(au.executes); const limits = strs(au.limits);
+    const undoRaw = isObj(au.undo) ? au.undo : {};
+    const undo: Record<string, string> = Object.fromEntries(Object.entries(undoRaw).map(([k, x]) => [k, str(x)]));
+    const declared = (a: string) => actions.some(x => x.id === a) || !!card?.actions.includes(a) || nodes.some(n => nodeKind(n.kind)?.acts?.includes(a));
+    if (!executes.length) errors.push('authority.executes needs at least one action it runs itself');
+    // `observe-only` = the act writes only receipts in the test universe / evidence (nothing to reverse)
+    for (const a of executes) {
+      if (!declared(a)) errors.push(`authority.executes: ${a} is not a declared action (actions: / card.actions)`);
+      if (!undo[a]) errors.push(`authority.undo: ${a} needs its reverse action (every executed act is reversible)`);
+      else if (undo[a] !== 'observe-only' && !declared(undo[a]!)) errors.push(`authority.undo: ${a} → ${undo[a]} is not a declared action (or observe-only)`);
+    }
+    if (!limits.length) errors.push('authority.limits needs at least one policy that bounds the acts (cap · TTL · grace)');
+    for (const l of limits) { used.add(l); if (!Object.hasOwn(policies, l)) errors.push(`authority.limits: ${l} is not under policies:`); }
+    if (au.respect_hold !== undefined && typeof au.respect_hold !== 'boolean') errors.push('authority.respect_hold must be true or false');
+    authority = { executes, undo, limits, respectHold: au.respect_hold !== false };
+  }
+
   // ── voice · memory · budget · levels ──
   const v = isObj(j.voice) ? j.voice : {};
   const ble = v.breach_line_every_min === undefined ? null : resolve(v.breach_line_every_min, 'voice.breach_line_every_min');
   const voice = { channel: str(v.channel) || `loop:${id}`, speakOn: strs(v.speak_on), breachLineEveryMin: ble?.n ?? null, mail: str(v.mail) || 'l0-only',
-    terminalOwner: v.terminal_owner === true, perHourMax: typeof v.per_hour_max === 'number' ? v.per_hour_max : 0 };
+    terminalOwner: v.terminal_owner === true, perHourMax: typeof v.per_hour_max === 'number' ? v.per_hour_max : 0,
+    ...(str(v.line) ? { line: str(v.line) } : {}), ...(str(v.l0_card) ? { l0Card: str(v.l0_card) } : {}) };
+  // CODE-BODY-TO-KIND: the kpi-voice kind speaks only what the YAML says — every KPI needs from · key · breach, the voice a line
+  if (nodes.some(n => n.kind === 'kpi-voice')) {
+    for (const k of kpis) if (!k.from || !k.key || !k.breach) errors.push(`kpis ${k.name}: the kpi-voice node needs from · key · breach (the breach line template)`);
+    for (const k of kpis) if (k.fromFile || k.fromWhere) errors.push(`kpis ${k.name}: the kpi-voice node reads its own metrics — from must be a dotted path (no file · where)`);
+    if (new Set(kpis.map(k => k.key)).size !== kpis.length) errors.push('kpis: duplicate breach key (kpi-voice keeps one cursor per key)');
+    if (!voice.line) errors.push('voice.line is required by the kpi-voice node (the channel line template · {breach} {time})');
+    if (actions.some(a => a.target === 'l0' && a.channel === 'mail') && !voice.l0Card) errors.push('voice.l0_card is required by the kpi-voice node when an action mails the L0');
+  }
   const mem = isObj(j.memory) ? j.memory : {};
   if (!str(ident.soul)) errors.push('identity.soul (soul.md in the agent dir) is required — an agent without a soul card is a script');
   const soulText = readRef(dir, str(ident.soul), 'identity.soul', errors);
@@ -387,7 +567,7 @@ export function lintAgentYaml(text: string, dir: string, env: LintEnv = {}): Lin
     id, address, name: name || id, version, description: str(man.description), rank: str(ident.rank), supervisor, goal: str(j.goal),
     policies, kpis, doneWhen: strs(j.done_when), neverAuto: strs(j.never_auto), wake,
     body: { entry, terminal, nodes, edges }, voice, subs, budget: { llmTurnsPerHour: typeof bud.llm_turns_per_hour === 'number' ? bud.llm_turns_per_hour : 0 },
-    levels: { start, values: levelValues }, actions, soulText, soul, knowhowText, card,
+    levels: { start, values: levelValues }, actions, soulText, soul, knowhowText, card, bus, authority,
   } : null;
   return { ok: ok && !!compiled, id: id || null, errors, warnings, compiled };
 }

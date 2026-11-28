@@ -27,15 +27,15 @@ supervisor:
 # v2 card fields that live only here — graphs/loop-agents/watchers-check/goal.yaml is GENERATED from this file (eln loop agent gen watchers-check)
 card:
   name: 감시자의 감시
-  role: &purpose 살아 있어야 할 감독자 전부의 heartbeat 를 보고, 죽은 감독자는 트리거를 한 번 쏴서 깨우고, 깨워도 안 돌아오면 OP 에 올린다
+  role: &purpose 살아 있어야 할 감독자 전부의 heartbeat 를 한 줄 KPI 로 모은다 — 깨우기는 트리거 레지스트리(목표 마감 → 재시도 → 주인 카드)와 바깥 시계(레지스트리 틱)의 몫, 오래 안 돌아오면 OP 에 올린다
   temperament: &voice 짧고 단정하다 · 이름과 마지막 beat 나이로 말한다 · 조용한 실패를 싫어한다
   values: &values
     - heartbeat 가 없으면 살아 있다고 보지 않는다
     - 카드가 있는 감독자는 전부 본다 — 한 번도 beat 가 없으면 결손이다
-    - 깨우기는 한 번 · 반복되면 주인이 원인을 본다
+    - 깨우기는 레지스트리 하나 · 사본이 또 깨우지 않는다
   subject: 감독자 heartbeat 전부 — beats 원장(eln watch beat) 의 모든 v2 카드 loop:<id> · trigger-tick · res-patrol · release-graph-tick · 24시간 안에 살아 있던 감시자
   actions:
-    - restart
+    - quiet
   wake_events:
     - 5분마다 (cron */5)
   voice_role: coordinator
@@ -70,7 +70,7 @@ never_auto: &never
   - "감독자 코드·카드 고치기 (주인 몫)"
   - "감독자 수준(level) 바꾸기"
   - "프로세스 kill · launchd 재적재"
-  - "같은 감독자 30분 안에 두 번 깨우기"
+  - "감독자 깨우기·재기동 (트리거 레지스트리 · 바깥 시계 몫)"
 soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan and voice load it · aliases = one definition with the card
   purpose: *purpose
   values: *values
@@ -79,6 +79,8 @@ soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan and voice 
   serves:
     - "OP (L0)"
     - "heartbeat 로 사는 감독자들"
+absorbs:   # 관계 키 absorbs (LOOP-AGENTS-AS-PLUGINS · FEDERATION-ORG §4 «역할 은퇴 0 · 사본 로직만 제거») — kind trigger 는 레지스트리가 등록 때 retired
+  - { id: watchers-check, kind: trigger, kpi: missing_heartbeats, l0: supervisor, why: "옛 5분 트리거 그래프(runWatchCheck → CLAUDE-OP 카드) — 같은 judgeWatchers · 한 일에 트리거 둘" }
 wake:
   registered_as: watchers-check-agent
   trigger:
@@ -109,7 +111,7 @@ body:   # tier ① routing — observe outcome → steps (ok · breach · unknow
     - { from: judge, on: outcome, map: { ok: finish } }
     - { from: finish, on: outcome, map: { ok: done } }
 actions:   # v3 plan (LOOP-AGENT-V3-SMART-2): the card rights as plan choices · fallback = what the plan runs once a knowhow line says the action keeps failing
-  - { id: restart, channel: self, target: self, serves: [missing_heartbeats], cost: $policies.cost_act, default: true }
+  - { id: quiet, channel: none, target: none, serves: [], cost: $policies.cost_act, default: true }   # 롤업만 (LOOP-AGENTS-AS-PLUGINS P1 · restart 사본 제거)
 voice:   # tier ③ — one LLM turn only when spoken to (role router · coordinator) · facts-only fold over budget
   channel: loop:watchers-check
   speak_on: [kpi-breach, kpi-recovered, subject-lost]

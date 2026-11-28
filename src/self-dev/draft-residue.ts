@@ -3,6 +3,7 @@ import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { basename, dirname, join } from 'node:path';
 import { findGitDir } from '../git-fs/locate.js';
+import { readRemoteUrl } from '../git-fs/origin-url.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { PR_LABELS, PR_LABEL_NAMES } from '../github/pr-labels.js';
 import { appendRunLedgerEntry, listRunLedgers, loadRunLedger, runLedgerDir, type RunLedgerEntry } from '../self-implement/run-ledger.js';
@@ -365,8 +366,9 @@ export function podTerminalPrBody(disposition: PodTerminalInput['disposition']):
 function hostRepository(): string | null {
   const root = findGitDir(process.cwd())?.root;
   if (!root) return null;
-  const result = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: root, encoding: 'utf8', timeout: 60_000 });
-  const match = result.status === 0 ? /^(?:https:\/\/github\.com\/|git@github\.com:)([\w.-]+\/[\w.-]+?)(?:\.git)?\/?\s*$/.exec(result.stdout) : null;
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+  const url = readRemoteUrl(root, { timeoutMs: 60_000 });
+  const match = url !== null ? /^(?:https:\/\/github\.com\/|git@github\.com:)([\w.-]+\/[\w.-]+?)(?:\.git)?\/?\s*$/.exec(url) : null;
   return match?.[1] ?? null;
 }
 

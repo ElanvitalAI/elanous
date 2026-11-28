@@ -129,6 +129,9 @@ describe('fed-org registration', () => {
     ]);
     expect(pack.scenarios.filter((row: { module: string }) => row.module !== 'src/ux-sim/sim-world/fed-org/scenarios.ts').map((row: { id: string; module: string }) => `${row.id}@${row.module}`)).toEqual([
       'KIT-KPI-WINDOW-EVENT-TIME@src/ux-sim/sim-world/fed-org/kit-kpi.ts', 'KIT-KPI-RAW-JUDGMENT@src/ux-sim/sim-world/fed-org/kit-kpi.ts', 'KIT-KPI-BREACH-DEBOUNCE@src/ux-sim/sim-world/fed-org/kit-kpi.ts',
+      // CONTEXT-BUS-FEDERATION (0.3.39 P0)
+      'CTX-BUS-DECIDE@src/ux-sim/sim-world/fed-org/context-bus.ts', 'CTX-BUS-HQ-HANDOFF@src/ux-sim/sim-world/fed-org/context-bus.ts', 'CTX-BUS-RAW-CONTEXT@src/ux-sim/sim-world/fed-org/context-bus.ts',
+      'CTX-BUS-LOOP-STATUS@src/ux-sim/sim-world/fed-org/context-bus.ts', 'CTX-BUS-FALLBACK@src/ux-sim/sim-world/fed-org/context-bus.ts',
     ]);
     expect(simWorldScenarios.map((s) => s.id)).toEqual(own.map((row: { id: string }) => row.id));
   });

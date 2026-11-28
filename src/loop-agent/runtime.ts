@@ -54,6 +54,8 @@ export interface AgentPorts {
   readonly llm?: VoiceLlm | null;
   /** SUPERVISOR-CORRECTION-JOURNAL rollup sink (live: OP 30-min digest ⊕ ws:supervisors) · omitted = no rollup lines. */
   readonly rollup?: import('./journal.js').RollupSink;
+  /** SUPERVISORS-EXECUTE-NOT-PROPOSE: the active HOLD over an act's target («<id> (<owner>)») · null = none · absent = no ledger. */
+  holdOn?(target: string, now: Date): string | null;
 }
 
 export interface TickReport {
@@ -61,6 +63,8 @@ export interface TickReport {
   readonly kpi: number | null; readonly kpiOk: boolean | null; readonly kpiLine: string;
   readonly subjects: number; readonly planned: number;
   readonly acted: string[]; readonly refused: string[]; readonly failed: string[];
+  /** DETECT-TO-ACTION: planned but waiting (cooldown · parked streak) with the reason — not refused, not acted. */
+  readonly deferred?: string[];
   readonly breach: 'new' | 'ongoing' | 'recovered' | null; readonly escalated: boolean;
   readonly candidates: string[]; readonly promoted: string[]; readonly error?: string;
   /** The subject could not be read SUBJECT_LOST_TICKS ticks in a row → a reattach proposal went to the L0 (once per episode). */
@@ -113,7 +117,7 @@ export function isParked(state: AgentState, key: string, now: Date): boolean {
 }
 
 /** Run one action through the rights gate (closed set ⊕ policy-narrowed ⊕ cooldown) and record it. */
-export async function runAction(card: AgentCard, body: AgentBody, ports: AgentPorts, ctx: BodyCtx, obs: Observation, pa: PlannedAction, by: string, opts: { ignoreCooldown?: boolean } = {}): Promise<{ status: 'acted' | 'refused' | 'failed' | 'cooldown' | 'parked'; line: string; ref?: string; journal?: JournalRow }> {
+export async function runAction(card: AgentCard, body: AgentBody, ports: AgentPorts, ctx: BodyCtx, obs: Observation, pa: PlannedAction, by: string, opts: { ignoreCooldown?: boolean } = {}): Promise<{ status: 'acted' | 'refused' | 'failed' | 'cooldown' | 'parked' | 'held'; line: string; ref?: string; journal?: JournalRow }> {
   const mem = ports.memory; const at = ctx.now.toISOString();
   const def = body.actions[pa.action];
   if (!def || !card.rights.actions.includes(pa.action)) {
@@ -122,6 +126,17 @@ export async function runAction(card: AgentCard, body: AgentBody, ports: AgentPo
     return { status: 'refused', line, journal: journalRow(card, at, 'refused', pa, line, by, obs, null) };
   }
   const key = `${pa.action}:${pa.target}`;
+  // SUPERVISORS-EXECUTE-NOT-PROPOSE: an act the agent runs itself (agent.yaml authority.executes) waits under an active HOLD
+  // over its target — journaled «held», retried next tick (no cooldown taken). An unreadable ledger holds too (fail-closed).
+  if (card.authority?.respectHold && card.authority.executes.includes(pa.action)) {
+    let hold: string | null;
+    try { hold = ports.holdOn?.(pa.target, ctx.now) ?? null; } catch (e) { hold = `hold ledger unreadable (${e instanceof Error ? e.message : String(e)})`.slice(0, 120); }
+    if (hold) {
+      const line = `${key}: HOLD ${hold} — 실행 안 함(풀리면 다음 틱)`;
+      mem.appendCase({ at, kind: 'act-held', subject: key, why: `${line} · ${pa.why}`, decidedBy: by, supervisedBy: card.supervisor });
+      return { status: 'held', line, journal: journalRow(card, at, 'refused', pa, line, by, obs, null) };
+    }
+  }
   const last = ctx.state.acted[key];
   if (!opts.ignoreCooldown && last && ctx.now.getTime() - Date.parse(last) < card.rights.cooldownMin * 60_000)
     return { status: 'cooldown', line: `${key}: ${card.rights.cooldownMin}분 쿨다운 안 (마지막 ${last.slice(11, 16)}Z)` };
@@ -158,6 +173,14 @@ function journalRow(card: AgentCard, at: string, status: JournalRow['status'], p
     evidence: [`case:${card.id}@${at}`, ...(r?.ref ? [r.ref] : [])], undo: r?.undo ?? null, source: by === card.address ? 'tick' : 'voice', by };
 }
 
+/** DETECT-TO-ACTION: « · 대기 N(쿨다운 a:b 12:04Z…)» — a waiting action says why, so a flat KPI with «행동 0» reads as
+ *  «my next step is due at …», never as an unexplained refusal. */
+export function deferredLine(deferred: readonly string[]): string {
+  if (!deferred.length) return '';
+  const cool = deferred.filter(d => d.includes('쿨다운')).length;
+  return ` · 대기 ${deferred.length}(${cool ? `쿨다운 ${cool}` : ''}${cool && deferred.length > cool ? ' · ' : ''}${deferred.length > cool ? `멈춤 ${deferred.length - cool}` : ''} — ${deferred[0]!.slice(0, 120)})`;
+}
+
 /** One wake of the body (the trigger runs this). */
 /** The steps one tick walks (LOOP-AGENT v3 · agent.yaml `body:` names them as node kinds `loop-agent.<step>`). */
 export const TICK_STEPS = ['observe', 'act', 'learn', 'judge', 'finish'] as const;
@@ -188,6 +211,8 @@ interface TickRun {
   obs: Observation | null; ok: boolean | null; err: string | null; subjectLost: boolean;
   plan: PlannedAction[]; acted: string[]; refused: string[]; failed: string[]; candidates: string[]; promoted: string[]; journal: JournalRow[];
   breach: TickReport['breach']; escalated: boolean; walked: string[];
+  /** DETECT-TO-ACTION: why each planned action waits (cooldown · parked) — the 11-27 journals counted these as «거절». */
+  deferred: string[];
 }
 
 const STEP: Readonly<Record<TickStep, (r: TickRun) => Promise<StepOutcome>>> = {
@@ -229,7 +254,8 @@ const STEP: Readonly<Record<TickStep, (r: TickRun) => Promise<StepOutcome>>> = {
     for (const [k, v] of Object.entries(state.failStreak ?? {})) if (now.getTime() - Date.parse(v.since) > PARK_KEEP_DAYS * 86_400_000) delete state.failStreak![k];
     for (const pa of r.plan) {
       const res = await runAction(card, r.body, ports, ctx, obs, pa, card.address);
-      (res.status === 'acted' ? r.acted : res.status === 'failed' ? r.failed : r.refused).push(`${pa.action}:${pa.target}`);
+      if (res.status === 'cooldown' || res.status === 'parked' || res.status === 'held') r.deferred.push(res.line); // the line names the key and why («a:b: 60분 쿨다운 안 (마지막 21:28Z)»)
+      else (res.status === 'acted' ? r.acted : res.status === 'failed' ? r.failed : r.refused).push(`${pa.action}:${pa.target}`);
       // v3 (LOOP-AGENT-V3-SMART-2): every decided action is an outcome row the reflection reads — a failure carries its cause
       if (r.smart && (res.status === 'acted' || res.status === 'failed')) r.smartRows.push({ at, intent: shellIntent(obs.subjects.find(x => x.id === pa.target)?.kind), action: pa.action, to: 'self', key: `${pa.action}:${pa.target}:${at}`,
         outcome: res.status === 'acted' ? 'acted' : 'unacted', resolvedAt: at, ...(res.status === 'failed' ? { cause: failureCause(res.line, pa.target) } : {}) });
@@ -289,7 +315,7 @@ const STEP: Readonly<Record<TickStep, (r: TickRun) => Promise<StepOutcome>>> = {
     // SUPERVISOR-CORRECTION-JOURNAL — one line per correction ⊕ the rollup of windows that ended (OP digest ⊕ ws:supervisors)
     try { appendJournal(mem.root, r.journal); } catch { /* fail-soft: the cases row keeps it */ }
     if (ports.rollup) { try { emitWindowRollups(mem.root, card.id, r.now, ports.rollup); } catch { /* fail-soft */ } }
-    mem.appendCase({ at, kind: 'tick', subject: card.kpi.name, why: `${kpiLine(card.kpi, obs.kpi)} · 대상 ${obs.subjects.length} · 행동 ${r.acted.length}/${r.plan.length}${r.refused.length ? ` · 거절 ${r.refused.length}` : ''}${r.failed.length ? ` · 실패 ${r.failed.length}` : ''}`,
+    mem.appendCase({ at, kind: 'tick', subject: card.kpi.name, why: `${kpiLine(card.kpi, obs.kpi)} · 대상 ${obs.subjects.length} · 행동 ${r.acted.length}/${r.plan.length}${r.refused.length ? ` · 거절 ${r.refused.length}` : ''}${r.failed.length ? ` · 실패 ${r.failed.length}` : ''}${deferredLine(r.deferred)}`,
       decidedBy: card.address, supervisedBy: card.supervisor, extra: { level: r.lvl, ...(r.walked.join('>') !== 'observe>act>learn>judge>finish' ? { walked: r.walked } : {}) } });
     ports.beat({ name: beatName(card.id), saw: obs.subjects.length, everyMin: card.heartbeatEveryMin, last: at });
     if (r.smart?.cfg.retro) smartRetro(r);
@@ -352,10 +378,10 @@ export function writeRetro(i: { memory: AgentMemory; card: Pick<AgentCard, 'id' 
 
 /** One wake of the body (the trigger runs this). `opts.graph` = the agent.yaml body · `opts.policies` = its resolved policies. */
 export async function tickAgent(baseCard: AgentCard, body: AgentBody, ports: AgentPorts, now = new Date(), opts: { graph?: TickGraph; policies?: Readonly<Record<string, number>>; smart?: ShellSmart | null } = {}): Promise<TickReport> {
-  return withPolicies(opts.policies, async () => {
+  return withPolicies(opts.policies ?? baseCard.policies, async () => {
     const mem = ports.memory; const card = nowCard(baseCard, mem); const at = now.toISOString();
     const r: TickRun = { card, body, ports, now, at, lvl: levelOf(card, mem).level, state: mem.readState(), ctx: null, obs: null, ok: null, err: null, subjectLost: false,
-      plan: [], acted: [], refused: [], failed: [], candidates: [], promoted: [], journal: [], breach: null, escalated: false, walked: [],
+      plan: [], acted: [], refused: [], failed: [], candidates: [], promoted: [], journal: [], breach: null, escalated: false, walked: [], deferred: [],
       smart: opts.smart ?? null, planOut: null, smartRows: [], learned: null, retro: null };
     const g = opts.graph ?? DEFAULT_TICK_GRAPH;
     const visits = new Map<string, number>();
@@ -375,7 +401,7 @@ export async function tickAgent(baseCard: AgentCard, body: AgentBody, ports: Age
     if (r.lvl === 'off') return { ...base, subjects: 0, planned: 0, acted: [], refused: [], failed: [], kpi: null, kpiOk: null, kpiLine: kpiLine(card.kpi, null), breach: null, escalated: false };
     if (r.err !== null) return { ...base, subjects: 0, planned: 0, acted: [], refused: [], failed: [], kpi: null, kpiOk: null, kpiLine: kpiLine(card.kpi, null), breach: null, escalated: false, error: r.err, ...(r.subjectLost ? { subjectLost: true } : {}) };
     const kpi = r.obs?.kpi ?? null;
-    return { ...base, kpi, kpiOk: r.ok, kpiLine: kpiLine(card.kpi, kpi), subjects: r.obs?.subjects.length ?? 0, planned: r.plan.length, acted: r.acted, refused: r.refused, failed: r.failed,
+    return { ...base, kpi, kpiOk: r.ok, kpiLine: kpiLine(card.kpi, kpi), subjects: r.obs?.subjects.length ?? 0, planned: r.plan.length, acted: r.acted, refused: r.refused, failed: r.failed, ...(r.deferred.length ? { deferred: r.deferred } : {}),
       breach: r.breach, escalated: r.escalated, ...(r.subjectLost ? { subjectLost: true } : {}),
       ...(r.planOut ? { plan: r.planOut } : {}), ...(r.learned && (r.learned.created.length || r.learned.promoted.length) ? { learned: r.learned } : {}), ...(r.retro ? { retro: retroLine(r.retro) } : {}) };
   });
@@ -454,7 +480,7 @@ export function foldedReply(card: AgentCard, obs: Observation | null, state: Age
 }
 
 export async function voiceAgent(deps: VoiceDeps, msg: VoiceMessage): Promise<VoiceResult> {
-  return withPolicies(deps.policies, () => voiceAgentTurn(deps, msg));
+  return withPolicies(deps.policies ?? deps.card.policies, () => voiceAgentTurn(deps, msg));
 }
 async function voiceAgentTurn(deps: VoiceDeps, msg: VoiceMessage): Promise<VoiceResult> {
   const { body, ports } = deps; const mem = ports.memory; const now = deps.now ?? new Date();

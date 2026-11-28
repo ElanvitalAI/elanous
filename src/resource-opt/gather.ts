@@ -45,7 +45,9 @@ export async function gatherMatchingTable(opts: { seat: string; hqRoot?: string;
     const { releaseLedgerRoot } = await import('../instance/resolve.js');
     items = listChecklist(version, releaseLedgerRoot()).items;
     cells = items.map((item) => ({ id: item.id, title: item.title, status: item.status, updatedAt: item.updatedAt,
-      ...(item.owner ? { owner: item.owner } : {}), ...(item.priority ? { priority: item.priority } : {}) }));
+      ...(item.owner ? { owner: item.owner } : {}), ...(item.priority ? { priority: item.priority } : {}),
+      ...(item.evidence ? { evidence: item.evidence } : {}), ...(item.updatedBy ? { updatedBy: item.updatedBy } : {}),
+      ...(item.writer ? { writer: { seat: item.writer.seat, at: item.writer.at } } : {}) }));
   } catch (error) { unmeasured.push(`checklist(${short(error)})`); }
 
   let prs: PrIn[] = [];
@@ -76,7 +78,25 @@ export async function gatherMatchingTable(opts: { seat: string; hqRoot?: string;
     isJudge = (seat) => isJudgeRole(seat, { roleOf: (s) => org.seats[s.toUpperCase()]?.role, ...(ladder ? { parentOf: (s: string) => ladder!.parentOf(s) } : {}) });
   } catch (error) { unmeasured.push(`org-roles(${short(error)})`); }
 
-  return buildMatchingTable({ now, version, hqSeat, ...(isJudge ? { isJudge } : {}), panes, cells, prs, greenLanes, judgeQueue, unmeasured, ...(opts.refused?.length ? { refused: opts.refused } : {}) });
+  // WORK-PULL-REACHES-ROSTER — the shared pull policy ⊕ OP's roster rank (unreadable policy → the pre-policy table, named).
+  let pull: { policy: import('../kit/work-pull/index.js').PullPolicy; rosterRank?: ReadonlyMap<string, number> } | undefined;
+  try {
+    const pp = await import('../kit/work-pull/index.js');
+    const { effectiveInstanceRoot } = await import('../instance/resolve.js');
+    const live = pp.livePullPolicy();
+    if (live.error) unmeasured.push(`pull-policy(${live.error.slice(0, 60)})`);
+    else { const rank = pp.rosterRank(pp.readRoster(effectiveInstanceRoot()), version); pull = { policy: live.policy, ...(rank ? { rosterRank: rank } : {}) }; }
+  } catch (error) { unmeasured.push(`pull-policy(${short(error)})`); }
+  // SEAT-AREA-GUARD — seat roles ⊕ areas (graphs/policies/seat-roles.yaml) over the full checklist rows (body · done-when).
+  let seatFit: ((seat: string, cellId: string) => { ok: boolean; area?: boolean }) | undefined;
+  try {
+    const sa = await import('../kit/seat-area/index.js');
+    const live = sa.liveSeatRoles();
+    if (live.error) unmeasured.push(`seat-roles(${live.error.slice(0, 60)})`);
+    const byId = new Map(items.map((item) => [item.id, item] as const));
+    seatFit = (seat, cellId) => { const item = byId.get(cellId); return item ? sa.seatTakesCell(seat, item, live.policy) : { ok: true }; };
+  } catch (error) { unmeasured.push(`seat-roles(${short(error)})`); }
+  return buildMatchingTable({ now, version, hqSeat, ...(isJudge ? { isJudge } : {}), panes, cells, prs, greenLanes, judgeQueue, unmeasured, ...(opts.refused?.length ? { refused: opts.refused } : {}), ...(pull ? { pull } : {}), ...(seatFit ? { seatFit } : {}) });
 }
 
 export const RESOURCE_OPT_TRIGGER = 'trigger';

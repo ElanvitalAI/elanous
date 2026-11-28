@@ -3,6 +3,10 @@
 # This file carries the butler's v3 smartness (reflect · plan · learn-knowhow over its HOLD-narrowing mail). The goal numbers
 # are still READ from goal.yaml (src/judge-butler/cards.ts) — the KPI targets below mirror it and a test keeps them equal,
 # because the body is being changed by other open PRs (#40402 · #40385 · #40410); the full migration follows them.
+# JUDGE-BUTLER-V3-LISTED (대표 11-28 15:3x): this file is the agent's source — the trigger registry builds the trigger from wake:
+# (graphs/triggers/judge-butler.yaml is only the tick shim) · the body runs through the shared door `eln loop agent judge-butler
+# tick` (node kind judge-butler.tick · src/loop-agent/v3/kind-runners.ts · `eln loop butler tick` is its alias) · `eln loop agent
+# list|status` read the KPIs below from last-tick.json (kpis[].from) · the trigger owner is the L0 (JUD) so its loop shows in JUD's space.
 apiVersion: elanous/loop-agent@3
 manifest:
   name: judge-butler
@@ -42,10 +46,12 @@ policies:
   cost_mail: 0.05
   cost_escalate_l0: 0.15
   cost_fold_digest: 0
+  e4_runs_per_tick: 3               # SUPERVISORS-EXECUTE-NOT-PROPOSE: the butler's own evidence runs per tick (E4 ⊕ named sim scenes · serial)
+  e4_retry_min: 60                  # the same cell's own run at most once in this window
 kpis:
-  - { name: greens_per_hour, at_least: $policies.greens_per_hour_min, unit: /h }
+  - { name: greens_per_hour, at_least: $policies.greens_per_hour_min, unit: /h, from: kpi.greensLastHour }
   - { name: judge_queue_median_wait, at_most: $policies.judge_queue_median_wait_max_min, unit: min }
-  - { name: frozen_hands, at_most: $policies.frozen_hands_max }
+  - { name: frozen_hands, at_most: $policies.frozen_hands_max, from: frozenHands }
   - { name: hand_answer_sla, at_most: $policies.hand_answer_sla_min, unit: min }
 never_auto: &never
   - security-4 paths
@@ -65,6 +71,7 @@ soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan (LLM judgm
     - "OP (초록 처리량)"
 wake:
   registered_as: judge-butler
+  owner: JUD                        # the trigger's exception-card owner = the L0 (duty veto) — its «↻ loops» row sits in JUD's space
   trigger:
     condition:
       predicate:
@@ -78,6 +85,7 @@ wake:
       cooldown_min: 2
       max_wait_min: 10
       on_max_wait: fire
+  failure: { goal_deadline_min: 30, max_attempts: 2, backoff_sec: [60] }   # the registry's goal deadline · attempts · backoff (was graphs/triggers/judge-butler.yaml)
 body:
   entry_node: tick
   terminal_nodes: [done, failed]
@@ -94,6 +102,11 @@ actions:                            # for one HOLD-narrowing proposal (security-
   - { id: mail, channel: mail, target: receiver, serves: [frozen_hands], cost: $policies.cost_mail, default: true }
   - { id: escalate-l0, channel: mail, target: l0, serves: [frozen_hands], cost: $policies.cost_escalate_l0 }
   - { id: fold-digest, channel: none, target: none, serves: [], cost: $policies.cost_fold_digest }
+authority:                          # SUPERVISORS-EXECUTE-NOT-PROPOSE (대표 11-28 17:3x) — signs and runs evidence itself; JUD keeps security-4 · its own verdicts · HOLD-named cells
+  executes: [sign-green, run-evidence, run-sim]
+  undo: { sign-green: veto, run-evidence: observe-only, run-sim: observe-only }
+  limits: [e4_runs_per_tick, e4_retry_min]
+  respect_hold: true                # a registered HOLD naming the cell → not signed (JUD's)
 voice:
   channel: loop:judge-butler
   speak_on: [kpi-breach]

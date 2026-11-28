@@ -90,7 +90,7 @@ describe('CLI overlap evidence path', () => {
           return { ok: true, out: value, err: '' };
         }
         if (cmd === 'gh') return { ok: false, out: '', err: 'external GitHub mutation stubbed in test' };
-        if (cmd === 'git' && args[0] === 'remote' && args[1] === 'get-url' && args[2] === 'origin') return { ok: true, out: 'https://github.com/example/repo.git', err: '' };
+        if (cmd === 'git' && args.join(' ') === 'config --get remote.origin.url') return { ok: true, out: 'https://github.com/example/repo.git', err: '' };
         if (cmd === 'git' && args[0] === 'ls-remote') return { ok: true, out: `${base}\trefs/heads/main\n`, err: '' };
         const result = spawnSync(cmd, [...args], { cwd: opts?.cwd ?? cwd, encoding: 'utf8' });
         return { ok: result.status === 0, out: result.stdout ?? '', err: result.stderr ?? '' };

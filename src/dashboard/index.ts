@@ -1385,7 +1385,7 @@ export function buildClassicDashboardTuiTurnTools(
   adapter: DashboardPluginRouteAdapter,
   options: Parameters<typeof buildSessionRuntimeToolSpecs>[0],
 ) {
-  return prioritizeDashboardTuiToolSearch(buildSessionRuntimeToolSpecs({ ...options, hostTools: adapter.classicHostTools(options.hostTools) }));
+  return buildSessionRuntimeToolSpecs({ ...options, hostTools: adapter.classicHostTools(options.hostTools) });
 }
 
 /** Tool-catalog assembly invoked by the production ACP-next chat-turn path. */
@@ -1393,10 +1393,9 @@ export function buildNextDashboardTuiTurnTools(
   adapter: DashboardPluginRouteAdapter,
   options: Parameters<typeof buildSessionRuntimeToolSpecs>[0],
 ) {
-  return prioritizeDashboardTuiToolSearch(buildSessionRuntimeToolSpecs({ ...options, hostTools: adapter.nextHostTools(options.hostTools) }));
+  return buildSessionRuntimeToolSpecs({ ...options, hostTools: adapter.nextHostTools(options.hostTools) });
 }
 import { registerDashboardPaneHostTools } from './panes/host-tools.js';
-import { dispatchClassicTuiTool, prioritizeDashboardTuiToolSearch } from './classic-tui-dispatch.js';
 import { type ThemeTokens } from '../theme/tokens.js';
 import { getActiveThemeName, resolveActiveTheme } from './render/theme-resolver.js';
 import { getTheme } from '../themes/index.js';
@@ -14253,7 +14252,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               uc.shell.allowDashboardPty === true && (acpPtyAvailable?.() ?? false),
             getToolRuntime: (toolName) => runtime.getToolRuntime(toolName),
             dispatchToolRuntime: (toolName, input, toolCallId) =>
-              dispatchClassicTuiTool(runtime.dispatchToolByName, toolName, input, {
+              runtime.dispatchToolByName(toolName, input, {
                 surface: 'tui',
                 parentSessionId: ctx?.sessionId,
                 toolCallId,
@@ -14300,7 +14299,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   acpDispatchToolSelf
                     ? acpDispatchToolSelf(childName, childArgs, ctx)
                     : Promise.resolve({ error: 'parent dispatcher unavailable' }),
-              }, acpTurnToolSpecs),
+              }),
             dispatchPluginTool: async (toolName, input) => pluginRouteAdapter.dispatch(toolName, input),
           });
           if (ctx?.callId && (name === 'Bash' || name === 'RunShell')) {

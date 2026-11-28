@@ -31,9 +31,10 @@ const P95_TEST_TIMEOUT_MS = 300_000;
 
 /** The one-line English hint the status line must show verbatim (UX-fixed wording — OP order ②). The status line is CUT
  *  TO THE WIDTH (attach-app.ts statusText · ELS-FIRST-RUN-FU3 ①): the build label (`0.3.34-dev.0 · dev · 261124_1154 · ` —
- *  version · channel · stamp, measured 11-24) rides left of the hint, so at 120 cols the `q quit · ? help` tail is the part
- *  that falls off — the FIRST_RUN_HINT literal itself (attach-view.ts) keeps it for the widths that fit. */
-export const FIRST_RUN_HINT = 'ctrl+b c new shell · a chat · s list · j/k move · x close · q';
+ *  version · channel · stamp, measured 11-24) rides left of the hint, so at 120 cols the tail of the hint falls off — the
+ *  row must show a leading part of this literal, at least «ctrl+b ? shortcuts · c new shell» (ELS-SHORTCUTS-POPUP puts it first). */
+export const FIRST_RUN_HINT = 'ctrl+b ? shortcuts · c new shell · a chat · s list · j/k move · x close · q quit';
+const HINT_KEPT = 'ctrl+b ? shortcuts · c new shell';
 /** The build label the status line puts left of the hint: `0.3.xx(-dev.y)? · dev · <스탬프> · ` (version · channel · stamp). */
 const BUILD_LABEL_PREFIX = /^\s*(?:\d+(?:\.\d+)+(?:-dev\.\d+)? · )?(?:dev · )?(?:\d{6}(?:_\d{4})? · )?/;
 
@@ -44,7 +45,8 @@ const isHintRow = (line: string): boolean => {
   if (!row.endsWith(buttons)) return false;
   const body = row.slice(0, row.length - buttons.length);
   const label = BUILD_LABEL_PREFIX.exec(body)?.[0] ?? '';
-  return body.slice(label.length).startsWith(FIRST_RUN_HINT) && body.slice(label.length + FIRST_RUN_HINT.length).trim() === '';
+  const shown = body.slice(label.length).trimEnd();
+  return shown.startsWith(HINT_KEPT) && FIRST_RUN_HINT.startsWith(shown);
 };
 
 /** The production ledger this test must never touch (~/.elanous/els/journal.json → ELANOUS_STATE_DIR). */

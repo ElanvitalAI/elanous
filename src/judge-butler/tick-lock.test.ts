@@ -34,8 +34,9 @@ describe('BUTLER-TICK-CADENCE — one tick at a time', () => {
     expect(existsSync(join(home, 'tick.lock'))).toBe(true);
   });
   test('the trigger wakes on checklist changes and at least every 10 min', () => {
-    const g = parse(readFileSync(join(import.meta.dir, '../../graphs/triggers/judge-butler.yaml'), 'utf8')) as { loop: { trigger: { condition: { predicate: { parts: Array<{ file: string }> }; max_wait_min: number; on_max_wait: string } } } };
-    const c = g.loop.trigger.condition;
+    // JUDGE-BUTLER-V3-LISTED: the trigger lives in agent.yaml wake: (graphs/triggers/judge-butler.yaml is only the tick shim)
+    const g = parse(readFileSync(join(import.meta.dir, '../../graphs/loop-agents/judge-butler/agent.yaml'), 'utf8')) as { wake: { trigger: { condition: { predicate: { parts: Array<{ file: string }> }; max_wait_min: number; on_max_wait: string } } } };
+    const c = g.wake.trigger.condition;
     expect(c.predicate.parts.map(p => p.file)).toContain('{stateRoot}/release/features.sqlite');
     expect(c.max_wait_min).toBeLessThanOrEqual(10); // 출처: 내부 문서 `LOOP-AGENT` §6 판정 집사(✋ 10분 SLA · goal.yaml hand_answer_sla_min) · #40365
     expect(c.on_max_wait).toBe('fire');

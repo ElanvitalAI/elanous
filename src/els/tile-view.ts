@@ -12,7 +12,7 @@ export const TILE_GRIDS: readonly TileGridSpec[] = ['auto', '2x2', '3x3', '4x3']
 export const MAX_TILES = 12;
 /** The tile refresh period: ~2 fps (memory read of each pane's screen, damage-only paint by the frame writer). */
 export const TILE_REFRESH_MS = 500;
-export const TILE_HELP = 'TILE · arrows/hjkl focus · Enter zoom · ctrl+b t back to tile · ctrl+b q quit';
+export const TILE_HELP = 'TILE · arrows/hjkl focus · Enter zoom · ctrl+b ? shortcuts · ctrl+b q quit';
 
 export interface TileInput {
   readonly pane: string;

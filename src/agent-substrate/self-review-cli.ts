@@ -42,6 +42,8 @@ import { decideReviewCapPolicy, REVIEW_CAP_R5_LIMIT, REVIEW_CAP_RELEASE_PATHS, r
 import { NEEDS_CLEAN_BRANCH_DELTA_REFUSALS } from './review-runner-guard.js';
 import { gitAt, type GitRun } from '../git-fs/smart-run.js';
 import { deltaSince, SHA40 } from '../git-smart/delta.js';
+import { mergeTree } from '../git-smart/merge-tree.js';
+import { remoteUrlVia } from '../git-fs/origin-url.js';
 
 /** SUBSCRIPTION-EXHAUST-REROUTE — API reviewer when the configured `roleLlm.reviewer` lane is unavailable (off codex). */
 export const ROLE_REVIEWER_FALLBACK_MODEL = 'openrouter/z-ai/glm-5.3';
@@ -622,13 +624,13 @@ export function classifyMainMergeOnlyCapExemptHead(
     const intermediateFirst = commitFields[1]!.toLowerCase();
     const intermediateMain = commitFields[2]!.toLowerCase();
     if (git(['merge-base', '--is-ancestor', intermediateMain, baseRefOid.toLowerCase()], 10_000).status !== 0) return undefined;
-    const intermediateTree = git(['merge-tree', '--write-tree', intermediateFirst, intermediateMain], 10_000);
+    const intermediateTree = mergeTree(args => git(args, 10_000), intermediateFirst, intermediateMain, [], []);
     const actualIntermediateTree = git(['rev-parse', `${commit.toLowerCase()}^{tree}`], 10_000);
     const expectedIntermediateTree = intermediateTree.stdout.trim().split(/\s+/)[0];
     if (intermediateTree.status !== 0 || !expectedIntermediateTree || actualIntermediateTree.status !== 0
       || actualIntermediateTree.stdout.trim().toLowerCase() !== expectedIntermediateTree.toLowerCase()) return undefined;
   }
-  const mergedTree = git(['merge-tree', '--write-tree', firstParent, mainParent], 10_000);
+  const mergedTree = mergeTree(args => git(args, 10_000), firstParent, mainParent, [], []);
   if (mergedTree.status !== 0) return undefined; // Conflicts require a human resolution and are not cap-exempt.
   const expectedTree = mergedTree.stdout.trim().split(/\s+/)[0];
   const actualTree = git(['rev-parse', `${head.toLowerCase()}^{tree}`], 10_000);
@@ -984,9 +986,9 @@ function prHeadRef(pr: string, deps: SelfReviewCliDeps): { branch: string; host:
 function localRemoteIdentity(deps: SelfReviewCliDeps): { host: RemoteAuthority; nameWithOwner: string } | null {
   const git = deps.git;
   if (!git) return null;
-  const url = git(['remote', 'get-url', 'origin'], 10_000);
-  if (url.status !== 0) return null;
-  const raw = url.stdout.trim();
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+  const raw = remoteUrlVia((argv) => { const r = git(argv, 10_000); return r.status === 0 ? r.stdout : null; });
+  if (!raw) return null;
   // ⛔⭐ **실제 호스트(authority)를 파싱해서** 검증한다(리뷰 must-fix ×2 · 2026-07-30).
   //    ⚠️ 초판은 전체 문자열 정규식이라 **경로 안의 github.com** 이 통과했다:
   //       https://gitlab.com/github.com/OWNER/REPO.git  ⇒ 비-GitHub 인데 GitHub 로 오인

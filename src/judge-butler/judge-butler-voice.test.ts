@@ -8,6 +8,8 @@ import { judgeButlerVoiceAdapter, parseLoopVoiceInput, speakerOf } from './voice
 import type { ButlerPorts, ButlerView } from './body.js';
 import { loadCards } from './cards.js';
 import { judgeCell, type CellIn, type PrFacts } from './done-when.js';
+/** JUDGE-GREEN-PR-BINDING: each fixture PR's body carries «칸: <its cell>». */
+const own = (...ids: string[]) => ({ declared: ids, title: [], branch: [], pipeline: [], selfDeclared: true, evidence: [] });
 import { butlerTarget } from './live.js';
 import { fileMemory } from './memory.js';
 import { buildVoicePrompt, parseVoice, type VoiceInbox, type VoiceLlm, type VoiceMessage } from './voice.js';
@@ -37,10 +39,11 @@ function world() {
     ['V-2', { id: 'V-2', title: 'V-2', status: 'yellow', owner: 'TC-H-2', evidence: `#40502 merged\n${e4('V-2')}`, updatedAt: '2026-11-27T00:10:00.000Z', updatedBy: 'TC' }], // eligible but signed by body first
     ['V-3', { id: 'V-3', title: 'V-3', status: 'yellow', owner: 'TC-H-3', evidence: `#40503 merged\n${e4('V-3')}`, updatedAt: '2026-11-27T00:10:00.000Z', updatedBy: 'TC' }], // security
   ]);
+  for (const c of cells.values()) Object.assign(c, { doneCriterion: 'Merged change with passing receipt' });
   const facts = new Map<number, PrFacts>([
-    [40501, { pr: 40501, merged: true, landedHead: h, receipt: null, files: ['src/a.ts'], securityFindings: [] }],
-    [40502, { pr: 40502, merged: true, landedHead: h, receipt: { head: h, dir: 'PREGATE-GREEN/40502-cccccccccccc-minim5', focusedFiles: 1, focused: { pass: 4, fail: 0 } }, files: ['src/b.ts'], securityFindings: [] }],
-    [40503, { pr: 40503, merged: true, landedHead: h, receipt: { head: h, dir: 'PREGATE-GREEN/40503-cccccccccccc-minim5', focusedFiles: 1, focused: { pass: 4, fail: 0 } }, files: ['src/secret/vault.ts'], securityFindings: [] }],
+    [40501, { pr: 40501, merged: true, landedHead: h, receipt: null, files: ['src/a.ts'], securityFindings: [], binding: own('V-1') }],
+    [40502, { pr: 40502, merged: true, landedHead: h, receipt: { head: h, dir: 'PREGATE-GREEN/40502-cccccccccccc-minim5', focusedFiles: 1, focused: { pass: 4, fail: 0 } }, files: ['src/b.ts'], securityFindings: [], binding: own('V-2') }],
+    [40503, { pr: 40503, merged: true, landedHead: h, receipt: { head: h, dir: 'PREGATE-GREEN/40503-cccccccccccc-minim5', focusedFiles: 1, focused: { pass: 4, fail: 0 } }, files: ['src/secret/vault.ts'], securityFindings: [], binding: own('V-3') }],
   ]);
   addHold(root, { owner: 'TC', cells: ['*'], reason: '격리 입증 전', unlock: 'TC go', by: 'TC' }, { now: new Date(now.getTime() - 60_000), fact: null });
   const posts: Array<{ key: string; to: string; body: string }> = [];
@@ -50,6 +53,8 @@ function world() {
     sign(id, evidence, _e, a) { const c = cells.get(id)!; Object.assign(c, { status: 'green', evidence, updatedBy: a.decidedBy }); },
     readCell: id => cells.get(id) ?? null,
     freshFacts: () => facts,
+    decomposeCriterion: async (_id, text) => ({ trusted: true, requirements: [{ id: 'R1', text, classification: 'must' }] }),
+    judgeCriterion: async input => ({ trusted: true, policyVersion: 'sim', requirements: input.requirements.map(req => ({ id: req.id, classification: 'must', fulfilled: true, evidenceIds: [input.evidence[0]!.id], reason: 'voice fixture' })) }),
     expireHolds: (by, unlockFacts) => expireDue(root, { by, unlockFacts }, { now, fact: null }),
     post(key, to, body) { if (posts.some(p => p.key === key)) return null; posts.push({ key, to, body }); return 7000 + posts.length; },
     answerHand: () => null, escalateHand: () => null,
@@ -123,6 +128,25 @@ describe('judge-butler voice — one LLM turn per message, actions only through 
     expect(p.user).toContain('보낸 이 CEO');
     expect(p.system).toContain('{"cmd":"sign","cell":"<칸>"}');
   });
+});
+
+// JUDGE-NOT-OVERSTRICT (대표 §판정·증거 11-22): an unavailable criterion judgment is not an unmet must — the voice sign lands on
+// the baseline (same-head receipt ⊕ focused exit 0) and files «V-2-FU» with the reason; a FU that cannot be filed still refuses.
+test('voice sign with the criterion judgment unavailable → green on the baseline + «<cell>-FU»', async () => {
+  const w = world(); const fu: Array<[string, string]> = [];
+  const ports = { ...w.ports, judgeCriterion: undefined, addFollowUp: (id: string, title: string) => { fu.push([id, title]); return true; } };
+  const reply = await voiceOnce({ view: w.view(), ports, llm: fakeLlm([]), cards: loadCards() }, m(500, 'OP', 'V-2 서명해'));
+  expect(reply.actions).toEqual(['sign:V-2']);
+  expect(w.cells.get('V-2')!.status).toBe('green');
+  expect(fu).toEqual([['V-2-FU', 'V-2 — 판정 미확인 부분 검증: 판정 LLM 불가 (no judgment port) (서명 근거 = 같은 head 영수 + focused exit 0 · 미재현 추론 = FU)']]);
+});
+test('voice sign refuses when the criterion FU cannot be filed', async () => {
+  const w = world();
+  const ports = { ...w.ports, judgeCriterion: undefined };
+  const reply = await voiceOnce({ view: w.view(), ports, llm: fakeLlm([]), cards: loadCards() }, m(501, 'OP', 'V-2 서명해'));
+  expect(reply.actions).toEqual(['sign-refused:V-2']);
+  expect(reply.reply).toContain('판정 FU 생성 실패: V-2-FU');
+  expect(w.cells.get('V-2')!.status).toBe('yellow');
 });
 
 describe('els channel loop-voice contract (PR #40331) — {loop,from,channel,text,refs,messageId} → {text,evidence[],actions[]}', () => {
@@ -231,8 +255,8 @@ describe('BUTLER-E4-AUTORUN ⊕ TARGET-VERSION', () => {
     for (let i = 4; i <= 8; i++) {
       const id = `V-${i}`; const pr = 40500 + i;
       const title = i <= 7 ? `${id}\n- 완료 경계 증거 명령: bun test src/x-${i}.test.ts` : id; // V-8 has no evidence command
-      w.cells.set(id, { id, title, status: 'yellow', owner: 'TC-H-4', evidence: `#${pr} merged`, updatedAt: '2026-11-27T00:10:00.000Z', updatedBy: 'TC' });
-      facts.set(pr, { pr, merged: true, landedHead: h, receipt: { head: h, dir: `PREGATE-GREEN/${pr}-cccccccccccc-minim5`, focusedFiles: 1, focused: { pass: 3, fail: 0 } }, files: [`src/x-${i}.ts`], securityFindings: [] });
+      w.cells.set(id, { id, title, doneCriterion: 'Merged change with passing receipt', status: 'yellow', owner: 'TC-H-4', evidence: `#${pr} merged`, updatedAt: '2026-11-27T00:10:00.000Z', updatedBy: 'TC' });
+      facts.set(pr, { pr, merged: true, landedHead: h, receipt: { head: h, dir: `PREGATE-GREEN/${pr}-cccccccccccc-minim5`, focusedFiles: 1, focused: { pass: 3, fail: 0 } }, files: [`src/x-${i}.ts`], securityFindings: [], binding: own(id) });
       (w.ports.merged as Set<number>).add(pr);
     }
     const runs: string[] = []; const fu: string[] = [];
@@ -306,11 +330,11 @@ describe('JUDGE-BUTLER-E4-RESIGN-SCOPE — a parent focused receipt never signs 
   const parentHead = '5d237548c458'.padEnd(40, '0');
   const e4run = (id: string) => `E4 sim 층 — runId fed-org-s1 · event: checklist.evidence.run · 2026-11-27T10:00:00Z · host node-b · 칸 ${id} · 명령: bun bin/elanous.mjs --test sim world run fed-org --seed 1 · rc 0`;
   const child = (id: string, evidence: string, updatedBy = 'cli', updatedAt = '2026-11-27T09:30:00.000Z') =>
-    ({ id, title: `${id.replace(/-E4$/u, '')} — E4 sim/test-universe evidence`, status: 'yellow', owner: 'OP', evidence, updatedAt, updatedBy });
+    ({ id, title: `${id.replace(/-E4$/u, '')} — E4 sim/test-universe evidence`, status: 'yellow', owner: 'OP', evidence, updatedAt, updatedBy, doneCriterion: 'E4 evidence and passing receipt' });
   const parentFacts = (w: ReturnType<typeof world>) => {
     const facts = w.view().prFacts as Map<number, PrFacts>;
-    facts.set(40445, { pr: 40445, merged: true, landedHead: parentHead, receipt: { head: parentHead, dir: 'PREGATE-GREEN/40445-5d237548c458-minim5', focusedFiles: 6, focused: { pass: 51, fail: 0 } }, files: ['src/fed-state/actions.ts'], securityFindings: [] });
-    facts.set(40463, { pr: 40463, merged: true, landedHead: 'cd0d3495ec59'.padEnd(40, '0'), receipt: { head: 'cd0d3495ec59'.padEnd(40, '0'), dir: 'PREGATE-GREEN/40463-cd0d3495ec59-node-b', focusedFiles: 1, focused: { pass: 6, fail: 0 } }, files: ['src/cli/pr-land-scope-revert-guard.test.ts'], securityFindings: [] });
+    facts.set(40445, { pr: 40445, merged: true, landedHead: parentHead, receipt: { head: parentHead, dir: 'PREGATE-GREEN/40445-5d237548c458-minim5', focusedFiles: 6, focused: { pass: 51, fail: 0 } }, files: ['src/fed-state/actions.ts'], securityFindings: [], binding: own('FED-FACT-OP-ACTIONS') });
+    facts.set(40463, { pr: 40463, merged: true, landedHead: 'cd0d3495ec59'.padEnd(40, '0'), receipt: { head: 'cd0d3495ec59'.padEnd(40, '0'), dir: 'PREGATE-GREEN/40463-cd0d3495ec59-node-b', focusedFiles: 1, focused: { pass: 6, fail: 0 } }, files: ['src/cli/pr-land-scope-revert-guard.test.ts'], securityFindings: [], binding: own('CX3-LAND-VERSION-REVERT') });
     (w.ports.merged as Set<number>).add(40445); (w.ports.merged as Set<number>).add(40463);
   };
 
@@ -334,7 +358,7 @@ describe('JUDGE-BUTLER-E4-RESIGN-SCOPE — a parent focused receipt never signs 
     const w = world(); parentFacts(w);
     w.cells.set('FED-FACT-OP-ACTIONS-E4-E4', child('FED-FACT-OP-ACTIONS-E4-E4', 'JUD #195542/#195728: 부모 #40445@5d237548c458 focused 51/0 및 E4 없음→FU 서명은 실 E4 실행 근거가 아님'));
     w.cells.set('CX3-LAND-VERSION-REVERT-E4-E4', child('CX3-LAND-VERSION-REVERT-E4-E4', 'JUD #195686: #40463@cd0d3495ec59 focused는 PR 전용 시험이며 E4 실행 영수가 아니다'));
-    w.cells.set('FED-FACT-OP-ACTIONS', { id: 'FED-FACT-OP-ACTIONS', title: 'FED-FACT-OP-ACTIONS', status: 'yellow', owner: 'OP', evidence: '#40445 head 5d237548', updatedAt: '2026-11-27T00:10:00.000Z', updatedBy: 'OP' });
+    w.cells.set('FED-FACT-OP-ACTIONS', { id: 'FED-FACT-OP-ACTIONS', title: 'FED-FACT-OP-ACTIONS', doneCriterion: 'Merged change with passing receipt', status: 'yellow', owner: 'OP', evidence: '#40445 head 5d237548', updatedAt: '2026-11-27T00:10:00.000Z', updatedBy: 'OP' });
     const fu: string[] = [];
     const ports = { ...w.ports, addFollowUp: (id: string) => { fu.push(id); return true; } };
     const first = await wakeButler({ view: w.view(), ports, cards: loadCards() });

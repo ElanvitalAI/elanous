@@ -90,6 +90,14 @@ export interface ParkedItem {
   readonly createdAt: string;
 }
 
+/** Parse only real structured land-graph exception cards. */
+export function landGraphException(m: Pick<DigestCandidate, 'from' | 'body'>): { pr: string; reason: string } | null {
+  if (m.from.trim().toUpperCase() !== 'LAND-GRAPH') return null;
+  const match = /^\[land-graph\s*·\s*([^\]\n]+)\]\s*#(\d+)\b/iu.exec(m.body.trim());
+  if (!match || /^(?:auto-cell|cell)$/iu.test(match[1]!.trim())) return null;
+  return { pr: match[2]!, reason: match[1]!.trim() };
+}
+
 /** Needs OP's decision: a decision/request ask or a steward exception card. */
 export function needsDecision(i: Pick<ParkedItem, 'kind' | 'intent'>): boolean {
   const kind = (i.kind ?? '').toLowerCase();
@@ -117,12 +125,22 @@ export function renderOpDigest(items: readonly ParkedItem[]): string {
   ] : [];
   const journal = items.filter((i) => i.sender === JOURNAL_ROLLUP_SENDER).sort((a, b) => a.id - b.id);
   const journalLines = journal.length ? [`Supervisor corrections (${journal.length}):`, ...journal.map((i) => `  - ${oneLine(i.body)}`)] : [];
+  const exceptions = new Map<string, { pr: string; reason: string; count: number }>();
+  for (const item of items) {
+    const e = landGraphException({ from: item.sender, body: item.body });
+    if (!e) continue;
+    const key = JSON.stringify([e.pr, e.reason]);
+    const group = exceptions.get(key) ?? { ...e, count: 0 };
+    group.count++;
+    exceptions.set(key, group);
+  }
   const lines = [
     `[machine digest · ${items.length} mails ${hhmm(first)}–${hhmm(last)} · needs decision ${decisions.length}] ${counts}`,
     ...(top.length ? ['Needs your decision:', ...top.map((i, n) => `  ${n + 1}. ${i.sender}${i.kind ? `/${i.kind}` : ''} — ${oneLine(i.body)}`)] : ['No item needs a decision — status only.']),
     ...(decisions.length > top.length ? [`  … ${decisions.length - top.length} more decision items`] : []),
     ...dormantLines,
     ...journalLines,
+    ...(exceptions.size ? [`LAND-GRAPH 예외: ${[...exceptions.values()].map((e) => `#${e.pr} · ${e.reason} · ${e.count}건`).join(' / ')}`] : []),
     'Bodies are kept in the msg ledger (msg_op_digest_pending · flushed_into = this mail) · 🚨 mail never waits for this digest.',
   ];
   return lines.join('\n');

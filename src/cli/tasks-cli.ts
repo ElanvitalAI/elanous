@@ -1,6 +1,7 @@
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { readRemoteUrl, remoteUrlVia } from '../git-fs/origin-url.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { loadRunLedger as loadRunLedgerSync, loadRunLedgerWithMetadata, runLedgerDir, resolveFederatedRunLedgerDirectories, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { goalRunDbPath, loadGoalRunQuery } from '../self-implement/goal-run-store.js';
@@ -10,7 +11,7 @@ import { InvalidArgumentError, Option, type Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { acquireLockAsync } from '../storage/file-lock.js';
 import { readRunExits } from '../harness/harness-incidents.js';
-import { checklistDevVersion, listChecklist, setItemIfSnapshot } from '../release-loop/checklist.js';
+import { listChecklist, setItemIfSnapshot } from '../release-loop/checklist.js';
 import { assignedVersions, releasedVersion, validateVersion } from '../release-loop/feature-store.js';
 import { compareVersions } from '../directives/version-at.js';
 import type { BoardNode } from '../task-agent/board.js';
@@ -42,6 +43,7 @@ import { measureRepairOutcomes, measureRepairTierModels } from '../task-agent/re
 import { LogStore, STORE_SAFETY_MAX, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
 import { resolveLogTargets } from './logs-cli.js';
 import { createTasksCliContext, handleError, NEXUS_DOWN, NexusUnavailable, registerTaskAgentSink, registerTaskListCommand, registerTaskShowCommand, registerTasksRoot, request, responseJson, TASK_AGENT_SINK_SURFACE } from './tasks-read-cli.js';
+import { boardVersion } from '../release-loop/board-version.js';
 
 // CLI-ENTRY-LAZY — 가벼운 읽기 경로(`tasks-read-cli.ts`)로 옮긴 공용 표면은 옛 import 경로 그대로 남긴다.
 export { registerTaskAgentSink, TASK_AGENT_SINK_SURFACE };
@@ -103,7 +105,7 @@ export interface TasksCliDeps {
   tierSizedDecompose?: TierSizedDecompose;
   /** `task advance` 의 착지 근거 읽기(시험 주입). 기본 = `predecessorState`(gh · 런 원장). */
   pieceEvidence?: PieceEvidenceReader;
-  /** `task board` 의 내부 팩 어댑터(시험 주입). 기본 = 현재 판(`checklistDevVersion()`)의 `releasePackBoard` — 읽기만. */
+  /** `task board` 의 내부 팩 어댑터(시험 주입). 기본 = 현재 판(`boardVersion()`)의 `releasePackBoard` — 읽기만. */
   releaseBoard?: (version?: string) => BoardNode[];
   /** `tasks hand --checklist` 판 목록(시험 주입). 기본은 발행 전 체크리스트가 있는 판 전부. */
   releaseVersions?: () => string[];
@@ -785,7 +787,7 @@ async function currentMapInventory(recipe: MapRecipe, source: 'landed-but-yellow
   if (!/^[a-f0-9]{40}$/.test(recipeSha) || !/^[a-f0-9]{40}$/.test(mainSha)
     || run('git', ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0] !== mainSha)
     throw new Error('origin-main-unverified');
-  const originUrl = run('git', ['remote', 'get-url', 'origin']);
+  const originUrl = remoteUrlVia((argv) => run('git', argv)) ?? ''; // GH-MIRROR-ORIGIN-URL-SAFE: raw configured URL
   const repo = /github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?$/i.exec(originUrl)?.[1]?.toLowerCase();
   if (!repo) throw new Error('origin-repository-unverified');
   const snapshotTime = new Date().toISOString();
@@ -793,7 +795,7 @@ async function currentMapInventory(recipe: MapRecipe, source: 'landed-but-yellow
   let checklistSnapshotPath: string | null = null;
   let snapshotRef: string;
   if (source === 'landed-but-yellow') {
-    const version = checklistDevVersion();
+    const version = boardVersion();
     const snapshot = listChecklist(version);
     const cards = Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(taskStatePath).tasks ?? {});
     items = [];
@@ -1537,7 +1539,7 @@ export function readTaskDoctor(target: string, opts: { traffic?: string } = {}, 
   const matches = cards.filter((item) => item?.id === target || item?.runId === target || item?.runChildId === target);
   if (matches.length !== 1) throw new Error(matches.length ? `카드 결속 모호: ${target}` : `카드·런 없음: ${target}`);
   const card = matches[0]!;
-  const version = (deps.doctorVersion ?? checklistDevVersion)();
+  const version = (deps.doctorVersion ?? boardVersion)();
   const cell = card.checklistId ?? null;
   const run = deps.doctorRun ?? ((command: string, args: string[]) => spawnSync(command, args,
     { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000, maxBuffer: 4 * 1024 * 1024 }));
@@ -2121,9 +2123,10 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         } else holdDiagnostic = 'traffic-path-not-provided: pass --traffic ~/elanous-hq/seat-state/OP/traffic.json';
         const prCache = new Map<number, GreenSweepPr | null>();
         const ambiguousPrs = ambiguousGreenSweepPrs(snapshot.items, opts.version, cards);
-        const origin = run('git', ['remote', 'get-url', 'origin']);
-        const originRepo = origin.status === 0
-          ? /github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?$/i.exec(origin.stdout.trim())?.[1]?.toLowerCase() : undefined;
+        // GH-MIRROR-ORIGIN-URL-SAFE: raw configured URL (a fetch mirror's insteadOf makes get-url a local path)
+        const origin = remoteUrlVia((argv) => { const r = run('git', argv); return r.status === 0 ? String(r.stdout) : null; });
+        const originRepo = origin
+          ? /github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?$/i.exec(origin)?.[1]?.toLowerCase() : undefined;
         const localMain = run('git', ['rev-parse', 'origin/main']);
         const remoteMain = run('git', ['ls-remote', 'origin', 'refs/heads/main']);
         const localMainSha = localMain.status === 0 ? localMain.stdout.trim() : '';
@@ -2516,11 +2519,11 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           }
         }
         const versions = opts.version !== undefined ? [opts.version]
-          : [checklistDevVersion(), ...(deps.releaseVersions?.() ?? (deps.releaseBoard ? [] : (() => {
+          : [boardVersion(), ...(deps.releaseVersions?.() ?? (deps.releaseBoard ? [] : (() => {
             const released = releasedVersion();
             return assignedVersions().filter((version) => !released || compareVersions(version, released) > 0);
           })()))];
-        const current = checklistDevVersion();
+        const current = boardVersion();
         const orderedVersions = [...new Set(versions)].sort((a, b) => {
           if (a === current) return -1;
           if (b === current) return 1;
@@ -2635,8 +2638,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           try { debug.log('task-agent.hand', 'goal-file-inlined', { path: resolved.path, chars: resolved.chars, sha256: resolved.sha256 }); } catch { /* fail-soft */ }
         }
         if (opts.live && opts.checklist && birthBoardVersion) {
-          const origin = deps.handOriginRepo?.() ?? execFileSync('git', ['remote', 'get-url', 'origin'],
-            { cwd: process.cwd(), encoding: 'utf8' }).trim().replace(/\.git\/?$/, '');
+          const origin = (deps.handOriginRepo?.() ?? readRemoteUrl(process.cwd()) ?? '').trim().replace(/\.git\/?$/, '');
           const repo = origin.match(/^(?:git@github\.com:|https:\/\/github\.com\/|ssh:\/\/git@github\.com\/)?([^/\s]+\/[^/\s]+)\/?$/)?.[1];
           if (!repo) throw new Error(`현재 worktree origin이 GitHub 저장소가 아니다: ${origin}`);
           const run = deps.handOpenPrRun ?? ((command: string, args: string[]) => spawnSync(command, args,
@@ -2976,7 +2978,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         if (opts.card) {
           const current = readTaskCard(opts.card, deps.taskStatePath ?? taskStatePathDefault());
           if (!current?.checklistId) throw new Error(`카드 ${opts.card}의 칸이 없다`);
-          const versions = opts.version ? [opts.version] : [...new Set([checklistDevVersion(), ...(deps.releaseVersions?.() ?? assignedVersions())])];
+          const versions = opts.version ? [opts.version] : [...new Set([boardVersion(), ...(deps.releaseVersions?.() ?? assignedVersions())])];
           const matches = versions.filter((version) => {
             try { return (deps.adoptChecklist ?? listChecklist)(version).items.some((item) => item.id === current.checklistId); }
             catch (error) { if (opts.version) throw error; return false; }
@@ -2989,7 +2991,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         }
         let checklist: { version: string; id: string; title: string; status: string } | undefined;
         if (opts.checklist) {
-          const versions = opts.version ? [opts.version] : [...new Set([checklistDevVersion(), ...(deps.releaseVersions?.() ?? assignedVersions())])];
+          const versions = opts.version ? [opts.version] : [...new Set([boardVersion(), ...(deps.releaseVersions?.() ?? assignedVersions())])];
           const matches = versions.flatMap((version) => {
             try { return (deps.adoptChecklist ?? listChecklist)(version).items.filter((item) => item.id === opts.checklist).map((item) => ({ version, id: item.id, title: item.title, status: item.status })); }
             catch (error) { if (opts.version) throw error; return []; }
@@ -2998,7 +3000,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           checklist = matches[0];
         }
         const number = Number(value);
-        const origin = (deps.handOriginRepo?.() ?? execFileSync('git', ['remote', 'get-url', 'origin'], { cwd: process.cwd(), encoding: 'utf8' }).trim()).replace(/\.git\/?$/, '');
+        const origin = (deps.handOriginRepo?.() ?? readRemoteUrl(process.cwd()) ?? '').trim().replace(/\.git\/?$/, '');
         const repo = origin.match(/^(?:git@github\.com:|https:\/\/github\.com\/|ssh:\/\/git@github\.com\/)([^/\s]+\/[^/\s]+)\/?$/)?.[1];
         if (!repo) throw new Error(`현재 worktree origin이 GitHub 저장소가 아니다: ${origin}`);
         const view = (deps.adoptPrView ?? ((pr: number, cwd: string) => JSON.parse(execFileSync('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'number,url,state,baseRefName,headRefOid'], { cwd, encoding: 'utf8' }))))(number, process.cwd());
@@ -3061,7 +3063,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         const wantsPack = opts.project === undefined || opts.project === INTERNAL_PACK_PROJECT;
         const board = mergeBoards(
           cardsBoard(deps.taskStatePath ?? taskStatePathDefault()),
-          wantsPack ? (deps.releaseBoard ?? (() => releasePackBoard(checklistDevVersion())))() : [],
+          wantsPack ? (deps.releaseBoard ?? (() => releasePackBoard(boardVersion())))() : [],
         );
         // 무소속(unassigned: true)은 어떤 --project 로도 고르지 않는다 — 실제 프로젝트 id 와 겹치지 않게.
         const selected = opts.project !== undefined ? board.filter((project) => project.unassigned !== true && project.id === opts.project) : board;

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "guardian",
+  "name": "guardian",
+  "version": "1.0.0",
+  "description": "세계 자원(호스트 · 감독자 · LLM 연료 · 자격 · 용량)이 늘 건강하게 있게 — 얇은 본체 1분 맥박 ⊕ 서브 7 · 본다 → 정상화 → 올림",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "guardian",
+          "agent": "../../graphs/loop-agents/guardian/agent.yaml",
+          "trigger": "../../graphs/triggers/guardian.yaml",
+          "kpis": [
+            "unnormalized_cases",
+            "host_load_per_cpu",
+            "orphans_over_2h"
+          ]
+        }
+      ]
+    }
+  }
+}

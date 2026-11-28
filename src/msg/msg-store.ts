@@ -15,7 +15,8 @@ import { isLive, mayRetract } from './directive-expiry.js';
 import { appendedBody } from './outbound-coalesce.js';
 import { readMailRoutePolicy } from '../kit/mail-route/policy.js';
 import { readHandRoutes } from '../kit/mail-route/hand-routes.js';
-import { OP_DIGEST_RECIPIENT, OP_DIGEST_SENDER, OP_DIGEST_TOP, needsDecision, opDigestFolds, renderOpDigest, type ParkedItem } from './op-machine-digest.js';
+import { defaultNeedsAck } from '../kit/mail-route/notice.js';
+import { OP_DIGEST_RECIPIENT, OP_DIGEST_SENDER, OP_DIGEST_TOP, needsDecision, opDigestFolds, renderOpDigest, landGraphException, type ParkedItem } from './op-machine-digest.js';
 
 /** ELS-ORCH-TASK-ENVELOPE §1 — one result artifact reference (WU §4-3 `attachments[{path, sha}]` shape). */
 export interface TaskResultArtifact { path: string; sha: string; }
@@ -832,7 +833,7 @@ export class MsgStore {
     const intent = input.intent ?? legacyIntent(input.kind);
     const want = {
       body: normalizeRepeatBody(input.body), evidence: repeatEvidenceSha(input.refs), replyTo: input.replyTo ?? null, intent,
-      deadlineAt: input.deadlineAt ?? null, needsAck: input.needsAck ?? (intent === 'request' || intent === 'decision'),
+      deadlineAt: input.deadlineAt ?? null, needsAck: input.needsAck ?? defaultNeedsAck(intent, input),
       kind: input.kind ?? null, priority: input.priority ?? null,
     };
     for (const { id } of ids) {
@@ -910,9 +911,16 @@ export class MsgStore {
       const prior = this.db.query('SELECT id FROM msg_op_digest_pending WHERE provenance_key = ?').get(provenanceKey) as { id: number } | null;
       if (prior) return { id: 0, ...msg, createdAt: this.clock().toISOString(), digested: prior.id };
     }
+    this.flushOpDigestIfDue();
+    const exception = landGraphException(msg);
+    const firstException = exception !== null && !this.pendingOpDigest().some((item) => {
+      const existing = landGraphException({ from: item.sender, body: item.body });
+      return existing?.pr === exception.pr && existing.reason === exception.reason;
+    });
     const at = this.clock().toISOString();
     const res = this.db.query(`INSERT INTO msg_op_digest_pending(recipient, sender, kind, intent, body, refs_json, provenance_key, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(msg.to, msg.from, msg.kind ?? null, msg.intent ?? null, msg.body, msg.refs ? JSON.stringify(msg.refs) : null, provenanceKey ?? null, at);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(msg.to, msg.from, msg.kind ?? null, msg.intent ?? null, msg.body, msg.refs ? JSON.stringify(msg.refs) : null, firstException ? null : provenanceKey ?? null, at);
+    if (firstException) return null; // original is delivered; this retained copy is the board/count
     const parkedId = Number(res.lastInsertRowid);
     try { debug.log('msg.op-digest', 'parked', { from: msg.from, to: msg.to, kind: msg.kind ?? null, parkedId }); } catch { /* fail-open */ }
     const digest = this.flushOpDigestIfDue();
@@ -1021,8 +1029,10 @@ export class MsgStore {
     // §5 canonical intent (v2 rows never store NULL): absent intent maps through the §1b legacy-kind table —
     // identical to the v1 read-path normalization (`fromRow`).
     const intent: MessageEnvelope['intent'] = msg.intent ?? legacyIntent(msg.kind);
-    // needsAck default (SEAT-INBOX-PROTOCOL B1-A, doc-settled): request·decision → true, info·alert → false.
-    const needsAck = msg.needsAck ?? (intent === 'request' || intent === 'decision');
+    // needsAck default (SEAT-INBOX-PROTOCOL B1-A, doc-settled): request·decision → true, info·alert → false —
+    // except a notice by kit/mail-route/notice-policy.yaml (passive kind · work-block shape): it informs, nobody owes a reply
+    // (SILENCE-NOTICE-NOT-REQUEST). An explicit needsAck still wins.
+    const needsAck = msg.needsAck ?? defaultNeedsAck(intent, msg);
     const baseOrigin = msg.origin ?? derivedOrigin(msg.from);
     // A crown directive is crown delegation even when the caller omitted the flag (mf3).
     const origin = baseOrigin && msg.crownDirective && baseOrigin.delegatedByCrown !== true
@@ -1158,7 +1168,9 @@ export class MsgStore {
      */
     stage?: 'seen' | 'ack';
     /** Page below this id (newest first) — callers that need every row walk pages instead of stopping at `limit` (#38361 Terra ③). */
-    beforeId?: number }): Array<{ message: Message; recipient: string; current: ReceiptState | null }> {
+    beforeId?: number;
+    /** Structured kinds excluded before pagination; absent preserves the legacy SLA query. */
+    excludedKinds?: readonly string[] }): Array<{ message: Message; recipient: string; current: ReceiptState | null }> {
     const ackStage = query.stage === 'ack';
     const limit = query.limit ?? 100;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
@@ -1172,11 +1184,12 @@ export class MsgStore {
       FROM msg_messages m
       WHERE m.intent = 'request' AND m.needs_ack = 1 AND m.recipient <> 'ALL' AND m.recipient NOT LIKE 'group:%'
         AND m.created_at >= ? AND m.created_at <= ?
+        ${query.excludedKinds?.length ? `AND (m.kind IS NULL OR lower(trim(m.kind)) NOT IN (${query.excludedKinds.map(() => '?').join(', ')}))` : ''}
         ${query.beforeId === undefined ? '' : `AND m.id < ${Math.trunc(query.beforeId)}`}
         ${ackStage ? '' : 'AND m.id > COALESCE((SELECT c.last_id FROM msg_cursors c WHERE c.recipient = m.recipient), 0)'}
         ${acks ? `AND NOT EXISTS (SELECT 1 FROM msg_message_acks a WHERE a.message_id = m.id AND a.recipient = m.recipient${ackStage ? " AND a.status = 'done'" : ''})` : ''}
         ${receipts ? `AND NOT EXISTS (SELECT 1 FROM msg_receipts r WHERE r.message_id = m.id AND r.recipient = m.recipient AND r.state IN (${ackStage ? '' : "'seen',"}'accepted','rejected','done','expired'))` : ''}
-      ORDER BY m.id DESC LIMIT ?`).all(query.postedAfter.toISOString(), query.postedBefore.toISOString(), limit) as Array<MessageRow & { receipt_state: ReceiptState | null }>;
+      ORDER BY m.id DESC LIMIT ?`).all(query.postedAfter.toISOString(), query.postedBefore.toISOString(), ...(query.excludedKinds ?? []).map(k => k.trim().toLowerCase()), limit) as Array<MessageRow & { receipt_state: ReceiptState | null }>;
     return rows.map(row => ({ message: fromRow(row), recipient: row.recipient, current: row.receipt_state }));
   }
 
@@ -1775,6 +1788,28 @@ export class MsgStore {
     if (!this.db.inTransaction) this.emitLedgerEvent('ack');
     recordFedFact({ type: 'mail', state: 'ack', seat: to, ref: String(messageId), source: 'msg-store' });
     return true;
+  }
+
+  /** The explicit per-id ack row of (recipient, message) — null = none (the cursor is not read). */
+  explicitAck(recipient: string, messageId: number): 'acked' | 'done' | null {
+    if (!hasMessageAckTable(this.db)) return null;
+    const row = this.db.query('SELECT status FROM msg_message_acks WHERE message_id = ? AND recipient = ?')
+      .get(messageId, canonicalMessageAddress(recipient)) as { status: 'acked' | 'done' } | null;
+    return row?.status ?? null;
+  }
+
+  /**
+   * SILENCE-NOTICE-NOT-REQUEST — the exact undo of one `ackMessage`: put the explicit ack row of (recipient, message) back
+   * to what it was before (`null` = there was none → the row is removed). The receipt ledger is never touched.
+   */
+  restoreAck(recipient: string, messageId: number, prior: 'acked' | 'done' | null): boolean {
+    const to = canonicalMessageAddress(recipient);
+    if (!hasMessageAckTable(this.db)) return false;
+    const changes = prior === null
+      ? this.db.query('DELETE FROM msg_message_acks WHERE message_id = ? AND recipient = ?').run(messageId, to).changes
+      : this.db.query('UPDATE msg_message_acks SET status = ? WHERE message_id = ? AND recipient = ?').run(prior, messageId, to).changes;
+    if (changes && !this.db.inTransaction) this.emitLedgerEvent('ack');
+    return changes > 0;
   }
 
   /** A batch either acknowledges every requested message or none, without moving the cursor. */

@@ -8,6 +8,7 @@ import { ELANOUS_RUNTIME_ARTIFACT_DIRS, ELANOUS_RUNTIME_ARTIFACT_PATHS } from '.
 import { runGhCliWithResult, type GhCliResult } from '../git-fs/gh-cli.js';
 import { debug } from '../debug/log.js';
 import { runGitCommand } from '../git-fs/runner.js';
+import { remoteUrlVia } from '../git-fs/origin-url.js';
 import type { GitRunResult } from '../git-fs/retry.js';
 import type { HarnessTargetResolution } from './harness-target-options.js';
 
@@ -119,7 +120,8 @@ export function resolveRepositoryRoot(cwd: string, deps: Pick<RepositoryPublishD
 }
 
 function remoteOriginUrl(cwd: string, deps: Pick<RepositoryPublishDeps, 'runGit'>): string | undefined {
-  return gitText(cwd, ['remote', 'get-url', 'origin'], deps);
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+  return remoteUrlVia((argv) => gitText(cwd, argv, deps)) ?? undefined;
 }
 
 function remoteRepository(cwd: string, deps: Pick<RepositoryPublishDeps, 'runGit'>): string | undefined {

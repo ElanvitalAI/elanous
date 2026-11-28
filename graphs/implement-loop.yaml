@@ -498,6 +498,45 @@ nodes:
       tools: none
       outputs: [checkout-decision]
 
+  # DEV-REVIEW-COMMON (0.3.40 P0 · 대표 11-28 18:2x «TA 든 손 탭이든 이 로직은 공용화») — the three review units the hand path
+  #   runs too (`eln work next` claim → cell-review ⊕ pre-impl · first pregate → post-impl · src/kit/dev-review). Same judge
+  #   line as the judge butler (requirement-judge decomposeDoneCriterion · assessCriterionForSign · judging.yaml).
+  #   정본 = 내부 문서 `JUDGE-LOAD-REDUCTION` §1·§2·§3·§5. ⛔ 지금 TA 는 이 셋을 «선언»으로 안다(observed 0) — 앞단의
+  #   author·plan·decompose·gate 는 그대로 돌고, 같은 판정 함수(precheckGoalDocument · scoreGoalRubric · 판정 집사 kit)를 부른다.
+  #   on: dev_review 라벨은 기존 출구(ok · local · pass …)와 겹치지 않는다 — 기존 걸음은 한 칸도 안 바뀐다.
+  - node_id: cell-review
+    group: author
+    journey_stage: author
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: cell-review@1
+    budget: { inner_steps: 2 }
+    terminal_stages: []
+    contract: { inputs: [goal_path, ask_text], tools: checklist-write, outputs: [criterion, requirements] }
+
+  - node_id: pre-impl
+    group: author
+    journey_stage: author
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: pre-impl@1
+    budget: { inner_steps: 2 }
+    terminal_stages: []
+    contract: { inputs: [pieces, requirements], tools: checklist-write, outputs: [core, edge_fus] }
+
+  - node_id: post-impl
+    group: verify
+    journey_stage: run
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: post-impl@1
+    budget: { inner_steps: 2 }
+    terminal_stages: []
+    contract: { inputs: [changed-files, requirements], tools: checklist-write, outputs: [judge_prediction, edge_fus] }
+
 # ═══════════════════════════════════════════════════════════════════════
 # 엣지 — ⛔ 출처는 «코드 선언 ⊕ 원장 실측» 둘 다다. 어느 하나만 보면 틀린다.
 #   📏 2026-09-08 실측 (pipeline-traversal-shadow 182 걸음 · 판정 함수가 «실제로 본» 것):
@@ -692,3 +731,34 @@ edges:
 
   - from: merge
     to: cleanup
+
+  # DEV-REVIEW-COMMON — the review units' edges. `dev_review` is a new label key: no existing outcome routes through it.
+  - from: author
+    on: dev_review
+    map:
+      cell: cell-review                # 저작 뒤 칸 완료조건 검토(§1 3절 · 판정선 = 판정 집사의 분해)
+    observed: 0
+
+  - from: cell-review
+    on: outcome
+    map: { pass: plan, written: plan, strengthened: plan, untrusted: plan }
+
+  - from: decompose
+    on: dev_review
+    map:
+      pre: pre-impl                    # 구현 전 핵심/엣지 쪼개기 — 엣지 = FU 칸 선발행(판정 집사와 같은 id)
+    observed: 0
+
+  - from: pre-impl
+    on: outcome
+    map: { core: implement, split: implement, hold: needs-human }
+
+  - from: gate
+    on: dev_review
+    map:
+      first: post-impl                 # 첫 게이트 뒤 판정선 재확인(§3 골 대조표) — 판정 거절 예측
+    observed: 0
+
+  - from: post-impl
+    on: outcome
+    map: { clean: review, fu: review, flagged: rework, untrusted: review }

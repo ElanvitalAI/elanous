@@ -1,0 +1,27 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "autopsy",
+  "name": "autopsy",
+  "version": "1.0.0",
+  "description": "미분류 사망 0 · 반복 꼴(7일 3회)은 칸으로",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "autopsy",
+          "agent": "../../graphs/loop-agents/autopsy/agent.yaml",
+          "trigger": "../../graphs/triggers/autopsy-agent.yaml",
+          "kpis": [
+            "unclassified_deaths"
+          ]
+        }
+      ]
+    }
+  }
+}

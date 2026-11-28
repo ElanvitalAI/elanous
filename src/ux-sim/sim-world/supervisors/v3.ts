@@ -29,7 +29,7 @@ const V2: Readonly<Record<string, { kpi: string; target: number; max: number; co
   'run-supervisor': { kpi: 'zombie_runs', target: 0, max: 3, cool: 20, esc: 60, l0: 'TC', body: { pregate_zombie_min: 90, stale_record_min: 90, run_stall_min: 30, run_zombie_min: 120, run_window_h: 48 } },
   'run-doctor': { kpi: 're_success_ratio', target: 0.5, max: 4, cool: 30, esc: 120, l0: 'TC', body: { window_h: 24, settle_min: 60, retry_max_age_h: 6, loop_exception_min: 5, rail_window_min: 20, loop_normalize_attempts: 2, loop_case_sla_min: 60 } },
   autopsy: { kpi: 'unclassified_deaths', target: 0, max: 3, cool: 10, esc: 120, l0: 'OP', body: { window_h: 24, classify_batch: 50, cell_repeat: 3, cell_window_days: 7, cells_per_day: 2 } },
-  macrophage: { kpi: 'orphans_over_2h', target: 0, max: 3, cool: 30, esc: 120, l0: 'RES', body: { recent_reap_min: 30 } },
+  macrophage: { kpi: 'orphans_over_2h', target: 0, max: 3, cool: 30, esc: 120, l0: 'RES', body: { recent_reap_min: 30, stale_worktree_days: 14, stale_stash_days: 14, oneshot_grace_h: 24 } },
   'watchers-check': { kpi: 'missing_heartbeats', target: 0, max: 5, cool: 30, esc: 30, l0: 'OP', body: { recent_min: 1440 } },
   'silence-watch': { kpi: 'unanswered_mail_past_sla', target: 0, max: 8, cool: 60, esc: 60, l0: 'OP', body: { sla_min: 30, lookback_h: 24 } },
   'train-manager': { kpi: 'hot_file_churn_refusals', target: 0, max: 3, cool: 30, esc: 90, l0: 'TC', body: { churn_window_min: 60 } },

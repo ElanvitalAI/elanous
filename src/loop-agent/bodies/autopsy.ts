@@ -9,22 +9,22 @@
 //          run stop class / last node outcome, the PR's own last land refusal; only a closed PR with none of these falls
 //          back to its closing text (supersede / split / duplicate), else it stays `unclassified` and counts.
 //          RFC-run-doctor-and-postmortem §4 E3: «같은 원인 ≥3» → a cell, so the class turns into structure.
-//   수복과 인계 = `classify` writes up to CLASSIFY_BATCH rows into its own ledger (<home>/autopsy.jsonl · undo = removal
-//          rows); `open-cell` opens one release-checklist cell per class seen ≥ CELL_REPEAT times in 7 days (one cell per
-//          class ever · ≤ CELLS_PER_DAY a day · undo = `eln release checklist rm <id>`). Deaths it cannot classify stay a
+//   수복과 인계 = `classify` writes up to classify_batch rows into its own ledger (<home>/autopsy.jsonl · undo = removal
+//          rows); `open-cell` opens one release-checklist cell per class seen ≥ cell_repeat times in 7 days (one cell per
+//          class ever · ≤ cells_per_day a day · undo = `eln release checklist rm <id>`). Deaths it cannot classify stay a
 //          KPI breach → one card to OP.
+//   DETECT-TO-ACTION (11-28 · KPI ≥ 1 for 18 h with «행동 0/0»): the five «unclassified» closed PRs of 11-27 (#40363 #40415
+//          #40430 #40438 #40475) all carried their cause in the CLOSING COMMENT («Superseded by #40441» · «중복이라 닫는다» ·
+//          «분할로 대체» …) — the reader took only the PR body. The text now includes the last comments, and a death whose row says
+//          `unclassified` but whose fresh evidence classifies gets `reclassify` (a newer row for the same id — the ladder step
+//          that was missing; a death with still no evidence stays unclassified and goes to OP, never a guess).
 import { join } from 'node:path';
 import type { BodyEnv } from '../registry.js';
 import type { ActionResult, AgentBody, BodyCtx, Observation, PlannedAction, Subject } from '../runtime.js';
 import { agentHome } from '../memory.js';
 import { readJsonlFile, scanRunLedgers } from './run-lifecycle-shared.js';
-import { pv } from '../policy-context.js';
+import { pn } from '../policy-context.js';
 
-export const WINDOW_H = 24;
-export const CLASSIFY_BATCH = 50;
-export const CELL_REPEAT = 3;
-export const CELL_WINDOW_DAYS = 7;
-export const CELLS_PER_DAY = 2;
 
 export type DeathKind = 'land-refused' | 'pr-closed' | 'run-died';
 export interface Death {
@@ -54,15 +54,26 @@ export function classifyDeath(d: Death): { cls: string; basis: AutopsyRow['basis
   if (d.kind === 'pr-closed') {
     const t = d.text;
     if (/supersed|replaced by|대체|→\s*#\d+/iu.test(t)) return { cls: 'pr:superseded', basis: 'text' };
-    if (/\bsplit\b|쪼개|나눠/iu.test(t)) return { cls: 'pr:split', basis: 'text' };
     if (/duplicate|중복/iu.test(t)) return { cls: 'pr:duplicate', basis: 'text' };
+    if (/abandon|수확하지 않|폐기/iu.test(t)) return { cls: 'pr:abandoned', basis: 'text' };
+    if (/\bsplit\b|쪼개|쪼갬|나눠|분할/iu.test(t)) return { cls: 'pr:split', basis: 'text' };
     if (/24h|stale|오래된/iu.test(t)) return { cls: 'pr:stale-24h', basis: 'text' };
+    // the harness close-triage line is a structured marker of our own producer («멈춘 사유 <reason>») — last resort
+    const stop = /멈춘 사유 ([a-z][a-z0-9-]*)/u.exec(t)?.[1];
+    if (stop) return { cls: `pr:harness-stop:${stop}`, basis: 'text' };
   }
   return { cls: 'unclassified', basis: 'none' };
 }
 
-/** Cells this agent opened in the last 24 h (the CELLS_PER_DAY budget). */
-export const cellsToday = (cells: readonly CellRow[], now: Date): number => cells.filter(c => !c.removed && now.getTime() - Date.parse(c.at) < 86_400_000).length; // 출처: CELLS_PER_DAY = 하루(24h) 창 · RFC-run-doctor-and-postmortem §4 E3
+/** The deaths in `ids` whose LATEST row still says `unclassified` (a newer row for the same id wins · reclassify). */
+export function stuckRows(rows: readonly AutopsyRow[], ids: ReadonlySet<string>): AutopsyRow[] {
+  const latest = new Map<string, AutopsyRow>();
+  for (const r of rows) latest.set(r.id, r);
+  return [...latest.values()].filter(r => r.cls === 'unclassified' && ids.has(r.id));
+}
+
+/** Cells this agent opened in the last 24 h (the cells_per_day budget). */
+export const cellsToday = (cells: readonly CellRow[], now: Date): number => cells.filter(c => !c.removed && now.getTime() - Date.parse(c.at) < 86_400_000).length; // 출처: cells_per_day = 하루(24h) 창 · RFC-run-doctor-and-postmortem §4 E3
 export const cellIdFor = (cls: string): string => `AUTOPSY-${cls.toUpperCase().replace(/[^A-Z0-9]+/gu, '-').replace(/^-|-$/gu, '').slice(0, 48)}`;
 
 export function liveDeps(stateRoot: string): AutopsyDeps {
@@ -87,7 +98,7 @@ export function liveDeps(stateRoot: string): AutopsyDeps {
   };
   return {
     deaths(now) {
-      const since = now.getTime() - pv('window_h', WINDOW_H) * 3_600_000;
+      const since = now.getTime() - pn('window_h') * 3_600_000;
       const deaths: Death[] = []; const unknown: string[] = [];
       // land refusals (+ last refusal per PR, used to explain closed PRs)
       const lastRefusal = new Map<number, string>();
@@ -110,15 +121,16 @@ export function liveDeps(stateRoot: string): AutopsyDeps {
         }
       } catch { unknown.push('land-graph'); }
       // closed-unmerged PRs
-      const out = gh(['pr', 'list', '--state', 'closed', '--limit', '80', '--json', 'number,closedAt,mergedAt,title,body']);
+      const out = gh(['pr', 'list', '--state', 'closed', '--limit', '80', '--json', 'number,closedAt,mergedAt,title,body,comments']);
       if (out === null) unknown.push('gh');
       else {
         try {
-          for (const p of JSON.parse(out) as Array<{ number: number; closedAt?: string; mergedAt?: string | null; title?: string; body?: string }>) {
+          for (const p of JSON.parse(out) as Array<{ number: number; closedAt?: string; mergedAt?: string | null; title?: string; body?: string; comments?: Array<{ body?: string }> }>) {
             if (p.mergedAt || !p.closedAt || Date.parse(p.closedAt) < since) continue;
             const prior = lastRefusal.get(p.number);
             deaths.push({ id: `pr:${p.number}`, kind: 'pr-closed', ref: `pr:${p.number}`, at: p.closedAt, cls: prior ? `refused-then-closed:${prior}` : null,
-              text: `${p.title ?? ''}\n${(p.body ?? '').slice(-600)}` });
+              // the closing comment comes FIRST (the closer's own reason · 11-27 all five «unclassified» had it there), then the body tail
+              text: `${(p.comments ?? []).slice(-2).reverse().map(c => (c.body ?? '').slice(0, 400)).join('\n')}\n${p.title ?? ''}\n${(p.body ?? '').slice(-600)}` });
           }
         } catch { unknown.push('gh'); }
       }
@@ -157,10 +169,10 @@ export function createBody(env: BodyEnv, deps: AutopsyDeps = liveDeps(env.stateR
   const repeatedClasses = (rows: readonly AutopsyRow[], nowMs: number): Map<string, AutopsyRow[]> => {
     const by = new Map<string, AutopsyRow[]>();
     for (const r of rows) {
-      if (r.cls === 'unclassified' || nowMs - Date.parse(r.at) > pv('cell_window_days', CELL_WINDOW_DAYS) * 86_400_000) continue;
+      if (r.cls === 'unclassified' || nowMs - Date.parse(r.at) > pn('cell_window_days') * 86_400_000) continue;
       by.set(r.cls, [...(by.get(r.cls) ?? []), r]);
     }
-    return new Map([...by].filter(([, v]) => v.length >= pv('cell_repeat', CELL_REPEAT)));
+    return new Map([...by].filter(([, v]) => v.length >= pn('cell_repeat')));
   };
 
   const observe = (ctx: BodyCtx): Observation => {
@@ -169,44 +181,51 @@ export function createBody(env: BodyEnv, deps: AutopsyDeps = liveDeps(env.stateR
     const rows = deps.rows();
     const ids = new Set(deaths.map(d => d.id));
     const todo = pending(deaths, rows);
-    const stuck = rows.filter(r => r.cls === 'unclassified' && ids.has(r.id));
+    const stuck = stuckRows(rows, ids);
+    const byId = new Map(deaths.map(d => [d.id, d] as const));
+    const fixable = stuck.filter(r => { const d = byId.get(r.id); return !!d && classifyDeath(d).cls !== 'unclassified'; });
     const subjects: Subject[] = [];
     for (const d of todo.slice(0, 30)) subjects.push({ id: d.id, kind: `death-${d.kind}`, summary: `${d.ref} 미분류 (${d.cls ?? '구조 원인 없음'})`, ageMin: (nowMs - Date.parse(d.at)) / 60_000 });
-    for (const r of stuck.slice(0, 10)) subjects.push({ id: r.id, kind: 'death-unclassified', summary: `${r.ref} 원인 근거 없음 — 사람 판정 필요`, ageMin: (nowMs - Date.parse(r.at)) / 60_000 });
+    for (const r of stuck.slice(0, 10)) {
+      const fix = fixable.includes(r);
+      subjects.push({ id: r.id, kind: fix ? 'death-reclassifiable' : 'death-unclassified', summary: fix ? `${r.ref} 미분류 행 — 새 근거로 분류 가능(${classifyDeath(byId.get(r.id)!).cls})` : `${r.ref} 원인 근거 없음 — 사람 판정 필요`, ageMin: (nowMs - Date.parse(r.at)) / 60_000 });
+    }
     const cells = new Set(deps.cells().map(c => c.cls));
     const repeated = repeatedClasses(rows, nowMs);
-    for (const [cls, rs] of repeated) if (!cells.has(cls)) subjects.push({ id: `cls:${cls}`, kind: 'repeat-class', summary: `${cls} ${rs.length}회/${pv('cell_window_days', CELL_WINDOW_DAYS)}일 — 칸 없음`, ageMin: 0 });
+    for (const [cls, rs] of repeated) if (!cells.has(cls)) subjects.push({ id: `cls:${cls}`, kind: 'repeat-class', summary: `${cls} ${rs.length}회/${pn('cell_window_days')}일 — 칸 없음`, ageMin: 0 });
     const today = cellsToday(deps.cells(), ctx.now);
     const counts = new Map<string, number>();
     for (const d of deaths) counts.set(d.kind, (counts.get(d.kind) ?? 0) + 1);
-    const facts = [`사망 ${deaths.length} (창 ${pv('window_h', WINDOW_H)}h · ${[...counts].map(([k, v]) => `${k} ${v}`).join(' · ') || '없음'})`, `미분류 대기 ${todo.length} · 근거 없음 ${stuck.length}`,
-      `반복 꼴 ${repeated.size} · 칸 연 꼴 ${cells.size} · 오늘 연 칸 ${today}/${pv('cells_per_day', CELLS_PER_DAY)}${today >= pv('cells_per_day', CELLS_PER_DAY) ? ' — 나머지 꼴은 내일' : ''}`, ...(unknown.length ? [`읽기 실패: ${unknown.join(', ')} — KPI 모름`] : [])];
+    const facts = [`사망 ${deaths.length} (창 ${pn('window_h')}h · ${[...counts].map(([k, v]) => `${k} ${v}`).join(' · ') || '없음'})`, `미분류 대기 ${todo.length} · 근거 없음 ${stuck.length - fixable.length} · 새 근거로 재분류 가능 ${fixable.length}`,
+      `반복 꼴 ${repeated.size} · 칸 연 꼴 ${cells.size} · 오늘 연 칸 ${today}/${pn('cells_per_day')}${today >= pn('cells_per_day') ? ' — 나머지 꼴은 내일' : ''}`, ...(unknown.length ? [`읽기 실패: ${unknown.join(', ')} — KPI 모름`] : [])];
     // patterns: one per class among deaths not yet classified (each death counted once)
     const pseen = new Set<string>(); const patterns: { key: string; lesson: string }[] = [];
     for (const d of todo) {
       const c = classifyDeath(d).cls;
       if (c === 'unclassified' || pseen.has(c)) continue;
-      pseen.add(c); patterns.push({ key: `death:${c}`, lesson: `${c} 사망이 반복된다 — 같은 꼴 ${pv('cell_repeat', CELL_REPEAT)}회면 구조 칸으로 옮긴다(부검 E3).` });
+      pseen.add(c); patterns.push({ key: `death:${c}`, lesson: `${c} 사망이 반복된다 — 같은 꼴 ${pn('cell_repeat')}회면 구조 칸으로 옮긴다(부검 E3).` });
     }
     return { kpi: unknown.length ? null : todo.length + stuck.length, subjects, facts, patterns };
   };
 
   const plan = (obs: Observation, ctx: { now: Date }): PlannedAction[] => {
     const out: PlannedAction[] = [];
-    if (obs.subjects.some(s => s.kind.startsWith('death-') && s.kind !== 'death-unclassified')) out.push({ action: 'classify', target: 'pending', why: `미분류 사망 — 최대 ${pv('classify_batch', CLASSIFY_BATCH)}건 분류` });
+    if (obs.subjects.some(s => s.kind.startsWith('death-') && s.kind !== 'death-unclassified' && s.kind !== 'death-reclassifiable')) out.push({ action: 'classify', target: 'pending', why: `미분류 사망 — 최대 ${pn('classify_batch')}건 분류` });
+    const re = obs.subjects.filter(s => s.kind === 'death-reclassifiable');
+    if (re.length) out.push({ action: 'reclassify', target: 'stuck', why: `미분류 행 ${re.length}건에 새 근거(닫는 댓글 등) — ${re.slice(0, 3).map(s => s.id).join(' ')}` });
     // SUPERVISOR-JOURNAL-DEFECTS (11-27 journal: open-cell failed 29× on «오늘 칸 2개 — 하루 한도 2»): the daily cap is a plan
     // input, not an action failure — plan only as many cells as today's budget leaves; the rest wait (a fact line, no row).
-    const left = Math.max(0, pv('cells_per_day', CELLS_PER_DAY) - cellsToday(deps.cells(), ctx.now));
+    const left = Math.max(0, pn('cells_per_day') - cellsToday(deps.cells(), ctx.now));
     for (const s of obs.subjects.filter(x => x.kind === 'repeat-class').slice(0, left)) out.push({ action: 'open-cell', target: s.id, why: s.summary });
     return out;
   };
 
   const actions: AgentBody['actions'] = {
     classify: {
-      describe: `미분류 사망을 최대 ${pv('classify_batch', CLASSIFY_BATCH)}건 원인 분류해 부검 원장(autopsy.jsonl)에 쓴다 — 구조 원인(거부 꼴·stop 꼴) 먼저 · 되돌림: 같은 id 의 removed 행`,
+      describe: `미분류 사망을 최대 ‹classify_batch›건 원인 분류해 부검 원장(autopsy.jsonl)에 쓴다 — 구조 원인(거부 꼴·stop 꼴) 먼저 · 되돌림: 같은 id 의 removed 행`,
       run(_target, ctx): ActionResult {
         const { deaths } = deps.deaths(ctx.now);
-        const todo = pending(deaths, deps.rows()).slice(0, pv('classify_batch', CLASSIFY_BATCH));
+        const todo = pending(deaths, deps.rows()).slice(0, pn('classify_batch'));
         if (!todo.length) return { ok: true, line: '분류할 사망 없음' };
         const at = ctx.now.toISOString();
         const rows = todo.map(d => { const c = classifyDeath(d); return { id: d.id, at, kind: d.kind, ref: d.ref, cls: c.cls, basis: c.basis } satisfies AutopsyRow; });
@@ -216,20 +235,36 @@ export function createBody(env: BodyEnv, deps: AutopsyDeps = liveDeps(env.stateR
         return { ok: true, line: `부검 ${rows.length}건 분류(근거 없음 ${un}) — ${top}`, ref: `autopsy:${rows[0]!.id}`, undo: `autopsy.jsonl 에 {id, removed:true} 행: ${rows.map(r => r.id).slice(0, 5).join(', ')}${rows.length > 5 ? ` 외 ${rows.length - 5}` : ''}` };
       },
     },
+    reclassify: {
+      describe: '원장에 «미분류»로 남은 사망 중 새 근거(닫는 댓글·구조 꼴)로 이제 분류되는 것에 새 행을 쓴다(같은 id · 최신 행이 이긴다) — 근거가 여전히 없으면 건드리지 않는다 · 되돌림: 같은 id 의 removed 행',
+      run(_target, ctx): ActionResult {
+        const { deaths } = deps.deaths(ctx.now);
+        const byId = new Map(deaths.map(d => [d.id, d] as const));
+        const at = ctx.now.toISOString();
+        const rows = stuckRows(deps.rows(), new Set(byId.keys())).flatMap(r => {
+          const d = byId.get(r.id)!; const c = classifyDeath(d);
+          return c.cls === 'unclassified' ? [] : [{ id: d.id, at, kind: d.kind, ref: d.ref, cls: c.cls, basis: c.basis } satisfies AutopsyRow];
+        });
+        if (!rows.length) return { ok: false, line: '재분류할 미분류 행 없음(새 근거 없음)' };
+        deps.record(rows);
+        return { ok: true, line: `미분류 ${rows.length}건 재분류 — ${rows.slice(0, 5).map(r => `${r.ref}→${r.cls}`).join(' · ')}${rows.length > 5 ? ` 외 ${rows.length - 5}` : ''}`, ref: `autopsy:${rows[0]!.id}`,
+          undo: `autopsy.jsonl 에 {id, removed:true} 행: ${rows.map(r => r.id).slice(0, 5).join(', ')}` };
+      },
+    },
     'open-cell': {
-      describe: `같은 원인 꼴이 ${pv('cell_window_days', CELL_WINDOW_DAYS)}일에 ${pv('cell_repeat', CELL_REPEAT)}회 넘으면 그 꼴의 구조 칸 하나를 연다(꼴당 평생 1칸 · 하루 ${pv('cells_per_day', CELLS_PER_DAY)}칸) — 되돌림: eln release checklist rm <칸>`,
+      describe: `같은 원인 꼴이 ‹cell_window_days›일에 ‹cell_repeat›회 넘으면 그 꼴의 구조 칸 하나를 연다(꼴당 평생 1칸 · 하루 ‹cells_per_day›칸) — 되돌림: eln release checklist rm <칸>`,
       run(target, ctx): ActionResult {
         const cls = target.replace(/^cls:/u, '');
         const cells = deps.cells();
         if (cells.some(c => c.cls === cls)) return { ok: false, line: `${cls}: 이미 칸이 있다` };
         const today = cellsToday(cells, ctx.now);
-        if (today >= pv('cells_per_day', CELLS_PER_DAY)) return { ok: false, line: `${cls}: 오늘 칸 ${today}개 — 하루 한도 ${pv('cells_per_day', CELLS_PER_DAY)}` };
+        if (today >= pn('cells_per_day')) return { ok: false, line: `${cls}: 오늘 칸 ${today}개 — 하루 한도 ${pn('cells_per_day')}` };
         const rs = repeatedClasses(deps.rows(), ctx.now.getTime()).get(cls);
-        if (!rs) return { ok: false, line: `${cls}: 다시 세니 ${pv('cell_repeat', CELL_REPEAT)}회 미만` };
+        if (!rs) return { ok: false, line: `${cls}: 다시 세니 ${pn('cell_repeat')}회 미만` };
         const cellId = cellIdFor(cls);
         const refs = rs.slice(-6).map(r => r.ref).join(' ');
         const r = deps.openCell(cellId, `[부검] ${cls} 반복 ${rs.length}회 — 구조 수리`,
-          `부검반: ${pv('cell_window_days', CELL_WINDOW_DAYS)}일 안 같은 원인 꼴 ${cls} ${rs.length}회. 사례 ${refs}. 처방을 반복하지 말고 이 꼴이 생기는 구조를 고친다.`, `loop:autopsy ${refs}`);
+          `부검반: ${pn('cell_window_days')}일 안 같은 원인 꼴 ${cls} ${rs.length}회. 사례 ${refs}. 처방을 반복하지 말고 이 꼴이 생기는 구조를 고친다.`, `loop:autopsy ${refs}`);
         if (r.ok) deps.recordCell({ cls, cellId, at: ctx.now.toISOString() });
         return { ok: r.ok, line: r.line, ref: `cell:${cellId}`, ...(r.ok ? { undo: `eln release checklist rm ${cellId}` } : {}) };
       },

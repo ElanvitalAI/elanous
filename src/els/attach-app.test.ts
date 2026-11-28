@@ -58,7 +58,7 @@ test('key router: plain text is input; ctrl+b then a herdr key is an action; ctr
   expect(router.feed('k')).toEqual([{ kind: 'action', action: 'previous' }]);
   expect(router.feed('\u0002\u0002')).toEqual([{ kind: 'input', bytes: '\u0002' }]);
   // ELS-POPUP-TERM: ctrl+b Esc is a key of its own now (it hides the popup terminal; the app ignores it elsewhere).
-  expect(router.feed('\u0002\u001bq')).toEqual([{ kind: 'unknown', key: '\u001b' }, { kind: 'input', bytes: 'q' }]);
+  expect(router.feed('\u0002\u001bq')).toEqual([{ kind: 'action', action: 'escape' }, { kind: 'input', bytes: 'q' }]);
   expect(router.feed('\u00023')).toEqual([{ kind: 'action', action: 'goto', n: 3 }]);
   expect(router.feed('\u0002z')).toEqual([{ kind: 'unknown', key: 'z' }]);
   const keyed: [string, KeyAction][] = [['q', 'detach'], ['n', 'next'], ['p', 'previous'], ['w', 'next-workspace'], ['b', 'toggle-sidebar'], ['c', 'new'], ['N', 'new-workspace'], ['x', 'close'], ['D', 'close-workspace'], ['?', 'help']];
@@ -542,7 +542,7 @@ test('app: ctrl+b q detaches with code 0 and releases the attach without closing
   const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
   await h.app.start();
   h.app.key('\u0002z');
-  expect(h.lastScreen()).toContain('ctrl+b z 는 아직 없음');
+  expect(h.lastScreen()).toContain('ctrl+b z: no such key');
   expect(h.attachments[0]!.typed).toEqual([]);
   h.app.key('\u0002q');
   expect(await h.app.done).toEqual({ code: 0, message: '' });

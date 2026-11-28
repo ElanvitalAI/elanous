@@ -17,6 +17,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { readRemoteUrl } from '../git-fs/origin-url.js';
 import { getElanousConfigDir, getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { userConfigPath } from '../user-config.js';
 import { landingOwner, mayRunLandOps } from '../org/land-authority.js';
@@ -24,8 +25,14 @@ import { defaultRetryHosts, nextHost, tscHostsFor } from '../land-graph/red-rece
 import { filterRoutable, hostsFor } from '../kit/resource-facts/index.js';
 import type { RefreshResult } from '../land-graph/finisher.js';
 import { gitAt } from '../git-fs/smart-run.js';
-import { prDelta } from '../git-smart/delta.js';
+import { carriesOwnDiff, prDelta } from '../git-smart/delta.js';
+import { mergeTree } from '../git-smart/merge-tree.js';
 import { discoverParents, smartRefresh, smartRefreshSync, type SmartRefreshResult } from '../git-smart/smart-refresh.js';
+import { autofixPr, redRaw } from '../land-graph/autofix.js';
+import { runGhCliWithResult } from '../git-fs/gh-cli.js';
+import { GhGovernorRefusal, liveGhGovernorPolicy } from '../kit/gh-governor/index.js';
+import { headCommitTimes, livePrAgingPolicy } from '../kit/pr-aging/index.js';
+import { invalidateOpenPrSnapshot, readOpenPrSnapshot, sleepSync, type OpenPrRecord } from '../kit/gh-governor/open-pr-snapshot.js';
 import {
   clearHold, focusedCounts, isDocOnly, readHolds, readLedger, replayAttempt, SECURITY4, setHold, tickLand,
   type BaselineDiff, type Focused, type LandDeps, type Mode, type PrInfo, type Receipt, type ReplayRow, type TerraReview,
@@ -64,8 +71,8 @@ export function resolveLandRepo(o: { env?: NodeJS.ProcessEnv; cfgRepo?: unknown;
   const fromEnv = (env.GH_REPO ?? '').trim();
   if (fromEnv) return { root, slug: fromEnv };
   if (!root) return { root, slug: null };
-  const out = spawnSync('git', ['-C', root, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 10_000 });
-  return { root, slug: out.status === 0 ? repoSlugFromUrl(out.stdout ?? '') : null };
+  const url = readRemoteUrl(root); // GH-MIRROR-ORIGIN-URL-SAFE: raw configured URL, never the insteadOf mirror path
+  return { root, slug: url ? repoSlugFromUrl(url) : null };
 }
 
 /** gh argv + spawn cwd for one call: `--repo <slug>` when known, and cwd = repo root, so gh never depends on the caller's cwd. */
@@ -76,24 +83,41 @@ export function ghInvocation(args: string[], repo: LandRepo): { args: string[]; 
 const hqRepo = () => join(homedir(), 'elanous-hq', 'repo.git');
 const landTarget = (cfg: LandConfig = readConfig()) => resolveLandRepo({ cfgRepo: cfg.repo, defaultRoot: hqRepo() });
 
-function ghJson(args: string[], repo: LandRepo): unknown {
-  if (!repo.slug && !repo.root) throw new Error('no repo: set GH_REPO or config land.graph.repo (gh would read the cwd, which is the installed package)');
+const noRepo = (repo: LandRepo) => { if (!repo.slug && !repo.root) throw new Error('no repo: set GH_REPO or config land.graph.repo (gh would read the cwd, which is the installed package)'); };
+/** One gh call through the governed door (src/git-fs/gh-cli.ts · kit/gh-governor): cooldown / budget refusals throw GhGovernorRefusal. */
+function ghRun(args: string[], repo: LandRepo) {
+  noRepo(repo);
   const inv = ghInvocation(args, repo);
-  const out = spawnSync(gh(), inv.args, { encoding: 'utf8', timeout: 60_000, ...(inv.cwd ? { cwd: inv.cwd } : {}) }); // Source: one gh call per PR list / re-read.
-  if (out.status !== 0) throw new Error(`gh ${args[0]} ${args[1]} exit ${out.status}: ${(out.stderr || '').trim().slice(0, 160)}`);
-  return JSON.parse(out.stdout);
+  return runGhCliWithResult(inv.args, { bin: gh(), timeoutMs: 60_000, ...(inv.cwd ? { cwd: inv.cwd } : {}) }); // Source: one gh call per PR re-read / write.
+}
+function ghJson(args: string[], repo: LandRepo): unknown {
+  const out = ghRun(args, repo);
+  if (out.refused) throw new GhGovernorRefusal(out.refused, out.stderr.toString('utf8').trim().split('\n')[0] ?? 'gh refused');
+  if (!out.ok) throw new Error(`gh ${args[0]} ${args[1]} exit ${out.exitCode}: ${out.stderr.toString('utf8').trim().slice(0, 160)}`);
+  return JSON.parse(out.stdout.toString('utf8'));
+}
+/** GH-BUDGET-GOVERNOR: the open PRs from the shared snapshot (one refresher for every seat · TTL in graphs/policies/gh-governor.yaml). */
+export function openPrsFromSnapshot(repo: LandRepo, stateRoot: string): OpenPrRecord[] {
+  noRepo(repo);
+  const policy = liveGhGovernorPolicy();
+  if (!policy) throw new Error('gh-governor policy unreadable (graphs/policies/gh-governor.yaml)');
+  return readOpenPrSnapshot({ slug: repo.slug, ...(repo.root ? { cwd: repo.root } : {}) }, {
+    stateRoot, now: Date.now, policy, sleep: sleepSync, timeoutMs: 60_000,
+    run: (args, opts) => runGhCliWithResult(args, { ...opts, bin: gh() }),
+  }).prs;
 }
 
 interface GhPr { number: number; headRefOid: string; baseRefName: string; isDraft: boolean; state: string; title: string; author?: { login?: string }; files?: Array<{ path: string }>;
-  headRefName?: string; isCrossRepository?: boolean; createdAt?: string; body?: string }
-const FIELDS = 'number,headRefOid,baseRefName,isDraft,state,title,author,files,headRefName,isCrossRepository,createdAt,body';
+  headRefName?: string; isCrossRepository?: boolean; createdAt?: string; updatedAt?: string; body?: string; labels?: Array<{ name: string }> }
+const FIELDS = 'number,headRefOid,baseRefName,isDraft,state,title,author,files,headRefName,isCrossRepository,createdAt,body,labels';
 
 function toPr(p: GhPr, authors: Record<string, string>): PrInfo {
   const login = p.author?.login ?? '';
   return { number: p.number, head: p.headRefOid, base: p.baseRefName, draft: p.isDraft, state: p.state as PrInfo['state'], title: p.title,
     author: authors[login] ?? 'OP', files: (p.files ?? []).map(f => f.path),
     ...(p.headRefName ? { headRef: p.headRefName } : {}), ...(p.isCrossRepository ? { crossRepo: true } : {}), ...(p.createdAt ? { createdAt: p.createdAt } : {}),
-    ...(typeof p.body === 'string' ? { body: p.body } : {}) };
+    ...(p.updatedAt ? { updatedAt: p.updatedAt } : {}),
+    ...(typeof p.body === 'string' ? { body: p.body } : {}), labels: (p.labels ?? []).map(l => l.name) };
 }
 
 function receiptDirs(pr: number, kind: 'PREGATE-GREEN' | 'PREGATE-RED' = 'PREGATE-GREEN'): string[] {
@@ -286,8 +310,8 @@ export function defaultLandDeps(over: Partial<LandDeps> = {}): LandDeps {
   // 착지 집사 policy pack (graphs/loop-agents/land-steward/policies.yaml · decision 11-27): only explicit lane pins reorder a
   // land run; no pins (or no pack) → no `order` → tickLand's own landOrder, exactly as before. The pack's `mode` is the
   // steward's live order (stewardDeps), never applied here.
-  const policy = (require('../land-steward/policy.js') as typeof import('../land-steward/policy.js'));
-  const pinned = policy.pinOrder(policy.loadLandPolicy());
+  const policy = (require('../land-graph/lane-order.js') as typeof import('../land-graph/lane-order.js'));
+  const pinned = policy.pinOrder((require('../kit/lane-pins/index.js') as typeof import('../kit/lane-pins/index.js')).loadLivePolicy(effectiveInstanceRoot())); // ⊕ the train manager's runtime pins (TTL)
   return {
     now: () => new Date(),
     stateRoot: effectiveInstanceRoot(),
@@ -295,7 +319,8 @@ export function defaultLandDeps(over: Partial<LandDeps> = {}): LandDeps {
     ...(typeof cfg.orgPath === 'string' ? { org: { path: cfg.orgPath } } : {}),
     ...(typeof cfg.cardSeat === 'string' ? { cardSeat: cfg.cardSeat } : {}),
     async listPrs() {
-      return (ghJson(['pr', 'list', '--state', 'open', '--limit', '100', '--json', FIELDS], target) as GhPr[]).map(p => toPr(p, authors));
+      // GH-BUDGET-GOVERNOR ①: the shared snapshot (every page · files from the per-head cache), not a fresh 100-PR read per tick.
+      return (openPrsFromSnapshot(target, this.stateRoot) as unknown as GhPr[]).map(p => toPr(p, authors));
     },
     async prNow(n) { return toPr(ghJson(['pr', 'view', String(n), '--json', FIELDS], target) as GhPr, authors); },
     receipt(pr, head) {
@@ -303,7 +328,7 @@ export function defaultLandDeps(over: Partial<LandDeps> = {}): LandDeps {
       const all = receiptDirs(pr).map(d => readReceipt(d, { expectedPr: pr })).filter((r): r is Receipt => !!r);
       const rs = all.filter(r => r.head === head && r.dir.split('/').pop()!.startsWith(`${pr}-${head.slice(0, 12)}-`));
       // GREEN same head → GREEN reused by patch-id → RED same head (RED-RECEIPT · decide() keeps only focused / tsc-timeout reds).
-      return rs.find(r => localFocusedRaw(r) !== null) ?? rs[0] ?? reuseByPatchId(all, head, p => patchIdOf(repoCwd, p, pr))
+      return rs.find(r => localFocusedRaw(r) !== null) ?? rs[0] ?? reuseByPatchId(all, head, p => patchIdOf(repoCwd, p, pr), old => carriesOwnDiff(repoCwd, old, head))
         ?? redReceipts(receiptDirs(pr, 'PREGATE-RED'), head, pr)[0] ?? null;
     },
     olderReceiptHead(pr, head) {
@@ -337,6 +362,7 @@ export function defaultLandDeps(over: Partial<LandDeps> = {}): LandDeps {
           LAND_TSC_HOSTS: tscHostsFor(ctx?.tscAttempt ?? 0, retryHosts(cfg, hostsFor('tsc')[0])) }, timeout: 40 * 60_000 }); // Source: v2 preflight ≤ ~30 min on the first registry tsc host.
       const text = `${out.stdout ?? ''}\n${out.stderr ?? ''}`;
       appendFileSync(join(e, `land-graph-${pr.number}.log`), text);
+      if (out.status === 0) invalidateOpenPrSnapshot(this.stateRoot, { slug: target.slug }); // the open set changed
       return { rc: out.status ?? 99, text };
     },
     staleRevert(pr) {
@@ -372,16 +398,25 @@ export function defaultLandDeps(over: Partial<LandDeps> = {}): LandDeps {
       return Array.isArray(v) && v.length > 0;
     },
     retargetToMain(pr) {
-      const inv = ghInvocation(['pr', 'edit', String(pr.number), '--base', 'main'], target);
-      const out = spawnSync(gh(), inv.args, { encoding: 'utf8', timeout: 60_000, ...(inv.cwd ? { cwd: inv.cwd } : {}) });
-      return out.status === 0 ? { ok: true } : { ok: false, why: (out.stderr ?? '').trim().slice(0, 160) };
+      const out = ghRun(['pr', 'edit', String(pr.number), '--base', 'main'], target);
+      if (out.ok) invalidateOpenPrSnapshot(this.stateRoot, { slug: target.slug });
+      return out.ok ? { ok: true } : { ok: false, why: out.stderr.toString('utf8').trim().slice(0, 160) };
     },
     superseded: pr => supersededInMain(repoCwd, pr),
     ...cellLinkDeps(),
     closePr(pr, comment) {
-      const inv = ghInvocation(['pr', 'close', String(pr.number), '--comment', comment], target);
-      const out = spawnSync(gh(), inv.args, { encoding: 'utf8', timeout: 60_000, ...(inv.cwd ? { cwd: inv.cwd } : {}) });
-      return out.status === 0 ? { ok: true } : { ok: false, why: (out.stderr ?? '').trim().slice(0, 160) };
+      const out = ghRun(['pr', 'close', String(pr.number), '--comment', comment], target);
+      if (out.ok) invalidateOpenPrSnapshot(this.stateRoot, { slug: target.slug });
+      return out.ok ? { ok: true } : { ok: false, why: out.stderr.toString('utf8').trim().slice(0, 160) };
+    },
+    // PR-ZOMBIE-AGING (graphs/policies/pr-aging.yaml): head age from the local head commit (no fetch) · conflict from RED steps.
+    prAging: livePrAgingPolicy(),
+    headTimes: heads => headCommitTimes(repoCwd, heads),
+    redSteps: (pr, head) => [...new Set(redReceipts(receiptDirs(pr, 'PREGATE-RED'), head, pr).flatMap(r => (r.red?.failed ?? []).map(f => f.name)))],
+    toDraft(pr) {
+      const out = ghRun(['pr', 'ready', String(pr.number), '--undo'], target);
+      if (out.ok) invalidateOpenPrSnapshot(this.stateRoot, { slug: target.slug });
+      return out.ok ? { ok: true } : { ok: false, why: out.stderr.toString('utf8').trim().slice(0, 160) };
     },
     ...(pinned ? { order: pinned } : {}),
     ...over,
@@ -404,16 +439,21 @@ export function patchIdOf(repo: string, head: string, pr?: number, mainRef = 'or
   return id;
 }
 
-/** A GREEN receipt of an older head whose PR-own change has the same patch-id (only main merged since) counts for `head`. */
-export function reuseByPatchId(receipts: readonly Receipt[], head: string, pidOf: (sha: string) => string | null): Receipt | null {
+/** LAND10-FINISHER-WAIT: the memoized carry proof now lives with carryProof (src/git-smart/delta.ts · shared with the judge). */
+export { carriesOwnDiff };
+
+/** A GREEN receipt of an older head whose PR-own change is the same counts for `head`: same stable patch-id, or (`carry`) the
+ *  own-diff proof — the receipt key is the PR's own change, the head is only recorded (대표 11-28 18:1x). */
+export function reuseByPatchId(receipts: readonly Receipt[], head: string, pidOf: (sha: string) => string | null, carry?: (oldHead: string) => boolean): Receipt | null {
   const older = receipts.filter(r => r.head !== head);
   if (!older.length) return null;
   const cur = pidOf(head);
-  if (!cur) return null;
-  for (const r of [...older].reverse()) {
+  const newest = [...older].reverse();
+  if (cur) for (const r of newest) {
     const old = r.patchId ?? pidOf(r.head);
-    if (old && old === cur) return { ...r, head, reusedFrom: r.head };
+    if (old && old === cur) return { ...r, head, reusedFrom: r.head, reusedVia: 'patch-id' };
   }
+  if (carry) for (const r of newest) if (carry(r.head)) return { ...r, head, reusedFrom: r.head, reusedVia: 'own-diff' };
   return null;
 }
 
@@ -422,13 +462,13 @@ export function reuseByPatchId(receipts: readonly Receipt[], head: string, pidOf
 /** Cell of the release in play (`release.graph.version`) · attach = the `checklist evidence add` store call. Checklist read once per tick. */
 export function cellLinkDeps(): Pick<LandDeps, 'cellLink' | 'attachCell'> {
   /* eslint-disable @typescript-eslint/no-require-imports */
-  const { readReleaseGraphVersion } = require('../ops-dashboard/current-version.js') as typeof import('../ops-dashboard/current-version.js');
+  const { readBoardPointer } = require('../ops-dashboard/current-version.js') as typeof import('../ops-dashboard/current-version.js');
   const { listChecklist } = require('../release-loop/checklist.js') as typeof import('../release-loop/checklist.js');
   const { matchCell } = require('../land-graph/cell-link.js') as typeof import('../land-graph/cell-link.js');
   /* eslint-enable @typescript-eslint/no-require-imports */
   let cache: { at: number; version: string; items: ReturnType<typeof listChecklist>['items'] } | null = null;
   const current = () => {
-    const version = readReleaseGraphVersion();
+    const version = readBoardPointer();
     if (!version) return null;
     if (!cache || cache.version !== version || Date.now() - cache.at > 60_000) {
       try { cache = { at: Date.now(), version, items: listChecklist(version).items }; } catch { return null; }
@@ -438,7 +478,7 @@ export function cellLinkDeps(): Pick<LandDeps, 'cellLink' | 'attachCell'> {
   return {
     cellLink(pr) { const c = current(); return c && c.items.length ? matchCell(pr, c.items) : undefined; },
     attachCell(cell, pr) {
-      const c = current(); if (!c) return { ok: false, why: 'no release.graph.version' };
+      const c = current(); if (!c) return { ok: false, why: 'no current board (release/current-board.json · release.graph.version)' };
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const features = require('../release-loop/feature-store.js') as typeof import('../release-loop/feature-store.js');
       const snap = listChecklist(c.version);
@@ -457,7 +497,7 @@ const git = (cwd: string, args: string[], timeout = 120_000) => spawnSync('git',
 export function supersededInMain(repo: string, pr: PrInfo): boolean {
   if (git(repo, ['fetch', '-q', 'origin', 'main']).status !== 0) return false;
   if (git(repo, ['cat-file', '-e', `${pr.head}^{commit}`]).status !== 0) git(repo, ['fetch', '-q', 'origin', `pull/${pr.number}/head`]);
-  const mt = git(repo, ['merge-tree', '--write-tree', 'origin/main', pr.head]);
+  const mt = mergeTree(args => git(repo, args), 'origin/main', pr.head, [], []);
   if (mt.status !== 0) return false; // conflict or error: not provably contained
   const tree = (mt.stdout ?? '').split('\n')[0]?.trim();
   const mainTree = (git(repo, ['rev-parse', 'origin/main^{tree}']).stdout ?? '').trim();
@@ -569,6 +609,15 @@ export function finisherDeps(target: LandRepo, repo: string, hosts: readonly str
     },
     alive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } },
     refresh: (pr, ctx) => refreshBranch(repo, pr, ctx),
+    autofix(pr, red) {
+      // LAND10-AUTOFIX-LANE: only the mechanical red the ratchets named · plain push (the same PR lock as smart-merge).
+      if (!pr.headRef || pr.crossRepo) return { result: 'semantic', why: 'no same-repo head branch' };
+      const r = autofixPr({ repo, pr: pr.number, head: pr.head, branch: pr.headRef, lockDir: smartMergeLockDir(),
+        red: red.failed.map(s => ({ step: s.name, text: redRaw(red.dir, s.name) })),
+        stillOpen: () => { try { return (ghJson(['pr', 'view', String(pr.number), '--json', 'state'], target) as { state?: string }).state === 'OPEN'; } catch { return false; } } });
+      if (r.result === 'fixed') return { result: 'fixed', newHead: r.newHead, why: r.applied.map(a => `${a.kind} ${a.file}:${a.line}`).join(', ').slice(0, 300) };
+      return { result: r.result, why: r.why };
+    },
     launchResolve(pr, ctx) {
       // SMART-MERGE (c): the LLM step runs in a detached capsule — `eln land smart-merge <pr> --llm` (same CLI entry).
       const dir = join(effectiveInstanceRoot(), 'land-graph', 'finisher'); mkdirSync(dir, { recursive: true });
@@ -671,6 +720,7 @@ export function registerLandCommands(program: Command, deps: () => LandDeps = ()
     const res = await tickLand({ ...deps(), dry: true, ...(o.reap ? { reap: o.apply ? 'apply' as const : 'dry' as const } : {}) });
     emit(res, !!o.json, () => [`plan · mode ${res.mode} · ready ${res.ready ?? 0}${res.error ? ` · ${res.error}` : ''}`, ...res.decisions.map(x => `#${x.pr} ${x.action}${x.cls ? ` ${x.cls}` : ''} · ${x.why}`),
       ...(res.finisher ?? []).map(f => `finisher #${f.pr} @${f.head.slice(0, 12)} ${f.kind} ${f.state} · ${f.why}`),
+      ...(res.autofixPerHour !== undefined ? [`KPI autofix/h ${res.autofixPerHour}`] : []),
       ...(res.stale ?? []).map(s => `stale #${s.pr} ${s.ageH}h · ${s.reason}`),
       ...(res.reaped ?? []).map(r => `reap #${r.pr} ${r.action} · ${r.why}`),
       ...(res.cells ?? []).map(c => c.cell ? `cell #${c.pr} ${c.action} ${c.cell} (${c.basis})` : `cell #${c.pr} landed-no-cell`)].join('\n'));
@@ -684,8 +734,9 @@ export function registerLandCommands(program: Command, deps: () => LandDeps = ()
     emit(res, !!o.json, () => res.locked ? 'tick: another tick holds the lock' : [`tick · mode ${res.mode} · landed ${res.landed.join(',') || '—'}${res.error ? ` · ${res.error}` : ''}`,
       ...res.decisions.map(x => `#${x.pr} ${x.action}${x.cls ? ` ${x.cls}` : ''} · ${x.why}`),
       ...(res.finisher ?? []).map(f => `finisher #${f.pr} @${f.head.slice(0, 12)} ${f.kind} ${f.state} · ${f.why}`),
+      ...(res.autofixPerHour !== undefined ? [`KPI autofix/h ${res.autofixPerHour}`] : []),
       ...(res.cells ?? []).map(c => c.cell ? `cell #${c.pr} ${c.action} ${c.cell} (${c.basis})${c.why ? ` · ${c.why}` : ''}` : `cell #${c.pr} landed-no-cell`)].join('\n'));
-    if (res.error) process.exitCode = 1;
+    if (res.error && !res.skipped) process.exitCode = 1; // GH-BUDGET-GOVERNOR ④: skipped = exit 0, the next tick retries
   }));
   graph.command('replay').option('--date <yyyymmdd>', 'evidence day', '20261125').option('--json').action((o: { date: string; json?: boolean }) => handle(() => {
     const dir = join(seatState(), 'OP', 'evidence', o.date);

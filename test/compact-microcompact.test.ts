@@ -4,6 +4,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { recoverToolOutputChunk } from '../src/compact/archive';
 import { applyMicrocompact } from '../src/compact/microcompact';
 import type { LLMMessage } from '../src/llm';
 
@@ -21,14 +22,16 @@ describe('Wave 2 · Layer 2 · microcompact', () => {
     for (let i = 1; i <= 8; i++) {
       messages.push({
         role: i % 2 === 1 ? 'user' : 'assistant',
-        content: [{ type: 'tool_result', tool_use_id: `t${i}`, content: `payload ${i} ` + 'x'.repeat(100) }],
+        content: [{ type: 'tool_result', tool_use_id: `t${i}`, content: `payload ${i} ` + 'x'.repeat(500) }],
       });
     }
+    const dir = archDir();
     const r = applyMicrocompact(messages, {
+      sessionId: 'micro-test',
       policy: {
         microcompactAgeThreshold: 3,
         preserveLastN: 2,
-        archiveDir: archDir(),
+        archiveDir: dir,
       },
     });
     // First 5 turns should be cleared
@@ -37,11 +40,27 @@ describe('Wave 2 · Layer 2 · microcompact', () => {
     // Verify placeholder applied to old turns
     for (let i = 0; i < 5; i++) {
       const block = (r.messages[i]?.content as any)[0];
-      expect(block.content).toBe(PLACEHOLDER);
+      expect(block.content).toStartWith(PLACEHOLDER);
+      const sha = block.content.match(/sha256-utf16le: ([a-f0-9]{64})/)?.[1];
+      expect(sha).toBeDefined();
+      expect(recoverToolOutputChunk('micro-test', `t${i + 1}`, 0, 5000, dir, sha)).toMatchObject({ok: true, content: `payload ${i + 1} ` + 'x'.repeat(500)});
     }
     // Recent turns kept
     const recent = (r.messages[7]?.content as any)[0];
     expect(recent.content).toContain('payload 8');
+  });
+
+  test('preserves the original if the archive cannot be written', () => {
+    const messages: LLMMessage[] = [
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'failed-archive', content: 'original evidence' }] },
+      { role: 'assistant', content: 'newer turn' },
+    ];
+    // A regular file cannot be used as an archive directory.
+    const r = applyMicrocompact(messages, { sessionId: 'failure', policy: {
+      microcompactAgeThreshold: 0, preserveLastN: 1, archiveDir: import.meta.path,
+    } });
+    expect(r.cleared).toBe(0);
+    expect(r.messages).toEqual(messages);
   });
 
   test('idempotent — running twice does not double-clear', () => {

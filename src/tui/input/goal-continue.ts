@@ -36,11 +36,19 @@ export const DEFAULT_SEAT_CAP_CONTINUE_LIMIT = 5;
 export const SEAT_CAP_CONTINUE_ENV = 'ELANOUS_TUI_SEAT_CAP_CONTINUE';
 /** Plan-driven continues in a row (no person's turn between) before a person is asked. */
 export const DEFAULT_PLAN_CONTINUE_LIMIT = 10;
+/** Policy key: set to 0 to retain manual handling at the plan cap. */
+export const PLAN_CAP_AUTO_RESUME_ENV = 'ELANOUS_TUI_PLAN_CAP_AUTO_RESUME';
 /** Language-free: the verdict came from the plan state, so the prompt only restates the contract. */
 export const PLAN_CONTINUE_PROMPT = '[plan] Open steps remain in your plan and nothing is marked blocked. Continue with the active step using tools and keep the plan current with update_plan. '
   + 'Decide questions you can answer yourself; if you truly cannot go on without a person or an outside change, mark that step blocked with a reason instead of asking.';
 export const PLAN_NUDGE_PROMPT = '[plan] Record this turn\'s outcome with update_plan before ending a turn: finished steps completed, the active step in_progress, a step that needs a person blocked (with a reason), '
   + 'a step that waits for something waiting (with a wake). Then continue if work remains.';
+
+/** TURN-GIVES-UP-NO-WORK ④ — language-free like the plan prompts: the verdict came from the tool rows (a delegation that did
+ *  not start and no state change), so the prompt only restates what to do. */
+export const DELEGATION_FAILED_CONTINUE_PROMPT = '[delegation] The delegated agent in the last turn did not start, and nothing was saved or changed since. '
+  + 'Do that work yourself now with your own tools — search, read, and write any file the request asked for — and keep the plan current with update_plan. '
+  + 'If the request is already fully answered, say so in one line and stop.';
 
 export const SEAT_CAP_CONTINUE_PROMPT = '[자리 턴 상한 이어가기] 앞 자리 턴이 도구·시간 상한에 닿아 마감됐다. 위 진행 요약을 이어받아 남은 일을 계속한다 — 다 끝났다면 update_goal(status:"complete", evidence) 로 마감하고, 사람 판단·권한이 필요한 막힘이면 무엇이 필요한지 한 줄로 쓰고 멈춘다.';
 const HUMAN_ACTION = /로그인(?:이 필요|해 주세요)|결제(?:가 필요|해 주세요|해야 합니다)|(?:사람|사용자)의\s*(?:결정|승인)|(?:결정|승인)(?:이 필요|해 주세요)|권한이 필요|비밀번호를 입력해 주세요|위험\s*(?:승인|감수)(?:가 필요|를 직접)|직접\s*(?:선택|확인|승인)(?:해 주세요|이 필요)|\bhuman\s+(?:approval|decision|login|payment)\s+(?:is )?(?:required|needed)\b/iu;
@@ -140,6 +148,19 @@ export function isSucceededStateChange(m: ProgressRow, extra: ReadonlySet<string
 /** AUTOPILOT-GOAL-CONTINUE-CAP: progress = a state-changing tool call whose dispatch result succeeded. */
 export function turnMadeProgress(rows: ReadonlyArray<ProgressRow>): boolean {
   return rows.some((m) => isSucceededStateChange(m));
+}
+
+const DELEGATION_TOOL_ROW_NAMES = new Set(['agent', 'task']);
+
+/**
+ * TURN-GIVES-UP-NO-WORK ④ (CEO field report 11-28: A continued, B stopped — only A's last sentence happened to match a pledge pattern):
+ * this turn handed its work to a delegation that did not start (an Agent/Task row whose result did not succeed) and
+ * changed nothing afterwards. Structured rows only — the reply's wording is not read.
+ */
+export function turnDelegationFailedWithoutWork(rows: ReadonlyArray<ProgressRow>): boolean {
+  const failedDelegation = rows.some((m) => m.role === 'tool' && typeof m.toolName === 'string'
+    && DELEGATION_TOOL_ROW_NAMES.has(m.toolName.toLowerCase()) && !toolResultSucceeded(m.toolResult));
+  return failedDelegation && !turnMadeProgress(rows);
 }
 
 export function formatGoalContinuePrompt(phrase: string): string {
@@ -259,9 +280,11 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
     return Number.isInteger(raw) && raw >= 0 && (process.env[SEAT_CAP_CONTINUE_ENV] ?? '').trim() !== '' ? raw : (deps.seatCapContinueLimit ?? DEFAULT_SEAT_CAP_CONTINUE_LIMIT);
   })();
   let seatCapConsecutive = 0;
-  type Armed = { tail: string; phrase: string; fingerprint: string; mode: 'pledge' | 'remaining' | 'seat-cap' | 'plan' | 'plan-nudge' };
+  type Armed = { tail: string; phrase: string; fingerprint: string; mode: 'pledge' | 'remaining' | 'seat-cap' | 'plan' | 'plan-nudge' | 'delegation-failed' };
   let armed: Armed | null = null;
   let planConsecutive = 0;
+  // Progress is accumulated only within this cap window, not across human turns.
+  let planWindowProgress = false;
   // Only newly completed steps on the same plan are evidence of progress. Version bumps,
   // changed wording, and completing the same step twice cannot buy another budget.
   let planIdentity: string | undefined;
@@ -321,6 +344,12 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
       return { opened: false, reason: 'no-progress' };
     }
     if (mode === 'plan' || mode === 'plan-nudge') {
+      if (!autopilot && mode === 'plan' && planConsecutive >= planLimit && planWindowProgress
+        && process.env[PLAN_CAP_AUTO_RESUME_ENV] !== '0') {
+        log('tui', 'turn.auto-continue', { reason: 'plan-cap-policy-resume', n: planConsecutive, limit: planLimit });
+        planConsecutive = 0;
+        planWindowProgress = false;
+      }
       if (!autopilot && mode === 'plan' && planConsecutive >= planLimit) {
         armed = null;
         log('tui', 'turn.auto-continue', { rejected: true, reason: 'plan-limit', n: planConsecutive, limit: planLimit });
@@ -402,7 +431,10 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
       log('tui.proactive', 'stop-cap', { reason: mode === 'remaining' ? 'work-remaining' : 'pledge', remainingDigest: fingerprint, autoTurn: consecutive, cap });
       return { opened: false, reason: 'cap' };
     }
-    const result = deps.startTurnIfIdle(formatGoalContinuePrompt(phrase), { origin: 'goal-continue', reason: mode === 'remaining' ? CONTINUE_REASON.remainingPlan : CONTINUE_REASON.nextStep });
+    const result = deps.startTurnIfIdle(mode === 'delegation-failed' ? DELEGATION_FAILED_CONTINUE_PROMPT : formatGoalContinuePrompt(phrase), {
+      origin: 'goal-continue',
+      reason: mode === 'remaining' ? CONTINUE_REASON.remainingPlan : mode === 'delegation-failed' ? CONTINUE_REASON.delegationFallback : CONTINUE_REASON.nextStep,
+    });
     if (result.opened) {
       armed = null;
       turnRunningStreak = 0;
@@ -410,7 +442,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
       consecutive += 1;
       openedFingerprints.add(fingerprint);
       log('tui.goal-continue', 'decided', { opened: true, reason: 'pledge-without-result', phrase, tail, consecutive, turnId: result.turnId });
-      log('tui', 'turn.auto-continue', { opened: true, reason: mode === 'remaining' ? 'remaining-work' : 'declared-next-step', n: consecutive, limit: cap, turnId: result.turnId });
+      log('tui', 'turn.auto-continue', { opened: true, reason: mode === 'remaining' ? 'remaining-work' : mode === 'delegation-failed' ? 'delegation-failed' : 'declared-next-step', n: consecutive, limit: cap, turnId: result.turnId });
       log('tui.proactive', 'continue', { reason: mode === 'remaining' ? 'work-remaining' : 'pledge-without-result', remainingDigest: fingerprint, autoTurn: consecutive, turnId: result.turnId });
       return { opened: true, reason: 'pledge-without-result' };
     }
@@ -460,6 +492,10 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
         noProgress = progressed ? 0 : noProgress + 1;
         log('tui.goal-continue', 'progress', { progressed, noProgress, consecutive });
       }
+      // Plan bookkeeping and mail do not prove delivery progress; only successful artifact edits count here.
+      if (continuationOpen && !end.failed && (end.rows ?? []).some((row) =>
+        ['edit', 'write', 'multiedit', 'apply_patch', 'applypatch', 'edit_file', 'write_file'].includes((row.toolName ?? '').toLowerCase())
+        && isSucceededStateChange(row))) planWindowProgress = true;
       continuationOpen = false;
       if (end.failed) {
         log('tui.goal-continue', 'decided', { rejected: true, reason: 'turn-failed' });
@@ -494,6 +530,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
             if (progressed) {
               log('tui', 'turn.auto-continue', { reason: 'plan-progress', completed: completedPlanSteps.size, previousStreak: planConsecutive });
               planConsecutive = 0;
+              planWindowProgress = false;
             }
           }
           armed = { tail: tail ?? '', phrase: 'plan open', fingerprint: goalContinueFingerprint(planOutcome.step), mode: 'plan' };
@@ -521,6 +558,12 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
       // No structure: ask for the plan state once before falling back to wording — but only when the old rules would have continued anyway.
       const armedByLegacy = armed as Armed | null; // armLegacy assigns it; TypeScript cannot see through the call
       if (deps.planNudge === true && armedByLegacy && !planNudged) armed = { ...armedByLegacy, mode: 'plan-nudge' };
+      // TURN-GIVES-UP-NO-WORK ④: the wording armed nothing, but the rows say the work was handed to a delegation that
+      // never started and nothing changed since — continue (bounded by the same cap and same-reply rule).
+      if (!armed && turnDelegationFailedWithoutWork(end.rows ?? [])) {
+        armed = { tail: tail ?? '', phrase: 'delegation did not start', fingerprint: goalContinueFingerprint(`delegation-failed:${tail ?? ''}`), mode: 'delegation-failed' };
+        log('tui.goal-continue', 'armed', { reason: 'delegation-failed', by: 'rows' });
+      }
     },
     noteGoalCompleted() {
       completedGoal = true;
@@ -535,6 +578,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
       continuationOpen = false;
       seatCapConsecutive = 0;
       planConsecutive = 0;
+      planWindowProgress = false;
       planIdentity = undefined;
       completedPlanSteps.clear();
       planNudged = false;

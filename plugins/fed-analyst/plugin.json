@@ -1,0 +1,27 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "fed-analyst",
+  "name": "fed-analyst",
+  "version": "1.0.0",
+  "description": "30분마다 연방 분석 여섯 줄(발견 → 누가 · 무엇을 · 재확인) ⊕ 토폴로지 합격판이 원장과 OP 세계 카드에 있다",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "fed-analyst",
+          "agent": "../../graphs/loop-agents/fed-analyst/agent.yaml",
+          "trigger": "../../graphs/triggers/fed-analyst-agent.yaml",
+          "kpis": [
+            "analysis_age_min"
+          ]
+        }
+      ]
+    }
+  }
+}

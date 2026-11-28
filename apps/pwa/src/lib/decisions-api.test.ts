@@ -41,3 +41,20 @@ test('list and decide expose status on failed reads/writes', async () => {
   expect(listOpenDecisions(client)).rejects.toThrow('decisions list failed: 409');
   expect(decide(client, 'id', 'a')).rejects.toThrow('decision failed: 409');
 });
+
+test('an irreversible card asks once more (428 confirm token): confirm → second POST carries the token · cancel → nothing decided', async () => {
+  for (const answer of [true, false]) {
+    const bodies: unknown[] = [];
+    const asked: string[] = [];
+    const client = { fetchResponse: async (_path: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { confirmToken?: string };
+      bodies.push(body);
+      return body.confirmToken ? json({ decidedAt: '2026-11-28T05:00:00Z' }) : json({ error: 'confirm-required', confirmToken: 'c0ffee', message: 'A) Publish — this cannot be undone. Decide this?' }, 428);
+    } };
+    const run = decide(client, 'D-20261128-01', 'a', undefined, (message) => { asked.push(message); return answer; });
+    if (answer) expect(await run).toEqual({ decidedAt: '2026-11-28T05:00:00Z' });
+    else await expect(run).rejects.toThrow('decision cancelled');
+    expect(asked).toEqual(['A) Publish — this cannot be undone. Decide this?']);
+    expect(bodies).toEqual(answer ? [{ choice: 'a' }, { choice: 'a', confirmToken: 'c0ffee' }] : [{ choice: 'a' }]);
+  }
+});

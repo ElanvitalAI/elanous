@@ -137,6 +137,12 @@ export function buildQuestion(kind: 'noul' | 'choice' | 'score', instructions: s
   return { type: 'score', instructions, criteria };
 }
 
+/** A non-2xx Jev answer — `status` lets callers tell 402 (credits) · 429 (rate) · 401 (key) apart without reading text. */
+export class JevHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) { super(message); this.status = status; this.name = 'JevHttpError'; }
+}
+
 export async function callJev(
   req: JevRequest,
   key: string | undefined,
@@ -162,7 +168,7 @@ export async function callJev(
           : res.status === 429
             ? ' — ⛔ 레이트리밋이다. 잠시 뒤 다시 — 키·크레딧 문제가 아니다'
             : '';
-    throw new Error(`Jev HTTP ${res.status}: ${text.slice(0, 200)}${hint}`);
+    throw new JevHttpError(res.status, `Jev HTTP ${res.status}: ${text.slice(0, 200)}${hint}`);
   }
   return JSON.parse(text) as JevResponse;
 }

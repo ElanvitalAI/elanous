@@ -1,0 +1,42 @@
+# BURST-ACTUATOR-WIRED (0.3.40 P1 · CEO 11-29 02:3x «등록이 아니라 당장 바로 시작»): how a started burst turns its scale plan
+# into real launches. Incident 11-28: `eln pulse burst start --goal land --preset 4h` (burst-20261128T1409) beat «손 +0 · VM 0»
+# for ~5 h — the plan said «hands 4 → 6» every 15 min, but no code ever called an actuator (launches: [] all night) and the
+# start seeded `levels` with the preset TARGETS, so the planner believed 4 hands were already running.
+# Code reads these numbers (src/loops/op-pulse-burst-actuate.ts) — no copy lives in src/. Lane scale numbers (min · max · step
+# · cooldown · up_at · down_at · $/unit·h) stay in graphs/triggers/op-pulse.rhythm.yaml `burst.lanes`.
+schema: 1
+
+# A burst older than this with zero launches while a lane's pressure says «up» is a stall: the pulse brief carries a ⚠ line
+# naming why (unwired lane · no free hand seat · actuator error) so OP sees it on the next turn, not after 5 h.
+stall_after_min: 15
+# At most this many units launched per pulse across all lanes (one pulse = one step; the next pulse re-measures).
+max_units_per_pulse: 4
+# Cost recorded per launched unit = lane cost_per_unit_hour_usd × min(hours left in the burst, this many hours).
+cost_hours_cap: 4
+
+# Pressure targets the planner divides by (ratio 1 = on target). Before this file they were literals in op-pulse-run.ts.
+pressure_targets:
+  gate_wait_min: 10
+  review_wait_min: 20
+  land_queue: 6
+  ready_per_hand_default: 2
+  judge_wait_min_default: 30
+
+# Doors per lane. door: none = not wired (the beat says «미배선», never a fake +k). Only existing commands are doors.
+lanes:
+  hands:
+    door: els-new              # els new --ws <hand home> --cwd <seats folder>/<SEAT> --title <SEAT> -- <command…>
+    seats_dir: seats           # the seats folder beside the seat-state root (resolveSeatStateRoot) — no HQ path literal
+    # A hand seat declared in the federation registry with no live pane (hand pool state «no-pane») gets a pane.
+    command: [codex, -p, seat, 'eln work next 로 일감을 당겨 바로 시작한다 (버스트 손)']
+    timeout_sec: 30
+  vm:
+    door: hosts-start          # eln hosts start <host> — only after planScale cleared it (local/LAN full · forecast misses · budget/card)
+    # hosts = the world registry's paid burst hosts in priority order (kit/resource-facts paidHostsFor('burst')) — no list here
+    timeout_sec: 300
+  ta: { door: none }           # eln harness ask needs a goal file per cell — not chosen by the burst (TA 신규 발사 = OP 결정)
+  remote: { door: none }       # remote placement per RES caps — TODO
+  review: { door: none }       # one review per PR — the review lane is driven by the land graph
+  pregate: { door: none }      # pregate slots are RES caps — TODO
+  land: { door: none }         # train width — TODO
+  judge: { door: none }        # JUD-RELAX: veto only

@@ -9,7 +9,7 @@ const initial: SpaceJournal = {
   version: 1,
   workspaces: [{ id: 'w', name: 'OP', rootCwd: '/x', purpose: '', host: 'local', coordinatorSeat: 'A' }],
   tabs: ['A', 'B'].map(id => ({ id: `t${id}`, workspaceId: 'w', label: id, focusPaneId: `p${id}` })),
-  panes: ['A', 'B'].map(id => ({ id: `p${id}`, tabId: `t${id}`, kind: 'pty' as const, title: 'same', cwd: `/x/seats/${id}`, command: [], state: 'idle' as const, restore: 'cwd' as const, ptyId: '', scrollback: '' })),
+  panes: ['A', 'B'].map(id => ({ id: `p${id}`, tabId: `t${id}`, kind: 'pty' as const, title: 'same', cwd: `/x/seats/${id}`, seatIdentity: id, command: [], state: 'idle' as const, restore: 'cwd' as const, ptyId: '', scrollback: '' })),
   hqAuthorityLocation: 'future://authority',
 };
 

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { GitWorld } from './fixture.js';
-import { deltaSince, prDelta } from './delta.js';
+import { deltaSince, prDelta, stablePatchId } from './delta.js';
 import { revertGuard } from './revert-guard.js';
 import { importUnion, parseDiff3, resolveFileStructurally } from './conflict-ladder.js';
 import { acquirePrLock, smartRefresh, smartRefreshSync } from './smart-refresh.js';
@@ -58,6 +58,17 @@ describe('conflict ladder — structural rules (pure)', () => {
 });
 
 describe('PR-own delta', () => {
+  test('stable patch-id passes the measured diff and fails closed on git error', () => {
+    const diff = 'measured diff\n';
+    const sha = 'a'.repeat(40);
+    let seen: unknown;
+    expect(stablePatchId((args, opts) => {
+      seen = { args, input: opts?.input };
+      return { status: 0, stdout: `${sha} 0000000000000000000000000000000000000000\n`, stderr: '' };
+    }, diff)).toBe(sha);
+    expect(seen).toEqual({ args: ['patch-id', '--stable'], input: diff });
+    expect(stablePatchId(() => ({ status: 1, stdout: `${sha} ignored`, stderr: 'failure' }), diff)).toBeNull();
+  });
   test('a head that only merged main has an empty range-diff · an author edit does not', () => {
     const w = world({ 'a.ts': 'export const a = 1;\n', 'b.ts': 'export const b = 1;\n' });
     const h1 = w.onBranch('pr', { 'a.ts': 'export const a = 2;\n' }, 'pr edit', 'main');
@@ -93,8 +104,49 @@ describe('stack rebuild after squash', () => {
     const nh = w.remoteHead('child');
     expect(nh).toBe('newHead' in r ? r.newHead : '');
     expect(w.l(['rev-parse', `${nh}^1`])).toBe(child); // fast-forward of the old head — no force push
+    // The published merge has the old child and main as parents; the rebuilt
+    // cherry-pick tree is published directly, not as a separate parent commit.
+    expect(w.l(['rev-parse', `${nh}^2`])).toBe(w.remoteHead('main'));
+    expect(w.l(['show', '-s', '--format=%P', nh]).split(' ')).toEqual([child, w.remoteHead('main')]);
     expect(w.changed('main', nh)).toEqual(['b.ts']);
     expect(w.show(nh, 'a.ts')).toBe('line1\nline2-edited\nparent-added');
+    expect(w.show(nh, 'b.ts')).toBe('b1\nchild-added');
+  });
+
+  test('four-layer stack survives successive squash lands and rebuilds', () => {
+    const w = world({ 'base.ts': 'base\n' });
+    const a = w.onBranch('a', { 'a.ts': 'a\n' }, 'a', 'main');
+    w.onBranch('b', { 'b.ts': 'b1\n' }, 'b1', 'a');
+    const b = w.onBranch('b', { 'b.ts': 'b1\nb2\n' }, 'b2');
+    const c = w.onBranch('c', { 'c.ts': 'c\n' }, 'c', 'b');
+    const d = w.onBranch('d', { 'd.ts': 'd\n' }, 'd', 'c');
+
+    w.squashLand('a');
+    const rebuild = (pr: number, branch: string, head: string, parentHeads: string[], file: string) => {
+      const main = w.remoteHead('main');
+      const r = smartRefreshSync({ repo: w.land, pr, head, branch, parentHeads, lockDir: w.lockDir });
+      expect(r.result).toBe('rebuilt');
+      expect('pushed' in r && r.pushed).toBe(true);
+      const rebuilt = w.remoteHead(branch);
+      expect(rebuilt).toBe('newHead' in r ? r.newHead : '');
+      expect(w.l(['show', '-s', '--format=%P', rebuilt]).split(' ')).toEqual([head, main]);
+      expect(w.changed('main', rebuilt)).toEqual([file]);
+      return rebuilt;
+    };
+    const rb = rebuild(2, 'b', b, [a], 'b.ts');
+    expect(w.show(rb, 'a.ts')).toBe('a');
+    expect(w.show(rb, 'b.ts')).toBe('b1\nb2');
+    w.squashLand('b');
+    const rc = rebuild(3, 'c', c, [a, rb], 'c.ts');
+    expect(w.show(rc, 'a.ts')).toBe('a');
+    expect(w.show(rc, 'b.ts')).toBe('b1\nb2');
+    expect(w.show(rc, 'c.ts')).toBe('c');
+    w.squashLand('c');
+    const rd = rebuild(4, 'd', d, [a, rb, rc], 'd.ts');
+    expect(w.show(rd, 'a.ts')).toBe('a');
+    expect(w.show(rd, 'b.ts')).toBe('b1\nb2');
+    expect(w.show(rd, 'c.ts')).toBe('c');
+    expect(w.show(rd, 'd.ts')).toBe('d');
   });
 
   test('without the parent head the same child goes through merge and the ladder', () => {

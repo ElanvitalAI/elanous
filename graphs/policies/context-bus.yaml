@@ -1,0 +1,9 @@
+# CONTEXT-BUS-FEDERATION (0.3.39 · #40640) — bounds of the bus blocks a seat turn carries (src/op-context-bus/seat-turn.ts
+# seatBusDigests). Read by name; change a value here, not in TS (YAML-FIRST-RATCHET). A malformed pack carries no bus block
+# that turn (fail-open, logged as bus.digest-policy-unreadable) — never a silent default.
+version: 1
+digest:
+  # The seat's own space block (the first block) — the same bound the single OP-space digest always had.
+  own_max_chars: 2400
+  # Every further space block (HQ for coordinators · the OP space addressed-only for the rest) gets the smaller one.
+  other_max_chars: 1600

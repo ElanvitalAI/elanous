@@ -15,8 +15,10 @@ import { join } from 'node:path';
 import { checklistDevVersion, devVersion } from '../release-loop/checklist.js';
 import { readSchedule, readSchedules, releasedVersion, type ScheduleRow } from '../release-loop/feature-store.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
+import { readBoardRecord } from '../release-loop/current-board.js';
 
-export type CurrentVersionSource = 'graph' | 'plan' | 'schedule' | 'package';
+/** `board` = the one current-board record (release/current-board.json · CURRENT-RELEASE-ONE-SOURCE); the rest are fallbacks. */
+export type CurrentVersionSource = 'board' | 'graph' | 'plan' | 'schedule' | 'package';
 
 export interface CurrentVersion {
   version: string;
@@ -138,10 +140,22 @@ export function readReleaseGraphVersion(readRaw: () => unknown = readRawConfig):
  * stripped main's package version — main stayed 0.3.37-dev.0 after the 0.3.37 release, so every hand read the published
  * 0.3.37 board («일감 0») while the release in play was 0.3.38. One source: `release.graph.version`, then the package.
  */
-export function activeBoardVersion(readGraph: () => string | null = readReleaseGraphVersion, fallback: () => string = () => checklistDevVersion()): string {
-  let graph: string | null = null;
-  try { graph = readGraph(); } catch { graph = null; }
-  return graph ?? fallback();
+export function activeBoardVersion(readPointer: () => string | null = readBoardPointer, fallback: () => string = () => checklistDevVersion()): string {
+  let pointer: string | null = null;
+  try { pointer = readPointer(); } catch { pointer = null; }
+  return pointer ?? fallback();
+}
+
+/**
+ * CURRENT-RELEASE-ONE-SOURCE (11-28): «the current board» as a nullable pointer — the current-board record
+ * (`<releaseLedgerRoot>/release/current-board.json`, flipped by the release graph right after publish), then the legacy
+ * `release.graph.version`. null = neither is set (guards that skip on «no target» keep doing so). Read from disk every call.
+ * The package dev version is never a board pointer: it only answers in `activeBoardVersion`'s last fallback.
+ */
+export function readBoardPointer(ledgerRoot?: string, readGraph: () => string | null = readReleaseGraphVersion): string | null {
+  const record = readBoardRecord(ledgerRoot ?? releaseLedgerRoot());
+  if (record) return record.current;
+  try { return readGraph(); } catch { return null; }
 }
 
 /** The raw config.json (instance override first) — null when absent. Throws on unreadable JSON. */
@@ -153,11 +167,19 @@ export function readRawConfig(): unknown {
   return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : null;
 }
 
-/** Resolve the current release: `release.graph.version` first, then plan `status: current`, then a not-yet-published
- *  schedule, then the package. `graphVersion` overrides the config read (tests · callers that already hold it). */
-export function resolveCurrentVersion(input: { hqRoot: string; ledgerRoot?: string; packageVersion?: string; graphVersion?: string | null }): CurrentVersion {
+/** Resolve the current release: the current-board record first (CURRENT-RELEASE-ONE-SOURCE), then `release.graph.version`,
+ *  then plan `status: current`, then a not-yet-published schedule, then the package. `boardVersion` / `graphVersion`
+ *  override the record / config read (tests · callers that already hold it); `boardVersion: null` = ignore the record
+ *  (the release-graph run readers, which follow the run being launched, not the board). */
+export function resolveCurrentVersion(input: { hqRoot: string; ledgerRoot?: string; packageVersion?: string; graphVersion?: string | null; boardVersion?: string | null }): CurrentVersion {
   const ledgerRoot = input.ledgerRoot ?? releaseLedgerRoot();
   const plan = currentPlanMark(input.hqRoot);
+  const board = input.boardVersion !== undefined ? input.boardVersion : readBoardRecord(ledgerRoot)?.current ?? null;
+  if (board) {
+    const same = plan?.version === board ? plan : readPlanMarkAny(input.hqRoot, board);
+    return { version: board, source: 'board', theme: same?.theme ?? null, rosterCount: same?.rosterCount ?? null,
+      schedule: scheduleOf(board, ledgerRoot), published: isPublishedVersion(board, ledgerRoot) };
+  }
   const graph = input.graphVersion !== undefined ? input.graphVersion : readReleaseGraphVersion();
   if (graph) {
     const same = plan?.version === graph ? plan : readPlanMarkAny(input.hqRoot, graph);

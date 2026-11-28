@@ -63,7 +63,7 @@ describe('falling credit balance through the REAL pulse → llm-state · daily b
           probes: () => [...view.probes],
           fuelSnapshot: () => ({ ts: now.getTime(), accounts: ['default', 'team', 'third'].map(account => ({ provider: 'codex', account, usedPercent: 100, status: 'ok' as const })) }),
           refreshFuel: () => {}, credentials: () => [], scanSecrets: () => [], supervisors: () => [],
-          restart: () => {}, post: () => 1, heavy: () => ({ view, ports, close: () => {} }), beat: () => {},
+          post: () => 1, heavy: () => ({ view, ports, close: () => {} }), beat: () => {},
           fuelPhase: (sent, mark): FuelPhasePorts => ({
             now, day: new Date(t0).toISOString().slice(0, 10), sent, mark,
             usage: () => ['default', 'team', 'third'].map(account => ({ provider: 'codex', account, usedPercent: 100, status: 'ok' as const })),

@@ -2,13 +2,13 @@
 // The land-graph trigger (graphs/triggers/land-graph.yaml → recipe land-steward-tick) runs `tick`; els channel
 // `loop:land-steward` runs `voice` (register: els channel voice land-steward -- eln land steward voice).
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import type { LandDeps } from '../land-graph/land-graph.js';
 import { checkBusClaim } from '../cli/bus-cli.js';
 import { appendAudit } from '../kit/audit-ledger/index.js';
-import { fileMemory, loadCards, STEWARD_DEMOTERS, STEWARD_ID, STEWARD_LEVELS, STEWARD_SUPERVISOR, stewardHome, type StewardLevel } from './memory.js';
+import { fileMemory, loadCards, STEWARD_DEMOTERS, STEWARD_ID, STEWARD_LEVELS, STEWARD_SEAT, STEWARD_SUPERVISOR, stewardHome, type StewardLevel } from './memory.js';
 
 const out = (v: unknown, json: boolean, text: string) => console.log(json ? JSON.stringify(v) : text);
 const withRefs = (text: string, refs: readonly string[]) => (refs.length ? `${text}\n근거: ${refs.join(' ')}` : text);
@@ -43,24 +43,16 @@ export function channelPort(stateRoot: string): (line: string) => void {
 
 export function registerStewardCommands(land: Command, deps: () => LandDeps): void {
   const s = land.command('steward').description('착지 집사 (land-steward) — loop agent v2 over the land graph: train manager · finisher · cell link · KPI · voice (loop:land-steward)');
-  s.command('tick').description('One wake: body tick (train order · terminal owner) → KPI → one channel line per breach (the land-graph trigger runs this)')
+  s.command('tick').description('One wake: body tick (train order · terminal owner) → KPI → one channel line per breach (the land-graph trigger runs this · alias of the shared v3 door: the land-graph.tick kind runner)')
     .option('--json').action(async (o: { json?: boolean }) => {
       try {
-        const { stewardTick } = await import('./agent.js');
-        const d = deps();
-        const { sweepMainCellLinks } = await import('../land-graph/main-cell-link.js');
-        const { liveSweepDeps } = await import('./cell-link-live.js');
-        const cellSweep = () => sweepMainCellLinks(liveSweepDeps(d.stateRoot, d.dry ? { dry: true } : {}));
-        const r = await stewardTick(d, { memory: fileMemory(d.stateRoot), channel: channelPort(d.stateRoot), report: l0MailPort(), cellSweep }, loadCards());
-        // A lock-held duplicate tick reports itself but keeps the last valid report (KPI · lanes · blocked) on disk.
-        if (!r.locked && !r.error) { mkdirSync(stewardHome(d.stateRoot), { recursive: true }); writeFileSync(join(stewardHome(d.stateRoot), 'last-tick.json'), JSON.stringify(r)); }
-        if (!r.locked && !d.dry) await (await import('../loop-agent/live.js')).liveJournalRollup('land-steward'); // SUPERVISOR-CORRECTION-JOURNAL
-        const k = r.kpi;
-        out(r, !!o.json, r.locked ? 'land-steward: another tick holds the lock' : [`land-steward ${r.level} · body ${r.mode} · landed ${r.landed.join(',') || '—'}${r.error ? ` · ${r.error}` : ''}`,
-          k ? `lands/h ${k.landsLastHour} · ready ${k.ready}/${k.judged} · finisher p50 ${k.needsFinisherWaitP50Min === null ? '—' : Math.round(k.needsFinisherWaitP50Min)}m · no-next ${k.refusalsWithoutNext.length}` : '',
-          ...(r.cellLink ? [`cell-link ${r.cellLink.version ?? '—'} · merged ${r.cellLink.scanned} · ${Object.entries(r.cellLink.counts).map(([k, v]) => `${k} ${v}`).join(' · ') || 'nothing new'}${r.cellLink.error ? ` · ${r.cellLink.error}` : ''}`] : []),
-          ...r.posted, ...(r.slots && r.slots.advise !== r.slots.slots ? [`slots: ${r.slots.why}`] : [])].filter(Boolean).join('\n'));
-        if (r.error) process.exitCode = 1;
+        // CODE-BODY-TO-KIND: the shared v3 door's runner for the land-graph.tick kind — this command is its alias
+        const { KIND_RUNNERS } = await import('../loop-agent/v3/kind-runners.js');
+        const r = await KIND_RUNNERS['land-graph.tick']!({ stateRoot: deps().stateRoot });
+        out(r.summary, !!o.json, r.text);
+        // GH-BUDGET-GOVERNOR ④: a skipped tick (GitHub read failed · cooldown) exits 0 — the trigger must not record an exception.
+        const sum = r.summary as { error?: string; skipped?: string };
+        if (sum.error && !sum.skipped) process.exitCode = 1;
       } catch (e) { console.error(`land steward tick: ${e instanceof Error ? e.message : String(e)}`); process.exitCode = 1; }
     });
   s.command('cell-link').description('LAND-CELL-LINK-ALWAYS: link merges to main → their release cell (evidence #PR · 판정 집사 signs green) · unmatched → one OP digest line. The tick runs it every wake; --since = backfill')
@@ -80,7 +72,7 @@ export function registerStewardCommands(land: Command, deps: () => LandDeps): vo
     .option('--json').action((o: { json?: boolean }) => {
       try {
         const d = deps(); const mem = fileMemory(d.stateRoot); const lvl = mem.level();
-        const last = (() => { try { return JSON.parse(readFileSync(join(stewardHome(d.stateRoot), 'last-tick.json'), 'utf8')) as import('./agent.js').StewardReport; } catch { return null; } })();
+        const last = (() => { try { return JSON.parse(readFileSync(join(stewardHome(d.stateRoot), 'last-tick.json'), 'utf8')) as import('../loop-agent/v3/land-graph-kind.js').LandTickReport; } catch { return null; } })();
         const blocked = (last?.decisions ?? []).filter(x => x.action !== 'land');
         const v = { level: lvl, last, recent: mem.cases(10) };
         const pct = (x: number | null) => (x === null ? '—' : `${Math.round(x * 100)}%`);
@@ -97,8 +89,9 @@ export function registerStewardCommands(land: Command, deps: () => LandDeps): vo
   s.command('ask <question...>').description('«왜 #N 안 들어가?» · «지금 막힌 것?» · «다음 1시간 몇 건?» — answered from the records (dry plan)')
     .option('--json').action(async (q: string[], o: { json?: boolean }) => {
       try {
-        const { answer, voiceView } = await import('./agent.js');
-        const d = deps(); const a = answer(q.join(' '), await voiceView(d), loadCards());
+        const { answer } = await import('../land-graph/voice.js');
+        const { landVoiceView } = await import('../loop-agent/v3/land-graph-kind.js');
+        const d = deps(); const c = loadCards(); const a = answer(q.join(' '), await landVoiceView(d, STEWARD_SEAT), { id: STEWARD_ID, l0: STEWARD_SUPERVISOR, soulText: c.soulText, knowhowText: c.knowhowText });
         fileMemory(d.stateRoot).appendCase({ at: new Date().toISOString(), kind: 'voice', subject: a.kind, why: q.join(' ').slice(0, 120), refs: a.evidence });
         out(a, !!o.json, withRefs(a.text, a.evidence));
       } catch (e) { console.error(`land steward ask: ${e instanceof Error ? e.message : String(e)}`); process.exitCode = 1; }
@@ -111,8 +104,9 @@ export function registerStewardCommands(land: Command, deps: () => LandDeps): vo
         const j = JSON.parse(line) as { text?: unknown; loop?: unknown };
         if (typeof j.text !== 'string') throw new Error('loop voice input needs {text}');
         if (j.loop && j.loop !== STEWARD_ID) throw new Error(`this adapter is loop:${STEWARD_ID}, not loop:${String(j.loop)}`);
-        const { answer, voiceView } = await import('./agent.js');
-        const d = deps(); const a = answer(j.text, await voiceView(d), loadCards());
+        const { answer } = await import('../land-graph/voice.js');
+        const { landVoiceView } = await import('../loop-agent/v3/land-graph-kind.js');
+        const d = deps(); const c = loadCards(); const a = answer(j.text, await landVoiceView(d, STEWARD_SEAT), { id: STEWARD_ID, l0: STEWARD_SUPERVISOR, soulText: c.soulText, knowhowText: c.knowhowText });
         fileMemory(d.stateRoot).appendCase({ at: new Date().toISOString(), kind: 'voice', subject: a.kind, why: j.text.slice(0, 120), refs: a.evidence });
         reply = { text: a.text, evidence: a.evidence.slice(0, 12), actions: [] };
       } catch (e) { reply = { text: `[착지 집사] 목소리 실패 — ${e instanceof Error ? e.message : String(e)} · eln land steward status`, evidence: [], actions: [] }; process.exitCode = 1; }

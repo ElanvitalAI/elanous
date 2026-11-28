@@ -24,6 +24,8 @@ providers:
   #   daily_credit_budget       SAFETY: spent today ≥ this → credits stop (credit level L2) — in the provider's unit
   #   credit_floor              SAFETY: balance ≤ this → credits stop (credit level L3) — in the provider's unit
   #   uses                      what it may serve (implementation · review · judge · chat) — absent = everything
+  #   homes                     KEYS-PROACTIVE-REFRESH: CLI credential homes (CODEX_HOME) holding this account's login — the
+  #                             guardian 열쇠지기 refreshes each before its access token expires (HQ lists them in the overlay)
   # per provider: order (who is used first) · credit_order (by_balance_desc = most credit left first · listed = order)
   openai-codex:                      # unit: codex credits
     order: [team, third, default]
@@ -49,6 +51,25 @@ providers:
 # = an account allowed above goes on with paid credits before anything external (dropped while no account may).
 # Live 11-27: llm.fallbackChain [openrouter] with codexQuotaPolicy=credits — the same order, now stated in one place.
 fallback: [codex-credits, openrouter]
+# FALLBACK-SUBSCRIPTION-FIRST (0.3.39 P0 · 대표 11-28 12:3x «구독 여유 → 유료 크레딧»): the model a hand runs, per difficulty
+# tier (src/seat/model-by-difficulty.ts · `eln tier` names the models). The tier's first model is the plan; once its account is
+# out (used ≥ caps.accountCap · or the level says tier_down) the budget walks the tier's list once per `fallback` step:
+#   subscription-headroom   a model paid by a subscription window still under its cap (codex team/third/default · zai plan)
+#   credits-by-balance      a model whose provider may spend credits now (OpenRouter balance · codex accounts allowed above,
+#                           taken in the provider's credit_order — by_balance_desc = most credit left first)
+# so paid credits are used only when no acceptable subscription has headroom. Nothing left → the tier's last, noted (never a stall).
+# models.<id>.accounts = the pack provider that pays (glm runs on the zai plan) · uses.review false = never for review (대표).
+hand_models:
+  models:
+    terra:  { provider: openai-codex, model: gpt-6.1-terra }
+    luna:   { provider: openai-codex, model: gpt-6-luna }
+    glm:    { provider: glm, model: glm-5.3, accounts: zai, uses: { review: false } }
+    or-glm: { provider: openrouter, model: z-ai/glm-5.3, uses: { review: false } }
+  tiers:
+    hard:   [terra, luna, glm, or-glm]
+    medium: [luna, glm, or-glm, terra]
+    easy:   [glm, or-glm, luna]
+  fallback: [subscription-headroom, credits-by-balance]
 levels:
   # A resource stays at least this long in a level before it may move again (no flapping around a watermark).
   dwell_min: 15

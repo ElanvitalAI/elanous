@@ -573,6 +573,7 @@ import {
   handleVoiceCost,
   handleVoiceTranscribe,
   checkAuth,
+  ownerCredentialAuth,
   bearerCredential,
   setupBearerScopeDenied,
   registerAuthPeerAddress,
@@ -4656,6 +4657,7 @@ export async function routeRequest(
       return handleDecisions(req, {
         authorize: (request) =>
           !!opts.metaApi && checkAuth(request, opts.metaApi),
+        ownerProof: (request) => ownerCredentialAuth(request),
         ...opts.decisions,
       });
     }

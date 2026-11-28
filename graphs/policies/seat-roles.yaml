@@ -1,0 +1,84 @@
+# SEAT-AREA-GUARD (0.3.39 P0 · Claude OP 11-28) — who is a pool hand and which cells a seat may be handed. The first slice
+# of YAML-SEAT-ROLES (role YAML · 내부 문서 `YAML-SYSTEM` §8): kind ⊕ pool ⊕ areas only; permissions · tools · wakes ·
+# prompt fragments join this file in that cell. Read by ONE reader — src/kit/seat-area/index.ts — used by `eln seat assign`
+# (every push path: resource steward RO rows · the 행정관 · OP direct · SeatAssign tool), OP's next-action planner, the hand
+# steward (hints ⊕ claim-for), the space steward (R1) and `eln work next`. Change a value here, not in TS.
+# An unreadable file = the pre-policy board (every seat a pool hand · no areas), named in the reader's error — never a stop.
+#
+# S (11-28 measured): `eln seat pool` listed MK and UX as pool hands (home OP · ladder depth 3), so the resource steward
+#   (`[steward RO-n]`) and the 행정관 pushed any stalled P0/P1 at them — 40 `[SEAT-ASSIGN] … → MK` mails in one day, four of
+#   them after the CEO (19:1x–19:3x) made MK the docs-P0 owner (RES-ABSORB-GUARDIAN · ELS-REMOTE-TAB-RELAY · ELN-OP-SELF-HEAL-LOOP ·
+#   LAND-RECEIPT-RAW-RETENTION) · UX got 35 the same day.
+#
+# Seat rule fields:
+#   kind  — coordinator | hand | judge. judge: the maker ≠ judge rules (isJudgeRole) decide; this file does not narrow them.
+#   pool  — true = the seat may be handed cells by the planner / stewards / work next. false = never (its own cells only).
+#   areas — optional. Present = the seat only gets cells that match one entry:
+#             paths: globs matched against the cell's target paths (the «대상 경로:» line ⊕ repo paths in title/body/done-when)
+#             cells: globs matched against the cell id (the board's id namespaces)
+#           Absent = any cell (a general pool hand).
+# A cell that declares no target path and matches no id glob goes to general hands only. A seat's own cell (it is the
+# owner) always fits — waking an owner on its cell is never an area question.
+# Keys are seat ids or globs (`TC-H-*`); the first exact id wins, then the longest matching glob, then `default`.
+version: 1
+
+default:
+  kind: hand
+  pool: true
+
+seats:
+  OP:
+    kind: coordinator
+    pool: false
+  TC:
+    # Engineering lead — takes any code cell when idle (unchanged from the pre-policy board).
+    kind: coordinator
+    pool: true
+  MK:
+    # 내부 문서 `MK` · seat-state/MK/ROLE.md: everything said outside — website · public docs · release notes · marketing.
+    kind: coordinator
+    pool: true
+    areas:
+      paths:
+        - website/**
+        - release/public/**
+        - release/next.md
+        - docs/marketing/**
+        - docs/brand/**
+        - docs/roles/MK/**
+      cells:
+        - DOCS-*
+        - '*-DOCS'
+        - '*-DOCS-*'
+        - WEB-*
+        - SITE-*
+        - HOMEPAGE-*
+        - RELEASE-NOTES*
+        - MK-*
+  UX:
+    # 내부 문서 `UX` · seat-state/UX/ROLE.md: the surface contract — els/TUI · PWA/home · apps · Telegram/Discord.
+    kind: coordinator
+    pool: true
+    areas:
+      paths:
+        - src/els/**
+        - src/tui/**
+        - src/pwa/**
+        - apps/**
+        - src/telegram/**
+        - src/discord/**
+        - src/bots/**
+        - scripts/ux/**
+        - docs/roles/UX/**
+      cells:
+        - ELS-*
+        - PWA-*
+        - TUI-*
+        - UX-*
+        - SURFACE-*
+  JUD*:
+    kind: judge
+    pool: false
+  REVIEW*:
+    kind: judge
+    pool: false

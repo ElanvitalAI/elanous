@@ -1,5 +1,6 @@
 import { debug } from '../debug/log.js';
-import { checklistDevVersion, listChecklist, summarizeChecklist, type Checklist } from './checklist.js';
+import { listChecklist, summarizeChecklist, type Checklist } from './checklist.js';
+import { boardVersion } from './board-version.js';
 
 /** One text board shared by the Telegram and TUI slash surfaces. */
 export function renderChecklistBoard(checklist: Checklist): string {
@@ -19,7 +20,7 @@ export function renderChecklistBoard(checklist: Checklist): string {
 export function checklistBoardSlash(args: readonly string[], read: (version: string) => Checklist = listChecklist): string {
   if (args.length > 1) return '사용법: /board [판]';
   try {
-    return renderChecklistBoard(read(args[0] ?? checklistDevVersion()));
+    return renderChecklistBoard(read(args[0] ?? boardVersion()));
   } catch (error) {
     debug.log('release.checklist', 'board-read-failed', { version: args[0] ?? null, error: error instanceof Error ? error.message : String(error) });
     return '판 체크리스트를 못 읽었다 — 「없다」가 아니다';

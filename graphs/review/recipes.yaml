@@ -1,0 +1,3 @@
+# DEV-REVIEW-COMMON — the three review units run on in-process handlers only (src/kit/dev-review createDevReviewHandlers ·
+# registered by the host: `eln work review …` for the hand path, the sim world for scenes). No command recipe here.
+{}

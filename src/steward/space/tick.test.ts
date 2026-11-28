@@ -229,6 +229,22 @@ describe('steward space tick', () => {
     expect(shadowOnly.mails).toEqual([]);
   });
 
+  test('r1 skips reclaim when the injected pool limit is unknown or throws', () => {
+    const run = (id: string, limit: () => number | null): string[] => {
+      const effects = spy();
+      const d: TickDeps = { ...deps(effects, { scopes: { TC: { mode: 'live' } } }), reclaimLimit: limit,
+        sources: () => ({ ...sources(), panes: () => ({ panes: [{ seat: 'TC-H-CX-1', activityState: 'idle', lastEventAtMs: agoMs(300) }] }),
+          checklist: () => ({ version: '0.3.36', items: [{ id: 'STALE', title: 'stale', status: 'yellow', owner: 'TC-H-CX-1', priority: 'P0', updatedAt: ago(300) }] }),
+          prs: () => [], receipts: () => [] }) };
+      runStewardSpaceNode('r0', { runId: id, scope: 'TC' }, d);
+      runStewardSpaceNode('r1', { runId: id, scope: 'TC' }, d);
+      return effects.releases;
+    };
+    expect(run('allow', () => 1).length).toBe(1);
+    expect(run('unknown', () => null)).toEqual([]);
+    expect(run('error', () => { throw new Error('pool unavailable'); })).toEqual([]);
+  });
+
   test('a node without its snapshot fails (r0 did not run)', () => {
     expect(runStewardSpaceNode('r1', { runId: 'nope' }, deps(spy(), {})).outcome).toBe('fail');
   });

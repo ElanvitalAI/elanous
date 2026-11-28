@@ -10,6 +10,10 @@ if (!shouldRunCliEntry()) {
   // `<version> <YYMMDD_HHMM in KST> <sha>`. The stamp is omitted for legacy packages without build time.
   const { cliVersionLine } = await import('../src/version/build-stamp.ts');
   console.log(cliVersionLine());
+} else if (process.argv[2] === 'gh' && (process.env.ELN_GH_SHIM_ACTIVE === '1' || process.argv[3] === '--eln-door-probe')) {
+  // GH-PROXY-LAYER: the PATH gh shim (bin/gh-shim/gh) lands here — the transparent governed door, before any registry loads.
+  const { runGhShimDoorCli } = await import('../src/cli/gh-door-cli.ts');
+  process.exitCode = await runGhShimDoorCli(process.argv.slice(3));
 } else {
   // `els` is the argv0 alias of `elanous side` (same package, same entry).
   const invokedAsEls = process.argv[1]?.split(/[\\/]/).pop()?.replace(/\.(mjs|cjs|js)$/, '') === 'els';

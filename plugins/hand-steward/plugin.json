@@ -1,0 +1,27 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "hand-steward",
+  "name": "hand-steward",
+  "version": "1.0.0",
+  "description": "놀고 있는 손과 주인 없는 준비 칸이 동시에 남아 있지 않다",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "hand-steward",
+          "agent": "../../graphs/loop-agents/hand-steward/agent.yaml",
+          "trigger": "../../graphs/triggers/hand-steward-agent.yaml",
+          "kpis": [
+            "idle_hands_with_ready_cells"
+          ]
+        }
+      ]
+    }
+  }
+}

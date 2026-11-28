@@ -1,0 +1,27 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "run-supervisor",
+  "name": "run-supervisor",
+  "version": "1.0.0",
+  "description": "좀비 런 0 — 종결 줄 없이 멈춘 런과 끝나지 않는 pregate 를 닫거나 끝내고 다시 띄운다",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "run-supervisor",
+          "agent": "../../graphs/loop-agents/run-supervisor/agent.yaml",
+          "trigger": "../../graphs/triggers/run-supervisor-agent.yaml",
+          "kpis": [
+            "zombie_runs"
+          ]
+        }
+      ]
+    }
+  }
+}

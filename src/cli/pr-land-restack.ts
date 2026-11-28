@@ -12,6 +12,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import ts from 'typescript';
 import { parseMergeTreeConflictPaths } from './pr-land-conflict-merge.js';
+import { mergeTree } from '../git-smart/merge-tree.js';
 
 export type RestackClass = 'clean' | 'text' | 'semantic' | 'stack-squash' | 'unmeasured';
 
@@ -273,7 +274,7 @@ export function measureRestack(input: MeasureRestackInput): RestackMeasurement {
     GIT_ALTERNATE_OBJECT_DIRECTORIES: [resolve(cwd, objects.stdout.trim()), process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES].filter(Boolean).join(delimiter),
   };
   try {
-    const merged = git(['merge-tree', '--write-tree', '-z', mainTip, head], cwd, env);
+    const merged = mergeTree(args => git(args, cwd, env), mainTip, head, [], ['-z']);
     if (merged.status === 0) return { verdict: stack ? 'stack-squash' : 'clean', mainTip, head, files: [], ...(stack ? { stack } : {}), reasons: stack ? ['stack-carries-squashed-base'] : [] };
     const parsed = parseMergeTreeConflictPaths(merged.stdout, merged.status);
     if (!parsed.measured) return unmeasured('merge-tree-unmeasured');

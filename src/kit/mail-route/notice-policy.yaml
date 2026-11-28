@@ -1,0 +1,27 @@
+# KIT mail-route · notice policy — mail that never waits on a reply (SILENCE-NOTICE-NOT-REQUEST · 0.3.39)
+#
+# S: silence-watch's KPI unanswered_mail_past_sla stood in breach for 27 h (11-27 03:53Z →). The live census of 11-28 17:3x
+#    (2,300 rows in its 24 h window): 189 of the 511 open «requests» were work-block cards (kind steward-exception ⊕ a
+#    blocked-on: ref — «칸 X 이 Y 를 기다립니다 — TC 는 다음 칸으로 갑니다»): the block is already on the board and the seat
+#    moved on, yet the producer stored them as intent=request ⊕ needsAck, so every one waited on a reply nobody owes.
+# C: a notice stored as a request is counted, rung and bounced forever — the KPI cannot move and real asks drown in it.
+# A: ONE table, two readers (structured fields only · never the body · standing rule 11-20):
+#      the post path   — src/msg/msg-store.ts: a notice gets needsAck=false by default (an explicit needsAck still wins)
+#      silence-watch   — its request SLA and KPI skip notices; a notice stored before this policy (needsAck=1) is
+#                        closed by the agent itself (ack done · bounded · journaled · undo = reopen-notice)
+#    Change the classification here, not in TypeScript. An unreadable file = no notices (everything counts, as before).
+version: 1
+
+# Canonical kinds (src/msg/post-discipline.ts MSG_POST_KINDS) that inform and are never answered. Aliases follow their
+# canonical kind (bulletin → notice · reply → status · review → report …).
+passiveKinds: [info, notice, status, report, announce, coord, ack, receipt, coach]
+
+# A kind that is also used for asks, made a notice by one structured ref it carries.
+shapes:
+  - kind: steward-exception
+    refPrefix: 'blocked-on:'
+    why: work-block card — the block is on the board (cell-blocks ledger) and the seat already moved on; its leader has nothing to answer
+
+# Addresses whose notices silence-watch never closes on their behalf (a person's inbox · 대표): they stay out of the KPI
+# like every notice, but only the person acks them.
+keepOpenFor: [CEO]

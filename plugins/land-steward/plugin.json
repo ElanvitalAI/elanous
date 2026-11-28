@@ -1,0 +1,30 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "land-steward",
+  "name": "land-steward",
+  "version": "1.0.0",
+  "description": "Landing line owner — lands ready PRs on the merge result, owns every land refusal's next action, one channel line per KPI breach.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "land-steward",
+          "agent": "../../graphs/loop-agents/land-steward/agent.yaml",
+          "trigger": "../../graphs/triggers/land-graph.yaml",
+          "kpis": [
+            "lands_per_hour",
+            "landable_ratio",
+            "needs_finisher_wait_p50",
+            "refusals_without_next"
+          ]
+        }
+      ]
+    }
+  }
+}

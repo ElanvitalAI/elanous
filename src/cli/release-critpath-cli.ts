@@ -7,7 +7,8 @@ import { join, resolve } from 'node:path';
 import type { Command } from 'commander';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { APPROVE_OPTION, AUTO_PUBLISH_AGENT, approvalRef, type ApprovalBinding, type AutoPublishDeps, type CritpathDeps, type PreparedRelease } from '../../scripts/release-loop/critpath.js';
+import { APPROVE_OPTION, AUTO_PUBLISH_AGENT, approvalRef, type ApprovalBinding, type AutoPublishDeps, type CritpathDeps, type PreAuthDeps, type PreparedRelease } from '../../scripts/release-loop/critpath.js';
+import type { PreAuthGateIo } from '../kit/release-preauth/index.js';
 import type { DecisionEntry, RaiseInput } from '../decisions/decision-ledger.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { userConfigPath } from '../user-config.js';
@@ -127,6 +128,7 @@ export async function defaultCritpathDeps(log: (line: string) => void): Promise<
       return { id: entry.id };
     },
     autoPublish: await defaultAutoPublishDeps(),
+    preAuth: await defaultPreAuthDeps(),
     log,
   };
 }
@@ -148,6 +150,46 @@ export async function defaultAutoPublishDeps(): Promise<AutoPublishDeps> {
       finally { store.close(); }
     },
   };
+}
+
+/**
+ * RELEASE-PRESIGNED-AUTO — the real I/O behind a CEO pre-signed card (kit/release-preauth): the decision ledger ⊕ trust root,
+ * graphs/policies/release-proof.yaml `preauth:`, the checklist reds and open HOLDs, and one line to OP mail ⊕ the CEO channel.
+ */
+export async function defaultPreAuthGateIo(): Promise<PreAuthGateIo> {
+  const { DecisionLedger, readDecisionTrustRoots } = await import('../decisions/decision-ledger.js');
+  const { listChecklist } = await import('../release-loop/checklist.js');
+  const { readRemoteChecklist } = await import('./release-checklist-remote.js');
+  const { loadPreAuthPolicy } = await import('../kit/release-preauth/index.js');
+  const { openMsgStore } = await import('../msg/msg-store.js');
+  const stateDir = elanousStateRoot();
+  return {
+    stateDir,
+    records: () => new DecisionLedger().list({ status: 'all' }),
+    trustRoots: () => readDecisionTrustRoots(stateDir),
+    policy: () => loadPreAuthPolicy(),
+    reds: async (version) => (await readRemoteChecklist(version) ?? listChecklist(version)).items
+      .filter((i) => i.status === 'red').map((i) => ({ id: i.id, ...(i.priority ? { priority: i.priority } : {}), ...(i.knownIssue ? { knownIssue: i.knownIssue } : {}) })),
+    openHolds: (version) => openHoldDecisions(new DecisionLedger().list({ status: 'open' }), version),
+    // Two channels, each on its own: a failed OP mail never swallows the CEO line (and the reverse).
+    notify: async (line, key) => {
+      let mailError: unknown;
+      try {
+        const store = openMsgStore();
+        try { store.appendWithProvenance({ from: 'RLA', to: 'OP', kind: 'info', body: `[release-preauth · 대표 보고] ${line}` }, key); }
+        finally { store.close(); }
+      } catch (e) { mailError = e; }
+      const [{ sendTelegramReport }, { getUserConfig }] = await Promise.all([import('../telegram-report.js'), import('../user-config.js')]);
+      await sendTelegramReport(getUserConfig(), line, { markdown: false, kind: 'op-report' });
+      if (mailError) throw mailError;
+    },
+  };
+}
+
+export async function defaultPreAuthDeps(io?: PreAuthGateIo): Promise<PreAuthDeps> {
+  const { preAuthGate } = await import('../kit/release-preauth/index.js');
+  const gateIo = io ?? await defaultPreAuthGateIo();
+  return { gate: (input, opts) => preAuthGate(gateIo, input, opts) };
 }
 
 export function registerReleaseCritpathCommand(release: Command, depsFactory: (log: (line: string) => void) => Promise<CritpathDeps> = defaultCritpathDeps): void {

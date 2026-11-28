@@ -1,3 +1,4 @@
+import { liveStewardCaps } from '../live-caps.js';
 /**
  * BOARD-STEWARD command node (graphs/triggers/board-steward.yaml · `cmd:board-steward-tick`). Live wiring of the pure
  * tick (tick.ts): checklist ledger · els panes · federation ladder · op-pulse state · priority-order ledger · gh release.
@@ -87,13 +88,13 @@ export function liveBoardDeps(input: { live: boolean; stateRoot: string; seatSta
 
 interface Ctx { graphId?: string; runId?: string; input?: { window?: string; stage?: string; shadowDir?: string; vars?: { stateRoot?: string; seatState?: string } } }
 
-export function runBoardNode(ctx: Ctx): Record<string, unknown> {
+export function runBoardNode(ctx: Ctx, candidateCap: number | null = null, cardCap: number | null = null): Record<string, unknown> {
   const input = ctx.input ?? {};
   const stateRoot = input.vars?.stateRoot ?? process.env.ELANOUS_STATE_DIR ?? effectiveInstanceRoot();
   const seatState = input.vars?.seatState ?? join(process.env.HOME ?? '', 'elanous-hq', 'seat-state');
   const live = input.stage === 'live';
   const dir = live ? join(effectiveInstanceRoot(), 'steward', 'board') : (input.shadowDir ?? join(stateRoot, 'loops', 'shadow', 'board-steward'));
-  const r = boardTick(liveBoardDeps({ live, stateRoot, seatState, dir }));
+  const r = boardTick({ ...liveBoardDeps({ live, stateRoot, seatState, dir }), candidateCap: () => candidateCap, cardCap: () => cardCap });
   const window = input.window ?? 'manual';
   // FEDERATION MAIL WATCH (CEO 11-26 23:xx) — ✋ escalation past a silent coordinator / OP (live only writes), unacked per
   // seat, coordinator broadcast holds with frozen hands. Fail-open: the board tick result stands either way.
@@ -124,7 +125,8 @@ if (import.meta.main) {
   try {
     const path = process.env.ELANOUS_GRAPH_CONTEXT;
     const ctx = path && existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) as Ctx : {};
-    console.log(JSON.stringify(runBoardNode(ctx)));
+    const caps = await liveStewardCaps();
+    console.log(JSON.stringify(runBoardNode(ctx, caps?.candidates ?? null, caps?.boardCards ?? null)));
   } catch (error) {
     console.log(JSON.stringify({ outcome: 'error', error: error instanceof Error ? error.message : String(error) }));
     process.exitCode = 1;

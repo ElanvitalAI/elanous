@@ -39,7 +39,7 @@ async function sweep(trainMergeSha: string, trafficMode: 'valid' | 'missing-opti
     taskStatePath: statePath, output: (line) => lines.push(line), greenSweepChecklist: () => checklist,
     greenSweepRun: (command, args) => {
       const key = `${command} ${args.join(' ')}`;
-      if (key === 'git remote get-url origin') return { status: 0, stdout: 'git@github.com:example/repo.git\n' };
+      if (key === 'git config --get remote.origin.url') return { status: 0, stdout: 'git@github.com:example/repo.git\n' };
       if (key === 'git rev-parse origin/main') return { status: 0, stdout: `${MAIN}\n` };
       if (key === 'git ls-remote origin refs/heads/main') return { status: 0, stdout: `${MAIN}\trefs/heads/main\n` };
       if (key === `git merge-base --is-ancestor ${SHA} origin/main`) return { status: 0, stdout: '' };

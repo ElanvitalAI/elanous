@@ -468,6 +468,13 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       // MEMORY-TRIAGE-NO-LLM ③ 생산자 — 주입 «시도»마다 한 줄(빈 주입 포함 · `no-activity` 와 «활동했는데 안 쓰임»을 가른다).
       // 실패는 원장이 사건 ⊕ 구멍 표식으로 남긴다.
       try { recordMemoryTurnUsage(opts.userText, inj); } catch { /* 원장 실패가 턴을 막지 않는다 */ }
+      // MEMORY-OBSERVABILITY — the global layer under the same door as the seat layers (ids · tokens · judge).
+      try {
+        (require('../seat-memory/memory-trace.js') as typeof import('../seat-memory/memory-trace.js')).traceMemoryRecall({
+          store: 'global', via: 'turn', hit: inj.injectedIds.length > 0, ids: inj.injectedIds, tokens: inj.tokens,
+          session: opts.sessionId ?? null, ...(inj.injectedIds.length === 0 ? { reason: 'no-match' } : {}),
+        });
+      } catch { /* trace only */ }
       if (inj.block) {
         memoryIds = inj.injectedIds;
         debug.log('chat.memory-layer', 'injected', { session: opts.sessionId, ids: inj.injectedIds, tokens: inj.tokens });

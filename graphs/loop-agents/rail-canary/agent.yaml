@@ -1,0 +1,133 @@
+# 레일 캐너리 (rail-canary) — LOOP-AGENT v3 YAML definition (RAIL-CANARY-AUTO-ROLLBACK · 0.3.40 P0 · 대표 11-29 02:3x «등록이 아니라
+# 당장 바로 시작»). On 11-28 night three regressions rode the 2-hourly rail into operations (#40735 hands seat=null · GH mirror
+# insteadOf origin · a seat's GitHub budget 300/300) and each stopped work 1–4 h; nothing measured the swap.
+# A PLUGIN (대표 11-28 08:4x): this file is an instance of the shared executor kind `canary.check` (src/loop-agent/v3/canary-kind.ts ⊕
+# src/kit/canary) — no agent-specific TS. Its probes ⊕ their thresholds ⊕ the doors are graphs/policies/rail-canary.yaml
+# (canary.pack); another canary (a kingdom's own build) is another agent.yaml ⊕ pack on the same kind.
+# Relation: rail-watch (graphs/triggers/rail-watch.yaml · TC) smokes four CLI exits per rail and cards a revert PR for main —
+# it never touches the host. This agent rolls the HOST back (install.json previous) so work goes on while main is fixed.
+# Schema: src/loop-agent/v3/agent-yaml.ts · executor: src/loop-agent/v3/supervisor.ts · lint: eln loop agent lint rail-canary
+# The ONE definition (YAML-SUPERVISORS-RUNTIME): the trigger registry reads wake: from here (graphs/triggers/rail-canary-agent.yaml
+# is only the tick shim) and goal.yaml is GENERATED from this file (eln loop agent gen rail-canary).
+apiVersion: elanous/loop-agent@3
+manifest:
+  name: rail-canary
+  version: 1.0.0
+  description: "레일(설치 빌드 교체) 직후 30분 탐침 5개 — 이전 빌드에서 통과하던 탐침이 깨지면 이전 빌드로 자동 되돌림(빌드당 1회) ⊕ els 재기동 ⊕ OP 카드(용의자 PR)"
+  requires:
+    executor: loop-agent@3
+    kits: [kpi]
+    node_kinds: [canary.check, loop-agent.act, loop-agent.learn, loop-agent.judge, loop-agent.finish, gate]
+    facts: []
+  provides:
+    agent: rail-canary
+    kpis: [canary_fail_to_rollback_minutes, false_rollbacks]
+    nodes: []   # tier ② is the shared kind canary.check — nothing agent-specific
+identity:
+  id: rail-canary
+  address: RAIL-CANARY
+  rank: supervisor
+  soul: soul.md
+supervisor:
+  duty: escalation-parent
+canary:
+  pack: rail-canary   # graphs/policies/rail-canary.yaml — probes · fail_if · rollback / restart / undo doors · suspects repo
+# v2 card fields that live only here — graphs/loop-agents/rail-canary/goal.yaml is GENERATED from this file
+card:
+  name: 레일 캐너리
+  role: &purpose 레일이 설치 빌드를 바꾼 뒤 30분 동안 운영이 실제로 도는지(자리 칸 · origin · 착지 틱 · GitHub 예산 · 연방 손) 재고, 이전 빌드에서 통과하던 것이 깨지면 그 호스트를 이전 빌드로 되돌린 뒤 OP 에 용의자 PR 을 넘긴다
+  temperament: &voice 짧고 숫자로 말한다 · 빌드 sha · 탐침 이름 · 이전 값 → 지금 값 · 되돌리기 명령을 붙인다
+  values: &values
+    - 교체 뒤에 깨진 것만 되돌린다 — 이전 빌드에서도 깨져 있던 것은 빌드 탓이 아니다
+    - 빌드당 한 번만 · 같은 빌드가 또 깨지면 사람에게 넘긴다
+    - 되돌림은 언제나 되돌릴 수 있게 — 취소 명령을 카드에 붙인다
+  subject: 이 호스트의 설치 빌드(install.json commit · previous · installedAt) ⊕ 탐침 5(els ls 자리 칸 · HQ origin slug · 착지 그래프 틱 나이 · OP GitHub 예산 · 연방 스냅숏 손)
+  actions:
+    - rollback
+    - card
+    - restore-build
+  wake_events:
+    - install.json 변경 직후 (레일 · eln self-update)
+    - 5분마다 (max_wait)
+  voice_role: coordinator
+  fallback_seat: OP
+goal: "회귀한 설치 빌드는 실패 확인 후 10분 안에 이전 빌드로 — 거짓 되돌림 0 · 빌드당 되돌림 1회"
+policies:   # tier ① — the loop numbers (the kind reads them through pn() · probe thresholds live in the pack)
+  fail_to_rollback_max_min: 10   # KPI: a confirmed regression waits at most this long for its rollback
+  false_rollbacks_max: 0         # KPI: rollbacks whose probes still failed on the rolled-back build (false_rollback_window_h)
+  watch_window_min: 30           # a swap is judged this long after install.json installedAt — later readings are baseline only
+  confirm_reads: 2               # a regression must fail this many reads in one tick …
+  confirm_gap_sec: 60            # … this far apart (a flap that recovers in a minute is not a regression)
+  rollbacks_per_sha_max: 1       # never roll the same build back twice (the rail may re-install it — then a card)
+  verify_min: 15                 # after a rollback the failed probes must be back on the old build within this (else false rollback)
+  step_timeout_sec: 120          # one door step (rollback · restart · undo)
+  suspects_max: 12               # PRs listed in the card (newest first)
+  false_rollback_window_h: 168   # the false_rollbacks KPI counts this week
+  max_per_tick: 2
+  cooldown_min: 30               # one rollback / card per target per window (targets carry the sha)
+  escalate_after_min: 15         # its own KPI breach (a regression not rolled back) lasting this → one L0 card (the runtime ladder)
+  heartbeat_every_min: 5
+  subject_lost_ticks: 3          # install.json / pack unreadable this many ticks → reattach proposal to the L0
+kpis:
+  - { name: canary_fail_to_rollback_minutes, at_most: $policies.fail_to_rollback_max_min, unit: "분" }
+  - { name: false_rollbacks, at_most: $policies.false_rollbacks_max, unit: "회", from: { file: canary.json, path: kpi.false_rollbacks } }
+done_when:
+  - "감시 창 안의 회귀마다 이전 빌드로 되돌림 ⊕ OP 카드 한 장 (또는 한도 · 대상 불명 카드)"
+  - "되돌림마다 verify_min 안에 판정(fixed · false)"
+never_auto: &never
+  - "같은 빌드를 두 번 되돌리기"
+  - "지켜보지 않은 빌드로 되돌리기 (install.json previous ≠ 건강하게 본 이전 빌드)"
+  - "되돌림 취소(restore-build)를 스스로 고르기 (사람 · L0 몫)"
+  - "main 에 revert PR · 강제 push · 프로세스 kill (rail-watch · 착지 줄 몫)"
+  - "HOLD 아래에서 되돌리기 (eln hold --cells RAIL)"
+soul:
+  purpose: *purpose
+  values: *values
+  do_not: *never
+  voice: *voice
+  serves:
+    - "OP (L0) · 레일 주인"
+    - "손 자리 · 착지 줄 — 교체 뒤에도 일이 계속 돈다"
+    - "TC — 용의자 PR 로 main 수리"
+wake:
+  registered_as: rail-canary-agent
+  trigger:
+    condition:
+      predicate: {"kind":"state-changed","parts":[{"file":"{installRoot}/install.json"}]}
+      cooldown_min: 1
+      max_wait_min: 5
+      on_max_wait: fire
+  failure: { goal_deadline_min: 10, max_attempts: 2, backoff_sec: [60] }
+body:   # tier ① routing — observe outcome → steps (ok · breach · unknown → act; off · error → finish)
+  entry_node: observe
+  terminal_nodes: [done]
+  nodes:
+    - { node_id: observe, kind: canary.check, max_visits: 1 }
+    - { node_id: act, kind: loop-agent.act, max_visits: 1 }
+    - { node_id: learn, kind: loop-agent.learn, max_visits: 1 }
+    - { node_id: judge, kind: loop-agent.judge, max_visits: 1 }
+    - { node_id: finish, kind: loop-agent.finish, max_visits: 1 }
+    - { node_id: done, kind: gate }
+  edges:
+    - { from: observe, on: outcome, map: { ok: act, breach: act, unknown: act, off: finish, error: finish } }
+    - { from: act, on: outcome, map: { ok: learn } }
+    - { from: learn, on: outcome, map: { ok: judge } }
+    - { from: judge, on: outcome, map: { ok: finish } }
+    - { from: finish, on: outcome, map: { ok: done } }
+authority:   # SUPERVISORS-EXECUTE-NOT-PROPOSE — the rollback is executed, not proposed (OP gets the card after it)
+  executes: [rollback]
+  undo: { rollback: restore-build }
+  limits: [rollbacks_per_sha_max, watch_window_min, confirm_reads, verify_min, max_per_tick, cooldown_min]
+  respect_hold: true   # an active HOLD on cell RAIL (or *) → no rollback this tick (journal «held» · retried next tick)
+voice:   # «방금 레일 괜찮아?» — one LLM turn when spoken to (role router · coordinator) · facts = the probe lines
+  channel: loop:rail-canary
+  speak_on: [kpi-breach, kpi-recovered, subject-lost]
+  mail: l0-only
+  per_hour_max: 6
+memory:
+  knowhow: knowhow.md
+budget:
+  llm_turns_per_hour: 6
+levels:
+  start: live
+  values: [live, L1, shadow, off]

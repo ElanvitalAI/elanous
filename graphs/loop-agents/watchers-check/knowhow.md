@@ -12,7 +12,7 @@
 
 ## K-WATCHERS-CHECK-002 beat 가 한 번도 없는 감독자는 «안 보임» 이 아니라 결손이다 (2026-11-27)
 - 상황: 옛 watchers-check 가 beat 를 남긴 4개(release-graph-tick · res-patrol · trigger-tick · 자기)만 보던 때.
-- 처방(힐링): 기대 목록 = 모든 v2 카드의 loop:<id> ⊕ 핵심 그래프 감시자. 기대했는데 beat 가 없으면 MISSING 으로 세고 트리거를 한 번 쏜다.
+- 처방(힐링): 기대 목록 = 모든 v2 카드의 loop:<id> ⊕ 핵심 그래프 감시자. 기대했는데 beat 가 없으면 MISSING 으로 센다(깨우기는 트리거 레지스트리 몫 · 11-28 P1).
 - 재는 명령: eln loop agent list
 - 종류: warning
 - 검증: 2026-11-27 참 (SUPERVISORS-AND-MESSAGING-1127 §2a watchers-check «감시 대상 4개뿐»)
@@ -20,7 +20,7 @@
 
 ## K-WATCHERS-CHECK-003 카드만 보내면 아무도 안 고친다 — 깨우고, 안 되면 L0 한 장 (2026-11-27)
 - 상황: 결손을 CLAUDE-OP 카드로만 알리던 옛 꼴(미확인 ≥100).
-- 처방(힐링): 내 권한(트리거 한 번 발사)으로 먼저 닫는다. 30분 안 닫히면 OP 에 카드 한 장 · 같은 위반 중에는 다시 보내지 않는다.
+- 처방(힐링): 깨우기는 트리거 레지스트리(목표 마감 → 재시도 → 주인 카드)가 먼저 닫는다 — 이 에이전트는 롤업만(11-28 P1). 30분 안 닫히면 OP 에 카드 한 장 · 같은 위반 중에는 다시 보내지 않는다.
 - 재는 명령: eln loop agent watchers-check status
 - 종류: playbook
 - 검증: 2026-11-27 참 (SUPERVISORS-AND-MESSAGING-1127 §3a «watchers→CLAUDE-OP ≥100»)

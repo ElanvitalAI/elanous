@@ -62,7 +62,15 @@ export interface StepDef {
   /** The exact manual command (one shell line). `null` = a decision gate (checks only). */
   cmd: string | null;
   checks: Check[];
+  /** An in-process step the tick itself performs (no shell): `board-flip` = CURRENT-RELEASE-ONE-SOURCE. */
+  inProcess?: 'board-flip';
 }
+
+/** The step that moves the one current-board record after a real publish (before npm · verify · dev-bump). */
+export const BOARD_FLIP_STEP = 'board-flip';
+
+/** What the board-flip step reports back (the writer is injected: the CLI wires `flipBoardAfterPublish` + the announce). */
+export interface BoardFlipResult { kind: 'flipped' | 'already' | 'refused'; current: string; previous: string | null; reason?: string; announced?: Record<string, string> }
 
 export interface ReleaseClock { rehearsalAt: string; cutAt: string; publishAt: string; demoAt?: string }
 
@@ -190,6 +198,10 @@ export function releaseSteps(version: string, clock: ReleaseClock, files: { note
       cmd: `sed -E 's/ \\(#[0-9]+\\)//g' ${N} > ${NP}` }),
     s({ id: 'publish', phase: 'L-5', label: 'publish: public repo push + GH release + 5 assets', needs: ['prepare', 'go', 'notes-public'], clock: at('publish'), host: 'publish', hard: true, expectMin: 0.5,
       cmd: `${tree} release publish --dir ${D} --notes-file ${NP} --yes` }),
+    // CURRENT-RELEASE-ONE-SOURCE (11-28): the board flips the moment publish is really done — its own step, in-process,
+    // needing only publish (a failed dev-bump/npm/verify never delays it; 0.3.38 read the closed board for ~1 h).
+    s({ id: BOARD_FLIP_STEP, phase: 'L-5', label: 'current board → next version (one record · announce once · before npm/verify/dev-bump)', needs: ['publish'], expectMin: 0,
+      cmd: null, inProcess: 'board-flip' }),
     s({ id: 'npm', phase: 'L-6', label: 'npm: present (publish it from the same tgz only when missing)', needs: ['publish'], hard: true, expectMin: 1,
       // NPM-STEP-AUTH (0.3.36 E404): the shell has no npm login — auth via a temp npmrc from the token file (never printed).
       // A missing or empty token file fails fast before npm publish (Terra r1).
@@ -312,6 +324,12 @@ export interface ExecDeps {
   /** Mail: returns an id. Cards go to OP; stall/NO-GO also wake REL. */
   post(to: string, kind: string, body: string): string;
   planOptions?: PlanOptions & PlanPaths;
+  /** CURRENT-RELEASE-ONE-SOURCE: flip the current board after the real publish of `published` (throws = retry next tick).
+   *  Absent = no writer wired (sims): the step records «unwired» and is done. */
+  flipBoard?(published: string, input: { by: string; cause: string; now: Date }): BoardFlipResult;
+  /** RELEASE-PRESIGNED-AUTO: at `go`, a CEO pre-signed card whose conditions hold on this cut stands in for the missing OP GO
+   *  vote (normal profile = auto cards only · quick-surgery = auto or surgery). `record` = live (writes the single use). */
+  preAuthGo?(version: string, profile: Profile, opts: { record: boolean }): Promise<{ ok: true; id: string; mode: string; line: string } | { ok: false; reason: string }>;
 }
 
 /** The per-version release home the hand quick pass uses (<instance root>/release/<v> — same root as `release critpath`). */
@@ -647,6 +665,32 @@ async function tickLocked(version: string, deps: ExecDeps): Promise<TickSummary>
     }
   }
 
+  // 2b. Board flip (CURRENT-RELEASE-ONE-SOURCE): once publish is REALLY done (graph exit 0 · REL detected · marked — never a
+  //     shadow would-run), the tick moves the current board in-process, in both modes (the flip records a fact that already
+  //     happened; a hand publish under a shadow graph flips too). Ignores a hard stop: the release is out. A failed write
+  //     stays pending and retries next tick (one card); dependents of publish never wait for it.
+  for (const step of state.kind === 'rehearsal' ? [] : steps.filter(x => x.inProcess === 'board-flip')) {
+    const st = state.steps[step.id]!;
+    if (st.status === 'done' || st.status === 'skipped') continue;
+    const pub = state.steps.publish;
+    if (pub?.status !== 'done') continue;
+    if (!deps.flipBoard) {
+      st.status = 'done'; st.by = 'graph(unwired)'; st.startedAt = at; st.endedAt = at; st.warnings = [...(st.warnings ?? []), 'no board writer wired'];
+      progress(); log({ kind: 'board-flip-unwired', step: step.id }); continue;
+    }
+    try {
+      const r = deps.flipBoard(version, { by: `release-graph:${version}`, cause: `published ${version} (${pub.by ?? 'graph'})`, now });
+      st.status = 'done'; st.by = 'graph'; st.startedAt ??= at; st.endedAt = at; st.ref = `board ${r.previous ?? '-'} → ${r.current} (${r.kind})`;
+      progress();
+      log({ kind: 'board-flip', step: step.id, outcome: r.kind, current: r.current, previous: r.previous, ...(r.reason ? { reason: r.reason } : {}), ...(r.announced ? { announced: r.announced } : {}) });
+      if (r.kind === 'refused') { st.warnings = [...(st.warnings ?? []), r.reason ?? 'refused']; card(step.id, 'board-flip-refused', `[release graph · ${version}] board flip refused: ${r.reason ?? ''} — the board stays ${r.current}. Hand surgery: eln release current set <v> --by OP --cause <why>`); }
+    } catch (e) {
+      st.startedAt ??= at; st.warnings = [...(st.warnings ?? []).slice(-4), `flip failed: ${String(e).slice(0, 200)}`];
+      log({ kind: 'board-flip-failed', step: step.id, error: String(e) });
+      if (!st.lateCarded) { st.lateCarded = true; card(step.id, 'board-flip-failed', `[release graph · ${version}] current board flip failed (${String(e).slice(0, 160)}) — retrying every tick; readers still see the previous board. Check: eln release current · hand: eln release current set <next> --by OP --cause <why>`); }
+    }
+  }
+
   // 3. Ready steps → advisory checks → run (live) or would-run (shadow), under host caps. Repeat to a fixpoint so a gate
   //    that passes this tick releases its dependents in the same tick.
   const running = (host: GoldenHost) => steps.filter(s => s.host === host && state.steps[s.id]!.status === 'running').length;
@@ -655,6 +699,13 @@ async function tickLocked(version: string, deps: ExecDeps): Promise<TickSummary>
     for (const step of steps) {
       const st = state.steps[step.id]!;
       if (st.status !== 'pending') continue;
+      // The board flip is the 2b pass's alone; shadow only marks it would-run once publish is virtually through.
+      if (step.inProcess) {
+        if (mode === 'shadow' && !state.hardStop && step.needs.every(n => satisfied(state.steps[n]!, byId.get(n)!, mode, nowMs))) {
+          st.status = 'would-run'; st.wouldRunAt = at; progress(); changed = true; log({ kind: 'would-run', step: step.id, phase: step.phase, host: step.host, cmd: null });
+        }
+        continue;
+      }
       // A non-critical stop (normal profile) waits for the quick-surgery switch: no cleanup (traffic-restore) before publish.
       if (state.hardStop) { if (!step.always || state.hardStop.noncritical) continue; }
       else {
@@ -670,6 +721,15 @@ async function tickLocked(version: string, deps: ExecDeps): Promise<TickSummary>
           if (r.blocked) { stop(step.id, 'poll', `explicit NO-GO: ${r.blocked}`); break; }
           if (!r.met) warnings.push(`${check.id}: ${r.evidence} → waived: ${check.waive}`);
         } catch (e) { warnings.push(`${check.id}: could not measure (${String(e)}) → waived: ${check.waive}`); }
+      }
+      // RELEASE-PRESIGNED-AUTO — no OP GO vote, but a CEO pre-signature whose signed conditions hold on this cut: that is the GO.
+      const goMiss = warnings.findIndex(w => w.startsWith('op-go:'));
+      if (!state.hardStop && goMiss >= 0 && deps.preAuthGo) {
+        let pa: Awaited<ReturnType<NonNullable<ExecDeps['preAuthGo']>>>;
+        try { pa = await deps.preAuthGo(version, state.profile ?? 'quick-surgery', { record: mode === 'live' }); }
+        catch (e) { pa = { ok: false, reason: `preauth gate failed: ${String(e).slice(0, 200)}` }; }
+        if (pa.ok) { warnings.splice(goMiss, 1); log({ kind: 'preauth-go', step: step.id, id: pa.id, preauthMode: pa.mode, line: pa.line }); }
+        else if (pa.reason) warnings.push(`preauth: ${pa.reason}`);
       }
       if (!state.hardStop && strict && warnings.length) { stop(step.id, 'guard', `refused: ${warnings.join(' | ')}`, true); continue; }
       if (state.hardStop && !step.always) { continue; }

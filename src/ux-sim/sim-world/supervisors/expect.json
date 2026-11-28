@@ -8,7 +8,7 @@
     },
     "supervisors/LA-B2": {
       "expect": "green",
-      "reason": "trigger goal file-mtime last-tick.json · deadline 30 min · 2 attempts → exception card to OP · stale (>15 min) / dead-pid tick.lock taken over · tick.lock refuses an overlapping live tick"
+      "reason": "trigger goal file-mtime last-tick.json · deadline 30 min · 2 attempts → exception card to JUD (agent.yaml wake.owner · JUDGE-BUTLER-V3-LISTED) · stale (>15 min) / dead-pid tick.lock taken over · tick.lock refuses an overlapping live tick"
     },
     "supervisors/LA-D1": {
       "expect": "green",

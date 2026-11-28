@@ -37,11 +37,11 @@ export function guardianLive(now: Date = new Date()): GuardianLive {
     registry.set(h, h === me ? readLocalRegistry(stateRoot) : remoteRegistry(h));
   }
   const self = new Map<string, ReadonlySet<number>>([[me, new Set([process.pid, process.ppid])]]);
-  // ready supply — yellow, unowned cells of the release in play (release.graph.version from config.json)
+  // ready supply — yellow, unowned cells of the current board (current-board record → release.graph.version)
   let ready: GuardianView['ready'] = null;
   try {
-    const { readReleaseGraphVersion } = require('../ops-dashboard/current-version.js') as typeof import('../ops-dashboard/current-version.js');
-    const v = readReleaseGraphVersion();
+    const { readBoardPointer } = require('../ops-dashboard/current-version.js') as typeof import('../ops-dashboard/current-version.js');
+    const v = readBoardPointer();
     if (v) {
       const { listChecklist } = require('../release-loop/checklist.js') as typeof import('../release-loop/checklist.js');
       const free = listChecklist(v).items.filter(i => i.status === 'yellow' && !i.owner);
@@ -64,10 +64,12 @@ export function guardianLive(now: Date = new Date()): GuardianLive {
     memory,
     kill: (host, cands) => killExact(host, cands),
     writeRoute: (route) => { try { mkdirSync(dirname(routePath(stateRoot)), { recursive: true }); writeFileSync(routePath(stateRoot), JSON.stringify(route)); } catch { /* fail-open */ } },
-    post: (key, to, body, kind = 'request') => {
+    // CONTEXT-BUS-FEDERATION ③ — graphs/loop-agents/guardian/agent.yaml declares `bus-post` (notices: status): the 30-min
+    // status digest goes to the L0's bus space as one status item (kit/bus-post); proposals and escalations stay mail.
+    post: (require('../kit/bus-post/index.js') as typeof import('../kit/bus-post/index.js')).liveBusNoticePort(GUARDIAN_ID, GUARDIAN_SEAT, (key: string, to: string, body: string, kind = 'request'): number | null => {
       try { const w = appendOnce(store, key, () => ({ from: GUARDIAN_SEAT, to, body, kind, intent: kind === 'status' ? 'info' : 'decision', refs: [key] })); return w.fresh ? w.mail.id : 0; }
       catch { return null; }
-    },
+    }, { stateRoot, mailHas: (key) => { try { return store.findByProvenanceKey(key) !== null; } catch { return false; } } }),
     audit: (row) => auditReap(stateRoot, row),
     reapLock: (fn) => withReapLock(stateRoot, fn),
     recentReaps: (nowMs) => recentReaps(stateRoot, nowMs),

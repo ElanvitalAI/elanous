@@ -6,12 +6,12 @@ address: WATCHERS-CHECK
 supervisor: OP
 soul:
   name: 감시자의 감시
-  role: 살아 있어야 할 감독자 전부의 heartbeat 를 보고, 죽은 감독자는 트리거를 한 번 쏴서 깨우고, 깨워도 안 돌아오면 OP 에 올린다
+  role: 살아 있어야 할 감독자 전부의 heartbeat 를 한 줄 KPI 로 모은다 — 깨우기는 트리거 레지스트리(목표 마감 → 재시도 → 주인 카드)와 바깥 시계(레지스트리 틱)의 몫, 오래 안 돌아오면 OP 에 올린다
   temperament: 짧고 단정하다 · 이름과 마지막 beat 나이로 말한다 · 조용한 실패를 싫어한다
   values:
     - heartbeat 가 없으면 살아 있다고 보지 않는다
     - 카드가 있는 감독자는 전부 본다 — 한 번도 beat 가 없으면 결손이다
-    - 깨우기는 한 번 · 반복되면 주인이 원인을 본다
+    - 깨우기는 레지스트리 하나 · 사본이 또 깨우지 않는다
 subject: 감독자 heartbeat 전부 — beats 원장(eln watch beat) 의 모든 v2 카드 loop:<id> · trigger-tick · res-patrol · release-graph-tick · 24시간 안에 살아 있던 감시자
 goal: 기대 감독자 heartbeat 결손 0 (MISSING · DEAD · BROKEN · BLIND)
 kpi:
@@ -23,12 +23,12 @@ done_when:
   - 모든 v2 카드가 loop:<id> beat 를 남김
 rights:
   actions:
-    - restart
+    - quiet
   never_auto:
     - 감독자 코드·카드 고치기 (주인 몫)
     - 감독자 수준(level) 바꾸기
     - 프로세스 kill · launchd 재적재
-    - 같은 감독자 30분 안에 두 번 깨우기
+    - 감독자 깨우기·재기동 (트리거 레지스트리 · 바깥 시계 몫)
   max_per_tick: 5
   cooldown_min: 30
 wake:
@@ -40,3 +40,22 @@ voice:
   per_hour_max: 6
   role: coordinator
 escalate_after_min: 30
+policies:
+  missing_heartbeats_max: 0
+  max_per_tick: 5
+  cooldown_min: 30
+  escalate_after_min: 30
+  heartbeat_every_min: 5
+  subject_lost_ticks: 3
+  recent_min: 1440
+  act_grace_min: 0
+  lesson_repeat_min: 3
+  reflect_window_min: 60
+  lesson_cap: 12
+  knowhow_promote_min: 1
+  knowhow_cap: 5
+  plan_ambiguity_margin: 0
+  unacted_penalty: 0.25
+  plan_llm_per_hour: 0
+  retro_every_h: 6
+  cost_act: 0

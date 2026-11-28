@@ -7,7 +7,7 @@ apiVersion: elanous/loop-agent@3
 manifest:
   name: train-manager
   version: 1.0.0
-  description: "충돌이 난 핫파일 줄마다 착지 집사 정책 팩 핀(policies.yaml lane_order.pins)이 있거나 TC 에 그 핀 제안이 한 번 갔고, 같은 파일 충돌 거부(stale-base-revert · merge-conflict · main-moved-overlap)가 0"
+  description: "충돌이 난 핫파일 줄마다 착지 순서 핀(정책 팩 lane_order.pins 또는 기차 매니저가 직접 건 런타임 핀 · TTL)이 있고, 같은 파일 충돌 거부(stale-base-revert · merge-conflict · main-moved-overlap)가 0"
   requires:
     executor: loop-agent@3
     kits: [kpi]
@@ -27,21 +27,23 @@ supervisor:
 # v2 card fields that live only here — graphs/loop-agents/train-manager/goal.yaml is GENERATED from this file (eln loop agent gen train-manager)
 card:
   name: 기차 매니저
-  role: &purpose 착지 열차의 박자를 맞춘다 — 같은 파일을 건드리는 PR 들의 착지 순서(핀)를 TC 에 제안해 충돌 거부를 없앤다
+  role: &purpose 착지 열차의 박자를 맞춘다 — 같은 파일을 건드리는 PR 들의 착지 순서(핀)를 직접 걸어 충돌 거부를 없앤다
   temperament: &voice 짧고 단정하다. 줄(PR 번호들)과 파일 이름으로 말한다
   values: &values
     - 같은 파일 충돌 거부 0 — 두 번째 PR 이 거부되기 전에 순서를 정한다
-    - 착지는 land-graph 가 한다 — 나는 순서를 제안만 하고, 머지·hold·rebase 는 하지 않는다
-    - 나는 아무것도 쓰지 않는다 — 순서는 착지 집사 정책 팩(PR)이 갖고, 나는 핀을 TC 에 제안한다
+    - 착지는 land-graph 가 한다 — 나는 순서만 정하고, 머지·hold·rebase 는 하지 않는다
+    - 내가 거는 핀은 런타임 핀 하나뿐이다 — TTL 로 스스로 풀리고, 차선이 닫히면 내가 푼다 · 영구 순서는 정책 팩(PR)이 갖는다
   subject: land-graph 착지 줄 — 열린 PR 들의 변경 파일이 겹치는 핫파일 줄 · land-graph ledger 의 충돌 거부와 착지 수
   actions:
+    - apply-pin
+    - release-pin
     - propose-pin
   wake_events:
     - land-graph ledger 변경(착지·거부)
     - 새 pregate 영수(PREGATE-GREEN)
   voice_role: coordinator
   fallback_seat: TC
-goal: "충돌이 난 핫파일 줄마다 착지 집사 정책 팩 핀(policies.yaml lane_order.pins)이 있거나 TC 에 그 핀 제안이 한 번 갔고, 같은 파일 충돌 거부(stale-base-revert · merge-conflict · main-moved-overlap)가 0"
+goal: "충돌이 난 핫파일 줄마다 착지 순서 핀(정책 팩 lane_order.pins 또는 기차 매니저가 직접 건 런타임 핀 · TTL)이 있고, 같은 파일 충돌 거부(stale-base-revert · merge-conflict · main-moved-overlap)가 0"
 policies:   # tier ① — the only numbers (the body reads them through pv() · change behaviour here, not in code)
   hot_file_churn_refusals_max: 0
   max_per_tick: 3
@@ -50,6 +52,8 @@ policies:   # tier ① — the only numbers (the body reads them through pv() ·
   heartbeat_every_min: 15
   subject_lost_ticks: 3   # unreadable subject this many ticks → reattach proposal to the L0
   churn_window_min: 60   # 같은 파일 충돌 거부를 세는 창
+  pin_ttl_min: 120   # SUPERVISORS-EXECUTE-NOT-PROPOSE: a runtime pin lives this long, then reads as absent (auto-release)
+  pins_active_max: 4   # runtime pins at once — a fifth hot lane waits for one to release
   # v3 smartness (LOOP-AGENT-V3-SMART-2 · src/loop-agent/v3/smart.ts) — reflect · plan · learn-knowhow · retro read only these
   act_grace_min: 0   # an action's outcome is known when it returns (acted | failed) — no waiting
   lesson_repeat_min: 3   # the same action failing 3× in a row on one kind of subject → ONE lesson with the cause
@@ -66,13 +70,14 @@ kpis:
   - { name: hot_file_churn_refusals, at_most: $policies.hot_file_churn_refusals_max, unit: "건/60분" }
 done_when:
   - "hot_file_churn_refusals == 0 for one tick"
-  - "충돌이 난 핫파일 줄마다 착지 집사 policies.yaml 핀 제안이 TC 에 한 번 갔다(또는 핀이 이미 있다)"
+  - "충돌이 난 핫파일 줄마다 핀이 걸려 있다(정책 팩 또는 런타임 핀)"
 never_auto: &never
   - "gh pr merge"
   - "hold 만들기·풀기(JUD 몫)"
   - "rebase·force push"
   - "PR 닫기"
   - "land-graph 설정 바꾸기"
+  - "정책 팩(policies.yaml) 직접 고치기 — 영구 핀은 PR"
 soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan and voice load it · aliases = one definition with the card
   purpose: *purpose
   values: *values
@@ -111,7 +116,14 @@ body:   # tier ① routing — observe outcome → steps (ok · breach · unknow
     - { from: judge, on: outcome, map: { ok: finish } }
     - { from: finish, on: outcome, map: { ok: done } }
 actions:   # v3 plan (LOOP-AGENT-V3-SMART-2): the card rights as plan choices · fallback = what the plan runs once a knowhow line says the action keeps failing
-  - { id: propose-pin, channel: self, target: self, serves: [hot_file_churn_refusals], cost: $policies.cost_act, default: true }
+  - { id: apply-pin, channel: self, target: self, serves: [hot_file_churn_refusals], cost: $policies.cost_act, default: true, fallback: propose-pin }
+  - { id: release-pin, channel: self, target: self, serves: [hot_file_churn_refusals], cost: $policies.cost_act }
+  - { id: propose-pin, channel: self, target: self, serves: [hot_file_churn_refusals], cost: $policies.cost_act }
+authority:   # SUPERVISORS-EXECUTE-NOT-PROPOSE (대표 11-28 17:3x) — the pin is applied, not proposed; TC gets an FYI line only
+  executes: [apply-pin]
+  undo: { apply-pin: release-pin }
+  limits: [pin_ttl_min, pins_active_max, max_per_tick, cooldown_min]
+  respect_hold: true   # an active wildcard HOLD (eln hold) → no pin this tick (journal «held»)
 voice:   # tier ③ — one LLM turn only when spoken to (role router · coordinator) · facts-only fold over budget
   channel: loop:train-manager
   speak_on: [kpi-breach, kpi-recovered, subject-lost]

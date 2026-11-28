@@ -45,6 +45,8 @@ export interface HandRouteOptions {
   readonly table?: HandRoutesTable;
   /** The checklist owner of a cell (null = unknown). Needed only by a `cell-owner` row. */
   readonly cellOwnerOf?: ((cell: string) => string | null) | null;
+  /** The federation ladder parent of a seat (hand → its coordinator · coordinator → HQ). Needed by `defaultOwner: coordinator`. */
+  readonly parentOf?: ((seat: string) => string | null) | null;
 }
 
 const tableOf = (opts?: HandRouteOptions): HandRoutesTable => opts?.table ?? readHandRoutes();
@@ -107,9 +109,22 @@ function ownerFor(spec: HandOwnerSpec, input: HandBlockInput & { readonly seat: 
 }
 
 /**
+ * Where a ✋ with no owner row lands (hand-routes.yaml `defaultOwner`): `coordinator` = the hand's own coordinator when the
+ * hand wrote one rung ABOVE it (a TC hand → OP lands at TC) — never up the ladder, never sideways (a hand under OP that
+ * wrote to TC keeps TC) · `keep` / unknown parent = `defaultTo`. Never throws.
+ */
+function keepAddress(seat: string, defaultTo: string, table: HandRoutesTable, opts?: HandRouteOptions): string {
+  if (table.defaultOwner !== 'coordinator' || !table.relievedRungs.has(defaultTo) || !opts?.parentOf) return defaultTo;
+  const parent = (s: string): string => { try { return (opts.parentOf!(s) ?? '').trim().toUpperCase(); } catch { return ''; } };
+  const coordinator = parent(seat);
+  if (!coordinator || coordinator === seat || coordinator === defaultTo || !/^[A-Z][A-Z0-9_-]{0,63}$/u.test(coordinator)) return defaultTo;
+  return parent(coordinator) === defaultTo ? coordinator : defaultTo;
+}
+
+/**
  * The first rung of a hand. `defaultTo` = the old first rung (the seat's coordinator, or OP). Only a hand headed for a
  * relieved rung (hand-routes.yaml `relievedRungs` · OP · TC) is moved, never to the blocked seat itself; `keep` roots and
- * unclear blocks keep `defaultTo`.
+ * unclear blocks go to the hand's coordinator ({@link keepAddress} · `defaultOwner`), else keep `defaultTo`.
  */
 export function routeHandBlock(input: HandBlockInput & { readonly seat: string; readonly defaultTo: string }, classification?: HandClassification, opts?: HandRouteOptions): HandRoute {
   const table = tableOf(opts);
@@ -119,8 +134,9 @@ export function routeHandBlock(input: HandBlockInput & { readonly seat: string; 
   const row = c.root === 'ambiguous' ? undefined : table.roots[c.root];
   const attachLine = row?.attach ? ATTACHMENTS[row.attach] : undefined;
   const attach = attachLine ? { attach: attachLine } : {};
-  const keep: HandRoute = { to: defaultTo, root: c.root, by: c.by, rerouted: false, ...attach };
-  if (!row || !table.relievedRungs.has(defaultTo)) return keep;
+  const keepTo = keepAddress(seat, defaultTo, table, opts);
+  const keep: HandRoute = { to: keepTo, root: c.root, by: c.by, rerouted: keepTo !== defaultTo, ...attach };
+  if (!row || !table.relievedRungs.has(defaultTo)) return keep;  // (keepAddress already returned defaultTo off a relieved rung)
   const owner = ownerFor(row.owner, input, { ...opts, table });
   if (!owner || owner === seat) return keep;
   return { to: owner, root: c.root, by: c.by, rerouted: owner !== defaultTo, ...attach };

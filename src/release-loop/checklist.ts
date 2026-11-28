@@ -63,9 +63,13 @@ export interface ChecklistItem {
   dispatchKind?: ChecklistDispatchKind;
   /** MUST 지정(있으면 이 칸은 MUST 다). 원장 스키마에 must 컬럼이 없어 `must` 이벤트에서 복원한다. */
   must?: ChecklistMust;
+  /** WORK-PULL-REACHES-ROSTER — the hand writing a coordinator-held cell (the coordinator stays owner). Restored from the
+   *  last `writer` event since the cell's last owner change; whether it is still live is the reader's lease rule. */
+  writer?: ChecklistWriter;
   updatedAt: string;
   updatedBy: string;
 }
+export interface ChecklistWriter { seat: string; at: string; by: string }
 export interface ChecklistHistory {
   at: string;
   by: string;
@@ -143,6 +147,16 @@ export function checklistEvidenceCommand(title: string): string | null {
     .map((match) => match[1]?.trim()).filter((command): command is string => Boolean(command));
   return commands.at(-1) ?? null;
 }
+
+/** SUPERVISORS-EXECUTE-NOT-PROPOSE (E4 noCommand): no «완료 경계 증거 명령» in the title → the repo test files the done-when
+ *  names («src/…/x.test.ts») as one `bun test` (the run still applies its own allow-list) · null = the done-when names none. */
+export function criterionEvidenceCommand(doneCriterion: string | undefined): string | null {
+  const paths = [...new Set((doneCriterion ?? '').match(/(?<![\w./-])(?:src|scripts|apps|packages)\/[\w./-]+\.test\.tsx?(?![\w-])/gu) ?? [])];
+  return paths.length ? `bun test ${paths.join(' ')}` : null;
+}
+/** The cell's E4 command: the title's (last «완료 경계 증거 명령:» line) first, else the one its done-when names. */
+export const evidenceCommandOf = (item: { readonly title?: string; readonly doneCriterion?: string }): string | null =>
+  checklistEvidenceCommand(item.title ?? '') ?? criterionEvidenceCommand(item.doneCriterion);
 
 /** Test runs (bun test · tsc · pregate) — the seat host refuses to execute these locally. */
 export function isTestRunCommand(command: string): boolean {
@@ -280,12 +294,68 @@ function latestMust(history: readonly ChecklistHistory[], id: string): Checklist
 }
 
 export function listChecklist(v: string, root?: string): Checklist {
-  return decodeMustHistory(decodeClaimHistory(root === undefined ? store.list(v) : store.list(v, undefined, undefined, root)));
+  return decodeWriterHistory(decodeMustHistory(decodeClaimHistory(root === undefined ? store.list(v) : store.list(v, undefined, undefined, root))));
+}
+
+// WORK-PULL-REACHES-ROSTER — the writer of a coordinator-held cell is an event, not a column (as `must`): the last
+// `writer` event since the cell's last owner change (`claim`) or status change. `to` = { seat } | null (released).
+function writerOf(history: readonly ChecklistHistory[], id?: string): Map<string, ChecklistWriter> {
+  const out = new Map<string, ChecklistWriter>();
+  for (const entry of history) {
+    if (id !== undefined && entry.id !== id) continue;
+    if (entry.field === 'claim' || entry.field === 'status') { out.delete(entry.id); continue; }
+    if (entry.field !== 'writer') continue;
+    const to = entry.to as { seat?: unknown } | null;
+    if (to && typeof to === 'object' && typeof to.seat === 'string') out.set(entry.id, { seat: to.seat, at: entry.at, by: entry.by });
+    else out.delete(entry.id);
+  }
+  return out;
+}
+
+function decodeWriterHistory(data: Checklist): Checklist {
+  const writers = writerOf(data.history);
+  if (!writers.size) return data;
+  return { ...data, items: data.items.map((item) => {
+    const writer = writers.get(item.id);
+    return writer && item.status === 'yellow' ? { ...item, writer } : item;
+  }) };
+}
+
+/**
+ * WORK-PULL-REACHES-ROSTER — compare-and-set the WRITER of a yellow cell whose owner (a coordinator) stays: succeeds only
+ * when the owner is still `expectedOwner` and the current writer seat is `expectedWriter` (null = none). `to` null =
+ * release. One `writer` history event (by = actor · reason) — the claim ledger every reader restores the writer from.
+ */
+export function setWriterIf(v: string, id: string, input: { expectedOwner: string | null; expectedWriter: string | null; to: string | null; actor: string; reason: string }):
+  { outcome: 'swapped' | 'lost' | 'missing'; writer: string | null } {
+  if (input.to !== null) parseOwner(input.to);
+  let outcome: 'swapped' | 'lost' | 'missing' = 'missing';
+  let writer: string | null = null;
+  mutate(v, (data) => {
+    const item = data.items.find((i) => i.id === id);
+    if (!item) return false;
+    writer = writerOf(data.history, id).get(id)?.seat ?? null;
+    if ((item.owner ?? null) !== input.expectedOwner || writer !== input.expectedWriter || item.status !== 'yellow') { outcome = 'lost'; return false; }
+    const at = new Date().toISOString();
+    item.updatedAt = at;
+    item.updatedBy = input.actor;
+    data.history.push({ at, by: input.actor, id, field: 'writer', from: writer, to: input.to === null ? null : { seat: input.to }, released: data.released, dev: data.dev, reason: input.reason });
+    outcome = 'swapped';
+    writer = input.to;
+    return true;
+  });
+  debug.log('release-loop.checklist', 'set-writer', { version: v, id, expectedOwner: input.expectedOwner, expectedWriter: input.expectedWriter, to: input.to, actor: input.actor, outcome });
+  return { outcome, writer };
 }
 
 /** Events for this id across every release, ordered by event time (then ledger sequence). */
 export function checklistHistory(id: string): Array<ChecklistHistory & { version: string; seq: number }> {
   return store.history(id).map((entry) => decodeMustEntry(decodeClaimHistoryEntry(entry)));
+}
+
+/** JUDGE-GREEN-PR-BINDING-LEGACY: evidence writes ⊕ the seats that held each cell, every release (one ledger read). */
+export function checklistTrails(ids: readonly string[], root?: string): ReturnType<typeof store.trails> {
+  return store.trails(ids, root);
 }
 
 /** Status events in the requested window; other ledger fields never become status changes. */
@@ -304,7 +374,7 @@ function assertPredecessorsExist(predecessors: readonly string[] | undefined, da
 
 function mutate(v: string, apply: (data: Checklist, otherItems: (id: string) => store.ChecklistCollision[]) => boolean): Checklist {
   // addItem/setItem/claimItem/removeItem/seedFromRoadmap/setMust reach the generation-fenced ledger write here.
-  return decodeMustHistory(decodeClaimHistory(store.mutate(v, store.releasedVersion(), devVersion(), apply)));
+  return decodeWriterHistory(decodeMustHistory(decodeClaimHistory(store.mutate(v, store.releasedVersion(), devVersion(), apply))));
 }
 
 function change(data: Checklist, id: string, field: string, from: unknown, to: unknown, by: string, at: string): void {
@@ -807,7 +877,7 @@ export function noteDispatchSkip(v: string, id: string, reason: string, expected
 }
 
 /** Apply a measured verdict only while the release cell is still the snapshot that was judged. */
-export function setItemIfSnapshot(v: string, id: string, patch: Parameters<typeof setItem>[2], by: string, expected: Pick<ChecklistItem, 'title' | 'status' | 'evidence'>, attribution?: GreenAttribution): Checklist {
+export function setItemIfSnapshot(v: string, id: string, patch: Parameters<typeof setItem>[2], by: string, expected: Pick<ChecklistItem, 'title' | 'status' | 'evidence'> & Partial<Pick<ChecklistItem, 'doneCriterion'>>, attribution?: GreenAttribution): Checklist {
   const before = patch.status === 'green' ? expected : null;
   const out = setItemGuarded(v, id, patch, by, expected);
   // A measured green is a green fact too (the judge-butler signs through here) — attribution names the decider and the doer.
@@ -815,7 +885,18 @@ export function setItemIfSnapshot(v: string, id: string, patch: Parameters<typeo
   return out;
 }
 
-function setItemGuarded(v: string, id: string, patch: Parameters<typeof setItem>[2], by: string, expected?: Pick<ChecklistItem, 'title' | 'status' | 'evidence'>): Checklist {
+/** FU-FLOOD: one line onto a cell's evidence — snapshot-guarded, idempotent on the exact line (false = not written). The snapshot
+ *  is the stored value as-is: a new FU cell has NO evidence (not '') — the judge-butler's old «?? ''» snapshot made every first
+ *  line a «판정 중 칸 변경» refusal, so the parent's sign was refused every tick (SUPERVISORS-EXECUTE-NOT-PROPOSE · 11-28
+ *  YAML-FEDERATION-BUNDLE · ELN-PROMPT-MUST-CARRY «판정 FU 근거 줄 쓰기 실패»). */
+export function appendEvidenceLine(v: string, id: string, line: string, by: string): boolean {
+  const i = listChecklist(v).items.find(x => x.id === id);
+  if (!i) return false;
+  if ((i.evidence ?? '').split('\n').includes(line)) return true;
+  try { setItemIfSnapshot(v, id, { evidence: i.evidence ? `${i.evidence}\n${line}` : line }, by, { title: i.title, status: i.status, evidence: i.evidence }); return true; } catch { return false; }
+}
+
+function setItemGuarded(v: string, id: string, patch: Parameters<typeof setItem>[2], by: string, expected?: Pick<ChecklistItem, 'title' | 'status' | 'evidence'> & Partial<Pick<ChecklistItem, 'doneCriterion'>>): Checklist {
   return setItemsGuarded(v, [id], patch, by, expected);
 }
 
@@ -841,7 +922,7 @@ function recordCellFacts(v: string, ids: readonly string[], patch: { status?: Ch
   }
 }
 
-function setItemsGuarded(v: string, ids: string[], originalPatch: Parameters<typeof setItem>[2], by: string, expected?: Pick<ChecklistItem, 'title' | 'status' | 'evidence'>): Checklist {
+function setItemsGuarded(v: string, ids: string[], originalPatch: Parameters<typeof setItem>[2], by: string, expected?: Pick<ChecklistItem, 'title' | 'status' | 'evidence'> & Partial<Pick<ChecklistItem, 'doneCriterion'>>): Checklist {
   if (!ids.length || new Set(ids).size !== ids.length) throw new CliUserError('칸 id 는 하나 이상, 중복 없이 지정한다');
   ids.forEach(assertNoOuterWhitespaceCellId);
   return mutate(v, (data, otherItems) => {
@@ -850,7 +931,7 @@ function setItemsGuarded(v: string, ids: string[], originalPatch: Parameters<typ
       let patch = originalPatch;
       const item = data.items.find((i) => i.id === id);
       if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
-      if (expected && (item.title !== expected.title || item.status !== expected.status || item.evidence !== expected.evidence))
+      if (expected && (item.title !== expected.title || item.status !== expected.status || item.evidence !== expected.evidence || (Object.hasOwn(expected, 'doneCriterion') && item.doneCriterion !== expected.doneCriterion)))
         throw new CliUserError(`판정 중 칸 변경: ${id}`, '현재 칸으로 다시 측정한다');
       if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new CliUserError(`잘못된 상태: ${patch.status}`);
       if (patch.disposition !== undefined && !['move', 'known-issue', 'block'].includes(patch.disposition)) throw new CliUserError(`잘못된 처분: ${patch.disposition}`);

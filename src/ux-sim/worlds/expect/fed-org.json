@@ -45,6 +45,31 @@
       "expect": "green",
       "greenSince": "2026-11-27 kit/kpi (#40409)",
       "reason": "6 seeds: one new per run of misses, one recovered per run end, unknown readings change nothing; per-key alerts only at run start and every >= 30 min inside a run"
+    },
+    "fed-org/CTX-BUS-DECIDE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CONTEXT-BUS-FEDERATION (this PR)",
+      "reason": "coordinator A decision in HQ → B next digest «참고» once (ack hides it) · A not shown its own write · a hand reads own+OP(addressed), never HQ"
+    },
+    "fed-org/CTX-BUS-HQ-HANDOFF": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CONTEXT-BUS-FEDERATION (this PR)",
+      "reason": "OP handoff in HQ with seat:A seat:B → both «할 일» + normal wake · third coordinator «참고» and no wake · writer not echoed"
+    },
+    "fed-org/CTX-BUS-RAW-CONTEXT": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CONTEXT-BUS-FEDERATION (this PR)",
+      "reason": "raw ceo-request: no wake for anyone · OP sees «CEO 원문(맥락…)» only · coordinator digest empty · the digested handoff (ref bus:<id>) is 할 일 + wake · OP folds raw→handoff"
+    },
+    "fed-org/CTX-BUS-LOOP-STATUS": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CONTEXT-BUS-FEDERATION (this PR)",
+      "reason": "live 24h shape: mail 78 → 19 (silence-watch 44 info + guardian 15 status → 59 bus status in OP space) · TC (non-reader) bounce + requests stay mail · second tick adds 0 · no wake"
+    },
+    "fed-org/CTX-BUS-FALLBACK": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CONTEXT-BUS-FEDERATION (this PR)",
+      "reason": "bus write fails 1..3× → each notice mailed once · later ticks of the same key neither re-mail nor post to the bus · a new key after recovery → bus"
     }
   }
 }

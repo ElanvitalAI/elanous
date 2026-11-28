@@ -13,15 +13,20 @@ scenarios:
   - { id: SUP-SILENCE-WATCH, module: src/ux-sim/sim-world/supervisors/hygiene.ts }
   - { id: SUP-TRAIN-MANAGER, module: src/ux-sim/sim-world/supervisors/delegates.ts }
   - { id: SUP-LANE-POLICY, module: src/ux-sim/sim-world/supervisors/delegates.ts }
+  - { id: SUP-LAND-KIND-PARAMS, module: src/ux-sim/sim-world/supervisors/land-kind.ts }
   - { id: SUP-RELEASE-ROCKET, module: src/ux-sim/sim-world/supervisors/flow.ts }
   - { id: SUP-HAND-STEWARD, module: src/ux-sim/sim-world/supervisors/flow.ts }
   - { id: SUP-POOL-NEEDS-SPEC, module: src/ux-sim/sim-world/supervisors/pool-needs-spec.ts }
+  - { id: SUP-SEAT-AREA-GUARD, module: src/ux-sim/sim-world/supervisors/seat-area.ts }
+  - { id: PR-ZOMBIE-SUPPLY-TRUE, module: src/ux-sim/sim-world/supervisors/pr-zombie.ts }
   - { id: SUP-SUBJECT-LOST, module: src/ux-sim/sim-world/supervisors/common.ts }
   - { id: SUP-GUARDIAN-PULSE, module: src/ux-sim/sim-world/supervisors/common.ts }
   - { id: SUP-JD-PARK, module: src/ux-sim/sim-world/supervisors/journal-defects.ts }
   - { id: SUP-JD-DEFUNCT, module: src/ux-sim/sim-world/supervisors/journal-defects.ts }
   - { id: SUP-JD-CELL-CAP, module: src/ux-sim/sim-world/supervisors/journal-defects.ts }
   - { id: SUP-JD-SILENCE, module: src/ux-sim/sim-world/supervisors/journal-defects.ts }
+  - { id: SUP-SILENCE-NOTICE, module: src/ux-sim/sim-world/supervisors/silence-notice.ts }
+  - { id: SUP-OPS-SLA-OP, module: src/ux-sim/sim-world/supervisors/journal-defects.ts }
   - { id: KIT-ROLE-LLM, module: src/ux-sim/sim-world/supervisors/kits.ts }
   - { id: KIT-LESSONS, module: src/ux-sim/sim-world/supervisors/kits.ts }
   - { id: KIT-LAND-LOCK, module: src/ux-sim/sim-world/supervisors/kits.ts }
@@ -36,6 +41,86 @@ scenarios:
   - { id: SUP-WIP1-ACTIVE, module: src/ux-sim/sim-world/supervisors/wip1-active.ts }
   - { id: SUP-YAML-RUNTIME, module: src/ux-sim/sim-world/supervisors/yaml-runtime.ts }
   - { id: SUP-YAML-SHIPPED, module: src/ux-sim/sim-world/supervisors/yaml-runtime.ts }
+  - { id: SUP-RETIRE-ABSORB, module: src/ux-sim/sim-world/supervisors/retire.ts }
+  - { id: SUP-RETIRE-BEAT, module: src/ux-sim/sim-world/supervisors/retire.ts }
+  - { id: SUP-RETIRE-FAULTS, module: src/ux-sim/sim-world/supervisors/retire.ts }
+  - { id: SUP-ROLE-KEPT, module: src/ux-sim/sim-world/supervisors/retire.ts }
+  - { id: SUP-HB-REGISTRY-OWNS, module: src/ux-sim/sim-world/supervisors/heartbeat-registry.ts }
+  - { id: SUP-HB-OUTSIDE-CLOCK, module: src/ux-sim/sim-world/supervisors/heartbeat-registry.ts }
   - { id: SUP-V3-SMART-LEARN, module: src/ux-sim/sim-world/supervisors/v3-smart.ts }
   - { id: SUP-V3-RETRO-SOUL, module: src/ux-sim/sim-world/supervisors/v3-smart.ts }
   - { id: SUP-LOOP-EXCEPTION, module: src/ux-sim/sim-world/supervisors/loop-exceptions.ts }
+  - { id: SUP-LOOP-RETIRED, module: src/ux-sim/sim-world/supervisors/loop-retired.ts }
+  - { id: SUP-V3-LISTED, module: src/ux-sim/sim-world/supervisors/v3-listed.ts }
+  - { id: SUP-STEWARD-CAPS-NORMAL, module: src/ux-sim/sim-world/supervisors/steward-caps.ts }
+  - { id: SUP-STEWARD-CAPS-EDGE, module: src/ux-sim/sim-world/supervisors/steward-caps.ts }
+  - { id: SUP-PLUGIN-GUARDIAN, module: src/ux-sim/sim-world/supervisors/plugin-install.ts }
+  - { id: SUP-PLUGIN-FAULTS, module: src/ux-sim/sim-world/supervisors/plugin-install.ts }
+  - { id: SUP-PLUGIN-ALL, module: src/ux-sim/sim-world/supervisors/plugin-install.ts }
+  - { id: SUP-AUDITOR-HEALTHY, module: src/ux-sim/sim-world/supervisors/fleet-audit.ts }
+  - { id: SUP-AUDITOR-STALE, module: src/ux-sim/sim-world/supervisors/fleet-audit.ts }
+  - { id: SUP-AUDITOR-WATCH-ONLY, module: src/ux-sim/sim-world/supervisors/fleet-audit.ts }
+  - { id: SUP-AUDITOR-FALSE-GREEN, module: src/ux-sim/sim-world/supervisors/fleet-audit.ts }
+  - { id: SUP-AUDITOR-RED, module: src/ux-sim/sim-world/supervisors/fleet-audit.ts }
+  - { id: SUP-CANARY-REGRESS, module: src/ux-sim/sim-world/supervisors/rail-canary.ts }
+  - { id: SUP-CANARY-HEALTHY, module: src/ux-sim/sim-world/supervisors/rail-canary.ts }
+  - { id: SUP-CANARY-FLAP, module: src/ux-sim/sim-world/supervisors/rail-canary.ts }
+  - { id: SUP-CANARY-HOLD, module: src/ux-sim/sim-world/supervisors/rail-canary.ts }
+  - { id: SUP-CANARY-FALSE, module: src/ux-sim/sim-world/supervisors/rail-canary.ts }
+  - { id: BOARD-PUBLISH-FLIP, module: src/ux-sim/sim-world/supervisors/current-board.ts }
+  - { id: BOARD-PUBLISH-FAIL, module: src/ux-sim/sim-world/supervisors/current-board.ts }
+  - { id: BOARD-DEVBUMP-FAIL, module: src/ux-sim/sim-world/supervisors/current-board.ts }
+  - { id: BOARD-WRITE-FAIL, module: src/ux-sim/sim-world/supervisors/current-board.ts }
+  - { id: BOARD-RACE, module: src/ux-sim/sim-world/supervisors/current-board.ts }
+  - { id: BOARD-READER-STALE, module: src/ux-sim/sim-world/supervisors/current-board.ts }
+  - { id: BOARD-ROLLBACK, module: src/ux-sim/sim-world/supervisors/current-board.ts }
+  - { id: BOARD-READERS-AGREE, module: src/ux-sim/sim-world/supervisors/current-board.ts }
+  - { id: BOARD-SHADOW-HAND, module: src/ux-sim/sim-world/supervisors/current-board.ts }
+  - { id: BOARD-TIMELINE-1128, module: src/ux-sim/sim-world/supervisors/current-board.ts }
+  - { id: JB-UNRELATED, module: src/ux-sim/sim-world/supervisors/judge-binding.ts }
+  - { id: JB-DECLARED, module: src/ux-sim/sim-world/supervisors/judge-binding.ts }
+  - { id: JB-UMBRELLA, module: src/ux-sim/sim-world/supervisors/judge-binding.ts }
+  - { id: JB-MISLABEL, module: src/ux-sim/sim-world/supervisors/judge-binding.ts }
+  - { id: JB-LEGACY-OWN-EVIDENCE, module: src/ux-sim/sim-world/supervisors/judge-binding.ts }
+  - { id: JB-NEGATION, module: src/ux-sim/sim-world/supervisors/judge-binding.ts }
+  - { id: JB-CRIT-UNCERTAIN, module: src/ux-sim/sim-world/supervisors/judge-criterion.ts }
+  - { id: JB-CRIT-LLM-DOWN, module: src/ux-sim/sim-world/supervisors/judge-criterion.ts }
+  - { id: JB-CRIT-MUST-UNMET, module: src/ux-sim/sim-world/supervisors/judge-criterion.ts }
+  - { id: JB-CRIT-EMPTY, module: src/ux-sim/sim-world/supervisors/judge-criterion.ts }
+  - { id: JB-CRIT-RESIGN-NO-FU, module: src/ux-sim/sim-world/supervisors/judge-criterion.ts }
+  - { id: JB-SIM-GREEN, module: src/ux-sim/sim-world/supervisors/judge-sim-receipt.ts }
+  - { id: JB-SIM-SCENE-MISMATCH, module: src/ux-sim/sim-world/supervisors/judge-sim-receipt.ts }
+  - { id: JB-SIM-REGRESSION, module: src/ux-sim/sim-world/supervisors/judge-sim-receipt.ts }
+  - { id: JB-SIM-E4, module: src/ux-sim/sim-world/supervisors/judge-sim-receipt.ts }
+  - { id: JB-SIM-CARRY-MERGE, module: src/ux-sim/sim-world/supervisors/sim-receipt-carry.ts }
+  - { id: JB-SIM-CARRY-OWN-CHANGED, module: src/ux-sim/sim-world/supervisors/sim-receipt-carry.ts }
+  - { id: SUP-EXEC-BUTLER-SQUASH-RUN, module: src/ux-sim/sim-world/supervisors/sim-receipt-carry.ts }
+  - { id: JB-SELF-RUN-SCENE-ROOT, module: src/ux-sim/sim-world/supervisors/sim-receipt-carry.ts }
+  - { id: SUP-EXEC-BUTLER-RETRY-BUILD, module: src/ux-sim/sim-world/supervisors/sim-retry-own-scenes.ts }
+  - { id: JB-SIM-SCENES-OWN-DIFF, module: src/ux-sim/sim-world/supervisors/sim-retry-own-scenes.ts }
+  - { id: RP-S1, module: src/ux-sim/sim-world/supervisors/release-proof.ts }
+  - { id: RP-S2, module: src/ux-sim/sim-world/supervisors/release-proof.ts }
+  - { id: RP-S3, module: src/ux-sim/sim-world/supervisors/release-proof.ts }
+  - { id: RP-S4, module: src/ux-sim/sim-world/supervisors/release-proof.ts }
+  - { id: RP-S5, module: src/ux-sim/sim-world/supervisors/release-proof.ts }
+  - { id: RP-S6, module: src/ux-sim/sim-world/supervisors/release-proof.ts }
+  - { id: RP-S7, module: src/ux-sim/sim-world/supervisors/release-proof.ts }
+  - { id: RP-S8, module: src/ux-sim/sim-world/supervisors/release-proof.ts }
+  - { id: RP-S9, module: src/ux-sim/sim-world/supervisors/release-proof.ts }
+  - { id: PA-S1, module: src/ux-sim/sim-world/supervisors/release-preauth.ts }
+  - { id: PA-S2, module: src/ux-sim/sim-world/supervisors/release-preauth.ts }
+  - { id: PA-S3, module: src/ux-sim/sim-world/supervisors/release-preauth.ts }
+  - { id: PA-S4, module: src/ux-sim/sim-world/supervisors/release-preauth.ts }
+  - { id: PA-S5, module: src/ux-sim/sim-world/supervisors/release-preauth.ts }
+  - { id: PA-S6, module: src/ux-sim/sim-world/supervisors/release-preauth.ts }
+  - { id: PA-S7, module: src/ux-sim/sim-world/supervisors/release-preauth.ts }
+  - { id: SUP-EXEC-TRAIN-PIN, module: src/ux-sim/sim-world/supervisors/execute-not-propose.ts }
+  - { id: SUP-EXEC-TRAIN-GUARD, module: src/ux-sim/sim-world/supervisors/execute-not-propose.ts }
+  - { id: SUP-EXEC-HAND-CLAIM, module: src/ux-sim/sim-world/supervisors/execute-not-propose.ts }
+  - { id: SUP-EXEC-HAND-GUARD, module: src/ux-sim/sim-world/supervisors/execute-not-propose.ts }
+  - { id: SUP-EXEC-BUTLER-RUN, module: src/ux-sim/sim-world/supervisors/execute-not-propose.ts }
+  - { id: SUP-EXEC-BUTLER-GUARD, module: src/ux-sim/sim-world/supervisors/execute-not-propose.ts }
+  - { id: SUP-EXEC-BUTLER-FU-LINE, module: src/ux-sim/sim-world/supervisors/execute-not-propose.ts }
+  - { id: SUP-EXEC-BUTLER-FU-FALLBACK, module: src/ux-sim/sim-world/supervisors/execute-not-propose.ts }
+  - { id: DECISION-BUS-TWO-SOURCES, module: src/ux-sim/sim-world/supervisors/decision-bus.ts }
+  - { id: CROWN-DIRECTIVE-ASSIGN-GUARD, module: src/ux-sim/sim-world/supervisors/crown-directive.ts }

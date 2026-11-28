@@ -37,7 +37,7 @@ function world(seed: number): World {
 
 function deps(w: World, dir: string, at: string, live = true): BoardDeps {
   return {
-    dir, live, now: () => new Date(at), version: () => '0.3.38', nextVersion: () => '0.3.39', phase: () => w.phase,
+    cardCap: () => 3, dir, live, now: () => new Date(at), version: () => '0.3.38', nextVersion: () => '0.3.39', phase: () => w.phase,
     cells: (v) => [...w.cells.values()].filter((c) => (c.deadlineVersion ?? v) === v || (v === '0.3.39' && c.status !== 'green')),
     hands: () => w.hands, scopeOf: (s) => (s === 'HOARD' ? 'TC' : 'OP'), isCoordinator: (s) => s === 'OP' || s === 'TC',
     waitingOn: (c) => (c.id === 'C080' ? 'JUD-1' : null),
@@ -49,6 +49,16 @@ function deps(w: World, dir: string, at: string, live = true): BoardDeps {
     card: (line, to) => { w.cards.push(line); w.sent.push({ to, line }); },
   };
 }
+
+test('candidate limit fails closed for unknown pool and preserves legacy when omitted', () => {
+  for (const cap of [null, 0]) {
+    const w = world(1); const dir = mkdtempSync(join(tmpdir(), 'board-cap-'));
+    const r = boardTick({ ...deps(w, dir, '2026-11-25T23:20:00Z'), candidateCap: () => cap });
+    expect(r.cards).toEqual([]);
+  }
+  const w = world(1); const dir = mkdtempSync(join(tmpdir(), 'board-cap-legacy-'));
+  expect(boardTick(deps(w, dir, '2026-11-25T23:20:00Z')).cards.length).toBeGreaterThan(0);
+});
 
 for (const seed of [1, 7, 42]) {
   describe(`board steward sim · seed ${seed}`, () => {
@@ -134,9 +144,13 @@ describe('board steward owner switch OP→TC mid-run', () => {
 describe('board steward edges', () => {
   test('card cap: ≤3 per 10 min, no repeat key', () => {
     const b = [{ key: 'a', line: 'a' }, { key: 'b', line: 'b' }, { key: 'c', line: 'c' }, { key: 'd', line: 'd' }];
-    expect(cardsAllowed(b, [], 0).map((x) => x.key)).toEqual(['a', 'b', 'c']);
-    expect(cardsAllowed(b, [{ at: 0, key: 'a' }, { at: 0, key: 'b' }], 60_000).map((x) => x.key)).toEqual(['c']);
-    expect(cardsAllowed(b, [{ at: 0, key: 'a' }], 600_001).map((x) => x.key)).toEqual(['a', 'b', 'c']);
+    expect(cardsAllowed(b, [], 0, 3).map((x) => x.key)).toEqual(['a', 'b', 'c']);
+    expect(cardsAllowed(b, [], 0, null)).toEqual([]);
+    expect(cardsAllowed(b, [], 0, 0)).toEqual([]);
+    expect(cardsAllowed(b, [], 0, Number.NaN)).toEqual([]);
+    expect(cardsAllowed([b[0]!, b[0]!, b[1]!, b[2]!], [], 0, 3).map((x) => x.key)).toEqual(['a', 'b', 'c']);
+    expect(cardsAllowed(b, [{ at: 0, key: 'a' }, { at: 0, key: 'b' }], 60_000, 3).map((x) => x.key)).toEqual(['c']);
+    expect(cardsAllowed(b, [{ at: 0, key: 'a' }], 600_001, 3).map((x) => x.key)).toEqual(['a', 'b', 'c']);
   });
   test('leader write: OP/BOARD allowed, empty never flagged', () => {
     expect(leaderWrite({ order: ['X'], by: 'op' }).flagged).toBe(false);
@@ -154,7 +168,7 @@ describe('board steward edges', () => {
     const cards: string[] = [];
     const cells: BoardCellIn[] = [{ id: 'SYN-1', title: 'synthetic', status: 'yellow', space: 'SYN', tags: ['synthetic'], updatedAt: '2026-11-25T00:00:00Z' }];
     const d: BoardDeps = { dir, live: true, now: () => new Date('2026-11-25T23:30:00Z'), version: () => '9.9.9', nextVersion: () => '9.9.10', phase: () => 'build', cells: () => cells,
-      synthetic: true, hands: () => [{ seat: 'S1', space: 'SYN', idle: true }, { seat: 'S2', space: 'SYN', idle: true }], scopeOf: () => 'SYN', isCoordinator: () => false, waitingOn: () => null,
+      cardCap: () => 3, synthetic: true, hands: () => [{ seat: 'S1', space: 'SYN', idle: true }, { seat: 'S2', space: 'SYN', idle: true }], scopeOf: () => 'SYN', isCoordinator: () => false, waitingOn: () => null,
       readOrder: () => ({ order: [] }), writeOrder: () => {}, publishedAt: () => null, resetPhase: () => {}, returnCell: () => false, card: (l) => { cards.push(l); } };
     boardTick(d); boardTick(d);
     expect(cards.length).toBe(1);

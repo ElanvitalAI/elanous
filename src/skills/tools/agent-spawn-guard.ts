@@ -186,6 +186,14 @@ export function isFanOutSibling(next: { name: string; prompt: string }, other: {
   return spawnWords(next.prompt).some(word => !otherWords.has(word) && nameWords.has(word));
 }
 
+/** isFanOutSibling over content words only: a verify verb in the name never makes a check look like a sibling. */
+export function isContentFanOutSibling(next: { name: string; prompt: string }, other: { prompt: string }): boolean {
+  const otherWords = new Set(spawnWords(other.prompt).map(stem));
+  const nameWords = new Set(spawnWords(next.name).filter(word => !isVerifyWord(word)).map(stem));
+  return spawnWords(next.prompt).filter(word => !isVerifyWord(word)).map(stem)
+    .some(word => !otherWords.has(word) && nameWords.has(word));
+}
+
 export interface AgentSpawnGuardOpts {
   now?: () => number;
   taskState?: TaskStateLookup;
@@ -371,7 +379,12 @@ export class AgentSpawnGuard {
     }
     const live = seatEntries.filter(entry => this.running(entry));
     if (isVerificationSpawn(attempt.name, attempt.prompt)) {
-      const target = live.find(entry => sameGoal(attempt, entry));
+      // TURN-GIVES-UP-NO-WORK (11-28 test universe): «메모리 회상 검색 조사» beside a running «메모리 생성 저장 조사» was
+      // refused as a verify chain only because its prompt said «확인», so the turn lost its second worker and gave up.
+      // A spawn whose NAME is a check stays a check. One whose verify verb is only in the prompt is a check only when it
+      // is not a fan-out sibling (its name names a part the running agent's prompt never mentions).
+      const verifyByName = spawnWords(attempt.name).some(isVerifyWord);
+      const target = live.find(entry => sameGoal(attempt, entry) && (verifyByName || !isContentFanOutSibling(attempt, entry)));
       if (target) {
         return {
           allowed: false,

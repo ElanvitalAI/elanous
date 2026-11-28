@@ -1,0 +1,33 @@
+# GH-PROXY-LAYER (0.3.40 P0 · CEO 11-28 21:0x «git 문제가 너무 많이 · proxy 등 기본 조치»): the layer in front of GitHub.
+# ① gh shim (bin/gh-shim/gh, first on a seat shell's PATH) → `eln gh` transparent door (kit/gh-proxy/door.ts) over the
+#   governor (graphs/policies/gh-governor.yaml: cooldown · per-seat budget) ⊕ a short shared read cache.
+# ② git fetch mirror (kit/gh-proxy/mirror.ts): one bare mirror fetches GitHub at most once per interval; consumers' fetch URL is
+#   rewritten to it (url.<mirror>.insteadOf · push stays GitHub); a mirror older than stale_fallback_min → consumers fetch direct.
+# Code reads these numbers — no copy of them lives in src/.
+schema: 1
+
+shim:
+  # An identical read (same argv · cwd · GH_REPO · GH_HOST) within this age is answered from the cache file — no GitHub call.
+  # 100 hand-shell `gh pr view N` per minute → ≤ 60 / read_cache_sec real reads (plus the seat budget of gh-governor.yaml).
+  read_cache_sec: 20
+  # Readers that lost the per-key lock wait this long for the first reader's answer (then call GitHub themselves).
+  read_cache_wait_sec: 15
+  # Outputs larger than this are passed through but never cached.
+  read_cache_max_bytes: 4000000
+  # Cache files older than this are deleted by the next writer (the cache dir never grows without bound).
+  read_cache_prune_sec: 600
+
+mirror:
+  # The refresher fetches GitHub into the mirror at most once per this window (a second trigger inside it is a no-op).
+  refresh_min_interval_sec: 60
+  # One refresh tick may fetch this many times, refresh_min_interval_sec apart (the trigger registry ticks every 2 min).
+  refreshes_per_tick: 2
+  # Last successful refresh older than this → every consumer's insteadOf is removed (fetch goes to GitHub) until a refresh succeeds.
+  stale_fallback_min: 10
+  # One `git fetch` from GitHub into the mirror may take this long before it is killed (a failed refresh, not a stall).
+  fetch_timeout_sec: 300
+  # What the mirror holds (consumers fetch any of these through it: main · branches · PR heads · tags).
+  refspecs:
+    - '+refs/heads/*:refs/heads/*'
+    - '+refs/tags/*:refs/tags/*'
+    - '+refs/pull/*/head:refs/pull/*/head'

@@ -1,0 +1,34 @@
+# DEV-REVIEW-COMMON post-impl@1 — JUDGE-LOAD-REDUCTION §3 골 대조표 (구현 뒤 · 판정 전 1회) ⊕ §2 의 «해상도가 오른 뒤» 재확인.
+# On a PR's FIRST pregate receipt the criterion is re-checked against the PR's own facts by assessCriterionForSign — the judge
+# butler's sign decision itself (judging.yaml refuse_must_unmet_when · fallback · follow_up):
+#   flagged    — a cited contradiction: the judge WILL refuse → one evidence line on the cell now (the hand fills the must first)
+#   fu         — must met · unmet independent edges → their FU cells now (the judge's ids · the sign adds nothing)
+#   clean      — the judge would sign on the criterion
+#   untrusted  — the judge LLM could not judge (it would sign on the baseline) → ledger row only
+# Called by: implement-loop node `post-impl` (after the first gate) · graphs/triggers/dev-review-post-impl.yaml (first pregate).
+graph_id: post-impl
+version: 1
+unit:
+  inputs: [cell, criterion, pr, head, facts]
+  outputs: [judge_prediction, edge_fus]
+  exits: [clean, fu, flagged, untrusted]
+entry_node: check
+terminal_nodes: [clean, fu, flagged, untrusted]
+nodes:
+  - node_id: check
+    kind: judge
+    recipe: 'handler:dev-review-post-check'
+    max_visits: 1
+    contract: { inputs: [cell, criterion, pr, head, facts], tools: read-only, outputs: [judge_prediction, edge_fus] }
+  - node_id: record
+    kind: agent
+    recipe: 'handler:dev-review-record-post'
+    max_visits: 1
+    contract: { inputs: [judge_prediction, edge_fus], tools: checklist-write, outputs: [judge_prediction, edge_fus] }
+  - { node_id: clean, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: fu, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: flagged, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: untrusted, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: check, on: outcome, map: { clean: record, fu: record, flagged: record, untrusted: record, fail: record, error: record } }
+  - { from: record, on: outcome, map: { clean: clean, fu: fu, flagged: flagged, untrusted: untrusted, fail: untrusted, error: untrusted } }

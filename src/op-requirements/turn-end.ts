@@ -7,6 +7,7 @@ import {
   decideTurnEnd, markStale, noteContinuationOpened, readStore, requirementStorePath, routeBlocked, seedRequirements, migrateUnreferencedDirectives, writeStore,
   type Requirement, type SeedInput, type WaitFor, type WaitState,
 } from './requirement-loop.js';
+import { boardVersion } from '../release-loop/board-version.js';
 
 export const REQUIREMENT_LOOP_SEAT = 'OP';
 const CATEGORY = 'op.requirements';
@@ -102,9 +103,9 @@ async function mailRecipients(): Promise<(msgId: string) => string | undefined> 
 async function defaultGather(seat: string): Promise<{ seed: SeedInput; waitState: (r: Requirement) => WaitState }> {
   const seed: SeedInput = {};
   try {
-    const { devVersion, listChecklist, ownerMatches } = await import('../release-loop/checklist.js');
+    const { listChecklist, ownerMatches } = await import('../release-loop/checklist.js');
     const { releaseLedgerRoot } = await import('../instance/resolve.js');
-    const version = devVersion().replace(/-dev\.\d+$/, '');
+    const version = boardVersion();
     seed.p0Cells = listChecklist(version, releaseLedgerRoot()).items
       .filter((item) => item.priority === 'P0' && ownerMatches(item.owner, seat))
       .map((item) => ({ version, id: item.id, title: item.title, status: item.status, ...(item.owner ? { owner: item.owner } : {}) }));

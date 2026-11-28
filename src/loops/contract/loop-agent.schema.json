@@ -88,7 +88,7 @@
   "allOf": [{ "if": { "properties": { "kind": { "const": "orchestrator" } }, "required": ["kind"] }, "then": { "properties": { "orchestration": true }, "required": ["orchestration"] }, "else": { "not": { "required": ["orchestration"] } } }],
   "$defs": {
     "supervisorV1": {
-      "description": "supervisor/v1 definition (kind: supervisor). Validated by src/supervision/definition-loader.ts; the set rule (one final actor per signal) is cross-definition and lives in the loader.",
+      "description": "supervisor/v1 definition (kind: supervisor). Validated with the package manifest (src/loops/package/verify.ts).",
       "type": "object", "additionalProperties": false,
       "required": ["apiVersion", "kind", "ref", "role", "supervises", "signals", "authority", "reportsTo", "escalation", "memory"],
       "properties": {

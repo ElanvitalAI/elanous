@@ -95,7 +95,7 @@ test('renderOpDigest quotes at most three decision items, newest first', () => {
 function rng(seed: number): () => number { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 2 ** 32; }; }
 
 for (const seed of [1, 7, 42, 1127]) {
-  test(`07:43 replay (seed ${seed}): 83 mails / 45 min → 39 direct + 2 🚨 + ≤ 2 digests, nothing lost`, () => {
+  test(`07:43 replay (seed ${seed}): first exceptions immediate, 39 seats + 2 🚨 + ≤2 digests, nothing lost`, () => {
     const r = rng(seed);
     const { store, set } = storeAt();
     const shape: Array<{ from: string; kind: string; intent?: 'alert' | 'decision' | 'info'; body: string }> = [
@@ -119,7 +119,14 @@ for (const seed of [1, 7, 42, 1127]) {
     expect(inbox.filter((m) => m.body.startsWith('🚨') || m.kind === 'cost-incident')).toHaveLength(2);
     expect(digests.length).toBeGreaterThanOrEqual(1);
     expect(digests.length).toBeLessThanOrEqual(2);
-    expect(inbox.length).toBeLessThanOrEqual(43); // was 85 rows (83 + 2 🚨)
+    // TC #198917 / OP #198830 changes the former total <=43 contract: the fixture has
+    // 26 distinct PR/reason exceptions, all now immediate (39 + 2 + 26 + digest rows).
+    // Repeated-combination suppression is independently exercised across these seeds in
+    // land-graph-198831-boundary.test.ts; do not hide this intentional contract change.
+    const firstExceptions = inbox.filter((m) => m.from.toUpperCase() === 'LAND-GRAPH' && m.body.startsWith('[land-graph · stall]'));
+    expect(firstExceptions).toHaveLength(26);
+    expect(new Set(firstExceptions.map((m) => m.body.match(/#\d+/u)?.[0])).size).toBe(26);
+    expect(inbox).toHaveLength(39 + 2 + 26 + digests.length);
     expect(store.pendingOpDigest()).toHaveLength(0);
     const counted = digests.reduce((n, d) => n + Number(/\[machine digest · (\d+) mails/u.exec(d.body)?.[1] ?? 0), 0);
     expect(counted).toBe(44);
@@ -149,4 +156,37 @@ test('a quiet OP inbox still gets the digest: the turn snapshot flushes when due
   now = T0 + 80 * 60_000;
   seatInboxSnapshotText('TC', { openStore: () => store, now: () => new Date(now) });
   expect(store.list('OP')).toHaveLength(1);
+});
+
+
+test('first land-graph exception per PR and reason is immediate, repeats are retained and grouped until window flush', () => {
+  const { store, set } = storeAt();
+  const post = (body: string) => store.post({ from: 'LAND-GRAPH', to: 'OP', kind: 'info', body });
+  const first = post('[land-graph · stall] #40500 ready 30+ min');
+  expect(first.id).toBeGreaterThan(0);
+  expect(post('[land-graph · stall] #40500 still waiting').digested).toBeGreaterThan(0);
+  expect(post('[land-graph · conflict] #40500 conflict').id).toBeGreaterThan(0);
+  expect(post('[land-graph · stall] #40501 ready').id).toBeGreaterThan(0);
+  expect(post('[land-graph 착지 후통보] #40500 MERGED').digested).toBeGreaterThan(0);
+  expect(store.list('OP')).toHaveLength(3);
+  expect(store.pendingOpDigest()).toHaveLength(5);
+  set(T0 + 30 * 60_000);
+  store.flushOpDigestIfDue();
+  const digest = store.list('OP').find((m) => m.from === 'SIGNAL-DIGEST')!;
+  expect(digest.body).toContain('#40500 · stall · 2건');
+  expect(digest.body).toContain('#40500 · conflict · 1건');
+  expect(digest.body).toContain('#40501 · stall · 1건');
+  expect(store.pendingOpDigest()).toHaveLength(0);
+  expect(post('[land-graph · stall] #40500 new window').id).toBeGreaterThan(0);
+});
+
+
+test('land-graph auto-cell and cell success notifications stay folded', () => {
+  const { store } = storeAt();
+  for (const cls of ['auto-cell', 'cell']) {
+    const msg = store.post({ from: 'LAND-GRAPH', to: 'OP', kind: 'info', body: `[land-graph · ${cls}] #40500 success` });
+    expect(msg.digested).toBeGreaterThan(0);
+  }
+  expect(store.list('OP')).toHaveLength(0);
+  store.close();
 });

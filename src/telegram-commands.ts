@@ -927,6 +927,43 @@ export function defaultTelegramCommands(
         return service.listOpen(String(ctx.chatId));
       },
     },
+    {
+      // RELEASE-PRESIGNED-AUTO — pre-sign a night release: /preauth (list) · /preauth <v> auto|surgery (raise the card,
+      // then A → confirm signs it) · /preauth 취소 [D-…] (revoke one, or every usable one). Owner · private chat only.
+      name: 'preauth',
+      description: '발행 사전 승인 — /preauth · /preauth <판> auto|surgery · /preauth 취소 [D-…]',
+      handler: async (args, ctx) => {
+        const { telegramDecisionService } = await import('./decisions/telegram-decision-cards.js');
+        const service = telegramDecisionService();
+        if (!service) return '결정 카드가 이 봇에 연결되어 있지 않습니다.';
+        if (!service.isOwner(String(ctx.userId))) return '사전 승인은 소유자만 다룰 수 있습니다.';
+        if (ctx.chatId !== ctx.userId) return '사전 승인은 개인 대화에서만 다룰 수 있습니다.';
+        const kit = await import('./kit/release-preauth/index.js');
+        const { DecisionLedger, readDecisionTrustRoots } = await import('./decisions/decision-ledger.js');
+        const { elanousStateRoot } = await import('./autopilot/state-paths.js');
+        const stateDir = elanousStateRoot();
+        const now = new Date();
+        const rows = () => kit.listPreAuth({ records: new DecisionLedger().list({ status: 'all' }), trustRoots: readDecisionTrustRoots(stateDir),
+          uses: kit.readPreAuthUses(stateDir), revocations: kit.readPreAuthRevocations(stateDir), now });
+        const [first, second] = args;
+        if (!first) { const all = rows(); return all.length ? all.map(kit.formatPreAuthRow).join('\n') : '사전 승인 없음 — /preauth <판> auto|surgery 로 올립니다'; }
+        if (first === '취소' || first === 'revoke') {
+          const targets = second ? [second] : rows().filter((r) => r.state === 'active' || r.state === 'scheduled' || r.state === 'awaiting-signature').map((r) => r.id);
+          if (!targets.length) return '취소할 사전 승인이 없습니다.';
+          for (const id of targets) kit.revokePreAuth(stateDir, id, `telegram:${ctx.userId}`, 'CEO revoked on Telegram', now);
+          return `사전 승인 취소: ${targets.join(', ')}`;
+        }
+        if (second !== 'auto' && second !== 'surgery') return '사용법: /preauth <판> auto|surgery · /preauth 취소 [D-…]';
+        const { getSchedule } = await import('./release-loop/release-schedule.js');
+        let publishAt: string | null = null;
+        try { publishAt = getSchedule(first)?.publishAt ?? null; } catch { publishAt = null; }
+        let r: ReturnType<typeof kit.raisePreAuth>;
+        try { r = kit.raisePreAuth(new DecisionLedger(), kit.loadPreAuthPolicy(), { version: first, mode: second, publishAt, now, raisedBy: 'release-preauth' }); }
+        catch (e) { return `사전 승인 카드를 올리지 못했습니다: ${e instanceof Error ? e.message.slice(0, 200) : 'unknown'}`; }
+        await service.tick().catch(() => undefined);
+        return `사전 승인 카드 ${r.id} (${r.status}) · v${first} ${second} · 카드에서 A → 확인을 누르면 서명됩니다`;
+      },
+    },
     ...(['coo', 'cto', 'cmo', 'cxo'] as const).map((command) => ({
       name: command,
       description: `${command.toUpperCase()} 자리에 일을 넘깁니다 — /${command} <할 일> (조율 채널 ⊕ 자리 메시지함)`,

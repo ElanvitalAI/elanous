@@ -1,0 +1,102 @@
+# kit/supervisor-index — the ontology the redundancy index tags every supervisor unit with (LOOP-AGENTS-AS-PLUGINS · 대표 11-28 07:5x).
+# Data, not code: a target / action / phase word added here changes the index without a code change.
+# targets  = what a unit WATCHES (edge `watches`) · actions = what it DOES (edge `acts`) · phases / scopes = the «meta only»
+# parameter axes the commonization pass strips before comparing two units (대표 08:1x «국면·테마·범위만 다르면 하나로»).
+targets:
+  mail: [우편, mail, msg, inbox, ack, 회신, 답 없음, unanswered, postoffice, 우체국, relay, 미결, 요청, sla_min, listUnseenRequests, dormant, 잠든 수신처]
+  hands: [노는 손, idle, 손, hand, work next, roster, 공급, supply]
+  orphans: [고아, orphan, reap, zombie-proc, 잔재, leftover, sanitize, worktree, 대식세포, macrophage, gc]
+  heartbeats: [heartbeat, 맥박, beat, watcher, liveness, 침묵, stale, dead-man, silent, 묵음, 무응답, last-tick, peer-silent, 하트비트, dead_after, 틱 기록, 마지막 틱]
+  runs: [run-ledger, 런, run, pregate, PREGATE-RED, tsc, 좀비, zombie, stall, 부검, autopsy, death, retry]
+  landing: [착지, land, landing, merge, train, 열차, 기차, churn, hot-file, 차선, lane, finisher]
+  judging: [판정, judge, green, 초록, verdict, waiver, review, 리뷰, sign]
+  release: [발행, release, 판, cut, 컷, rehearsal, 예행, milestone, rail, 레일]
+  cells: [칸, cell, board, checklist, roster, 보드, yellow]
+  hosts: [host, 호스트, load, 부하, lease, 임대, vm, burst, placement]
+  credentials: [자격, credential, oauth, token, secret, 비밀, key, 열쇠]
+  fuel: [연료, fuel, llm, quota, 크레딧, credit, budget, 한도]
+actions:
+  mail: [우편, mail, msg post, post, 통보, notify, telegram]
+  card: [카드, card, 진단, diagnose, report, 보고]
+  nudge: [깨움, wake, nudge, 재촉, kick, restart, 재기동, tick --only, trigger tick, 깨운다, 초인종, bell, redeliver, wake-peer]
+  rerun: [재실행, retry, rerun, re-run, 다시 돌림, normalize]
+  reap: [회수, reap, kill, 거두기, cleanup, 정리, quarantine]
+  assign: [배정, assign, claim, 할당, dispatch, lend]
+  land: [착지, land, merge, pin, order]
+  judge: [판정, judge, sign, green, waiver]
+  propose: [제안, propose, proposal, 칸 열기, open cell]
+phases: [post-release, accelerate, cut, rehearsal, release-day, daily, weekly, nightly, morning, shadow, live, 예행, 컷, 발행, 가속]
+scopes: [OP, TC, JUD, UX, MK, HQ, RES, REL, OPC, OPT, CEO]
+# Ops-script names that make a seat-state/*/tools file a supervisor unit (a watcher, not a one-off helper).
+script_name: '(watch|monitor|guard|sweep|patrol|nudge|steward|supervis|reap|idle|sla|heal|liveness|poll|pulse|beat|stall|silence|sentinel|janitor|gc|doctor|cleanup|relay|wake)'
+# Adjacent supervisors that live as TypeScript modules (one unit per file · header comment = its description).
+adjacent_code:
+  - src/judge-butler/agent.ts
+  - src/loop-agent/v3/land-graph-kind.ts
+  - src/steward/space/tick.ts
+  - src/steward/board/tick.ts
+  - src/supervision/silence-watch.ts
+  - src/supervision/seat-stall-watch.ts
+  - src/supervision/op-mail-coverage-watch.ts
+  - src/self-dev/run-supervisor.ts
+  - src/self-dev/draft-sweep.ts
+  - src/kit/mail-route/dormant-watch.ts
+  - src/loops/throughput-controller.ts
+  - src/loops/inbox-liveness.ts
+  - src/loops/host-reservation-watch.ts
+  - src/guardian-agent/reaper.ts
+  - src/guardian-agent/pulse.ts
+  - src/guardian-agent/peers.ts
+  - src/cli/watch-cli.ts
+# Stage axis (대표 08:2x «구현·착지·발행 여러 장소에서 쓰인다 — 공용화 가능성»): the same function family embedded once per stage.
+# A function whose NAME carries one of the family words, in a file under one stage's dirs, is one stage copy (file:line).
+stages:
+  implement: [src/harness, src/self-dev, src/agent-mission, src/task-agent]
+  land: [src/land-graph, src/land-guard, src/land-steward, src/pod-lease]
+  release: [src/release-loop]
+  judge: [src/judge-butler, src/hold-ledger]
+  ops: [src/guardian-agent, src/supervision, src/steward, src/loop-agent, src/loops]
+  kit: [src/kit]
+functions:
+  reap: [reap, orphan, zombie, sweep, prune, cleanup]
+  classify-failure: [classify, refusal, diagnos, failkind, failurekind, autopsy, deathreason]
+  retry-backoff: [retry, backoff, nextattempt]
+  raise-card: [handraise, escalat, raisecard, postcard, ownercard]
+  cooldown: [cooldown, debounce, throttle]
+  receipt: [receipt, appendledger, recordcase, writeevidence]
+# ④ «같은 일 · 다른 말» (대표 08:5x): every target/action word found in a unit's text adds its concept token (⟨heartbeats⟩ …) to
+# the BM25/vector document — two units that say «침묵 30분 → 깨움» and «DEAD 2× cadence → restart» then share tokens.
+concept_weight: 2   # concept tokens added per concept found (BM25 term frequency · vector weight)
+# Kit candidate per stage-axis function family (③).
+function_kits:
+  classify-failure: kit/failure-class (new · exit·stage·text → infra|content|timeout|policy)
+  reap: kit/reap (promote src/guardian-agent/reaper.ts planReap·killExact)
+  receipt: kit/audit-ledger (exists)
+  retry-backoff: trigger-registry backoff (src/loops/trigger-registry.ts · one policy)
+  raise-card: kit/case-ledger (exists · escalate step)
+  cooldown: kit/kpi breachStep (exists)
+# ② The eight families (hand-confirmed · LOOP-AGENT-REDUNDANCY.md §②). analyze() scores each with the four numbers;
+# a duplicate cluster that touches a family unit — or matches `confirmed` — counts as «확정» in the progress line (⑤).
+families:
+  mail-sla: [agent:silence-watch, code:guardian/post, code:src/kit/mail-route/dormant-watch.ts, code:src/supervision/silence-watch.ts, code:src/supervision/op-mail-coverage-watch.ts, graph:silence-watch, script:OP/idle-nudge.sh, script:TF/hq-wake-tick.py, code:src/loops/inbox-liveness.ts]
+  idle-hands: [agent:hand-steward, graph:steward-space, graph:board-steward, code:src/steward/space/tick.ts, code:src/steward/board/tick.ts, code:src/loops/throughput-controller.ts, code:src/supervision/seat-stall-watch.ts, graph:seat-stall-watch]
+  orphans: [agent:macrophage, code:guardian/macrophage, code:src/guardian-agent/reaper.ts, graph:harness-gc, graph:machine-sanitize, graph:machine-sanitize-daily, script:OP/hung-reaper.py, script:OP/host-tmp-reaper.py]
+  heartbeats: [agent:watchers-check, graph:watchers-check, code:guardian/pulse, code:src/guardian-agent/pulse.ts, code:src/guardian-agent/peers.ts, code:src/cli/watch-cli.ts, code:guardian/patrol, code:guardian/post, graph:resource-heartbeat-collect]
+  run-health: [agent:run-supervisor, agent:run-doctor, agent:autopsy, code:guardian/patrol, code:src/self-dev/run-supervisor.ts, script:OP/autopsy-watch.sh, script:OP/long-run-doctor.sh]
+  landing: [agent:land-steward, graph:land-graph, agent:train-manager, graph:train-manager, graph:train-batch, script:OP/land-poller.sh, script:OP/land-pulse.sh, script:OP/land-silence-guard.py]
+  judging: [agent:judge-butler, graph:judge-butler, code:src/judge-butler/agent.ts, graph:judiciary-intake, graph:rail-watch]
+  release: [agent:release-rocket, graph:release-rocket, graph:release-rocket-agent, graph:release-rehearsal, script:OP/release-stall-watch.sh]
+# Clusters judged outside the eight families (unit id prefix → verdict).
+confirmed:
+  - { match: 'script:RES', verdict: 'RES/RES-INFRA 사본 쌍·일회용 깨움·게이트 스크립트 → _archive (운영 스크립트 스캐터)' }
+  - { match: 'script:K-EAST', verdict: 'K-EAST 일회용 relay/gc 스크립트 → _archive' }
+  - { match: 'script:TF', verdict: 'TF hq-wake 사본 → mail-sla 인스턴스(2파)' }
+  - { match: 'script:OP/git-ref-reaper', verdict: 'orphans 가족 (kit/reap)' }
+  - { match: 'graph:op-on-eln-world', verdict: '오탐 (시뮬 세계 ↔ 감시 스크립트)' }
+  - { match: 'graph:inside-seed', verdict: '죽은 데모 두 벌 → 은퇴' }
+  - { match: 'code:guardian/lease', verdict: '수호자 임대관 정본 · 흡수 그래프 은퇴(2파)' }
+  - { match: 'code:guardian/keys', verdict: '수호자 열쇠지기 정본 · secret-exposure 그래프 은퇴(2파)' }
+  - { match: 'graph:guardian', verdict: '같은 graph_id 두 파일 → ops/guardian.yaml 은퇴(2파)' }
+  - { match: 'code:src/loop-agent/v3/land-graph-kind.ts', verdict: '한 단위의 두 면(몸 ↔ 그래프) · 중복 아님' }
+  - { match: 'graph:train-batch', verdict: '열차 인프라(배치 ↔ 매니저) · 착지 가족 밖 · 중복 아님' }
+thresholds: { onto: 0.75, cos: 0.7, bm25: 0.7, near: 0.95 }   # pair = same job when onto ≥ and (cos ≥ or bm25 ≥) · near-identical text ≥ near

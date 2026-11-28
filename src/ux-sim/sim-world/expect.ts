@@ -61,7 +61,7 @@ export function classifySimWorldOutcome(raw: unknown):
   return { actual: 'fail', diff: outcome.diff, reason: outcome.reason?.trim() ? outcome.reason : null };
 }
 
-const KEY = /^(memory|ta|graph|supervisors|seat-mail|capsule-events|seat-mail-roundtrip|worker|op-channel|router-cost|toolbatch|els|els-remote|member-journey|machine-infra|fed-org|llm-route|smart-merge|alloc-budget)\/[A-Za-z0-9][A-Za-z0-9_-]*(@(legacy|graph))?$/u;
+const KEY = /^(memory|ta|graph|supervisors|seat-mail|capsule-events|seat-mail-roundtrip|worker|op-channel|router-cost|toolbatch|els|els-remote|member-journey|machine-infra|fed-org|llm-route|smart-merge|alloc-budget|guardian)\/[A-Za-z0-9][A-Za-z0-9_-]*(@(legacy|graph))?$/u;
 
 /** Parse and validate sim-world-expect.json; throws with the offending key so a bad table is loud. */
 export function parseSimWorldExpectTable(text: string): SimWorldExpectTable {

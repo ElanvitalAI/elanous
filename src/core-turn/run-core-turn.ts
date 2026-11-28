@@ -50,6 +50,7 @@ import { CitationLedger, countVerifiedCitations, createCitationStreamFilter, san
 import { coreStopReasonFromProvider } from './provider-stop-reason.js';
 import { createToolBatchObserver } from './tool-batch-observation.js';
 import type { TurnNoProgressFire } from '../llm/turn-progress.js';
+import { delegationFailedResult, delegationFailureMessage, delegationResultFailed, isDelegationTool } from './delegation-fallback.js';
 import { TURN_STALL_DEFAULT_RECIPIENTS, createTurnStallReporter, defaultTurnStallMailer, type TurnStallMailer } from './turn-stall-report.js';
 import {
   isResearchToolAllowed,
@@ -523,6 +524,8 @@ export async function runCoreTurn(
     let researchToolCallCount = 0;
     let researchAxisCount = 0;
     let researchStopReason: string | undefined;
+    // TURN-GIVES-UP-NO-WORK: why the last research tool admission refused (structured — the dispatch result names it).
+    let lastResearchRefusal: 'insufficient-judgment-axes' | 'tool-budget' | undefined;
     let orderedLinearIssueStep = false;
     let orderedLinearResearchWorkflow = false;
     let releaseOrderedLinearResearch: (() => void) | undefined;
@@ -540,6 +543,7 @@ export async function runCoreTurn(
         debug.log('research.turn', 'subagent-skipped', {
           sessionId: ctx.sessionId, reason: 'insufficient-judgment-axes', axisCount: researchAxisCount, minimum: 3,
         });
+        lastResearchRefusal = 'insufficient-judgment-axes';
         return false;
       }
       if (researchToolCallCount >= RESEARCH_TURN_MAX_TOOL_TURNS) {
@@ -547,6 +551,7 @@ export async function runCoreTurn(
         // budget stop that requires tool-free synthesis. A wall-clock stop is
         // already terminal and keeps its more specific reason.
         if (researchStopReason !== 'wall-clock-budget') researchStopReason = 'tool-budget';
+        lastResearchRefusal = 'tool-budget';
         logResearchStop('tool-budget', { stage: 'tool-dispatch', tool: name, count: researchToolCallCount, limit: RESEARCH_TURN_MAX_TOOL_TURNS });
         return false;
       }
@@ -692,11 +697,44 @@ export async function runCoreTurn(
             ? 'This research turn may use research tools and Edit/Write only for the explicitly requested document.'
             : 'This research turn may only use the research tool allowlist.' };
         } else if (enforceResearchToolAllowlist && !admitResearchToolCall(name)) {
-          debug.log('core.turn', 'research-tool-budget-reached', {
-            sessionId: ctx.sessionId, tool: name, count: researchToolCallCount,
-            maxToolTurns: RESEARCH_TURN_MAX_TOOL_TURNS,
-          }, { level: 'warn' });
-          result = { error: 'Research tool budget reached. Answer with the evidence collected so far.' };
+          if (isDelegationTool(name) && lastResearchRefusal === 'insufficient-judgment-axes') {
+            // TURN-GIVES-UP-NO-WORK: the research subagent gate is not a budget stop. Say it did not start and hand the
+            // work back to this turn — the old «budget reached · answer now» line made the model give up with 0 tools.
+            debug.log('core.turn', 'delegation-failed', {
+              sessionId: ctx.sessionId, tool: name, reason: 'research-subagent-gate', fallback: 'inline', dispatchCount: currentDispatchCount,
+            }, { level: 'warn' });
+            result = delegationFailedResult('research-subagent-gate', 'This research turn does not run subagents for fewer than 3 judgment axes.');
+          } else {
+            debug.log('core.turn', 'research-tool-budget-reached', {
+              sessionId: ctx.sessionId, tool: name, count: researchToolCallCount,
+              maxToolTurns: RESEARCH_TURN_MAX_TOOL_TURNS,
+            }, { level: 'warn' });
+            result = { error: 'Research tool budget reached. Answer with the evidence collected so far.' };
+          }
+        } else if (isDelegationTool(name)) {
+          // TURN-GIVES-UP-NO-WORK ③: a delegation that throws or answers success:false (spawn guard, missing runtime,
+          // unregistered folder) returns one structured failed result whose fallback is inline work in this same turn.
+          try {
+            result = await ctx.dispatchTool(
+              name,
+              dispatchArgs,
+              c
+                ? { ...c, sessionId: ctx.sessionId, signal: ctx.signal, ...(ctx.userText ? { userText: ctx.userText } : {}) }
+                : { callId: '', sessionId: ctx.sessionId, signal: ctx.signal, ...(ctx.userText ? { userText: ctx.userText } : {}) },
+            );
+            if (delegationResultFailed(result)) {
+              debug.log('core.turn', 'delegation-failed', {
+                sessionId: ctx.sessionId, tool: name, reason: 'spawn-refused', fallback: 'inline', dispatchCount: currentDispatchCount,
+              }, { level: 'warn' });
+              result = delegationFailedResult('spawn-refused', delegationFailureMessage(result));
+            }
+          } catch (error) {
+            if (ctx.signal.aborted) throw error;
+            debug.log('core.turn', 'delegation-failed', {
+              sessionId: ctx.sessionId, tool: name, reason: 'spawn-threw', fallback: 'inline', dispatchCount: currentDispatchCount,
+            }, { level: 'warn' });
+            result = delegationFailedResult('spawn-threw', redactSecretText(error instanceof Error ? error.message : String(error)));
+          }
         } else {
           result = await ctx.dispatchTool(
             name,
@@ -1041,6 +1079,10 @@ export async function runCoreTurn(
     // 1121 RESEARCH-ROUTING: the structured route verdict of an eligible turn (set once, by the plan or by fallback).
     let structuredRoute: ResearchRouteDecision | undefined;
     let abortResearchForRoute: (() => void) | undefined;
+    // TURN-GIVES-UP-NO-WORK ①: the provisional first pass of a research turn runs on the research allowlist (no
+    // Glob/Grep/ListDir/Write/update_plan). A route verdict «skipped» (local-only …) ends that pass at once so the turn
+    // re-enters as the ordinary turn it is — the same re-entry a grounding-first turn already had.
+    let abortFirstPassForRoute: (() => void) | undefined;
     // FIRST-ANSWER-30S: a structured verdict that the turn needs fresh facts or citations makes the synthesis — the pass
     // AFTER the first answer — deep (Bloom L4·L5). It never touches the first answer.
     let routeDeepContinuation = false as boolean;
@@ -1050,7 +1092,11 @@ export async function runCoreTurn(
       routeDeepContinuation = !deepBloomDecision.apply && route.decision === 'entered' && route.by === 'structured'
         && (route.reason === 'fresh-facts' || route.reason === 'citations');
       logResearchRoute(ctx.sessionId, route, hasModelReason === undefined ? {} : { hasModelReason });
-      if (route.decision === 'skipped') abortResearchForRoute?.();
+      if (route.decision === 'skipped') {
+        abortResearchForRoute?.();
+        // Only the plan's own verdict (by: structured) ends a provisional pass; a fallback skip keeps the pass + synthesis.
+        if (route.by === 'structured') abortFirstPassForRoute?.();
+      }
     };
     // OP after r3: on an unconfirmed entry a route that does not confirm (missing / localOnly missing / plan failed /
     // budget) settles as SKIPPED by fallback → ordinary re-entry; only a confirmed entry may end GROUNDING_UNAVAILABLE.
@@ -1369,11 +1415,12 @@ export async function runCoreTurn(
     try {
       let provisionalTurnMessages: Parameters<NonNullable<StreamWithToolsHandlers['onTurnComplete']>>[0] | undefined;
       let firstPassTimedOut = false;
+      let firstPassEndedByRoute = false;
       const baseFirstPassHandlers: StreamWithToolsHandlers = researchResultPromise
         ? {
           ...handlers,
-          onText: (delta, full) => { if (!firstPassTimedOut) handlers.onText?.(delta, full); },
-          onTurnComplete: (newMessages) => { if (!firstPassTimedOut) provisionalTurnMessages = newMessages; },
+          onText: (delta, full) => { if (!firstPassTimedOut && !firstPassEndedByRoute) handlers.onText?.(delta, full); },
+          onTurnComplete: (newMessages) => { if (!firstPassTimedOut && !firstPassEndedByRoute) provisionalTurnMessages = newMessages; },
         }
         : handlers;
       // Citation guard (OP79035/79069): on information, grounding-first and research turns an answer URL must be one
@@ -1613,11 +1660,27 @@ export async function runCoreTurn(
         const deadline = new Promise<{ timedOut: true }>(resolve => {
           firstReplyTimer = timers.setTimeout(() => resolve({ timedOut: true }), firstReplyBudgetMs);
         });
+        let resolveRouteSkip: (() => void) | undefined;
+        const routeSkip = new Promise<{ timedOut: false; routeSkipped: true }>(resolve => {
+          resolveRouteSkip = () => resolve({ timedOut: false, routeSkipped: true });
+        });
+        abortFirstPassForRoute = (): void => {
+          // Silence the pass and settle the race first, then cancel: its own abort rejection arrives later and is ignored.
+          firstPassEndedByRoute = true;
+          resolveRouteSkip?.();
+          if (!firstPassController.signal.aborted) firstPassController.abort(new Error('Structured route: research skipped'));
+        };
         try {
+          if (structuredRoute?.decision === 'skipped' && structuredRoute.by === 'structured') abortFirstPassForRoute();
           const firstPass = streamLLMWithTools(firstPassMessages, firstPassHandlers, streamOptions(turnTools, firstPassController.signal))
             .then(text => ({ timedOut: false as const, text }));
-          const outcome = await Promise.race([firstPass, deadline]);
-          if (outcome.timedOut) {
+          const outcome = await Promise.race([firstPass, deadline, routeSkip]);
+          if ('routeSkipped' in outcome) {
+            firstPass.catch(() => { /* the cancelled provisional pass is replaced by the ordinary re-entry */ });
+            debug.log('research.turn', 'first-pass-ended-by-route', {
+              sessionId: ctx.sessionId, reason: structuredRoute?.reason ?? null, elapsedMs: now() - firstPassStartedAt, shownChars: accumulatedText.length,
+            });
+          } else if (outcome.timedOut) {
             firstPassTimedOut = true;
             firstPassController.abort(new Error('First answer budget reached'));
             logResearchStop('first-reply-budget', { stage: 'first-response', limitMs: firstReplyBudgetMs, elapsedMs: now() - firstPassStartedAt });
@@ -1629,9 +1692,11 @@ export async function runCoreTurn(
             finalText = settleFirstPassCitations(outcome.text);
           }
         } finally {
+          abortFirstPassForRoute = undefined;
           if (firstReplyTimer !== undefined) timers.clearTimeout(firstReplyTimer);
           ctx.signal.removeEventListener('abort', abortFirstPassFromParent);
         }
+        if (firstPassEndedByRoute && structuredRoute?.decision === 'skipped' && !ctx.signal.aborted) return reenterAsOrdinaryTurn(structuredRoute);
       } else {
         finalText = settleFirstPassCitations(await streamLLMWithTools(firstPassMessages, firstPassHandlers, streamOptions(turnTools)));
       }
@@ -1648,7 +1713,12 @@ export async function runCoreTurn(
         const racedResearch = await settleBeforeAbort(researchResultPromise, researchDeadlineSignal ?? ctx.signal, timers);
         // A run that never settled its route (e.g. a native tool ignoring the deadline) is unconfirmed → budget skip.
         if (groundingFirst && !structuredRoute && racedResearch.aborted) settleFallbackRoute('budget');
-        if (groundingFirst && structuredRoute?.decision === 'skipped' && !ctx.signal.aborted) return reenterAsOrdinaryTurn(structuredRoute);
+        // TURN-GIVES-UP-NO-WORK ①: a provisional (non-grounding-first) research turn whose plan said «skipped» (by:
+        // structured · local-only …) after its first pass re-enters too — staying meant the research allowlist and a
+        // tool-free synthesis. A fallback skip (route missing · plan failed · budget) keeps the provisional path.
+        if (structuredRoute?.decision === 'skipped' && (groundingFirst || structuredRoute.by === 'structured') && !ctx.signal.aborted) {
+          return reenterAsOrdinaryTurn(structuredRoute);
+        }
         if (racedResearch.aborted && ctx.signal.aborted) {
           commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
           return { stopReason: 'aborted', finalText };

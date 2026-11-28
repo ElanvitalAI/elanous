@@ -8,6 +8,7 @@ import { withGateTestEnv } from '../../scripts/lib/gate-test-env.js';
 import { runIsolationHardcodeGate } from '../../scripts/ci-isolation-hardcode-gate.js';
 import { runModelHardcodeGate } from '../../scripts/ci-model-hardcode-gate.js';
 import { runDaemonPortGate } from '../../scripts/ci-daemon-port-gate.js';
+import { runPolicyConstantsGate } from '../../scripts/ratchets/policy-constants.js';
 import { runAndroidUnitTestGate } from '../../scripts/ci-android-unit-tests.js';
 import { runIosUnitTestGate } from '../../scripts/ci-ios-unit-tests.js';
 import { runPwaBuildGate } from '../../scripts/ci-pwa-build-gate.js';
@@ -169,6 +170,8 @@ export interface SelfGateCliDeps {
   runModelHardcodeGate?: (out: GateOutput) => number;
   /** 데몬 포트 리터럴 래칫 — 공용 `runDaemonPortGate` 를 부른다(새 스캐너 금지). */
   runDaemonPortGate?: (out: GateOutput) => number;
+  /** YAML-FIRST-RATCHET — no new policy-shaped TS constant in src/ (scripts/ratchets/policy-constants.ts · 대표 11-27). */
+  runPolicyConstantsGate?: (out: GateOutput) => number;
   /** 안드로이드 단위 시험 게이트 심(시험 주입용). */
   runAndroidGate?: (out: GateOutput) => number;
   /** iOS 순수-로직 시험 게이트 심(시험 주입용). */
@@ -461,6 +464,7 @@ export function gateArtifactCounts(result: Pick<SelfGateCliResult, 'baseline'>, 
 
 interface GateOutput {
   args?: string[];
+  baseRef?: string;
   cwd: string;
   log: (message: string) => void;
   error: (message: string) => void;
@@ -488,24 +492,27 @@ export interface SelfGateCliResult {
   unmeasuredReason?: string;
 }
 
-/** 시험 단계와 독립인 정책 관문 넷. skipTestStep 이든 시험 통과든 같은 함수를 부른다. */
+/** 시험 단계와 독립인 정책 관문 다섯. skipTestStep 이든 시험 통과든 같은 함수를 부른다. */
 function runPolicyGates(
   files: readonly string[],
   cwd: string,
   lines: string[],
   deps: SelfGateCliDeps,
+  baseRef: string,
 ): boolean {
   const shouldRunAdditionalGates = deps.runIsolationGate !== undefined
     || deps.runMockModuleRestoreGate !== undefined
     || deps.runModelHardcodeGate !== undefined
     || deps.runDaemonPortGate !== undefined
+    || deps.runPolicyConstantsGate !== undefined
     || existsSync(join(cwd, 'scripts'));
   if (!shouldRunAdditionalGates) return true;
   const isolationPassed = runAdditionalGate('isolation-gate', deps.runIsolationGate ?? runIsolationHardcodeGate, files, cwd, lines);
   const mockModuleRestorePassed = runAdditionalGate('mock-module-restore-gate', deps.runMockModuleRestoreGate ?? runMockModuleRestoreGate, files, cwd, lines);
   const modelHardcodePassed = runAdditionalGate('model-hardcode-gate', deps.runModelHardcodeGate ?? runModelHardcodeGate, files, cwd, lines);
   const daemonPortPassed = runAdditionalGate('daemon-port-gate', deps.runDaemonPortGate ?? ((out) => runDaemonPortGate({ log: out.log, error: out.error, cwd: out.cwd, args: [] })), files, cwd, lines);
-  return isolationPassed && mockModuleRestorePassed && modelHardcodePassed && daemonPortPassed;
+  const policyConstantsPassed = runAdditionalGate('policy-constants-gate', (out) => (deps.runPolicyConstantsGate ?? runPolicyConstantsGate)({ ...out, baseRef }), files, cwd, lines);
+  return isolationPassed && mockModuleRestorePassed && modelHardcodePassed && daemonPortPassed && policyConstantsPassed;
 }
 
 function runAdditionalGate(
@@ -1523,7 +1530,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
       `tests: pass (${receiptDecision.inheritedTestFiles?.length ?? 0} files inherited from ${receiptDecision.sourceHead?.slice(0, 12) ?? 'prior receipt'})`);
     lines.push(testLine);
     capture.verdictLine = testLine;
-    const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
+    const policyPassed = runPolicyGates(selection.files, cwd, lines, deps, selection.baseRef);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
     return {
       exitCode: policyPassed && androidPassed && iosPassed && pwaPassed && expose.passed ? 0 : 1,
@@ -1536,7 +1543,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
 
   if (skipTestStep) {
     if (ledgerWriter?.required) throw new Error('remote train self-gate refused: no test shard was selected');
-    const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
+    const policyPassed = runPolicyGates(selection.files, cwd, lines, deps, selection.baseRef);
     capture.testReceiptMeasured = false;
     capture.failedTestFiles = [];
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
@@ -1631,7 +1638,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
         shardBaseline = { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 };
       }
       capture.verdictLine = lines[lines.length - 1];
-      const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
+      const policyPassed = runPolicyGates(selection.files, cwd, lines, deps, selection.baseRef);
       return {
         exitCode: capture.verdict !== 'passed' || !policyPassed || !androidPassed || !iosPassed || !pwaPassed || !expose.passed ? 1 : 0,
         lines, changedFiles: selection.files, testFiles, unverified: scope.unverified,
@@ -1652,7 +1659,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
     capture.failedTestFiles = [];
     lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, `tests: pass (${testFiles.length} files)`));
     Object.assign(capture, { verdict: 'passed', verdictLine: lines[lines.length - 1] } satisfies GateArtifactCapture);
-    const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
+    const policyPassed = runPolicyGates(selection.files, cwd, lines, deps, selection.baseRef);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
     return { exitCode: policyPassed && androidPassed && iosPassed && pwaPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, importerTestsAdded, baseline: { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 } };
   }
@@ -1688,7 +1695,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
     verdict: report.introduced > 0 || report.unknown > 0 || report.preconditionUnmet > 0 ? 'failed' : 'passed',
     verdictLine: lines[lines.length - 1],
   } satisfies GateArtifactCapture);
-  const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
+  const policyPassed = runPolicyGates(selection.files, cwd, lines, deps, selection.baseRef);
   const exitCode = !androidPassed || !iosPassed || !pwaPassed || !policyPassed || !expose.passed || report.introduced > 0 || report.unknown > 0 || report.preconditionUnmet > 0 ? 1 : 0;
   return { exitCode, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, importerTestsAdded, baseline: { introduced: report.introduced, preexisting: report.preexisting, unknown: report.unknown, preconditionUnmet: report.preconditionUnmet } };
 }

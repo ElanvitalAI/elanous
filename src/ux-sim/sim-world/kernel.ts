@@ -24,7 +24,7 @@ import { SIM_WORLD_IDS, type SimWorldDeviceDef, type SimWorldEngine, type SimWor
   type SimWorldPackId, type SimWorldReservedId, type SimWorldScenario, type SimWorldSummary, type SimWorldVerdict, type SimWorldVerdictRecord } from './types.js';
 
 const REPO_ROOT = resolve(import.meta.dir, '../../..');
-const SIM_WORLD_PACK_ROOT = join(REPO_ROOT, 'src/ux-sim/worlds');
+export const SIM_WORLD_PACK_ROOT = join(REPO_ROOT, 'src/ux-sim/worlds');
 const VERDICTS: readonly SimWorldVerdict[] = ['pass', 'xfail', 'promoted', 'promote-required', 'regression', 'ratchet-violation', 'infra-error', 'unlisted',
   'wrong-reason-red', 'unmeasured', 'malformed', 'contract-violation'];
 
@@ -67,7 +67,8 @@ function kernelEvent(events: SimWorldKernelEvent[], kind: string, world: SimWorl
   debug.log('ux.sim.world-kernel', kind, { world, detail });
 }
 
-function loadSimWorldPack(world: SimWorldPackId, packRoot: string): SimWorldPack {
+/** One pack's registered scenes (also read by the judge kit: a scene id named in a doneCriterion / PR body is a registered one). */
+export function loadSimWorldPack(world: SimWorldPackId, packRoot: string): SimWorldPack {
   const file = join(packRoot, `sim-world-${world}.yaml`);
   const value = parseYaml(readFileSync(file, 'utf8')) as Partial<SimWorldPack> | null;
   if (!value || value.schema !== 1 || value.world !== world || !Array.isArray(value.scenarios))

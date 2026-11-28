@@ -1,0 +1,18 @@
+# 착지 집사 (land-steward) — gate tier policy (LAND10-FINISHER-WAIT · 대표 11-28 18:1x «전체 게이트 필요한 것 자체를 만들면 안 된다 ·
+# 예행 게이트에서 소화»). Read by RES pregate (seat-state/RES/tools/pregate.py · from the mirror's origin/main, so a change here
+# takes effect when it lands) and by the smart-merge sim (src/ux-sim/sim-world/smart-merge/scenarios.ts). Changed by PR only.
+#
+# tiers: pregate grade → where its step set runs.
+#   land       the step set runs in the PR's pregate (the land receipt).
+#   rehearsal  the step set does NOT run at land time: the PR lands on the light (L2) receipt of its own diff, and the full step
+#              set runs in the release rehearsal gate (22:00 / 14:00 · hard rehearsal T−4h) and the periodic full run. A failure
+#              there goes the post-regression path: gate bisect → first failing commit → culprit PR → owner cell (revert or fix).
+# Security-4 paths stay bound by the Terra review on the head (a review, not a gate) — the land graph enforces it per PR.
+# Missing file or tier = the built-in pregate table (old: L3 = full gate at land time).
+schema: 1
+tiers:
+  L0: land        # comment / doc only
+  L1: land        # tests only
+  L1d: land       # deletion only
+  L2: land        # production (light: focused ⊕ changed-tsc ⊕ import neighbours, on the main-merged tree)
+  L3: rehearsal   # was «full-required» (security path · ≥50 files · release path · hot file · export removed)

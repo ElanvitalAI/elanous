@@ -7,6 +7,29 @@ import {
 import type { InProcessHandlerContext, InProcessHandlerResult } from '../in-process-registry.js';
 
 const CONTRACT = 'bookforge.app-docs-pdf@1' as const;
+/** Re-exec the renderer with the first Python 3.10+ found on PATH. */
+const PYTHON_310 = [
+  'import getpass, os, shutil, subprocess, sys',
+  'from pathlib import Path',
+  'need = sys.argv[1:]',
+  'cands = []',
+  'homes = [Path(os.environ["HOME"])] if os.environ.get("HOME") else []',
+  'account = Path("~" + getpass.getuser()).expanduser()',
+  'homes += [account] if account not in homes else []',
+  'names = ("python3.15", "python3.14", "python3.13", "python3.12", "python3.11", "python3.10", "python3")',
+  'fixed = [home / ".local/share/elanous/bin/python3" for home in homes]',
+  'fixed += [Path(f"/opt/homebrew/bin/{name}") for name in names]',
+  'fixed += [Path(f"/usr/local/bin/{name}") for name in names]',
+  'for path in [shutil.which(name) for name in names] + [str(path) for path in fixed if path.is_file()]:',
+  '    if path and path not in cands: cands.append(path)',
+  'for path in cands:',
+  '    probe = subprocess.run([path, "-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"],',
+  '                           capture_output=True)',
+  '    if probe.returncode == 0:',
+  '        os.execv(path, [path, *need])',
+  'print("Python 3.10 or newer is required for Bookforge.", file=sys.stderr)',
+  'raise SystemExit(1)',
+].join('\n');
 
 export function createBookforgeAppDocsRegistry(pluginRoot: string): GraphCapabilityRegistry {
   if (!isAbsolute(pluginRoot)) throw new Error('bookforge plugin root must be absolute');
@@ -63,18 +86,39 @@ export async function runBoundedBookforgeProcess(command: string, args: string[]
   });
 }
 
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+/** App-build writes ARCHITECTURE.md during the files stage; a standalone graph passes the path directly. */
+function bookforgeRequest(context: InProcessHandlerContext): Record<string, unknown> | undefined {
+  const direct = record(context.graphInput);
+  if (typeof direct?.designPath === 'string') return direct;
+  const outputs = record(context.outputs);
+  const files = record(outputs?.files)?.result;
+  const written = record(files)?.files;
+  const architecture = Array.isArray(written)
+    ? written.map(record).find(file => file?.path === 'ARCHITECTURE.md' && typeof file.absolutePath === 'string')
+    : undefined;
+  const scratch = record(record(outputs?.['source-reserve'])?.result)?.scratchDir;
+  if (!architecture || typeof scratch !== 'string') return direct;
+  return { designPath: architecture.absolutePath, outDir: scratch, title: '앱 설계' };
+}
+
 async function runBookforgeAppDocs(pluginRoot: string, context: InProcessHandlerContext): Promise<InProcessHandlerResult> {
-  const input = context.graphInput;
-  if (context.requires !== CONTRACT || !input || typeof input !== 'object' || Array.isArray(input))
+  const input = bookforgeRequest(context);
+  if (context.requires !== CONTRACT || !input)
     return { ok: false, outcome: 'failed', error: 'Bookforge graph input missing' };
-  const { designPath, outDir, title } = input as Record<string, unknown>;
+  const { designPath, outDir, title } = input;
   if (typeof designPath !== 'string' || !isAbsolute(designPath)
     || typeof outDir !== 'string' || !isAbsolute(outDir)
     || typeof title !== 'string' || !title.trim())
     return { ok: false, outcome: 'failed', error: 'Bookforge requires absolute designPath, outDir and title' };
   const renderScript = resolve(import.meta.dir, '../../../skills/bookforge/render_app_docs.py');
-  const run = await runBoundedBookforgeProcess('python3', [renderScript, '--design', designPath,
-    '--out', outDir, '--title', title], context.signal);
+  // `python3` on the gate host is 3.9 and cannot import the installed renderer
+  // packages. Pick the first 3.10+ interpreter already on PATH.
+  const run = await runBoundedBookforgeProcess('python3', ['-c', PYTHON_310, renderScript,
+    '--design', designPath, '--out', outDir, '--title', title], context.signal);
   if (run.error || run.aborted) return { ok: false, outcome: 'failed',
     error: run.error?.message ?? 'Bookforge render canceled', evidence: { exit: run.status, aborted: run.aborted } };
   let result: Record<string, unknown>;
@@ -87,7 +131,7 @@ async function runBookforgeAppDocs(pluginRoot: string, context: InProcessHandler
   if (run.status !== 0 || result.ok !== true || typeof result.pdfPath !== 'string')
     return { ok: false, outcome: 'failed', error: String(result.error ?? 'Bookforge render failed'),
       evidence: { ...result, exit: run.status } };
-  return { ok: true, outcome: 'done', result: { pdfPath: result.pdfPath, sourceSha256: result.sourceSha256,
-    visualReviewRequired: true }, evidence: { projectPath: result.projectPath, sourceSha256: result.sourceSha256,
-      exit: run.status } };
+  return { ok: true, outcome: 'done', result: { pdfPath: result.pdfPath, pageCount: result.pageCount,
+    sourceSha256: result.sourceSha256, visualReviewRequired: true },
+    evidence: { projectPath: result.projectPath, sourceSha256: result.sourceSha256, exit: run.status } };
 }

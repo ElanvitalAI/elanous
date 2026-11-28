@@ -1,4 +1,5 @@
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from 'node:child_process';
+import { mergeTree } from '../git-smart/merge-tree.js';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -353,7 +354,7 @@ export function integrateTrain(repo: string, baseSha: string, batch: readonly Tr
   const conflictPlans: TrainConflict[] = [];
   const run = (args: string[]) => git(args, repo);
   for (const item of batch) {
-    const merge = run([...uxSimMergeDriverArgs(repo), 'merge-tree', '--write-tree', '--name-only', '-z', current, item.head]);
+    const merge = mergeTree(run, current, item.head, uxSimMergeDriverArgs(repo));
     if (merge.status !== 0) {
       if (/unknown option|unrecognized option|unrecognized argument|invalid option|unknown switch|usage: git merge-tree/i.test(merge.stderr)) {
         return { conflicts, ...(conflictPlans.length ? { conflictPlans } : {}), unmeasured: true };

@@ -7,3 +7,4 @@ scenarios:
   - { id: E-HOST-SNAPSHOT-BOUND, module: src/ux-sim/sim-world/els/host-snapshot.ts }
   - { id: E-SEAT-STEER-BUSY-SHELL, module: src/ux-sim/sim-world/els/steer-preempt.ts }
   - { id: E-LIVE-CWD-OSC7, module: src/ux-sim/sim-world/els/live-cwd.ts }
+  - { id: E-SHORTCUTS-POPUP, module: src/ux-sim/sim-world/els/shortcuts-popup.ts }

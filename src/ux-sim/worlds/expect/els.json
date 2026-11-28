@@ -25,6 +25,11 @@
       "expect": "green",
       "greenSince": "ELS-REMOTE-TAB-1/2 worker_hosts read bridge 0.3.33 candidate",
       "reason": "실제 Nexus HTTP 라우터와 worker_hosts WAL을 장치 시간·라우트 문맥 재생성으로 실행한다. 무자격 401, 만료·철회 비가시 endpoint, principal 회전 뒤 새 generation·origin만 노출, WAL 재개 뒤 철회 보존을 검사하며 원격 ELS 호출은 없다."
+    },
+    "els/E-SHORTCUTS-POPUP": {
+      "expect": "green",
+      "greenSince": "ELS-SHORTCUTS-POPUP 0.3.39",
+      "reason": "실제 overlay registry 와 실제 attach app 을 @xterm/headless 화면으로 읽는다. ctrl+b ? 로 Shortcuts 팝업(탭 키 먼저)이 열리고, 엉뚱한 키는 pane 에 닿지 않고, ↓ 가 한 줄씩 스크롤되고, Esc 가 닫고, 타일 위에서는 타일 키가 먼저 오고 ctrl+b ? 가 닫는다. 실제 터미널 캡처는 els pane read 로 따로 본다."
     }
   }
 }

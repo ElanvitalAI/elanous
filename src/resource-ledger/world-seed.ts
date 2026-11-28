@@ -12,7 +12,7 @@ interface SeedRow { id: string; patch: SeedPatch }
 const S = (id: string, patch: SeedPatch): SeedRow => ({ id, patch: { registered: true, ...patch } });
 
 export const CENSUS_SEED: readonly SeedRow[] = [
-  // Code-defined supervisors (supervisor/v1 · src/supervision/definitions) — census: definitions only, 0 runs in 24h.
+  // Code-defined supervisors (supervisor/v1 — definition files retired 11-28, the loop agents carry these jobs) — census: 0 runs in 24h.
   // Each owes a `eln watch beat <name>`; until it beats it is judged zombie (revive, not retire — CEO).
   S('supervisor:run-supervisor', { kind: 'supervisor', purpose: 'supervise TA/agent mission run rounds', owner: 'OP', subject: 'agent-mission runs', wake: 'per run round', heartbeatSource: 'watch:run-supervisor', slaMin: 60, meta: { census: 'dormant — no runs to supervise (TA launches 0)' } }),
   S('supervisor:run-doctor', { kind: 'supervisor', purpose: 'diagnose failed runs and rebind', owner: 'OP', subject: 'release-loop / failed runs', wake: 'on run failure', heartbeatSource: 'watch:run-doctor', slaMin: 60, meta: { census: 'definition only — run-doctor.supervisor.yaml · subject release-loop stopped 11-24' } }),

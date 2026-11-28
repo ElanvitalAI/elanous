@@ -27,16 +27,18 @@ supervisor:
 # v2 card fields that live only here — graphs/loop-agents/hand-steward/goal.yaml is GENERATED from this file (eln loop agent gen hand-steward)
 card:
   name: 행정관
-  role: &purpose 놀고 있는 손과 주인 없는 준비 칸을 짝짓는다 — pull 힌트 ⊕ 난이도별 모델 ⊕ 깨움 한 번
+  role: &purpose 놀고 있는 손과 주인 없는 준비 칸을 짝짓는다 — pull 힌트 ⊕ 난이도별 모델 ⊕ 깨움 한 번 · 안 잡힌 힌트는 그 손 대신 잡는다
   temperament: &voice 짧다. 손 이름·칸 id·모델 등급으로 말한다
   values: &values
     - 놀고 있는 손 옆에 준비 칸이 남아 있지 않게 한다
-    - pull 이 기본 — 칸을 밀어 넣지 않고 힌트를 건다(손이 eln work next 로 잡는다)
+    - pull 이 기본 — 칸을 밀어 넣지 않고 힌트를 건다(손이 eln work next 로 잡는다) · 힌트가 claim_after_hint_min 넘게 안 잡히면 같은 문으로 대신 잡고 깨운다(두 번째 힌트 없음)
     - 소총 일에 탱크 금지 — 모델은 칸 난이도대로
   subject: 연방 손 풀(놀고 있는 구현 손) ⊕ 지금 판 체크리스트의 주인 없는 준비 칸(노랑 · 선행 닫힘 · umbrella/decision 아님) ⊕ priority-order 힌트
   actions:
     - assign
     - unassign
+    - claim-for
+    - unclaim
   wake_events:
     - 손 유휴(idle-seats 변경)
     - 체크리스트 칸 상태 변경
@@ -50,6 +52,8 @@ policies:   # tier ① — the only numbers (the body reads them through pv() ·
   escalate_after_min: 60
   heartbeat_every_min: 10
   subject_lost_ticks: 3   # unreadable subject this many ticks → reattach proposal to the L0
+  claim_after_hint_min: 15   # SUPERVISORS-EXECUTE-NOT-PROPOSE: a hint untaken this long → claim-for (the steward claims the cell for the hand)
+  claim_hold_min: 45   # = work-pull writer.lease_min — a seat claimed for is «working» this long (no new hint · not counted idle)
   # v3 smartness (LOOP-AGENT-V3-SMART-2 · src/loop-agent/v3/smart.ts) — reflect · plan · learn-knowhow · retro read only these
   act_grace_min: 0   # an action's outcome is known when it returns (acted | failed) — no waiting
   lesson_repeat_min: 3   # the same action failing 3× in a row on one kind of subject → ONE lesson with the cause
@@ -80,6 +84,8 @@ soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan and voice 
   serves:
     - "OP (L0)"
     - "일감을 기다리는 손 자리"
+absorbs:   # 관계 키 absorbs — 역할 보존(FEDERATION-ORG §4 «역할 은퇴 0»)
+  - { id: seat-stall-watch, kind: role, kpi: idle_hands_with_ready_cells, l0: supervisor, why: "판단 기록이 멈춘 자리 — 멈춘(노는) 손 ⊕ 주인 없는 ready 칸이면 배정(pull hint) → 60분 못 쓰면 OP 카드" }
 wake:
   registered_as: hand-steward-agent
   trigger:
@@ -112,6 +118,13 @@ body:   # tier ① routing — observe outcome → steps (ok · breach · unknow
 actions:   # v3 plan (LOOP-AGENT-V3-SMART-2): the card rights as plan choices · fallback = what the plan runs once a knowhow line says the action keeps failing
   - { id: assign, channel: self, target: self, serves: [idle_hands_with_ready_cells], cost: $policies.cost_act, default: true }
   - { id: unassign, channel: self, target: self, serves: [idle_hands_with_ready_cells], cost: $policies.cost_act }
+  - { id: claim-for, channel: self, target: self, serves: [idle_hands_with_ready_cells], cost: $policies.cost_act }
+  - { id: unclaim, channel: self, target: self, serves: [idle_hands_with_ready_cells], cost: $policies.cost_act }
+authority:   # SUPERVISORS-EXECUTE-NOT-PROPOSE (대표 11-28 17:3x) — an untaken hint is claimed for the hand, not hinted again
+  executes: [assign, claim-for]
+  undo: { assign: unassign, claim-for: unclaim }
+  limits: [claim_after_hint_min, claim_hold_min, max_per_tick, cooldown_min]
+  respect_hold: true   # an active HOLD naming the cell (or a wildcard) → no hint / no claim this tick (journal «held»)
 voice:   # tier ③ — one LLM turn only when spoken to (role router · coordinator) · facts-only fold over budget
   channel: loop:hand-steward
   speak_on: [kpi-breach, kpi-recovered, subject-lost]

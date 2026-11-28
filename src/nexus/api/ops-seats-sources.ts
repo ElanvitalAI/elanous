@@ -2,9 +2,10 @@
 // removed — same rule as decision replies), the release checklist, and the decision ledger. Each failure becomes null upstream.
 import { DecisionLedger } from '../../decisions/decision-ledger.js';
 import { listCoordEvents, type CoordEvent } from '../../context-bus/coord-events.js';
-import { checklistDevVersion, listChecklist, type ChecklistItem } from '../../release-loop/checklist.js';
+import { listChecklist, type ChecklistItem } from '../../release-loop/checklist.js';
 import { getUserConfig } from '../../user-config/reader.js';
 import { SEATS, kstDayRange, type ChannelComment, type ChannelSource, type MergedPr, type SeatsSources } from './ops-seats.js';
+import { boardVersion } from '../../release-loop/board-version.js';
 
 const GH_TIMEOUT_MS = 20_000;
 
@@ -82,7 +83,7 @@ export function liveSeatsSources(deps: { listEvents?: typeof listCoordEvents; gi
       return lines?.map((line) => JSON.parse(line) as MergedPr) ?? null;
     },
     checklist() {
-      const dev = checklistDevVersion();
+      const dev = boardVersion();
       const next = listChecklist(nextPatch(dev)).items;
       const current = listChecklist(dev).items;
       const all: ChecklistItem[] = [...current, ...next];

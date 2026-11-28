@@ -35,7 +35,7 @@ export type ConstraintKind =
 export type LeverActor = 'machine' | 'op';
 
 export interface TpRefusal { readonly pr: number; readonly cls: string; readonly at: string; readonly files: readonly string[] }
-export interface TpOpenPr { readonly pr: number; readonly head: string; readonly author: string; readonly files: readonly string[]; readonly draft: boolean }
+export interface TpOpenPr { readonly pr: number; readonly head: string; readonly author: string; readonly files: readonly string[]; readonly draft: boolean; readonly updatedAt?: string }
 export interface TpReceipt { readonly pr: number; readonly head: string; readonly host: string; readonly at: string; readonly tscExit: number | null; readonly author?: string }
 
 export interface ThroughputSnapshot {
@@ -55,6 +55,8 @@ export interface ThroughputSnapshot {
   /** Churn refusals (merge conflict · stale-base revert · same-files overlap) in the last 2 h, with the PR's files. */
   readonly churn: readonly TpRefusal[] | null;
   readonly openPrs: readonly TpOpenPr[] | null;
+  /** PR-ZOMBIE-AGING: non-draft open PRs left out of supply (head older than pr-aging.yaml supply.fresh_head_max_days) · absent = unmeasured. */
+  readonly staleExcluded?: readonly number[] | null;
   /** PRs the land graph is waiting on for a pregate receipt of their current head (no-receipt · stale-head), with age. */
   readonly awaitingPregate: readonly { readonly pr: number; readonly sinceMin: number }[] | null;
   /** Pregate receipts written in the last 2 h. */
@@ -66,6 +68,8 @@ export interface ThroughputSnapshot {
   readonly frozen: readonly { readonly seat: string; readonly to: string; readonly ageMin: number; readonly msgId: number }[] | null;
   /** Yellow cells nobody owns with a done-when (what `eln work next` can hand out). */
   readonly readyCells: number | null;
+  /** Verified live maximum number of recipient cards per run; unknown fails closed. */
+  readonly throughputCards?: number | null;
   readonly unmeasured?: readonly string[];
 }
 
@@ -92,7 +96,7 @@ export interface Lever {
 
 export interface ThroughputVerdict {
   readonly at: string;
-  readonly measured: { readonly lands: number | null; readonly greens: number | null; readonly targets: ThroughputSnapshot['targets']; readonly ceilingLandsPerH: number | null; readonly pipeline: number | null };
+  readonly measured: { readonly lands: number | null; readonly greens: number | null; readonly targets: ThroughputSnapshot['targets']; readonly ceilingLandsPerH: number | null; readonly pipeline: number | null; readonly staleExcluded?: number };
   /** Which target the walk followed (the one missing by more, relative). */
   readonly chain: 'green' | 'land';
   readonly active: readonly Constraint[];
@@ -100,6 +104,7 @@ export interface ThroughputVerdict {
   readonly lever: Lever;
   /** Safety cards that go out regardless of the binding constraint (tsc-blind receipts). */
   readonly safety: readonly LeverAction[];
+  readonly throughputCards?: number | null;
   readonly hotFiles: readonly { readonly file: string; readonly prs: readonly number[] }[];
   readonly unmeasured: readonly string[];
 }
@@ -136,7 +141,7 @@ export const LEVERS: Readonly<Record<ConstraintKind, { readonly id: string; read
   'green-linkage': { id: 'L-CELL-LINK', actor: 'op', owner: 'OP → authors', mechanism: 'landed PRs that cite no cell: add the PR to its cell (evidence add) · PR body «칸 닫음: <ID>»' },
   'land-dead': { id: 'L-LAND-TICK', actor: 'machine', owner: 'next-action (d) · RES', mechanism: 'one land-graph tick + outcome alarm (planner rule (d)); one refusal class on every PR = a tool fault, not the PRs' },
   'hot-file-churn': { id: 'L-HOT-LANE', actor: 'machine', owner: 'authors · land graph', mechanism: 'merge-main request to every open PR in the hot lane now · land order = churn victims first (land-graph landOrder)' },
-  'land-slots': { id: 'L-SLOTS', actor: 'op', owner: 'OP', mechanism: 'land.graph.slots 1 → 2 (the overlap guard still serializes same-file PRs)' },
+  'land-slots': { id: 'L-SLOTS', actor: 'op', owner: 'OP', mechanism: 'consider increasing land.graph.slots (the overlap guard still serializes same-file PRs)' },
   'pregate-blind': { id: 'L-TSC-BLIND', actor: 'machine', owner: 'author · RES', mechanism: 'card: re-run pregate on another host — a tsc exit outside 0/1/2 or an empty tsc output is a failure, never «clean»' },
   'pregate-wait': { id: 'L-PREGATE-ROUTE', actor: 'machine', owner: 'authors · RES', mechanism: 'card each waiting author the least-used local host: pregate.py <PR> --light --host <h>' },
   'hands-frozen': { id: 'L-UNFREEZE', actor: 'op', owner: 'OP · coordinator', mechanism: 'answer the ✋ / turn a blanket ban into named cells + expiry' },
@@ -190,10 +195,12 @@ export function decideThroughput(s: ThroughputSnapshot): ThroughputVerdict {
   const repeat = [...perPr].filter(([, n]) => n >= CHURN_PR_REPEAT).map(([pr]) => pr);
   if (churn.length >= CHURN_TOTAL_MIN && (hot.length > 0 || repeat.length > 0))
     add('hot-file-churn', `${churn.length} churn refusals in 2 h · ${hot.length ? `hot ${hot.slice(0, 3).map(h => `${h.file.split('/').pop()}×${h.prs.length}`).join(' · ')}` : 'no shared file'}${repeat.length ? ` · refused ≥${CHURN_PR_REPEAT}×: ${ids(repeat)}` : ''}`);
-  const ceiling = land?.slots && land.avgTickMin ? Math.round((land.slots * 60) / Math.max(1, land.avgTickMin) * 10) / 10 : null;
+  const rawCeiling = land && land.slots !== null && Number.isFinite(land.slots) && land.slots > 0 && land.avgTickMin !== null && Number.isFinite(land.avgTickMin) && land.avgTickMin > 0
+    ? land.slots * 60 / land.avgTickMin : null;
+  const ceiling = rawCeiling === null ? null : Math.round(rawCeiling * 10) / 10;
   if (land && land.slots !== null && land.readyToLand !== null && s.landsLastHour !== null && s.landsLastHour < T.landsPerH
-      && (land.readyToLand >= land.slots * 2 || (ceiling !== null && ceiling < T.landsPerH && land.readyToLand > land.slots)))
-    add('land-slots', `slots ${land.slots} · ${land.readyToLand} ready waiting · a tick every ${land.avgTickMin ?? '?'} min → ceiling ${ceiling ?? '?'}/h < ${T.landsPerH}`);
+      && rawCeiling !== null && rawCeiling < T.landsPerH && land.readyToLand > land.slots)
+    add('land-slots', `slots ${land.slots} · ${land.readyToLand} ready waiting · a tick every ${land.avgTickMin} min → ceiling ${rawCeiling}/h < ${T.landsPerH}`);
   const blind = (s.receipts ?? []).filter(r => r.tscExit === null || !TSC_OWN_EXITS.includes(r.tscExit));
   if (s.receipts === null) unmeasured.push('receipts');
   if (blind.length) add('pregate-blind', `${blind.length} receipts with a tsc exit outside 0/1/2 (OOM/kill = no verdict): ${blind.slice(0, 4).map(r => `#${r.pr}@${r.host} exit ${r.tscExit ?? 'none'}`).join(' · ')}`);
@@ -223,13 +230,13 @@ export function decideThroughput(s: ThroughputSnapshot): ThroughputVerdict {
     : order.map(k => active.find(a => a.kind === k)).find((a): a is Constraint => !!a)
       ?? { kind: 'on-target' as const, signal: `below target (lands ${s.landsLastHour ?? '?'} · greens ${s.greensLastHour ?? '?'}) but no constraint signal fired — measure by hand (FEATURE-SHIP-ACCELERATION §1d)` };
 
-  const safety: LeverAction[] = blind.slice(0, MAX_CARDS).map(r => {
+  const safety: LeverAction[] = blind.map(r => {
     const other = s.pregateHosts.find(h => h !== r.host) ?? r.host;
     return { key: `tsc-rerun:${r.pr}:${r.head.slice(0, 12)}`, do: 'tsc-rerun', to: [...new Set([r.author ?? 'OP', 'RES'])],
       body: `[처리량 · tsc-blind] #${r.pr} @${r.head.slice(0, 12)} receipt on ${r.host}: tsc exit ${r.tscExit ?? 'none'} — no type verdict (OOM/kill). Re-run: pregate.py ${r.pr} --light --host ${other} (tsc heap 14GB). An empty tsc output or an exit outside 0/1/2 is a failure, never «clean».` };
   });
   const lever = leverFor(binding, s, { hot, waiting, judgeReady, nowMs, ceiling });
-  return { at: s.now, measured: { lands: s.landsLastHour, greens: s.greensLastHour, targets: T, ceilingLandsPerH: ceiling, pipeline }, chain, active, binding, lever, safety, hotFiles: hot, unmeasured: [...new Set(unmeasured)] };
+  return { at: s.now, measured: { lands: s.landsLastHour, greens: s.greensLastHour, targets: T, ceilingLandsPerH: ceiling, pipeline, ...(s.staleExcluded ? { staleExcluded: s.staleExcluded.length } : {}) }, chain, active, binding, lever, safety, throughputCards: s.throughputCards, hotFiles: hot, unmeasured: [...new Set(unmeasured)] };
 }
 
 function leverFor(b: Constraint, s: ThroughputSnapshot, x: { hot: { file: string; prs: number[] }[]; waiting: readonly { pr: number; sinceMin: number }[]; judgeReady: readonly { cell: string; prs: readonly number[] }[]; nowMs: number; ceiling: number | null }): Lever {
@@ -251,15 +258,17 @@ function leverFor(b: Constraint, s: ThroughputSnapshot, x: { hot: { file: string
         doneWhen: 'the tick lands ≥ 1 PR, or its refusal classes name who fixes what', actions: [] };
     case 'hot-file-churn': {
       const lane = new Set(x.hot.map(h => h.file));
-      const targets = (s.openPrs ?? []).filter(p => !p.draft && p.files.some(f => lane.has(f))).slice(0, MAX_CARDS);
+      const targets = (s.openPrs ?? []).filter(p => !p.draft && p.files.some(f => lane.has(f)));
       return { ...base, what: `hot lane(s) ${x.hot.slice(0, 3).map(h => h.file).join(' · ') || '(repeat refusals)'}: every open PR in the lane merges origin/main now, then light pregate; one writer lane per hot file`,
         commands: ['git fetch origin && git merge origin/main   # in the PR worktree, then:', 'pregate.py <PR> --light --host minim5', '(new PRs on a hot file: wait for the lane — one open writer per hot file)'],
         doneWhen: 'no PR refused twice for churn in the next hour', actions: targets.map(p => ({ key: `merge-main:${p.pr}:${p.head.slice(0, 12)}`, do: 'merge-main-request' as const, to: [p.author || 'OP'],
           body: `[처리량 · 핫 파일 레인] #${p.pr} @${p.head.slice(0, 12)} shares ${p.files.filter(f => lane.has(f)).slice(0, 3).join(', ')} with PRs that keep bouncing (merge conflict / stale base). Merge origin/main into it NOW, then pregate.py ${p.pr} --light — the land graph lands churn victims first. Do not open another PR on these files until this one lands.` })) };
     }
-    case 'land-slots':
-      return { ...base, what: `raise land.graph.slots ${s.land?.slots ?? '?'} → 2 (ceiling ${x.ceiling ?? '?'}/h < ${s.targets.landsPerH}); same-file PRs still land one per tick`, commands: ['eln config set land.graph.slots 2', 'eln land graph tick --json'],
-        doneWhen: `≥ 2 lands in one tick, lands/h ≥ ${s.targets.landsPerH}`, actions: [] };
+    case 'land-slots': {
+      const nextSlots = Math.floor(s.land!.slots!) + 1;
+      return { ...base, what: `consider raising land.graph.slots ${s.land!.slots} → ${nextSlots} (estimated ceiling ${x.ceiling ?? '?'}/h; target ${s.targets.landsPerH}/h); same-file PRs still land one per tick`, commands: [`eln config set land.graph.slots ${nextSlots}`],
+        doneWhen: `lands/h ≥ ${s.targets.landsPerH}`, actions: [] };
+    }
     case 'pregate-blind':
       return { ...base, what: 're-run the tsc-blind receipts on another host (safety cards sent)', commands: ['pregate.py <PR> --light --host <other host>'], doneWhen: 'every receipt of the hour has a tsc exit in 0/1/2', actions: [] };
     case 'pregate-wait': {
@@ -267,7 +276,7 @@ function leverFor(b: Constraint, s: ThroughputSnapshot, x: { hot: { file: string
       const heads = new Map((s.openPrs ?? []).map(p => [p.pr, p] as const));
       return { ...base, what: `route waiting pregates to ${host} (least used in 30 min)`, commands: [`pregate.py <PR> --light --host ${host}`],
         doneWhen: `median wait for a same-head receipt < ${PREGATE_WAIT_MIN} min`,
-        actions: x.waiting.slice(0, MAX_CARDS).flatMap(w => { const p = heads.get(w.pr); return p ? [{ key: `pregate-route:${p.pr}:${p.head.slice(0, 12)}`, do: 'pregate-route' as const, to: [p.author || 'OP'],
+        actions: x.waiting.flatMap(w => { const p = heads.get(w.pr); return p ? [{ key: `pregate-route:${p.pr}:${p.head.slice(0, 12)}`, do: 'pregate-route' as const, to: [p.author || 'OP'],
           body: `[처리량 · pregate] #${p.pr} @${p.head.slice(0, 12)} has waited ${Math.round(w.sinceMin)} min for a same-head receipt — run: pregate.py ${p.pr} --light --host ${host} (least-used local host now).` }] : []; }) };
     }
     case 'hands-frozen':
@@ -299,6 +308,8 @@ export interface ThroughputDid { readonly key: string; readonly status: 'did' | 
 export async function executeThroughput(v: ThroughputVerdict, act: ThroughputActuators | null, stage: string): Promise<ThroughputDid[]> {
   const out: ThroughputDid[] = [];
   const all = [...v.safety, ...(v.lever.actor === 'machine' ? v.lever.actions : [])];
+  const cap = Number.isSafeInteger(v.throughputCards) && v.throughputCards! >= 0 ? v.throughputCards! : 0;
+  let remaining = cap;
   const sent = act?.sentKeys() ?? new Set<string>();
   const stale = act?.staleKeys?.() ?? new Set<string>();
   for (const a of all) {
@@ -308,6 +319,8 @@ export async function executeThroughput(v: ThroughputVerdict, act: ThroughputAct
       out.push({ key: a.key, status: 'skip', evidence: 'no effect after 6 h' });
       continue;
     }
+    if (a.to.length > remaining) { out.push({ key: a.key, status: 'skip', evidence: v.throughputCards == null ? 'steward throughputCards unmeasured' : 'steward throughputCards exhausted' }); continue; }
+    remaining -= a.to.length;
     if (stage !== 'live' || !act) { out.push({ key: a.key, status: 'would', evidence: `${a.do} → ${a.to.join(',')}` }); continue; }
     try {
       const mails: string[] = [];
@@ -328,7 +341,7 @@ export function boardLine(v: ThroughputVerdict): string {
 /** The «처리량 제어» block (pulse table · `eln pulse next` · `eln pulse throughput`). */
 export function renderThroughputBlock(v: ThroughputVerdict, did: readonly ThroughputDid[] = []): string {
   const lines = ['## 처리량 제어 (throughput controller)', boardLine(v),
-    `측정: 착지 ${v.measured.lands ?? '?'}/h · 초록 ${v.measured.greens ?? '?'}/h · 착지 천장 ${v.measured.ceilingLandsPerH ?? '?'}/h · 파이프라인 ${v.measured.pipeline ?? '?'} PR · 따라간 사슬 ${v.chain}`,
+    `측정: 착지 ${v.measured.lands ?? '?'}/h · 초록 ${v.measured.greens ?? '?'}/h · 착지 천장 ${v.measured.ceilingLandsPerH ?? '?'}/h · 파이프라인 ${v.measured.pipeline ?? '?'} PR${v.measured.staleExcluded ? ` (신선 PR 만 · 좀비 ${v.measured.staleExcluded} 제외)` : ''} · 따라간 사슬 ${v.chain}`,
     `묶는 병목: ${v.binding.kind} — ${v.binding.signal}`];
   const others = v.active.filter(a => a.kind !== v.binding.kind);
   if (others.length) lines.push(`함께 켜진 신호: ${others.map(a => a.kind).join(' · ')}`);

@@ -1,0 +1,45 @@
+graph_id: decision-bus
+version: 1
+loop:
+  title: 결정 버스 — CEO 결정(원장 ⊕ 문서 변경 이력) → HQ 맥락 버스 포인터 ⊕ 미읽음 카드
+  root: 조율자
+  managed_by: trigger-registry
+  description: >-
+    DECISION-TO-BUS-AUTO (0.3.40 P0 · CEO 11-28 20:4x «구조화»). A CEO decision's effect lives in its canon — the decisions
+    ledger or a docs/conductor change-log table on main — and the HQ bus carries one POINTER per decision (id · one-line
+    summary · CEO words · canonical path · AGENT-PLUGIN-GRAPH-WORKFLOW §1a #7), so every coordinator's turn digest (eln OP
+    included) reads it without a hand relay. Every 10 min, LLM 0 (src/kit/decision-bus): decided ledger cards in the
+    lookback window ⊕ change-log rows main's first-parent commits added → pointers (keyed decision:<id> · doc:<path>#<row
+    hash> — a rerun adds nothing) · pointers still past OP's ack cursor after unread_h → ONE OP card. The ledger's decide
+    path posts its pointer at once; this sweep is the backstop. Done-when = decision-bus/last-sync.json rewritten.
+  owner: OP
+  trigger:
+    cron: '4,14,24,34,44,54 * * * *'
+  goal:
+    kind: file-mtime
+    path: '{stateRoot}/decision-bus/last-sync.json'
+  failure:
+    goal_deadline_min: 8
+    max_attempts: 2
+    backoff_sec: [60]
+entry_node: sync
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: sync
+    kind: agent
+    recipe: 'cmd:trigger-decision-bus-sync'
+    max_visits: 1
+    input:
+      # Policy — the only numbers (src/kit/decision-bus decisionBusPolicyOf refuses a missing one).
+      space: HQ            # every conversational coordinator's turn digest carries HQ (src/op-context-bus/spaces.ts)
+      reader: OP           # whose ack cursor counts as «read»
+      lookback_h: 24       # ledger decisions / main commits older than this are not swept (the first run never floods)
+      unread_h: 24         # a pointer past OP's cursor this long → one OP card
+      max_per_tick: 40     # posts per sweep (both sources) — the rest waits for the next tick
+      ref: origin/main
+      docs: docs/conductor
+      repo: '{seatState}/../repo.git'   # the HQ mirror (an installed eln has no checkout of its own)
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: sync, on: outcome, map: { ok: done, fail: failed, error: failed } }

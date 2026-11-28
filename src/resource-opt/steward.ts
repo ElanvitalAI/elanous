@@ -26,7 +26,9 @@ export const STEWARD_CELL_WIDE_CODES: readonly string[] = ['live-writer', 'unkno
 /** SEAT-ASSIGN-GUARD (11-27): SeatAssign's own guards. Off-target = the cell is not in the target release (cell-wide);
  *  rate-folded = that row was oscillation or an over-cap repeat (the cell became a pull hint). Neither is an exception for
  *  OP. ASSIGN-CAP-POLICY (11-27 10:4x): a fold no longer ends the run — distinct cells to fresh idle hands still pass. */
-export const STEWARD_SILENT_CODES: readonly string[] = ['off-target', 'rate-folded'];
+// SEAT-AREA-GUARD (11-28): off-area = the seat is outside the pool or the cell outside its areas (seat-roles.yaml) — the
+// pair is excluded and the cell falls through to the next hand; never an exception for OP.
+export const STEWARD_SILENT_CODES: readonly string[] = ['off-target', 'rate-folded', 'off-area'];
 /** SeatAssign answered «not installed» — the steward cannot act; the caller falls back to the full table. */
 export const STEWARD_UNAVAILABLE = 'unavailable';
 /** A refusal is retried (and may be raised again) after this long — the writer may have landed. */

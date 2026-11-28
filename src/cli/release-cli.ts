@@ -73,6 +73,7 @@ import { checklistCodenames, checklistVersion, isReleaseVersion, readChecklistCo
 import { syncLinearProgress } from '../decisions/linear-progress-sync.js';
 import { registerReleaseRunStatusCommand } from './release-run-status-cli.js';
 import { registerReleaseGraphCommands } from './release-graph-cli.js';
+import { registerReleaseCurrentCommands } from './release-current-cli.js';
 import { registerReleaseCritpathCommand } from './release-critpath-cli.js';
 
 export const GATE_SHARD_JSON_PAGE_MAX_BYTES = 60_000;
@@ -695,6 +696,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
   registerReleaseRunStatusCommand(release);
   registerReleaseCritpathCommand(release);
   registerReleaseGraphCommands(release);
+  registerReleaseCurrentCommands(release);
   release.command('gate-shards').description('실행 중에도 읽는 게이트 조각 원장(시도·귀속·증거)')
     .requiredOption('--version <v>', '조회할 판').option('--all', '과거 전이와 재시도까지 조회').option('--json', '결과 JSON')
     .option('--offset <N>', 'JSON 결과에서 건너뛸 조각 수', '0').option('--limit <N>', 'JSON 한 페이지의 조각 수', '20')

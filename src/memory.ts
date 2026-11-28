@@ -41,6 +41,7 @@ import {
   type MemoryGateOutcome, type MemoryGateRow, type MemoryTriageRecord, type MemoryWriteGateMode, type MemoryWriteMeta,
 } from './memory-triage/write-gate.js';
 import { recordMemoryUsage } from './memory-triage/usage-ledger.js';
+import { traceMemoryWrite } from './seat-memory/memory-trace.js';
 
 /**
  * 임시 파일 → fsync → rename → 폴더 fsync. rename 만으로는 «원자적»이지만 «내구적»이 아니다.
@@ -260,14 +261,20 @@ export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot(), ga
       dailyLedger: fileDailyLedger(root),
     });
   } catch (error) {
-    if (error instanceof MemoryWriteRefusedError) throw error;
+    if (error instanceof MemoryWriteRefusedError) {
+      traceMemoryWrite({ store: 'global', action: 'refused', seat: gate.seat ?? null, name: opts.name, origin: gate.origin ?? 'unlabelled', reason: error.code });
+      throw error;
+    }
     // 문 자체의 결함은 옛 쓰기를 막지 않는다(그림자 원칙) — 대신 사건을 남긴다.
     emitMemoryTriage('refused', { store: 'global', origin: gate.origin ?? 'unlabelled', cause: 'gate-error', would: 'refuse' });
     outcome = { action: 'create', enforced: false };
   }
   if (outcome.action === 'increment') {
     const target = byId.get(outcome.target.id);
-    if (target) return bumpMemoryTriage(target, outcome.triage, root);
+    if (target) {
+      traceMemoryWrite({ store: 'global', action: 'deduped', seat: gate.seat ?? null, name: target.name, id: target.id, origin: gate.origin ?? 'unlabelled' });
+      return bumpMemoryTriage(target, outcome.triage, root);
+    }
   }
   ensureRoot(root);
   const now = new Date().toISOString();
@@ -313,7 +320,12 @@ export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot(), ga
     ?? (existingTriage ? { ...existingTriage, hash: memoryTextHash(opts.body) } : undefined);
   if (triage) frontmatter.triage = renderTriageRecord(triage);
   const raw = renderFrontmatter(frontmatter, opts.body);
+  const existedBefore = existsSync(path) || sameIdFile !== null;
   writeFileDurable(path, raw);
+  traceMemoryWrite({
+    store: 'global', action: outcome.action === 'supersede' ? 'superseded' : existedBefore ? 'updated' : 'created',
+    seat: gate.seat ?? null, name: opts.name, id, origin: gate.origin ?? 'unlabelled', bytes: opts.body.length,
+  });
   if (outcome.action === 'supersede') {
     const old = byId.get(outcome.target.id);
     // Jev 만의 근거(match jev)면 옛 줄은 손대지 않는다 — 오판 하나로 고정·색인이 사라지지 않게(새 줄의 supersedes 링크만).
@@ -451,6 +463,7 @@ export function deleteMemory(id: string, root: string = memoryRoot()): boolean {
     if (name.startsWith(id) && name.endsWith('.md')) {
       unlinkSync(join(root, name));
       rebuildIndex(root);
+      traceMemoryWrite({ store: 'global', action: 'deleted', id: name.slice(0, 36) });
       return true;
     }
   }
@@ -729,6 +742,14 @@ export interface MemoryJudgeOpts extends InjectOpts {
   recentTools?: string[];
   /** 기본 judge 모델 override(config `llm.memoryJudge.model`). 미지정 = env / luna(경량). */
   model?: string;
+  /** JEV-MEMORY-RECALL 이음매(시험·시뮬) — 모드 덮어쓰기 · 키트 deps · 원장 파일 · audience · 그림자 줄 받기. 미지정 = jev-sites.yaml `memory-recall`. */
+  recallJev?: {
+    mode?: import('./memory-triage/recall-jev.js').MemoryRecallMode;
+    deps?: import('./kit/jev-decide/index.js').JevDecideDeps;
+    ledgerFile?: string;
+    audience?: import('./kit/jev-decide/index.js').JevAudience;
+    onShadow?: (row: import('./memory-triage/recall-jev.js').RecallShadowRow) => void;
+  };
 }
 
 /** 후보 매니페스트 — 판정용 한 줄 요약(id8·type·name·description). 본문은 안 보낸다(토큰절약). */
@@ -849,11 +870,45 @@ export async function buildMemoryInjectionLLM(
       .filter((m) => !m.pinned && m.contextCard?.status !== 'retired' && !injected.includes(m.id))
       .slice(0, opts.maxCandidates ?? 60);
     if (candidates.length > 0) {
-      try {
-        judged = await selectJudgedMemories(userText, candidates, opts);
-      } catch {
-        judged = searchMemories(userText, { limit: maxSelect }, root)
-          .map((h) => h.entry).filter((e) => !injected.includes(e.id));
+      const keywordFallback = (): MemoryEntry[] => searchMemories(userText, { limit: maxSelect }, root)
+        .map((h) => h.entry).filter((e) => !injected.includes(e.id));
+      // JEV-MEMORY-RECALL — jev-sites.yaml `memory-recall.params.mode`: luna · shadow(기본 — luna 가 정하고 Jev 는 옆에서 기록만) · jev.
+      let rj: typeof import('./memory-triage/recall-jev.js') | null = null;
+      try { rj = await import('./memory-triage/recall-jev.js'); } catch { rj = null; }
+      let mode: import('./memory-triage/recall-jev.js').MemoryRecallMode = 'luna';
+      try { mode = opts.recallJev?.mode ?? rj?.memoryRecallMode() ?? 'luna'; } catch { mode = 'luna'; }
+      const jevInput = rj && mode !== 'luna' ? {
+        message: userText,
+        candidates: candidates.map((c) => ({ id: c.id, type: c.type, name: c.name, description: c.description })),
+        ...(opts.recentTools ? { recentTools: opts.recentTools } : {}),
+        audience: opts.recallJev?.audience ?? rj.memoryRecallAudience(),
+        maxSelect,
+      } : null;
+      if (rj && jevInput && mode === 'jev') {
+        // Jev 가 정한다 · luna 는 부르지 않는다 · Jev 실패 = 키워드 폴백.
+        const j = await rj.judgeRecallWithJev(jevInput, opts.recallJev?.deps);
+        judged = j.ok ? j.ids.map((id) => candidates.find((c) => c.id === id)).filter((e): e is MemoryEntry => e !== undefined) : keywordFallback();
+      } else {
+        // 그림자: Jev 를 luna 와 «동시에» 띄우고 턴은 luna 만 기다린다(지연 0 · 행동 변화 0). 비교 줄은 Jev 가 끝난 뒤 남긴다.
+        const jevPending = rj && jevInput && mode === 'shadow' ? rj.judgeRecallWithJev(jevInput, opts.recallJev?.deps) : null;
+        const lunaStart = Date.now();
+        let lunaIds: string[] | null = null;
+        try {
+          judged = await selectJudgedMemories(userText, candidates, opts);
+          lunaIds = judged.map((e) => e.id);
+        } catch {
+          judged = keywordFallback();
+        }
+        const lunaMs = Date.now() - lunaStart;
+        if (rj && jevPending && jevInput) {
+          const shadow = rj;
+          void jevPending.then((jev) => {
+            if (!jev.ok && jev.reason === 'no-live-in-test') return; // 시험에서 실제 Jev 없이 원장을 쓰지 않는다
+            const row = shadow.recallShadowRow({ at: new Date(), audience: jevInput.audience, candidates: candidates.length, luna: lunaIds, lunaMs, jev });
+            try { opts.recallJev?.onShadow?.(row); } catch { /* observation only */ }
+            shadow.appendRecallShadow(row, opts.recallJev?.ledgerFile);
+          }).catch(() => { /* the shadow never touches a turn */ });
+        }
       }
     }
   }

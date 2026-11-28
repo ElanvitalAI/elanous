@@ -91,7 +91,18 @@ export function priorityRank(priority: string | undefined, p: Wip1Policy): numbe
   return at >= 0 ? at : p.priorityOrder.indexOf(p.unrankedAs);
 }
 
-export type HeldCell = Pick<ChecklistItem, 'id' | 'status' | 'owner' | 'priority' | 'updatedAt'>;
+export type HeldCell = Pick<ChecklistItem, 'id' | 'status' | 'owner' | 'priority' | 'updatedAt'> & Partial<Pick<ChecklistItem, 'writer'>>;
+
+/** WORK-PULL-REACHES-ROSTER — who holds a cell: its writer (a hand claimed a coordinator-held cell · the coordinator stays
+ *  owner) while the claim or the cell moved within the guard's active window, else its owner. A writer cell counts for
+ *  that hand's WIP 1 and is never preempted (the veto path would move the coordinator's ownership) — refused instead. */
+const writerSeat = (c: HeldCell, nowMs: number, windowMs: number): string | undefined => {
+  const seat = c.writer?.seat?.trim().toUpperCase();
+  if (!seat) return undefined;
+  const last = Math.max(Date.parse(c.writer!.at), Date.parse(c.updatedAt));
+  return Number.isFinite(last) && nowMs - last <= windowMs ? seat : undefined;
+};
+const holderOf = (c: HeldCell, nowMs: number, windowMs: number): string => writerSeat(c, nowMs, windowMs) ?? ownerSeat(c.owner);
 
 export type Wip1Decision =
   | { readonly kind: 'clear'; readonly stale: readonly HeldCell[] }
@@ -115,7 +126,7 @@ export function freeHands(pool: readonly HandPoolEntry[], held: readonly HeldCel
     if (e.state !== 'idle') return false;
     if (e.pane && policy.activePanes.includes(e.pane.toUpperCase())) return false;
     const id = e.seat.trim().toUpperCase();
-    return !held.some(c => c.status === 'yellow' && ownerSeat(c.owner) === id && Number.isFinite(Date.parse(c.updatedAt)) && nowMs - Date.parse(c.updatedAt) <= policy.activeWindowMs);
+    return !held.some(c => c.status === 'yellow' && holderOf(c, nowMs, policy.activeWindowMs) === id && Number.isFinite(Date.parse(c.updatedAt)) && nowMs - Date.parse(c.updatedAt) <= policy.activeWindowMs);
   });
 }
 
@@ -127,9 +138,11 @@ export function wip1Decide(input: { readonly seat: string; readonly cell: Pick<C
   /** WIP1-ASSIGN-GUARD-ACTIVE: absent = only the ledger and the pane count. A throw = «unknown» = actively worked (kept). */
   readonly activity?: CellActivity }): Wip1Decision {
   const seat = input.seat.trim().toUpperCase();
-  const mine = input.held.filter(c => c.id !== input.cell.id && c.status === 'yellow' && ownerSeat(c.owner) === seat);
+  const mine = input.held.filter(c => c.id !== input.cell.id && c.status === 'yellow' && holderOf(c, input.nowMs, input.policy.activeWindowMs) === seat);
+  const writes = (c: HeldCell): boolean => writerSeat(c, input.nowMs, input.policy.activeWindowMs) === seat;
   const entry = input.pool.find(e => e.seat.toUpperCase() === seat);
   const isActive = (c: HeldCell): boolean => {
+    if (writes(c)) return true;
     const age = input.nowMs - Date.parse(c.updatedAt);
     return (Number.isFinite(age) && age <= input.policy.activeWindowMs) || (entry?.state === 'working' && entry.cell === c.id);
   };
@@ -150,6 +163,7 @@ export function wip1Decide(input: { readonly seat: string; readonly cell: Pick<C
   // WIP1-ASSIGN-GUARD-ACTIVE: a strictly higher cell displaces a lower one only when nobody is working on it right now.
   const since = input.nowMs - input.policy.activeRecentMs;
   const workedBy = (c: HeldCell): string | null => {
+    if (writes(c)) return 'writer claim';
     if (entry?.cell === c.id && entry.pane && input.policy.activePanes.includes(entry.pane.toUpperCase())) return `pane ${entry.pane.toUpperCase()}`;
     const ledger = Date.parse(c.updatedAt);
     if (Number.isFinite(ledger) && ledger >= since) return `ledger ${Math.max(0, Math.round((input.nowMs - ledger) / 60_000))}m ago`;

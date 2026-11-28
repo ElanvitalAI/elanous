@@ -26,7 +26,7 @@ export interface Proposal {
   readonly effect: string; readonly costUsd: number | null; readonly options: readonly { key: string; label: string; consequence: string }[]; readonly recommend: string;
 }
 
-/** Saturated = load per core at or above this (= guardian HEADROOM_RATIO). */
+/** Saturated = load per core at or above this (= guardian policy host_load_per_cpu_max · graphs/loop-agents/guardian/agent.yaml). */
 export const SATURATED_RATIO = 1.0;
 /** «Queue full» = ready cells ⊕ land queue at least this. */
 export const QUEUE_FULL = 6;

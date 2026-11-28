@@ -128,10 +128,13 @@ test('Jev classifier: max-probability word → root · below threshold / unclear
   await cheapHandClassifier('token=sk-abcdefghijkl leaked', { decide: async (req) => { seen.push(req); return { model: 'm', answers: {} }; } });
   expect(JSON.stringify(seen)).not.toContain('sk-abcdefghijkl'); // the line is redacted before it leaves the process
   expect(await resolveHandRoot({ reason: 'DEPENDENCY_WAIT', detail: 'disk full on node-b' }, async () => 'env')).toEqual({ root: 'env', by: 'classifier' });
-  // HUMAN_DECISION is a refinable default (hand-routes.yaml refineReasons); TOOL_DENIED is decisive
+  // HUMAN_DECISION is a refinable default (hand-routes.yaml refineReasons); PROVIDER_ERROR is decisive · TOOL_DENIED is no
+  // code any more (HAND-ROUTE-GUARDIAN-MISROUTE · #204425 «panel access denied» is a coordinator's question) → the classifier
   expect(await resolveHandRoot({ reason: 'HUMAN_DECISION', detail: 'plan-limit' }, async () => 'env')).toEqual({ root: 'env', by: 'classifier' });
   expect(await resolveHandRoot({ reason: 'HUMAN_DECISION', detail: 'which layout' }, async () => null)).toEqual({ root: 'design-decision', by: 'reason' });
-  expect(await resolveHandRoot({ reason: 'TOOL_DENIED', detail: 'x' }, async () => 'jud-verdict')).toEqual({ root: 'env', by: 'reason' });
+  expect(await resolveHandRoot({ reason: 'PROVIDER_ERROR', detail: 'x' }, async () => 'jud-verdict')).toEqual({ root: 'env', by: 'reason' });
+  expect(await resolveHandRoot({ reason: 'TOOL_DENIED', detail: 'panel access denied' }, async () => 'design-decision')).toEqual({ root: 'design-decision', by: 'classifier' });
+  expect(await resolveHandRoot({ reason: 'TOOL_DENIED', detail: 'x' }, async () => null)).toEqual({ root: 'ambiguous', by: 'none' });
   expect(classifyHandBlock({ reason: 'APPROVAL_PENDING', detail: 'x' })).toEqual({ root: 'env', by: 'reason' });
 });
 
@@ -150,7 +153,8 @@ test('hand-block route: only OP/TC are relieved; design and unclear keep the old
   expect(await routeHandMail(hand, null)).toMatchObject({ to: 'TC', rerouted: false });
   expect(await routeHandMail({ ...hand, replyTo: 9 }, async () => 'env')).toBeNull();
   expect(await routeHandMail({ ...hand, refs: ['seat:TC-H-1'] }, async () => 'env')).toBeNull();
-  expect(await routeHandMail({ ...hand, refs: ['block:b1', 'reason:TOOL_DENIED'] }, null)).toMatchObject({ to: 'GUARDIAN', root: 'env', rerouted: true });
+  expect(await routeHandMail({ ...hand, refs: ['block:b1', 'reason:PROVIDER_ERROR'] }, null)).toMatchObject({ to: 'GUARDIAN', root: 'env', rerouted: true });
+  expect(await routeHandMail({ ...hand, refs: ['block:b1', 'reason:TOOL_DENIED'] }, null)).toMatchObject({ to: 'TC', root: 'ambiguous', rerouted: false });
   expect(await routeHandMail({ ...hand, refs: ['block:b1', 'reason:DEPENDENCY_WAIT', 'hand-ask:env:*'] }, async () => 'env')).toBeNull(); // already routed
 });
 
@@ -206,7 +210,7 @@ test('HOLD → JUDGE-BUTLER · cell scope → the cell owner (asking seat owns i
 test('classifier words come from the table: the Jev choice criteria are the YAML words ⊕ unclear', () => {
   const q = handJevQuestion();
   expect(q.type).toBe('choice');
-  expect(Object.keys((q as { criteria: Record<string, string> }).criteria)).toEqual(['wip', 'jud', 'hold', 'guardian', 'autocontinue', 'approval', 'cell', 'decision', 'unclear']);
+  expect(Object.keys((q as { criteria: Record<string, string> }).criteria)).toEqual(['wip', 'jud', 'hold', 'guardian', 'autocontinue', 'approval', 'runstate', 'policy', 'cell', 'decision', 'unclear']);
   expect((q as { criteria: Record<string, string> }).criteria.hold).toContain('a HOLD / freeze');
   expect(readHandRoutes([BUILTIN_HAND_ROUTES_FILE]).classifierMinProbability).toBe(0.5);
 });

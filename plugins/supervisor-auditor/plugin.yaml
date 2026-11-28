@@ -1,0 +1,9 @@
+# Loop agent supervisor-auditor as a plugin (LOOP-AGENTS-AS-PLUGINS P3 · SUPERVISOR-AUDITOR-LOOP). The ONE definition is the agent.yaml
+# this points at — the plugin id · name · version · description are compiled from its manifest (src/plugins/core/plugin-yaml.ts
+# readLoopAgentRef) and are never repeated here. Its body is the shared executor kind fleet-audit.observe (no agent code in this
+# package). Install (eln plugin add plugins/supervisor-auditor --yes) bundles the package and its tick shim and registers the
+# trigger; remove retires it. plugin.json is GENERATED (bun scripts/plugins/generate-plugin-json.ts --plugin-dir plugins/supervisor-auditor).
+apiVersion: elanous.dev/plugin/v2
+loopAgent: ../../graphs/loop-agents/supervisor-auditor/agent.yaml
+trust: builtin
+capabilities: [proc:elanous]

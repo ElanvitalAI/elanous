@@ -1,0 +1,35 @@
+graph_id: steward-mail
+version: 1
+loop:
+  title: Mail steward (steward:mail) — shadow
+  root: 조율자
+  managed_by: trigger-registry
+  description: >-
+    STEWARD-MAIL (FEDERATION-STEWARDS §5b). Mail is data: each mail to a coordinator gets one verdict from
+    src/kit/mail-route/steward-mail.yaml — wake-now (✋ · CEO · P0 · decision) · digest (10-min batch) · record-only
+    (acks · self-mail · ledger echoes · repeats). Structured fields first; Jev only for mail whose fields cannot say
+    «act now», promote only. SHADOW: routes nothing. Every 10 min it records «would have woken / would not» next to the
+    TUI router's route and the coordinator's reply (steward/mail-shadow-<day>.jsonl) and rewrites the last-hour report
+    (shadow agreement % · would-be wakes/h). Live routing is a later change after 1 h ≥ 90% agreement on ≥ 30 samples.
+    Done-when = steward/mail-shadow.json rewritten.
+  owner: OP
+  trigger:
+    cron: '*/10 * * * *'
+  goal:
+    kind: file-mtime
+    path: '{stateRoot}/steward/mail-shadow.json'
+  failure:
+    goal_deadline_min: 8
+    max_attempts: 2
+    backoff_sec: [120]
+entry_node: shadow
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: shadow
+    kind: agent
+    recipe: 'cmd:trigger-steward-mail-shadow'
+    max_visits: 1
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: shadow, on: outcome, map: { ok: done, fail: failed, error: failed } }

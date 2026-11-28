@@ -40,18 +40,54 @@ export function accountEntries(snap: UsageSnapshot | null, nowMs: number): World
   });
 }
 
-export interface FuelVerdict { readonly low: string[]; readonly exhausted: string[]; readonly floorGone: boolean; readonly stale: boolean; readonly value: string; readonly ok: boolean | null }
-/** Pure: the 연료관 KPI from the account rows. */
+/** GUARDIAN-SUBS (11-28 07:5x «연료관 KPI miss 30× · 행동 없음»): the llm-accounts decision per usage account — an exhausted
+ *  account it already took off the subscription route (level L3 · skip) is NORMALIZED (phase-set did it), not a miss. */
+export interface FuelRoutes {
+  readonly accounts: Readonly<Record<string, { readonly pack: string; readonly routed: boolean; readonly routable: boolean; readonly level: string }>>;
+  /** pack provider → its effective SUBSCRIPTION route order (llm-decide `route` minus accounts on the credits path only) */
+  readonly providers: Readonly<Record<string, readonly string[]>>;
+}
+/** Pure: stamp each account row with its route facts (`routed` · `routable` · `level` · `pack` · `handled`) — untouched when
+ *  unknown. `handled` = the decision already reacted to the account's level (L1 demote · L2 demote ⊕ tier down · L3 skip):
+ *  the guardian's 95 % «exhausted» (resource facts accountCap) sits below the pack cap (100 %), so a 96 % account is
+ *  legitimately still routed — demoted and stepped a tier down (sim GRD-FUEL-7DAY found this, 11-28). */
+export function annotateRoutes(rows: readonly WorldEntry[], routes: FuelRoutes | null): WorldEntry[] {
+  if (!routes) return [...rows];
+  return rows.map(e => { const r = routes.accounts[e.id]; return r ? { ...e, facts: { ...e.facts, routed: r.routed, routable: r.routable, level: r.level, pack: r.pack, handled: !r.routed || r.level !== 'L0' } } : e; });
+}
+
+export interface FuelVerdict {
+  readonly low: string[]; readonly exhausted: string[];
+  /** exhausted AND still on the subscription route (or route unknown) — the real miss (cells still sent to a dry account) */
+  readonly stuck: string[];
+  /** exhausted and already taken off the subscription route by the decision (normalized) */
+  readonly skipped: string[];
+  /** exhausted, still routed but demoted / a tier down by its level (normalized — the pack cap is above the guardian's) */
+  readonly demoted: string[];
+  /** pack providers with accounts but none routable (no subscription · no credits) — cells fall to the fallback chain */
+  readonly dry: string[];
+  readonly floorGone: boolean; readonly stale: boolean; readonly value: string;
+}
+/** Pure: the 연료관 summary of the account rows (the KPI's ok is the agent.yaml line — CODE-BODY-TO-KIND). */
 export function judgeFuel(rows: readonly WorldEntry[]): FuelVerdict {
   const acc = rows.filter(e => e.kind === 'account');
-  if (!acc.length) return { low: [], exhausted: [], floorGone: false, stale: false, value: '계정 잔량 스냅숏 없음 (eln usage status-cache)', ok: null };
-  const low = acc.filter(e => e.status === 'low').map(e => e.id);
+  if (!acc.length) return { low: [], exhausted: [], stuck: [], skipped: [], demoted: [], dry: [], floorGone: false, stale: false, value: '계정 잔량 스냅숏 없음 (eln usage status-cache)' };
   const exhausted = acc.filter(e => e.status === 'exhausted').map(e => e.id);
+  const skipped = acc.filter(e => e.status === 'exhausted' && e.facts.routed === false).map(e => e.id);
+  const demoted = acc.filter(e => e.status === 'exhausted' && e.facts.routed === true && e.facts.handled === true).map(e => e.id);
+  const stuck = exhausted.filter(id => !skipped.includes(id) && !demoted.includes(id));
+  // a low account the decision already reacted to needs no warning either
+  const low = acc.filter(e => e.status === 'low' && e.facts.handled !== true).map(e => e.id);
+  const byPack = new Map<string, WorldEntry[]>();
+  for (const e of acc) if (typeof e.facts.pack === 'string') byPack.set(e.facts.pack, [...(byPack.get(e.facts.pack) ?? []), e]);
+  const dry = [...byPack].filter(([, es]) => es.every(e => e.facts.routable === false)).map(([p]) => p).sort();
   const floor = acc.filter(e => FLOOR_PROVIDERS.includes(String(e.facts.provider)));
   const floorGone = floor.length > 0 && floor.every(e => e.status === 'exhausted');
   const stale = acc.some(e => e.facts.stale === true);
   const pct = (e: WorldEntry) => (typeof e.facts.used === 'number' ? `${Math.round((e.facts.used as number) * 100)}%` : '?');
-  return { low, exhausted, floorGone, stale,
-    value: `${acc.map(e => `${e.id} ${pct(e)}`).join(' · ')}${stale ? ' (stale)' : ''}${floorGone ? ' · ⚠ floor gone' : ''}`,
-    ok: !floorGone && exhausted.length === 0 };
+  const routed = acc.some(e => typeof e.facts.routed === 'boolean');
+  const tag = (e: WorldEntry) => (e.status === 'ok' || e.status === 'unknown' ? '' : e.facts.routed === false ? ' 건너뜀' : e.facts.handled === true ? ' 강등' : '');
+  return { low, exhausted, stuck, skipped, demoted, dry, floorGone, stale,
+    value: `${acc.map(e => `${e.id} ${pct(e)}${tag(e)}`).join(' · ')}${stale ? ' (stale)' : ''}${floorGone ? ' · ⚠ floor gone' : ''}`
+      + `${routed ? ` · 소진·경로 잔존 ${stuck.length}${stuck.length ? `(${stuck.join(',')})` : ''} · 건너뜀 ${skipped.length} · 강등 ${demoted.length}` : ''}${dry.length ? ` · 경로 가능 계정 0: ${dry.join(',')}` : ''}` };
 }

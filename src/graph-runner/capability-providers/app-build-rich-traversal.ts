@@ -8,6 +8,7 @@ import { APP_BUILD_MAX_REPAIRS } from '../app-build/contracts.js';
 import { runFirecrawl } from '../../agent/firecrawl-plugin.js';
 import { createAsideCapabilityProvider } from './aside.js';
 import { createSourceBuildWithApprovalRegistry } from './app-build-publish-approval.js';
+import { createBookforgeAppDocsRegistry } from './bookforge-app-docs.js';
 import { MAX_DIAGNOSTIC_BYTES } from './source-build.js';
 import { registerGraphCapabilityContract, registerGraphCapabilityProviderDeclaration,
   type GraphCapabilityRegistry, type GraphContractId } from '../capabilities.js';
@@ -274,10 +275,23 @@ export function bindRichPlanningContext(registry: GraphCapabilityRegistry): Grap
   }) };
 }
 
+const BOOKFORGE_APP_DOCS = 'bookforge.app-docs-pdf@1' as const;
+
+/** The app-build graph node architecture-pdf requires this contract from the production registry. */
+function withBookforgeAppDocs(registry: GraphCapabilityRegistry): GraphCapabilityRegistry {
+  const pluginRoot = join(import.meta.dir, '../../../plugins/bookforge');
+  const bookforge = createBookforgeAppDocsRegistry(pluginRoot);
+  const provider = bookforge.providers.find(item => item.provides.includes(BOOKFORGE_APP_DOCS));
+  if (!provider) throw new Error('bookforge app-docs provider missing');
+  return registerGraphCapabilityProviderDeclaration(
+    registerGraphCapabilityContract(registry, bookforge.contracts[BOOKFORGE_APP_DOCS]!),
+    provider);
+}
+
 /** Keep the ordinary app-build owner approval provider and its node-scoped window. */
 export function createRichSourceBuildWithApprovalRegistry(): GraphCapabilityRegistry {
-  return bindRichPlanningContext(registerAppBuildRichTraversal(
-    preserveBuildFailureReasons(createSourceBuildWithApprovalRegistry())));
+  return withBookforgeAppDocs(bindRichPlanningContext(registerAppBuildRichTraversal(
+    preserveBuildFailureReasons(createSourceBuildWithApprovalRegistry()))));
 }
 
 export { CONTRACTS as APP_BUILD_RICH_CONTRACTS };

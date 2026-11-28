@@ -53,17 +53,17 @@ const seedsOf = (ctx: SimWorldScenarioContext): number[] => [ctx.seed, ctx.seed 
 
 // ── watchers-check world ─────────────────────────────────────────────────────────────────────────────────────────────
 function watchersWorld(opts: { stubborn?: boolean }) {
-  let clock = T0;
   const beat = (name: string, at: number, everyMin: number): Beat => ({ name, at: new Date(at).toISOString(), saw: 1, everyMin });
   const beats: Beat[] = [beat('loop:sup-b', T0 - 90 * MIN, 10), beat('trigger-tick', T0 - MIN, 2), beat('res-patrol', T0 - MIN, 5), beat('release-graph-tick', T0 - MIN, 2)];
   const alive = new Set(['trigger-tick', 'res-patrol', 'release-graph-tick']);
-  const fired: string[] = [];
   const deps: WatchersCheckDeps = {
-    beats: () => beats.slice(), sourceHead: () => null, cardIds: () => ['sup-a', 'sup-b'], triggerIds: () => new Set(),
-    fire: argv => { fired.push(argv.join(' ')); if (!opts.stubborn && argv[1] === 'agent') { const n = `loop:${argv[2]}`; alive.add(n); beats.push(beat(n, clock, 10)); } return { ok: true, line: 'fired' }; },
+    beats: () => beats.slice(), sourceHead: () => null, cardIds: () => ['sup-a', 'sup-b'], triggerIds: () => new Set(['sup-a-agent', 'sup-b-agent']),
   };
-  const advance = (t: number) => { clock = t; for (const n of alive) beats.push(beat(n, t, n.startsWith('loop:') ? 10 : 2)); };
-  return { deps, fired, advance };
+  // LOOP-AGENTS-AS-PLUGINS P1: the trigger registry (not watchers-check) refires a registered agent every window
+  const refired: string[] = [];
+  const registryRefires = (t: number) => { if (opts.stubborn) return; for (const n of ['loop:sup-a', 'loop:sup-b']) if (!alive.has(n)) { alive.add(n); refired.push(n); beats.push(beat(n, t, 10)); } };
+  const advance = (t: number) => { for (const n of alive) beats.push(beat(n, t, n.startsWith('loop:') ? 10 : 2)); };
+  return { deps, refired, registryRefires, advance };
 }
 
 // ── silence-watch world ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -93,18 +93,20 @@ async function ticks(body: AgentBody, id: string, p: Ports, n: number, stepMin: 
 export const simWorldScenarios: readonly SimWorldScenario[] = [
   {
     id: 'SUP-WATCHERS-CHECK',
-    title: 'watchers-check: a v2 card with no heartbeat and a DEAD supervisor are each restarted once; one that never comes back cards OP once',
+    title: 'watchers-check (KPI roll-up · LOOP-AGENTS-AS-PLUGINS P1): a v2 card with no heartbeat and a DEAD supervisor are counted and named «레지스트리가 다시 쏘고 주인 카드» — it wakes nobody; once the registry refires them KPI 0; one that never comes back cards OP once',
     async run(ctx) {
       for (const seed of seedsOf(ctx)) {
         const root = join(ctx.universeRoot, `s${seed}`, 'live');
         const w = watchersWorld({});
         const p = fakePorts(root, 'watchers-check', 'OP');
         const body = createWatchers({ stateRoot: root, card: loadCard('watchers-check') }, w.deps);
-        const [r1, r2] = await ticks(body, 'watchers-check', p, 2, 5, t => { if (t > T0) w.advance(t); });
-        ctx.recorder.event('sup:watchers-check', { seed, acted: r1!.acted, kpi: [r1!.kpi, r2!.kpi], fired: w.fired, posts: p.posts.map(x => x.key) });
-        const bad = checkInPolicy(`seed ${seed}`, r1!, p, { acted: ['restart:loop:sup-a', 'restart:loop:sup-b'], kpiText: 'missing_heartbeats 2', l0: 'OP' });
+        const [r1, r2] = await ticks(body, 'watchers-check', p, 2, 5, t => { if (t > T0) { w.registryRefires(t); w.advance(t); } });
+        const tickCases = p.memory.cases(500).filter(c => c.kind === 'tick').length;
+        ctx.recorder.event('sup:watchers-check', { seed, acted: r1!.acted, kpi: [r1!.kpi, r2!.kpi], refired: w.refired, posts: p.posts.map(x => x.key), ticks: tickCases });
+        const bad = checkInPolicy(`seed ${seed}`, r1!, p, { acted: [], kpiText: 'missing_heartbeats 2', l0: 'OP' });
         if (bad) return fail('in-policy', bad);
-        if (w.fired.join(' | ') !== 'loop agent sup-a tick | loop agent sup-b tick') return fail('wrong-fire', `seed ${seed}: fired ${w.fired.join(' | ')}`);
+        if (r1!.acted.length !== 0) return fail('woke-a-peer', `seed ${seed}: acted ${r1!.acted.join(',')} — the registry owns the wake`);
+        if (w.refired.join(' | ') !== 'loop:sup-a | loop:sup-b') return fail('registry-refire', `seed ${seed}: ${w.refired.join(' | ')}`);
         if (r2!.kpi !== 0) return fail('kpi-stuck', `seed ${seed}: second tick KPI ${r2!.kpi} ≠ 0`);
         const rootF = join(ctx.universeRoot, `s${seed}`, 'fault');
         const wf = watchersWorld({ stubborn: true });

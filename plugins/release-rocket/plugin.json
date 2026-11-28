@@ -1,0 +1,27 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "release-rocket",
+  "name": "release-rocket",
+  "version": "1.0.0",
+  "description": "예행·컷·발행 이정표가 모두 시각(유예 15분) 안에 시작/완료된다",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "release-rocket",
+          "agent": "../../graphs/loop-agents/release-rocket/agent.yaml",
+          "trigger": "../../graphs/triggers/release-rocket-agent.yaml",
+          "kpis": [
+            "late_milestones"
+          ]
+        }
+      ]
+    }
+  }
+}

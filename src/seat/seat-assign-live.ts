@@ -5,9 +5,9 @@ import { spawnSync } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { readRawConfig, readReleaseGraphVersion, resolveCurrentVersion } from '../ops-dashboard/current-version.js';
+import { readBoardPointer, readRawConfig, resolveCurrentVersion } from '../ops-dashboard/current-version.js';
 import { debug } from '../debug/log.js';
-import { assignItem, checklistDevVersion, listChecklist, swapOwnerIf } from '../release-loop/checklist.js';
+import { assignItem, listChecklist, swapOwnerIf } from '../release-loop/checklist.js';
 import { declaredFederationSeats } from '../msg/seat-mail-trust.js';
 import { loadFederationLadder } from '../msg/hand-raise-ladder.js';
 import { openMsgStore } from '../msg/msg-store.js';
@@ -20,6 +20,7 @@ import { lastTurnAt } from '../msg/diverted-mail.js';
 import { pathTouches, SEAT_ASSIGN_MAIL_KIND, type AssignRatePolicy, type SeatAssignDeps, type WriterRow } from './seat-assign.js';
 import { seatVeto, type SeatVetoDeps } from './seat-veto.js';
 import { loadSeatAssignPolicy } from './seat-assign-wip1.js';
+import { boardVersion } from '../release-loop/board-version.js';
 
 const WRITER_TIMEOUT_MS = 20_000;
 
@@ -38,7 +39,7 @@ export function priorAttempts(cellId: string, nowMs = Date.now()): number {
  *  package dev version: after a roster move (0.3.36 → 0.3.37) before the bump PR lands, the package still says 0.3.36. */
 function currentChecklistVersion(version?: string): string {
   if (version) return version;
-  try { return resolveCurrentVersion({ hqRoot: join(homedir(), 'elanous-hq') }).version; } catch { return checklistDevVersion(); }
+  try { return resolveCurrentVersion({ hqRoot: join(homedir(), 'elanous-hq') }).version; } catch { return boardVersion(); }
 }
 
 function liveFindCell(cellId: string, version?: string) {
@@ -173,7 +174,7 @@ export function liveSeatAssignDeps(): SeatAssignDeps {
     // ASSIGN-CAP-POLICY — `seat.assign.{rateMax,rateWindowMs,handRateMax}` straight from config.json on every call.
     ratePolicy: () => readAssignRatePolicy(readRawConfig()),
     // GRAPH-VERSION-FRESH: from config.json on every call — the typed/scoped getUserConfig() has no `release` section.
-    targetVersion: () => readReleaseGraphVersion(),
+    targetVersion: () => readBoardPointer(),
     hint: (cellId, seat, by) => {
       const { addPullHints } = require('../steward/space/work-next-cli.js') as typeof import('../steward/space/work-next-cli.js');
       const { effectiveInstanceRoot } = require('../instance/resolve.js') as typeof import('../instance/resolve.js');
@@ -184,6 +185,7 @@ export function liveSeatAssignDeps(): SeatAssignDeps {
       const m = require('./model-by-difficulty.js') as typeof import('./model-by-difficulty.js');
       const { effectiveInstanceRoot } = require('../instance/resolve.js') as typeof import('../instance/resolve.js');
       const d = m.directiveFor({ seat, cell: item.id, facts: { cellId: item.id, paths, priorAttempts: priorAttempts(item.id) }, usedShare: m.liveUsedShare, by: 'seat-assign', now: new Date() });
+      if (!d) { m.noModelFallback({ root: effectiveInstanceRoot(), seat, cell: item.id, note: 'no acceptable model under the budget', by: 'seat-assign', now: new Date() }); return { line: 'model: no acceptable model under the budget — your tab returns to its default model (no paid bypass)', tier: m.cellDifficulty({ cellId: item.id, paths }).tier }; }
       m.writeSeatModelDirective(effectiveInstanceRoot(), d);
       debug.log('seat', 'seat.model-directive', { seat: d.seat, cell: d.cell, tier: d.tier, model: `${d.provider}/${d.model}`, score: d.score, reasons: d.reasons, ...(d.note ? { note: d.note } : {}), via: 'assign' });
       return { line: m.directiveLine(d), tier: d.tier };
@@ -193,10 +195,18 @@ export function liveSeatAssignDeps(): SeatAssignDeps {
     heldCells: () => listChecklist(currentChecklistVersion()).items,
     wip1Policy: () => loadSeatAssignPolicy().wip1,
     cellActivity: (seat, cellId, sinceMs) => liveCellActivity(seat, cellId, sinceMs),
+    // ELN-OP-CROWN-MEMORY — active CEO directive cards (kit/crown-directive · policy graphs/policies/crown-directives.yaml).
+    directiveRefusal: (q) => {
+      const { liveDirectiveRefusal } = require('../kit/crown-directive/index.js') as typeof import('../kit/crown-directive/index.js');
+      const { elanousStateRoot } = require('../autopilot/state-paths.js') as typeof import('../autopilot/state-paths.js');
+      return liveDirectiveRefusal(q, { stateRoot: elanousStateRoot(), seatState: resolveSeatStateRoot() });
+    },
     returnToBoard: (cellId, reason) => {
       const r = seatVeto({ cellId, actor: loadFederationLadder().hq || 'OP', reason }, liveSeatVetoDeps());
       return { ok: r.ok, line: r.ok ? r.lines.join(' · ') : r.reason };
     },
+    // SEAT-AREA-GUARD — graphs/policies/seat-roles.yaml through the one reader (kit/seat-area).
+    seatFit: (seat, item) => (require('../kit/seat-area/index.js') as typeof import('../kit/seat-area/index.js')).liveSeatFit()(seat, item),
     // RAIL30 ⑤ — the seat's last turn stamp (eln TUI seats) lets the ledger stop a 3rd wake nobody answered; no stamp = unknown.
     claimWake: (seat, cellId, by) => {
       let last: number | null = null;

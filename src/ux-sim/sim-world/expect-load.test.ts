@@ -19,7 +19,7 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 
 test('#126458 실제 worlds 조각 발견 · 전 접두사 커버(행 수 고정 없음 — 11-27 충돌 원천 제거)(els-remote·member-journey·machine-infra·fed-org·supervisors·llm-route 포함)', () => {
   const table = readSimWorldExpectTable(join(realWorlds, 'sim-world-expect.json'));
-  for (const prefix of ['alloc-budget', 'capsule-events', 'els', 'els-remote', 'fed-org', 'graph', 'llm-route', 'machine-infra', 'member-journey', 'memory', 'op-channel', 'router-cost', 'seat-mail-roundtrip', 'smart-merge', 'supervisors', 'toolbatch', 'worker']) {
+  for (const prefix of ['alloc-budget', 'capsule-events', 'els', 'els-remote', 'fed-org', 'graph', 'guardian', 'llm-route', 'machine-infra', 'member-journey', 'memory', 'op-channel', 'router-cost', 'seat-mail-roundtrip', 'smart-merge', 'supervisors', 'toolbatch', 'worker']) {
     expect(Object.keys(table.entries).some((key) => key.startsWith(`${prefix}/`))).toBe(true);
   }
 });

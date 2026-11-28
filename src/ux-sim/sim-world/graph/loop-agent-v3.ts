@@ -1,9 +1,9 @@
 // SIM-WORLD graph · LOOP-AGENT-V3-YAML (대표 11-27 11:2x «루프 에이전트 v3 는 그래프러너 v2 처럼 yaml 로 정의 · 시뮬레이터에서 점검»
 // · 11:3x «yaml 이면 다른 사람에게 이전 쉽다 · 마켓에서 플러그인으로 유통»).
 // The device is the REAL code path: src/loop-agent/v3/agent-yaml.ts (lint · compile) → src/land-steward/memory.ts loadCards →
-// src/land-steward/agent.ts stewardTick over the real land graph (tickLand). Only the outside is faked (gh · receipts · land
+// the shared kinds land-graph.tick ⊕ kpi-voice (src/loop-agent/v3/land-graph-kind.ts · CODE-BODY-TO-KIND) over the real land graph (tickLand). Only the outside is faked (gh · receipts · land
 // command · mail store · clock). Every universe lives under ctx.universeRoot; the repo's agent dir is only ever copied.
-//   LA3-EQUIV     agent.yaml ≡ goal.yaml (v2) on the same synthetic events — decisions · lands · channel lines · mail · cases · ledger (seeds 1–5)
+//   LA3-EQUIV     agent.yaml with its v3 hooks ≡ the same package without them (the v2 voice) on the same synthetic events — decisions · lands · channel lines · mail · cases · ledger (seeds 1–5)
 //   LA3-POLICY    a threshold changed in YAML only changes the breach lines as expected (no code change)
 //   LA3-REFUSE    bad yaml · unknown node kind · missing policy ref · missing kit · hook node not optional → lint fails loudly,
 //                 the steward refuses the definition (plain body · level off) and cards its L0 once per error set
@@ -12,13 +12,15 @@
 import { cpSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { appendLedger, readLedger, type Focused, type LandDeps, type PrInfo, type Receipt } from '../../../land-graph/land-graph.js';
-import { stewardTick, type StewardPorts, type StewardReport } from '../../../land-steward/agent.js';
-import { cardsDir, fileMemory, goalFromGoalYaml, loadCards, type StewardCards } from '../../../land-steward/memory.js';
+import { landGraphAgentTick, type LandTickPorts as StewardPorts, type LandTickReport as StewardReport } from '../../../loop-agent/v3/land-graph-kind.js';
+import { cardsDir, fileMemory, loadCards, STEWARD_ID, STEWARD_SEAT, STEWARD_SUPERVISOR, type StewardCards } from '../../../land-steward/memory.js';
 import { lintAgentYaml } from '../../../loop-agent/v3/agent-yaml.js';
 import type { SimWorldScenario, SimWorldScenarioOutcome } from '../types.js';
 
 export const NOW = Date.parse('2026-11-27T03:00:00Z');
 export const MIN = 60_000;
+/** The land steward = one agent.yaml instance of the land-graph.tick kind. */
+export const stewardTick = (d: LandDeps, p: StewardPorts, c: StewardCards): Promise<StewardReport> => landGraphAgentTick(d, p, c, { id: STEWARD_ID, address: STEWARD_SEAT, l0Fallback: STEWARD_SUPERVISOR });
 const SEEDS = [1, 2, 3, 4, 5];
 const fail = (reason: string, diff: string): SimWorldScenarioOutcome => ({ ok: false, reason, diff });
 
@@ -80,11 +82,11 @@ async function runOnce(root: string, tag: string, w: World, cards: StewardCards,
   return { report, lines, posts, mails, cases, ledger };
 }
 
-/** A private copy of the repo's land-steward package (agent.yaml · soul.md · knowhow.md · goal.yaml) — the repo is never edited. */
+/** A private copy of the repo's land-steward package (agent.yaml · soul.md · knowhow.md) — the repo is never edited. */
 export function copyPkg(root: string, name: string, edit?: (yaml: string) => string): string {
   const dir = join(root, 'pkg', name, 'land-steward');
   mkdirSync(dir, { recursive: true });
-  for (const f of ['agent.yaml', 'soul.md', 'knowhow.md', 'goal.yaml']) cpSync(join(cardsDir(), f), join(dir, f));
+  for (const f of ['agent.yaml', 'soul.md', 'knowhow.md']) cpSync(join(cardsDir(), f), join(dir, f));
   if (edit) writeFileSync(join(dir, 'agent.yaml'), edit(readFileSync(join(dir, 'agent.yaml'), 'utf8')));
   return dir;
 }
@@ -92,20 +94,21 @@ export function orgFile(root: string): string {
   const p = join(root, 'org', 'federation.yaml'); mkdirSync(join(root, 'org'), { recursive: true });
   writeFileSync(p, 'org:\n  duties:\n    landing: TC\n    veto: JUD\n'); return p;
 }
-export const v2Cards = (dir: string): StewardCards => ({ ...loadCards(join(dir, 'no-such-dir')), goal: goalFromGoalYaml(readFileSync(join(dir, 'goal.yaml'), 'utf8')), source: 'goal.yaml' });
+/** The same package without its v3 hooks — the v2 voice (one default line per breach key per window). */
+export const v2Cards = (dir: string): StewardCards => { const { smart: _hooks, ...cards } = loadCards(dir); return cards; };
 const kpiLines = (r: Run) => r.lines.map(l => l.replace(/ · \d\d:\d\dZ · .*/u, '').split(' (')[0]!);
 
 export const simWorldScenarios: readonly SimWorldScenario[] = [
   {
     id: 'LA3-EQUIV',
-    title: 'land-steward from agent.yaml ≡ from goal.yaml (v2) on the same synthetic events — seeds 1–5',
+    title: 'land-steward from agent.yaml ≡ the same package without its v3 hooks (v2 voice) on the same synthetic events — seeds 1–5',
     async run(ctx) {
       const org = orgFile(ctx.universeRoot);
       const dir = copyPkg(ctx.universeRoot, 'equiv');
       const v3 = loadCards(dir, { triggersDir: join(cardsDir(), '..', '..', 'triggers') });
       if (v3.source !== 'agent.yaml') return fail('agent-yaml-not-loaded', `source ${v3.source} · ${(v3.refused ?? []).join(' · ')}`);
       const v2 = v2Cards(dir);
-      if (JSON.stringify(v3.goal) !== JSON.stringify(v2.goal)) return fail('goal-differs', `${JSON.stringify(v3.goal)} vs ${JSON.stringify(v2.goal)}`);
+      if (v2.smart || JSON.stringify(v3.compiled?.kpis) !== JSON.stringify(v2.compiled?.kpis)) return fail('goal-differs', `${JSON.stringify(v3.compiled?.kpis)} vs ${JSON.stringify(v2.compiled?.kpis)}`);
       const rows: unknown[] = [];
       for (const seed of SEEDS) {
         const a = await runOnce(ctx.universeRoot, `eq-${seed}-v2`, world(seed), v2, org);
@@ -150,7 +153,7 @@ export const simWorldScenarios: readonly SimWorldScenario[] = [
       const org = orgFile(ctx.universeRoot);
       const cases: Array<[string, (y: string) => string, RegExp]> = [
         ['bad-yaml', y => `${y}\n  : [unclosed`, /bad yaml/u],
-        ['unknown-node-kind', y => y.replace('kind: land-steward.tick', 'kind: land-steward.teleport').replace('node_kinds: [land-steward.tick, gate,', 'node_kinds: [land-steward.teleport, gate,'), /unknown node kind land-steward\.teleport/u],
+        ['unknown-node-kind', y => y.replace('kind: land-graph.tick', 'kind: land-graph.teleport').replace('node_kinds: [land-graph.tick, kpi-voice, gate,', 'node_kinds: [land-graph.teleport, kpi-voice, gate,'), /unknown node kind land-graph\.teleport/u],
         ['missing-policy-ref', y => y.replace('$policies.landable_ratio_min', '$policies.landable_ratio_floor'), /missing policy ref \$policies\.landable_ratio_floor/u],
         ['missing-kit', y => y.replace('kits: [kpi]', 'kits: [kpi, negotiation]'), /requires kit negotiation — not installed/u],
         ['hook-not-optional', y => y.replace('{ node_id: reflect, kind: reflect, optional: true }', '{ node_id: reflect, kind: reflect }'), /reflect is a v3 hook kind — mark it optional/u],

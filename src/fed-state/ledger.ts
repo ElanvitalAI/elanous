@@ -9,7 +9,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 
-export const FACT_TYPES = ['land', 'green', 'cell', 'hand', 'judge', 'slot', 'mail', 'turn', 'beat', 'phase', 'steward', 'work', 'hold', 'decision'] as const;
+export const FACT_TYPES = ['land', 'green', 'cell', 'hand', 'judge', 'slot', 'mail', 'turn', 'beat', 'phase', 'steward', 'work', 'hold', 'decision', 'board'] as const;
 export type FactType = typeof FACT_TYPES[number];
 
 export interface Fact {
@@ -19,7 +19,8 @@ export interface Fact {
   cell?: string;
   /** land: pr · cell: claim|block|release|green · hand: idle|busy · mail: post|ack · turn: mail|other ·
    *  steward: wake|reclaim · work: claimed|empty|block · slot: pregate|land · judge: enqueue|verdict · phase: burst|rhythm ·
-   *  cell: assign|veto|reassign (FED-FACT-OP-ACTIONS) · decision: resolve|reject|escalate|raise|propose|decide|record */
+   *  cell: assign|veto|reassign (FED-FACT-OP-ACTIONS) · decision: resolve|reject|escalate|raise|propose|decide|record ·
+   *  board: flip (CURRENT-RELEASE-ONE-SOURCE · from → to) */
   state?: string;
   from?: string;
   to?: string;

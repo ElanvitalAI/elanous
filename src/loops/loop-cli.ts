@@ -120,6 +120,7 @@ export function registerLoopCommands(program: Command, checkerDeps: RegistryAdap
       if (!result.ok) process.exitCode = 1;
     }));
   registerTriggerCommands(loop);
+  (require('../kit/supervisor-index/cli.js') as typeof import('../kit/supervisor-index/cli.js')).registerIndexCommand(loop);
   // 판정 집사 (JUD-BUTLER · 0.3.38) — first loop agent v2.
   (require('../judge-butler/butler-cli.js') as typeof import('../judge-butler/butler-cli.js')).registerButlerCommands(loop);
   // 수호자 (guardian · 0.3.38) — second loop agent v2.

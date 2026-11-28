@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
+import { GH_DOOR_ENV, governGhRun, governGhRunAsync, liveGhGovernorDeps, type GovernorDeps, type RawGhRun } from '../kit/gh-governor/index.js';
 import { writeCliStderr } from './cli-stderr.js';
 
 const LF = 0x0a;
@@ -59,8 +60,12 @@ function isReadOnlyGhCall(args: string[]): boolean {
   return args[0] === 'api' || (args[0] === 'pr' && args[1] === 'list');
 }
 
+/** Transient = worth an immediate retry. ⛔ A rate limit is NOT (GH-BUDGET-GOVERNOR 11-28): three instant retries per caller on a
+ *  secondary limit were the storm — the governor's global cooldown answers it instead (kit/gh-governor). */
 function isTransientGhError(output: Buffer): boolean {
-  return /\b(?:408|429|500|502|503|504)\b|timeout|temporar(?:y|ily)|connection reset|network.*(?:error|unreachable)|rate limit/i.test(output.toString('utf8'));
+  const text = output.toString('utf8');
+  if (/rate limit|abuse detection|too quickly|\b429\b/i.test(text)) return false;
+  return /\b(?:408|500|502|503|504)\b|timeout|temporar(?:y|ily)|connection reset|network.*(?:error|unreachable)/i.test(text);
 }
 
 function itemCount(stdout: Buffer): number | undefined {
@@ -122,9 +127,11 @@ export type GhCliResult = {
   maybeTruncated: boolean;
   itemCount?: number;
   limit?: number;
+  /** GH-BUDGET-GOVERNOR: the door refused without calling GitHub (global cooldown · seat budget). */
+  refused?: 'cooldown' | 'budget';
 };
 
-function ghResult(args: string[], stdout: Buffer, stderr: Buffer, status: number | null): GhCliResult {
+function ghResult(args: string[], stdout: Buffer, stderr: Buffer, status: number | null, refused?: 'cooldown' | 'budget'): GhCliResult {
   const exitCode = status ?? 1;
   const count = itemCount(stdout);
   const limit = limitValue(args);
@@ -136,28 +143,42 @@ function ghResult(args: string[], stdout: Buffer, stderr: Buffer, status: number
     maybeTruncated: exitCode === 0 && limit !== undefined && count !== undefined && count === limit,
     ...(count === undefined ? {} : { itemCount: count }),
     ...(limit === undefined ? {} : { limit }),
+    ...(refused ? { refused } : {}),
   };
 }
 
-/** One retry decision for both the blocking and the async gateway. */
-function shouldRetry(args: string[], attempt: number, stdout: Buffer, stderr: Buffer, status: number | null): boolean {
-  const exitCode = status ?? 1;
-  return !(exitCode === 0 || !isReadOnlyGhCall(args) || attempt === MAX_GH_RETRY_ATTEMPTS || !isTransientGhError(Buffer.concat([stderr, stdout])));
+/** One retry decision for both the blocking and the async gateway. A governor refusal is never retried. */
+function shouldRetry(args: string[], attempt: number, run: RawGhRun & { refused?: string }): boolean {
+  const exitCode = run.status ?? 1;
+  return !(run.refused || exitCode === 0 || !isReadOnlyGhCall(args) || attempt === MAX_GH_RETRY_ATTEMPTS || !isTransientGhError(Buffer.concat([run.stderr, run.stdout])));
 }
 
-/** Executes gh through the retry gateway and returns its raw stdout with outcome metadata. */
-export function runGhCliWithResult(args: string[]): GhCliResult {
-  let stdout: Buffer = Buffer.alloc(0);
-  let stderr: Buffer = Buffer.alloc(0);
-  let status: number | null = null;
+/** Where one gh child runs: cwd / env (GH_REPO) / timeout / binary (the land graph's LAND_GRAPH_GH test shim). */
+export interface GhRunOptions { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; bin?: string }
+
+/** The governor of this process (kit/gh-governor · graphs/policies/gh-governor.yaml) · null = policy unreadable → pass-through. */
+export function liveGhGovernor(): GovernorDeps | null {
+  return liveGhGovernorDeps();
+}
+
+/** GH-PROXY-LAYER: every gh child of this gateway carries the door marker, so a gh shim first on PATH (bin/gh-shim/gh) execs
+ *  the real gh at once instead of governing the same call a second time. */
+function doorEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+  return { ...(env ?? process.env), [GH_DOOR_ENV]: '1' };
+}
+
+/** Executes gh through the governed retry gateway and returns its raw stdout with outcome metadata. */
+export function runGhCliWithResult(args: string[], opts: GhRunOptions = {}): GhCliResult {
+  const governor = liveGhGovernor();
+  let last: RawGhRun & { refused?: 'cooldown' | 'budget' } = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), status: null };
   for (let attempt = 1; attempt <= MAX_GH_RETRY_ATTEMPTS; attempt++) {
-    const result = spawnSync('gh', args, { maxBuffer: Infinity });
-    stdout = asBuffer(result.stdout);
-    stderr = asBuffer(result.stderr);
-    status = result.status;
-    if (!shouldRetry(args, attempt, stdout, stderr, status)) break;
+    last = governGhRun(governor, args, () => {
+      const result = spawnSync(opts.bin ?? 'gh', args, { maxBuffer: Infinity, ...(opts.cwd ? { cwd: opts.cwd } : {}), env: doorEnv(opts.env), ...(opts.timeoutMs ? { timeout: opts.timeoutMs } : {}) });
+      return { stdout: asBuffer(result.stdout), stderr: Buffer.concat([asBuffer(result.stderr), result.error ? Buffer.from(String(result.error)) : Buffer.alloc(0)]), status: result.status };
+    });
+    if (!shouldRetry(args, attempt, last)) break;
   }
-  return ghResult(args, stdout, stderr, status);
+  return ghResult(args, last.stdout, last.stderr, last.status, last.refused);
 }
 
 function spawnGh(args: string[]): Promise<{ stdout: Buffer; stderr: Buffer; status: number | null }> {
@@ -165,7 +186,7 @@ function spawnGh(args: string[]): Promise<{ stdout: Buffer; stderr: Buffer; stat
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     let child: ReturnType<typeof spawn>;
-    try { child = spawn('gh', args, { stdio: ['ignore', 'pipe', 'pipe'] }); }
+    try { child = spawn('gh', args, { stdio: ['ignore', 'pipe', 'pipe'], env: doorEnv(undefined) }); }
     catch (e) { resolve({ stdout: Buffer.alloc(0), stderr: Buffer.from(String(e)), status: null }); return; }
     child.stdout?.on('data', (chunk: Buffer) => out.push(chunk));
     child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
@@ -176,12 +197,13 @@ function spawnGh(args: string[]): Promise<{ stdout: Buffer; stderr: Buffer; stat
 
 /** Same gateway without blocking the event loop — for daemon request handlers. */
 export async function runGhCliWithResultAsync(args: string[]): Promise<GhCliResult> {
-  let last: { stdout: Buffer; stderr: Buffer; status: number | null } = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), status: null };
+  const governor = liveGhGovernor();
+  let last: RawGhRun & { refused?: 'cooldown' | 'budget' } = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), status: null };
   for (let attempt = 1; attempt <= MAX_GH_RETRY_ATTEMPTS; attempt++) {
-    last = await spawnGh(args);
-    if (!shouldRetry(args, attempt, last.stdout, last.stderr, last.status)) break;
+    last = await governGhRunAsync(governor, args, () => spawnGh(args));
+    if (!shouldRetry(args, attempt, last)) break;
   }
-  return ghResult(args, last.stdout, last.stderr, last.status);
+  return ghResult(args, last.stdout, last.stderr, last.status, last.refused);
 }
 
 /** Executes gh while preserving its byte streams and appending a pipe-visible outcome.

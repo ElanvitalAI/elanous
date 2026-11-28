@@ -2,6 +2,7 @@
 // the `hand-ask:<root>:<cell>` dedupe identity. One checklist read per process per minute (the active board version).
 // Under bun test there is no live lookup (a test must never open the real ledger); every caller can inject its own.
 import { claimedCellOf } from '../../seat/hand-tab-title.js';
+import { readHandRoutes } from './hand-routes.js';
 
 export interface HandCellLookups {
   /** The yellow cell `seat` holds (null = none / unknown). */
@@ -37,4 +38,26 @@ export function liveHandCellLookups(): HandCellLookups | null {
     cached = { at: Date.now(), rows };
     return rows;
   });
+}
+
+let ladderCached: { at: number; parentOf: (seat: string) => string } | null = null;
+
+/**
+ * HAND-ROUTE-GUARDIAN-MISROUTE — the hand's own coordinator for hand-routes.yaml `defaultOwner: coordinator`: the live
+ * federation ladder (els journal ⊕ federation.yaml ⊕ org map), re-read at most every hand-routes.yaml `ladderCacheMinutes`. Null under bun test; an
+ * unreadable ladder answers null (the ✋ keeps its address).
+ */
+export function liveHandParentOf(): ((seat: string) => string | null) | null {
+  if (process.env.BUN_TEST !== undefined || process.env.NODE_ENV === 'test') return null;
+  return (seat) => {
+    try {
+      if (!ladderCached || Date.now() - ladderCached.at > readHandRoutes().ladderCacheMs) {
+        /* eslint-disable-next-line @typescript-eslint/no-require-imports */
+        const { loadFederationLadder } = require('../../msg/hand-raise-ladder.js') as typeof import('../../msg/hand-raise-ladder.js');
+        const ladder = loadFederationLadder();
+        ladderCached = { at: Date.now(), parentOf: (s) => ladder.parentOf(s) };
+      }
+      return ladderCached.parentOf(seat);
+    } catch { return null; }
+  };
 }

@@ -1,11 +1,17 @@
-# 착지 집사 (land-steward) — policy pack. Read by src/land-steward/policy.ts on every land-graph tick (missing file /
+# 착지 집사 (land-steward) — policy pack. Read by src/land-graph/lane-order.ts on every land-graph tick (missing file /
 # missing key = the built-in behaviour). Changed by PR (L0 TC · policy owner OP) — never written at run time.
 #
 # lane_order — the land order the land graph walks (기차 매니저 · train-manager sub-loop agent):
-#   mode: train      churn victims → crown/P0 → oldest → PR number (src/land-steward/train.ts trainOrder)
+#   mode: train      the `train:` keys below (CODE-BODY-TO-KIND — the order is this YAML, not code)
 #   mode: pr-number  churn victims → PR number (src/land-graph/land-graph.ts landOrder — the body's own default)
+#   train.keys       each in turn: churn (most same-file churn refusals first · T3) · priority (a title matching
+#                    train.priority first · T9) · age (oldest first) · number (lowest PR number first)
+#   train.priority   case-insensitive pattern of a priority PR title (the crown mark is written escaped)
 #   pins:            optional explicit order inside one hot-file lane: [{ file: <path>, prs: [n, …] }] — the listed PRs keep
 #                    the slots they hold in the base order but take them in the pinned sequence (others are untouched).
 lane_order:
   mode: train
+  train:
+    keys: [churn, priority, age, number]
+    priority: '\u{1F451}|\bP0\b|crown'
   pins: []

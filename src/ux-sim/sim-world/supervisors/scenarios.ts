@@ -1,6 +1,6 @@
 // SIM-WORLD supervisors — LOOP-AGENTS (대표 11-27 11:3x «시뮬월드에서 충분히 검증»): the new loop agents replayed on the
 // kernel contract. Each scenario drives the REAL code path that is on main — the real trigger registry ticking the
-// real graphs/triggers/judge-butler.yaml, the real butler tick.lock, the real MsgStore write door (SIGNAL-DIET digest)
+// real graphs/triggers/judge-butler.yaml (shim → agent.yaml wake), the real butler tick.lock, the real MsgStore write door (SIGNAL-DIET digest)
 // and the real `msg post` CLI (DORMANT-ADDRESS REROUTE). Only the outside (clock · graph runner · herdr census) is faked.
 // No real seat ledger, trigger registry or butler home is ever opened: everything lives under ctx.universeRoot.
 //
@@ -16,6 +16,7 @@ import type { ConditionProbes } from '../../../loops/trigger-conditions.js';
 import type { WakeDeps } from '../../../loops/msg-wake.js';
 import { MsgStore } from '../../../msg/msg-store.js';
 import type { SimWorldScenario, SimWorldScenarioContext, SimWorldScenarioOutcome } from '../types.js';
+import { simWorldScenarios as stewardCapsScenarios } from './steward-caps.js';
 
 const REPO = join(import.meta.dir, '..', '..', '..', '..');
 const T0 = Date.parse('2026-11-27T02:00:00Z');
@@ -91,7 +92,7 @@ const laB1: SimWorldScenario = {
 /** LA-B2 · a stalled butler (tick returns but last-tick.json never moves · a crashed tick's lock) is noticed. */
 const laB2: SimWorldScenario = {
   id: 'LA-B2',
-  title: 'a stalled judge-butler is noticed: missed heartbeat → retry → exception card to OP · stale tick.lock taken over · live lock refuses overlap',
+  title: 'a stalled judge-butler is noticed: missed heartbeat → retry → exception card to its L0 JUD (JUDGE-BUTLER-V3-LISTED · agent.yaml wake.owner) · stale tick.lock taken over · live lock refuses overlap',
   async run(ctx) {
     const w = butlerWorld(ctx, { writesHeartbeat: false });
     try {
@@ -115,7 +116,7 @@ const laB2: SimWorldScenario = {
       if (!first.held) first.release();
       const next = acquireTickLock(homeC, new Date(T0 + 10 * MIN), { pid: 303, isAlive: () => true });
       ctx.recorder.event('la-b2', { runs: w.runs, statuses, cardOwner: card?.owner ?? null, staleTaken: !afterAge.held, deadTaken: !afterDeath.held, overlapHeld: overlap.held });
-      const ok = card !== null && card.owner === 'OP' && card.body.includes('[graph-trigger exception] judge-butler') && card.body.includes('goal not met by deadline')
+      const ok = card !== null && card.owner === 'JUD' && card.body.includes('[graph-trigger exception] judge-butler') && card.body.includes('goal not met by deadline')
         && statuses.includes('exception') && afterAge.held === false && afterDeath.held === false
         && first.held === false && overlap.held === true && next.held === false;
       if (ok) return { ok: true };

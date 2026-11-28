@@ -10,7 +10,7 @@ export function registerPrLandOptions(command: Command): void {
     .option('--expected-head <sha>', '리뷰된 PR 머리 SHA 고정 (--pr 와 함께)')
     .option(
       '--heavy-remote',
-      '머리 고정 착지의 무거운 게이트를 node-b·node-c 중 빈 호스트에서 실행; head⊕main 증거가 없거나 실패하면 거부(로컬 폴백 없음)',
+      '머리 고정 착지의 무거운 게이트를 정책에 맞는 빈 원격 호스트에서 실행; head⊕main 증거가 없거나 실패하면 거부(로컬 폴백 없음)',
     )
     .option('--heavy-on-pod-shadow', '--heavy-remote 판정을 유지하고 같은 head/main의 Pod 타입·변경 시험 결과를 비교만 한다')
     .option('--dry-run', '변경 없이 landing 계획만 출력')

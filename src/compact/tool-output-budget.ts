@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 // ── Wave 2 · Layer 1 · tool-output budget (no LLM) ──────────────────
 //
 // Gemini `chatCompressionService.truncateHistoryToBudget` analogue.
@@ -66,8 +67,9 @@ export function applyToolOutputBudget(
         : '';
       const replacementPath = archiveReferencePath(sessionId, archiveDir);
       const prefix =
-        `[Full output (${block.content.length} chars) saved to: ${replacementPath}]\n` +
-        `[Up to last ${policy.toolOutputTailLines} lines preserved below]\n`;
+        `[Full output saved to: ${replacementPath}]\n` +
+        `[tool_use_id: ${JSON.stringify(block.tool_use_id)}] [sha256-utf16le: ${createHash('sha256').update(block.content, 'utf16le').digest('hex')}]\n` +
+        `[Tail]\n`;
       // Never cut the recovery pointer. A long final line may itself exceed
       // the budget; in that case retain the newest suffix that fits.
       const available = Math.floor(policy.toolOutputCharBudget) - prefix.length;

@@ -92,6 +92,7 @@ import { censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, sharedCensusDif
 import { guardHotspotStart, hotspotApprovalCommentId, type HotspotApproval, type HotspotApprovalSource } from './open-guard.js';
 import { recordHotspotStartForecast, type HotspotStartForecastRow } from './hotspot-start-forecast.js';
 import { registerRestackPlanCommand } from './pr-land-restack.js';
+import { remoteUrlVia } from '../git-fs/origin-url.js';
 
 export { branchLineageSlug, findSiblingPrs };
 
@@ -959,8 +960,9 @@ function resolveRemoteBranchRef(run: CmdRunner, cwd: string, base: string): Remo
 
 function remoteBaseTarget(run: CmdRunner, cwd: string, base: string): { remote: string; branch: string; url: string } | undefined {
   const ref = resolveRemoteBranchRef(run, cwd, base);
-  const remoteUrl = run('git', ['remote', 'get-url', ref.remote], { cwd });
-  return remoteUrl.ok ? { ...ref, url: remoteUrl.out.trim() } : undefined;
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf made get-url a local path («local-path»)
+  const url = remoteUrlVia((argv) => { const r = run('git', argv, { cwd }); return r.ok ? r.out : null; }, ref.remote);
+  return url ? { ...ref, url } : undefined;
 }
 
 function remoteCapability(run: CmdRunner, cwd: string, base: string, target = remoteBaseTarget(run, cwd, base)): PrRemoteCapability {

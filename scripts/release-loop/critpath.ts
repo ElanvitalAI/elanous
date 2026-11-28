@@ -7,24 +7,25 @@
 // Every step lands in an append-only ledger
 // (<instance>/release/<v>/critpath.json) so a rerun skips what is already done and the run is its own evidence.
 import { createHash } from 'node:crypto';
-import { verifyHumanApprovalProof, type DecisionTrustRoot, type HumanProof } from '../../src/decisions/decision-ledger.js';
+import { checkHumanApprovalProof, type DecisionTrustRoot, type HumanProof, type HumanProofFailure } from '../../src/decisions/decision-ledger.js';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { publicWaiverReason } from './known-issues-node.js';
 import { debug } from '../../src/debug/log.js';
+import type { PreAuthGateInput, PreAuthGateOutcome, PreAuthUse } from '../../src/kit/release-preauth/index.js';
 
 export type CritpathStep = 'prepare' | 'approval' | 'publish' | 'npm' | 'verify';
 export type CritpathOutcome = 'ok' | 'skipped' | 'dry-run' | 'waiting-approval' | 'staged' | 'fail';
 export interface CritpathLedgerEntry { step: CritpathStep; cmd: string; outcome: CritpathOutcome; at: string; sha?: string; detail?: string }
 /** A dry run that reached its end green for exactly this cut + notes (prepare · install e2e · publish preview · npm --dry-run). */
 export interface DryRunPass { cutSha: string; notesSha256: string; tgzSha1: string; at: string }
-export interface CritpathLedger { version: string; binding?: ApprovalBinding; waiveReason?: string; dryRunPass?: DryRunPass; entries: CritpathLedgerEntry[] }
+export interface CritpathLedger { version: string; binding?: ApprovalBinding; waiveReason?: string; dryRunPass?: DryRunPass; preAuthUse?: PreAuthUse; entries: CritpathLedgerEntry[] }
 
 /** What a human approves: exactly this version, cut commit and notes body. Anything else needs a new card. */
 export interface ApprovalBinding { version: string; cutSha: string; notesSha256: string }
-export type ApprovalState = { state: 'approved'; id: string } | { state: 'auto'; id: string } | { state: 'pending'; id: string } | { state: 'unverified'; id: string } | { state: 'declined'; id: string } | { state: 'none' };
+export type ApprovalState = { state: 'approved'; id: string; keyId?: string } | { state: 'auto'; id: string } | { state: 'pending'; id: string } | { state: 'unverified'; id: string; reason?: HumanProofFailure } | { state: 'declined'; id: string } | { state: 'none' };
 /** The slice of a decision-ledger entry the approval check reads (src/decisions/decision-ledger.ts DecisionEntry). */
-export interface ApprovalRecord { id: string; refs?: string[]; status: string; choice?: string; decidedBy?: { kind: string; agent?: string }; proof?: HumanProof }
+export interface ApprovalRecord { id: string; refs?: string[]; status: string; raisedAt?: string; choice?: string; decidedBy?: { kind: string; agent?: string; via?: string; platformUserId?: string }; proof?: HumanProof }
 
 export const APPROVE_OPTION = 'a';
 /** Distinct from failure (1): the run is healthy and waits for a human publish decision. 75 = EX_TEMPFAIL (sysexits.h). */
@@ -46,8 +47,11 @@ export function approvalState(records: readonly ApprovalRecord[], b: ApprovalBin
   if (entry.status === 'open') return { state: 'pending', id: entry.id };
   // The ledger is writable by the same account as a seat. A human marker stays a claim
   // until a trust-root signature over this exact binding proves it out of band.
-  if (entry.status === 'decided' && entry.choice === APPROVE_OPTION && entry.decidedBy?.kind === 'human')
-    return verifyHumanApprovalProof(ref, entry.proof, trustRoots) ? { state: 'approved', id: entry.id } : { state: 'unverified', id: entry.id };
+  // RELEASE-HUMAN-PROOF-TRUST-ROOT: the proof binds ref ⊕ card ⊕ choice ⊕ via ⊕ platform user (elanous-approval/v2).
+  if (entry.status === 'decided' && entry.choice === APPROVE_OPTION && entry.decidedBy?.kind === 'human') {
+    const check = checkHumanApprovalProof(entry, ref, trustRoots);
+    return check.ok ? { state: 'approved', id: entry.id, keyId: check.keyId } : { state: 'unverified', id: entry.id, reason: check.reason };
+  }
   // An AUTO record is not approval by itself: runCritpath re-checks the owner switch and every green condition on each run.
   if (entry.status === 'decided' && entry.choice === APPROVE_OPTION && entry.decidedBy?.kind === 'auto' && entry.decidedBy.agent === AUTO_PUBLISH_AGENT)
     return { state: 'auto', id: entry.id };
@@ -75,6 +79,8 @@ export interface CritpathDeps {
   requestApproval(b: ApprovalBinding, waiveReason?: string): { id: string };
   /** RELEASE-AUTO-PUBLISH — owner opt-in seam (`release.autoPublish: "on-green"`). Absent or mode 'off' = the card waits for a human. */
   autoPublish?: AutoPublishDeps;
+  /** RELEASE-PRESIGNED-AUTO — the CEO's pre-signed card for this version (kit/release-preauth preAuthGate). Absent = unchanged. */
+  preAuth?: PreAuthDeps;
   now?: () => Date;
   log?: (line: string) => void;
 }
@@ -89,6 +95,11 @@ export interface AutoPublishDeps {
   decide(cardId: string, reason: string): void;
   /** After-the-fact report to the owner (OP mail · CEO channel). Failure never blocks the release. */
   notify(body: string): void;
+}
+
+export interface PreAuthDeps {
+  /** Judge (record: false) or judge ⊕ record the single use ⊕ notify (record: true). Never throws by contract; a throw = no pre-auth. */
+  gate(input: PreAuthGateInput, opts: { record: boolean; by: string }): Promise<PreAuthGateOutcome>;
 }
 
 /** Why an automatic publish is not allowed now; empty = every green condition holds for this exact cut + notes. */
@@ -181,13 +192,20 @@ export async function runCritpath(o: CritpathOptions, deps: CritpathDeps): Promi
     log(`${outcome === 'fail' ? '✗' : outcome === 'waiting-approval' ? '⏸' : '✓'} ${step} · ${outcome}${detail ? ` · ${detail}` : ''}`);
   };
   const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/[\r\n]+/g, ' ').slice(0, 500);
+  const attempt = async <T>(f: () => T | Promise<T>): Promise<T | Error> => { try { return await f(); } catch (e) { return e instanceof Error ? e : new Error(String(e)); } };
+  // RELEASE-PRESIGNED-AUTO — the pre-auth gate input for this binding (branch head: --branch resolved it; --cut-commit asks release/<v>).
+  const preAuthRun = async (binding: ApprovalBinding, preparedCommit: string, notesPath: string, record: boolean): Promise<PreAuthGateOutcome | Error> => {
+    const branchHead = o.branch ? cut : await attempt(() => deps.resolveBranch(`release/${o.version}`).trim().toLowerCase());
+    return attempt(() => deps.preAuth!.gate({ binding, preparedCommit, branchHead, notesFile: notesPath, ...(ledger.dryRunPass ? { dryRunPass: ledger.dryRunPass } : {}),
+      ...(waiveReason ? { waiveReason } : {}) }, { record, by: 'critpath' }));
+  };
   // RELEASE-AUTO-PUBLISH — set once an AUTO decision approved this run: the owner then always hears the result (done or the stop step).
   let autoReport: string | undefined;
   const report = (r: CritpathResult): CritpathResult => {
     if (!autoReport || !deps.autoPublish) return r;
     const body = r.status === 'done'
       ? `auto-published v${o.version} · cut ${(ledger.binding?.cutSha ?? '').slice(0, 12)} · checks ${autoReport}`
-      : `auto-publish v${o.version} approved on green but stopped at ${r.step ?? '?'} · ${r.resume ?? ''} · checks ${autoReport}`;
+      : `auto-publish v${o.version} approved ${autoReport.startsWith('preauth ') ? 'by the CEO pre-signature' : 'on green'} but stopped at ${r.step ?? '?'} · ${r.resume ?? ''} · checks ${autoReport}`;
     try { deps.autoPublish.notify(body); }
     catch (e) { debug.log('release.auto-publish', 'notify-failed', { version: o.version, reason: message(e) }); log(`· release.auto-publish notify failed: ${message(e)}`); }
     return r;
@@ -276,7 +294,12 @@ export async function runCritpath(o: CritpathOptions, deps: CritpathDeps): Promi
     }
     const approval = approvalState(deps.approvalRecords(), binding, deps.trustRoots?.());
     const remaining = [rerun, verifyCmd, 'bun website/scripts/deploy-pages.ts --remote <host> --yes   # after the docs PR merges'];
-    log(`· approval ${approval.state} for v${o.version} cut ${binding.cutSha} notes sha256 ${binding.notesSha256}`);
+    log(`· approval ${approval.state}${approval.state === 'unverified' ? ` (reason=${approval.reason ?? 'no-proof'})` : approval.state === 'approved' && approval.keyId ? ` (proof ${approval.keyId})` : ''} for v${o.version} cut ${binding.cutSha} notes sha256 ${binding.notesSha256}`);
+    if (deps.preAuth) {
+      const pa = await preAuthRun(binding, prepared.sourceCommit, notes.path, false);
+      log(pa instanceof Error ? `· preauth unreadable: ${message(pa)}` : pa.ok ? `· preauth ${pa.use.preAuthId} (${pa.use.mode}) would authorize this cut · ${Object.values(pa.use.conditions).join(' · ')}`
+        : pa.reasons.length ? `· preauth none usable {${pa.reasons.join('; ')}}` : '· preauth none for this version');
+    }
     log(`dry run — nothing was published. Remaining:\n${remaining.map((c) => `   ${c}`).join('\n')}`);
     return { status: 'dry-run', exitCode: 0, approval, remaining, ledger: o.ledgerPath };
   }
@@ -286,11 +309,25 @@ export async function runCritpath(o: CritpathOptions, deps: CritpathDeps): Promi
     const approvalCmd = `approval record ${approvalRef(binding)}`;
     const approval = approvalState(deps.approvalRecords(), binding, deps.trustRoots?.());
     if (approval.state === 'declined') return fail('approval', approvalCmd, `publish card ${approval.id} was not approved — a changed cut or notes raises a new card`);
+    // RELEASE-PRESIGNED-AUTO (대표 11-28 14:4x) — a CEO pre-signed card for this version counts when every signed condition
+    // holds on this exact cut. Order: the exact human approval › the pre-signature › the on-green switch › the card.
+    let preAuthUsed: PreAuthUse | undefined;
+    let preAuthSkip: string | undefined;
+    if (approval.state !== 'approved' && deps.preAuth) {
+      const pa = await preAuthRun(binding, prepared.sourceCommit, notes.path, true);
+      if (pa instanceof Error) preAuthSkip = `gate failed: ${message(pa)}`;
+      else if (pa.ok) {
+        preAuthUsed = pa.use;
+        ledger.preAuthUse = pa.use;
+        writeLedger(o.ledgerPath, ledger);
+        autoReport = `preauth ${pa.use.preAuthId} (${pa.use.mode}) · ${Object.values(pa.use.conditions).join(' · ')}`;
+      } else if (pa.reasons.length) preAuthSkip = pa.reasons.join('; ');
+      if (preAuthSkip) { debug.log('release.preauth', 'skipped', { version: o.version, cut: binding.cutSha, reason: preAuthSkip }); log(`· release.preauth skipped {${preAuthSkip}}`); }
+    }
     // RELEASE-AUTO-PUBLISH (대표 11-25 «오토파일럿이면 큰 문제 없을 때 이 절차도 생략») — owner opt-in only; any red check keeps the human wait.
     let autoCard: string | undefined;
-    if (approval.state !== 'approved' && approval.state !== 'unverified' && deps.autoPublish?.mode() === 'on-green') {
+    if (!preAuthUsed && approval.state !== 'approved' && approval.state !== 'unverified' && deps.autoPublish?.mode() === 'on-green') {
       const ap = deps.autoPublish;
-      const attempt = async <T>(f: () => T | Promise<T>): Promise<T | Error> => { try { return await f(); } catch (e) { return e instanceof Error ? e : new Error(String(e)); } };
       // --branch resolved the head this run; --cut-commit still asks where release/<v> points now (a moved branch is not auto-published).
       const branchHead = o.branch ? cut : await attempt(() => deps.resolveBranch(`release/${o.version}`).trim().toLowerCase());
       const blockers = autoPublishBlockers({ version: o.version, binding, preparedCommit: prepared.sourceCommit, branchHead, dryRunPass: ledger.dryRunPass, now: now(),
@@ -317,12 +354,15 @@ export async function runCritpath(o: CritpathOptions, deps: CritpathDeps): Promi
         }
       }
     }
-    if (autoCard) record('approval', approvalCmd, 'ok', binding.cutSha, `card ${autoCard} · AUTO ${AUTO_PUBLISH_AGENT}`);
+    if (preAuthUsed) record('approval', approvalCmd, 'ok', binding.cutSha, `preauth ${preAuthUsed.preAuthId} · mode ${preAuthUsed.mode} · proof ${preAuthUsed.keyId}${preAuthUsed.waivers.length ? ` · waived ${preAuthUsed.waivers.map((w) => w.id).join(',')}` : ''}`);
+    else if (autoCard) record('approval', approvalCmd, 'ok', binding.cutSha, `card ${autoCard} · AUTO ${AUTO_PUBLISH_AGENT}`);
     else if (approval.state !== 'approved') {
       const card = approval.state === 'pending' || approval.state === 'unverified' || approval.state === 'auto' ? { id: approval.id } : deps.requestApproval(binding, waiveReason);
-      record('approval', approvalCmd, 'waiting-approval', binding.cutSha, `card ${card.id}${approval.state === 'unverified' ? ' · human proof unverified' : ''}`);
-      const resume = approval.state === 'unverified'
-        ? `decision ${card.id} claims human approval but has no trusted out-of-band proof; automatic critpath publication remains disabled`
+      const unverifiedReason = approval.state === 'unverified' ? approval.reason ?? 'no-proof' : undefined;
+      record('approval', approvalCmd, 'waiting-approval', binding.cutSha, `card ${card.id}${unverifiedReason ? ` · human proof unverified (reason=${unverifiedReason}) · delegation human-proof-unavailable:${unverifiedReason}` : ''}${preAuthSkip ? ` · preauth skipped {${preAuthSkip.slice(0, 300)}}` : ''}`);
+      if (unverifiedReason) debug.log('release.proof', 'unverified', { version: o.version, card: card.id, reason: unverifiedReason });
+      const resume = unverifiedReason
+        ? `decision ${card.id} claims human approval but its proof is unverified (reason=${unverifiedReason}); automatic critpath publication remains disabled · an OP delegation records human-proof-unavailable:${unverifiedReason}`
         : `card ${card.id} awaits a trusted out-of-band approval; automatic critpath publication remains disabled`;
       log(`⏸ waiting for publish approval\n   version ${o.version} · cut ${binding.cutSha} · notes sha256 ${binding.notesSha256}${waiveReason ? `\n   waiver: ${waiveReason}` : ''}\n   ${resume}`);
       return { status: 'waiting-approval', exitCode: CRITPATH_WAITING_EXIT, step: 'approval', cmd: approvalCmd, resume, approval: approval.state === 'unverified' ? approval : { state: 'pending', id: card.id }, ledger: o.ledgerPath };

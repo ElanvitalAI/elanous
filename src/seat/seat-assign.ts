@@ -33,6 +33,7 @@ import { parseChecklistTargetPaths, type ChecklistItem } from '../release-loop/c
 import { preapprovalLine, type PreapprovedPool } from './resource-preapproval.js';
 import { isJudgeHand, pickPoolHand, POOL_SEAT, type HandPoolEntry } from './hand-pool.js';
 import { freeHands, noIdleHandLine, wip1Decide, type CellActivity, type HeldCell, type Wip1Decision, type Wip1Policy } from './seat-assign-wip1.js';
+import type { AreaFit } from '../kit/seat-area/index.js';
 
 export const ASSIGN_DUE_MS = 30 * 60_000;
 export const LIVE_WRITER_MS = 2 * 60 * 60_000;
@@ -169,6 +170,14 @@ export interface SeatAssignDeps {
   readonly returnToBoard?: (cellId: string, reason: string) => { readonly ok: boolean; readonly line: string };
   /** WIP1-ASSIGN-GUARD-ACTIVE: the latest commit · push · worktree edit/test on the hand's cell since a time. Absent = ledger ⊕ pane only. */
   readonly cellActivity?: (seat: string, ...args: Parameters<CellActivity>) => ReturnType<CellActivity>;
+  /**
+   * SEAT-AREA-GUARD (graphs/policies/seat-roles.yaml · kit/seat-area seatTakesCell): may this seat be handed this cell? A
+   * seat outside the pool or a cell outside its areas is refused (`off-area` · a human's --force passes); the matched rule
+   * rides in the mail as «area match: …». Absent = no area guard. A throw = the guard is unavailable (logged, assign proceeds).
+   */
+  readonly seatFit?: (seat: string, item: ChecklistItem) => AreaFit;
+  /** ELN-OP-CROWN-MEMORY: the active CEO directive card this assignment contradicts → the refusal line (kit/crown-directive). Absent or a throw = no check. */
+  readonly directiveRefusal?: (q: { readonly seat: string; readonly cellId: string; readonly action: 'assign' }) => string | null;
 }
 
 /** The idle-hands pressure that opens HQ's direct assignment past a live scope steward. */
@@ -193,7 +202,7 @@ export type SeatAssignResult =
     readonly opDirect?: { readonly steward: string; readonly pressure: IdlePressure; readonly by: 'op-direct' | 'coord-direct' };
     /** WIP1-ASSIGN-GUARD: cells of the hand put back on the board (lower priority preempted · stale). */
     readonly returned?: readonly string[] }
-  | { readonly ok: false; readonly code: 'not-coordinator' | 'unknown-seat' | 'unknown-cell' | 'live-writer' | 'pool-empty' | 'judge-hand' | 'steward-owns' | 'off-target' | 'rate-folded' | 'wip-1'; readonly reason: string; readonly writers?: readonly AttributedWriter[]; readonly suggest?: string };
+  | { readonly ok: false; readonly code: 'not-coordinator' | 'unknown-seat' | 'unknown-cell' | 'live-writer' | 'pool-empty' | 'judge-hand' | 'steward-owns' | 'off-target' | 'off-area' | 'rate-folded' | 'wip-1' | 'crown-directive'; readonly reason: string; readonly writers?: readonly AttributedWriter[]; readonly suggest?: string };
 
 const PATH_TOKEN = /(?:^|[\s`'"(])((?:src|scripts|docs|bin|tests?|packages|apps|\.rules)\/[A-Za-z0-9_.\/-]+)/g;
 
@@ -230,7 +239,7 @@ export function writerLine(writer: AttributedWriter): string {
 }
 
 export function assignmentMailBody(input: { seat: string; item: ChecklistItem; version: string; due: Date; why?: string; paths: readonly string[];
-  writers: readonly AttributedWriter[]; writerCheck: string; pool: PreapprovedPool; actor: string; lendFrom?: string; modelLine?: string }): string {
+  writers: readonly AttributedWriter[]; writerCheck: string; pool: PreapprovedPool; actor: string; lendFrom?: string; modelLine?: string; areaLine?: string }): string {
   const done = input.item.doneCriterion?.trim() || `the cell title holds: ${input.item.title.slice(0, 120)}`;
   return [
     `[SEAT-ASSIGN] cell ${input.item.id} (${input.version}${input.item.priority ? ` · ${input.item.priority}` : ''}) → ${input.seat} · by ${input.actor}`,
@@ -238,6 +247,7 @@ export function assignmentMailBody(input: { seat: string; item: ChecklistItem; v
     `done-when: ${done.slice(0, 240)}`,
     `due: ${input.due.toISOString()} (${hhmm(input.due)}, +30m) — first PR or a blocked line by then`,
     ...(input.why?.trim() ? [`why: ${input.why.trim().slice(0, 200)}`] : []),
+    ...(input.areaLine ? [input.areaLine] : []),
     ...(input.modelLine ? [input.modelLine] : []),
     ...(input.lendFrom ? [`borrowed from the ${input.lendFrom} pool — you return to the pool when this cell is green/done or its PR lands`] : []),
     `target paths: ${input.paths.length ? input.paths.join(' · ') : 'none declared in the cell'}`,
@@ -274,6 +284,15 @@ export async function seatAssign(input: SeatAssignInput, deps: SeatAssignDeps): 
         const policy = deps.heldCells && deps.wip1Policy ? deps.wip1Policy() : null;
         if (policy && deps.heldCells) { candidates = freeHands(entries, deps.heldCells(), deps.now().getTime(), policy); free = true; }
       } catch (error) { log('seat.assign.wip1-unavailable', { seat, cellId, actor, error: String(error).slice(0, 160) }); }
+      // SEAT-AREA-GUARD — POOL never picks a seat the cell does not fit (outside the pool · outside its areas).
+      if (deps.seatFit) {
+        const item = deps.findCell(cellId, input.version)?.item;
+        if (item) {
+          candidates = candidates.filter(e => { try { return deps.seatFit!(e.seat, item).ok; } catch { return true; } });
+          const specialist = candidates.filter(e => { try { const f = deps.seatFit!(e.seat, item); return f.ok && f.area; } catch { return false; } });
+          if (specialist.length) candidates = specialist;
+        }
+      }
       pooled = pickPoolHand(candidates, actor);
       if (!pooled && free) {
         log('seat.assign.refused', { seat, cellId, actor, code: 'pool-empty', why: 'no-free-hand' });
@@ -317,8 +336,29 @@ export async function seatAssign(input: SeatAssignInput, deps: SeatAssignDeps): 
   try { target = deps.targetVersion?.() ?? null; } catch { target = null; }
   if (target && cell.version !== target && !input.force) {
     log('seat.assign.refused', { seat, cellId: cell.item.id, actor, code: 'off-target', version: cell.version, target });
-    return { ok: false, code: 'off-target', reason: `seat assign: ${cell.item.id} is a ${cell.version} cell — the target release is ${target} (release.graph.version); a human can pass --force` };
+    return { ok: false, code: 'off-target', reason: `seat assign: ${cell.item.id} is a ${cell.version} cell — the target release is ${target} (current board · eln release current); a human can pass --force` };
   }
+  // SEAT-AREA-GUARD — a coordinator is not a general hand: the seat must be a pool seat and the cell inside its areas
+  // (graphs/policies/seat-roles.yaml). Every push path comes through here; only a human's --force passes (audited).
+  let areaLine: string | undefined;
+  if (deps.seatFit) {
+    let fit: AreaFit | null = null;
+    try { fit = deps.seatFit(seat, cell.item); } catch (error) { log('seat.assign.area-unavailable', { seat, cellId: cell.item.id, actor, error: String(error).slice(0, 160) }); }
+    if (fit && !fit.ok && !input.force) {
+      log('seat.assign.refused', { seat, cellId: cell.item.id, actor, code: 'off-area', why: fit.code, line: fit.reason.slice(0, 200) });
+      return { ok: false, code: 'off-area', reason: `seat assign: ${fit.reason} — assign a hand whose area fits, or a human passes --force` };
+    }
+    if (fit) areaLine = fit.ok ? `area match: ${fit.rule}` : `area match: none — forced by ${actor} past «${fit.reason.slice(0, 120)}»`;
+  }
+  // ELN-OP-CROWN-MEMORY — an active CEO directive card that binds this seat and does not allow this cell refuses the assign
+  // (every caller · a human's --force passes it, logged). The line names the card, the words, the expiry and the seat's role.
+  let directive: string | null = null;
+  try { directive = deps.directiveRefusal?.({ seat, cellId: cell.item.id, action: 'assign' }) ?? null; } catch { directive = null; }
+  if (directive && !input.force) {
+    log('seat.assign.refused', { seat, cellId: cell.item.id, actor, code: 'crown-directive' });
+    return { ok: false, code: 'crown-directive', reason: `seat assign: ${directive}` };
+  }
+  if (directive) log('seat.assign.directive-forced', { seat, cellId: cell.item.id, actor });
   // WIP1-ASSIGN-GUARD — a hand holds ONE active cell (every caller: OP · coordinators · stewards; --force/--p0 do not lift it).
   // Only hands are bound: the seat must be in the federation hand pool view. Refusal here; returns run after the writer check.
   let wip1: Wip1Decision | null = null;
@@ -416,7 +456,7 @@ export async function seatAssign(input: SeatAssignInput, deps: SeatAssignDeps): 
   // MODEL-BY-DIFFICULTY: the hand's model is set before it starts (directive → its next turn); the tier rides in the mail.
   let model: { readonly line: string; readonly tier: string } | null = null;
   try { model = deps.modelFor?.(seat, cell.item, paths) ?? null; } catch (error) { log('seat.model-failed', { seat, cellId: cell.item.id, error: String(error).slice(0, 120) }); }
-  const body = assignmentMailBody({ seat, item: cell.item, version: cell.version, due, ...(input.why ? { why: input.why } : {}), paths, writers, writerCheck, pool, actor, ...(lend ? { lendFrom: lend.from } : {}), ...(model ? { modelLine: model.line } : {}) });
+  const body = assignmentMailBody({ seat, item: cell.item, version: cell.version, due, ...(input.why ? { why: input.why } : {}), paths, writers, writerCheck, pool, actor, ...(lend ? { lendFrom: lend.from } : {}), ...(model ? { modelLine: model.line } : {}), ...(areaLine ? { areaLine } : {}) });
   const mail = deps.post({ from: actor, to: seat, body, kind: SEAT_ASSIGN_MAIL_KIND, intent: 'request',
     doneWhen: cell.item.doneCriterion?.trim() || `cell ${cell.item.id}: a PR or a blocked line`, deadlineAt: due.toISOString(),
     refs: [`cell:${cell.item.id}`, ...(rateActor.startsWith('steward:') ? [rateActor] : [])] });
@@ -431,7 +471,7 @@ export async function seatAssign(input: SeatAssignInput, deps: SeatAssignDeps): 
     try { const woke = await deps.wake(seat, mail.id, actor); wake = woke.reason ? `${woke.result} (${woke.reason})` : woke.result; }
     catch (error) { wake = `failed: ${error instanceof Error ? error.message : String(error)}`; }
   }
-  log('seat.assign', { seat, cellId: cell.item.id, version: cell.version, actor, from: assigned.from, outcome: assigned.outcome, mailId: mail.id, wake, writers: writers.length, writerCheck, ...(opDirect ? { opDirect: opDirect.steward } : {}), ...(model ? { tier: model.tier } : {}) });
+  log('seat.assign', { seat, cellId: cell.item.id, version: cell.version, actor, ...(areaLine ? { area: areaLine } : {}), from: assigned.from, outcome: assigned.outcome, mailId: mail.id, wake, writers: writers.length, writerCheck, ...(opDirect ? { opDirect: opDirect.steward } : {}), ...(model ? { tier: model.tier } : {}) });
   const lines = [
     `✅ ${cell.item.id} → ${seat} (owner ${assigned.from ?? 'none'} → ${seat}${assigned.outcome === 'same' ? ', unchanged' : ''}) · mail #${mail.id} · due ${hhmm(due)} · wake ${wake}`,
     `writers (${writerCheck}):`,
@@ -439,6 +479,7 @@ export async function seatAssign(input: SeatAssignInput, deps: SeatAssignDeps): 
     ...(lend ? [`🤝 pool.lend ${seat}: ${lend.from} → ${lend.to} (${lend.via}) — returns to the pool when ${cell.item.id} is green/done or its PR lands`] : []),
     ...(opDirect ? [`⚡ ${opDirect.by} past steward:${opDirect.steward} (idle ${opDirect.pressure.idle} · ready ${opDirect.pressure.ready}) — veto: eln seat veto ${cell.item.id} --from ${opDirect.steward} --reason <line> [--to <seat>]`] : []),
     ...returnLines,
+    ...(areaLine ? [areaLine] : []),
     ...(model ? [model.line] : []),
     preapprovalLine(pool),
   ];

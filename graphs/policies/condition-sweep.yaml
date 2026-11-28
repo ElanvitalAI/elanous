@@ -1,0 +1,12 @@
+# CONDITION-WATCH sweep (0.3.39 · #40586) — policy of the armed-waker sweep (src/commitment/condition-sweep.ts).
+# Read by name; change a value here, not in TS (YAML-FIRST-RATCHET). A malformed pack throws — no silent default.
+version: 1
+sweep:
+  # A waker this long past its horizon is stale: retired without a wake. 30 min = the hand-to-coordinator digest window
+  # (FEDERATION-STEWARDS §5b ④).
+  stale_min: 30
+  # Wakes one sweep may send (fired ⊕ expired notices); the rest wait one tick. 20 = the OP wake budget per hour
+  # (STEWARD-MAIL done criterion).
+  max_wakes: 20
+  # Dry-run measurements per sweep (a pr-merged probe is one `gh` call).
+  max_probes: 60

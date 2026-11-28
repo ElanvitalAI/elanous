@@ -7,7 +7,7 @@ import { loadCard } from '../card.js';
 import { fileAgentMemory } from '../memory.js';
 import { readJournal } from '../journal.js';
 import { tickAgent, voiceAgent, type AgentPorts, type VoiceLlm, type VoiceMessage } from '../runtime.js';
-import { createBody, type SilenceDeps } from './silence-watch.js';
+import { createBody, ledgerAnswerFrom, type CellEvent, type SilenceDeps } from './silence-watch.js';
 
 const T0 = new Date('2026-11-27T10:00:00Z');
 const M = 60_000;
@@ -97,6 +97,14 @@ describe('silence-watch sim: unanswered mail → wake → redeliver/bounce → K
     expect(rows.filter(r => r.target === 'ORCHESTRATOR').length).toBe(1);
     expect(rows.length).toBe(5); // bounce ORCHESTRATOR · bounce RES · redeliver TC · UX · JUD
   });
+  test('YAML-OPS-SCRIPTS-ABSORB: an OP request is due after sla_min_op (15) · another sender after sla_min (30)', async () => {
+    const h = harness(3);
+    h.pending.set(9901, { id: 9901, from: 'OP', to: 'UX', at: T0.getTime() - 20 * M, body: '20분 된 OP 요청' });
+    h.pending.set(9902, { id: 9902, from: 'LAND-GRAPH', to: 'UX', at: T0.getTime() - 20 * M, body: '20분 된 착지 그래프 요청' });
+    h.pending.set(9903, { id: 9903, from: 'OP', to: 'UX', at: T0.getTime() - 14 * M, body: '14분 된 OP 요청' });
+    const r1 = await tickAgent(h.card, h.body, h.ports, T0);
+    expect(r1.kpi).toBe(h.overdueCount + 1); // only #9901 joins
+  });
   test('unreadable store = unknown, not 0', async () => {
     const h = harness(3);
     h.deps.overdue = () => null;
@@ -140,8 +148,73 @@ describe('silence-watch card', () => {
   test('card loads · knowhow parses ≥3', () => {
     const c = loadCard('silence-watch');
     expect(c).toMatchObject({ id: 'silence-watch', address: 'SILENCE-WATCH', supervisor: 'OP', kpi: { name: 'unanswered_mail_past_sla', target: 0, dir: 'at_most' } });
-    expect(c.rights.actions).toEqual(['redeliver', 'bounce']);
+    expect(c.rights.actions).toEqual(['redeliver', 'bounce', 'settle', 'close-notice', 'reopen-notice']);
     const kh = readFileSync(resolve(import.meta.dir, '../../../graphs/loop-agents/silence-watch/knowhow.md'), 'utf8');
     expect(parseKnowhowItems(kh, 'SILENCE-WATCH').length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+// DETECT-TO-ACTION (11-28 live: KPI 158 flat 18 h · 140 of 159 already seen ⊕ hand-acked ⊕ rung once — the ladder had no next step)
+describe('silence-watch settle: a request its cell ledger already answered gets the done receipt the ledger proves', () => {
+  const at = '2026-11-27T09:00:00.000Z';
+  const ev = (min: number, by: string, field: string, to: unknown): CellEvent => ({ at: new Date(Date.parse(at) + min * M).toISOString(), by, field, to });
+  test('ledgerAnswerFrom: receiver wrote after the mail · cell green · owner moved · nothing (and a release move is not a reply)', () => {
+    const m = { to: 'TC-H-CX-3', at, cells: ['A-1'] };
+    expect(ledgerAnswerFrom(m, () => [ev(-5, 'OP', 'claim', 'TC-H-CX-3'), ev(12, 'TC-H-CX-3', 'claim', 'TC')])).toEqual({ cell: 'A-1', why: 'receiver-wrote', evidence: 'cell:A-1 claim by TC-H-CX-3 @2026-11-27T09:12:00.000Z' });
+    expect(ledgerAnswerFrom(m, () => [ev(30, 'JUDGE-BUTLER', 'status', 'green')])).toEqual({ cell: 'A-1', why: 'cell-closed', evidence: 'cell:A-1 status green by JUDGE-BUTLER @2026-11-27T09:30:00.000Z' });
+    expect(ledgerAnswerFrom(m, () => [ev(40, 'OP', 'claim', 'MVP-B')])).toEqual({ cell: 'A-1', why: 'owner-moved', evidence: 'cell:A-1 claim → MVP-B by OP @2026-11-27T09:40:00.000Z' });
+    expect(ledgerAnswerFrom(m, () => [ev(40, 'OP', 'claim', 'TC-H-CX-3'), ev(50, 'TC-H-CX-3', 'move', '0.3.40'), ev(-60, 'OP', 'status', 'yellow')])).toBeNull();
+    expect(ledgerAnswerFrom({ to: 'TC', at, cells: [] }, () => [ev(1, 'TC', 'claim', 'TC')])).toBeNull();
+    expect(ledgerAnswerFrom({ to: 'TC', at: undefined, cells: ['A-1'] }, () => [ev(1, 'TC', 'claim', 'TC')])).toBeNull();
+  });
+  test('tick: 3 answered mails settled once (source ledger · evidence) · the unanswered one is rung, never settled · KPI 4 → 1', async () => {
+    const h = harness(31);
+    h.pending.clear();
+    const base = T0.getTime() - 120 * M;
+    const rows = [
+      { id: 7001, to: 'TC-H-CX-3', cells: ['A-1'] }, { id: 7002, to: 'TC-H-CX-3', cells: ['A-2'] },
+      { id: 7003, to: 'UX', cells: ['B-1'] }, { id: 7004, to: 'UX', cells: ['B-2'] },
+    ];
+    const hist: Record<string, CellEvent[]> = {
+      'A-1': [{ at: new Date(base + 10 * M).toISOString(), by: 'TC-H-CX-3', field: 'claim', to: 'TC-H-CX-3' }],
+      'A-2': [{ at: new Date(base + 20 * M).toISOString(), by: 'JUDGE-BUTLER', field: 'status', to: 'done' }],
+      'B-1': [{ at: new Date(base + 30 * M).toISOString(), by: 'OP', field: 'claim', to: 'MVP-B' }],
+      'B-2': [],
+    };
+    const receipts: string[] = []; const settled = new Set<number>();
+    h.deps.overdue = (now) => rows.filter(r => !settled.has(r.id)).map(r => ({ id: r.id, from: 'OP', to: r.to, ageMin: (now.getTime() - base) / M, summary: 'assign', at: new Date(base).toISOString(), kind: 'assign', cells: r.cells }));
+    h.deps.ring = (to, id) => { h.rung.push([to, id]); return true; };
+    h.deps.ledgerAnswer = m => ledgerAnswerFrom(m, c => hist[c] ?? []);
+    h.deps.settle = (to, id, reason, evidence) => { receipts.push(`${id}|${to}|${evidence}|${reason}`); settled.add(id); return true; };
+    const r1 = await tickAgent(h.card, h.body, h.ports, T0);
+    expect(r1.kpi).toBe(4);
+    expect([...r1.acted].sort()).toEqual(['redeliver:UX', 'settle:TC-H-CX-3', 'settle:UX']);
+    expect(receipts).toEqual([
+      '7001|TC-H-CX-3|cell:A-1 claim by TC-H-CX-3 @2026-11-27T08:10:00.000Z|silence-watch: 받는 이가 칸 원장에 씀 — 우편 대신 칸 원장에서 결정됨',
+      '7002|TC-H-CX-3|cell:A-2 status done by JUDGE-BUTLER @2026-11-27T08:20:00.000Z|silence-watch: 칸이 끝남 — 우편 대신 칸 원장에서 결정됨',
+      '7003|UX|cell:B-1 claim → MVP-B by OP @2026-11-27T08:30:00.000Z|silence-watch: 칸 주인이 바뀜 — 우편 대신 칸 원장에서 결정됨',
+    ]);
+    expect(h.rung).toEqual([['UX', 7004]]);
+    const r2 = await tickAgent(h.card, h.body, h.ports, new Date(T0.getTime() + 5 * M));
+    expect(r2.kpi).toBe(1);
+    expect(receipts.length).toBe(3);
+    const settleCase = h.memory.cases(50).find(c => c.kind === 'act' && c.subject === 'settle:TC-H-CX-3');
+    expect(settleCase?.why).toBe('TC-H-CX-3 미결 2통 정리(done · 원장 근거: 받는 이가 칸 원장에 씀·칸이 끝남) #7001 #7002 · 이유: TC-H-CX-3 앞 2통은 칸 원장이 이미 답함(#7001 A-1 · #7002 A-2)');
+  });
+  test('a cooldown is «대기» with its reason, not «거절» (11-27 journal: «행동 0/4 · 거절 4» were all cooldowns)', async () => {
+    const h = harness(33);
+    h.pending.clear();
+    let n = 7100;
+    const add = () => { n++; h.pending.set(n, { id: n, from: 'OP', to: 'REL', at: T0.getTime() - 40 * M, body: `ask ${n}` }); };
+    h.deps.ring = (to, id) => { h.rung.push([to, id]); return true; }; // REL reads, never decides
+    add();
+    await tickAgent(h.card, h.body, h.ports, T0);
+    add(); // a new unrung request to the same seat inside the 60-min cooldown of redeliver:REL
+    const r2 = await tickAgent(h.card, h.body, h.ports, new Date(T0.getTime() + 5 * M));
+    expect(r2.refused).toEqual([]);
+    expect(r2.deferred).toEqual(['redeliver:REL: 60분 쿨다운 안 (마지막 10:00Z)']);
+    const tick = h.memory.cases(50).filter(c => c.kind === 'tick').at(-1)!;
+    expect(tick.why).toContain('행동 0/1 · 대기 1(쿨다운 1 — redeliver:REL: 60분 쿨다운 안 (마지막 10:00Z))');
+    expect(tick.why).not.toContain('거절');
   });
 });

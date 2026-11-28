@@ -1852,12 +1852,13 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       })();
       // BUS-SEAT-TURN — a seat turn carries its OP-context-bus digest (digested work first · raw CEO words as context);
       // the seat's cursor advances only after the turn completes (seat-turn.ts · fail-open).
+      // CONTEXT-BUS-FEDERATION — one block per space the seat reads (own · HQ for coordinators · OP addressed), org-map resolved.
       const busTurn = (() => {
         try {
           const seat = (require('../seat/seat-boot-preamble.js') as typeof import('../seat/seat-boot-preamble.js')).detectSeat(process.cwd())?.seat ?? null;
           if (!seat) return null;
           const stateRoot = (require('../autopilot/state-paths.js') as typeof import('../autopilot/state-paths.js')).elanousStateRoot();
-          const digest = (require('../op-context-bus/seat-turn.js') as typeof import('../op-context-bus/seat-turn.js')).seatBusDigest(stateRoot, { seat, now: Date.now() });
+          const digest = (require('../op-context-bus/seat-turn.js') as typeof import('../op-context-bus/seat-turn.js')).seatBusDigests(stateRoot, { seat, now: Date.now() });
           return { seat, stateRoot, digest };
         } catch { return null; }
       })();
@@ -1977,8 +1978,8 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         process.exit(0);
       }
       backgroundBridge?.emit();
-      if (busTurn?.digest.ackTo) {
-        try { (require('../op-context-bus/seat-turn.js') as typeof import('../op-context-bus/seat-turn.js')).ackSeatDigest(busTurn.stateRoot, busTurn.seat, busTurn.digest.ackTo); } catch { /* fail-open */ }
+      if (busTurn?.digest.blocks.some((b) => b.ackTo)) {
+        try { (require('../op-context-bus/seat-turn.js') as typeof import('../op-context-bus/seat-turn.js')).ackSeatDigests(busTurn.stateRoot, busTurn.seat, busTurn.digest); } catch { /* fail-open */ }
       }
       const failures = applyAsserts(result.reply, turn.asserts, undefined, turn.id ?? 't?');
       const out = {

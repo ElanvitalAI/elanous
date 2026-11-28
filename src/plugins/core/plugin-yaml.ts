@@ -32,6 +32,35 @@ function graphPath(root: string, asset: string): string {
   return actual;
 }
 
+/** LOOP-AGENTS-AS-PLUGINS P3: one loop agent package = one plugin. `loopAgent:` points at `…/graphs/loop-agents/<id>/agent.yaml`;
+ *  the plugin's id · name · version · description are COMPILED from that agent.yaml manifest (never repeated in plugin.yaml),
+ *  its trigger shim is `…/graphs/triggers/<wake.registered_as>.yaml`. Install bundles both into the package (graphs/…). */
+export interface PluginLoopAgentRef { readonly id: string; readonly name: string; readonly version: string; readonly description: string; readonly agent: string; readonly trigger: string; readonly kpis: readonly string[] }
+export function readLoopAgentRef(root: string, ref: unknown): PluginLoopAgentRef {
+  if (typeof ref !== 'string' || !ref || ref.includes('\0') || isAbsolute(ref) || !ref.endsWith('/agent.yaml')) throw new Error('plugin.yaml loopAgent must be a relative path to …/graphs/loop-agents/<id>/agent.yaml');
+  const parts = ref.split('/');
+  const id = parts.at(-2) ?? '';
+  if (parts.at(-3) !== 'loop-agents' || parts.at(-4) !== 'graphs' || !/^[a-z0-9][a-z0-9-]{1,39}$/.test(id)) throw new Error(`plugin.yaml loopAgent must point at graphs/loop-agents/<id>/agent.yaml: ${ref}`);
+  // the source tree: the pointer (shared with the repo's graphs/) · an installed package: the bundled copy (graphs/ inside it)
+  const pointed = resolve(root, ref); const bundled = join(root, 'graphs', 'loop-agents', id, 'agent.yaml');
+  const path = existsSync(pointed) ? pointed : existsSync(bundled) ? bundled : null;
+  if (!path) throw new Error(`plugin.yaml loopAgent not found: ${ref}`);
+  const doc = record(parseYaml(readFileSync(path, 'utf8')), ref);
+  if (typeof doc.apiVersion !== 'string' || !doc.apiVersion.startsWith('elanous/loop-agent@')) throw new Error(`${ref} apiVersion must be elanous/loop-agent@<n>`);
+  const man = record(doc.manifest, `${ref} manifest`); const ident = record(doc.identity, `${ref} identity`);
+  if (ident.id !== id) throw new Error(`${ref} identity.id ${String(ident.id)} ≠ its directory ${id}`);
+  if (man.name !== id) throw new Error(`${ref} manifest.name must equal identity.id (${id}) — it is the plugin id`);
+  if (typeof man.version !== 'string' || !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(man.version)) throw new Error(`${ref} manifest.version is invalid`);
+  const wake = record(doc.wake ?? {}, `${ref} wake`);
+  const shimId = wake.registered_as;
+  if (typeof shimId !== 'string' || !/^[a-z][a-z0-9-]{0,62}$/.test(shimId)) throw new Error(`${ref} wake.registered_as is required — the trigger shim the registry ticks`);
+  const trigger = [...parts.slice(0, -3), 'triggers', `${shimId}.yaml`].join('/');
+  if (!existsSync(resolve(root, trigger)) && !existsSync(join(root, 'graphs', 'triggers', `${shimId}.yaml`))) throw new Error(`${ref}: trigger shim ${trigger} not found`);
+  const provides = record(man.provides ?? {}, `${ref} manifest.provides`);
+  const kpis = Array.isArray(provides.kpis) ? provides.kpis.filter((k): k is string => typeof k === 'string') : [];
+  return { id, name: id, version: man.version, description: typeof man.description === 'string' ? man.description : '', agent: ref, trigger, kpis };
+}
+
 /** Compile a declarative plugin.yaml and its graph headers into the committed Agent Plugins JSON manifest. */
 export function compilePluginYaml(pluginDir: string): string {
   const root = realpathSync(pluginDir);
@@ -39,14 +68,19 @@ export function compilePluginYaml(pluginDir: string): string {
   const source = readFileSync(yamlPath, 'utf8');
   const raw = record(parseYaml(source), 'plugin.yaml');
   if (raw.apiVersion !== 'elanous.dev/plugin/v2') throw new Error('plugin.yaml apiVersion must be elanous.dev/plugin/v2');
-  const allowedKeys = new Set(['apiVersion', 'id', 'name', 'version', 'description', 'graphs', 'graphProviders', 'capabilities', 'ext',
+  const allowedKeys = new Set(['apiVersion', 'id', 'name', 'version', 'description', 'loopAgent', 'graphs', 'graphProviders', 'capabilities', 'ext',
     'trust', 'contributes', 'skills', 'packs', 'sims', 'handlers', 'dependencies', 'httpGet',
     'whenToUse', 'inputs', 'outputs', 'examples', 'requires']);
   const unknownKeys = Object.keys(raw).filter(key => !allowedKeys.has(key));
   if (unknownKeys.length) throw new Error(`plugin.yaml has unsupported keys: ${unknownKeys.join(', ')}`);
-  const id = raw.id;
-  const name = raw.name;
-  const version = raw.version;
+  const loopAgent = raw.loopAgent === undefined ? null : readLoopAgentRef(root, raw.loopAgent);
+  if (loopAgent) {
+    const repeated = ['id', 'name', 'version', 'description'].filter(k => raw[k] !== undefined);
+    if (repeated.length) throw new Error(`plugin.yaml with loopAgent must not repeat ${repeated.join(', ')} — compiled from the agent.yaml manifest`);
+  }
+  const id = loopAgent?.id ?? raw.id;
+  const name = loopAgent?.name ?? raw.name;
+  const version = loopAgent?.version ?? raw.version;
   if (typeof id !== 'string' || !/^[a-z0-9][a-z0-9-]{1,39}$/.test(id)) throw new Error('plugin.yaml id is invalid');
   if (typeof name !== 'string' || !name.trim()) throw new Error('plugin.yaml name must be nonempty');
   if (typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) throw new Error('plugin.yaml version is invalid');
@@ -57,7 +91,7 @@ export function compilePluginYaml(pluginDir: string): string {
     || !Object.hasOwn(record(raw.handlers, 'plugin.yaml handlers'), httpGet.handler))) {
     throw new Error('plugin.yaml httpGet requires a /v1/ path and a declared handler');
   }
-  if (!graphAssets.length && !httpGet) throw new Error('plugin.yaml must declare at least one graph');
+  if (!graphAssets.length && !httpGet && !loopAgent) throw new Error('plugin.yaml must declare at least one graph');
   const graphProviders = raw.graphProviders === undefined ? {} : record(raw.graphProviders, 'plugin.yaml graphProviders');
   for (const [graphAsset, value] of Object.entries(graphProviders)) {
     const normalizedGraphAsset = graphAsset.replace(/^\.\//, '');
@@ -151,7 +185,7 @@ export function compilePluginYaml(pluginDir: string): string {
     name,
     version,
     ...(raw.dependencies === undefined ? {} : { dependencies: record(raw.dependencies, 'plugin.yaml dependencies') }),
-    ...(typeof raw.description === 'string' ? { description: raw.description } : {}),
+    ...(loopAgent ? { description: loopAgent.description } : typeof raw.description === 'string' ? { description: raw.description } : {}),
     ...(discovery ?? {}),
     ...(raw.requires === undefined ? {} : { requires: record(raw.requires, 'plugin.yaml requires') }),
     ...(Object.keys(contributes).length || skills.length ? { contributes: {
@@ -168,6 +202,7 @@ export function compilePluginYaml(pluginDir: string): string {
       ...(Object.keys(handlers).length ? { handlers } : {}),
       ...(httpGet ? { httpGet } : {}),
       ...(raw.ext === undefined ? {} : { ext: record(raw.ext, 'plugin.yaml ext') }),
+      ...(loopAgent ? { loopAgents: [{ id: loopAgent.id, agent: loopAgent.agent, trigger: loopAgent.trigger, kpis: loopAgent.kpis }] } : {}),
     } },
   };
   return `${JSON.stringify(manifest, null, 2)}\n`;

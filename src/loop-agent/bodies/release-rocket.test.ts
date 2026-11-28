@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { withPolicies } from '../policy-context.js';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -60,7 +61,7 @@ describe('release-rocket card', () => {
     const kh = readFileSync(resolve(import.meta.dir, '../../../graphs/loop-agents/release-rocket/knowhow.md'), 'utf8');
     expect(parseKnowhowItems(kh, 'RELEASE-ROCKET').length).toBeGreaterThanOrEqual(3);
   });
-  test('milestones: grace · default clock judges only the rehearsal', () => {
+  test('milestones: grace · default clock judges only the rehearsal', () => withPolicies(loadCard('release-rocket').policies, async () => {
     const v: ReleaseView = { version: '0.3.40', published: false, clock: CLOCK, clockSource: 'schedule', run: NONE, rehearsal: NONE, yellow: [] };
     expect(milestones(v, at(CLOCK.rehearsalAt, 10)).find(m => m.id === 'rehearsal')!.state).toBe('pending');
     expect(milestones(v, at(CLOCK.rehearsalAt, 16)).find(m => m.id === 'rehearsal')!.state).toBe('late');
@@ -69,7 +70,7 @@ describe('release-rocket card', () => {
     const d = defaultClock(new Date(2026, 10, 27, 12, 0));
     expect(new Date(d.publishAt).getHours()).toBe(6); expect(new Date(d.cutAt).getHours()).toBe(4); expect(new Date(d.rehearsalAt).getHours()).toBe(22);
     expect(Date.parse(d.publishAt)).toBeGreaterThan(Date.parse(d.rehearsalAt));
-  });
+  }));
 });
 
 describe('release-rocket sim: clock → wake → rehearsal / waiver proposal → KPI', () => {

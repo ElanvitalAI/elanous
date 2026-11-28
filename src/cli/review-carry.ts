@@ -4,7 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { delimiter, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { patchIdFromOutput } from '../git-smart/delta.js';
+import { stablePatchId } from '../git-smart/delta.js';
+import { mergeTree } from '../git-smart/merge-tree.js';
 
 const SHA = /^[0-9a-f]{40}$/i;
 const MAX = 32 * 1024 * 1024;
@@ -124,7 +125,7 @@ export function proveReviewCarry(cwd: string, oldHead: string, newHead: string, 
   const env = { ...process.env, GIT_OBJECT_DIRECTORY: temporary,
     GIT_ALTERNATE_OBJECT_DIRECTORIES: [resolve(cwd, objects), process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES].filter(Boolean).join(delimiter) };
   try {
-    const mergedTree = read(['merge-tree', '--write-tree', oldHead, newBase], env);
+    const mergedTree = mergeTree(args => read(args, env), oldHead, newBase, [], []);
     if (!mergedTree || !SHA.test(mergedTree)) return { ok: false, reason: 'carry-merge-conflict-or-unmeasured' };
     const actualTree = read(['rev-parse', '--verify', `${newHead}^{tree}`]);
     if (!actualTree || actualTree.toLowerCase() !== mergedTree.toLowerCase()) {
@@ -144,8 +145,10 @@ export function proveReviewCarry(cwd: string, oldHead: string, newHead: string, 
         if (!match || !fields[i + 1] || !['A', 'M', 'D', 'T'].includes(match[3]!)) return null;
         pathsModes.push(`${match[3]}\0${match[1]}\0${match[2]}\0${fields[i + 1]}`);
       }
-      const patched = run(['patch-id', '--stable'], objectEnv, `${diff}\n`);
-      const patchId = patched.status === 0 && !patched.error ? patchIdFromOutput(patched.stdout) : null; // SMART-MERGE ① shared parse
+      const patchId = stablePatchId((args, opts) => {
+        const result = run([...args], objectEnv, opts?.input);
+        return { status: result.error ? null : result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+      }, `${diff}\n`);
       return patchId ? { patchId, pathsModes: pathsModes.sort() } : null;
     };
     const before = changed(oldBase, oldHead);

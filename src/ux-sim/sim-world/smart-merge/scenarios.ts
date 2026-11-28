@@ -7,25 +7,32 @@ import { GitWorld } from '../../../git-smart/fixture.js';
 import { deltaSince, prDelta } from '../../../git-smart/delta.js';
 import { preflightMergeHistory } from '../../../agent-substrate/review-runner-guard.js';
 import { discoverParents, smartRefresh, smartRefreshSync, type SmartRefreshResult } from '../../../git-smart/smart-refresh.js';
-import { patchIdOf, reuseByPatchId } from '../../../cli/land-graph-cli.js';
+import { carriesOwnDiff, patchIdOf, reuseByPatchId } from '../../../cli/land-graph-cli.js';
 import { detectStaleBaseRevert, parseDeclaredRemovals } from '../../../land-guard/stale-base-revert.js';
 import { reviewRangeDelta } from '../../../agent-substrate/self-review-cli.js';
 import type { GitRun } from '../../../git-fs/smart-run.js';
-import { runFinisher, type FinishBook } from '../../../land-graph/finisher.js';
-import type { PrInfo } from '../../../land-graph/land-graph.js';
+import { finishKindFor, runFinisher, type FinishBook, type FinishDeps } from '../../../land-graph/finisher.js';
+import { decide, type PrInfo, type Receipt } from '../../../land-graph/land-graph.js';
+import { deliverGateBisectOwnerMail, uniqueAssociatedPullRequest } from '../../../../scripts/release-loop/gate-bisect-owner-mail.js';
+import { runGateBisect, type GateBisectPlan } from '../../../../scripts/release-loop/gate-bisect.js';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import type { SimWorldDeviceDef, SimWorldScenario, SimWorldScenarioContext, SimWorldScenarioOutcome } from '../types.js';
+import { ghGovernorDevice, ghGovernorScenarios, type GhGovDevice } from './gh-governor-scenes.js';
+import { ghProxyDevice, ghProxyScenarios, type GhProxyDevice } from './gh-proxy-scenes.js';
 
 const DEVICE = 'SMART-MERGE-GIT-WORLD';
 interface Device { world(files: Record<string, string>): GitWorld; disposeAll(): void }
 
-export const simWorldDevices: readonly SimWorldDeviceDef<Device>[] = [{
+export const simWorldDevices: readonly SimWorldDeviceDef<Device | GhGovDevice | GhProxyDevice>[] = [{
   id: DEVICE,
   title: 'temp git origin + land clone + author clone · real squash-land / force-push / fault-injected git runner',
   create: () => {
     const all: GitWorld[] = [];
     return { world: (files) => { const w = new GitWorld(files); all.push(w); return w; }, disposeAll: () => { for (const w of all.splice(0)) w.dispose(); } };
   },
-}];
+}, ghGovernorDevice, ghProxyDevice];
 
 const fail = (reason: string, diff: string): SimWorldScenarioOutcome => ({ ok: false, reason, diff });
 const tagOf = (ctx: SimWorldScenarioContext) => `s${ctx.seed}x${Math.floor(ctx.random() * 1000)}`;
@@ -44,6 +51,21 @@ const leftoverWorktrees = (w: GitWorld) => w.l(['worktree', 'list', '--porcelain
 async function withDevice(ctx: SimWorldScenarioContext, body: (d: Device) => Promise<SimWorldScenarioOutcome>): Promise<SimWorldScenarioOutcome> {
   const d = ctx.device<Device>(DEVICE);
   try { return await body(d); } finally { d.disposeAll(); }
+}
+
+// ── LAND10-FINISHER-WAIT (대표 11-28 18:1x): receipt key = the PR-own change · no full-required lane ─────────────────────────
+const GATE_TIER = join(import.meta.dir, '../../../../graphs/loop-agents/land-steward/gate-tier.yaml');
+const greenReceipt = (pr: number, head: string, grade?: string): Receipt =>
+  ({ dir: `/r/${pr}-${head.slice(0, 12)}-host`, head, host: 'host-a', focused: ['a.test.ts'], rawDir: '', focusedExit: 0, ...(grade ? { grade } : {}) });
+const prOf = (pr: number, head: string, files: string[]): PrInfo => ({ number: pr, head, base: 'main', draft: false, state: 'OPEN', title: 'x', author: 'TC', files, headRef: 'pr' });
+/** What the land graph does with this head this tick: decide() on the receipt it would find · the finisher pregates it would launch. */
+function landTick(w: GitWorld, pr: PrInfo, receipts: Receipt[]): { action: string; cls?: string; why: string; rechecks: number; via?: string } {
+  const r = receipts.find(x => x.head === pr.head) ?? reuseByPatchId(receipts, pr.head, s => patchIdOf(w.land, s), old => carriesOwnDiff(w.land, old, pr.head));
+  const dec = decide({ pr, receipt: r, olderReceiptHead: r ? null : receipts[0]?.head ?? null, focused: r ? { pass: 3, fail: 0 } : null, hold: null, security: [], landedBefore: false });
+  const fk = finishKindFor(dec.cls, {});
+  const deps: FinishDeps = { now: () => new Date(0), launchPregate: () => ({ ok: true }), alive: () => false, hasReceipt: () => null, refresh: () => ({ result: 'busy' }) };
+  const out = fk ? runFinisher({ jobs: {} }, [{ pr, kind: fk }], deps, false) : [];
+  return { action: dec.action, ...(dec.cls ? { cls: dec.cls } : {}), why: dec.why, rechecks: out.filter(o => o.state === 'would-run').length, ...(r?.reusedVia ? { via: r.reusedVia } : {}) };
 }
 
 export const simWorldScenarios: readonly SimWorldScenario[] = [
@@ -402,6 +424,22 @@ export const simWorldScenarios: readonly SimWorldScenario[] = [
     }),
   },
   {
+    id: 'SM-OWN-REWRITE-DECLARATION',
+    title: 'own rewrite is refused with a filled declaration candidate',
+    devices: [DEVICE],
+    run: (ctx) => withDevice(ctx, async (d) => {
+      const lines = Array.from({ length: 12 }, (_, i) => `line-${i}`).join('\n');
+      const w = d.world({ 'src/own.ts': 'base\n' });
+      w.onMain({ 'src/own.ts': `base\n${lines}\n` }, 'feat: prior (#9001)');
+      const head = w.onBranch('rewrite', { 'src/own.ts': 'base\nreplacement\n' }, 'refactor: rewrite', 'main');
+      w.l(['fetch', '-q', 'origin']);
+      const result = detectStaleBaseRevert(w.land, 'origin/main', head);
+      ctx.recorder.event('smart-merge:own-rewrite', { ok: result.ok, hits: result.hits });
+      return !result.ok && result.card?.includes('의도된 삭제: src/own.ts (PR 수정으로 기존 줄 대체; 의도 확인 후 사용)')
+        ? { ok: true } : fail('own-rewrite-card', JSON.stringify(result));
+    }),
+  },
+  {
     id: 'SM-RESTRUCTURE-PLUS-INSERT',
     title: 'ours restructured a function, theirs inserted 2 lines into the old body (#40447 tickAgent → TICK_STEPS): the LLM capsule gets both sides; the focused test decides',
     devices: [DEVICE],
@@ -450,4 +488,95 @@ export const simWorldScenarios: readonly SimWorldScenario[] = [
       return 'error' in own || !same(own.files, [`own-${ctx.seed}.ts`]) ? fail('review-own-delta', JSON.stringify('error' in own ? own : own.files)) : { ok: true };
     }),
   },
+  {
+    id: 'SM-CARRY-CONTEXT-MOVED',
+    title: 'smart-merge merged main that edited a context line next to the PR hunk: patch-id moved, PR-own change the same → receipt carried · 0 rechecks · lands',
+    devices: [DEVICE],
+    run: (ctx) => withDevice(ctx, async (d) => {
+      const w = d.world({ 'a.ts': 'l1\nl2\nl3\nl4\nl5\n', 'b.ts': 'b\n' });
+      const h1 = w.onBranch('pr', { 'a.ts': `l1\nl2\nl3-pr-${ctx.seed}\nl4\nl5\n` }, 'pr', 'main');
+      w.onMain({ 'a.ts': 'l1-main\nl2\nl3\nl4\nl5\n' }, 'main edits a context line');
+      const r = refresh(w, 7, h1, 'pr');
+      if (r.result !== 'merged') return fail('carry-not-merged', res(r));
+      w.l(['fetch', '-q', 'origin']);
+      const h2 = w.l(['rev-parse', 'origin/pr']);
+      const moved = patchIdOf(w.land, h1) !== patchIdOf(w.land, h2);
+      const t = landTick(w, prOf(7, h2, ['a.ts']), [greenReceipt(7, h1)]);
+      ctx.recorder.event('smart-merge:carry-context', { patchIdMoved: moved, ...t });
+      if (!moved) return fail('carry-patch-id-did-not-move', 'the scene needs main to touch the hunk context');
+      if (t.via !== 'own-diff' || t.action !== 'land' || t.rechecks !== 0) return fail('carry-refused', JSON.stringify(t));
+      return t.why.includes(`receipt reused via own-diff from ${h1.slice(0, 12)}`) ? { ok: true } : fail('carry-why', t.why);
+    }),
+  },
+  {
+    id: 'SM-CARRY-OWN-CHANGED',
+    title: 'the PR-own change moved after the receipt (own commit · or a merge resolved against main: -X ours) → no carry · 1 recheck each',
+    devices: [DEVICE],
+    run: (ctx) => withDevice(ctx, async (d) => {
+      const w = d.world({ 'a.ts': 'a\n', 'c.ts': 'c\n' });
+      const h1 = w.onBranch('pr', { 'a.ts': `a-${ctx.seed}\n` }, 'pr', 'main');
+      const own = w.onBranch('pr', { 'a.ts': `a-${ctx.seed}-again\n` }, 'author edit');
+      const t1 = landTick(w, prOf(8, own, ['a.ts']), [greenReceipt(8, h1)]);
+      // hidden resolution: main and the PR both edit c.ts → the author merges with -X ours (the own diff now reverts main)
+      const w2 = d.world({ 'a.ts': 'a\n', 'c.ts': 'c\n' });
+      const g1 = w2.onBranch('pr', { 'a.ts': `a-${ctx.seed}\n`, 'c.ts': 'c-pr\n' }, 'pr', 'main');
+      w2.onMain({ 'c.ts': 'c-main\n' }, 'main edits c');
+      w2.a(['fetch', '-q', 'origin']); w2.checkout('pr');
+      w2.a(['-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '-q', '--no-edit', '-X', 'ours', 'origin/main']); w2.a(['push', '-q', 'origin', 'pr']);
+      w2.l(['fetch', '-q', 'origin']);
+      const g2 = w2.l(['rev-parse', 'origin/pr']);
+      const t2 = landTick(w2, prOf(9, g2, ['a.ts', 'c.ts']), [greenReceipt(9, g1)]);
+      ctx.recorder.event('smart-merge:carry-own-changed', { own: t1, resolved: t2 });
+      for (const [k, t] of [['own-commit', t1], ['resolved-merge', t2]] as const) {
+        if (t.via || t.action === 'land' || t.cls !== 'stale-head' || t.rechecks !== 1) return fail(`carry-wrongly-${k}`, JSON.stringify(t));
+      }
+      return { ok: true };
+    }),
+  },
+  {
+    id: 'SM-L3-LIGHT-LAND',
+    title: 'no full-required lane: gate-tier.yaml puts L3 at the rehearsal · an old L3 receipt and a rehearsal-tier L2 receipt both land on the light receipt',
+    devices: [DEVICE],
+    run: async (ctx) => {
+      const policy = parseYaml(readFileSync(GATE_TIER, 'utf8')) as { tiers?: Record<string, string> };
+      const tiers = policy.tiers ?? {};
+      const head = (ctx.seed.toString(16).padStart(2, '0')).repeat(20);
+      const pr = prOf(10, head, ['src/x.ts']);
+      const outs = (['L3', 'L2'] as const).map(g => decide({ pr, receipt: greenReceipt(10, head, g), olderReceiptHead: null, focused: { pass: 2, fail: 0 }, hold: null, security: [], landedBefore: false }));
+      ctx.recorder.event('smart-merge:l3-light', { tiers, actions: outs.map(o => o.action) });
+      if (tiers.L3 !== 'rehearsal' || ['L0', 'L1', 'L1d', 'L2'].some(g => tiers[g] !== 'land')) return fail('gate-tier-policy', JSON.stringify(tiers));
+      return outs.every(o => o.action === 'land') ? { ok: true } : fail('l3-not-landed', JSON.stringify(outs));
+    },
+  },
+  {
+    id: 'SM-REHEARSAL-REGRESSION-CELL',
+    title: 'two PRs land on light receipts · the rehearsal full gate fails · gate bisect names the culprit commit → its PR → one owner cell (the post-regression path)',
+    devices: [DEVICE],
+    run: (ctx) => withDevice(ctx, async (d) => {
+      const w = d.world({ 'src/contract.ts': 'export const C = 1;\n', 'src/other.ts': 'o\n' });
+      w.l(['fetch', '-q', 'origin']);
+      const base = w.l(['rev-parse', 'origin/main']);
+      const [good, bad] = ctx.seed % 2 ? [101, 102] : [102, 101];
+      w.onBranch('p1', { 'src/other.ts': `o-${ctx.seed}\n` }, 'p1', 'main');
+      const c1 = w.squashLand('p1', `light lane one (#${good})`);
+      w.onBranch('p2', { 'src/contract.ts': 'export const C = BROKEN;\n' }, 'p2', 'main');
+      const c2 = w.squashLand('p2', `light lane two (#${bad})`);
+      w.l(['fetch', '-q', 'origin']);
+      const file = 'test/contract.test.ts';
+      const plan: GateBisectPlan = { kind: 'bisect', version: '0.3.39', baseCommit: base, cutCommit: c2, commits: [c1, c2], files: [file], introducedIds: [`${file} > contract`], host: 'sim-host' };
+      const found = await runGateBisect(plan, async (_f, commit) => (w.show(commit, 'src/contract.ts').includes('BROKEN') ? 'fail' : 'pass'));
+      const hit = found.findings[0];
+      const subject = hit ? w.l(['log', '-1', '--format=%s', hit.firstFailingCommit]) : '';
+      const pr = uniqueAssociatedPullRequest([...subject.matchAll(/\(#(\d+)\)/g)].map(m => Number(m[1])));
+      const posts: string[] = [];
+      const cells = await deliverGateBisectOwnerMail(hit ? [{ file, firstFailingCommit: hit.firstFailingCommit, pullRequest: pr, owner: 'author', ownerSeat: 'TC', evidence: 'rehearsal full gate' }] : [],
+        { post: async (_seat, body) => { posts.push(body); return { id: `cell-${posts.length}` }; } });
+      ctx.recorder.event('smart-merge:rehearsal-regression', { culprit: pr, cells: cells.map(c => c.status) });
+      if (hit?.firstFailingCommit !== c2 || pr !== bad) return fail('bisect-culprit', JSON.stringify({ found, pr }));
+      return cells.length === 1 && cells[0]!.status === 'delivered' && posts[0]!.includes(`#${bad}`) ? { ok: true } : fail('regression-cell', JSON.stringify(cells));
+    }),
+  },
+  // GH-BUDGET-GOVERNOR (0.3.39 P0): the one gh door — shared open-PR snapshot · global cooldown · per-seat budget.
+  ...ghGovernorScenarios,
+  ...ghProxyScenarios,
 ];

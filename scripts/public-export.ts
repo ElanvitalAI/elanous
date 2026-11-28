@@ -130,21 +130,31 @@ function codeIdentifierRanges(file: string, text: string): Array<{ start: number
   return ranges;
 }
 
-function assertRedactionsAvoidIdentifiers(file: string, text: string, redactions: readonly PrivateRedaction[]): void {
-  if (!CODE_FILE.test(file) || !redactions.some((redaction) => text.includes(redaction.from))) return;
+/** One code identifier a private redaction would rewrite (release prepare refuses these). `placeholder` = the table's
+ *  replacement — diagnostics name the placeholder, never the private value itself. */
+export interface RedactionIdentifierHit { readonly file: string; readonly line: number; readonly column: number; readonly name: string; readonly placeholder: string }
+
+/** Non-throwing form of the prepare-time identifier check — the light pregate (LAND10-SHIFT-LEFT) runs it on a PR's own changed files. */
+export function redactionIdentifierHits(file: string, text: string, redactions: readonly PrivateRedaction[]): RedactionIdentifierHit[] {
+  if (!CODE_FILE.test(file) || !redactions.some((redaction) => text.includes(redaction.from))) return [];
   const identifiers = codeIdentifierRanges(file, text);
-  if (!identifiers.length) return;
-  const hits: RedactionProblem[] = [];
+  if (!identifiers.length) return [];
+  const hits: RedactionIdentifierHit[] = [];
   for (const redaction of redactions) {
     for (const match of text.matchAll(redactionPattern(redaction.from))) {
       const start = match.index;
       const token = identifiers.find((entry) => start < entry.end && start + match[0].length > entry.start);
       if (!token) continue;
-      const line = text.slice(0, token.start).split('\n').length;
-      hits.push({ marker: 'private-redaction-identifier', file, line, text: token.name });
+      const before = text.slice(0, token.start).split('\n');
+      hits.push({ file, line: before.length, column: before.at(-1)!.length + 1, name: token.name, placeholder: redaction.to });
     }
   }
-  const unique = [...new Map(hits.map((hit) => [`${hit.file}:${hit.line}:${hit.text}`, hit])).values()];
+  return [...new Map(hits.map((hit) => [`${hit.file}:${hit.line}:${hit.name}`, hit])).values()];
+}
+
+function assertRedactionsAvoidIdentifiers(file: string, text: string, redactions: readonly PrivateRedaction[]): void {
+  const unique: RedactionProblem[] = redactionIdentifierHits(file, text, redactions)
+    .map((hit) => ({ marker: 'private-redaction-identifier', file: hit.file, line: hit.line, text: hit.name }));
   if (unique.length) throw new PrivateRedactionError(`private redaction would change code identifiers: ${unique.slice(0, 12).map((hit) => `${hit.file}:${hit.line} ${hit.text}`).join(', ')}${unique.length > 12 ? ` (+${unique.length - 12} more)` : ''}`, unique);
 }
 

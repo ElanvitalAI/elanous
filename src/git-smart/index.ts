@@ -3,6 +3,8 @@
  * Callers: land graph finisher (REFRESH · STACK rebuild · LLM capsule), review delta (range-diff), land-graph receipts
  * (patch-id reuse), review carry / virtual-rebase proofs (patch-id parse), `eln land smart-merge`.
  */
+export { mergeTree } from './merge-tree.js';
+export { hasConflictMarkers, hasLadderConflictMarkers } from './conflict-markers.js';
 export { patchIdFromOutput, stablePatchId, prDelta, deltaBetween, deltaSince, SHA40, type PrDelta, type DeltaSince } from './delta.js';
 export { revertGuard, removedLines, type RevertGuardResult, type ForeignRemoval } from './revert-guard.js';
 export { RERERE_ARGS, parseDiff3, resolveHunkStructurally, resolveFileStructurally, importUnion, runLadderSync, runLadderLlm, conflictCard, type LlmResolve, type FileConflict, type Hunk } from './conflict-ladder.js';

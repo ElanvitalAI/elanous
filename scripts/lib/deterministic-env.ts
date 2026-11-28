@@ -7,7 +7,7 @@
 // untested credential filter rots silently, which is the failure mode that
 // matters here: it keeps reporting success while letting a key through.
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { envLiteral } from '../../src/platform/env-literal.js';
@@ -73,7 +73,23 @@ export function prepareDeterministicChildEnvironment(
   let cleaned = false;
   const cleanup = (): void => {
     if (cleaned) return;
-    remove(root, { recursive: true, force: true });
+    try {
+      remove(root, { recursive: true, force: true });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // Bun can surface ENOTEMPTY after a recursive removal encounters EACCES.
+      if (code !== 'EACCES' && code !== 'EPERM' && code !== 'ENOTEMPTY') throw error;
+      // Only directories in this run's private root need write permission.
+      // lstat prevents traversal or chmod of linked shared dependency stores.
+      const makeWritable = (path: string): void => {
+        const stat = lstatSync(path);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) return;
+        chmodSync(path, stat.mode | 0o700);
+        for (const entry of readdirSync(path)) makeWritable(join(path, entry));
+      };
+      makeWritable(root);
+      remove(root, { recursive: true, force: true });
+    }
     cleaned = true;
   };
   try {

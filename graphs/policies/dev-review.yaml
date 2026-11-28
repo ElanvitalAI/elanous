@@ -1,0 +1,54 @@
+# DEV-REVIEW-COMMON (0.3.40 P0 · 대표 11-28 18:2x «TA 든 손 탭이든 이 로직은 공용화되어야 공회전이 사라진다») — the WHEN and HOW
+# MUCH of the three review subgraphs (graphs/review/{cell-review,pre-impl,post-impl}.yaml). The judge line itself is NOT here:
+# it is graphs/policies/judging.yaml (split.must · refuse_must_unmet_when · fallback · follow_up) read through the shared kit
+# src/kit/requirement-judge (decomposeDoneCriterion · assessCriterionForSign) — the very functions the judge butler signs with.
+# Read by src/kit/dev-review/index.ts (loadDevReviewPolicy). Change a value here, not in TS. Unreadable = the defaults below.
+#
+# 🔗 정본 = 내부 문서 `JUDGE-LOAD-REDUCTION` §1 (골 판정식 3절 · 쪼개기) · §2 (GOAL-SPEC-CORRECTION 골 정정 v1→v2) ·
+#    §3 (골 대조표 · 구현 뒤 판정 전 1회) · §5 (필수/엣지 강제 · 라운드 상한).
+version: 1
+
+# §1 판정식 3절 — the lint the goal linter applies to goal documents, applied to a cell's doneCriterion. A section is present
+# when the criterion carries one of its labels. A criterion the review writes or strengthens always uses these labels
+# («판정식: … · 필수: … · 엣지(FU): … · 실패 경로: …»), so a reviewed criterion re-lints clean.
+sections:
+  judge_line:
+    labels: ['판정식', '판정선', 'PASS 조건', 'done-when']
+    # the judge line names a universe (§0e · judging.yaml sim_evidence.markers vocabulary) — one of these words
+    universe: ['시뮬', '시험 우주', '운영 읽기', '합성', 'sim world', 'synthetic', 'test universe', 'focused']
+  must_edge:
+    labels: ['필수', '엣지', 'must', 'edge']
+  failure_paths:
+    labels: ['실패 경로', '실패 꼴', '거부', 'failure path']
+
+# cell-review@1 — on `eln work next` claim (hand) · after author (TA). Never blocks the hand: the claim spawns a detached
+# review process and returns at once; the spawn itself is abandoned past max_block_ms.
+cell_review:
+  max_block_ms: 1500
+  once_per: criterion-hash        # one review per cell per criterion text (the ledger row carries before/after hashes)
+  writer: DEV-REVIEW              # checklist `by` of a written/strengthened criterion (history keeps v1)
+  write_when: [empty]             # no doneCriterion → write one (judge LLM route · verified by the JUD decomposition)
+  strengthen_when: [decomposition_uncertain, no_must, sections_missing]
+  # §2 guard: a strengthened criterion must START with the old text verbatim — the review only appends (never weakens a must)
+  append_only: true
+  max_chars: 900
+
+# pre-impl@1 — core vs edge split before implementation. An independent edge becomes its FU cell NOW, with the judge's own
+# FU id («<cell>-FU-<sha8 of the edge text>» · sign-decision edgeFus) so the later sign finds it and adds nothing.
+pre_impl:
+  edge_fu: open-now
+  max_fu_per_cell: 3
+  fu_priority: P2
+
+# post-impl@1 — the first pregate receipt of a PR (PREGATE-GREEN ⊕ PREGATE-RED lane «<pr>-<head12>-<host>»). The criterion is
+# re-checked against the PR's own facts by assessCriterionForSign (the judge's sign decision): a cited contradiction = the
+# judge WILL refuse → one ledger line on the cell before the judge sees it; unmet edges → FU cells (same ids as the judge).
+post_impl:
+  trigger: first-pregate
+  max_prs_per_tick: 3
+  max_fu_per_pr: 3
+  # a lane older than the first scan is history, not a «first pregate» (the first tick sets the watermark, reviews nothing)
+  watermark: first-scan
+
+ledger:
+  file: dev-review/ledger.jsonl   # under the instance state root

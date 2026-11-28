@@ -7,6 +7,8 @@
 //   SUP-JD-CELL-CAP — autopsy: the cells-per-day budget is a plan input — no open-cell is planned once it is used up.
 //   SUP-JD-SILENCE  — silence-watch: 18 re-asks to ORCHESTRATOR (no tab) got 18 bells; now no bell for a reader-less
 //                     address, one notice a day (kit/mail-route dormant reroute reader, else the sender), one bell per seat.
+//   SUP-OPS-SLA-OP  — silence-watch absorbs seat-state/K-EAST/tools/op-overdue-doorbell.py (YAML-OPS-SCRIPTS-ABSORB): a request
+//                     from OP is due after policy sla_min_op (15) · any other sender after sla_min (30). Five seeds.
 // Expectations are independent literals (rule 11).
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -175,6 +177,37 @@ export const simWorldScenarios: readonly SimWorldScenario[] = [
         if (JSON.stringify(notices.map(n => `${n.to}|${n.key}`).sort()) !== JSON.stringify([...want].sort())) return fail('notices', `seed ${seed}: ${JSON.stringify(notices.map(n => `${n.to}|${n.key}`))}`);
         if (!notices.find(n => n.to === 'OP')!.body.includes('18통')) return fail('notice-body', `seed ${seed}: OP notice «${notices.find(n => n.to === 'OP')!.body}» lacks 18통`);
         if (rows.length !== 3) return fail('journal-flood', `seed ${seed}: ${rows.length} journal rows in 12 ticks (want 3: bounce ORCHESTRATOR · bounce RES · redeliver TC)`);
+      }
+      return { ok: true };
+    },
+  },
+  {
+    id: 'SUP-OPS-SLA-OP',
+    title: 'silence-watch: an OP request 15–29 min old is overdue (sla_min_op 15 · the retired op-overdue-doorbell.py) · the same age from another sender is not (sla_min 30) · one bell per seat',
+    async run(ctx) {
+      for (const seed of [ctx.seed, ctx.seed + 1, ctx.seed + 2, ctx.seed + 3, ctx.seed + 4]) {
+        const card = loadCard('silence-watch');
+        const root = join(ctx.universeRoot, `sla-op-s${seed}`);
+        const r = rig(root, 'silence-watch', 'OP');
+        const age = 16 + (seed % 10); // 16..25 min — past 15, inside 30
+        const pending = new Map<number, { id: number; from: string; to: string; at: number }>([
+          [7001, { id: 7001, from: 'OP', to: 'TC', at: T0 - age * MIN }],          // due (OP · 15)
+          [7002, { id: 7002, from: 'LAND-GRAPH', to: 'UX', at: T0 - age * MIN }],  // not yet (30)
+          [7003, { id: 7003, from: 'LAND-GRAPH', to: 'JUD', at: T0 - 41 * MIN }],  // due (30)
+          [7004, { id: 7004, from: 'OP', to: 'REL', at: T0 - 9 * MIN }],           // not yet (15)
+        ]);
+        const rung: string[] = [];
+        const deps: SilenceDeps = {
+          overdue: (now, sla) => [...pending.values()].filter(m => now.getTime() - m.at >= sla * MIN).map(m => ({ id: m.id, from: m.from, to: m.to, ageMin: (now.getTime() - m.at) / MIN, summary: 'please accept' })),
+          readers: (_now, addrs) => new Map(addrs.map(a => [a, true] as const)),
+          stalled: () => [],
+          ring: to => { rung.push(to); return true; },
+          post: () => null,
+        };
+        const out = await tickAgent(card, createSilence({ stateRoot: root, card }, deps), r.ports, new Date(T0));
+        ctx.recorder.event('sup:ops-sla-op', { seed, age, kpi: out.kpi, rung });
+        if (out.kpi !== 2) return fail('kpi', `seed ${seed}: KPI ${out.kpi} (want 2: #7001 OP→TC ${age} min · #7003 LAND-GRAPH→JUD 41 min)`);
+        if (JSON.stringify([...rung].sort()) !== '["JUD","TC"]') return fail('bells', `seed ${seed}: rung ${JSON.stringify(rung)} (want JUD · TC)`);
       }
       return { ok: true };
     },

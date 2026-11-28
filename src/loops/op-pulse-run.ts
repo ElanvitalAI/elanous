@@ -9,6 +9,7 @@ import { appendPulseLedger, beatsForWindow, detectPhase, parseRhythm, pulseDue, 
 import { burstCourse, burstProposal, digestionRate, forecast, parseBurstConfig, planScale, pressures, startBurst, type BurstConfig, type BurstState,
   type Deadline, type ForecastRow, type HostSlots } from './op-pulse-burst.js';
 import { burstEntry, demandSurge, urgentCeoLines, type CeoLine, type DemandSignals } from './op-pulse-urgency.js';
+import { actuateBurst, actuationLines, actuationSummary, executedLevels, liveBurstActuatorPolicy, normalizeBurstState, stallLine, type BurstActuatorPolicy, type BurstActuators } from './op-pulse-burst-actuate.js';
 import { executeNextActions, needsOpTurn, planNextActions, renderNextActionBlock, type ActionResult, type NextActionState, type NextActuators } from './op-next-action.js';
 
 export interface PulseExtra {
@@ -34,9 +35,11 @@ export interface PulseProbes {
   throughput?(now: Date, stage: string): Promise<string>;
   /** OP-WORLD-LENS: the world card lines for the brief (absent/null = no card). */
   worldCard?(now: Date): Promise<string[] | null>;
+  /** BURST-ACTUATOR-WIRED: the lane doors a live burst pulse launches through (absent = every up-step is «unwired»). */
+  burstActuators?(policy: BurstActuatorPolicy): BurstActuators;
 }
 
-export interface PulsePathsIn { seatState: string; stateRoot: string; rhythmPath: string }
+export interface PulsePathsIn { seatState: string; stateRoot: string; rhythmPath: string; /** default graphs/policies/burst-actuators.yaml */ actuatorPolicyPath?: string }
 
 export function loadRhythmAndBurst(path: string): { rhythm: Rhythm; burst: BurstConfig } {
   const text = readFileSync(path, 'utf8');
@@ -44,7 +47,7 @@ export function loadRhythmAndBurst(path: string): { rhythm: Rhythm; burst: Burst
 }
 
 function readBurst(path: string): BurstState | null {
-  try { return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) as BurstState : null; } catch { return null; }
+  try { return existsSync(path) ? normalizeBurstState(JSON.parse(readFileSync(path, 'utf8')) as BurstState) : null; } catch { return null; }
 }
 export function writeBurst(path: string, state: BurstState): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -133,17 +136,24 @@ export async function runPulse(p: PulseProbes, input: PulsePathsIn & { window: s
   // Burst planning lines (inside a burst: re-forecast course + scale plan; outside: the proposal for OP).
   const burstLines: string[] = [];
   if (active) {
+    const actPolicy = input.actuatorPolicyPath ? liveBurstActuatorPolicy(input.actuatorPolicyPath) : liveBurstActuatorPolicy();
+    const pt = actPolicy.pressureTargets;
     const course = burstCourse(active, miss ?? rows[0] ?? null, now, burstCfg.presets);
     const press = pressures({ targetGapRatio: measure.landedPerH && row.targets.landedPerH ? row.targets.landedPerH / Math.max(0.1, measure.landedPerH) : null,
-      readyBacklog: extra.readyBacklog, hands: measure.spaces.reduce((n, s) => n + (s.hands ?? 0), 0) || null, readyPerHand: row.targets.readyPerHand ?? 2,
-      judgeWaitMin: measure.judgeWaitMedianMin, judgeWaitTargetMin: row.targets.judgeWaitMedianMin ?? 30, judgeQueue: measure.judgeQueue,
-      gateWaitMin: extra.gateWaitMin, gateWaitTargetMin: 10, reviewWaitMin: extra.reviewWaitMin, reviewWaitTargetMin: 20, landQueue: extra.landQueue, landQueueTarget: 6,
+      readyBacklog: extra.readyBacklog, hands: measure.spaces.reduce((n, s) => n + (s.hands ?? 0), 0) || null, readyPerHand: row.targets.readyPerHand ?? pt.readyPerHandDefault,
+      judgeWaitMin: measure.judgeWaitMedianMin, judgeWaitTargetMin: row.targets.judgeWaitMedianMin ?? pt.judgeWaitMinDefault, judgeQueue: measure.judgeQueue,
+      gateWaitMin: extra.gateWaitMin, gateWaitTargetMin: pt.gateWaitMin, reviewWaitMin: extra.reviewWaitMin, reviewWaitTargetMin: pt.reviewWaitMin, landQueue: extra.landQueue, landQueueTarget: pt.landQueue,
       hoursToDeadline: miss ? miss.hoursLeft : null });
-    const plan = planScale({ levels: active.levels, lastChangeAt: active.lastChangeAt, pressures: press, now, config: burstCfg, spentUsd: active.spentUsd, budgetUsd: active.budgetUsd,
+    const plan = planScale({ levels: executedLevels(active), lastChangeAt: active.lastChangeAt, pressures: press, now, config: burstCfg, spentUsd: active.spentUsd, budgetUsd: active.budgetUsd,
       cloudApprovedUsd: active.cloudApprovedUsd, hoursLeft: Math.max(0, (Date.parse(active.until) - now.getTime()) / 3_600_000), forecastMisses: miss !== null, allIn: active.allIn,
       ...(extra.hosts ? { hosts: extra.hosts } : {}) });
+    // BURST-ACTUATOR-WIRED: the plan is executed here (live), not only printed; the beat counts launches, not targets.
+    const acted = await actuateBurst({ state: active, plan, actuators: p.burstActuators?.(actPolicy) ?? null, policy: actPolicy, lanes: burstCfg.lanes, now, stage: input.stage });
+    if (input.stage === 'live' && acted.state !== active) { writeBurst(paths.burst, acted.state); active = acted.state; }
+    const stall = stallLine(acted.state, acted.rows, now, actPolicy);
     burstLines.push(`버스트 ${active.id} (${active.trigger}${active.ceoLine ? ` · CEO #${active.ceoLine.msgId}` : ''}) · 진로: ${course.action} — ${course.why}${course.until ? ` → until ${course.until}` : ''}`,
-      ...plan.map(d => `- ${d.lane}: ${d.from} → ${d.to}${d.blocked ? ` (막힘 ${d.blocked})` : ''} · ${d.why}`));
+      actuationSummary(acted.rows, acted.state), ...(stall ? [stall] : []),
+      ...plan.map(d => `- ${d.lane}: ${d.from} → ${d.to}${d.blocked ? ` (막힘 ${d.blocked})` : ''} · ${d.why}`), ...actuationLines(acted.rows));
     if (course.action.startsWith('exit')) burstLines.push(`→ 종료: eln pulse burst stop --reason ${course.action}`);
   } else if (entry && entry.trigger !== 'ceo-all-in') {
     const preset = burstCfg.presets.find(x => x.name === entry.preset)!;

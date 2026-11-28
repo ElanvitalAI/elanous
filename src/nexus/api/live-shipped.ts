@@ -7,6 +7,7 @@ import { debug } from '../../debug/log.js';
 import { parseSinceParam } from './log-fabric.js';
 import { resolveWorktreesRepoRoot } from './worktrees.js';
 import { jsonResponse } from './json-response.js';
+import { remoteUrlViaAsync } from '../../git-fs/origin-url.js';
 
 export const LIVE_SHIPPED_PATH = '/v1/live/shipped';
 const CACHE_MS = 60_000;
@@ -35,8 +36,9 @@ export function slugFromRemote(url: string): string | null {
 async function defaultRepoSlug(): Promise<string | null> {
   const root = resolveWorktreesRepoRoot();
   if (!root) return null;
-  const r = await run(['git', '-C', root, 'remote', 'get-url', 'origin']);
-  return r.code === 0 ? slugFromRemote(r.out) : null;
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+  const url = await remoteUrlViaAsync(async (argv) => { const r = await run(['git', '-C', root, ...argv]); return r.code === 0 ? r.out : null; });
+  return url ? slugFromRemote(url) : null;
 }
 
 async function defaultCountMerged(slug: string, sinceIso: string): Promise<number> {

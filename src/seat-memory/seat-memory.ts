@@ -24,7 +24,9 @@ import {
   type MemoryWriteRefusalCode,
 } from '../memory-triage/write-gate.js';
 import { recordMemoryUsage } from '../memory-triage/usage-ledger.js';
+import { CROWN_CARD_PREFIX, expiryOfDescription } from '../kit/crown-directive/index.js';
 import { memoryStoreBaseRoot } from './memory-store.js';
+import { traceMemoryRecall, traceMemoryWrite } from './memory-trace.js';
 
 export const SEAT_MEMORY_TYPES = ['user', 'feedback', 'project', 'reference'] as const;
 export type SeatMemoryType = typeof SEAT_MEMORY_TYPES[number];
@@ -198,7 +200,12 @@ export function rebuildSeatMemoryIndex(dir: string): { lines: number } {
   return { lines: lines.length };
 }
 
-/** 색인 한 줄만 고친다 — 그 파일을 가리키는 줄이 있으면 바꾸고, 없으면 끝에 붙인다. 가져온 색인의 순서·묶음을 지킨다. */
+/** Markdown heading line (`#`… then a space) — the start of a hand-made section of the index. */
+const isHeadingLine = (line: string): boolean => /^#{1,6}\s/.test(line);
+
+/** 색인 한 줄만 고친다 — 그 파일을 가리키는 줄이 있으면 바꾸고, 없으면 새 줄을 붙인다. 가져온 색인의 순서·묶음을 지킨다.
+ *  MEMORY-INDEX-HYGIENE ② — 새 줄은 색인 머리의 살아 있는 목록 «끝»(첫 머리글 `#` 바로 앞)에 들어간다. 머리글 아래 구역은 손으로
+ *  묶은 무리(«무효로 한 것» 같은)라 새 기억이 그 무리의 한 줄로 읽히면 안 된다. 머리글이 없으면 맨 끝. */
 function upsertIndexLine(dir: string, entry: SeatMemoryEntry): void {
   const path = join(dir, SEAT_MEMORY_INDEX_FILE);
   if (!existsSync(path)) { rebuildSeatMemoryIndex(dir); return; }
@@ -210,7 +217,13 @@ function upsertIndexLine(dir: string, entry: SeatMemoryEntry): void {
     lines[at] = line;
   } else {
     if (lines.length === 1 && lines[0] === '') lines.length = 0;
-    lines.push(line);
+    const heading = lines.findIndex(isHeadingLine);
+    if (heading < 0) lines.push(line);
+    else {
+      let end = heading; // 머리글 앞 빈 줄은 구역 구분이다 — 새 줄은 그 빈 줄 위(목록 끝)에 붙는다.
+      while (end > 0 && lines[end - 1]!.trim() === '') end -= 1;
+      lines.splice(end, 0, line);
+    }
   }
   writeFileDurable(path, `${lines.join('\n')}\n`);
 }
@@ -223,6 +236,24 @@ function removeIndexLine(dir: string, file: string): void {
   writeFileDurable(path, kept.join('\n'));
 }
 
+/** MEMORY-FAILURE-TRUTH (E-13) — the entry file, then its index line. When the index write fails the entry file is put back
+ *  as it was (its previous text, or no file) and the error is rethrown: a failed save reports failure and leaves no half-written
+ *  entry that recall would still find. */
+function writeEntryAndIndexLine(dir: string, entry: SeatMemoryEntry, text: string | null, trace: { seat: string | null; origin: string }): void {
+  const path = join(dir, entry.file);
+  const before = text !== null && isRegularFile(path) ? readFileSync(path, 'utf8') : null;
+  if (text !== null) writeFileDurable(path, text);
+  try {
+    upsertIndexLine(dir, entry);
+  } catch (error) {
+    if (text !== null) {
+      try { if (before === null) unlinkSync(path); else writeFileDurable(path, before); } catch { /* the index error is the one reported */ }
+    }
+    traceMemoryWrite({ store: 'seat', action: 'failed', seat: trace.seat, name: entry.name, origin: trace.origin, reason: 'index-write' });
+    throw error;
+  }
+}
+
 /** 색인 줄 하나를 맨 위로 올린다 — 세션 시작 색인은 앞 줄부터 실리므로(상한 200줄·25KB) 위 줄은 잘리지 않는다(CLI `memory pin`). */
 export function pinSeatMemory(name: string, dir: string): { ok: boolean; file?: string } {
   const entry = findSeatMemory(dir, name);
@@ -231,6 +262,7 @@ export function pinSeatMemory(name: string, dir: string): { ok: boolean; file?: 
   const lines = isRegularFile(path) ? readFileSync(path, 'utf8').replace(/\n+$/, '').split('\n').filter(l => l !== '' && !linksFile(l, entry.file)) : [];
   writeFileDurable(path, `${[seatMemoryIndexLine(entry), ...lines].join('\n')}\n`);
   debug.log('memory', 'pinned', { name: entry.name, file: entry.file });
+  traceMemoryWrite({ store: 'seat', action: 'pinned', seat: basename(dir), name: entry.name });
   return { ok: true, file: entry.file };
 }
 
@@ -277,6 +309,7 @@ export function saveSeatMemory(input: SeatMemoryInput, dir: string, seat?: strin
   if (!(SEAT_MEMORY_TYPES as readonly string[]).includes(type)) return { ok: false, error: `type 은 ${SEAT_MEMORY_TYPES.join('|')} 중 하나다.` };
   if (looksSecret([name, description, body, ...links].join('\n'))) {
     debug.log('memory', 'save-refused', { seat: seat ?? null, name: redactSecretText(name), reason: 'secret-pattern' });
+    traceMemoryWrite({ store: 'seat', action: 'refused', seat: seat ?? null, name: redactSecretText(name), origin: gate.origin ?? 'unlabelled', reason: 'secret-pattern' });
     return { ok: false, error: '비밀(키·토큰·암호)처럼 보이는 내용은 기억에 저장하지 않는다. 값은 빼고 «어디에 있는지»만 적어라.' };
   }
   // `$` also matches before a final newline — the length check pins the whole string (no trailing \n).
@@ -308,6 +341,7 @@ export function saveSeatMemory(input: SeatMemoryInput, dir: string, seat?: strin
     });
   } catch (error) {
     if (error instanceof MemoryWriteRefusedError) {
+      traceMemoryWrite({ store: 'seat', action: 'refused', seat: seat ?? null, name, origin, reason: error.code });
       return { ok: false, code: error.code, error: `쓰기 문이 거부했다(${error.code}) — 출처 사건 id·종류·범위·이유가 있어야 하고, 같은 교훈은 횟수로 접히며, 자리당 하루 상한이 있다.` };
     }
     emitMemoryTriage('refused', { store: 'seat', origin, seat: seat ?? null, cause: 'gate-error', would: 'refuse' });
@@ -318,6 +352,7 @@ export function saveSeatMemory(input: SeatMemoryInput, dir: string, seat?: strin
     if (target) {
       writeFileDurable(join(dir, target.file), renderSeatMemoryFile({ ...target, triage: outcome.triage }));
       debug.log('memory', 'saved', { seat: seat ?? null, name: target.name, type: target.type, action: 'deduped', file: target.file, links: target.links.length, bodyChars: target.body.length });
+      traceMemoryWrite({ store: 'seat', action: 'deduped', seat: seat ?? null, name: target.name, origin, bytes: target.body.length });
       return { ok: true, action: 'deduped', name: target.name, file: target.file, count: outcome.triage.count, match: outcome.match };
     }
   }
@@ -326,14 +361,14 @@ export function saveSeatMemory(input: SeatMemoryInput, dir: string, seat?: strin
   if (outcome.action === 'supersede' && superseded && superseded.file !== file) {
     const entry: SeatMemoryEntry = { name, description, type: type as SeatMemoryType, body, links, file, triage: outcome.triage, ...withSource };
     const text = renderSeatMemoryFile(entry);
-    writeFileDurable(join(dir, file), text);
-    upsertIndexLine(dir, { ...entry, links: extractLinks(text) });
+    writeEntryAndIndexLine(dir, { ...entry, links: extractLinks(text) }, text, { seat: seat ?? null, origin });
     // 강등은 결정적 근거(MinHash)일 때만 — Jev 만의 근거면 옛 줄·색인은 그대로 두고 새 줄의 supersedes 링크만 남긴다.
     if (outcome.demote) {
       writeFileDurable(join(dir, superseded.file), renderSeatMemoryFile({ ...superseded, triage: { ...outcome.demoted, supersededBy: file } }));
       removeIndexLine(dir, superseded.file);
     }
     debug.log('memory', 'saved', { seat: seat ?? null, name, type, action: 'superseded', file, links: links.length, bodyChars: body.length });
+    traceMemoryWrite({ store: 'seat', action: 'superseded', seat: seat ?? null, name, origin, bytes: body.length });
     return { ok: true, action: 'superseded', name, file, count: outcome.triage.count, match: outcome.match, supersedes: superseded.name };
   }
   const triage = (outcome.action === 'create' || outcome.action === 'supersede' ? outcome.triage : undefined)
@@ -344,9 +379,9 @@ export function saveSeatMemory(input: SeatMemoryInput, dir: string, seat?: strin
   let action: 'created' | 'updated' | 'unchanged' = existing ? 'updated' : 'created';
   if (!existing && existsSync(path)) action = 'updated'; // 다른 이름이 같은 파일 이름으로 접힌 경우 — 덮어씀을 숨기지 않는다
   if (existing && isRegularFile(path) && readFileSync(path, 'utf8') === text) action = 'unchanged';
-  if (action !== 'unchanged') writeFileDurable(path, text);
-  upsertIndexLine(dir, { ...entry, links: extractLinks(text) });
+  writeEntryAndIndexLine(dir, { ...entry, links: extractLinks(text) }, action !== 'unchanged' ? text : null, { seat: seat ?? null, origin });
   debug.log('memory', 'saved', { seat: seat ?? null, name, type, action, file, links: links.length, bodyChars: body.length });
+  traceMemoryWrite({ store: 'seat', action, seat: seat ?? null, name, origin, bytes: body.length });
   return { ok: true, action, name, file };
 }
 
@@ -359,6 +394,7 @@ export function deleteSeatMemory(name: string, dir: string, seat?: string): { ok
   unlinkSync(join(dir, existing.file));
   removeIndexLine(dir, existing.file);
   debug.log('memory', 'deleted', { seat: seat ?? null, name: existing.name, file: existing.file });
+  traceMemoryWrite({ store: 'seat', action: 'deleted', seat: seat ?? null, name: existing.name });
   return { ok: true, file: existing.file };
 }
 
@@ -409,26 +445,44 @@ export interface SeatMemoryIndexBlock {
   truncated: boolean;
 }
 
-/** 세션 시작 색인 블록 — 앞 `SEAT_MEMORY_INDEX_MAX_LINES` 줄 ⊕ `SEAT_MEMORY_INDEX_MAX_BYTES` 바이트(줄 경계). 넘치면 잘림 알림. */
-export function buildSeatMemoryIndexBlock(seat: string, dir: string, caps: { maxLines?: number; maxBytes?: number } = {}): SeatMemoryIndexBlock | null {
+/** Index positions of the lines that point at a live `crown-` directive card (expiry in its description not passed). */
+function liveCrownLineIndexes(all: readonly string[], dir: string, nowMs: number): Set<number> {
+  const out = new Set<number>();
+  if (!all.some(l => l.includes(`](${CROWN_CARD_PREFIX}`))) return out;
+  const live = listSeatMemories(dir).filter(e => e.file.startsWith(CROWN_CARD_PREFIX)).filter(e => { const exp = expiryOfDescription(e.description); return exp === null || exp > nowMs; });
+  all.forEach((line, i) => { if (live.some(e => linksFile(line, e.file))) out.add(i); });
+  return out;
+}
+
+/** 세션 시작 색인 블록 — 앞 `SEAT_MEMORY_INDEX_MAX_LINES` 줄 ⊕ `SEAT_MEMORY_INDEX_MAX_BYTES` 바이트(줄 경계). 넘치면 잘림 알림.
+ *  MEMORY-INDEX-HYGIENE ① — 넘칠 때 살아 있는 지시 카드(`crown-` · 만료 전) 줄이 먼저 자리를 잡고, 나머지 줄이 앞에서부터 남은
+ *  자리를 채운다(순서는 색인 그대로). 새 카드는 색인 아래쪽에 붙으므로 앞에서 자르기만 하면 가장 새 지시가 가장 먼저 잘렸다. */
+export function buildSeatMemoryIndexBlock(seat: string, dir: string, caps: { maxLines?: number; maxBytes?: number; nowMs?: number } = {}): SeatMemoryIndexBlock | null {
   const raw = readSeatMemoryIndex(dir).replace(/\n+$/, '');
   if (!raw.trim()) return null;
   const maxLines = caps.maxLines ?? SEAT_MEMORY_INDEX_MAX_LINES;
   const maxBytes = caps.maxBytes ?? SEAT_MEMORY_INDEX_MAX_BYTES;
   const all = raw.split('\n');
-  const kept: string[] = [];
-  let bytes = 0;
-  for (const line of all) {
-    if (kept.length >= maxLines) break;
-    const add = Buffer.byteLength(line, 'utf8') + 1;
-    if (bytes + add > maxBytes) break;
-    kept.push(line);
-    bytes += add;
-  }
+  const size = (line: string): number => Buffer.byteLength(line, 'utf8') + 1;
   const totalBytes = Buffer.byteLength(raw, 'utf8') + 1;
+  const keptAt = new Set<number>();
+  let bytes = 0;
+  if (all.length > maxLines || totalBytes > maxBytes) {
+    for (const i of liveCrownLineIndexes(all, dir, caps.nowMs ?? Date.now())) {
+      if (keptAt.size >= maxLines) break;
+      if (bytes + size(all[i]!) > maxBytes) continue;
+      keptAt.add(i); bytes += size(all[i]!);
+    }
+  }
+  for (let i = 0; i < all.length; i += 1) {
+    if (keptAt.has(i)) continue;
+    if (keptAt.size >= maxLines || bytes + size(all[i]!) > maxBytes) break;
+    keptAt.add(i); bytes += size(all[i]!);
+  }
+  const kept = all.filter((_, i) => keptAt.has(i));
   const truncated = kept.length < all.length;
   const notice = truncated
-    ? `\n\n⚠️ 색인 ${all.length}줄(${totalBytes}바이트) 중 앞 ${kept.length}줄만 실었다(상한 ${maxLines}줄·${maxBytes}바이트). 나머지는 memory_search 로 찾는다.`
+    ? `\n\n⚠️ 색인 ${all.length}줄(${totalBytes}바이트) 중 ${kept.length}줄만 실었다(살아 있는 지시 카드 먼저 · 나머지는 앞에서부터 · 상한 ${maxLines}줄·${maxBytes}바이트). 나머지는 memory_search 로 찾는다.`
     : '';
   const block = `## 자리 기억 색인 — ${seat} (${SEAT_MEMORY_BACKGROUND_NOTE})\n` +
     '한 줄 = 기억 하나. 본문은 memory_search 로 연다 · 새 지도·정정·확인된 방법은 memory_save 로 남긴다(같은 name 은 고쳐 쓴다).\n\n' +
@@ -534,6 +588,8 @@ export interface SeatMemoryRecall { block: string; names: string[] }
 export function recallSeatMemoriesForTurn(opts: {
   seat: string; dir: string; text: string; sessionKey?: string;
   maxHits?: number; maxTokens?: number; minScore?: number;
+  /** MEMORY-OBSERVABILITY — extra trace fields from the caller (session id · stale session-start index). */
+  trace?: { session?: string | null; staleIndex?: boolean; indexAgeMs?: number };
 }): SeatMemoryRecall | null {
   const seen = opts.sessionKey ? recalledBySession.get(opts.sessionKey) ?? new Map<string, string>() : new Map<string, string>();
   // 낱말 1개 이하 글은 의도 판정이 어렵다 — 회상하지 않는다(전역 주입의 low-context 가드와 같은 규칙).
@@ -546,13 +602,18 @@ export function recallSeatMemoriesForTurn(opts: {
   const names: string[] = [];
   const revisions = new Map<string, string>();
   let used = 0;
+  let alreadyShown = 0;
+  let overBudget = 0;
+  let aboveFloor = 0;
   for (const hit of candidates) {
     if (names.length >= maxHits) break;
     const revision = createHash('sha256').update(JSON.stringify([hit.entry.type, hit.entry.description, hit.entry.body])).digest('hex');
-    if (hit.score < minScore || seen.get(hit.entry.name) === revision) continue;
+    if (hit.score < minScore) continue;
+    aboveFloor += 1;
+    if (seen.get(hit.entry.name) === revision) { alreadyShown += 1; continue; }
     const chunk = `### ${hit.entry.name} [${hit.entry.type}]\n${redactSecretText(hit.entry.body || hit.entry.description)}`;
     const tok = estimateTokens(chunk);
-    if (used + tok > maxTokens) continue;
+    if (used + tok > maxTokens) { overBudget += 1; continue; }
     chunks.push(chunk);
     names.push(hit.entry.name);
     revisions.set(hit.entry.name, revision);
@@ -561,6 +622,13 @@ export function recallSeatMemoriesForTurn(opts: {
   // 낱말이 모자란 글(빈 유휴 preamble 등)은 «부를 일이 없었다» — 관측 소음을 만들지 않는다.
   if (tokenCount >= 2) {
     debug.log('memory', 'recalled', { seat: opts.seat, count: names.length, names, candidates: candidates.length, tokens: used });
+    traceMemoryRecall({
+      store: 'seat', via: 'turn', seat: opts.seat, hit: names.length > 0, names, candidates: candidates.length, tokens: used,
+      ...(names.length === 0 ? { reason: aboveFloor === 0 ? 'no-match' : alreadyShown > 0 && overBudget === 0 ? 'already-shown' : 'budget' } : {}),
+      ...(opts.trace?.session !== undefined ? { session: opts.trace.session } : {}),
+      ...(opts.trace?.staleIndex !== undefined ? { staleIndex: opts.trace.staleIndex } : {}),
+      ...(opts.trace?.indexAgeMs !== undefined ? { indexAgeMs: opts.trace.indexAgeMs } : {}),
+    });
     // MEMORY-TRIAGE-NO-LLM ③ 생산자 — 시도마다 한 줄(빈 것도 · 이 자리가 «돌았다»는 증거). used = 이 글에 맞은 줄 전부
     // (이미 이 대화에서 꺼내 다시 안 실은 줄·예산에 밀린 줄도 «필요했다»). 파일 이름은 원장에서 해시 참조가 된다.
     const matched = candidates.filter(hit => hit.score >= minScore).map(hit => hit.entry.file);

@@ -6,6 +6,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { addHold, expireDue, narrowHold, readHolds, unregisteredCards, type HoldBlock } from '../hold-ledger/hold-ledger.js';
+import type { PrCellBinding } from '../land-graph/cell-link.js';
 import { judgeCell, type CellIn, type PrFacts } from './done-when.js';
 import type { ButlerPorts, HandIn } from './body.js';
 import { wakeButler, judgeQueue, type JudgeQueue } from './agent.js';
@@ -15,6 +16,8 @@ export function rng(seed: number): () => number {
   let a = seed >>> 0;
   return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 }
+/** Each sim PR's body carries «칸: <its cell>» (JUDGE-GREEN-PR-BINDING). */
+const declares = (id: string): PrCellBinding => ({ declared: [id], title: [], branch: [], pipeline: [], selfDeclared: true, evidence: [] });
 const head = (n: number, salt = 0) => (n * 2654435761 + salt).toString(16).padStart(8, '0').repeat(5).slice(0, 40);
 
 export type CellKind = 'eligible' | 'no-receipt' | 'stale-head' | 'no-e4' | 'focused-fail' | 'security'
@@ -51,8 +54,8 @@ export async function runSim(seed: number, opts: { ticks?: number; tickMin?: num
     const id = `JQ-${String(i + 1).padStart(2, '0')}`; const pr = 40100 + i; const h = head(pr);
     const waited = 20 + Math.floor(r() * 60);
     cells.set(id, { id, kind, pr, title: id, status: 'yellow', owner: `TC-H-${(i % 16) + 1}`, updatedBy: 'TC', updatedAt: iso(T0 - waited * 60_000),
-      evidence: `#${pr} merged` }); // GREEN-DEFINITION-ONE: no E4 lines and no evidence commands anywhere
-    facts.set(pr, { pr, merged: true, landedHead: h, files: kind === 'security' ? ['src/oauth/token-refresh.ts'] : [`src/feature-${i}.ts`, `src/feature-${i}.test.ts`], securityFindings: [],
+      doneCriterion: 'Merged change with passing receipt', evidence: `#${pr} merged` }); // GREEN-DEFINITION-ONE: no E4 lines and no evidence commands anywhere
+    facts.set(pr, { pr, merged: true, landedHead: h, files: kind === 'security' ? ['src/oauth/token-refresh.ts'] : [`src/feature-${i}.ts`, `src/feature-${i}.test.ts`], securityFindings: [], binding: declares(id),
       receipt: kind === 'no-receipt' ? null : { head: kind === 'stale-head' ? head(pr, 7) : h, dir: simDir(pr, h), focusedFiles: 1,
         focused: kind === 'focused-fail' ? { pass: 30, fail: 2 } : { pass: 12 + i, fail: 0 } } });
   });
@@ -61,7 +64,7 @@ export async function runSim(seed: number, opts: { ticks?: number; tickMin?: num
   let eqN = 0;
   for (const [kind, n] of EQ) for (let k = 0; k < n; k++) {
     const id = `EQ-${String(++eqN).padStart(2, '0')}`; const pr = 40400 + eqN; const landed = head(pr); const earlier = head(pr, 3);
-    cells.set(id, { id, kind, pr, title: id, status: 'yellow', owner: 'OP', updatedBy: 'land-graph', updatedAt: iso(T0 - 30 * 60_000), evidence: `#${pr} merged` });
+    cells.set(id, { id, kind, pr, title: id, status: 'yellow', owner: 'OP', updatedBy: 'land-graph', updatedAt: iso(T0 - 30 * 60_000), doneCriterion: 'Merged change with passing receipt', evidence: `#${pr} merged` });
     const doc = kind === 'doc-only-l0';
     const receipt: PrFacts['receipt'] =
       kind === 'patch-id-reuse' ? { head: landed, reusedFrom: earlier, dir: simDir(pr, earlier), focusedFiles: 2, focused: { pass: 20, fail: 0 }, grade: 'L2', focusedExit: 0 }
@@ -69,7 +72,7 @@ export async function runSim(seed: number, opts: { ticks?: number; tickMin?: num
       : kind === 'baseline-preexisting' ? { head: landed, dir: simDir(pr, landed), focusedFiles: 4, focused: { pass: 87, fail: 1 }, grade: 'L3', focusedExit: 1, focusedBaseline: { mine: 1, onMain: 1, newFailures: [] } }
       : kind === 'new-failure' ? { head: landed, dir: simDir(pr, landed), focusedFiles: 4, focused: { pass: 40, fail: 2 }, grade: 'L3', focusedExit: 1, focusedBaseline: { mine: 2, onMain: 1, newFailures: ['x > breaks on head'] } }
       : { head: landed, dir: simDir(pr, landed), focusedFiles: 1, focused: null, grade: 'L0', focusedExit: null };
-    facts.set(pr, { pr, merged: true, landedHead: landed, files: doc ? ['docs/conductor/X.md'] : [`src/eq-${eqN}.ts`, `src/eq-${eqN}.test.ts`], securityFindings: [], receipt,
+    facts.set(pr, { pr, merged: true, landedHead: landed, files: doc ? ['docs/conductor/X.md'] : [`src/eq-${eqN}.ts`, `src/eq-${eqN}.test.ts`], securityFindings: [], receipt, binding: declares(id),
       ...(kind === 'different-delta' ? { olderReceiptHead: earlier } : {}) });
   }
   const EQ_KINDS = new Set<CellKind>(EQ.map(([k]) => k));
@@ -112,6 +115,9 @@ export async function runSim(seed: number, opts: { ticks?: number; tickMin?: num
     },
     readCell: id => cells.get(id) ?? null,
     freshFacts: () => facts,
+    // The seeded world supplies deterministic model responses; the live provider is never called.
+    decomposeCriterion: async (_id, text) => ({ trusted: true, requirements: [{ id: 'R1', text, classification: 'must' }] }),
+    judgeCriterion: async input => ({ trusted: true, policyVersion: 'sim', requirements: input.requirements.map(req => ({ id: req.id, classification: 'must', fulfilled: true, evidenceIds: [input.evidence[0]!.id], reason: 'seeded receipt fixture' })) }),
     expireHolds: (by, unlockFacts) => expireDue(root, { by, unlockFacts }, { now: new Date(nowMs), fact: null }),
     post(key, to, body) { if (sent.has(key)) return null; sent.add(key); posts.push({ key, to, body, at: nowMs }); return nextMsg++; },
     addFollowUp(id) { fu.add(id); return true; },

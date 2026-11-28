@@ -100,7 +100,7 @@ test('live hand uses the production verifier against a temporary bare remote and
   expect(rejected.card.alreadyDoneCandidate).toBeUndefined();
 
   const runner = (_cwd: string, argv: string[], timeout?: number): PinnedGitResult => {
-    if (argv[0] === 'remote' && argv[1] === 'get-url')
+    if (argv.join(' ') === 'config --get remote.origin.url')
       return { status: 0, stdout: 'https://github.com/example/repo.git\n', error: false };
     const actual = argv[0] === 'ls-remote' ? ['ls-remote', remote, ...argv.slice(2)] : argv;
     return runPinnedGit(repo, actual, timeout);

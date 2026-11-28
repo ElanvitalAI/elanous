@@ -11,7 +11,7 @@
  */
 import type { Command } from 'commander';
 import { readdirSync } from 'node:fs';
-import { join, relative, resolve } from 'node:path';
+import { basename, join, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { writeStdoutJson } from '../cli/stdout-json.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
@@ -196,13 +196,18 @@ export function registerTriggerCommands(loop: Command, deps: TriggerCliDeps = {}
     // Do not use cronRepoRoot: it can substitute an unrelated checkout for the running package.
     return { root: resolve(deps.root ?? resolve(import.meta.dir, '../..')), stateRoot: resolve(opts.stateRoot ?? deps.stateRoot ?? effectiveInstanceRoot()) };
   };
-  trigger.command('register [files...]').description('Register graph trigger declarations (default: every graphs/triggers/*.yaml)')
+  trigger.command('register [files...]').description('Register graph trigger declarations (default: every graphs/triggers/*.yaml ⊕ installed loop-agent plugins)')
     .option('--update', 'Replace a changed declaration').option('--state-root <dir>').option('--json')
     .action((files: string[], opts: { update?: boolean; stateRoot?: string; json?: boolean }) => handle(async () => {
       const { root, stateRoot } = roots(opts);
       const db = openTriggerRegistry(stateRoot);
       try {
-        const results = (files.length ? files : triggerGraphFiles(root)).map(file => {
+        // LOOP-AGENTS-AS-PLUGINS P3: with no files, installed plugins' loop-agent shims register too (a rail re-register keeps them)
+        // (a shim the package itself ships under graphs/triggers/ is the package's — never registered twice)
+        const shipped = files.length ? [] : triggerGraphFiles(root);
+        const pluginShims = files.length ? [] : (require('../plugins/install/loop-agents.js') as typeof import('../plugins/install/loop-agents.js')).installedLoopAgentShims(stateRoot)
+          .filter(f => !shipped.some(s => basename(s) === basename(f)));
+        const results = (files.length ? files : [...shipped, ...pluginShims]).map(file => {
           const { created, updated, row, retired } = registerTrigger(db, readTriggerDecl(file, root), { update: !!opts.update });
           return { graphId: row.graphId, created, updated, stage: row.stage, trigger: row.cron ?? 'condition', owner: row.owner, ...(retired.length ? { retired } : {}) };
         });
@@ -362,11 +367,13 @@ export function registerTriggerCommands(loop: Command, deps: TriggerCliDeps = {}
         const anomalies = triggerRegistrationAnomalies(root, listTriggers(db));
         const events = await tickTriggers(db, tickDeps(deps, root, stateRoot), opts.only ? { only: opts.only } : {});
         appendLoopLog(TRIGGER_TICK_LOOP_ID, `${JSON.stringify({ at, events, anomalies })}\n`, stateRoot);
-        beatSafe({ name: 'trigger-tick', saw: events.length, everyMin: 2, last: at, ...(anomalies.length ? { err: `${anomalies.length} unregistered, stale or invalid trigger declaration(s)` } : {}) });
+        // only a full pass beats `trigger-tick` (a `--only` wake from a loop agent is not the registry tick — the outside clock
+        // src/loops/trigger-clock.ts and watchers-check read this beat as «the crontab tick runs»)
+        if (!opts.only) beatSafe({ name: 'trigger-tick', saw: events.length, everyMin: 2, last: at, ...(anomalies.length ? { err: `${anomalies.length} unregistered, stale or invalid trigger declaration(s)` } : {}) });
         await output({ at, events, anomalies }, !!opts.json);
       } catch (error) {
         appendLoopLog(TRIGGER_TICK_LOOP_ID, `${JSON.stringify({ at, error: error instanceof Error ? error.message : String(error) })}\n`, stateRoot);
-        beatSafe({ name: 'trigger-tick', saw: 0, everyMin: 2, last: at, err: error instanceof Error ? error.message : String(error) });
+        if (!opts.only) beatSafe({ name: 'trigger-tick', saw: 0, everyMin: 2, last: at, err: error instanceof Error ? error.message : String(error) });
         throw error;
       } finally { db.close(); }
     }));

@@ -11,12 +11,14 @@
 
 export const RESOURCE_OPT_STALL_MS = 2 * 60 * 60_000;
 import { isJudgeHand } from '../seat/hand-pool.js';
+import { comparePull, liveWriter, pullClass, type PullPolicy } from '../kit/work-pull/index.js';
+import { pickByArea } from '../kit/seat-area/index.js';
 
 export const RESOURCE_OPT_JUDGE_AGE_MS = 30 * 60_000;
 export const RESOURCE_OPT_ROW_CAP = 20;
 
 export interface PaneIn { seat?: string; state: string; since?: number }
-export interface CellIn { id: string; title: string; status: string; owner?: string; priority?: string; updatedAt: string }
+export interface CellIn { id: string; title: string; status: string; owner?: string; priority?: string; updatedAt: string; evidence?: string; updatedBy?: string; writer?: { seat: string; at: string } }
 export interface PrIn { number: number; headSha: string; branch: string; title?: string; isDraft: boolean }
 export interface JudgeIn { id: string; owner?: string | null; sinceMs: number; pr?: number }
 
@@ -44,6 +46,19 @@ export interface MatchingInput {
    * parent) is never an implementer candidate. JUD·JUDGE·REVIEW ids are excluded even without this predicate.
    */
   isJudge?: (seat: string) => boolean;
+  /**
+   * WORK-PULL-REACHES-ROSTER — the shared «ready for a hand» policy (graphs/policies/work-pull.yaml) ⊕ OP's roster rank:
+   * the open-work order is the one `eln work next` and the steward use (roster class → rank → priority), a «[WIP 잔류 …]»
+   * cell is never offered, and a cell a hand is live-writing (writer claim · pane not idle) is that hand's. Absent = the
+   * pre-policy table (P0 → P1 → P2 → none).
+   */
+  pull?: { readonly policy: PullPolicy; readonly rosterRank?: ReadonlyMap<string, number> };
+  /**
+   * SEAT-AREA-GUARD (graphs/policies/seat-roles.yaml · kit/seat-area seatTakesCell) — may this idle seat be handed this cell?
+   * false = the pair is never offered (MK/UX get only cells inside their areas · non-pool seats none) and the cell falls
+   * through to the next idle seat. Absent = every pair fits (the pre-policy table). A throw = fits.
+   */
+  seatFit?: (seat: string, cellId: string) => { readonly ok: boolean; readonly area?: boolean };
 }
 
 export type MatchingRow =
@@ -111,27 +126,44 @@ export function buildMatchingTable(input: MatchingInput): MatchingTable {
     .map(([seat, since]) => ({ seat, idleMin: since === null ? null : minutes(input.now - since) }));
 
   // Open work: 🟡 cells with no owner, or with no movement for 2h. P0 → P1 → P2 → none; unowned before stalled; oldest first.
-  const open = input.cells.filter((cell) => cell.status === 'yellow').flatMap((cell) => {
+  // STEWARD-READY-LANES (11-28 01:11Z: MSG-ACK-MULTI-ID «P1 stalled» → TC-H-CX-3 · COORD-RIGHTS-INVENTORY → TC-H-CX-7): a
+  // judge-queue cell (green-triage lane a · merged ⊕ receipt) is a `judge` row, never an `assign` row to a hand.
+  const judgeIds = new Set(input.judgeQueue.map((item) => item.id));
+  const pull = input.pull;
+  const idlePane = new Set(input.panes.filter((p) => p.state === 'IDLE' && p.seat).map((p) => p.seat!.trim().toUpperCase()));
+  // The shared live-writer rule (kit/work-pull liveWriter): the writer's pane not idle counts as activity now.
+  const writing = (cell: CellIn): boolean => {
+    const w = cell.writer?.seat?.trim().toUpperCase();
+    if (!w || !pull) return false;
+    return liveWriter(cell, { nowMs: input.now, ...(idlePane.has(w) ? {} : { activityMs: input.now }) }, pull.policy) !== undefined;
+  };
+  const open = input.cells.filter((cell) => cell.status === 'yellow' && !judgeIds.has(cell.id))
+    .filter((cell) => !pull || (pullClass(cell.evidence, pull.policy) !== 'never' && !writing(cell))).flatMap((cell) => {
     const owner = ownerSeat(cell.owner);
     const updated = Date.parse(cell.updatedAt);
     const stalled = Number.isFinite(updated) && input.now - updated >= RESOURCE_OPT_STALL_MS;
     if (owner && !stalled) return [];
     return [{ cell, owner, updated: Number.isFinite(updated) ? updated : 0 }];
-  }).sort((a, b) => rank(a.cell.priority) - rank(b.cell.priority) || Number(a.owner !== null) - Number(b.owner !== null) || a.updated - b.updated);
+  }).sort((a, b) => (pull ? comparePull(a.cell, b.cell, pull.policy, pull.rosterRank) : rank(a.cell.priority) - rank(b.cell.priority))
+    || Number(a.owner !== null) - Number(b.owner !== null) || a.updated - b.updated);
 
   const free = new Map(idle.map((row) => [row.seat, row] as const));
   const picked = new Map<string, { seat: string; idleMin: number | null }>();
   const refusedCells = new Set((input.refused ?? []).filter((r) => !r.seat).map((r) => r.cell.toUpperCase()));
   const refusedPairs = new Set((input.refused ?? []).filter((r) => r.seat).map((r) => `${r.cell.toUpperCase()}|${r.seat!.toUpperCase()}`));
-  const allowed = (cellId: string, seat: string): boolean => !refusedCells.has(cellId.toUpperCase()) && !refusedPairs.has(`${cellId.toUpperCase()}|${seat}`);
+  const fitOf = (cellId: string, seat: string): { ok: boolean; area?: boolean } => { try { return input.seatFit?.(seat, cellId) ?? { ok: true }; } catch { return { ok: true }; } };
+  const fits = (cellId: string, seat: string): boolean => fitOf(cellId, seat).ok;
+  const allowed = (cellId: string, seat: string): boolean => !refusedCells.has(cellId.toUpperCase()) && !refusedPairs.has(`${cellId.toUpperCase()}|${seat}`) && fits(cellId, seat);
   // Pass 1: a stalled cell whose owner sits idle goes back to that owner (no hand-over cost, the owner knows the cell).
   for (const { cell, owner } of open) {
     if (owner && free.has(owner) && allowed(cell.id, owner)) { picked.set(cell.id, free.get(owner)!); free.delete(owner); }
   }
-  // Pass 2: the rest in priority order to the longest-idle seat this cell was not refused for.
+  // Pass 2: the rest in priority order to the longest-idle seat this cell was not refused for — a seat that fits it by area
+  // first (SEAT-AREA-GUARD · kit/seat-area pickByArea), else the longest-idle general hand.
   for (const { cell } of open) {
     if (picked.has(cell.id)) continue;
-    const next = [...free.values()].find((row) => allowed(cell.id, row.seat));
+    const rows = [...free.values()].filter((row) => allowed(cell.id, row.seat));
+    const next = rows[pickByArea(rows, (row) => row.seat, input.seatFit ? (seat) => fitOf(cell.id, seat) : undefined)];
     if (!next) continue;
     picked.set(cell.id, next);
     free.delete(next.seat);

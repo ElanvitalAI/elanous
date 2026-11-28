@@ -42,19 +42,30 @@ export function livePorts(card: AgentCard, opts: { stateRoot?: string; llm?: boo
     if (!store) { const m = require('../msg/msg-store.js') as typeof import('../msg/msg-store.js'); store = m.openMsgStore(m.defaultMsgStorePath()); }
     return store;
   };
+  const mail = (key: string, to: string, body: string, kind = 'request'): number | null => {
+    try {
+      const { appendOnce } = require('../msg/hand-raise-ladder.js') as typeof import('../msg/hand-raise-ladder.js');
+      const w = appendOnce(openStore(), key, () => ({ from: card.address, to, body, kind, intent: kind === 'info' || kind === 'status' ? 'info' : 'decision', refs: [key.slice(0, 200)] }));
+      return w.fresh ? w.mail.id : null;
+    } catch { return null; }
+  };
+  // CONTEXT-BUS-FEDERATION ③ — an agent.yaml with a `bus-post` node sends its notices to the L0's bus space (kit/bus-post);
+  // requests, a non-reading L0 and a failed bus write keep this mail port. No node → the mail port itself.
+  const { liveBusNoticePort } = require('../kit/bus-post/index.js') as typeof import('../kit/bus-post/index.js');
+  const post = liveBusNoticePort(card.id, card.address, mail, { stateRoot, mailHas: (key) => { try { return openStore().findByProvenanceKey(key) !== null; } catch { return false; } } });
   return {
     memory,
-    post(key, to, body, kind = 'request') {
-      try {
-        const { appendOnce } = require('../msg/hand-raise-ladder.js') as typeof import('../msg/hand-raise-ladder.js');
-        const w = appendOnce(openStore(), key, () => ({ from: card.address, to, body, kind, intent: kind === 'info' || kind === 'status' ? 'info' : 'decision', refs: [key.slice(0, 200)] }));
-        return w.fresh ? w.mail.id : null;
-      } catch { return null; }
-    },
+    post(key, to, body, kind = 'request') { return post(key, to, body, kind); },
     beat(b) { try { (require('../kit/heartbeat/index.js') as typeof import('../kit/heartbeat/index.js')).beatSafe(b); } catch { /* fail-soft */ } },
     ...(opts.speak ? { speak: opts.speak } : {}),
     llm: opts.llm === false ? null : configuredRoleLlm(card.voice.role, 900, `loop-agent:${card.id}`),
     rollup: liveRollupSink(card.id, openStore),
+    // SUPERVISORS-EXECUTE-NOT-PROPOSE: the hold ledger (eln hold) — read errors throw → the runtime holds (fail-closed)
+    holdOn(target, now) {
+      const hl = require('../hold-ledger/hold-ledger.js') as typeof import('../hold-ledger/hold-ledger.js');
+      const h = hl.holdOverTarget(hl.readHolds(stateRoot, now), target, now);
+      return h ? `${h.id} (${h.owner} · ${h.cells.join(',')} · ~${h.expiresAt.slice(11, 16)}Z)` : null;
+    },
     close() { try { (store as { close(): void } | null)?.close(); } catch { /* closed */ } },
   };
 }

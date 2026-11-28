@@ -14,7 +14,7 @@ test('land-steward agent.yaml lints clean against this install and the registere
   expect([r.present, r.ok, r.errors, r.warnings]).toEqual([true, true, [], []]);
   const c = r.compiled!;
   expect(c.kpis.map(k => [k.name, k.dir, k.target])).toEqual([['lands_per_hour', 'at_least', 10], ['landable_ratio', 'at_least', 0.5], ['needs_finisher_wait_p50', 'at_most', 30], ['refusals_without_next', 'at_most', 0]]);
-  expect([c.supervisor, c.voice.breachLineEveryMin, c.wake.cooldownMin, c.wake.maxWaitMin, c.subs.map(s => s.id)]).toEqual([{ duty: 'landing' }, 30, 2, 10, ['train-manager', 'finisher', 'cell-link']]);
+  expect([c.supervisor, c.voice.breachLineEveryMin, c.wake.cooldownMin, c.wake.maxWaitMin, c.subs.map(s => s.id)]).toEqual([{ duty: 'landing' }, 30, 2, 10, ['train-manager', 'finisher', 'cell-link', 'pr-aging']]);
 });
 
 /** A temp agent dir with its soul card (identity.soul is required — LOOP-AGENT-V3-SMART-2). */
@@ -53,6 +53,18 @@ test('refusals name their cause', () => {
   expect(errs(minimal().replace('identity: { id: a1, soul: soul.md }', 'identity: { id: a1 }'))).toContain('identity.soul (soul.md in the agent dir) is required');
   writeFileSync(join(dir, 'agent.yaml'), 'apiVersion: [');
   expect(lintAgentDir(dir).errors[0]).toStartWith('bad yaml');
+});
+
+test('GUARDIAN-KPI-FROM: from as { file · path · where } compiles · a path string stays the tick-file form · bad file / where refused by name', () => {
+  const dir = soulDir();
+  const k = (from: string) => lintAgentYaml(minimal().replace('{ name: k1, at_least: $policies.k1_min }', `{ name: k1, at_least: $policies.k1_min, from: ${from} }`), dir);
+  const a = k('{ file: last-pulse.json, path: kpi, where: { ok: false } }');
+  expect([a.ok, a.errors, a.compiled?.kpis[0]]).toEqual([true, [], { name: 'k1', dir: 'at_least', target: 3, unit: '', ref: 'k1_min', from: 'kpi', fromFile: 'last-pulse.json', fromWhere: { ok: false } }]);
+  expect(k('kpi.k1').compiled?.kpis[0]).toEqual({ name: 'k1', dir: 'at_least', target: 3, unit: '', ref: 'k1_min', from: 'kpi.k1' });
+  expect(k('{ file: ../x.json, path: kpi }').errors[0]).toEqual('kpis[0].from.file must be a JSON file name in the agent home (e.g. last-pulse.json)');
+  expect(k('{ file: last-pulse.json, path: kpi, where: { ok: [1] } }').errors[0]).toEqual('kpis[0].from.where must map field names to scalars (e.g. { ok: false })');
+  expect(k('{ file: last-pulse.json }').errors[0]).toEqual('kpis[0].from must be a dotted field path into the tick file (e.g. kpi.landsLastHour)');
+  expect(k('{ path: kpi, pick: max }').errors[0]).toEqual('kpis[0].from takes only file · path · where');
 });
 
 test('refusal report: L0 by duty through the org map · key stable per error set', () => {

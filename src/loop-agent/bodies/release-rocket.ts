@@ -19,13 +19,9 @@ import type { AgentCard } from '../card.js';
 import type { BodyEnv } from '../registry.js';
 import type { ActionResult, AgentBody, Observation, PlannedAction, Subject } from '../runtime.js';
 import { livePost } from '../live.js';
-import { pv } from '../policy-context.js';
+import { pn } from '../policy-context.js';
 
 export const AGENT_ID = 'release-rocket';
-/** A milestone is late this many minutes after its time. */
-export const GRACE_MIN = 15;
-/** Waiver proposals open this many minutes before publish (OPS-RULES · 대표 11-25 «컷은 늦게 · 발행 2h 전»). */
-export const WAIVER_WINDOW_MIN = 120;
 // 출처: OPS-RULES 발행 케이던스 — 예행 22:00 · 컷 04:00 · 발행 06:00 (local). Used only when no run/schedule names the times.
 export const DEFAULT_CLOCK = { rehearsalHour: 22, cutHour: 4, publishHour: 6 } as const;
 
@@ -62,7 +58,7 @@ const startedStatus = (s: string | undefined) => s === 'running' || s === 'done'
 /** Milestones of a release view at `now` — pure. */
 export function milestones(v: ReleaseView, now: Date): Milestone[] {
   if (!v.clock) return [];
-  const t = now.getTime(); const graceMs = pv('grace_min', GRACE_MIN) * 60_000;
+  const t = now.getTime(); const graceMs = pn('grace_min') * 60_000;
   const pub = Date.parse(v.clock.publishAt);
   const out: Milestone[] = [];
   // rehearsal: started = a rehearsal run exists; irrelevant once publish has passed or the version is published.
@@ -70,7 +66,7 @@ export function milestones(v: ReleaseView, now: Date): Milestone[] {
     const due = Date.parse(v.clock.rehearsalAt);
     const state: Milestone['state'] = v.rehearsal?.done ? 'done' : v.rehearsal?.exists ? 'started'
       : v.published || t >= pub ? 'skipped' : t >= due + graceMs ? 'late' : 'pending';
-    out.push({ id: 'rehearsal', dueAt: v.clock.rehearsalAt, state, why: state === 'late' ? `예행 ${pv('grace_min', GRACE_MIN)}분 넘게 안 시작` : state });
+    out.push({ id: 'rehearsal', dueAt: v.clock.rehearsalAt, state, why: state === 'late' ? `예행 ${pn('grace_min')}분 넘게 안 시작` : state });
   }
   // cut and publish are judged only on a named clock (run · schedule) — the default clock only drives the rehearsal.
   if (v.clockSource !== 'default') {
@@ -113,10 +109,10 @@ export function createBody(env: BodyEnv, deps: ReleaseRocketDeps = liveDeps(env.
       const out: PlannedAction[] = [];
       const ms = milestones(last, ctx.now);
       if (ms.some(m => m.id === 'rehearsal' && m.state === 'late'))
-        out.push({ action: 'start-rehearsal', target: last.version, why: `예행 시각 ${last.clock.rehearsalAt} + ${pv('grace_min', GRACE_MIN)}분 지남 · 예행 런 없음` });
+        out.push({ action: 'start-rehearsal', target: last.version, why: `예행 시각 ${last.clock.rehearsalAt} + ${pn('grace_min')}분 지남 · 예행 런 없음` });
       const pub = Date.parse(last.clock.publishAt); const t = ctx.now.getTime();
       const nc = (last.yellow ?? []).filter(c => !c.critical);
-      if (!last.published && nc.length && t >= pub - pv('waiver_window_min', WAIVER_WINDOW_MIN) * 60_000 && t < pub)
+      if (!last.published && nc.length && t >= pub - pn('waiver_window_min') * 60_000 && t < pub)
         out.push({ action: 'propose-waiver', target: last.version, why: `발행 ${Math.round((pub - t) / 60_000)}분 전 · 크리티컬 아닌 노랑 ${nc.length}` });
       return out;
     },
@@ -158,7 +154,7 @@ export function createBody(env: BodyEnv, deps: ReleaseRocketDeps = liveDeps(env.
 /** OPS-RULES default clock around `now` (local time): the next publish at 06:00, cut 04:00 that day, rehearsal 22:00 the night before. */
 export function defaultClock(now: Date): Clock {
   const pub = new Date(now); pub.setHours(DEFAULT_CLOCK.publishHour, 0, 0, 0);
-  if (now.getTime() >= pub.getTime() + pv('grace_min', GRACE_MIN) * 60_000) pub.setDate(pub.getDate() + 1);
+  if (now.getTime() >= pub.getTime() + pn('grace_min') * 60_000) pub.setDate(pub.getDate() + 1);
   const cut = new Date(pub); cut.setHours(DEFAULT_CLOCK.cutHour, 0, 0, 0);
   const reh = new Date(pub); reh.setDate(reh.getDate() - 1); reh.setHours(DEFAULT_CLOCK.rehearsalHour, 0, 0, 0);
   return { rehearsalAt: reh.toISOString(), cutAt: cut.toISOString(), publishAt: pub.toISOString() };
@@ -178,7 +174,9 @@ export function liveDeps(stateRoot: string, card?: AgentCard): ReleaseRocketDeps
         const { homedir } = require('node:os') as typeof import('node:os');
         const { join } = require('node:path') as typeof import('node:path');
         const cv = require('../../ops-dashboard/current-version.js') as typeof import('../../ops-dashboard/current-version.js');
-        const cur = cv.resolveCurrentVersion({ hqRoot: join(homedir(), 'elanous-hq'), graphVersion: cv.readReleaseGraphVersion() });
+        // The rocket follows the release graph run being launched (release.graph.version), not the board: the board flips to
+        // <v+1> at publish while <v>'s npm/verify tail still runs (CURRENT-RELEASE-ONE-SOURCE).
+        const cur = cv.resolveCurrentVersion({ hqRoot: join(homedir(), 'elanous-hq'), graphVersion: cv.readReleaseGraphVersion(), boardVersion: null });
         const version = cur.version.replace(/-.*$/u, '');
         const x = exec();
         const run = (() => { try { return x.loadRun(stateRoot, version); } catch { return null; } })();

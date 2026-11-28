@@ -25,6 +25,7 @@ import { COMMITMENT_TERMINAL, CommitmentLedger, defaultCommitmentRoot, type Comm
 import { canonicalSeatId } from './msg-store.js';
 import { MSG_WAIT_DEFAULT_WITHIN_MS, MSG_WAIT_RETRY_GRACE_MS } from './msg-wait-contract.js';
 import { findPregateReceipt, pregateGreenDir } from '../commitment/pregate-receipt-dir.js';
+import { boardVersion } from '../release-loop/board-version.js';
 
 // ── 상수(NUMGUARD — 출처 주석 필수) ─────────────────────────────────────────────────────
 
@@ -620,6 +621,50 @@ export async function tickWakers(seat: string | undefined, deps: SelfTimerDeps =
   return out;
 }
 
+/** Stale watches measured once before they are retired — local ledger reads only (no gh · no els · no mail store). */
+export const STALE_MEASURED_KINDS: ReadonlySet<WaitCondition['kind']> = new Set(['file', 'pregate-receipt', 'cell-status']);
+
+export type StaleRetireOutcome = 'stale-satisfied' | 'stale-cancelled' | 'closed';
+
+/**
+ * COND-WATCH sweep — settle a waker whose horizon passed long before anything measured it (its blocking watcher died:
+ * 11-28 1,449 armed wakers sat past their deadline because nothing ran `wait-tick`). It wakes NOBODY: a deadline that
+ * passed hours ago is a fact to record, not a turn. An auto-close watch on a local ledger is measured once — when it
+ * holds, the commitment closes done with the evidence (`commitment.watch.satisfied {silent}`); otherwise the waker is
+ * cancelled `stale` (the commitment stays as it was — its owner closes or re-arms it).
+ */
+export async function retireStaleWaker(seat: string, id: string, deps: SelfTimerDeps = {}): Promise<{ outcome: StaleRetireOutcome; waker: WakerRecord }> {
+  const r = resolveDeps(deps);
+  const s = canonicalSeatId(seat);
+  const current = readWakers(r.root, s).find(w => w.id === id);
+  if (!current) throw new Error(`waker not found: ${s}/${id}`);
+  if (current.status !== 'armed') return { outcome: 'closed', waker: current };
+  const now = r.now();
+  let kind: WaitCondition['kind'] | null = null;
+  try { kind = parseWaitCondition(current.condition).kind; } catch { kind = null; }
+  if (current.autoClose && kind !== null && STALE_MEASURED_KINDS.has(kind)) {
+    let met = false; let evidence = '';
+    try { ({ met, evidence } = await conditionMet(r, current, now)); }
+    catch (error) { r.emit(SELF_TIMER_LOG_CATEGORY, SELF_TIMER_EVENTS.probeError, { seat: s, wakerId: id, condition: current.condition, error: `stale: ${String(error).slice(0, 180)}` }); }
+    if (met) {
+      const waker = updateWaker(r, s, id, { status: 'fired', closedAt: now.toISOString(), checks: current.checks + 1, lastCheckedAt: now.toISOString(), evidence });
+      const commitment = r.ledger.get(s, current.commitmentId);
+      let closed = false;
+      if (commitment && !COMMITMENT_TERMINAL.has(commitment.status)) {
+        try { r.ledger.markDone(s, current.commitmentId, `watch ${current.condition}: ${evidence}`); closed = true; }
+        catch (error) { r.emit(SELF_TIMER_LOG_CATEGORY, SELF_TIMER_EVENTS.probeError, { seat: s, wakerId: id, condition: current.condition, error: `stale auto-close: ${String(error).slice(0, 170)}` }); }
+      }
+      if (closed) cancelCommitmentWakers(s, current.commitmentId, 'commitment done (stale watch satisfied)', shared(deps, r));
+      r.emit(COMMITMENT_WATCH_CATEGORY, COMMITMENT_WATCH_EVENTS.satisfied, { kind, seat: s, wakerId: id, commitmentId: current.commitmentId, closed, silent: true, evidence: evidence.slice(0, 200) });
+      return { outcome: 'stale-satisfied', waker };
+    }
+  }
+  const reason = `stale: horizon ${current.deadlineAt} passed unmeasured (no watcher) — retired at ${now.toISOString()} without a wake`;
+  const waker = updateWaker(r, s, id, { status: 'cancelled', closedAt: now.toISOString(), cancelReason: reason });
+  r.emit(SELF_TIMER_LOG_CATEGORY, SELF_TIMER_EVENTS.cancelled, { seat: s, wakerId: id, commitmentId: current.commitmentId, condition: current.condition, reason: 'stale' });
+  return { outcome: 'stale-cancelled', waker };
+}
+
 /** 다음 점검까지 기다릴 시간 — 백오프 간격을 지평 끝·발화 시각에서 자른다. */
 export function nextPollDelay(interval: number, waker: WakerRecord, nowMs: number): number {
   const until = Math.min(Date.parse(waker.deadlineAt), waker.fireAt ? Date.parse(waker.fireAt) : Number.POSITIVE_INFINITY) - nowMs;
@@ -790,8 +835,8 @@ export function defaultWaitProbes(): WaitProbes {
       return lane === null ? null : `receipt ${join(dir, lane)}`;
     },
     async cellStatus(cell) {
-      const { checklistDevVersion, listChecklist } = await import('../release-loop/checklist.js');
-      const item = listChecklist(checklistDevVersion()).items.find((x) => x.id === cell);
+      const { listChecklist } = await import('../release-loop/checklist.js');
+      const item = listChecklist(boardVersion()).items.find((x) => x.id === cell);
       return item ? { status: item.status, ...(item.owner ? { owner: item.owner } : {}) } : null;
     },
     async seatIdle(seat) {

@@ -481,9 +481,14 @@ async function defaultRepoSlug(): Promise<string | null> {
   const [{ resolveWorktreesRepoRoot }, { slugFromRemote }] = await Promise.all([import('./worktrees.js'), import('./live-shipped.js')]);
   const root = resolveWorktreesRepoRoot();
   if (!root) return (cachedRepoSlug = null);
-  const proc = Bun.spawn(['git', '-C', root, 'remote', 'get-url', 'origin'], { stdout: 'pipe', stderr: 'ignore' });
-  const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-  return (cachedRepoSlug = code === 0 ? slugFromRemote(out) : null);
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+  const { remoteUrlViaAsync } = await import('../../git-fs/origin-url.js');
+  const url = await remoteUrlViaAsync(async (argv) => {
+    const proc = Bun.spawn(['git', '-C', root, ...argv], { stdout: 'pipe', stderr: 'ignore' });
+    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    return code === 0 ? out : null;
+  });
+  return (cachedRepoSlug = url ? slugFromRemote(url) : null);
 }
 
 async function defaultRunGh(args: string[]) {

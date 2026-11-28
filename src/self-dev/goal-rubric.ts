@@ -21,7 +21,7 @@ import { security4Hits } from '../judge-butler/done-when.js';
 
 export type RubricVerdict = 'launch' | 'split' | 'probe-first' | 'hand';
 export type RubricTier = 'luna' | 'terra' | 'sol';
-export type RubricAxisId = 'behaviors' | 'blast_radius' | 'uncertainty' | 'verification_cost' | 'size' | 'dependencies' | 'security_over_spec';
+export type RubricAxisId = 'behaviors' | 'blast_radius' | 'uncertainty' | 'verification_cost' | 'size' | 'dependencies' | 'security_over_spec' | 'yaml_definable';
 
 export interface GoalRubric {
   readonly behaviors: { readonly maxCore: number; readonly nonBehaviorMarkers: readonly string[] };
@@ -32,6 +32,8 @@ export interface GoalRubric {
   readonly dependencies: { readonly markers: readonly string[] };
   readonly securityOverSpec: { readonly markers: readonly string[]; readonly keepMarkers: readonly string[]; readonly scopeWideningMarkers: readonly string[] };
   readonly edges: { readonly markers: readonly string[] };
+  /** YAML-FIRST-RATCHET — «YAML 정의 가능»: a new policy value names its YAML home (policy pack · agent.yaml · plugin.json). */
+  readonly yamlDefinable: { readonly policyMarkers: readonly string[]; readonly homeMarkers: readonly string[] };
   readonly verdictOrder: readonly RubricVerdict[];
   readonly tier: { readonly lunaMax: number; readonly terraMax: number };
 }
@@ -93,6 +95,7 @@ export function parseGoalRubric(text: string): GoalRubric {
     dependencies: { markers: strList(a('dependencies').markers, 'axes.dependencies.markers') },
     securityOverSpec: { markers: strList(a('security_over_spec').markers, 'axes.security_over_spec.markers'), keepMarkers: strList(a('security_over_spec').keep_markers, 'axes.security_over_spec.keep_markers'), scopeWideningMarkers: strList(a('security_over_spec').scope_widening_markers, 'axes.security_over_spec.scope_widening_markers') },
     edges: { markers: strList(a('edges').markers, 'axes.edges.markers') },
+    yamlDefinable: { policyMarkers: strList(a('yaml_definable').policy_markers, 'axes.yaml_definable.policy_markers'), homeMarkers: strList(a('yaml_definable').home_markers, 'axes.yaml_definable.home_markers') },
     verdictOrder: order as RubricVerdict[],
     tier: { lunaMax, terraMax },
   };
@@ -208,6 +211,13 @@ export function scoreGoalRubric(input: RubricInput, rubric: GoalRubric = loadGoa
   const relaxedSecurity = securityOverSpecLines(document, targetPaths, rubric);
   axes.push({ id: 'security_over_spec', score: 0, evidence: relaxedSecurity.length
     ? `보안 4종 경로 밖 보안 강화 요구 ${relaxedSecurity.length}줄 → 완화(요구하지 않는다)` : sec4.length ? '보안 4종 경로 — 보안 요구 유지' : '과잉 보안 요구 없음' });
+
+  // (8) YAML 정의 가능 — a new policy value must name its YAML home; never a verdict blocker (the pregate ratchet refuses the TS constant).
+  const policyHits = hit(document, rubric.yamlDefinable.policyMarkers);
+  const homeHits = hit(document, rubric.yamlDefinable.homeMarkers);
+  axes.push({ id: 'yaml_definable', score: policyHits.length && !homeHits.length ? 1 : 0, evidence: !policyHits.length ? '새 정책 값 표지 없음'
+    : homeHits.length ? `정책 값(${policyHits.join(' · ')}) → YAML 집 ${homeHits.join(' · ')}`
+    : `정책 값(${policyHits.join(' · ')})의 YAML 집이 없다 → graphs/policies/<영역>.yaml · agent.yaml policies: · plugin.json 에 둔다(TS 상수는 pregate 래칫 RED)` });
 
   const total = axes.reduce((s, a) => s + a.score, 0);
   const tier: RubricTier = total <= rubric.tier.lunaMax ? 'luna' : total <= rubric.tier.terraMax ? 'terra' : 'sol';

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { tickLand } from '../land-graph/land-graph.js';
 import { defaultLandDeps, ghInvocation, landToolPath, repoSlugFromUrl, resolveLandRepo } from './land-graph-cli.js';
+import { invalidateOpenPrSnapshot } from '../kit/gh-governor/open-pr-snapshot.js';
 
 // The land-graph trigger runs `land graph tick` with cwd = the installed package dir (not a git repo);
 // a bare `gh pr list` there fails with «fatal: not a git repository». gh must never depend on the cwd.
@@ -47,8 +48,39 @@ describe('land graph gh target', () => {
     const r = await tickLand(defaultLandDeps({ stateRoot: state, mode: 'shadow', post: () => {}, record: () => {} }));
     expect(r.error).toBeUndefined();
     expect(r.decisions).toEqual([]);
-    expect(readFileSync(log, 'utf8')).toContain('pr list --state open --limit 100 --json');
+    // GH-BUDGET-GOVERNOR: the list comes from the shared snapshot's one refresh — every page (limit 1000), no files field.
+    expect(readFileSync(log, 'utf8')).toContain('pr list --state open --limit 1000 --json');
+    expect(readFileSync(log, 'utf8')).not.toContain(',files,');
   });
+});
+
+test('same-head label change from gh re-judges a refused PR on the next tick', async () => {
+  const json = join(nonRepo, 'pr.json');
+  const fake = join(nonRepo, 'gh.sh');
+  const org = join(nonRepo, 'org.yaml');
+  writeFileSync(org, 'org:\n  duties:\n    landing: TC\n    veto: JUD\n');
+  const pr = { number: 40001, headRefOid: 'a'.repeat(40), baseRefName: 'main', isDraft: false, state: 'OPEN', title: 't', author: { login: 'tc' }, files: [{ path: 'src/x.ts' }], body: 'same body', labels: [] as Array<{ name: string }> };
+  writeFileSync(fake, `#!/bin/sh\ncase "$*" in *labels*) ;; *) exit 2;; esac\ncase "$2" in list) printf '['; cat '${json}'; printf ']';; view) cat '${json}';; esac\n`);
+  chmodSync(fake, 0o755);
+  process.env.LAND_GRAPH_GH = fake;
+  process.env.GH_REPO = 'acme/widget';
+  writeFileSync(json, JSON.stringify(pr));
+  let guards = 0;
+  const d = defaultLandDeps({ stateRoot: nonRepo, mode: 'live', org: { path: org },
+    receipt: () => ({ dir: '/receipt', head: pr.headRefOid, host: 'test', focused: ['x'], rawDir: '/raw' }),
+    olderReceiptHead: () => null, focused: () => ({ pass: 1, fail: 0 }), security: () => [],
+    judHold: () => null, staleRevert: () => { guards++; return { ok: false, why: 'test refusal' }; },
+    post: () => {}, record: () => {},
+  });
+  await tickLand(d);
+  await tickLand(d);
+  expect(guards).toBe(1);
+  pr.labels = [{ name: 'reviewed' }];
+  writeFileSync(json, JSON.stringify(pr));
+  invalidateOpenPrSnapshot(nonRepo, { slug: 'acme/widget' }); // the shared snapshot's TTL (60 s) has passed
+  const result = await tickLand(d);
+  expect(guards).toBe(2);
+  expect(result.decisions[0]?.why).toContain('re-judge: context changed');
 });
 
 describe('land command PATH (11-26: launchd python3 = system 3.9 → land-name-diff-check TypeError → every live land STOP)', () => {

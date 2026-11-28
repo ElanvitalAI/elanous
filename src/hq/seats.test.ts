@@ -937,7 +937,7 @@ test('remote seat lifecycle runs on the selected SSH host and records its host w
   expect(calls[0]?.script).toContain('+refs/heads/main:refs/remotes/origin/main');
   expect(calls[0]?.script).toContain('gh auth setup-git');
   expect(calls[0]?.script.indexOf('gh auth setup-git')).toBeLessThan(calls[0]?.script.indexOf('git clone --bare'));
-  const callerOrigin = git(['remote', 'get-url', 'origin'], process.cwd());
+  const callerOrigin = git(['config', '--get', 'remote.origin.url'], process.cwd());
   expect(calls[0]?.script).toContain(`git clone --bare --filter=blob:none --single-branch --branch main '${callerOrigin}'`);
   expect(calls[0]?.script).toContain(`if [ "$remote_origin" != '${callerOrigin}' ]; then`);
   expect(calls[0]?.script).toContain('worktree add --detach');

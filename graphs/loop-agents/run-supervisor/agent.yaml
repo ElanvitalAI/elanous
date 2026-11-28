@@ -89,6 +89,8 @@ soul:   # 영혼 (LOOP-AGENT-V3-SMART-2 · lint requires it) — plan and voice 
   serves:
     - "TC (L0 · landing)"
     - "착지 줄 pregate 를 기다리는 손 자리"
+absorbs:   # 관계 키 absorbs (YAML-OPS-SCRIPTS-ABSORB · 운영 스크립트 스캐터) — what this agent takes over · the script retires when this is live
+  - { id: stall-watch, kind: script, kpi: zombie_runs, l0: supervisor, why: "seat-state/OP/tools/stall-watch.sh (cron */15 · pod-lease admit-by-usage 만 30분+ 반복하는 «승인 굶주림» 런 → OP 우편) — 그 이벤트는 7일 0건 · 마지막 후보 11-03 · 멈춘 런은 run_stall_min 30 / run_zombie_min 120 으로 이 에이전트가 닫는다" }
 wake:
   registered_as: run-supervisor-agent
   trigger:

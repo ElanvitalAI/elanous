@@ -33,6 +33,10 @@ export function genGoalYaml(c: CompiledAgent): string | null {
     voice: { per_hour_max: c.voice.perHourMax, role: c.card.voiceRole },
     ...(n(p, 'escalate_after_min') !== undefined ? { escalate_after_min: n(p, 'escalate_after_min') } : {}),
     ...(c.levels.start === 'shadow' || c.levels.start === 'L1' ? { start_level: c.levels.start } : {}),
+    // the body policies — the refused-agent.yaml fallback runs with the last clean values (bodies hold no TS default)
+    policies: { ...c.policies },
+    // SUPERVISORS-EXECUTE-NOT-PROPOSE: the fallback card keeps the authority (its HOLD gate) — never a looser card
+    ...(c.authority ? { authority: { executes: [...c.authority.executes], undo: { ...c.authority.undo }, limits: [...c.authority.limits], respect_hold: c.authority.respectHold } } : {}),
   };
   return GOAL_YAML_HEADER(c.id) + stringify(doc, { lineWidth: 0 });
 }

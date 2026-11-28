@@ -17,6 +17,7 @@ import { promisify } from 'node:util';
 import { homedir } from 'node:os';
 import { extname, join, relative, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
+import { remoteUrlViaAsync } from '../git-fs/origin-url.js';
 import { passJourneyNode } from '../self-dev/graph-journey-nodes.js';
 import { readJourneyEdge, recordJourneyEdge } from '../self-dev/graph-journey-route.js';
 import { mintMoveId } from './repair-next-move.js';
@@ -36,9 +37,10 @@ import { liveMoveHistoryEntry, recordLiveMoveHistory } from './live-move-history
 import { idempotentCreateCardForRun, updateTaskCard } from './task-hand.js';
 import { capturedSelfReview, captureReviewResults, hasCapturedPass } from './review-result-capture.js';
 import { configuredTaskAgentLiveMoves, defaultPrHead, executeLiveDecisionCard, executeLiveGreenProposal, executeLiveLand, executeLiveReview, type LiveMoveDeps, type LiveMoveResult, type TaskAgentLiveMove } from './live-moves.js';
-import { checklistDevVersion, listChecklist, type Checklist } from '../release-loop/checklist.js';
+import { listChecklist, type Checklist } from '../release-loop/checklist.js';
 import { ambiguousGreenSweepPrs, type GreenSweepPr } from './green-sweep.js';
 import type { GreenSweepProbe } from './actions.js';
+import { boardVersion } from '../release-loop/board-version.js';
 
 export interface TaskAgentShadowInput {
   runId: string | null;
@@ -136,7 +138,7 @@ export interface ProductionGreenSweepDeps {
 /** Read-only production context for the green shadow. Any unreadable source remains unknown. */
 export function productionGreenSweep(checklistId: string, card: TaskCard | undefined, statePath: string, cwd: string,
   deps: ProductionGreenSweepDeps = {}) {
-  const version = card?.checklistVersion ?? checklistDevVersion();
+  const version = card?.checklistVersion ?? boardVersion();
   const readChecklist = deps.readChecklist ?? listChecklist;
   const snapshot = readChecklist(version);
   const item = snapshot.items.find((entry) => entry.id === checklistId);
@@ -149,8 +151,9 @@ export function productionGreenSweep(checklistId: string, card: TaskCard | undef
     { cwd: workingDirectory, encoding: 'utf8', timeout: 20_000, maxBuffer: 4 * 1024 * 1024 }));
   // This context is created once per shadow-move evaluation; these caches are turn-scoped.
   let repoPromise: Promise<string | undefined> | undefined;
-  const repository = () => repoPromise ??= run('git', ['remote', 'get-url', 'origin'], cwd).then(({ stdout }) =>
-    /github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?$/i.exec(stdout.trim())?.[1]?.toLowerCase()).catch(() => undefined);
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+  const repository = () => repoPromise ??= remoteUrlViaAsync((argv) => run('git', argv, cwd).then(({ stdout }) => stdout)).then((url) =>
+    url ? /github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?$/i.exec(url)?.[1]?.toLowerCase() : undefined).catch(() => undefined);
   let mainPromise: Promise<boolean> | undefined;
   const mainFresh = () => mainPromise ??= Promise.all([
     run('git', ['rev-parse', 'origin/main'], cwd).then(({ stdout }) => stdout.trim()),

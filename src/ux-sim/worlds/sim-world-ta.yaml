@@ -1,4 +1,6 @@
 # SIM-WORLD ta pack — rows { id, module } filled by the ta hand (SIM-WORLD §2 · contract seat-state/TC/SIM-KERNEL-API.md).
+# TA-DR* = DEV-REVIEW-COMMON (대표 11-28 18:2x): the shared review units (graphs/review) on TA and hand paths — claim → criterion written ·
+#   weak → strengthened append-only · first pregate → judge refusal predicted ⊕ edge FU · TA journey unchanged.
 # TA-GP* = goal policy (대표 11-27 12:2x): policy-aware authoring · precheck before launch · revise after the first implementation.
 schema: 1
 world: ta
@@ -15,3 +17,7 @@ scenarios:
   - { id: TA-GP10, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
   - { id: TA-GP11, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
   - { id: TA-GP12, module: src/ux-sim/sim-world/ta/goal-policy-scenarios.ts }
+  - { id: TA-DR1, module: src/ux-sim/sim-world/ta/dev-review-scenarios.ts }
+  - { id: TA-DR2, module: src/ux-sim/sim-world/ta/dev-review-scenarios.ts }
+  - { id: TA-DR3, module: src/ux-sim/sim-world/ta/dev-review-scenarios.ts }
+  - { id: TA-DR4, module: src/ux-sim/sim-world/ta/dev-review-scenarios.ts }

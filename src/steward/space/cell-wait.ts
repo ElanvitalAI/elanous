@@ -6,6 +6,13 @@
 //     · green receipt, no verdict yet (JUD)  → 'awaiting-verdict'
 //     · no receipt yet (RES pregate slot)    → 'awaiting-receipt'
 //   A red receipt or a FAIL verdict is NOT waiting — the owner has work (fix and push). A draft PR is the owner's own work.
+//   STEWARD-READY-LANES (11-28 · steward:hq agreement 72% → 11% after #40627): with no open PR left, the green-triage lane
+//   of the cell (`eln release checklist green-triage` · release-loop/green-triage.ts) decides —
+//     · lane a «judge now» (a cited PR merged on origin/main ⊕ a receipt for it) → 'awaiting-judge': JUD signs it (judge-
+//       butler · R3), no hand has a move. 11-28 01:00Z the shadow paired JUDGE-GATE-MISCLASS-FIX / COORD-RIGHTS-INVENTORY.
+//     · lane b «produce evidence» (merged, no receipt) is hand work, given ONCE: a hand that got it keeps it for the
+//       steward's stall clock (graphs/policies/steward-hq.yaml stall_min · not the 45-min lease) — 11-28
+//       CAPSULE-A1-POLICY drew 3 hands in 40 min.
 // Consumers: `eln work next` (a waiting cell does not count toward WIP 1, and is never offered as READY) · the 행정관 R1
 // (a hand whose every cell waits is woken with «take work next», not on its own cell) · the hand drive (goal-drive.ts).
 //
@@ -13,12 +20,27 @@
 // (same sources the steward already reads) · 수복과 인계 = when the verdict/receipt lands the cell is active again and
 // `eln work next` hands it back first (exit 4 = continue your own cell).
 
-export type CellWait = 'hold' | 'awaiting-land' | 'awaiting-verdict' | 'awaiting-receipt';
+export type CellWait = 'hold' | 'awaiting-land' | 'awaiting-verdict' | 'awaiting-receipt' | 'awaiting-judge';
 
-export interface WaitPr { readonly number: number; readonly head: string; readonly branch: string; readonly title: string; readonly draft: boolean }
+/** green-triage lanes that change «ready for a hand»: judge = lane a (JUD signs) · evidence = lane b (one hand). Lane c
+ *  (supply) is the default and is not stored. */
+export type HandLane = 'judge' | 'evidence';
+export interface CellLanes {
+  /** cell id → lane (lane c not stored). */
+  readonly cells: Readonly<Record<string, HandLane>>;
+  /** A lane-b cell given to a hand stays with it this long past the latest of its change / the owner's activity — the
+   *  policy pack's stall clock (steward-hq.yaml stall_min), not the 45-min lease. Absent = the plain lease. */
+  readonly holdMin?: number;
+}
+
+export interface WaitPr { readonly number: number; readonly head: string; readonly branch: string; readonly title: string; readonly draft: boolean; readonly body?: string; readonly updatedAt?: string }
 export interface WaitReceipt { readonly pr: number; readonly head12: string; readonly status: string }
 export interface WaitVerdict { readonly pr: number; readonly head12: string; readonly kind: string; readonly verdict: string }
-export interface WaitFacts { readonly prs: readonly WaitPr[]; readonly receipts: readonly WaitReceipt[]; readonly verdicts: readonly WaitVerdict[] }
+export interface WaitFacts {
+  readonly prs: readonly WaitPr[]; readonly receipts: readonly WaitReceipt[]; readonly verdicts: readonly WaitVerdict[];
+  /** green-triage lanes by cell id (absent = unknown → no lane rule: the pre-lane behaviour). */
+  readonly lanes?: CellLanes;
+}
 
 const escape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -31,7 +53,8 @@ export function prNamesCell(pr: Pick<WaitPr, 'title' | 'branch'>, cellId: string
 /** Why the cell waits on someone else, or null (the owner can move it / no PR facts). */
 export function cellWaitOf(cellId: string, facts: WaitFacts): CellWait | null {
   const prs = facts.prs.filter((pr) => !pr.draft && prNamesCell(pr, cellId));
-  if (!prs.length) return null;
+  // No open PR of the cell: lane a waits on JUD — unless the owner has a draft PR of it open (its own work).
+  if (!prs.length) return facts.lanes?.cells[cellId] === 'judge' && !facts.prs.some((pr) => pr.draft && prNamesCell(pr, cellId)) ? 'awaiting-judge' : null;
   const waits = prs.map((pr): CellWait | null => {
     const head12 = pr.head.slice(0, 12);
     const verdicts = facts.verdicts.filter((v) => v.pr === pr.number && v.head12 === head12);
@@ -45,6 +68,18 @@ export function cellWaitOf(cellId: string, facts: WaitFacts): CellWait | null {
   // Any PR of the cell with owner work left (red) makes the cell active.
   if (waits.some((w) => w === null)) return null;
   return waits[0]!;
+}
+
+/** Lease minutes for a hand holding this cell: a lane-b cell holds `lanes.holdMin`, everything else `leaseMinutes`. */
+export const handLeaseMinutes = (cellId: string, lanes: CellLanes | undefined, leaseMinutes: number): number =>
+  (lanes?.cells[cellId] === 'evidence' && lanes.holdMin !== undefined ? Math.max(leaseMinutes, lanes.holdMin) : leaseMinutes);
+
+/** green-triage → the lanes (lane a ⊕ lane b ids · lane c not stored) ⊕ the lane-b hold. */
+export function lanesOfTriage(rows: { readonly judge: readonly { readonly id: string }[]; readonly evidence: readonly { readonly id: string }[] }, holdMin?: number): CellLanes {
+  const cells: Record<string, HandLane> = {};
+  for (const r of rows.evidence) cells[r.id] = 'evidence';
+  for (const r of rows.judge) cells[r.id] = 'judge';
+  return { cells, ...(holdMin !== undefined ? { holdMin } : {}) };
 }
 
 // PR-DONE (CEO 11-27 07:3x · revised 07:5x OPS-RULES «처리량 정책 개정 11-27» ①②): the land line owns the receipt and the

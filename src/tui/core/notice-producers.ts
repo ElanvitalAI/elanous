@@ -2,7 +2,7 @@ import type { NextTuiQueueItem, NextTuiQueueMailSpan, NextTuiQueueNoticeSource, 
 import { isUrgentSeatMail } from '../seat-mail-priority.js';
 import { SEAT_MAIL_DIGEST_BODY_CHARS, SEAT_MAIL_PASSIVE_DIGEST_BODY_CHARS, seatMailDigestLine, seatMailDigestPrefix } from '../seat-mail-digest.js';
 import { seatMailRoute } from '../seat-mail-turn-policy.js';
-import { seatMessageContextBlock, type ContextHeaderInput } from '../../msg/msg-context-header.js';
+import { modelContextHeader, seatMessageContextBlock, type ContextHeaderInput } from '../../msg/msg-context-header.js';
 import type { MessageOrigin } from '../../msg/msg-store.js';
 import { legacyIntent } from '../../msg/msg-receipts.js';
 import { classifySeatMail } from '../queue-finish-first.js';
@@ -138,7 +138,9 @@ export function seatMessageNoticeParts(message: SeatMessageNoticeInput, declared
   }
   const frame = federationWorkOrderFrame({ msgId: message.id, from: message.fromSeat ?? message.sender,
     intent: message.intent ?? legacyIntent(message.kind), crownDirective: message.crownDirective ?? null });
-  const lead = `${FEDERATION_WORK_ORDER_NOTE}\n${frame.open}\n`;
+  // Crown mail keeps the §5d origin on the first line as well as inside the work-order frame.
+  const crownHeader = message.crownDirective ? modelContextHeader(message) : null;
+  const lead = `${crownHeader ? `${crownHeader}\n` : ''}${FEDERATION_WORK_ORDER_NOTE}\n${frame.open}\n`;
   const block = seatMessageContextBlock({ ...message, body });
   return { text: `${lead}${block}\n${frame.close}${tail}`, bodyAt: lead.length + block.length - body.length, bodyLength: body.length };
 }

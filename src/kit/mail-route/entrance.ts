@@ -5,7 +5,7 @@
 import type { WakeDeps } from '../../loops/msg-wake.js';
 import type { RerouteInput } from '../../msg/dormant-reroute.js';
 import { routeDormant } from './dormant.js';
-import { liveHandCellLookups, type HandCellLookups } from './hand-cells.js';
+import { liveHandCellLookups, liveHandParentOf, type HandCellLookups } from './hand-cells.js';
 import { cheapHandClassifier } from './hand-classifier.js';
 import { routeHandMail, type HandRoot, type HandRootClassifier } from './hand-route.js';
 import type { HandRoutesTable } from './hand-routes.js';
@@ -34,13 +34,16 @@ export interface EntranceOptions {
   /** Defaults to the live checklist (null under bun test); `null` = no cell lookups. */
   readonly cells?: HandCellLookups | null;
   readonly table?: HandRoutesTable;
+  /** The federation ladder parent of a seat — hand-routes.yaml `defaultOwner: coordinator` (live ladder; null under bun test). */
+  readonly parentOf?: ((seat: string) => string | null) | null;
 }
 
 export async function routeAtEntrance(envelope: EntranceEnvelope, opts: EntranceOptions = {}): Promise<EntranceMove[]> {
   const moves: EntranceMove[] = [];
   const classify = opts.classifyHand === undefined ? (text: string) => cheapHandClassifier(text) : opts.classifyHand;
   const cells = opts.cells === undefined ? liveHandCellLookups() : opts.cells;
-  const hand = await routeHandMail(envelope, classify, { ...(opts.table ? { table: opts.table } : {}), claimedCellOf: cells?.claimedCellOf ?? null, cellOwnerOf: cells?.cellOwnerOf ?? null });
+  const parentOf = opts.parentOf === undefined ? liveHandParentOf() : opts.parentOf;
+  const hand = await routeHandMail(envelope, classify, { ...(opts.table ? { table: opts.table } : {}), claimedCellOf: cells?.claimedCellOf ?? null, cellOwnerOf: cells?.cellOwnerOf ?? null, parentOf });
   if (hand) {
     if (hand.rerouted) moves.push({ kind: 'hand-route', to: envelope.to, into: hand.to, note: hand.note, root: hand.root });
     Object.assign(envelope, { to: hand.to, refs: hand.refs, body: hand.body });

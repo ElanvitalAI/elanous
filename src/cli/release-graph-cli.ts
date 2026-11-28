@@ -21,6 +21,7 @@ import { userConfigPath } from '../user-config.js';
 import { defaultConditionProbes } from '../loops/trigger-conditions.js';
 import { readSchedule } from '../release-loop/feature-store.js';
 import { dispatchScheduledGraph } from '../release-loop/scheduled-graph-dispatch.js';
+import { announceBoardFlip, flipBoardAfterPublish } from '../release-loop/current-board.js';
 import {
   compareTable, configuredMode, createRun, criticalPath, defaultDetect, defaultStart, listRuns, loadRun, createRehearsal, markDone, enterQuickSurgery, noGoWith, skipStep, pidAlive, rehearsalKey, rehearsalReceiptPath,
   releaseHome, releaseSteps, resumeFrom, runDir, stepsFor, tickRelease, type ExecDeps, type PlanOptions, type PlanPaths, type ReleaseClock,
@@ -94,6 +95,38 @@ export function defaultExecDeps(stateRoot: string, over: Partial<ExecDeps> = {})
       try { return `msg#${store.post({ from: 'release-graph', to, kind, body } as Parameters<typeof store.post>[0]).id}`; } finally { store.close(); }
     },
     planOptions,
+    // CURRENT-RELEASE-ONE-SOURCE: the one current-board record (release ledger root) + one bus/fact announcement per flip.
+    flipBoard: (published, input) => {
+      const r = flipBoardAfterPublish({ published, by: input.by, cause: input.cause, now: input.now });
+      const announced = r.kind === 'flipped' ? announceBoardFlip(r.record, { stateRoot }) : undefined;
+      return { kind: r.kind, current: r.record.current, previous: r.record.previous, ...(r.kind === 'refused' ? { reason: r.reason } : {}), ...(announced ? { announced } : {}) };
+    },
+    // RELEASE-PRESIGNED-AUTO: the same kit gate critpath uses, fed from this run's own cut (cut.json) and the critpath
+    // dry-run ledger the `prepare` step wrote (binding ⊕ dryRunPass). No prepare yet → no binding → not a GO.
+    preAuthGo: async (version, profile, opts) => {
+      const home = releaseHome(version);
+      const read = <T>(path: string): T | null => { try { return JSON.parse(readFileSync(path, 'utf8')) as T; } catch { return null; } };
+      const cut = read<{ sha?: string }>(join(home, 'cut.json'))?.sha?.trim().toLowerCase();
+      const crit = read<{ binding?: { version: string; cutSha: string; notesSha256: string }; dryRunPass?: { cutSha: string; notesSha256: string; at: string } }>(join(home, 'critpath.json'));
+      const run = loadRun(stateRoot, version);
+      if (!crit?.binding || !run) return { ok: false, reason: 'no critpath dry-run binding yet' };
+      // Terra r1: bind to what publish ships — the prepared folder's own source commit (release.json) — and to this run's
+      // version and notes bytes; the cut file is the run's cut. Any mismatch fails the cut-head condition (closed).
+      const prepared = read<{ version?: string; sourceCommit?: string }>(join(run.prepDir, 'release.json'));
+      if (crit.binding.version !== version || prepared?.version !== version) return { ok: false, reason: `critpath binding/prepare is for ${crit.binding.version}/${prepared?.version ?? 'none'}, not ${version}` };
+      const { createHash } = await import('node:crypto');
+      let notesSha = '';
+      try { notesSha = createHash('sha256').update(readFileSync(run.notesFile)).digest('hex'); } catch { notesSha = ''; }
+      if (notesSha !== crit.binding.notesSha256) return { ok: false, reason: `notes changed since the dry run (${notesSha.slice(0, 12) || 'unreadable'} ≠ ${crit.binding.notesSha256.slice(0, 12)})` };
+      const { defaultPreAuthDeps } = await import('./release-critpath-cli.js');
+      const { preAuthUseLine } = await import('../kit/release-preauth/index.js');
+      const preparedCommit = prepared?.sourceCommit?.trim().toLowerCase() ?? '';
+      if (preparedCommit !== crit.binding.cutSha) return { ok: false, reason: `prepared ${preparedCommit.slice(0, 12) || 'none'} ≠ dry-run cut ${crit.binding.cutSha.slice(0, 12)}` };
+      const r = await (await defaultPreAuthDeps()).gate({ binding: crit.binding, preparedCommit, branchHead: cut ?? new Error('cut.json missing'),
+        notesFile: run.notesFile, ...(crit.dryRunPass ? { dryRunPass: crit.dryRunPass } : {}), modes: profile === 'normal' ? ['auto'] : ['auto', 'surgery'] },
+        { record: opts.record, by: `release-graph:${version}:go` });
+      return r.ok ? { ok: true, id: r.use.preAuthId, mode: r.use.mode, line: preAuthUseLine(r.use) } : { ok: false, reason: r.reasons.join('; ') };
+    },
     ...over,
   };
 }

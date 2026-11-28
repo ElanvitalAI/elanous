@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { resolveCurrentInstance } from '../instance/current.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { addItem, checklistDevVersion, checklistHistory, devVersion, listChecklist } from '../release-loop/checklist.js';
+import { addItem, checklistDevVersion, checklistHistory, listChecklist } from '../release-loop/checklist.js';
 import { assignedVersions as assignedChecklistVersions } from '../release-loop/feature-store.js';
 import { resolveTimeZone } from '../time/time-zone.js';
 import { adaptIOSChatEdgeInputs, hasChangedIOSChatEdgeTouch, isIOSChatEdgeSeed } from './ios-chat-edge-adapter.js';
@@ -25,6 +25,7 @@ import {
   type EdgeCreatorSeed,
   type EdgeCreatorScenarioTrace,
 } from './edge-creator.js';
+import { boardVersion } from '../release-loop/board-version.js';
 
 const DEFAULT_NIGHTLY_AT = '02:00';
 // 출처: src/domains/watch-default-scheduler.ts polls daemon-owned daily work once per minute.
@@ -107,7 +108,7 @@ export interface EdgeCreatorNightlyDeps {
 export async function runEdgeCreatorNightly(deps: EdgeCreatorNightlyDeps = {}): Promise<EdgeCreatorNightlyResult> {
   const cpuStartedAt = process.cpuUsage();
   const observe = deps.log ?? ((category: string, event: string, data: Record<string, unknown>) => debug.log(category, event, data));
-  const version = (deps.version ?? devVersion)();
+  const version = (deps.version ?? boardVersion)();
   const checklistVersion = checklistDevVersion(version);
   let availableChecklistVersions = new Set<string>();
   let checklistVersionLookupError: string | undefined;
@@ -425,7 +426,7 @@ export function startEdgeCreatorNightlyScheduler(deps: EdgeCreatorNightlySchedul
       const result = deps.run ? await deps.run(pendingFailures, { lastRunHead: savedState.lastRunHead, scenarioTraces: savedState.scenarioTraces })
         : await runEdgeCreatorNightly({ ...deps.nightlyDependencies, pendingFailures,
         planOptions: { head: head!, priorReceipts: receipts, greenStreakByHash, changedTouches: changedPaths!,
-          incidentHistory: (deps.readIncidentHistory ?? readIncidentHistory)(checklistDevVersion(devVersion()), EDGE_CREATOR_INCIDENT_SEEDS, pendingFailures),
+          incidentHistory: (deps.readIncidentHistory ?? readIncidentHistory)(boardVersion(), EDGE_CREATOR_INCIDENT_SEEDS, pendingFailures),
           traceByTuple: savedState.scenarioTraces },
         scenarioTraces: savedState.scenarioTraces });
       deps.onNightlyResult?.(result);

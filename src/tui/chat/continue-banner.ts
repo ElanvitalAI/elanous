@@ -11,6 +11,7 @@ export const CONTINUE_REASON = {
   turnLimit: (n: number, limit: number) => `turn-limit ${n}/${limit}`,
   nextStep: 'next-step',
   remainingPlan: 'remaining-plan',
+  delegationFallback: 'delegation-fallback',
 } as const;
 
 const RESUME_BY_ORIGIN: Readonly<Partial<Record<InternalTurnOrigin | string, string>>> = {
@@ -30,6 +31,7 @@ export function continueLabel(origin: InternalTurnOrigin | string, reason?: stri
     if (limit) return `Continuing (turn limit reached · ${limit[1]}/${limit[2]})`;
     if (reason === CONTINUE_REASON.remainingPlan) return 'Continuing (remaining plan)';
     if (reason === CONTINUE_REASON.nextStep) return 'Continuing (next step)';
+    if (reason === CONTINUE_REASON.delegationFallback) return 'Continuing (doing the delegated work directly)';
     return 'Continuing';
   }
   return RESUME_BY_ORIGIN[origin] ?? 'Resuming';

@@ -121,9 +121,9 @@ test('retry recovers the creation record after interruption following state publ
 });
 
 describe('plan', () => {
-  test('quick path = the 21 golden steps; the full path adds the hard rehearsal and telemetry', () => {
+  test('quick path = the 21 golden steps + the board flip; the full path adds the hard rehearsal and telemetry', () => {
     expect(stepsFor(loadRun(root, V)!, OPTS).map(s => s.id)).toEqual(['cli-fresh', 'notes', 'roster', 'schedule', 'cut', 'cut-push', 'pregate', 'prebuild',
-      'prepare', 'rehearsal', 'go', 'notes-public', 'publish', 'npm', 'verify', 'docs', 'rail', 'els-restart', 'update-all', 'dev-bump', 'traffic-restore']);
+      'prepare', 'rehearsal', 'go', 'notes-public', 'publish', 'board-flip', 'npm', 'verify', 'docs', 'rail', 'els-restart', 'update-all', 'dev-bump', 'traffic-restore']);
     const full = releaseSteps(V, CLOCK, { notesFile: '/h/notes.md', prepDir: '/h/prep' }, OPTS);
     expect(full.filter(s => !s.quick).map(s => s.id)).toEqual(['rehearsal-hard', 'telemetry']);
   });
@@ -171,6 +171,8 @@ describe('plan', () => {
     expect(byId.get('rail')).toBe("RAIL_HOSTS='local mbp node-b minim5' zsh /hq/seat-state/OP/tools/rail-now.sh");
     expect(byId.get('traffic-restore')).toBe('zsh /hq/seat-state/OP/tools/traffic-knob.sh restore');
     expect(byId.get('go')).toBe(null);
+    expect(byId.get('board-flip')).toBe(null); // in-process (CURRENT-RELEASE-ONE-SOURCE), needs only publish
+    expect(stepsFor(loadRun(root, V)!, OPTS).find(s => s.id === 'board-flip')!.needs).toEqual(['publish']);
   });
 
   test('critical path with the measured warm durations', () => {
@@ -193,8 +195,8 @@ describe('shadow', () => {
     await tickFor('shadow', 12 * 60, 2);
     const rows = readLedger(root, V);
     const would = rows.filter(r => r.kind === 'would-run').map(r => r.step);
-    expect(would.length).toBe(20); // 21 − the go gate
-    expect(new Set(would).size).toBe(20);
+    expect(would.length).toBe(21); // 22 − the go gate (board-flip would-runs: a shadow publish never flips)
+    expect(new Set(would).size).toBe(21);
     expect(started).toEqual([]);
     expect(mail).toEqual([]);
     const wr = (id: string) => Date.parse(String(rows.find(r => r.kind === 'would-run' && r.step === id)!.at));

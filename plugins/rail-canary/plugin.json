@@ -1,0 +1,28 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "rail-canary",
+  "name": "rail-canary",
+  "version": "1.0.0",
+  "description": "레일(설치 빌드 교체) 직후 30분 탐침 5개 — 이전 빌드에서 통과하던 탐침이 깨지면 이전 빌드로 자동 되돌림(빌드당 1회) ⊕ els 재기동 ⊕ OP 카드(용의자 PR)",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "rail-canary",
+          "agent": "../../graphs/loop-agents/rail-canary/agent.yaml",
+          "trigger": "../../graphs/triggers/rail-canary-agent.yaml",
+          "kpis": [
+            "canary_fail_to_rollback_minutes",
+            "false_rollbacks"
+          ]
+        }
+      ]
+    }
+  }
+}

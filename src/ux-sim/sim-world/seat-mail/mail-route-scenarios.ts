@@ -110,13 +110,16 @@ const mr3: SimWorldScenario = {
       store.post({ from: 'LAND-GRAPH', to: 'OP', kind: 'status', body: 'landed #40001' });
       store.post({ from: 'LAND-GRAPH', to: 'OP', kind: 'status', body: 'landed #40002' });
       store.post({ from: 'LAND-GRAPH', to: 'OP', kind: 'status', body: 'train stuck', priority: 1 });
+      store.post({ from: 'LAND-GRAPH', to: 'OP', kind: 'status', body: '[land-graph · stall] #40003 ready 30+ min' });
+      store.post({ from: 'LAND-GRAPH', to: 'OP', kind: 'status', body: '[land-graph · stall] #40003 still waiting' });
+      store.post({ from: 'LAND-GRAPH', to: 'OP', kind: 'status', body: '[land-graph · no-receipt] #40003 receipt missing' });
       const before = store.list('OP').map((m) => m.body);
       nowMs += 31 * 60_000;
       const digest = store.flushOpDigestIfDue();
       const after = store.list('OP').map((m) => m.from);
-      const facts = { before, digestFrom: digest?.from ?? null, digestCounts: digest?.body.includes('LAND-GRAPH 2') ?? false, after };
+      const facts = { before, digestFrom: digest?.from ?? null, digestCounts: digest?.body.includes('LAND-GRAPH 5') ?? false, grouped: digest?.body.includes('#40003 · stall · 2건') && digest?.body.includes('#40003 · no-receipt · 1건'), after };
       ctx.recorder.event('mr3-p0', facts);
-      if (before.length === 1 && before[0] === 'train stuck' && facts.digestFrom === 'SIGNAL-DIGEST' && facts.digestCounts && after.length === 2) return { ok: true };
+      if (before.length === 3 && before.includes('train stuck') && before.includes('[land-graph · stall] #40003 ready 30+ min') && before.includes('[land-graph · no-receipt] #40003 receipt missing') && facts.digestFrom === 'SIGNAL-DIGEST' && facts.digestCounts && facts.grouped && after.length === 4) return { ok: true };
       return fail('P0 waited for the digest or plain machine mail did not fold', JSON.stringify(facts));
     } finally { store.close(); }
   },

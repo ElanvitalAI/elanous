@@ -37,6 +37,7 @@ card:
   actions:
     - classify
     - open-cell
+    - reclassify
   wake_events:
     - PR 닫힘(병합 없이)
     - 런 사망(run-ledger stop·failed)
@@ -118,6 +119,8 @@ body:   # tier ① routing — observe outcome → steps (ok · breach · unknow
 actions:   # v3 plan (LOOP-AGENT-V3-SMART-2): the card rights as plan choices · fallback = what the plan runs once a knowhow line says the action keeps failing
   - { id: classify, channel: self, target: self, serves: [unclassified_deaths], cost: $policies.cost_act, default: true }
   - { id: open-cell, channel: self, target: self, serves: [unclassified_deaths], cost: $policies.cost_act }
+  # DETECT-TO-ACTION (11-28): an «unclassified» row whose fresh evidence (closing comment) now classifies — the missing ladder step
+  - { id: reclassify, channel: self, target: self, serves: [unclassified_deaths], cost: $policies.cost_act }
 voice:   # tier ③ — one LLM turn only when spoken to (role router · coordinator) · facts-only fold over budget
   channel: loop:autopsy
   speak_on: [kpi-breach, kpi-recovered, subject-lost]

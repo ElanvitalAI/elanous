@@ -1714,6 +1714,10 @@ registerStartCommand(program);
 registerGroundingSourcesCli(program);
 registerGraphCommands(program);
 registerLoopCommands(program);
+if (!INDEX_FAST_ROOT || INDEX_FAST_ROOT === 'def') {
+  const { registerDefinitionCommands } = require('./definitions/cli.js') as typeof import('./definitions/cli.js');
+  registerDefinitionCommands(program);
+}
 registerLandCommands(program);
 registerResourceCommands(program);
 // RFC 실행·착지 루프 §3 — 태스크 컨텍스트 카드(`elanous card list|show` · ⛔ `task`/`tasks` 는 TOX 몫).
@@ -1810,6 +1814,13 @@ workCmd.command('priority [entries...]').description('Show or set federation.pri
   .action(async (entries: string[], opts: { clear?: boolean; by?: string; json?: boolean }) => {
     process.exitCode = (await import('./steward/space/work-next-cli.js')).runWorkPriorityCli(entries ?? [], opts);
   });
+workCmd.command('roster [ids...]').description('Show or set OP\'s roster rank for a version (cell ids in rank order) — `work next` claims roster cells in this order, then by priority · reserve («[예비 …]») only when no roster cell is claimable')
+  .option('--version <v>', 'checklist version (default: current dev)')
+  .option('--by <seat>', 'who set it (default: ELANOUS_TRACK or OP)')
+  .option('--json', 'JSON output')
+  .action(async (ids: string[], opts: { version?: string; by?: string; json?: boolean }) => {
+    process.exitCode = (await import('./kit/work-pull/roster-cli.js')).runWorkRosterCli(ids ?? [], opts);
+  });
 workCmd.command('block <cell>').description('My cell waits on another seat (approval · HOLD · decision): park it on my coordinator\'s board as blocked-on:<seat> (lease released · one exception mail to that seat\'s coordinator) — then run `eln work next`. The cell comes back to me first when that seat answers.')
   .requiredOption('--on <seat>', 'the seat the cell waits on (e.g. RES)')
   .requiredOption('--reason <text>', 'one line: what it waits for')
@@ -1818,6 +1829,30 @@ workCmd.command('block <cell>').description('My cell waits on another seat (appr
   .option('--json', 'JSON result')
   .action(async (cell: string, opts: { on?: string; reason?: string; seat?: string; version?: string; json?: boolean }) => {
     process.exitCode = await (await import('./steward/space/work-next-cli.js')).runWorkBlockCli(cell, opts);
+  });
+// DEV-REVIEW-COMMON — the review units the TA journey and the hand path share (graphs/review/*.yaml · src/kit/dev-review).
+const workReviewCmd = workCmd.command('review').description('Shared dev review (graphs/review): cell-review⊕pre-impl on a cell · post-impl on a PR\'s first pregate · same judge line as the judge butler');
+workReviewCmd.command('cell <cell>').description('cell-review@1 (doneCriterion: empty → write · weak → strengthen append-only · judge split) then pre-impl@1 (edges → FU cells now) — `work next` runs this detached on every claim')
+  .option('--version <v>', 'checklist version (default: current dev)')
+  .option('--dry-run', 'judge and record only — write nothing to the board')
+  .option('--force', 'review again even when this criterion text was reviewed')
+  .option('--json', 'JSON result')
+  .action(async (cell: string, opts: { version?: string; dryRun?: boolean; force?: boolean; json?: boolean }) => {
+    process.exitCode = await (await import('./kit/dev-review/live.js')).runCellReviewCli(cell, opts);
+  });
+workReviewCmd.command('post <pr>').description('post-impl@1 on one PR: the judge\'s sign decision on its own facts before the judge (predicted refusal → one cell line · unmet edges → FU cells)')
+  .option('--version <v>', 'checklist version (default: current dev)')
+  .option('--dry-run', 'judge and record only — write nothing to the board')
+  .option('--json', 'JSON result')
+  .action(async (pr: string, opts: { version?: string; dryRun?: boolean; json?: boolean }) => {
+    process.exitCode = (await (await import('./kit/dev-review/live.js')).runPostImplCli(Number(pr), opts)).code;
+  });
+workReviewCmd.command('scan').description('first-pregate scan (graphs/triggers/dev-review-post-impl.yaml): post-impl@1 for each PR whose first receipt landed after the watermark')
+  .option('--version <v>', 'checklist version (default: current dev)')
+  .option('--dry-run', 'judge and record only — write nothing to the board')
+  .option('--json', 'JSON result')
+  .action(async (opts: { version?: string; dryRun?: boolean; json?: boolean }) => {
+    process.exitCode = await (await import('./kit/dev-review/live.js')).runPostImplScan(opts);
   });
 // OP-PULSE — `eln pulse status|verify|burst …` (structural pulse that replaces OP's pinned standing goal).
 (await import('./loops/op-pulse-cli.js')).registerPulseCommands(program);
@@ -1858,6 +1893,16 @@ fedCmd.command('chatlog').description('All-seat chat log: every seat\'s turns (i
   .action(async (opts: { since?: string; turns?: string; seat?: string; grep?: string; clip?: string; mail?: boolean; maxBytes?: string; json?: boolean }) => {
     process.exitCode = await (await import('./fed-observe/fed-observe-cli.js')).runFedChatlogCli(opts);
   });
+// FED-ANALYST-LOOP-AGENT (0.3.39) — the 30-min federation analysis (six lines ⊕ topology pass board), deterministic; the loop
+// agent fed-analyst runs the same function every 30 min (graphs/loop-agents/fed-analyst/agent.yaml).
+fedCmd.command('analyze').description('30-min federation analysis: six finding lines (who · what · re-check) ⊕ topology pass board — numbers are deterministic, prose optional (--prose)')
+  .option('--at <iso>', 'window end (default now)').option('--window <min>', 'window minutes', '30')
+  .option('--mail <file>', 'recorded chat-log mail.jsonl instead of the msg store').option('--panes <file>', 'recorded screens/panes.tsv instead of the fed snapshot')
+  .option('--prose', 'rephrase the six facts with the cheap-tier LLM (numbers stay)').option('--write', 'append the analyst ledger ⊕ rewrite FED-ANALYST-NOW.md ⊕ sync cases')
+  .option('--json', 'JSON output')
+  .action(async (opts: { at?: string; window?: string; mail?: string; panes?: string; prose?: boolean; write?: boolean; json?: boolean }) => {
+    process.exitCode = await (await import('./fed-analyst/cli.js')).runFedAnalyzeCli(opts);
+  });
 const stewardSpaceCmd = stewardCmd.command('space').description('행정관 — per-coordinator steward graph (graphs/steward/space.yaml)');
 stewardSpaceCmd.command('status').description('Last tick per scope: counts · rollup · escalations')
   .option('--scope <seat>', 'One coordinator scope, e.g. TC')
@@ -1871,6 +1916,18 @@ stewardSpaceCmd.command('tick').description('Run the steward graph now for one s
   .option('--json', 'Print run state as JSON')
   .action(async (opts: { scope?: string; shadow?: boolean; json?: boolean }) => {
     process.exitCode = (await import('./steward/space/status.js')).runStewardSpaceTickCli(opts);
+  });
+
+const stewardHqCmd = stewardCmd.command('hq').description('교통 행정관 steward:hq — the HQ instance of the space steward (FEDERATION-STEWARDS §5a)');
+stewardHqCmd.command('shadow-report').description('Shadow «would pair» rows vs what OP actually assigned (fed-state) · agreement vs the §5a target')
+  .option('--since <w>', 'window (30m · 1h · 1d)', '1h')
+  .option('--hq <seat>', 'HQ seat', 'OP')
+  .option('--root <dir>', 'state root (default: this instance)')
+  .option('--facts <path>', 'fed-state facts.jsonl (default: <root>/fed-state/facts.jsonl)')
+  .option('--replay', 'Replay the kept R0 snapshots instead of reading the shadow ledger')
+  .option('--json', 'JSON output')
+  .action(async (opts: { since?: string; hq?: string; root?: string; facts?: string; replay?: boolean; json?: boolean }) => {
+    process.exitCode = (await import('./steward/space/hq-shadow-cli.js')).runHqShadowReportCli(opts);
   });
 
 program.command('directive').description('Turn instructions into Linear issues')
@@ -2616,6 +2673,22 @@ program
     const unknown = rows.filter((r) => r.v.tier === '⛔ 못 잰다').length;
     console.log(`\n업무 ${rows.length}건 · 입력 ${tok.toLocaleString()} 토큰 · 비용 ≈ $${(tok * 0.042 / 1e6).toFixed(4)}`);
     if (unknown) console.log(`⛔ 「현재판단」 칸이 빈 업무 ${unknown}건 — 순위를 매기지 «않았다». 인터뷰로 채워라.`);
+  });
+
+// ── jev-recall-agreement (JEV-MEMORY-RECALL — 기억 회상 luna ↔ Jev 그림자 일치율) ──
+program
+  .command('jev-recall-agreement')
+  .description('기억 회상 판정의 그림자 일치율(luna vs Jev)을 읽는다 — 원장 <state>/jev/memory-recall-shadow.jsonl · 전환 스위치 = graphs/policies/jev-sites.yaml memory-recall.params.mode')
+  .option('--since <window>', '창 (예: 30m · 24h · 7d)', '24h')
+  .option('--json', 'JSON 출력')
+  .action(async (opts: { since: string; json?: boolean }) => {
+    const m = /^(\d+)\s*(m|h|d)$/u.exec(opts.since.trim());
+    if (!m) { console.error(`--since 는 30m · 24h · 7d 꼴이다 (받은 것: ${opts.since})`); process.exitCode = 1; return; }
+    const ms = Number(m[1]) * (m[2] === 'm' ? 60_000 : m[2] === 'h' ? 3_600_000 : 86_400_000);
+    const { formatRecallShadowSummary, readRecallShadow, summarizeRecallShadow } = await import('./memory-triage/recall-jev.js');
+    const summary = summarizeRecallShadow(readRecallShadow(), Date.now() - ms);
+    if (opts.json) { await writeStdoutJson(JSON.stringify(summary, null, 2) + '\n'); return; }
+    console.log(formatRecallShadowSummary(summary));
   });
 
 // ── decide-recipe (⛔ 「Claude 없이 도는 결정」 — 질문이 파일에 «고정»되어 있다) ──

@@ -496,7 +496,7 @@ test('loop CLI exposes the five lifecycle actions with safe mutation flags', () 
   const program = new Command();
   registerLoopCommands(program);
   const loop = program.commands.find(c => c.name() === 'loop');
-  expect(loop?.commands.map(c => c.name())).toEqual(['agent', 'list', 'activity', 'status', 'start', 'stop', 'cron', 'run', 'package', 'trigger', 'butler', 'demote', 'promote', 'guardian']);
+  expect(loop?.commands.map(c => c.name())).toEqual(['agent', 'list', 'activity', 'status', 'start', 'stop', 'cron', 'run', 'package', 'trigger', 'index', 'butler', 'demote', 'promote', 'guardian']);
   expect(loop?.commands.find(c => c.name() === 'start')?.options.map(o => o.long)).toContain('--yes');
   expect(loop?.commands.find(c => c.name() === 'stop')?.options.map(o => o.long)).toContain('--yes');
   expect(loop?.commands.find(c => c.name() === 'run')?.options.map(o => o.long)).toContain('--dry-run');

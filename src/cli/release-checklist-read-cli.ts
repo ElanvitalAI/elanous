@@ -6,7 +6,7 @@ import type { Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { CHECKLIST_EVIDENCE_RUN_EVENT, EVIDENCE_COMMIT_ABBREV, checklistEvidenceChain, checklistEvidenceCommand, checklistEvidenceRunLine, devVersion, isTestRunCommand, listChecklist, ownerMatches, parseOwner, parityGap, setItemIfSnapshot, summarizeChecklist, type ChecklistEvidenceStage, type ChecklistItem } from '../release-loop/checklist.js';
+import { CHECKLIST_EVIDENCE_RUN_EVENT, EVIDENCE_COMMIT_ABBREV, checklistEvidenceChain, checklistEvidenceCommand, checklistEvidenceRunLine, evidenceCommandOf, isTestRunCommand, listChecklist, ownerMatches, parseOwner, parityGap, setItemIfSnapshot, summarizeChecklist, type ChecklistEvidenceStage, type ChecklistItem } from '../release-loop/checklist.js';
 import { collectStaleMergedChecklistProposals, type StaleMergedChecklistScan } from '../release-loop/merged-pr-checklist.js';
 import { userConfigPath } from '../user-config.js';
 import { hqLocalHostName } from '../hq/hq.js';
@@ -19,6 +19,9 @@ import { mayWriteReleaseChecklist } from './release-checklist-write.js';
 import { dispatchEvidenceRun, evidenceRunPlan, evidenceTestHosts, parseEvidenceRunCommand, registryHostName, runInIsolatedUniverse, type EvidenceDispatchOutcome, type EvidencePackageFs, type EvidenceRunReceipt, type EvidenceRunRequest, type RegistryHostEntry } from '../release-loop/checklist-evidence-run.js';
 import { resolveGateRemoteSettings, type GateRemoteSettings } from '../self-implement/gate-remote.js';
 import { getUserConfig } from '../user-config/reader.js';
+import { boardVersion } from '../release-loop/board-version.js';
+import { installedBuildSha } from '../fed-observe/sources-live.js';
+import { remoteUrlVia } from '../git-fs/origin-url.js';
 
 export { evidenceRunEnv, parseEvidenceRunCommand, runInIsolatedUniverse, type EvidenceSpawn } from '../release-loop/checklist-evidence-run.js';
 
@@ -33,7 +36,7 @@ export function checklistCodenames(): Record<string, string> {
 }
 
 export function checklistVersion(input: string | undefined, codenames: Record<string, string>): string {
-  const v = input ?? devVersion().replace(/-dev\.\d+$/, '');
+  const v = input ?? boardVersion();
   const resolved = isReleaseVersion(v) ? v : Object.entries(codenames).find(([, name]) => name === v)?.[0] ?? v;
   if (!isReleaseVersion(resolved)) throw new CliUserError(`체크리스트 판 또는 별칭이 아니다: ${v}`);
   return resolved;
@@ -228,14 +231,15 @@ export function collectChecklistEvidenceStages(item: ReturnType<typeof listCheck
     if (!pinSha) e3.reason = `eln --version에서 설치본 SHA를 읽지 못했다${pin.error ? `: ${pin.error}` : ''}`;
     else {
       const repoRoot = run('git', ['rev-parse', '--show-toplevel']);
-      const origin = run('git', ['remote', 'get-url', 'origin']);
+      // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+      const origin = remoteUrlVia((argv) => { const r = run('git', argv); return r.status === 0 ? r.stdout : null; });
       const pinObject = run('git', ['cat-file', '-e', `${pinSha}^{commit}`]);
-      const repoUrl = origin.stdout.trim().replace(/^git@github\.com:/i, 'https://github.com/').replace(/\.git$/i, '').replace(/\/$/u, '').toLowerCase();
+      const repoUrl = (origin ?? '').replace(/^git@github\.com:/i, 'https://github.com/').replace(/\.git$/i, '').replace(/\/$/u, '').toLowerCase();
       const expectedRepos = new Set([
         'https://github.com/elanvitalai/elanous',
         'https://github.com/ElanvitalAI/elanous',
       ]);
-      if (repoRoot.status !== 0 || !repoRoot.stdout.trim() || origin.status !== 0 || !expectedRepos.has(repoUrl) || pinObject.status !== 0) {
+      if (repoRoot.status !== 0 || !repoRoot.stdout.trim() || origin === null || !expectedRepos.has(repoUrl) || pinObject.status !== 0) {
         e3.reason = '현재 git 저장소가 elanous 원본이 아니거나 설치본 pin 객체가 없어 조상 관계를 판정할 수 없다';
       } else {
         // 모든 merge SHA 가 설치본 pin 의 조상이어야 observed — 하나라도 아니면 missing(그 SHA 를 이유에 적는다).
@@ -415,6 +419,16 @@ function gitHeadSha(cwd: string): string | null {
   return /^[a-f0-9]{40}$/u.test(sha) ? sha : null;
 }
 
+/** JUDGE-BUTLER-SELF-RUN-FIX (11-29): the commit an evidence run is dispatched at — the running tree's git HEAD, else (the
+ *  installed package has no .git, so HEAD was null and every dispatch refused «HEAD 커밋을 읽지 못했다») the installed build's
+ *  commit (versions/<dir>/install.json · fed-observe installedBuildSha). A full 40-hex sha only — a test host checks it out. */
+export function evidenceHeadSha(root: string, deps: { gitHead?: (cwd: string) => string | null; installed?: (root: string) => string | null } = {}): string | null {
+  const git = (deps.gitHead ?? gitHeadSha)(root);
+  if (git) return git;
+  const built = (deps.installed ?? ((r: string) => installedBuildSha(r)))(root);
+  return built && /^[a-f0-9]{40}$/u.test(built) ? built : null;
+}
+
 export function defaultChecklistEvidenceRunDeps(by: string, hqWriteAllowed: () => boolean): ChecklistEvidenceRunDeps {
   return {
     hqWriteAllowed,
@@ -430,7 +444,7 @@ export function defaultChecklistEvidenceRunDeps(by: string, hqWriteAllowed: () =
     runId: () => randomUUID(),
     cwd: RUNNING_TREE_ROOT,
     registryHosts: readRegistryHosts,
-    headSha: () => gitHeadSha(RUNNING_TREE_ROOT),
+    headSha: () => evidenceHeadSha(RUNNING_TREE_ROOT),
     dispatch: (request) => {
       let settings: GateRemoteSettings;
       try { settings = resolveGateRemoteSettings(getUserConfig().gateRemote); } catch { settings = resolveGateRemoteSettings(undefined); }
@@ -447,8 +461,8 @@ export function runChecklistEvidence(version: string, id: string, deps: Checklis
       '본부 호스트에서 다시 실행한다 — 시험은 본부가 넥서스 호스트 원장의 등록 시험 호스트로 보낸다');
   const item = deps.readItem(version, id);
   if (!item) throw new CliUserError(`없는 칸: ${id}`);
-  const command = checklistEvidenceCommand(item.title);
-  if (!command) throw new CliUserError(`칸 ${id} 제목에 «완료 경계 증거 명령: <명령>» 이 없다 — 실행·기록·근거 0`, 'release checklist list --json 으로 제목을 확인한다');
+  const command = evidenceCommandOf(item); // the title's command, else the test files its done-when names (SUPERVISORS-EXECUTE-NOT-PROPOSE)
+  if (!command) throw new CliUserError(`칸 ${id} 제목에 «완료 경계 증거 명령: <명령>» 이 없고 완료 조건도 시험 파일을 적지 않았다 — 실행·기록·근거 0`, 'release checklist list --json 으로 제목·완료 조건을 확인한다');
   const parsed = parseEvidenceRunCommand(command);
   if ('refused' in parsed) throw new CliUserError(`칸 ${id} 증거 명령을 실행하지 않는다 — ${parsed.refused}: ${command}`, '제목의 «완료 경계 증거 명령: bun test <저장소 안 상대 경로…>» 로 고친다');
   // 한 워크스페이스 패키지 아래의 시험은 그 패키지 디렉터리에서 돈다(구조 판정: 가장 가까운 package.json) — 패키지가 섞이면 거부.

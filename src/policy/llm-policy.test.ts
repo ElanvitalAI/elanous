@@ -46,6 +46,21 @@ test('missing file and empty YAML preserve code defaults without writing a file'
   }
 });
 
+test('shared YAML reader preserves policy validation and fail-closed syntax errors', () => {
+  const valid = loadLlmPolicy({ configDir: fixture({}, 'version: 1\naccounts:\n  codex:\n    rotateAtPercent: 87\n'), now });
+  expect(valid.valid).toBe(true);
+  expect(valid.policy.accounts.codex.rotateAtPercent).toBe(87);
+  expect(valid.sources['accounts.codex.rotateAtPercent']).toBe('file');
+  for (const text of ['version: 1\nversion: 1\n', 'version: [unclosed\n']) {
+    const root = fixture({}, text);
+    const result = loadLlmPolicy({ configDir: root, now });
+    expect(result.filePresent).toBe(true);
+    expect(result.valid).toBe(false);
+    expect(result.errors.join('\n')).toContain(`invalid policy file ${join(root, 'policy', 'llm.yaml')}`);
+    expect(result.policy).toEqual(defaultLlmPolicy());
+  }
+});
+
 test('explicit null YAML is invalid rather than an empty mapping', () => {
   for (const text of ['null\n', '~\n', '--- null\n']) {
     const root = fixture({}, text);

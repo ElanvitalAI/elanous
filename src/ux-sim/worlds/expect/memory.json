@@ -85,6 +85,341 @@
       "expect": "green",
       "reason": "same seed ⇒ same document and parse · next seed ⇒ another · CRLF and LF parse alike",
       "greenSince": "#40414 (kit/knowhow)"
+    },
+    "memory/MC1-SAVE-RECALL": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC1-SAME-NAME-TWO-SCOPES": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC1-SECRET-REFUSED": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC2-CORRECT": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC2-CORRECT-SAME-SESSION": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC2-RESAVE-NOOP": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC3-FORGET": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC3-FORGET-ONE-PROJECT": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC3-FORGET-MISSING": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC4-SEAT-ISOLATION": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC4-PROJECT-ISOLATION": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC4-COMMON-LABELLED": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC5-NO-USE-FLAG": {
+      "expect": "green",
+      "reason": "MEMORY-NO-USE-FLAG-PER-TASK — seatMemoryRecallText takes a structured per-task memory: off input (recall 0 · tail 0 · store kept)",
+      "greenSince": "MEMORY-NO-USE-FLAG-PER-TASK (SeatMemoryTurnCtx.memory)"
+    },
+    "memory/MC5-NO-USE-KEEPS-STORE": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC5-NO-USE-NEXT-TASK": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC6-WRITE-FAIL": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MC6-INDEX-WRITE-FAIL": {
+      "expect": "green",
+      "reason": "MEMORY-FAILURE-TRUTH — an index write failure puts the entry file back as it was (no half-written entry) and the save reports failure",
+      "greenSince": "MEMORY-FAILURE-TRUTH (writeEntryAndIndexLine rollback)"
+    },
+    "memory/MC6-RECALL-FAIL-NOT-EMPTY": {
+      "expect": "green",
+      "reason": "MEMORY-FAILURE-TRUTH — an unreadable store is traced as memory.recall reason=error, not swallowed as an empty recall",
+      "greenSince": "MEMORY-FAILURE-TRUTH (seatMemoryRecallText error trace)"
+    },
+    "memory/MW1-REPEAT-CORRECTION": {
+      "expect": "red",
+      "reason": "MEMORY-WRITEBACK-WIRE — createSeatMemoryWriteback has no caller; a repeated correction writes nothing",
+      "redReason": "expectation-mismatch: feedbackCards"
+    },
+    "memory/ME1-DECISION-TO-CARD": {
+      "expect": "green",
+      "reason": "ELN-OP-CROWN-MEMORY — a decided CEO card with a directive line writes a crown- card in the OP seat store",
+      "greenSince": "#40727 (ELN-OP-CROWN-MEMORY)"
+    },
+    "memory/ME1-DECISION-NO-SHAPE": {
+      "expect": "green",
+      "reason": "ELN-OP-CROWN-MEMORY — a decided CEO card without a directive line still writes one memory card",
+      "greenSince": "#40727 (ELN-OP-CROWN-MEMORY)"
+    },
+    "memory/ME1-CARD-WITH-SEAT-WORD": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/ME1-CARD-WITHOUT-SEAT-WORD": {
+      "expect": "green",
+      "reason": "ELN-OP-CROWN-MEMORY S2 — a live crown- card reaches every turn tail whatever the turn words",
+      "greenSince": "#40727 (ELN-OP-CROWN-MEMORY)"
+    },
+    "memory/ME1-EXPIRY-JUST-BEFORE": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/ME1-EXPIRY-JUST-AFTER": {
+      "expect": "red",
+      "reason": "MEMORY-BITEMPORAL — turn recall ignores the card expiry (valid_to)",
+      "redReason": "expectation-mismatch: recalled"
+    },
+    "memory/ME1-SUPERSEDED": {
+      "expect": "red",
+      "reason": "MEMORY-BITEMPORAL — no superseded_by: the replaced directive is still recalled",
+      "redReason": "expectation-mismatch: names"
+    },
+    "memory/ME2-PIN-NEXT-TURN": {
+      "expect": "green",
+      "reason": "ELN-OP-CROWN-MEMORY S1 — a pin written after the session-start snapshot reaches the next turn tail",
+      "greenSince": "#40727 (ELN-OP-CROWN-MEMORY)"
+    },
+    "memory/ME2-THREE-PINS": {
+      "expect": "green",
+      "reason": "ELN-OP-CROWN-MEMORY S1 — pins written during the session reach the next turn",
+      "greenSince": "#40727 (ELN-OP-CROWN-MEMORY)"
+    },
+    "memory/ME2-NEW-SESSION": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/ME2-STALE-FLAGGED": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/ME3-GUARD-REFUSES": {
+      "expect": "green",
+      "reason": "ELN-OP-CROWN-MEMORY S3 — the live seat-assign deps carry the directive check and refuse",
+      "greenSince": "#40727 (ELN-OP-CROWN-MEMORY)"
+    },
+    "memory/ME3-GUARD-ALLOWS-MATCH": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/ME3-CONFLICT-LATEST-WINS": {
+      "expect": "red",
+      "reason": "MEMORY-DIRECTIVE-LATEST-WINS — two directives on one seat: the action-time guard (#40727) refuses by the older card; no latest-wins rule and no conflict line",
+      "redReason": "expectation-mismatch: ok"
+    },
+    "memory/ME3-EXPIRED-ALLOWS": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/ME3-POLICY-NO-RECALL": {
+      "expect": "green",
+      "reason": "ELN-OP-CROWN-MEMORY S3 — the ledger/policy check refuses without any recall",
+      "greenSince": "#40727 (ELN-OP-CROWN-MEMORY)"
+    },
+    "memory/ME4-BUS-DECISION-SURVIVES": {
+      "expect": "red",
+      "reason": "MEMORY-BUS-DECISION-TO-CARD — a bus decision item is acked after one turn and leaves no memory card",
+      "redReason": "expectation-mismatch: cards"
+    },
+    "memory/ME4-BUS-SAME-DECISION-TWICE": {
+      "expect": "red",
+      "reason": "MEMORY-BUS-DECISION-TO-CARD — a bus decision posted twice leaves no card (target: exactly one)",
+      "redReason": "expectation-mismatch: cards"
+    },
+    "memory/ME4-ACK-DIGEST-TO-SEAT": {
+      "expect": "red",
+      "reason": "MEMORY-ACK-DIGEST-TO-SEAT — saveAckDigestMemory writes the global store, not the seat store",
+      "redReason": "expectation-mismatch: seat"
+    },
+    "memory/ME5-SEAT-ONE-STORE": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/ME5-USER-ONE-STORE": {
+      "expect": "red",
+      "reason": "MEMORY-STORE-ONE-PER-SCOPE — memoryRoot() is XDG without a stamp and the state root with one (split global store)",
+      "redReason": "expectation-mismatch: same"
+    },
+    "memory/ME6-WRITE-TRACED": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/ME6-RECALL-TRACED": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/ME6-ACK-DIGEST-TRACED": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MX2-SOURCELESS-NOOP": {
+      "expect": "red",
+      "reason": "MEMORY-WRITE-SOURCE-REQUIRED — a source-less crown- candidate is written (shadow gate)",
+      "redReason": "expectation-mismatch: written"
+    },
+    "memory/MX2-WITH-SOURCE-ADD": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MX3-CORE-BLOCK-CAP": {
+      "expect": "green",
+      "reason": "ELN-OP-CROWN-MEMORY S2 — the turn tail carries live directive cards under the YAML caps (turn_max_cards · turn_max_chars)",
+      "greenSince": "#40727 (ELN-OP-CROWN-MEMORY)"
+    },
+    "memory/MX4-STEWARD-CANARY": {
+      "expect": "red",
+      "reason": "MEMORY-STEWARD-LOOP — no memory steward loop agent plugin (graphs/loop-agents/memory-steward) with a canary KPI",
+      "redReason": "expectation-mismatch: steward"
+    },
+    "memory/MX6-HQ-CARD-ROLE-SUBSCRIBE": {
+      "expect": "red",
+      "reason": "MEMORY-FED-ROLE-SUBSCRIBE — an HQ common-layer directive card does not reach a seat turn by role",
+      "redReason": "expectation-mismatch: tcCarried"
+    },
+    "memory/MX7-MAIL-BODY-NO-CARD": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/LA1-INEFFECTIVE-SKIP": {
+      "expect": "red",
+      "reason": "LOOP-AGENT-MEMORY — runAction learns only from failures; an action with no effect is repeated",
+      "redReason": "expectation-mismatch: fourth"
+    },
+    "memory/LA1-FAILURE-PARKS": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/LA2-ROLE-DIRECTIVE-REFUSE": {
+      "expect": "red",
+      "reason": "LOOP-AGENT-MEMORY — runAction does not check role-subscribed directive cards",
+      "redReason": "expectation-mismatch: status"
+    },
+    "memory/MH1-INDEX-OVERFLOW-KEEPS-NEW-CROWN": {
+      "expect": "green",
+      "reason": "MEMORY-INDEX-HYGIENE — an overflowing session-start index keeps live crown- directive card lines first, then fills the rest from the top",
+      "greenSince": "MEMORY-INDEX-HYGIENE (buildSeatMemoryIndexBlock live crown lines first)"
+    },
+    "memory/MH2-NEW-CARD-NOT-UNDER-INVALID": {
+      "expect": "green",
+      "reason": "MEMORY-INDEX-HYGIENE — upsertIndexLine puts a new line at the end of the leading live list, above the first heading",
+      "greenSince": "MEMORY-INDEX-HYGIENE (upsertIndexLine above the first heading)"
+    },
+    "memory/MH3-HOME-ISOLATED-RECALL": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MV7-RESUME-SUMMARY": {
+      "expect": "red",
+      "reason": "SESSION-REHYDRATE — the OP resume snapshot (buildOpHandoffRecall) carries yesterday's decisions · PRs · appointments, not goal · last checked state · remaining decisions",
+      "redReason": "expectation-mismatch: hasGoal"
+    },
+    "memory/MV7-SUMMARY-NOT-PROMOTED": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MV7-DIRECTIVE-CHANGE-NOT-MEMORY": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MV8-SHARE-TWO-PHASES": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MV8-DELETED-NOT-FROM-CACHE": {
+      "expect": "red",
+      "reason": "MEMORY-COHERENCE-DIRECTORY — the session-start index is a per-conversation cache; a common-layer delete stays in it until the next process",
+      "redReason": "expectation-mismatch: cachedIndexHasDeleted"
+    },
+    "memory/MV8-SHARE-FAIL-REPORTED": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MV9-SAME-NAME-TWO-AGENTS": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MV9-RENAME-KEEPS-MEMORY": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MV9-NO-FOREIGN-FALLBACK": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MV10-SEAT-SCOPE-ACROSS-PROJECTS": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
+    },
+    "memory/MV10-PROJECT-PERSONAL": {
+      "expect": "red",
+      "reason": "MEMORY-AGENT-SCOPE-PROJECT-PERSONAL — a seat resolves to one store whatever the repo; no seat × project (project-personal) scope",
+      "redReason": "expectation-mismatch: separate"
+    },
+    "memory/MV10-DELETE-ONE-SCOPE-OTHER-STAYS": {
+      "expect": "green",
+      "reason": "MEMORY-CONTRACT acceptance scene (docs/conductor/MEMORY-CONTRACT.md §5–§8) through the real product door",
+      "greenSince": "MEMORY-CONTRACT (this PR)"
     }
   }
 }

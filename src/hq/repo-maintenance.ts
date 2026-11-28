@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync }
 import { spawnSync } from 'node:child_process';
 import { hostname, homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { remoteUrlVia } from '../git-fs/origin-url.js';
 const TRAIN_REF_TTL_MS = 24 * 60 * 60 * 1000;
 // Pack/ref limits and six-hour cadence come from PLAN-GIT-FILE-IO-MIN-1105.md §1.
 export const MAX_REPO_PACKS = 200;
@@ -289,7 +290,9 @@ export function maintainHqRepo(options: { root?: string; apply?: boolean; expire
   const git = deps.git ?? defaultGit;
   const now = deps.now ?? Date.now;
   if (command(git, repo, ['rev-parse', '--is-bare-repository']) !== 'true') throw new Error(`not an HQ bare repository: ${repo}`);
-  const originUrl = command(git, repo, ['remote', 'get-url', 'origin']);
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+  const originUrl = remoteUrlVia((argv) => { const r = git(repo, argv, 30_000); return r.status === 0 ? r.stdout : null; });
+  if (originUrl === null) throw new Error('git config --get remote.origin.url failed: no origin');
   const initialPlan = currentRefExpiryPlan(root, repo, originUrl, git, deps, now());
   const refExpiryPlan = initialPlan.plan;
   if (options.expireRefs && trainExpiryWarnings(refExpiryPlan).length)

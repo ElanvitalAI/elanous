@@ -3,7 +3,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { classifyLandExit, decide, replayAttempt, security4Hits, tickLand, type Facts, type LandDeps } from './land-graph.js';
+import { appendLedger, classifyLandExit, decide, readLedger, refusalContext, replayAttempt, security4Hits, tickLand, type Facts, type LandDeps } from './land-graph.js';
 
 const pr = { number: 40001, head: 'a'.repeat(40), base: 'main', draft: false, state: 'OPEN' as const, title: 't', author: 'TC', files: ['src/x.ts'] };
 const receipt = { dir: '/r/40001-aaaaaaaaaaaa-minim5', head: 'a'.repeat(40), host: 'minim5', focused: ['src/x.test.ts'], rawDir: '/raw' };
@@ -96,6 +96,25 @@ describe('replayAttempt', () => {
 });
 
 describe('tickLand', () => {
+  test('independent literal: overlapping files wait even with four available slots', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'lg-serial-'));
+    const a = { ...pr, number: 41001, files: ['src/shared.ts'] };
+    const b = { ...pr, number: 41002, files: ['src/shared.ts'] };
+    const c = { ...pr, number: 41003, files: ['src/other.ts'] };
+    const landed: number[] = [];
+    const result = await tickLand({
+      now: () => new Date('2026-11-25T21:00:00Z'), stateRoot: root, mode: 'live', synthetic: true, slots: 4,
+      listPrs: async () => [a, b, c], prNow: async n => [a, b, c].find(p => p.number === n)!,
+      receipt: () => receipt, olderReceiptHead: () => null, focused: () => ({ pass: 9, fail: 0 }), security: () => [],
+      land: async p => { landed.push(p.number); return { rc: 0, text: '' }; }, post: () => {}, record: () => {},
+    });
+    expect(landed).toEqual([41001, 41003]);
+    expect(result.landed).toEqual([41001, 41003]);
+    expect(result.decisions.map(d => [d.pr, d.action, d.cls ?? null])).toEqual([
+      [41001, 'land', null], [41002, 'wait', 'main-moved-overlap'], [41003, 'land', null],
+    ]);
+  });
+
   const deps = (stateRoot: string, over: Partial<LandDeps> = {}): LandDeps => ({
     now: () => new Date('2026-11-25T21:00:00Z'), stateRoot, mode: 'live', slots: 2,
     listPrs: async () => [pr], prNow: async () => pr, receipt: () => receipt, olderReceiptHead: () => null,
@@ -111,6 +130,66 @@ describe('tickLand', () => {
     const root = mkdtempSync(join(tmpdir(), 'lg-')); let lands = 0;
     const res = await tickLand(deps(root, { org: { path: ORG }, judHold: () => ({ reason: 'HOLD verdict hold-40001', by: 'JUD' }), land: async () => { lands++; return { rc: 0, text: '' }; } }));
     expect([lands, res.decisions[0]?.action]).toEqual([0, 'hold']);
+  });
+  // LAND10-RESTICKY-REFUSAL — the #40516 shape (11-27): refused stale-base-revert, then the author added the
+  // «의도된 삭제» lines to the PR body at the SAME head. The refusal used to stick until a new head.
+  describe('same-head refusal re-judged when its context changes (#40516 shape)', () => {
+    const DECLARED = '의도된 삭제: graphs/triggers/a.yaml (moved to agent.yaml)';
+    const world = (root: string, over: Partial<LandDeps> = {}) => {
+      const st = { body: 'feat: move triggers', guard: 0, lands: 0, hold: null as null | { reason: string; by: string } };
+      const cur = () => ({ ...pr, body: st.body });
+      const d = deps(root, {
+        org: { path: ORG }, listPrs: async () => [cur()], prNow: async () => cur(), judHold: () => st.hold,
+        staleRevert: p => { st.guard++; return (p.body ?? '').includes('의도된 삭제') ? { ok: true } : { ok: false, why: 'graphs/triggers/a.yaml←30ee342ce9 (not own)' }; },
+        land: async () => { st.lands++; return { rc: 0, text: '' }; }, ...over,
+      });
+      return { st, d };
+    };
+    test('body unchanged → the refusal sticks (guard runs once) · body gains «의도된 삭제» → same head re-judged and lands', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'lg-')); const { st, d } = world(root);
+      await tickLand(d); await tickLand(d);
+      expect([st.guard, st.lands]).toEqual([1, 0]);
+      const refused = readLedger(root).filter(r => r.event === 'refused');
+      expect(refused.map(r => r.cls)).toEqual(['stale-base-revert']);
+      expect(refused[0]!.ctx).toMatch(/^[0-9a-f]{16}$/);
+      st.body = `feat: move triggers\n\n${DECLARED}`;
+      const t3 = await tickLand(d);
+      expect([st.guard, st.lands, t3.landed]).toEqual([2, 1, [40001]]);
+      expect(t3.decisions[0]!.why).toContain('re-judge: context changed since refusal stale-base-revert');
+    });
+    test('a new receipt dir at the same head re-judges; the same context after a second refusal sticks again', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'lg-')); let dir = receipt.dir;
+      const { st, d } = world(root, { receipt: () => ({ ...receipt, dir }) });
+      await tickLand(d);
+      dir = '/r/40001-aaaaaaaaaaaa-node-b';
+      await tickLand(d); await tickLand(d);
+      expect([st.guard, st.lands]).toEqual([2, 0]);
+    });
+    test('a HOLD set and cleared after the refusal re-judges the same head', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'lg-')); const { st, d } = world(root);
+      await tickLand(d);
+      st.hold = { reason: 'HOLD verdict hold-40001', by: 'JUD' };
+      const held = await tickLand({ ...d, now: () => new Date('2026-11-25T21:05:00Z') });
+      expect(held.decisions[0]!.action).toBe('hold');
+      st.hold = null;
+      await tickLand({ ...d, now: () => new Date('2026-11-25T21:10:00Z') });
+      expect(st.guard).toBe(2);
+    });
+    test('a legacy refusal row without a context keeps sticking (no mass re-run on deploy)', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'lg-')); const { st, d } = world(root);
+      appendLedger(root, { at: '2026-11-25T20:00:00.000Z', mode: 'live', pr: pr.number, head: pr.head, event: 'refused', cls: 'stale-base-revert', why: 'graphs/triggers/a.yaml←30ee342ce9' });
+      st.body = DECLARED;
+      await tickLand(d);
+      expect([st.guard, st.lands]).toEqual([0, 0]);
+    });
+    test('context = body (CRLF/whitespace-normalized) ⊕ sorted labels ⊕ receipt dir ⊕ baseline-diff receipt', () => {
+      const base = refusalContext({ body: 'a\nb' }, receipt);
+      expect(refusalContext({ body: ' a\r\nb \n' }, receipt)).toBe(base);
+      expect(refusalContext({ body: 'a\nb', labels: [] }, receipt)).toBe(base);
+      expect(refusalContext({ body: 'a\nb', labels: ['x', 'y'] }, receipt)).toBe(refusalContext({ body: 'a\nb', labels: ['y', 'x'] }, receipt));
+      expect(new Set([base, refusalContext({ body: 'a\nb', labels: ['x'] }, receipt), refusalContext({ body: 'a\nb' }, null),
+        refusalContext({ body: 'a\nb' }, receipt, { receipt: '/nd.json' }), refusalContext({ body: 'a\nc' }, receipt)]).size).toBe(5);
+    });
   });
   test('shadow posts no card unless a card seat is set', async () => {
     const root = mkdtempSync(join(tmpdir(), 'lg-')); const posts: string[] = [];

@@ -463,6 +463,13 @@ export function checkAuth(req: Request, opts: MetaApiOpts): boolean {
   return decision.ok;
 }
 
+/** RELEASE-HUMAN-PROOF-TRUST-ROOT — did the preceding `checkAuth` pass on the OWNER credential (bearer · short owner token ·
+ * same-origin PWA)? Member/setup/noauth passes are not the owner and never get a release approval proof. */
+export function ownerCredentialAuth(req: Request): boolean {
+  const reason = authDecisions.get(req)?.reason;
+  return reason === 'bearer-match' || reason === 'temp-token' || reason === 'same-origin';
+}
+
 /** Return the safe public reason for a preceding failed `checkAuth` call.
  * Internal auth diagnostics stay in the trace; bearer mismatch variants
  * intentionally collapse here to avoid exposing token-length information. */

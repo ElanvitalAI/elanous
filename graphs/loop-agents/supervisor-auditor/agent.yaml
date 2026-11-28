@@ -1,0 +1,136 @@
+# 감독 감사관 (supervisor-auditor) — LOOP-AGENT v3 YAML definition (SUPERVISOR-AUDITOR-LOOP · 0.3.39 · 대표 11-28 16:5x «자동으로
+# 돌아가도록 조치를 계속 · 스스로 돌아가도록»). It takes over the two Claude-session cron jobs: the hourly supervisor audit
+# (six axes ⊕ trend ⊕ «보기만 함» ⊕ «거짓 초록» → ledger table) and the 15-min live check (tick stale · KPI missing · watch-only).
+# A PLUGIN (대표 11-28 08:4x): this file is an instance of the shared executor kind `fleet-audit.observe`
+# (src/loop-agent/v3/fleet-audit-kind.ts ⊕ src/kit/fleet-audit) — no agent-specific TS. Another fleet auditor (a kingdom's own) is
+# another agent.yaml on the same kind with its own numbers.
+# Schema: src/loop-agent/v3/agent-yaml.ts · executor: src/loop-agent/v3/supervisor.ts · lint: eln loop agent lint supervisor-auditor
+# Tiers: ① every threshold · weight · cadence = this file (policies) · ② deterministic judgment = the kind's kit (its tests and the
+# supervisors sim world SUP-AUDITOR-* are the spec) · ③ fuzzy judgment = the voice block (one LLM turn when spoken to).
+# The ONE definition (YAML-SUPERVISORS-RUNTIME): the trigger registry reads wake: from here (graphs/triggers/supervisor-auditor-agent.yaml
+# is only the tick shim) and goal.yaml is GENERATED from this file (eln loop agent gen supervisor-auditor).
+apiVersion: elanous/loop-agent@3
+manifest:
+  name: supervisor-auditor
+  version: 1.0.0
+  description: "루프 에이전트 전부를 15분마다 감사 — 보기만 하는 에이전트 0 · 감사 나이 ≤ 70분 (6축 원장 ⊕ 매시 OP 요약)"
+  requires:
+    executor: loop-agent@3
+    kits: [kpi, fleet-audit]
+    node_kinds: [fleet-audit.observe, loop-agent.act, loop-agent.learn, loop-agent.judge, loop-agent.finish, gate]
+    facts: []
+  provides:
+    agent: supervisor-auditor
+    kpis: [watch_only_agents, audit_age_min]
+    nodes: []   # tier ② is the shared kind fleet-audit.observe — nothing agent-specific
+identity:
+  id: supervisor-auditor
+  address: SUPERVISOR-AUDITOR
+  rank: supervisor
+  soul: soul.md
+supervisor:
+  duty: escalation-parent
+# v2 card fields that live only here — graphs/loop-agents/supervisor-auditor/goal.yaml is GENERATED from this file
+card:
+  name: 감독 감사관
+  role: &purpose 루프 에이전트 전부의 틱·KPI·행동·거절·교훈을 15분마다 읽어 6축 점수와 추세를 매기고, 보기만 하는 에이전트는 한 단계씩(재기동 요청 → 주인 카드 → ✋) 정상화한다
+  temperament: &voice 짧고 표로 말한다 · 이름 · 틱 나이 · 위반 시간 · 거절 이유를 붙인다 · 초록이라도 근거가 낡았으면 거짓 초록이라 부른다
+  values: &values
+    - 위반을 보고만 있는 감독은 감독이 아니다 — 행동 0 이 2시간이면 주인이 안다
+    - 낡은 틱의 초록은 초록이 아니다
+    - 사다리는 한 칸씩 · 사건마다 한 번 — 같은 주인에게 두 번 쓰지 않는다
+  subject: 루프 에이전트 전부 — 정의(graphs/loop-agents) ⊕ 집(state.json · last-tick.json · 교정 일지 · 교훈) ⊕ 트리거 레지스트리 행 (자기 자신 제외 · watchers-check 가 이 감사관의 heartbeat 를 본다)
+  actions:
+    - refire
+    - owner-card
+    - l0-hand
+    - report
+    - notify-red
+  wake_events:
+    - 15분마다 (cron 7,22,37,52)
+  voice_role: coordinator
+  fallback_seat: OP
+goal: "보기만 하는 루프 에이전트 0 · 감사 나이 ≤ 70분 — 매 틱 원장 표 ⊕ HQ 상태 줄 · 매시 OP 요약 한 통"
+policies:   # tier ① — the only numbers (the kind reads them through pn() · change behaviour here, not in code)
+  watch_only_agents_max: 0
+  audit_age_max_min: 70        # one missed hour ⊕ slack — watchers-check (heartbeat loop:supervisor-auditor) and the OP world card see it
+  max_per_tick: 5              # heal_max_per_tick ⊕ report ⊕ notify-red
+  cooldown_min: 60             # one refire / card per target per hour (the ladder's own rung_wait_min agrees)
+  escalate_after_min: 180      # its own KPI breach (watch-only agents) lasting 3h → one card to the L0 (the runtime ladder)
+  heartbeat_every_min: 15
+  subject_lost_ticks: 3        # unreadable fleet this many ticks → reattach proposal to the L0
+  # the audit (kit/fleet-audit · the old seat-state/OP/tools/loop-agent-live-check.sh numbers)
+  window_min: 60               # acts · failures · refusals counted over the last hour (journal rows)
+  stale_tick_min: 45           # a tick older than this is «틱 정지» …
+  stale_cadence_x: 2           # … or than 2× the agent's own heartbeat_every_min, whichever is longer (a daily agent is not stopped at 45 min)
+  watch_only_breach_min: 120   # «보기만 함» = KPI breach ≥ 2h ∧ 0 acts in the window
+  false_green_unacted_min: 3   # «거짓 초록» = KPI ok but stale/errored tick, or ≥ 3 refusals/failures with 0 acts
+  rung_wait_min: 60            # the ladder climbs one rung at most this often (refire → owner card → ✋ L0)
+  heal_max_per_tick: 3
+  red_watch_only_min: 2        # red = ≥ 2 watch-only agents …
+  red_after_min: 180           # … for ≥ 3h → OP ⊕ telegram once per red episode
+  summary_lines_max: 6         # the hourly OP summary mail (Korean)
+  # six axes (rubric 대표 11-27: 성과30 · 반응책임20 · 능동15 · 견고15 · 판단10 · 지속10) · partial credit for «unknown»
+  w_outcome: 30
+  w_response: 20
+  w_proactive: 15
+  w_robust: 15
+  w_judgment: 10
+  w_sustain: 10
+  score_partial_pct: 50
+kpis:
+  - { name: watch_only_agents, at_most: $policies.watch_only_agents_max, unit: "agents" }
+  - { name: audit_age_min, at_most: $policies.audit_age_max_min, unit: "분" }   # facts line each tick · fleet-audit.json lastAuditAt (the runtime judges the first KPI; liveness = the heartbeat)
+done_when:
+  - "watch_only_agents == 0 한 틱"
+  - "매시 OP 요약 한 통 ⊕ 원장 표(loop-agents/supervisor-auditor/audit/latest.md)"
+never_auto: &never
+  - "다른 루프 에이전트의 정의·정책·수준(level) 바꾸기 (주인 몫)"
+  - "프로세스 kill · launchd 재적재 · eln CLI 띄우기 (재기동은 레지스트리 요청만)"
+  - "같은 에이전트 같은 사건에 사다리 한 칸을 두 번"
+  - "사람 탭에 키 입력·주입"
+soul:
+  purpose: *purpose
+  values: *values
+  do_not: *never
+  voice: *voice
+  serves:
+    - "OP (L0)"
+    - "CEO 매시 감독 감사"
+    - "감독받는 루프 에이전트들"
+absorbs:   # 관계 키 absorbs (LOOP-AGENTS-AS-PLUGINS) — what this agent takes over (the Claude session cron retires when it is live)
+  - { id: loop-agent-live-check, kind: script, kpi: watch_only_agents, l0: supervisor, why: "seat-state/OP/tools/loop-agent-live-check.sh (15분 실가동 점검 · eln loop agent 텍스트 파싱) — 같은 판정 셋(틱 45분 · KPI 없음 · 보기만 함)" }
+  - { id: supervisor-audit-hourly, kind: session-cron, kpi: watch_only_agents, l0: supervisor, why: "Claude 세션 매시 감독 감사(6축 ⊕ 추세 ⊕ 보기만 함 ⊕ 거짓 초록 → 원장 표)" }
+wake:
+  registered_as: supervisor-auditor-agent
+  trigger:
+    cron: "7,22,37,52 * * * *"
+  failure: { goal_deadline_min: 10, max_attempts: 2, backoff_sec: [60] }
+body:   # tier ① routing — observe outcome → steps (ok · breach · unknown → act; off · error → finish)
+  entry_node: observe
+  terminal_nodes: [done]
+  nodes:
+    - { node_id: observe, kind: fleet-audit.observe, max_visits: 1 }
+    - { node_id: act, kind: loop-agent.act, max_visits: 1 }
+    - { node_id: learn, kind: loop-agent.learn, max_visits: 1 }
+    - { node_id: judge, kind: loop-agent.judge, max_visits: 1 }
+    - { node_id: finish, kind: loop-agent.finish, max_visits: 1 }
+    - { node_id: done, kind: gate }
+  edges:
+    - { from: observe, on: outcome, map: { ok: act, breach: act, unknown: act, off: finish, error: finish } }
+    - { from: act, on: outcome, map: { ok: learn } }
+    - { from: learn, on: outcome, map: { ok: judge } }
+    - { from: judge, on: outcome, map: { ok: finish } }
+    - { from: finish, on: outcome, map: { ok: done } }
+voice:   # «지금 보기만 하는 감독?» — one LLM turn when spoken to (role router · coordinator) · facts = the audit lines
+  channel: loop:supervisor-auditor
+  speak_on: [kpi-breach, kpi-recovered, subject-lost]
+  mail: l0-only
+  per_hour_max: 6
+memory:
+  knowhow: knowhow.md
+budget:
+  llm_turns_per_hour: 6
+levels:
+  start: live
+  values: [live, L1, shadow, off]

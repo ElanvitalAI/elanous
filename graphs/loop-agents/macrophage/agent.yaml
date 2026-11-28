@@ -49,6 +49,9 @@ policies:   # tier ① — the only numbers (the body reads them through pv() ·
   escalate_after_min: 120
   heartbeat_every_min: 1440
   subject_lost_ticks: 3   # unreadable subject this many ticks → reattach proposal to the L0
+  stale_worktree_days: 14   # 이보다 오래된 깨끗한 worktree = 보고 줄(정리는 수호자 정비 창) · OPS-RULES «가지·작업 트리 14일 정리»
+  stale_stash_days: 14   # 이보다 오래된 stash = 보고 줄(drop 안 함)
+  oneshot_grace_h: 24   # 일회성 launchd·날짜 고정 크론은 예정 시각 + 이 시간이 지나면 «지난 것»
   recent_reap_min: 30   # 이 안에 거둔 대상(누구든) = 다시 안 거둠
   # v3 smartness (LOOP-AGENT-V3-SMART-2 · src/loop-agent/v3/smart.ts) — reflect · plan · learn-knowhow · retro read only these
   act_grace_min: 0   # an action's outcome is known when it returns (acted | failed) — no waiting

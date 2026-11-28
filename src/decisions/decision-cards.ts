@@ -4,10 +4,11 @@
 // ⛔ 보안: 버튼은 대표 id 만 받는다(그 밖은 무시 ⊕ 관측). 되돌릴 수 없는 범주(결제·외부 게시·보안·비가역)는 «되돌릴 수 없음» ⊕ 두 번 확인.
 // 플랫폼(텔레그램·디스코드)은 `CardTransport` 하나만 구현한다 — 판단은 전부 여기 있다.
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { readPendingQuestions } from '../ask-user-question/pending-questions.js';
-import { DecisionLedger, type DecisionEntry } from './decision-ledger.js';
+import { DecisionLedger, type ApprovalProofBinding, type DecisionEntry, type HumanProof } from './decision-ledger.js';
+import { proofWanted, signApprovalProof, type SignOutcome } from './approval-signer.js';
 
 export type CardPlatform = 'telegram' | 'discord' | 'webpush';
 export interface CardButton { label: string; data: string }
@@ -127,6 +128,9 @@ export interface DecisionCardServiceOptions {
   deferredReason?: (entry: DecisionEntry, now: Date) => string;
   /** Tell the seat that raised it. Default: none (observed only). */
   replyToRaiser?: (entry: DecisionEntry, via: CardPlatform) => Promise<void>;
+  /** RELEASE-HUMAN-PROOF-TRUST-ROOT — signs an owner-confirmed critpath approval. Default: the ledger state's signer on
+   *  Telegram only (discord · webpush stay unverified); null = never sign. */
+  signer?: ((binding: ApprovalProofBinding) => SignOutcome) | null;
 }
 
 export type TapOutcome =
@@ -142,10 +146,15 @@ export class DecisionCardService {
   private readonly ledger: DecisionLedger;
   private readonly statePath: string;
   private readonly now: () => Date;
+  private readonly signer: ((binding: ApprovalProofBinding) => SignOutcome) | null;
   constructor(private readonly opts: DecisionCardServiceOptions) {
     this.ledger = opts.ledger ?? new DecisionLedger();
     this.statePath = opts.statePath ?? join(this.ledger.path, '..', `cards-${opts.transport.platform}.json`);
     this.now = opts.now ?? (() => new Date());
+    // The signer state lives next to the ledger it proves (<state>/decisions/decisions.jsonl → <state>/release/signer).
+    const stateDir = dirname(dirname(this.ledger.path));
+    this.signer = opts.signer !== undefined ? opts.signer
+      : opts.transport.platform === 'telegram' ? (binding) => signApprovalProof(binding, { stateDir }) : null;
   }
 
   private load(): CardState {
@@ -310,9 +319,20 @@ export class DecisionCardService {
     }
     let decided: DecisionEntry;
     let answerDelivery: ReturnType<DecisionLedger['decideWithDelivery']>['delivery'] = null;
+    // RELEASE-HUMAN-PROOF-TRUST-ROOT ③-3: owner ✓ (above) · open ✓ · irreversible two-step confirmed · critpath ref ⊕ approve.
+    let proof: HumanProof | undefined;
+    const ref = proofWanted(entry, parsed.key);
+    if (ref && this.signer) {
+      if (!isIrreversible(entry) || !parsed.confirmed || !entry.raisedAt) {
+        debug.log('release.proof', 'sign-skipped', { platform, card: entry.id, reason: !entry.raisedAt ? 'no-raised-at' : 'not-confirmed' }, { level: 'warn' });
+      } else {
+        const signed = this.signer({ ref, cardId: entry.id, raisedAt: entry.raisedAt, choice: parsed.key, via: platform, platformUserId: userId });
+        if (signed.ok) proof = signed.proof;
+      }
+    }
     try {
       // Same ledger method the CLI `decide` uses — one record path.
-      const recorded = this.ledger.decideWithDelivery(entry.id, parsed.key, { kind: 'human', via: platform, platformUserId: userId }, card?.note);
+      const recorded = this.ledger.decideWithDelivery(entry.id, parsed.key, { kind: 'human', via: platform, platformUserId: userId }, card?.note, undefined, proof);
       decided = recorded.entry;
       answerDelivery = recorded.delivery;
     } catch (error) {
@@ -332,7 +352,7 @@ export class DecisionCardService {
     });
     return { kind: 'decided', view, toast: answerDelivery && !answerDelivery.ok
       ? `결정은 기록됐지만 런 답 전달 실패 — decisions retry-answer ${decided.id}`
-      : `결정했습니다: ${decided.choice?.toUpperCase()}` };
+      : `결정했습니다: ${decided.choice?.toUpperCase()}${ref && this.signer ? (proof ? ` · 발행 승인 서명 ✓ ${proof.keyId}` : ' · 서명 증명 없음 — 발행은 OP 위임') : ''}` };
   }
 
   /** Store a memo typed after «메모 달기»; the card shows it and the eventual decision carries it. */

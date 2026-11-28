@@ -7,6 +7,7 @@ import { Database } from 'bun:sqlite';
 import { formatMessage, registerMsgListCommand } from './msg-list-cli.js';
 import { readUnreadCount } from '../msg/msg-store.js';
 import { registerMsgWaitForCommands } from './msg-wait-for-cli.js';
+import { registerStewardShadowCommand } from '../kit/mail-route/steward-mail-cli.js';
 import { registerMsgHandCommands } from './msg-hand-cli.js';
 import { registerMsgClearCommand, registerMsgQuestionCommand, registerMsgResetCommand } from './msg-clear-cli.js';
 import { registerMsgRequirementCommands } from './msg-requirement-cli.js';
@@ -991,6 +992,8 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
   registerMsgListCommand(msg, { openStore: open, cacheReads: deps.openStore === undefined, out, setExitCode });
   // ELN-SELF-TIMER-WATCH(I3) — 원장 항목에 묶인 셀프 깨우개: wait-for · wait-tick · wait-list.
   registerMsgWaitForCommands(msg, { out, setExitCode });
+  // STEWARD-MAIL — steward:mail shadow replay (read-only).
+  registerStewardShadowCommand(msg, { out, setExitCode });
   registerMsgRequirementCommands(msg, { out, setExitCode });
   // HAND-RAISE-LADDER — every ✋ ends in one outcome: hand <msgId> resolve|reject|escalate · sweep · board · list.
   registerMsgHandCommands(msg, { openStore: open, out, setExitCode, ...(deps.now === undefined ? {} : { now: deps.now }) });
@@ -1029,11 +1032,11 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     })());
 
   msg.command('ack [id]').description('Acknowledge selected messages; --through acknowledges every message up to and including that ID')
-    .option('--to <seat>').option('--id <id>', 'acknowledge exactly one message').option('--ids <ids>', 'acknowledge selected comma-separated IDs').option('--through <id>', 'WARNING: acknowledge ALL messages through this ID, including earlier unread messages')
+    .option('--to <seat>').option('--id <id>', 'acknowledge exactly this message (repeat for multiple)', (id: string, previous: string[] = []) => [...previous, id]).option('--ids <ids>', 'acknowledge selected comma-separated IDs').option('--through <id>', 'WARNING: acknowledge ALL messages through this ID, including earlier unread messages')
     .option('--receipted', 'acknowledge every message that already has an accepted, rejected, done or expired receipt (idempotent)')
     .option('--apply <line>', 'with a positional ID / --id / --ids naming an announce: the «적용:» line — what this seat will do differently')
     .option('--json')
-    .action((positional: string | undefined, opts: CommonOptions & { to?: string; id?: string; ids?: string; through?: string; receipted?: boolean; apply?: string }) => run(async () => {
+    .action((positional: string | undefined, opts: CommonOptions & { to?: string; id?: string[]; ids?: string; through?: string; receipted?: boolean; apply?: string }) => run(async () => {
       const to = messageRecipient(opts.to, '--to');
       const apply = parseApplyField(opts.apply);
       if (apply !== null && opts.id === undefined && opts.ids === undefined && positional === undefined)
@@ -1058,7 +1061,7 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         return;
       }
       if (opts.id !== undefined || positional !== undefined || opts.ids !== undefined) {
-        const ids = [...new Set((opts.ids !== undefined ? opts.ids.split(',') : [opts.id ?? positional!]).map(raw => integer(raw.trim(), 'message ID', 1, 1, Number.MAX_SAFE_INTEGER)))];
+        const ids = [...new Set((opts.ids !== undefined ? opts.ids.split(',') : opts.id ?? [positional!]).map(raw => integer(raw.trim(), 'message ID', 1, 1, Number.MAX_SAFE_INTEGER)))];
         if (opts.ids !== undefined && (!opts.ids.trim() || opts.ids.split(',').some(raw => !raw.trim()))) throw new Error('--ids requires comma-separated positive message IDs');
         let inputs: AckDigestInput[] = [];
         withStore(store => {

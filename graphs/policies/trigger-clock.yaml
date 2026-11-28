@@ -1,0 +1,15 @@
+# The outside clock of the trigger registry tick (LOOP-AGENTS-AS-PLUGINS P1 · src/loops/trigger-clock.ts · the nexus 5-min
+# schedule catch-up sweep). Read by name every sweep; change a value here, not in TS (YAML-FIRST-RATCHET). A malformed pack
+# is refused (the sweep says why) — no silent default.
+version: 1
+clock:
+  # The full-pass `trigger-tick` beat (crontab */2) older than this = the registry tick stopped. 6 = three missed ticks.
+  stale_after_min: 6
+  # Run the tick's own schedule-entry command at most once per this window while it stays stale (the nexus sweep grain is 5).
+  wake_every_min: 10
+  # Still stale this long after it first went stale → one card to the owner (two wakes did not bring it back).
+  card_after_min: 20
+  # At most one card per this window while it stays stale.
+  card_every_h: 6
+  # Every loop agent (guardian · supervisors) runs on this tick — the federation coordinator owns it.
+  owner: OP

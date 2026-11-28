@@ -7,7 +7,7 @@ import {
 } from '@/lib/run-graph-yaml-edit';
 import { layeredPositions } from '@/lib/graph-edge-route';
 import { collapseGroups, GROUP_NODE_PREFIX, groupNames, groupOf, isGroupNodeId, type GroupedRunGraph } from './graph-groups';
-import type { RunStep } from '../../../../../src/self-implement/run-step-projection';
+import type { RunStep } from '../../../../../src/self-implement/run-step-types';
 
 /** Read-only projection for the editor. The YAML source and its node positions never change when a unit is folded. */
 export function canvasGroupGraph(graph: CanvasGraph): GroupedRunGraph {

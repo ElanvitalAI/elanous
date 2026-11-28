@@ -20,7 +20,8 @@ import { SEAT_FIRST_ANSWER_LINE, SEAT_NO_CAUSE_CONTINUE } from './seat-turn-pros
 export { SEAT_FIRST_ANSWER_LINE, SEAT_ZERO_WORK_CONTINUE } from './seat-turn-prose.js';
 import { collectSeatBootSections, renderSeatBootCard } from '../cli/seat-cli.js';
 import { defaultMsgStorePath } from '../msg/msg-store.js';
-import { buildCommonMemoryIndexBlock, buildSeatMemoryIndexBlock, seatMemoryDir, seatMemoryIndexFiles } from '../seat-memory/seat-memory.js';
+import { buildCommonMemoryIndexBlock, buildSeatMemoryIndexBlock, seatMemoryDir, seatMemoryIndexFiles, SEAT_MEMORY_INDEX_FILE } from '../seat-memory/seat-memory.js';
+import { traceMemoryRecall } from '../seat-memory/memory-trace.js';
 import { gitWorktreeRoots, resolveMemoryStore, type MemoryStore } from '../seat-memory/memory-store.js';
 import { buildActiveDirectivesBlock } from '../directives/active-directives-block.js';
 import { readOpRolePackBootPrompt, readSeatHandoffBootPrompt } from '../tui/seat-mail-boot.js';
@@ -113,16 +114,37 @@ function activeDirectivesMessages(store: MemoryStore, deps: SeatBootDeps): LLMMe
 }
 
 /** 세션 시작 안정 구역 — 기억 색인(자리·프로젝트) · 살아 있는 지시. 대화마다 한 번 · 바이트 고정. */
-function sessionStartStable(cwd: string, deps: SeatBootDeps): Pick<CardEntry, 'memoryIndex' | 'directives'> {
+function sessionStartStable(cwd: string, deps: SeatBootDeps): Pick<CardEntry, 'memoryIndex' | 'directives' | 'memoryIndexSnapshot'> {
   const target = resolveSessionMemoryStore(cwd, deps);
   if (!target) return { memoryIndex: [], directives: [] };
-  return { memoryIndex: seatMemoryIndexMessages(target.seat, target.dir, target.commonDir), directives: activeDirectivesMessages(target.store, deps) };
+  const memoryIndexSnapshot = { dir: target.dir, at: Date.now(), indexMtimeMs: memoryIndexMtimeMs(target.dir) };
+  return {
+    memoryIndex: seatMemoryIndexMessages(target.seat, target.dir, target.commonDir), directives: activeDirectivesMessages(target.store, deps),
+    memoryIndexSnapshot,
+  };
+}
+
+function memoryIndexMtimeMs(dir: string): number | null {
+  try { return statSync(join(dir, SEAT_MEMORY_INDEX_FILE)).mtimeMs; } catch { return null; }
+}
+
+/** MEMORY-OBSERVABILITY — is this conversation's session-start memory index older than the store? A write or pin after the
+ *  snapshot is NOT in the prompt until the next conversation (or the next process) — turn recall is the only path meanwhile. */
+export function seatMemoryIndexStaleness(cwd: string): { staleIndex: boolean; indexAgeMs: number } | null {
+  const snap = cardCache.get(cwd)?.memoryIndexSnapshot;
+  if (!snap) return null;
+  const now = memoryIndexMtimeMs(snap.dir);
+  return { staleIndex: now !== null && (snap.indexMtimeMs === null || now > snap.indexMtimeMs), indexAgeMs: Math.max(0, Date.now() - snap.at) };
 }
 
 // 대화마다 한 장(작업 디렉터리별). 대시보드는 한 번에 한 대화이고 ACP sessionId 가 수명 내내 같으므로
 // 세션 id 가 아니라 «대화 ⊕ cwd» 가 키다. 비우는 자리는 `startSeatBootConversation`(새 대화) 뿐 — 축출 없음.
 // 첫 화면 한 줄(`describeSeatBoot`)과 턴 카드가 «같은 스냅샷»을 본다.
-interface CardEntry { messages: LLMMessage[]; observed: Record<string, unknown>; memoryIndex?: LLMMessage[]; directives?: LLMMessage[] }
+interface CardEntry {
+  messages: LLMMessage[]; observed: Record<string, unknown>; memoryIndex?: LLMMessage[]; directives?: LLMMessage[];
+  /** MEMORY-OBSERVABILITY — when the session-start index was taken and the store's MEMORY.md mtime at that moment. */
+  memoryIndexSnapshot?: { dir: string; at: number; indexMtimeMs: number | null };
+}
 const cardCache = new Map<string, CardEntry>();
 
 export function resetSeatBootCacheForTest(): void {
@@ -459,6 +481,9 @@ function seatMemoryIndexMessages(seat: string, dir: string, commonDir?: string):
     try {
       const c = buildCommonMemoryIndexBlock(commonDir, { skipFiles: seatMemoryIndexFiles(dir) });
       debug.log('memory', 'common-index', c ? { seat, lines: c.lines, totalLines: c.totalLines, truncated: c.truncated } : { seat, lines: 0, reason: 'empty-or-missing' });
+      traceMemoryRecall(c
+        ? { store: 'common', via: 'session-start', seat, hit: c.lines > 0, lines: c.lines, truncated: c.truncated }
+        : { store: 'common', via: 'session-start', seat, hit: false, reason: 'empty-or-missing' });
       common = c?.block ?? null;
     } catch (error) {
       debug.log('memory', 'common-index', { seat, lines: 0, reason: 'error', error: error instanceof Error ? error.message : String(error) });
@@ -470,9 +495,13 @@ function seatMemoryIndexMessages(seat: string, dir: string, commonDir?: string):
     debug.log('memory', 'index-injected', built
       ? { seat, lines: built.lines, totalLines: built.totalLines, bytes: built.bytes, totalBytes: built.totalBytes, truncated: built.truncated }
       : { seat, lines: 0, reason: 'empty-or-missing' });
+    traceMemoryRecall(built
+      ? { store: 'seat', via: 'session-start', seat, hit: built.lines > 0, lines: built.lines, bytes: built.bytes, truncated: built.truncated }
+      : { store: 'seat', via: 'session-start', seat, hit: false, reason: 'empty-or-missing' });
     own = built?.block ?? null;
   } catch (error) {
     debug.log('memory', 'index-injected', { seat, lines: 0, reason: 'error', error: error instanceof Error ? error.message : String(error) });
+    traceMemoryRecall({ store: 'seat', via: 'session-start', seat, hit: false, reason: 'error' });
   }
   const parts = [common, own].filter((p): p is string => !!p);
   return parts.length ? [{ role: 'system', content: parts.join('\n\n') }] : [];
@@ -515,6 +544,13 @@ export function buildSeatBootSystemMessages(ctx: { cwd: string; sessionId?: stri
 /** 이 대화의 자리 기억 색인(system 메시지 0~1개) — 카드와 같은 스냅샷. 호출부는 «캐시 접두» 쪽(안정 구역)에 싣는다. */
 export function buildSeatMemoryIndexSystemMessages(ctx: { cwd: string; sessionId?: string }, deps: SeatBootDeps = {}): LLMMessage[] {
   return conversationCard(ctx.cwd, deps, ctx.sessionId).memoryIndex ?? [];
+}
+
+/** ELN-OP-CROWN-MEMORY S1 — the session-start index text this conversation carries (null = none cached yet). Read-only: it never
+ *  builds a card (the turn tail compares the live index against this snapshot). */
+export function seatMemoryIndexSnapshot(cwd: string): string | null {
+  const content = cardCache.get(cwd)?.memoryIndex?.[0]?.content;
+  return typeof content === 'string' ? content : null;
 }
 
 /** 이 대화의 «살아 있는 지시» 블록(system 메시지 0~1개) — 카드와 같은 스냅샷 · 안정 구역(캐시 접두)에 싣는다. */

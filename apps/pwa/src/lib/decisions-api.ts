@@ -60,12 +60,23 @@ export async function listOpenDecisions(client: Pick<DaemonClient, 'fetchRespons
   return body.decisions;
 }
 
-export async function decide(client: Pick<DaemonClient, 'fetchResponse'>, id: string, choice: string, note?: string): Promise<{ decidedAt?: string }> {
-  const response = await client.fetchResponse(`/v1/decisions/${encodeURIComponent(id)}/decide`, {
+/** Irreversible cards answer 428 with a one-use confirm token; the person confirms once more (same rule as Telegram). */
+export type ConfirmIrreversible = (message: string) => boolean | Promise<boolean>;
+const browserConfirm: ConfirmIrreversible = (message) =>
+  typeof window !== 'undefined' && typeof window.confirm === 'function' ? window.confirm(message) : false;
+
+export async function decide(client: Pick<DaemonClient, 'fetchResponse'>, id: string, choice: string, note?: string, confirm: ConfirmIrreversible = browserConfirm): Promise<{ decidedAt?: string }> {
+  const post = (confirmToken?: string) => client.fetchResponse(`/v1/decisions/${encodeURIComponent(id)}/decide`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ choice, ...(note === undefined ? {} : { note }) }),
+    body: JSON.stringify({ choice, ...(note === undefined ? {} : { note }), ...(confirmToken ? { confirmToken } : {}) }),
   });
+  let response = await post();
+  if (response.status === 428) {
+    const asked = await response.json() as { confirmToken?: string; message?: string };
+    if (!asked.confirmToken || !(await confirm(asked.message ?? 'This cannot be undone. Decide?'))) throw new Error('decision cancelled');
+    response = await post(asked.confirmToken);
+  }
   if (!response.ok) throw new Error(`decision failed: ${response.status}`);
   return response.json() as Promise<{ decidedAt?: string }>;
 }

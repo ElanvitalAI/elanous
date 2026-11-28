@@ -53,6 +53,37 @@ describe('registration', () => {
     expect(bulletin.goal.path).toBe('{seatState}/OPS/BULLETIN-NOW.md');
   });
 
+  test('shared YAML reader preserves legacy graph fields, aliases and trigger defaults', () => {
+    const file = join(dir, 'legacy.yaml');
+    writeFileSync(file, `graph_id: legacy-trigger
+loop:
+  owner: OP
+  trigger: { cron: '  0 * * * *  ' }
+  goal: &goal { kind: file-mtime, path: 'node-b' }
+other_graph_metadata: *goal
+nodes:
+  - { node_id: legacy, kind: not-a-template-kind }
+`);
+    const result = readTriggerDecl(file, dir);
+    expect(result.graphId).toBe('legacy-trigger');
+    expect(result.cron).toBe('0 * * * *');
+    expect(result.goal).toEqual({ kind: 'file-mtime', path: 'node-b' });
+    // Legacy trigger policy defaults, asserted independently of DEFAULT_POLICY.
+    expect(result.maxAttempts).toBe(3);
+    expect(result.goalDeadlineMin).toBe(20);
+    expect(result.backoffSec).toEqual([60, 300]);
+    expect(result.cutoverAfter).toBe(2);
+    expect(result.staleAfterMin).toBe(30);
+  });
+
+  test('shared YAML reader rejects malformed and duplicate mappings', () => {
+    const file = join(dir, 'syntax.yaml');
+    writeFileSync(file, 'graph_id: one\ngraph_id: two\n');
+    expect(() => readTriggerDecl(file, dir)).toThrow();
+    writeFileSync(file, 'graph_id: [\n');
+    expect(() => readTriggerDecl(file, dir)).toThrow();
+  });
+
   test('a trigger with both or neither of cron and condition is refused', () => {
     const both = join(dir, 'both.yaml');
     writeFileSync(both, 'graph_id: both\nloop:\n  owner: OP\n  trigger:\n    cron: "0 * * * *"\n    condition: { predicate: { kind: minute-at-least, minute: 5 } }\n  goal: { kind: file-mtime, path: x }\n');

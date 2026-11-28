@@ -40,4 +40,9 @@ describe('supervisors on the v2 shell', () => {
     for (const id of SUPERVISOR_BODIES) expect(loadCard(id).startLevel).toBe('live');
     expect(loadCard('macrophage').rights.actions).toEqual(['reap']);
   });
+  test('LOOP-AGENTS-AS-PLUGINS: one trigger per job — the agent absorbs the old watchers-check graph, whose file is gone', () => {
+    expect(readTriggerDecl('graphs/triggers/watchers-check-agent.yaml', REPO).absorbs).toEqual(['watchers-check']);
+    expect(() => readFileSync(join(REPO, 'graphs/triggers/watchers-check.yaml'), 'utf8')).toThrow();
+    expect(recipes['trigger-watchers-check']).toBeUndefined();
+  });
 });

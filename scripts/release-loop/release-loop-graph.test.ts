@@ -1445,7 +1445,7 @@ test('publish accepts measured automatic approval but refuses incomplete metrics
     for (let i = 0; i < 5; i++) writeFileSync(join(out, 'dist', `install-${i}`), 'fixture');
     const input = { version: '0.2.5', previousVersion: '0.2.4' };
     const outputs: GraphContext['outputs'] = {
-      'version-release': { outcome: 'ok', commit: 'a'.repeat(40) }, gate: { outcome: 'ok', introduced: [] }, pwa: { outcome: 'ok' },
+      'version-release': { outcome: 'ok', commit: 'a'.repeat(40) }, gate: { outcome: 'ok', verdict: 'pass', introduced: [] }, pwa: { outcome: 'ok' },
       prepare: { outcome: 'ok', commit: 'a'.repeat(40), out }, upgrade: { outcome: 'ok' },
       tui: { outcome: 'ok', regress: { pass: 7, fail: 0,
         results: Array.from({ length: 7 }, (_, i) => ({ id: `R${i + 1}`, title: 'check', ok: true, reason: 'measured' })) } }, 'notes-check': { outcome: 'ok' },

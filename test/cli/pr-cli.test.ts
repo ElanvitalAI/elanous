@@ -182,7 +182,7 @@ describe('production CLI launch-goal filesystem isolation', () => {
 const baseLookupRun = (cmd: string, args: readonly string[]) =>
   cmd === 'git' && args.join(' ') === 'remote'
     ? { ok: true, out: 'origin\n' }
-    : cmd === 'git' && args.join(' ') === 'remote get-url origin'
+    : cmd === 'git' && args.join(' ') === 'config --get remote.origin.url'
       ? { ok: true, out: 'git@github.com:example/repo.git\n' }
       : cmd === 'git' && args.join(' ') === 'rev-parse --verify --quiet refs/remotes/origin/main'
         ? { ok: true, out: 'remote-sha\n' }
@@ -560,7 +560,7 @@ describe('elanous pr land', () => {
     const viewCalls: string[][] = [];
     const run = (cmd: string, args: readonly string[]) => {
       if (cmd === 'git' && args.join(' ') === 'remote') return { ok: true, out: 'origin\n' };
-      if (cmd === 'git' && args.join(' ') === 'remote get-url origin') return { ok: true, out: 'https://github.com/example/repo.git\n' };
+      if (cmd === 'git' && args.join(' ') === 'config --get remote.origin.url') return { ok: true, out: 'https://github.com/example/repo.git\n' };
       if (cmd === 'git' && args.join(' ') === 'rev-parse --verify --quiet refs/remotes/origin/main') return { ok: true, out: 'remote-sha\n' };
       if (cmd === 'git' && args.join(' ') === 'rev-list --left-right --count main...refs/remotes/origin/main') return { ok: true, out: '0\t0\n' };
       if (cmd === 'gh' && args.join(' ').includes('pr view')) viewCalls.push([...args]);
@@ -613,7 +613,7 @@ describe('elanous pr land', () => {
     const logged = spyOn(debug, 'log').mockImplementation(() => {});
     const run = (cmd: string, args: readonly string[]) => {
       if (cmd === 'git' && args.join(' ') === 'remote') return { ok: true, out: 'origin\n' };
-      if (cmd === 'git' && args.join(' ') === 'remote get-url origin') return { ok: true, out: 'https://github.com/example/repo.git\n' };
+      if (cmd === 'git' && args.join(' ') === 'config --get remote.origin.url') return { ok: true, out: 'https://github.com/example/repo.git\n' };
       if (cmd === 'git' && args.join(' ') === 'rev-parse --verify --quiet refs/remotes/origin/main') return { ok: true, out: 'remote-sha\n' };
       if (cmd === 'git' && args.join(' ') === 'rev-list --left-right --count main...refs/remotes/origin/main') return { ok: true, out: '0\t0\n' };
       if (cmd === 'gh' && args.includes('mergeCommit')) return { ok: true, out: JSON.stringify({ mergeCommit: { oid: mergeCommit } }) };
@@ -639,7 +639,7 @@ describe('elanous pr land', () => {
       const sink = output();
       const run = (cmd: string, args: readonly string[]) => {
         if (cmd === 'git' && args.join(' ') === 'remote') return { ok: true, out: 'origin\n' };
-        if (cmd === 'git' && args.join(' ') === 'remote get-url origin') return { ok: true, out: 'https://github.com/example/repo.git\n' };
+        if (cmd === 'git' && args.join(' ') === 'config --get remote.origin.url') return { ok: true, out: 'https://github.com/example/repo.git\n' };
         if (cmd === 'git' && args.join(' ') === 'rev-parse --verify --quiet refs/remotes/origin/main') return { ok: true, out: 'remote-sha\n' };
         if (cmd === 'git' && args.join(' ') === 'rev-list --left-right --count main...refs/remotes/origin/main') return { ok: true, out: '0\t0\n' };
         return { ok: false, out: '' };
@@ -1075,7 +1075,7 @@ describe('elanous pr land', () => {
       const command = args.join(' ');
       if (cmd === 'gh' && command.includes('pr view')) viewCalls.push({ cmd, args });
       if (cmd === 'git' && command === 'remote') return { ok: true, out: 'origin\n' };
-      if (cmd === 'git' && command === 'remote get-url origin') return { ok: true, out: 'https://github.com/example/repo.git\n' };
+      if (cmd === 'git' && command === 'config --get remote.origin.url') return { ok: true, out: 'https://github.com/example/repo.git\n' };
       return cmd === 'gh' && command.includes('pr view')
         ? { ok: true, out: 'release/2026' }
         : { ok: false, out: '' };
@@ -1446,7 +1446,7 @@ describe('elanous pr land', () => {
         if (cmd === 'git' && command === 'rev-parse --verify refs/remotes/origin/main') return { ok: true, out: `${fixture.main}\n` };
         if (cmd === 'git' && args[0] === 'ls-remote' && args.at(-1) === 'refs/heads/main') return { ok: true, out: `${fixture.main}\trefs/heads/main\n` };
         if (cmd === 'git' && args[0] === 'fetch') return { ok: true, out: '' };
-        if (cmd === 'git' && command === 'remote get-url origin') return { ok: true, out: 'git@github.com:example/repo.git\n' };
+        if (cmd === 'git' && command === 'config --get remote.origin.url') return { ok: true, out: 'git@github.com:example/repo.git\n' };
         if (cmd === 'git' && command === 'remote get-url --push origin') { gitCalls.push([...args]); return { ok: true, out: `${pushOpts.url ?? 'git@github.com:example/repo.git'}\n` }; }
         if (cmd === 'git' && args[0] === 'check-ref-format' && args[1] === '--branch') return { ok: true, out: 'feat/land\n' };
         if (cmd === 'git' && args[0] === 'ls-remote' && args.at(-1) === 'refs/heads/feat/land') return { ok: true, out: `${fixture.head}\trefs/heads/feat/land\n` };
@@ -1885,7 +1885,7 @@ describe('elanous pr land', () => {
         const sink = output();
         const run: CmdRunner = (command, args, options) => {
           if (command === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feat/land', baseRefName: 'main', state: 'OPEN', isDraft: false, url: URL }) };
-          if (command === 'git' && args.join(' ') === 'remote get-url origin') return { ok: true, out: 'git@github.com:example/repo.git\n' };
+          if (command === 'git' && args.join(' ') === 'config --get remote.origin.url') return { ok: true, out: 'git@github.com:example/repo.git\n' };
           const result = spawnSync(command, [...args], { cwd: options?.cwd ?? repo, encoding: 'utf8' });
           return { ok: result.status === 0, out: result.stdout ?? '', err: result.stderr ?? '' };
         };
@@ -1986,7 +1986,7 @@ describe('elanous pr land', () => {
             return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feat/land', headRepository: { name: 'repo' }, headRepositoryOwner: { login: 'example' } }) };
           }
           if (command === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feat/land', baseRefName: 'main', state: 'OPEN', isDraft: false, url: URL }) };
-          if (command === 'git' && args.join(' ') === 'remote get-url origin') return { ok: true, out: 'git@github.com:example/repo.git\n' };
+          if (command === 'git' && args.join(' ') === 'config --get remote.origin.url') return { ok: true, out: 'git@github.com:example/repo.git\n' };
           if (command === 'git' && args.join(' ') === `fetch --quiet origin ${'d'.repeat(40)}`) return { ok: true, out: '' };
           if (command === 'git' && args.join(' ') === `rev-parse --verify ${'d'.repeat(40)}^1`) return { ok: true, out: `${laterMain}\n` };
           const result = spawnSync(command, [...args], { cwd: options?.cwd ?? repo, encoding: 'utf8' });
@@ -3180,7 +3180,7 @@ describe('elanous pr land', () => {
     const sink = output();
     const run = (cmd: string, args: readonly string[]) => {
       if (cmd === 'git' && args.join(' ') === 'remote') return { ok: true, out: 'origin\n' };
-      if (cmd === 'git' && args.join(' ') === 'remote get-url origin') {
+      if (cmd === 'git' && args.join(' ') === 'config --get remote.origin.url') {
         return { ok: true, out: 'https://github.com/example/repo.git\n' };
       }
       // ⭐ 브랜치에 «이미» 작업 커밋이 있다 — 이것이 옛 동작에서 제목을 가져갔다.

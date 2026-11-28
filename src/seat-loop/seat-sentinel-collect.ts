@@ -12,8 +12,9 @@ import { defaultHerdrCliRunner, type HerdrCliRunner } from '../pty-shell/herdr-p
 import { remoteHerdrRunner, resolveSeatStateRoot } from '../loops/msg-wake.js';
 import { readSeatRegistry, seatRegistryPath, type SeatRegistryEntry, type SeatRegistryRead } from '../loops/seat-registry.js';
 import { defaultMsgStorePath, openMsgStoreReadOnly } from '../msg/msg-store.js';
-import { checklistDevVersion, listChecklist, ownerMatches } from '../release-loop/checklist.js';
+import { listChecklist, ownerMatches } from '../release-loop/checklist.js';
 import type { Known, SeatActivitySample, SeatPaneStatus, SeatRoute, SeatUnackedMail } from './seat-sentinel.js';
+import { boardVersion } from '../release-loop/board-version.js';
 
 /** What one tick sees of one seat, before it is joined with the sample history. */
 export interface SeatObservation {
@@ -150,7 +151,7 @@ function defaultUnreadAddresses(): string[] | null {
 function defaultOpenWork(): (seat: string) => string[] | null {
   let items: ReturnType<typeof listChecklist>['items'] | null | undefined;
   return (seat) => {
-    if (items === undefined) { try { items = listChecklist(checklistDevVersion()).items; } catch { items = null; } }
+    if (items === undefined) { try { items = listChecklist(boardVersion()).items; } catch { items = null; } }
     return items === null ? null : items
       .filter((item) => (item.status === 'yellow' || item.status === 'red') && ownerMatches(item.owner, seat))
       .map((item) => item.id);

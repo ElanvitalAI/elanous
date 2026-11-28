@@ -1,0 +1,55 @@
+# RAIL-CANARY-AUTO-ROLLBACK (0.3.40 P0 · 대표 11-29 02:3x): the probe pack of the loop agent rail-canary — what «the swap broke
+# operations» means, as data. Read by the shared kind canary.check (src/loop-agent/v3/canary-kind.ts ⊕ src/kit/canary). Every
+# probe threshold lives here; the loop numbers (window · confirm re-reads · 1 rollback per sha · verify) are agent.yaml policies.
+# A regression = a probe that fails now (confirm_reads reads, confirm_gap_sec apart) AND passed on the previous build, inside
+# watch_window_min after install.json named a new commit. A probe the previous build never passed cannot regress (known break).
+# Templates: {stateRoot} {installRoot} {hqRepo} {uid} {date} · an argv item «{eln}» = the CLI of the build being judged.
+# The 11-28 night incidents each probe catches are named next to it (each stopped work 1–4 h after a rail).
+schema: 1
+
+build:   # the installed build identity (written by `eln self-update --dev` · the rail)
+  file: '{installRoot}/install.json'
+  sha_path: commit
+  previous_path: previous          # versions/<판>-dev.<sha12> — the rollback door's target; must be the build watched healthy
+  installed_at_path: installedAt   # the watch window starts here
+
+probes:
+  # ① #40735 (23:38–00:45): legacy hand tabs lost their seat → fed snapshot hands 0 → wakeups / assign stopped → landings 0/h
+  - id: seat-panes
+    what: "seat-identified panes from els ls (pane.seat set) vs the previous build"
+    read: { cmd: ['{eln}', side, ls, --json], timeout_sec: 20, json: { path: panes, count_present: seat } }
+    fail_if: { drop_pct_over: 50 }
+    error_is_fail: true            # els ls itself failing after a swap is the build's own surface
+  # ② GH mirror insteadOf: `git remote get-url origin` became a local path → claim / land slug refused
+  - id: origin-slug
+    what: "the HQ clone's origin still reads as a GitHub slug (the land graph and claim read it)"
+    read: { cmd: [git, -C, '{hqRepo}', remote, get-url, origin], timeout_sec: 10 }
+    fail_if: { not_match: 'github\.com[:/][^/\s]+/[^/\s]+' }
+    error_is_fail: true
+  # ③ the land graph stopped ticking (wake max_wait 10 min ⊕ one slow tick)
+  - id: land-tick-age
+    what: "minutes since the land graph's last tick (land-steward last-tick.json at)"
+    read: { file: '{stateRoot}/loop-agents/land-steward/last-tick.json', json: { age_of: at } }
+    fail_if: { over: 25 }
+  # ④ a seat's GitHub budget hit 300/300 (GH-BUDGET-GOVERNOR ledger · budget from graphs/policies/gh-governor.yaml)
+  - id: op-gh-budget
+    what: "OP's GraphQL calls in the last hour as % of its seat budget"
+    read: { sensor: gh-graphql-used-pct, seat: OP }
+    fail_if: { over: 95 }
+  # ⑤ #40735 seen from the federation: the fed snapshot shows no hand with a pane
+  - id: fed-hands
+    what: "hands with a pane in the fed snapshot (idle ⊕ holding ⊕ working)"
+    read: { file: '{stateRoot}/fed-state/snapshots/latest.json', json: { sum: [totals.hands.idle, totals.hands.holding, totals.hands.working] }, max_age_min: 15 }
+    fail_if: { under: 1 }
+
+rollback:
+  # the existing door: install.json previous → current (versions/<판>-dev.<sha12>) · it swaps current ↔ previous
+  cmd: ['{eln}', self-update, --rollback, --json]
+  # undo = the same door again: after a rollback install.json previous is the new build, so it re-installs it
+  undo: ['{eln}', self-update, --rollback, --json]
+  restart:   # the doors the rail itself uses after an install (rail-now · release graph step els-restart)
+    - { id: els, cmd: [launchctl, kickstart, -k, 'gui/{uid}/dev.elanous.els'] }
+    - { id: nexus, cmd: [launchctl, kickstart, -k, 'gui/{uid}/com.elanous.nexus'], optional: true }
+
+suspects:   # git log --first-parent prev..new on this clone (one fetch first) — squash subjects «… (#N)»
+  repo: '{hqRepo}'

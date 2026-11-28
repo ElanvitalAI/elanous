@@ -44,3 +44,25 @@ voice:
   per_hour_max: 6
   role: coordinator
 escalate_after_min: 120
+policies:
+  orphans_over_2h_max: 0
+  max_per_tick: 3
+  cooldown_min: 30
+  escalate_after_min: 120
+  heartbeat_every_min: 1440
+  subject_lost_ticks: 3
+  stale_worktree_days: 14
+  stale_stash_days: 14
+  oneshot_grace_h: 24
+  recent_reap_min: 30
+  act_grace_min: 0
+  lesson_repeat_min: 3
+  reflect_window_min: 60
+  lesson_cap: 12
+  knowhow_promote_min: 1
+  knowhow_cap: 5
+  plan_ambiguity_margin: 0
+  unacted_penalty: 0.25
+  plan_llm_per_hour: 0
+  retro_every_h: 6
+  cost_act: 0

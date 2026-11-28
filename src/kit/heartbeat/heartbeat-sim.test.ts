@@ -3,7 +3,6 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readTriggerDecl } from '../../loops/trigger-registry.js';
 import { runWatchCheck } from '../../cli/watch-cli.js';
 import { alertStep, appendBeat, judgeWatchers, makeBeat, readBeats, watchersBoardLine, type Beat } from './index.js';
 
@@ -89,11 +88,6 @@ describe('sim: check pass over a ledger with dead, blind, broken watchers', () =
     const ledger = join(dir, 'beats.jsonl');
     writeFileSync(ledger, 'not json\n{"name":"x","at":"2026-11-25T11:00:00.000Z","saw":0,"everyMin":5}\n');
     expect(readBeats(ledger).length).toBe(1);
-  });
-  test('watchers-check graph declares a 5-min cron trigger', () => {
-    const decl = readTriggerDecl('graphs/triggers/watchers-check.yaml', join(import.meta.dir, '..', '..', '..'));
-    expect(decl.cron).toBe('*/5 * * * *');
-    expect(decl.owner).toBe('OP');
   });
   test('invalid name refused', () => {
     expect(() => makeBeat({ name: '../x', saw: 0 }, at(0))).toThrow('invalid watcher name');

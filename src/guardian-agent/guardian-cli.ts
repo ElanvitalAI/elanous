@@ -8,13 +8,13 @@ import { GUARDIAN_DEMOTERS, GUARDIAN_ID, GUARDIAN_SUPERVISOR, runGuardian } from
 const stateRoot = () => (require('../instance/resolve.js') as typeof import('../instance/resolve.js')).effectiveInstanceRoot();
 const guardianMemory = () => fileMemory(stateRoot(), { agent: GUARDIAN_ID, supervisor: GUARDIAN_SUPERVISOR, demoters: GUARDIAN_DEMOTERS });
 
-function cards(): { soulText: string; goalText: string; perHour: number } {
-  const { resolve } = require('node:path') as typeof import('node:path');
-  const dir = resolve(import.meta.dir, '../../graphs/loop-agents/guardian');
-  const read = (f: string) => { try { return readFileSync(join(dir, f), 'utf8'); } catch { return ''; } };
-  const goalText = read('goal.yaml');
-  const per = Number(/per_hour_max:\s*(\d+)/u.exec(goalText)?.[1] ?? 12);
-  return { soulText: read('soul.md') || '수호자 (guardian) — 자원국 서브 조율자 · L0 = RES', goalText, perHour: per };
+/** GUARDIAN-V3-SMART: the voice cards from the ONE definition — soul.md ⊕ the agent.yaml soul block · goal ⊕ KPIs ⊕ done-when ⊕
+ *  never ⊕ the latest retro (graphs/loop-agents/guardian/agent.yaml · src/guardian-agent/smart.ts guardianVoiceCards). */
+export function cards(root: string | null = (() => { try { return stateRoot(); } catch { return null; } })()): { soulText: string; goalText: string; perHour: number } {
+  const { guardianPkgDir, guardianDef } = require('./def.js') as typeof import('./def.js');
+  const { guardianVoiceCards } = require('./smart.js') as typeof import('./smart.js');
+  let soulMd = ''; try { soulMd = readFileSync(join(guardianPkgDir(), 'soul.md'), 'utf8'); } catch { soulMd = ''; }
+  return guardianVoiceCards(guardianDef(root ? { stateRoot: root } : {}), soulMd, root);
 }
 
 export function registerGuardianCommands(loop: Command): void {
@@ -44,6 +44,15 @@ export function registerGuardianCommands(loop: Command): void {
           console.log(o.json ? JSON.stringify(r) : `guardian pulse ${r.level} · changes ${r.changes.length} · spawned ${r.spawned.join(', ') || '-'} · reaped lines ${r.reaped.length} · route ${r.route ?? '-'}`);
         } finally { d.close(); }
       } catch (e) { console.error(`guardian pulse: ${e instanceof Error ? e.message : String(e)}`); process.exitCode = 1; }
+    });
+  // KEYS-PROACTIVE-REFRESH: the 열쇠지기's action — the CLI's own refresh of ONE codex home, verified on disk (times only, never values)
+  g.command('key-refresh').description('열쇠지기: refresh one CODEX_HOME by the codex CLI\'s own flow (app-server account/read refreshToken) and verify last_refresh advanced — prints times only')
+    .requiredOption('--home <dir>', 'the CODEX_HOME directory').option('--json').action(async (o: { home: string; json?: boolean }) => {
+      const { refreshCodexHome } = await import('../kit/credential-keeper/index.js');
+      const { gp } = await import('./def.js');
+      const r = await refreshCodexHome(o.home.replace(/^~(?=\/|$)/u, (await import('node:os')).homedir()), { timeoutMs: gp('key_refresh_timeout_sec') * 1000 });
+      console.log(o.json ? JSON.stringify(r) : `${r.ok ? 'refreshed' : 'NOT refreshed'} ${o.home} · ${r.line} · access exp ${r.before.expiresAt ? new Date(r.before.expiresAt).toISOString() : '-'} → ${r.after.expiresAt ? new Date(r.after.expiresAt).toISOString() : '-'}`);
+      if (!r.ok) process.exitCode = 1;
     });
   g.command('world').description('World health in one screen — hosts (load/ncpu) · supervisors · fuel · the 7 sub-agents\' KPI').option('--json')
     .action(async (o: { json?: boolean }) => {

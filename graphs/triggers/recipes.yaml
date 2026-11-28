@@ -17,9 +17,12 @@ trigger-retro-draft:
 trigger-bulletin-write:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/trigger-nodes.ts" bulletin-write'
   timeout_ms: 240000 # git rev-list · els ls · one ledger read, one file rewrite, ≤ 8 msg posts (each a short CLI spawn).
-trigger-watchers-check:
-  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/trigger-nodes.ts" watchers-check'
-  timeout_ms: 60000 # One ledger read, one msg-store max id, at most one card post.
+trigger-watch-sweep:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/trigger-nodes.ts" watch-sweep'
+  timeout_ms: 110000 # Waker files + local ledger probes; network probes (gh pr view) only for unexpired pr/review watches.
+trigger-decision-bus-sync:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/trigger-nodes.ts" decision-bus-sync'
+  timeout_ms: 90000 # One ledger read, git log/show over a day of docs commits, ≤ max_per_tick bus appends, one msg write.
 # RES burst pool (src/res-graphs/res-nodes.ts · RES-READY-POOL-RESERVATION). Machines only via $ELANOUS_RES_ACTUATOR.
 res-ready-pick:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/res-graphs/res-nodes.ts" ready-pick'
@@ -83,9 +86,15 @@ guardian-pulse:
 guardian-tick:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop guardian tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
   timeout_ms: 600000 # 5 hosts × (probe + ps + kill ≤ 60 s) over ssh · ≤10 voice turns.
+# JUDGE-BUTLER-V3-LISTED: the shared v3 door (agent.yaml body judge-butler.tick) · `loop butler tick` is its alias
 judge-butler-tick:
-  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop butler tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent judge-butler tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
   timeout_ms: 600000 # gh pr view per newly merged PR (cached) · receipt focused reads (ssh ≤ 30 s each) · ≤10 voice turns (≤120 s each).
+# DEV-REVIEW-COMMON: post-impl@1 on each PR whose FIRST pregate receipt landed after the watermark (src/kit/dev-review/live.ts)
+dev-review-post-impl-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" work review scan --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" work review scan --dry-run --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 900000 # ≤ 3 PRs a tick × (gh pr view ≤ 30 s + judge decomposition ⊕ judgment ≤ 3 × 90 s).
 land-graph-tick:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" land graph tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
   timeout_ms: 2700000 # Live: up to 2 lands × op-direct-land-v2 preflight (~20 min each on minim5).
@@ -122,7 +131,24 @@ run-doctor-agent-tick:
 autopsy-agent-tick:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent autopsy tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
   timeout_ms: 600000 # one v2 tick: observe + ≤max_per_tick actions + ≤5 mail voice turns (≤120 s each).
+fed-analyst-agent-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent fed-analyst tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # one v2 tick: observe (msg store window · fed kpi · registry · board) + publish (one cheap LLM call ≤60 s) + ≤6 case rows.
+supervisor-auditor-agent-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent supervisor-auditor tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # one v2 tick: observe (every loop-agent home ⊕ registry rows) + ≤5 actions (registry request · mail · bus · telegram) + ≤5 mail voice turns.
+rail-canary-agent-tick:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" loop agent rail-canary tick --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
+  timeout_ms: 600000 # one v2 tick: observe (install.json ⊕ 5 probes ≤ 20 s each ⊕ ≤ 1 confirm re-read 60 s apart) + ≤2 actions (rollback door ⊕ 2 restarts ≤ 120 s each · git fetch/log · mail).
 # WORLD-REGISTRY (src/resource-ledger/world-*.ts) — the guardian's world-ledger sweep (LLM 0 · writes as loop:guardian).
 world-sweep-tick:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" world sweep --by loop:guardian --json >/dev/null && echo "{\"outcome\":\"ok\"}" || echo "{\"outcome\":\"fail\"}"'
   timeout_ms: 600000 # One probe per host (ssh ≤ 25 s each, 6 hosts) + listAllLoops + one els pane list (≤ 15 s).
+# steward:mail shadow (src/kit/mail-route/steward-mail-shadow.ts · STEWARD-MAIL). Read-only mail ledger · ≤ 30 Jev calls.
+trigger-steward-mail-shadow:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/kit/mail-route/steward-mail-shadow.ts"'
+  timeout_ms: 150000 # One window query + up to 30 Jev calls (4 at a time · 8 s timeout each) + one jsonl append.
+# GH-PROXY-LAYER ② (src/kit/gh-proxy/mirror-node.ts · graphs/triggers/gh-mirror.yaml). LLM 0 · prints its own outcome line.
+gh-mirror-refresh:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/kit/gh-proxy/mirror-node.ts" refresh'
+  timeout_ms: 720000 # ≤ refreshes_per_tick (2) × fetch_timeout_sec (300 s) + refresh_min_interval_sec (60 s) between them.

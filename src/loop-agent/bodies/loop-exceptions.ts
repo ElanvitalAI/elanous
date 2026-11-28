@@ -21,20 +21,12 @@
 import { existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { pv } from '../policy-context.js';
+import { pn } from '../policy-context.js';
 import { attemptsOf, moveCase, openCase, openCases, readCases, unresolvedCases, type Case } from '../../kit/case-ledger/index.js';
 
 /** kit/case-ledger domain of this lane (`<stateRoot>/cases/loop-exception.jsonl`). */
 export const LOOP_CASE_DOMAIN = 'loop-exception';
-/** Normalize attempts (retries through the registry) before the case is escalated. */
-export const LOOP_NORMALIZE_ATTEMPTS = 2; // 출처: 대표 11-27 사다리 — ① 한 번 다시 ② 이유를 잡으며 다시 → 그다음 카드
-/** A loop case not normal again within this many minutes is escalated whatever the ladder says. */
-export const LOOP_CASE_SLA_MIN = 60; // 출처: run-doctor escalate_after_min 120 의 절반 — 루프 예외는 착지·발행 박자를 막는다
 
-/** An exception younger than this is left to the registry's own backoff retries. */
-export const LOOP_EXCEPTION_MIN = 5; // 출처: graphs/triggers/*.yaml failure.backoff_sec [60] × max_attempts 2 — the registry's own retry is done by then
-/** An exception that began within this many minutes after a rail is a restart casualty → retry once. */
-export const RAIL_WINDOW_MIN = 20; // 출처: rail = install ⊕ els kickstart ⊕ rail-watch smokes (≤ 10 min tick) — 11-27 release-traffic failed 22:21:58 right after rail 95
 const DAY_MS = 86_400_000; // 출처: «first failure» = no retry/card for this loop in the last day
 
 export interface LoopFault {
@@ -53,6 +45,9 @@ export interface LoopScan {
   readonly faults: LoopFault[];
   /** graphId → its last fire status (`done` = the normal state). */
   readonly status: Readonly<Record<string, string | null>>;
+  /** Retired (absorbed) trigger ids (trigger-registry `retiredTriggerIds`) — no loop to normalize any more: an unresolved
+   *  case on one is settled, never escalated (11-28 #40634 → watchers-check carded 62 min after it was retired). */
+  readonly retired?: readonly string[];
 }
 export interface LoopExceptionDeps {
   /** Registered (non-retired) loops, the ones in `exception` and every loop's last status (null = registry unreadable). */
@@ -73,29 +68,32 @@ const ageMin = (f: LoopFault, now: number): number => Math.max(0, Math.round((no
 
 const graphOf = (caseId: string): string => caseId.replace(/^loop:/u, '').replace(/@.*$/u, '');
 
-/** Reconcile (observe side): open a case per exception · resolve an open case whose loop is normal (`done`) again. */
-export function reconcileLoopCases(deps: Pick<LoopExceptionDeps, 'caseRoot'>, scan: LoopScan, by: string, now: Date): { open: Case[]; unresolved: number; resolved: string[] } {
-  const resolved: string[] = [];
+/** Reconcile (observe side): open a case per exception · resolve an open case whose loop is normal (`done`) again · settle
+ *  (resolve) any unresolved case — escalated included — whose loop was retired (`settled` · the job lives in its absorber). */
+export function reconcileLoopCases(deps: Pick<LoopExceptionDeps, 'caseRoot'>, scan: LoopScan, by: string, now: Date): { open: Case[]; unresolved: number; resolved: string[]; settled: string[] } {
+  const resolved: string[] = []; const settled: string[] = [];
+  const retired = new Set(scan.retired ?? []);
   for (const f of scan.faults) openCase(deps.caseRoot, { domain: LOOP_CASE_DOMAIN, id: loopTarget(f), subject: `${f.graphId} 예외 (창 ${f.window})`, owner: f.owner,
-    slaMin: pv('loop_case_sla_min', LOOP_CASE_SLA_MIN), by, why: `last fire exception · run ${f.runId ?? '?'} · node ${f.node ?? '?'}${f.tail ? '' : ' · no-reason'}`, ...(f.runId ? { refs: [`run:${f.runId}`] } : {}) }, now);
+    slaMin: pn('loop_case_sla_min'), by, why: `last fire exception · run ${f.runId ?? '?'} · node ${f.node ?? '?'}${f.tail ? '' : ' · no-reason'}`, ...(f.runId ? { refs: [`run:${f.runId}`] } : {}) }, now);
   const faultIds = new Set(scan.faults.map(loopTarget));
   for (const c of unresolvedCases(readCases(deps.caseRoot, LOOP_CASE_DOMAIN))) {
     if (faultIds.has(c.id)) continue;
+    if (retired.has(graphOf(c.id))) { if (moveCase(deps.caseRoot, LOOP_CASE_DOMAIN, c.id, 'resolved', { by, why: 'retired: the trigger is retired in the registry (absorbed) — no loop to normalize · its job lives in the absorber' }, now)) settled.push(c.id); continue; }
     if (scan.status[graphOf(c.id)] === 'done') { moveCase(deps.caseRoot, LOOP_CASE_DOMAIN, c.id, 'resolved', { by, why: 'normal again: the loop\'s last fire is done (re-observed)' }, now); resolved.push(c.id); }
   }
   const all = readCases(deps.caseRoot, LOOP_CASE_DOMAIN);
-  return { open: openCases(all), unresolved: unresolvedCases(all).length, resolved };
+  return { open: openCases(all), unresolved: unresolvedCases(all).length, resolved, settled };
 }
 
 /** The ladder step for one exception: normalize (retry) · escalate (card) · wait (the registry or a retry is still running) · done. */
 export function loopDecision(f: LoopFault, c: Case | null, cases: readonly Case[], railAt: number | null, now: number): 'retry' | 'card' | 'wait' | 'done' {
   if (c?.state === 'escalated' || c?.state === 'resolved') return 'done';
   if (c && now - Date.parse(c.detectedAt) > c.slaMin * 60_000) return 'card'; // SLA passed — never stays «seen»
-  if (now - f.at < pv('loop_exception_min', LOOP_EXCEPTION_MIN) * 60_000) return 'wait';
+  if (now - f.at < pn('loop_exception_min') * 60_000) return 'wait';
   const attempts = c ? attemptsOf(c) : 0;
-  if (attempts >= pv('loop_normalize_attempts', LOOP_NORMALIZE_ATTEMPTS)) return 'card'; // ladder exhausted
+  if (attempts >= pn('loop_normalize_attempts')) return 'card'; // ladder exhausted
   if (attempts > 0) return 'retry'; // ② continue the ladder (the reason of the failed retry is captured in the case)
-  const inRail = railAt !== null && f.at >= railAt && f.at - railAt <= pv('rail_window_min', RAIL_WINDOW_MIN) * 60_000;
+  const inRail = railAt !== null && f.at >= railAt && f.at - railAt <= pn('rail_window_min') * 60_000;
   const failedBefore = cases.some(x => x.id !== loopTarget(f) && graphOf(x.id) === f.graphId && now - Date.parse(x.detectedAt) < DAY_MS);
   return inRail || !failedBefore ? 'retry' : 'card'; // ① restart casualty or first failure → normalize · else out of policy
 }
@@ -154,7 +152,7 @@ export function liveLoopDeps(stateRoot: string, post: LoopExceptionDeps['post'])
       try {
         const r = reg(); const db = r.openTriggerRegistry(stateRoot);
         try {
-          const rows = r.listTriggers(db).filter(t => t.stage !== 'retired');
+          const rows = r.listLiveTriggers(db);
           const faults = rows.filter(t => t.lastStatus === 'exception').map(t => {
             const fire = r.listFires(db, t.graphId, 1)[0];
             const runId = fire?.runId ?? t.lastRunId;
@@ -162,7 +160,7 @@ export function liveLoopDeps(stateRoot: string, post: LoopExceptionDeps['post'])
             return { graphId: t.graphId, owner: t.owner, window: fire?.window ?? t.lastWindow ?? '', at: Date.parse(t.lastAt ?? '') || Date.now(),
               attempt: fire?.attempt ?? 0, runId, error: fire?.error ?? null, node: rf.node, tail: rf.tail || (fire?.error ?? '').trim() };
           });
-          return { total: rows.length, faults, status: Object.fromEntries(rows.map(t => [t.graphId, t.lastStatus ?? null])) };
+          return { total: rows.length, faults, status: Object.fromEntries(rows.map(t => [t.graphId, t.lastStatus ?? null])), retired: [...r.retiredTriggerIds(db)].sort() };
         } finally { db.close(); }
       } catch { return null; }
     },

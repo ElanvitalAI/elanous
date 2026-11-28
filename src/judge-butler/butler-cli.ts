@@ -1,9 +1,10 @@
 // `eln loop butler tick|status` · `eln loop demote|promote judge-butler` — the judge-butler's doors (registered under `eln loop`).
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import { BUTLER_ID, BUTLER_LEVELS, butlerHome, fileMemory, type ButlerLevel } from './memory.js';
 import { filterInWindow, HOUR_MS } from '../kit/kpi/index.js';
+import { greensInWindow } from '../loop-agent/v3/kind-runners.js';
 
 const out = (v: unknown, json: boolean, text: string) => console.log(json ? JSON.stringify(v) : text);
 const stateRoot = () => (require('../instance/resolve.js') as typeof import('../instance/resolve.js')).effectiveInstanceRoot();
@@ -22,34 +23,12 @@ function agentMemory(id: string) {
 
 export function registerButlerCommands(loop: Command): void {
   const b = loop.command('butler').description('판정 집사 (judge-butler) — first loop agent v2: greens from evidence · HOLD ledger · judge ✋ · voice (mail to JUDGE-BUTLER / loop:judge-butler)');
-  b.command('tick').description('One wake: observe → judge vs done-when → act → verify → report, then voice turns for waiting mail (the trigger runs this)')
+  b.command('tick').description('One wake: observe → judge vs done-when → act → verify → report, then voice turns for waiting mail — alias of `eln loop agent judge-butler tick` (the shared v3 door · JUDGE-BUTLER-V3-LISTED)')
     .option('--json').action(async (o: { json?: boolean }) => {
       try {
-        const { liveContext, configuredVoiceLlm } = await import('./live.js');
-        const { wakeButler } = await import('./agent.js');
-        const { loadCards } = await import('./cards.js');
-        const { beatSafe } = await import('../kit/heartbeat/index.js');
-        const { acquireTickLock } = await import('./tick-lock.js');
-        // BUTLER-TICK-CADENCE: one tick at a time (trigger ⊕ manual/stopgap ticks used to race and refuse each other's signs).
-        mkdirSync(butlerHome(stateRoot()), { recursive: true });
-        const lock = acquireTickLock(butlerHome(stateRoot()));
-        if (lock.held) { out({ skipped: 'tick-running', pid: lock.pid, since: lock.at }, !!o.json, `judge-butler tick skipped — another tick is running (pid ${lock.pid} since ${lock.at})`); return; }
-        let ctx: ReturnType<typeof liveContext>;
-        try { ctx = liveContext(); } catch (e) { lock.release(); beatSafe({ name: 'judge-butler', saw: 0, everyMin: 10, err: e instanceof Error ? e.message : String(e) }); throw e; }
-        try {
-          const cards = loadCards();
-          const llm = configuredVoiceLlm();
-          const res = await wakeButler({ view: ctx.view, ports: ctx.ports, inbox: ctx.inbox, llm, cards, smart: await liveSmart(ctx, llm) });
-          // heartbeat (watchers-check judges DEAD after 2× cadence): saw = yellow cells judged this tick
-          beatSafe({ name: 'judge-butler', saw: ctx.view.cells.filter(c => c.status === 'yellow').length, everyMin: 10, last: new Date().toISOString() });
-          const summary = { ...res.tick, ...(res.smart ? { smart: res.smart } : {}), voice: res.voice.map(v => ({ msg: v.msg.id, from: v.msg.from, folded: v.folded, model: v.model, escalated: v.escalated })) };
-          mkdirSync(butlerHome(ctx.stateRoot), { recursive: true });
-          writeFileSync(join(butlerHome(ctx.stateRoot), 'last-tick.json'), JSON.stringify(summary));
-          await (await import('../loop-agent/live.js')).liveJournalRollup('judge-butler'); // SUPERVISOR-CORRECTION-JOURNAL
-          const reasons = res.tick.notSigned.slice(0, 12).map(x => `\n  not signed ${x.cell} — ${x.why.slice(0, 200)}`).join('');
-          out(summary, !!o.json, `judge-butler ${res.tick.level} · signed ${res.tick.signed.length}${res.tick.signed.length ? ` (${res.tick.signed.slice(0, 8).join(',')})` : ''} · refused ${res.tick.signRefused.length} · not signed ${res.tick.notSigned.length} · HOLD expired ${res.tick.expired.length} · proposed ${res.tick.proposed.length} · ✋ answered ${res.tick.answered.length} · → JUD ${res.tick.escalated.length} · freed ${res.tick.freed.length} · frozen ${res.tick.frozenHands} · voice ${res.voice.length}${reasons}`);
-        } catch (e) { beatSafe({ name: 'judge-butler', saw: 0, everyMin: 10, err: e instanceof Error ? e.message : String(e) }); throw e; }
-        finally { ctx.close(); lock.release(); }
+        const { KIND_RUNNERS } = await import('../loop-agent/v3/kind-runners.js');
+        const r = await KIND_RUNNERS['judge-butler.tick']!({ stateRoot: stateRoot() });
+        out(r.summary, !!o.json, r.text);
       } catch (e) { console.error(`judge-butler tick: ${e instanceof Error ? e.message : String(e)}`); process.exitCode = 1; }
     });
   b.command('voice').description('els channel voice adapter (PR #40331): one JSON line {loop,from,channel,text,refs,messageId} on stdin → one JSON line {text,evidence[],actions[]} on stdout · register: els channel voice judge-butler -- eln loop butler voice')
@@ -73,7 +52,7 @@ export function registerButlerCommands(loop: Command): void {
     const s = mem.readState(); const lvl = mem.level(); const now = Date.now();
     const cases = mem.cases(1000);
     const hour = filterInWindow(cases, c => c.at, now, HOUR_MS); // kit/kpi: by event time · a future-dated case never counts
-    const k = { level: lvl, lastTickAt: s.lastTickAt, greensLastHour: new Set(hour.filter(c => c.kind === 'sign' && !s.reversed[c.subject]).map(c => c.subject)).size, signEventsLastHour: hour.filter(c => c.kind === 'sign').length, frozenHands: Object.keys(s.frozenLast).length,
+    const k = { level: lvl, lastTickAt: s.lastTickAt, greensLastHour: greensInWindow(cases, s.reversed, now, HOUR_MS), signEventsLastHour: hour.filter(c => c.kind === 'sign').length, frozenHands: Object.keys(s.frozenLast).length,
       voiceTurnsLastHour: s.voiceTurns.filter(t => now - t < 3_600_000).length, escalationsLastHour: hour.filter(c => /escalate/u.test(c.kind)).length, lessons: mem.lessons().length,
       e4LastHour: { tried: hour.filter(c => c.kind === 'e4-run').length, ok: hour.filter(c => c.kind === 'e4-run' && /rc 0\b/u.test(c.why)).length, fail: hour.filter(c => c.kind === 'e4-run' && !/rc 0\b/u.test(c.why)).length },
       e4LastTick: (() => { try { return (JSON.parse(readFileSync(join(butlerHome(stateRoot()), 'last-tick.json'), 'utf8')) as { e4?: unknown }).e4 ?? null; } catch { return null; } })() };
@@ -97,28 +76,4 @@ export function registerButlerCommands(loop: Command): void {
       try { const a = agentMemory(id); a.mem.setLevel('live', byOf(o.by), o.reason); console.log(`${a.name} → live`); }
       catch (e) { console.error(`loop promote: ${e instanceof Error ? e.message : String(e)}`); process.exitCode = 1; }
     });
-}
-
-/** LOOP-AGENT-V3-SMART live wiring: agent.yaml hooks · L0 by duty «veto» · outcome = the proposal mail acked/done/replied ·
- *  router = the coordinator LLM (judgment node only for a toss-up) · knowhow = the butler's v2 pack. Absent / refused → null. */
-async function liveSmart(ctx: { store: import('../msg/msg-store.js').MsgStore; stateRoot: string }, llm: import('./voice.js').VoiceLlm | null): Promise<import('./smart.js').ButlerSmartInput | null> {
-  try {
-    const { loadButlerSmart } = await import('./smart.js');
-    const { cfg } = loadButlerSmart();
-    if (!cfg) return null;
-    const { supervisorSeat } = await import('../loop-agent/v3/agent-yaml.js');
-    const { fileAgentMemory } = await import('../loop-agent/memory.js');
-    const l0 = supervisorSeat({ duty: 'veto' }, 'JUD');
-    const shell = fileAgentMemory(ctx.stateRoot, 'judge-butler', l0);
-    return {
-      cfg, l0, router: llm,
-      mailOutcome: row => {
-        const id = Number(row.ref?.startsWith('msg:') ? row.ref.slice(4) : NaN);
-        if (!Number.isFinite(id)) return null;
-        const st = ctx.store.messageStatus(row.to, id);
-        return st === 'acked' || st === 'done' ? true : null; // unread / delivered = the HOLD state decides
-      },
-      knowhow: { text: () => shell.knowhow().text, add: (item, by, at) => shell.addKnowhow(item, by, at) },
-    };
-  } catch { return null; }
 }

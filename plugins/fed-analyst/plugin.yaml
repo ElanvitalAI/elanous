@@ -1,0 +1,8 @@
+# Loop agent fed-analyst as a plugin (LOOP-AGENTS-AS-PLUGINS P3). The ONE definition is the agent.yaml this points at — the plugin
+# id · name · version · description are compiled from its manifest (src/plugins/core/plugin-yaml.ts readLoopAgentRef) and are
+# never repeated here. Install (eln plugin add plugins/fed-analyst --yes) bundles the package and its tick shim and registers the
+# trigger; remove retires it. plugin.json is GENERATED (bun scripts/plugins/generate-plugin-json.ts --plugin-dir plugins/fed-analyst).
+apiVersion: elanous.dev/plugin/v2
+loopAgent: ../../graphs/loop-agents/fed-analyst/agent.yaml
+trust: builtin
+capabilities: [proc:elanous]

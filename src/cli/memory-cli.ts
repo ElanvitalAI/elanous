@@ -49,8 +49,17 @@ function cliCallerSeat(from?: string): string | null {
   return normalizeSeat(process.env.ELANOUS_TRACK) ?? seatFromCwd(process.cwd());
 }
 
+/** Subcommands that change a memory store — they register the logs.db sink before running. */
+export const MEMORY_CLI_WRITE_COMMANDS: ReadonlySet<string> = new Set(['add', 'pin', 'unpin', 'priority', 'delete', 'import', 'seed-op', 'promote', 'sync-proxy', 'import-claude']);
+
 export function registerMemoryCommands(program: Command): void {
   const memCmd = program.command('memory').description('Persistent memories injected into every chat turn (user / feedback / project / reference)');
+  // MEMORY-OBSERVABILITY — a CLI write (`memory add|pin|delete --seat …`) reaches logs.db like a session write does:
+  // `elanous logs --category memory.write` shows who wrote what, from where. Read-only subcommands stay sink-free.
+  memCmd.hook('preAction', async (_parent, action) => {
+    if (!MEMORY_CLI_WRITE_COMMANDS.has(action.name())) return;
+    try { await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('cli'); } catch { /* observation is fail-soft */ }
+  });
 
   memCmd
   .command('list [type]')

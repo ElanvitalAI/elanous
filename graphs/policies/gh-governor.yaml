@@ -1,0 +1,27 @@
+# GH-BUDGET-GOVERNOR (0.3.39 P0 · 11-28 19:0x · 20:0x KST): the one gh door's policy numbers.
+# Incident: GraphQL «API rate limit already exceeded» while `gh api rate_limit` showed 4,600/5,000 left = GitHub's SECONDARY
+# limit (burst · concurrency). Measured 20:0x: 26 full open-PR `--paginate` queries (body ⊕ files(first:100) per PR) in 195 s from
+# 14 seat TUIs (idle work-pull knocks), all on one token. Code reads these numbers — no copy of them lives in src/.
+schema: 1
+
+# Shared open-PR snapshot (<stateRoot>/gh-governor/open-prs-<repo>.json): one refresher (lock), every other reader reads the file.
+open_pr_snapshot:
+  ttl_sec: 60                 # a reader within this age reads the file, never GitHub
+  stale_max_sec: 900          # refresh failed / cooldown / budget → serve a snapshot up to this old (older = the read fails)
+  wait_for_refresher_sec: 20  # a reader that lost the lock waits this long for the refresher's file
+  lock_stale_sec: 120         # a lock older than this (or of a dead pid) is taken over
+  list_limit: 1000            # gh pr list --limit (gh pages by 100 itself)
+  files_batch: 25             # PRs per files GraphQL request (only heads the files cache has not seen)
+
+# Global secondary-limit cooldown (<stateRoot>/gh-governor/cooldown.json): every caller skips until it expires — no retry storm.
+cooldown:
+  default_sec: 120            # no Retry-After in the answer → this long
+  max_sec: 900
+  escalate_factor: 2          # a new hit within escalate_window_sec of the last cooldown's end multiplies the last duration
+  escalate_window_sec: 600
+
+# Per-seat GraphQL budget (<stateRoot>/gh-governor/ledger/<yyyymmdd>.jsonl): calls per rolling hour. Reads over it are refused
+# (writes are counted, never refused: a land / pr ready must not die on a counter · an unattributed caller is metered only).
+budget:
+  graphql_per_seat_per_hour: 300
+  overrides: {}               # seat → per-hour number (e.g. { OP: 600 })

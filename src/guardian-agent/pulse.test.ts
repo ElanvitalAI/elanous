@@ -4,13 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileMemory } from '../judge-butler/memory.js';
 import { GUARDIAN_DEMOTERS, GUARDIAN_ID, GUARDIAN_SUPERVISOR, type GuardianPorts, type GuardianView } from './body.js';
-import { runResidentPulse, type PulseDeps } from './pulse.js';
+import { codexHomeMeta, liveCredentials, runResidentPulse, type PulseDeps } from './pulse.js';
 import { dueSubAgents, memorySpawnLedger, renderKpiTable, SUB_AGENTS, worldEvents } from './subagents.js';
 import { diffWorld, readPulseSnapshot, renderWorld, supervisorEntries } from './world.js';
 import type { HostProbe } from './hosts.js';
 import type { Proc } from './reaper.js';
-import { accountEntries, judgeFuel, type UsageSnapshot } from './fuel.js';
-import { credentialEntries, type CredentialIn, type ExposureIn } from './keys.js';
+import { accountEntries, annotateRoutes, judgeFuel, type UsageSnapshot } from './fuel.js';
+import { credentialEntries, judgeKeys, type CredentialIn, type ExposureIn } from './keys.js';
 
 const T0 = new Date('2026-11-27T10:00:00.000Z');
 const H = 3_600_000;
@@ -19,7 +19,7 @@ function harness(fuel: { snap?: UsageSnapshot | null; fresh?: UsageSnapshot | nu
   const root = mkdtempSync(join(tmpdir(), 'guardian-pulse-'));
   const memory = fileMemory(root, { agent: GUARDIAN_ID, supervisor: GUARDIAN_SUPERVISOR, demoters: GUARDIAN_DEMOTERS });
   let refreshed = 0; let snap = fuel.snap ?? null;
-  const posts: Array<{ key: string; to: string; body: string }> = []; const restarts: string[] = []; const routes: string[] = []; const killed: number[] = [];
+  const posts: Array<{ key: string; to: string; body: string }> = []; const routes: string[] = []; const killed: number[] = [];
   let probes: HostProbe[] = [
     { host: 'node-b', reachable: true, load1: 135, ncpu: 32 }, { host: 'minim5', reachable: true, load1: 1.9, ncpu: 18 },
     { host: 'node-c', reachable: true, load1: 3.8, ncpu: 14 }, { host: 'mbp', reachable: true, load1: 4.7, ncpu: 18 },
@@ -39,12 +39,11 @@ function harness(fuel: { snap?: UsageSnapshot | null; fresh?: UsageSnapshot | nu
       { id: 'judge-butler', owner: 'OP', everyMin: 10, lastAt: new Date(now.getTime() - 5 * 60_000).toISOString(), lastStatus: 'done', badSince: new Date(now.getTime() - 90 * 60_000).toISOString(), via: 'trigger' }, // bad 90m
       { id: 'op-pulse', owner: 'OP', everyMin: 10, lastAt: new Date(now.getTime() - 3 * 60_000).toISOString(), lastStatus: 'done', badSince: null, via: 'trigger' },
     ],
-    restart: id => { restarts.push(id); },
     post: (key, to, body) => { posts.push({ key, to, body }); return posts.length; },
     heavy: () => ({ view: view(now), ports, close: () => {} }),
     beat: () => {},
   });
-  return { root, memory, posts, restarts, routes, killed, deps, refreshed: () => refreshed, setProbes: (p: HostProbe[]) => { probes = p; } };
+  return { root, memory, posts, routes, killed, deps, refreshed: () => refreshed, setProbes: (p: HostProbe[]) => { probes = p; } };
 }
 
 describe('guardian thin body — pulse aggregates, spawns sub-agents (one line each), decides the route', () => {
@@ -54,8 +53,8 @@ describe('guardian thin body — pulse aggregates, spawns sub-agents (one line e
     expect(r.spawned.map(s => s.split('(')[0]).sort()).toEqual(['fuel', 'keys', 'lease', 'macrophage', 'patrol', 'post', 'pulse']);
     expect(r.spawned).toContain('lease(event host-overload)');
     expect(r.spawned).toContain('pulse(event supervisor-dead)');
-    expect(h.restarts).toEqual(['land-graph']); // 맥박: dead → one restart
-    expect(h.posts.some(p => p.to === 'TC' && p.body.includes('감독자 재기동'))).toBe(true);
+    // LOOP-AGENTS-AS-PLUGINS P1: a dead trigger is the registry's (refire · retry · owner card) — the 맥박 only counts it
+    expect(h.posts.some(p => p.body.includes('감독자 재기동'))).toBe(false);
     expect(h.posts.some(p => p.to === 'OP' && p.body.includes('재부착 제안') && p.body.includes('judge-butler'))).toBe(true); // bad 90m → reattach, never retire
     expect(h.killed.sort()).toEqual([500, 501, 502, 503, 504]); // 대식세포 reaped the orphans
     expect(h.routes).toEqual(['minim5']); // final load-switch decision by the body
@@ -63,7 +62,9 @@ describe('guardian thin body — pulse aggregates, spawns sub-agents (one line e
     const snap = readPulseSnapshot(h.root)!;
     expect(snap.kpi).toHaveLength(7);
     expect(renderKpiTable(snap.kpi)).toContain('✘ 맥박(pulse) — 감독자·호스트 heartbeat 결손 0: 감독자 결손 2/3');
-    expect(renderKpiTable(snap.kpi)).toContain('· 순찰대(patrol) — 좀비 런 0 · 미분류 사망 0: not built yet');
+    // GUARDIAN-SUBS: patrol/post run (no peer registered in this world → «?», never «not built yet» and never a false 0)
+    expect(renderKpiTable(snap.kpi)).toContain('· 순찰대(patrol) — 좀비 런 0 · 미분류 사망 0: 좀비 런 ? · 미분류 사망 ? · 실패 진단 ? · 루프 예외 0 · 응답 없는 서브 0/0');
+    expect(renderKpiTable(snap.kpi)).toContain('· 우체국·레일지기(post) — SLA 초과 우편 0 · 레일 회귀 즉시 카드: SLA 초과 우편 ? · 잠든 수신처 ? · 레일 ? · 응답 없는 서브 0/0');
     expect(renderWorld(snap.world)).toContain('node-b overloaded 4.22');
     // every spawn is one line, opened and closed
     const lines = h.memory.cases().filter(c => c.kind === 'spawn');
@@ -78,7 +79,6 @@ describe('guardian thin body — pulse aggregates, spawns sub-agents (one line e
     expect(runResidentPulse(h.deps(new Date(T0.getTime() + 60_000))).spawned).toEqual([]);
     const r3 = runResidentPulse(h.deps(new Date(T0.getTime() + 5 * 60_000)));
     expect(r3.spawned.map(s => s.split('(')[0]).sort()).toEqual(['lease', 'macrophage', 'pulse']);
-    expect(h.restarts).toEqual(['land-graph']); // restart is rate-limited to once per 30 min
   });
 
   test('a spawn line left open past its TTL is reaped by the parent', () => {
@@ -93,7 +93,7 @@ describe('guardian thin body — pulse aggregates, spawns sub-agents (one line e
     const h = harness();
     h.memory.setLevel('shadow', 'RES', 'drill', T0);
     const r = runResidentPulse(h.deps(T0));
-    expect(r.spawned).toEqual([]); expect(h.restarts).toEqual([]); expect(h.killed).toEqual([]);
+    expect(r.spawned).toEqual([]); expect(h.killed).toEqual([]);
     expect(readPulseSnapshot(h.root)!.world.length).toBeGreaterThan(0);
   });
 });
@@ -156,8 +156,26 @@ describe('연료관 — accounts from the status snapshot · alerts before the 9
     const rows = accountEntries(snapAt(T0.getTime() - 20 * 60_000), T0.getTime());
     expect(rows.map(r => `${r.id}:${r.status}`)).toEqual(['codex:team:low', 'codex:third:exhausted', 'codex:default:ok', 'zai:default:exhausted', 'openrouter:default:exhausted']);
     const v = judgeFuel(rows);
-    expect(v).toMatchObject({ low: ['codex:team'], floorGone: true, stale: true, ok: false });
-    expect(judgeFuel([]).ok).toBeNull();
+    expect(v).toMatchObject({ low: ['codex:team'], floorGone: true, stale: true });
+    expect(judgeFuel([]).value).toBe('계정 잔량 스냅숏 없음 (eln usage status-cache)'); // ok/miss = the agent.yaml KPI line (CODE-BODY-TO-KIND)
+  });
+
+  test('units (GUARDIAN-SUBS 11-28): an exhausted account the decision took off the subscription route is normalized — no miss, no fuel-90', () => {
+    const snap: UsageSnapshot = { ts: T0.getTime(), accounts: [{ provider: 'codex', account: 'team', usedPercent: 2, status: 'ok' }, { provider: 'codex', account: 'third', usedPercent: 100, status: 'ok' }, { provider: 'codex', account: 'default', usedPercent: 100, status: 'ok' }] };
+    const routes = { accounts: { 'codex:team': { pack: 'openai-codex', routed: true, routable: true, level: 'L0' }, 'codex:third': { pack: 'openai-codex', routed: false, routable: true, level: 'L3' }, 'codex:default': { pack: 'openai-codex', routed: false, routable: true, level: 'L3' } }, providers: { 'openai-codex': ['team'] } };
+    const rows = annotateRoutes(accountEntries(snap, T0.getTime()), routes);
+    expect(judgeFuel(rows)).toMatchObject({ stuck: [], floorGone: false, skipped: ['codex:third', 'codex:default'], dry: [], value: 'codex:team 2% · codex:third 100% 건너뜀 · codex:default 100% 건너뜀 · 소진·경로 잔존 0 · 건너뜀 2 · 강등 0' });
+    // 96 % on a pack cap of 100 % → still routed, demoted + a tier down at L2 → handled, not a miss (GRD-FUEL-7DAY)
+    const l2 = annotateRoutes(accountEntries({ ts: T0.getTime(), accounts: [{ provider: 'codex', account: 'team', usedPercent: 96, status: 'ok' }] }, T0.getTime()), { providers: { 'openai-codex': ['team'] }, accounts: { 'codex:team': { pack: 'openai-codex', routed: true, routable: true, level: 'L2' } } });
+    expect(judgeFuel(l2)).toMatchObject({ stuck: [], dry: [], demoted: ['codex:team'], value: 'codex:team 96% 강등 · 소진·경로 잔존 0 · 건너뜀 0 · 강등 1' });
+    expect([...worldEvents(l2)]).toEqual([]);
+    expect([...worldEvents(rows)]).toEqual([]);
+    // still on the subscription route at 100 % = the real miss · every account unroutable = dry
+    const stuck = annotateRoutes(accountEntries(snap, T0.getTime()), { ...routes, accounts: { ...routes.accounts, 'codex:third': { pack: 'openai-codex', routed: true, routable: true, level: 'L0' } } });
+    expect(judgeFuel(stuck)).toMatchObject({ stuck: ['codex:third'] });
+    expect([...worldEvents(stuck)]).toEqual(['fuel-90']);
+    const dry = annotateRoutes(accountEntries(snap, T0.getTime()), { providers: { 'openai-codex': [] }, accounts: Object.fromEntries(Object.keys(routes.accounts).map(k => [k, { pack: 'openai-codex', routed: false, routable: false, level: 'L3' }])) });
+    expect(judgeFuel(dry)).toMatchObject({ dry: ['openai-codex'] });
   });
 });
 
@@ -174,9 +192,34 @@ describe('열쇠지기 — credential metadata rows · stopped refresh = stale �
     expect(h.posts.filter(p => p.key.startsWith('guardian-key-stale')).map(p => p.key.split(':').slice(1, 3).join(':')).sort()).toEqual(['oauth:grok', 'oauth:gws']);
     const card = h.posts.find(p => p.key.startsWith('guardian-expose'))!;
     expect(card.body).toContain('logs 행 9912'); expect(card.body).toContain('길이 51'); expect(card.body).toContain('값은 옮기지 않았다');
-    expect(readPulseSnapshot(h.root)!.kpi.find(k => k.agent === 'keys')).toMatchObject({ ok: false, value: '자격 3 · 만료/정지 oauth:grok,oauth:gws · 노출 1' });
+    expect(readPulseSnapshot(h.root)!.kpi.find(k => k.agent === 'keys')).toMatchObject({ ok: false, value: '자격 3 · 만료/정지 oauth:grok,oauth:gws · 노출 1 · 만료 48h 이내 미갱신 2 (oauth:openai-codex,oauth:grok)' });
     runResidentPulse(h.deps(new Date(T0.getTime() + 5 * 60_000)));
     expect(h.posts.filter(p => p.key.startsWith('guardian-expose'))).toHaveLength(1);
+  });
+
+  // Terra #40656 r1 ①② · r2 ①: the home is the only truth — unreadable = disconnected (pack home still checked) · readable but
+  // undecodable exp / no last_refresh = null (never the store row's numbers) · pack home ids carry the full path
+  test('liveCredentials: CODEX_HOME truth · unreadable = disconnected · undecodable = unknown · full-path pack ids', () => {
+    const files: Record<string, string> = {
+      '/h/garbled/auth.json': JSON.stringify({ tokens: { access_token: 'not-a-jwt', refresh_token: 'r' } }),
+      '/a/codex-x/auth.json': JSON.stringify({ last_refresh: '2026-11-27T00:00:00.000Z', tokens: { access_token: `h.${Buffer.from('{"exp":1796176551}').toString('base64url')}.s`, refresh_token: 'r' } }),
+    };
+    const read = (p: string) => { const t = files[p]; if (t === undefined) throw new Error('ENOENT'); return t; };
+    const rows = () => [
+      { provider: 'openai-codex:team', connected: true, expiresAt: 1, lastRefresh: '2026-01-01T00:00:00.000Z', home: '/h/missing' },
+      { provider: 'openai-codex:third', connected: true, expiresAt: 2, lastRefresh: '2026-01-02T00:00:00.000Z', home: '/h/garbled' },
+      { provider: 'grok', connected: true, expiresAt: 3, lastRefresh: '2026-01-03T00:00:00.000Z', home: null },
+    ];
+    const packHomes = () => [{ account: 'team', home: '/h/missing' }, { account: 'team', home: '/a/codex-x' }, { account: 'team', home: '/b/codex-x' }];
+    const got = liveCredentials({ rows, readAuth: read, packHomes, real: h => h });
+    expect(got.map(c => `${c.provider}|${c.connected}|${c.expiresAt}|${c.lastRefresh}|${c.refreshable ?? '-'}`)).toEqual([
+      'openai-codex:team|false|null|null|false',
+      'openai-codex:third|true|null|null|true',
+      'grok|true|3|2026-01-03T00:00:00.000Z|-',
+      'codex-home:team:/h/missing|false|null|null|false',
+      'codex-home:team:/a/codex-x|true|1796176551000|2026-11-27T00:00:00.000Z|true',
+      'codex-home:team:/b/codex-x|false|null|null|false',
+    ]);
   });
 
   test('units: stale only when refresh stopped > 7d and access expired, or disconnected', () => {
@@ -185,6 +228,27 @@ describe('열쇠지기 — credential metadata rows · stopped refresh = stale �
       { provider: 'b', connected: true, expiresAt: T0.getTime() - H, lastRefresh: new Date(T0.getTime() - 8 * 24 * H).toISOString() },
     ], T0.getTime());
     expect(rows.map(r => `${r.id}:${r.status}`)).toEqual(['oauth:a:ok', 'oauth:b:stale']);
+    // GUARDIAN-SUBS 11-28: an unknown expiry (named codex account row) is `unknown`, never `stale`
+    const named = credentialEntries([{ provider: 'openai-codex:team', connected: true, expiresAt: null, lastRefresh: new Date(T0.getTime() - 8 * 24 * H).toISOString() }], T0.getTime());
+    expect(named.map(r => `${r.id}:${r.status}`)).toEqual(['oauth:openai-codex:team:unknown']);
     expect(JSON.stringify(rows)).not.toMatch(/accessToken|refreshToken/);
+  });
+
+  test('units (GUARDIAN-SUBS 11-28): a named codex account reads its CODEX_HOME auth.json (JWT exp · last_refresh) · unknown expiry is not a miss', () => {
+    // exp 1795831200 = 2026-11-28T02:00:00Z (literal) · the token itself is never returned
+    const auth = JSON.stringify({ last_refresh: '2026-11-18T10:00:00.000Z', tokens: { access_token: `hdr.${Buffer.from('{"exp":1795831200}').toString('base64url')}.sig` } });
+    const meta = codexHomeMeta('/codex-third/', p => { expect(p).toBe('/codex-third/auth.json'); return auth; });
+    expect(meta).toEqual({ connected: true, expiresAt: 1795831200000, lastRefresh: '2026-11-18T10:00:00.000Z', refreshable: false });
+    expect(JSON.stringify(meta)).not.toContain('hdr.');
+    expect(codexHomeMeta('/nope', () => { throw new Error('ENOENT'); })).toBeNull();
+    expect(codexHomeMeta('/garbled', () => JSON.stringify({ tokens: { access_token: 'not-a-jwt' } }))).toEqual({ connected: true, expiresAt: null, lastRefresh: null, refreshable: false });
+    const rows = credentialEntries([
+      { provider: 'anthropic', connected: true, expiresAt: T0.getTime() - H, lastRefresh: new Date(T0.getTime() - 10 * 24 * H).toISOString() },
+      { provider: 'openai-codex:third', connected: true, expiresAt: null, lastRefresh: new Date(T0.getTime() - 9 * 24 * H).toISOString() },
+      { provider: 'openai-codex:team', connected: true, expiresAt: meta!.expiresAt, lastRefresh: meta!.lastRefresh },
+    ], T0.getTime());
+    expect(rows.map(r => `${r.id}:${r.status}`)).toEqual(['oauth:anthropic:stale', 'oauth:openai-codex:third:unknown', 'oauth:openai-codex:team:ok']);
+    expect(judgeKeys(rows, [])).toEqual({ stale: ['oauth:anthropic'], value: '자격 3 · 만료/정지 oauth:anthropic · 만료 모름 oauth:openai-codex:third · 노출 0' });
+    expect([...worldEvents(rows)]).toEqual(['credential-expiring']);
   });
 });

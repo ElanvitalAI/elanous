@@ -4,9 +4,18 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendLedger, type Focused, type LandDeps, type PrInfo, type Receipt } from '../land-graph/land-graph.js';
-import { answer, stewardTick, voiceView } from './agent.js';
-import { fileMemory, loadCards } from './memory.js';
-import { lanes, trainOrder } from './train.js';
+import { answer as answerWith } from '../land-graph/voice.js';
+import { landGraphAgentTick, landVoiceView } from '../loop-agent/v3/land-graph-kind.js';
+import { fileMemory, loadCards, STEWARD_ID, STEWARD_SEAT, STEWARD_SUPERVISOR, type StewardCards } from './memory.js';
+import { fileAgentMemory } from '../loop-agent/memory.js';
+import { BESPOKE_AGENTS, hasBody } from '../loop-agent/registry.js';
+import { lanes, loadLandPolicy, trainOrderOf } from '../land-graph/lane-order.js';
+
+// CODE-BODY-TO-KIND: the steward = the land-graph.tick ⊕ kpi-voice kinds with the land-steward package
+const stewardTick = (d: LandDeps, p: Parameters<typeof landGraphAgentTick>[1], c: StewardCards) => landGraphAgentTick(d, p, c, { id: STEWARD_ID, address: STEWARD_SEAT, l0Fallback: STEWARD_SUPERVISOR });
+const voiceView = (d: LandDeps) => landVoiceView(d, STEWARD_SEAT);
+const answer = (q: string, v: Parameters<typeof answerWith>[1]) => answerWith(q, v, { id: STEWARD_ID, l0: STEWARD_SUPERVISOR });
+const trainOrder = trainOrderOf(loadLandPolicy()!.laneOrder.train!);
 
 const ORG = join(mkdtempSync(join(tmpdir(), 'ls-org-')), 'federation.yaml');
 writeFileSync(ORG, 'org:\n  duties:\n    landing: TC\n    veto: JUD\n');
@@ -55,6 +64,10 @@ describe('seed A — 11-27 08:4x queue (the stopgap runner list)', () => {
     appendLedger(s, { at: '2026-11-26T22:04:11Z', pr: 39114, head: hx(39114), mode: 'live', event: 'refused', cls: 'stale-base-revert', why: 'guard error: …' });
     const d = deps(s, w, posts, { slots: 4 });
     const r = await stewardTick(d, ports(s), cards);
+    expect(fileMemory(s).readState()).toMatchObject({ lastTickAt: NOW.toISOString(), ticks: 1 });
+    expect(fileAgentMemory(s, 'land-steward', 'TC').readState()).toMatchObject({ lastTickAt: NOW.toISOString(), ticks: 1 });
+    expect(BESPOKE_AGENTS['land-steward']).toBe('eln land steward status|tick|voice');
+    expect(hasBody('land-steward')).toBe(false);
     expect(r.landed).toEqual([39891, 39794, 40157]); // crown first; #39960 tsc-refused at land time
     expect(r.decisions.filter(x => x.action !== 'land').every(x => !!x.next)).toBe(true);
     expect(r.kpi!.refusalsWithoutNext).toEqual([]);

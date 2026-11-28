@@ -41,6 +41,20 @@ test('stale copy of a file (branch merged main, then committed the old file) is 
   } finally { rmSync(r.dir, { recursive: true, force: true }); }
 });
 
+test('own rewrite is refused with a filled declaration candidate, not automatically declared', () => {
+  const r = repo();
+  try {
+    r.write('a.ts', 'base\n'); r.commit('base');
+    r.write('a.ts', `base\n${twelve.join('\n')}\n`); r.commit('feat: prior (#9001)');
+    r.run('checkout', '-q', '-b', 'feature');
+    r.write('a.ts', 'base\nreplacement\n'); r.commit('refactor: rewrite');
+    const result = detectStaleBaseRevert(r.dir, 'main', 'feature');
+    expect(result.ok).toBe(false);
+    expect(result.card).toContain('의도된 삭제: a.ts (PR 수정으로 기존 줄 대체; 의도 확인 후 사용)');
+    expect(result.hits.map((hit) => hit.file)).toEqual(['a.ts']);
+  } finally { rmSync(r.dir, { recursive: true, force: true }); }
+});
+
 test('a real edit that keeps part of a recent PR passes · up-to-date head passes', () => {
   const r = repo();
   try {
@@ -92,6 +106,25 @@ test('a declared path or PR is excluded from the wipe check · an undeclared wip
     expect(none.card).toContain('의도된 삭제: ');
     const byPath = detectStaleBaseRevert(r.dir, 'main', 'feature', { declared: { paths: ['a.ts'], prs: [] } });
     expect([byPath.ok, byPath.hits.map((h) => h.file)]).toEqual([false, ['b.ts']]);
+    for (const body of [
+      '의도된 삭제: a.ts (superseded)',
+      '의도된 삭제: `a.ts` (superseded)',
+      '의도된 삭제: **a.ts** (superseded)',
+      '- 의도된 삭제: a.ts (superseded)',
+      '의도된 삭제: - `a.ts` (superseded)',
+    ]) {
+      const declared = parseDeclaredRemovals(body);
+      expect(declared).toEqual({ paths: ['a.ts'], prs: [] });
+      const result = detectStaleBaseRevert(r.dir, 'main', 'feature', { declared });
+      expect(result.ok).toBe(false);
+      expect(result.hits.map((h) => h.file)).toEqual(['b.ts']);
+      expect(result.card).toContain('REFUSE stale-base-revert:');
+      const allowed = detectStaleBaseRevert(r.dir, 'main', 'feature', {
+        declared: { paths: [...declared.paths, 'b.ts'], prs: declared.prs },
+      });
+      expect(allowed.ok).toBe(true);
+      expect(allowed.hits).toEqual([]);
+    }
     const both = detectStaleBaseRevert(r.dir, 'main', 'feature', { declared: { paths: ['a.ts'], prs: [40402] } });
     expect(both.ok).toBe(true);
   } finally { rmSync(r.dir, { recursive: true, force: true }); }

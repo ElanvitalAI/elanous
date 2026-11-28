@@ -1,6 +1,8 @@
 schema: 1
 world: capsule-events
 scenarios:
+  - { id: BUS-P0-BUSY-ONCE, module: src/ux-sim/sim-world/capsule-events/bus-p0-steer.ts }
+  - { id: BUS-P0-FALLBACK-IDLE, module: src/ux-sim/sim-world/capsule-events/bus-p0-steer.ts }
   - { id: SEAT-STEER-PREEMPT-137, module: src/ux-sim/sim-world/capsule-events/steer-preempt.ts }
   - { id: SEAT-CAPSULE-NO-REPEAT-REPORT, module: src/ux-sim/sim-world/capsule-events/c8-no-repeat.ts }
   - id: C1
@@ -33,3 +35,7 @@ scenarios:
     module: src/ux-sim/sim-world/capsule-events/c9-session-scoped.ts
   - id: A1
     module: src/ux-sim/sim-world/capsule-events/a1-sample.ts
+  - { id: TURN-GIVEUP-ROUTE-REENTER, module: src/ux-sim/sim-world/capsule-events/turn-gives-up.ts }
+  - { id: TURN-GIVEUP-DELEGATION-INLINE, module: src/ux-sim/sim-world/capsule-events/turn-gives-up.ts }
+  - { id: TURN-GIVEUP-CONTINUE-ROWS, module: src/ux-sim/sim-world/capsule-events/turn-gives-up.ts }
+  - { id: TURN-GIVEUP-FANOUT-NOT-VERIFY, module: src/ux-sim/sim-world/capsule-events/turn-gives-up.ts }

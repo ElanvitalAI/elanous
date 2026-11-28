@@ -5,13 +5,15 @@
 //
 // 세 얼굴:
 //   관측 = every planned/done row in `<state>/steward/space/<scope>/ledger.jsonl` ⊕ graph run outputs ⊕ `eln steward space status`
-//   판단 근거 = rules only (no LLM): idle ≥ 10 min (an idle owner of a yellow cell is woken there, never reassigned) · yellow P0/P1 stalled ≥ 2 h · same-head receipt · verdict files · caps
+//   판단 근거 = rules only (no LLM): free hand idle ≥ live.idle_min (graphs/policies/steward-hq.yaml · 2 min) · an idle owner (≥ 10 min) of a yellow cell is woken there, never reassigned · coordinator-held roster cells move at once · yellow P0/P1 stalled ≥ 2 h · same-head receipt · verdict files · caps
 //   수복과 인계 = one batched exception card per tick to the scope's coordinator (≤ 10 lines + count) · only refused /
 //               ambiguous rows are exceptions; «no free hand» / «over the cap» is capacity → `defer` (11-25 15:37 flood:
 //               64+45+32 escalate rows in one shadow tick were capacity, not decisions)
 
 import { isJudgeRole } from '../../seat/hand-pool.js';
-import { cellWaitOf } from './cell-wait.js';
+import { cellWaitOf, handLeaseMinutes, prNamesCell, type CellLanes } from './cell-wait.js';
+import { comparePull, legacyPullPolicy, liveWriter, recentDeclaredPr, pullClass, type PullPolicy, type RosterRankLike } from '../../kit/work-pull/index.js';
+import { seatTakesCell, type SeatRolesPolicy } from '../../kit/seat-area/index.js';
 import { STEWARD_SPACE_DEFAULTS as D, STEWARD_SPACE_FORBIDDEN_HOSTS, type ResolvedScope, type StewardSpaceProfile } from './config.js';
 
 export interface SeatView {
@@ -31,13 +33,52 @@ export interface CellView {
   readonly owner?: string;
   readonly priority?: string;
   readonly updatedAt: string;
+  /** Launch class (code · ops · measure · decision · umbrella …) — umbrella/decision cells are never pushed at a hand. */
+  readonly dispatchKind?: string;
+  /** The evidence's first line (≤ 120 chars) — the roster marker lives there («[예비 0.3.39] …» · «[WIP 잔류 0.3.39] …»). */
+  readonly evidenceHead?: string;
+  readonly updatedBy?: string;
+  /** WORK-PULL-REACHES-ROSTER — the hand writing this coordinator-held cell (checklist `writer` event). */
+  readonly writer?: { readonly seat: string; readonly at: string };
+  /** SEAT-AREA-GUARD — the cell's area signals (kit/seat-area cellAreaPaths over the full title/body/done-when). */
+  readonly areaPaths?: readonly string[];
 }
+
+// ── live R1 policy (STEWARD-HQ-LIVE-ALIGN · graphs/policies/steward-hq.yaml `live`) ────────────────────────────────
+// 11-28 22:25Z: the HQ shadow paired 3 idle TC hands while live R1 wrote 3 × defer «no-idle-hand-anywhere» — free = idle
+// ≥ 10 min (shadow 2) · a coordinator-held cell moved only after the 2 h stall clock (the 0.3.39 roster moved in 65 min
+// earlier) · cross-scope lending only through the sub-scope's `idleLeft` (TC reported []). The numbers live in the policy
+// pack; these are its defaults.
+
+export interface LiveR1Policy {
+  /** A hand with no workable cell idle at least this long is free (push · lend · pull nudge). Owner wakes keep 10 min. */
+  readonly idleMin: number;
+  /** A yellow roster cell held by a coordinator is movable at once (no stall clock) — leaders route, hands work. */
+  readonly rosterStallExempt: boolean;
+  /** HQ lends any scope's free hand directly (not only the hands a sub-scope reported as `idleLeft`). */
+  readonly directLend: boolean;
+  /** Evidence first-line prefixes that mark a cell as NOT on the roster (reserve · WIP leftover). */
+  readonly notRosterMarkers: readonly string[];
+}
+
+/** The policy pack's defaults (= the values graphs/policies/steward-hq.yaml ships). */
+export const DEFAULT_LIVE_R1: LiveR1Policy = { idleMin: 2, rosterStallExempt: true, directLend: true, notRosterMarkers: ['[예비 ', '[WIP 잔류 '] };
+/** Before STEWARD-HQ-LIVE-ALIGN — what a planMatch call without a policy does (unit fixtures · older callers). */
+export const LEGACY_R1: LiveR1Policy = { idleMin: D.idleMinMinutes, rosterStallExempt: false, directLend: false, notRosterMarkers: [] };
+
+/** Never pushed at a hand (same set as hand-steward · op-next-action). */
+export const NOT_ASSIGNABLE_KINDS: ReadonlySet<string> = new Set(['umbrella', 'decision']);
+export const isAssignableCell = (c: Pick<CellView, 'dispatchKind'>): boolean => !NOT_ASSIGNABLE_KINDS.has(c.dispatchKind ?? '');
+/** On the current roster = no «not roster» marker at the head of its evidence. */
+export const isRosterCell = (c: Pick<CellView, 'evidenceHead'>, markers: readonly string[]): boolean =>
+  !markers.some((m) => (c.evidenceHead ?? '').trimStart().startsWith(m));
 
 export interface PrView {
   readonly number: number;
   readonly head: string;
   readonly branch: string;
   readonly title: string;
+  readonly body?: string;
   readonly draft: boolean;
   readonly updatedAt: string;
   readonly files?: readonly string[];
@@ -79,8 +120,38 @@ export interface Snapshot {
   readonly roles?: Readonly<Record<string, string>>;
   /** Cells only a judge can sign (judge-butler «JUD signs this one») — absent = none known (R3 judges open PRs only). */
   readonly judgeCells?: readonly JudgeCellView[];
+  /** STEWARD-READY-LANES — green-triage lanes (cell-wait.ts): lane a waits on JUD · lane b stays with its hand 2 h. */
+  readonly lanes?: CellLanes;
+  /** WORK-PULL-REACHES-ROSTER — the shared «ready for a hand» policy (graphs/policies/work-pull.yaml) ⊕ OP's roster rank.
+   *  Absent = the pre-policy steward (P0/P1 · its own order). */
+  readonly pull?: { readonly policy: PullPolicy; readonly rosterRank?: RosterRankLike };
+  /** SEAT-AREA-GUARD — graphs/policies/seat-roles.yaml (plain data: the snapshot is persisted as JSON). Absent = every
+   *  hand fits every cell (the pre-policy steward). */
+  readonly seatRoles?: SeatRolesPolicy;
   readonly sourceErrors: readonly string[];
 }
+
+/** SEAT-AREA-GUARD — may this hand be handed this cell (seat-roles.yaml · kit/seat-area)? `area` = it fits by its area
+ *  (preferred over a general hand). No policy in the snapshot = yes, generally. */
+const areaFitOf = (snap: Pick<Snapshot, 'seatRoles'>, seat: string, cell: CellView): { ok: boolean; area: boolean } => {
+  if (!snap.seatRoles) return { ok: true, area: false };
+  try {
+    const f = seatTakesCell(seat, { id: cell.id, title: cell.title, ...(cell.owner ? { owner: cell.owner } : {}), ...(cell.areaPaths ? { paths: cell.areaPaths } : {}) }, snap.seatRoles);
+    return { ok: f.ok, area: f.ok && f.area };
+  } catch { return { ok: true, area: false }; }
+};
+const areaFits = (snap: Pick<Snapshot, 'seatRoles'>, seat: string, cell: CellView): boolean => areaFitOf(snap, seat, cell).ok;
+
+/** WORK-PULL-REACHES-ROSTER — the live writer of a cell in this snapshot (kit/work-pull liveWriter · the seats' activity
+ *  clock ⊕ PRs naming the cell — the same rule `eln work next` applies). */
+const liveWriterInSnap = (snap: Snapshot, cell: CellView): string | undefined => {
+  const seat = cell.writer?.seat?.trim().toUpperCase();
+  if (!seat) return undefined;
+  const view = snap.seats.find((s) => s.seat === seat);
+  const activityMs = view?.lastActiveMs ?? (view?.activity === 'working' ? snap.nowMs : view?.activity === 'idle' && view.idleForMs !== null ? snap.nowMs - view.idleForMs : undefined);
+  const prs = snap.prs.filter((pr) => prNamesCell(pr, cell.id)).map((pr) => Date.parse(pr.updatedAt)).filter((t) => Number.isFinite(t));
+  return liveWriter(cell, { nowMs: snap.nowMs, ...(activityMs !== undefined ? { activityMs } : {}), ...(prs.length ? { prUpdatedMs: Math.max(...prs) } : {}) }, snap.pull?.policy ?? legacyPullPolicy());
+};
 
 export type RowAction = 'reclaim' | 'wake' | 'assign' | 'dispatch' | 'judge-assign' | 'handoff' | 'watch' | 'digest' | 'escalate' | 'reject' | 'ambiguous' | 'defer';
 
@@ -171,10 +242,10 @@ export const judgeCell = (snap: Pick<Snapshot, 'parent' | 'roles'>, cell: Pick<C
 const isHand = (snap: Snapshot, seat: string): boolean => seat !== snap.hq && !snap.coordinators.includes(seat);
 
 /** Idle hands of a scope, longest idle first. */
-export function idleHands(snap: Snapshot, scope: string, state: ScopeState): SeatView[] {
+export function idleHands(snap: Snapshot, scope: string, state: ScopeState, idleMin: number = D.idleMinMinutes): SeatView[] {
   return snap.seats
     .filter((s) => isHand(snap, s.seat) && scopeOf(snap, s.seat) === scope)
-    .filter((s) => s.activity === 'idle' && s.idleForMs !== null && s.idleForMs >= D.idleMinMinutes * MIN)
+    .filter((s) => s.activity === 'idle' && s.idleForMs !== null && s.idleForMs >= idleMin * MIN)
     .filter((s) => !within(state.seatCooldown[s.seat], snap.nowMs, D.cooldownMinutes))
     .sort((a, b) => (b.idleForMs ?? 0) - (a.idleForMs ?? 0) || a.seat.localeCompare(b.seat));
 }
@@ -185,18 +256,43 @@ const PRIORITY_RANK: Record<string, number> = { P0: 0, P1: 1 };
 
 /** Yellow P0/P1 cells this scope must move: unowned cells belong to HQ; an owned cell belongs to its owner's scope and
  *  is movable once untouched ≥ 2 h while its owner is not working. */
-export function movableCells(snap: Snapshot, scope: string, state: ScopeState): CellView[] {
+export function movableCells(snap: Snapshot, scope: string, state: ScopeState, r1: LiveR1Policy = LEGACY_R1): CellView[] {
   const working = new Set(snap.seats.filter((s) => s.activity === 'working').map((s) => s.seat));
+  const pull = snap.pull;
+  // WORK-PULL-REACHES-ROSTER — the shared priorities (work-pull.yaml order.priorities · OP's table and `work next` use the
+  // same) · a cell a hand is live-writing is that hand's · «[WIP 잔류 …]» never moves.
+  const ranked = (c: CellView): boolean => c.priority !== undefined && (pull ? pull.policy.priorities.includes(c.priority) : c.priority in PRIORITY_RANK);
+  const roster = (c: CellView): boolean => (pull ? pullClass(c.evidenceHead, pull.policy) === 'roster' : isRosterCell(c, r1.notRosterMarkers));
   return snap.cells
-    .filter((c) => c.status === 'yellow' && c.priority !== undefined && c.priority in PRIORITY_RANK)
+    .filter((c) => c.status === 'yellow' && ranked(c) && isAssignableCell(c))
+    .filter((c) => !pull || (pullClass(c.evidenceHead, pull.policy) !== 'never' && liveWriterInSnap(snap, c) === undefined && !recentDeclaredPr(c.id, snap.prs, snap.nowMs, pull.policy)))
+    // A cell waiting on someone else (verdict · receipt · HOLD · train — its PR is done) is not work to push (the board's
+    // rule · 11-28 22:25Z replay: JEV-DECIDE-KIT / JEV-MEMORY-RECALL were awaiting a receipt and still drew hands).
+    .filter((c) => !cellWaitOf(c.id, snap))
     .filter((c) => !within(state.assigned[c.id]?.at, snap.nowMs, D.cooldownMinutes))
     .filter((c) => {
       if (UNOWNED(c.owner)) return scope === snap.hq;
       const owner = ownerSeat(c.owner);
+      if (scopeOf(snap, owner) !== scope) return false;
+      // STEWARD-HQ-LIVE-ALIGN: a roster cell a coordinator holds is the board now (`eln work next` reads it so) — no clock.
+      if (!isHand(snap, owner) && r1.rosterStallExempt && roster(c)) return true;
       // A coordinator is always «working» on coordination; its held cells move on age alone.
-      return scopeOf(snap, owner) === scope && (!working.has(owner) || !isHand(snap, owner)) && ageMs(c.updatedAt, snap.nowMs) >= D.stallMinutes * MIN;
+      return (!working.has(owner) || !isHand(snap, owner)) && ageMs(c.updatedAt, snap.nowMs) >= D.stallMinutes * MIN;
     })
-    .sort(cellOrder);
+    .sort(pull ? (a, b) => comparePull(a, b, pull.policy, pull.rosterRank) || Date.parse(a.updatedAt) - Date.parse(b.updatedAt) || a.id.localeCompare(b.id) : cellOrder);
+}
+
+/** Free hands anywhere (HQ direct lending · the shadow plan): idle ≥ idleMin · not waiting on an open ✋ · no workable
+ *  yellow cell of its own (WIP 1 — an owner is woken on its cell by its own scope, never lent). Longest idle first. */
+export function freeHands(snap: Snapshot, idleMin: number): SeatView[] {
+  const waiting = new Set(snap.openHands.flatMap((h) => [h.sender, h.blockedSeat]).filter((s): s is string => !!s).map((s) => s.trim().toUpperCase()));
+  const owns = new Set(snap.cells.filter((c) => c.status === 'yellow' && !UNOWNED(c.owner) && !cellWaitOf(c.id, snap)).map((c) => ownerSeat(c.owner)));
+  // WORK-PULL-REACHES-ROSTER — a hand live-writing a coordinator-held cell has its WIP 1 there.
+  for (const c of snap.cells) { if (c.status !== 'yellow' || cellWaitOf(c.id, snap)) continue; const w = liveWriterInSnap(snap, c); if (w) owns.add(w); }
+  return snap.seats
+    .filter((s) => isHand(snap, s.seat) && s.activity === 'idle' && s.idleForMs !== null && s.idleForMs >= idleMin * MIN)
+    .filter((s) => !waiting.has(s.seat) && !owns.has(s.seat))
+    .sort((a, b) => (b.idleForMs ?? 0) - (a.idleForMs ?? 0) || a.seat.localeCompare(b.seat));
 }
 
 /** P0 before P1, then the longest untouched, then id. */
@@ -208,8 +304,6 @@ function cellOrder(a: CellView, b: CellView): number {
 
 /** An owned yellow cell is leased to its owner this long past the owner's last activity. */
 export const LEASE_MINUTES = 45;
-/** Reclaims per scope per tick. */
-export const RECLAIM_PER_TICK = 8;
 
 /** Push (assign) only these — everything else waits on the board for `eln work next`. */
 export const isPushCell = (cell: Pick<CellView, 'id' | 'priority'>): boolean => cell.priority === 'P0' || /DEMO/i.test(cell.id);
@@ -227,12 +321,16 @@ export function leaseUntilMs(snap: Snapshot, cell: CellView, known = knownSeatsO
     ...prs.map((pr) => Date.parse(pr.updatedAt)),
     ...snap.receipts.filter((r) => prs.some((pr) => pr.number === r.pr)).map((r) => r.atMs),
   ].filter((t) => Number.isFinite(t));
-  return (stamps.length ? Math.max(...stamps) : 0) + LEASE_MINUTES * MIN;
+  return (stamps.length ? Math.max(...stamps) : 0) + handLeaseMinutes(cell.id, snap.lanes, LEASE_MINUTES) * MIN;
 }
 
 /** Hand-owned yellow cells of this scope whose lease ran out → back to the board (owner cleared, history kept). */
-export function planReclaim(snap: Snapshot, input: { scope: ResolvedScope }): Row[] {
+export function planReclaim(snap: Snapshot, input: { scope: ResolvedScope; reclaimLimit?: number | null }): Row[] {
   const { scope } = input;
+  // Legacy callers that omit a limit retain the original cap. Live callers pass the
+  // YAML-scaled limit explicitly, or null when the pool measurement is unknown.
+  const limit = input.reclaimLimit === undefined ? 8 : input.reclaimLimit;
+  if (limit === null || !Number.isSafeInteger(limit) || limit < 0) return [];
   const mode = scope.mode === 'live' ? 'live' : 'shadow';
   const known = knownSeatsOf(snap);
   return snap.cells
@@ -240,7 +338,7 @@ export function planReclaim(snap: Snapshot, input: { scope: ResolvedScope }): Ro
     .map((c) => ({ c, owner: ownerSeat(c.owner), until: leaseUntilMs(snap, c, known) }))
     .filter(({ owner, until }) => isHand(snap, owner) && scopeOf(snap, owner) === scope.scope && until < snap.nowMs)
     .sort((a, b) => a.until - b.until || a.c.id.localeCompare(b.c.id))
-    .slice(0, RECLAIM_PER_TICK)
+    .slice(0, limit)
     .map(({ c, owner, until }) => ({ node: 'r1', scope: scope.scope, action: 'reclaim' as const, target: c.id, seat: owner, owner: c.owner!, priority: c.priority, mode,
       reason: `lease-expired:${Math.floor((snap.nowMs - until) / MIN)}m` }));
 }
@@ -275,13 +373,15 @@ export interface WakePlan {
   readonly nudges: readonly Row[];
 }
 
-export function planWake(snap: Snapshot, input: { scope: ResolvedScope; state: ScopeState; reclaimed?: ReadonlySet<string> }): WakePlan {
+export function planWake(snap: Snapshot, input: { scope: ResolvedScope; state: ScopeState; reclaimed?: ReadonlySet<string>; freeIdleMin?: number }): WakePlan {
   const { scope, state } = input;
   const reclaimed = input.reclaimed ?? new Set<string>();
   // A free hand is nudged to pull only when the board has something to pull. The board = unowned · reclaimed · held by
   // this scope's own coordinator (rail 30: leader-owned yellow cells are claimable by its hands) — and not waiting.
   const waitOf = (id: string) => cellWaitOf(id, snap);
-  const board = snap.cells.some((c) => c.status === 'yellow' && (UNOWNED(c.owner) || reclaimed.has(c.id) || ownerSeat(c.owner) === scope.scope) && !waitOf(c.id));
+  const board = snap.cells.some((c) => c.status === 'yellow' && isAssignableCell(c) && (UNOWNED(c.owner) || reclaimed.has(c.id) || ownerSeat(c.owner) === scope.scope) && !waitOf(c.id));
+  // Free hands are seen from `freeIdleMin` (policy · 2 min); an idle OWNER is still woken only after the 10 min it always had.
+  const freeIdleMin = Math.min(input.freeIdleMin ?? D.idleMinMinutes, D.idleMinMinutes);
   const mode = scope.mode === 'live' ? 'live' : 'shadow';
   const rows: Row[] = [];
   const nudges: Row[] = [];
@@ -292,11 +392,13 @@ export function planWake(snap: Snapshot, input: { scope: ResolvedScope; state: S
   const answered = Object.entries(state.woken ?? {}).filter(([seat, w]) => wakeAnswered(seats.get(seat), w.at, snap.nowMs)).map(([seat]) => seat);
   const waiting = new Set(snap.openHands.flatMap((h) => [h.sender, h.blockedSeat]).filter((s): s is string => !!s).map((s) => s.trim().toUpperCase()));
   let budget = scope.caps.assign;
-  for (const hand of idleHands(snap, scope.scope, state)) {
+  for (const hand of idleHands(snap, scope.scope, state, freeIdleMin)) {
     const owned = snap.cells.filter((c) => c.status === 'yellow' && !UNOWNED(c.owner) && !reclaimed.has(c.id) && ownerSeat(c.owner) === hand.seat).sort(cellOrder);
     // Waiting cells (JUD verdict · RES receipt · HOLD · train) are not work: a hand whose every cell waits is woken with
     // «take work next», never on its own cell (rail 30: woken on a waiting cell → idle again right away).
     const own = owned.filter((c) => !waitOf(c.id));
+    // An owner below the owner-wake threshold: not free (WIP 1), not woken yet.
+    if (own.length && (hand.idleForMs ?? 0) < D.idleMinMinutes * MIN) { owners.add(hand.seat); continue; }
     const allWaiting = owned.length > 0 && own.length === 0;
     for (const c of owned) if (waitOf(c.id)) held.add(c.id);
     // PULL default: a hand that called `eln work next` since it went idle is not woken (it pulled; an empty board is fine).
@@ -336,9 +438,15 @@ export function planWake(snap: Snapshot, input: { scope: ResolvedScope; state: S
 export interface MatchInput {
   readonly scope: ResolvedScope;
   readonly state: ScopeState;
+  /** Explicit null means the hand-pool measurement is unknown; do not reclaim. */
+  readonly reclaimLimit?: number | null;
   /** HQ only: cells the sub-scopes could not staff (ids) and idle hands they could not use. */
   readonly wanting?: readonly string[];
   readonly lendable?: readonly { seat: string; from: string }[];
+  /** STEWARD-HQ-LIVE-ALIGN — graphs/policies/steward-hq.yaml `live` (absent = {@link LEGACY_R1}). */
+  readonly r1?: LiveR1Policy;
+  /** Seats another scope already assigned / woke / nudged in this run — never lent again the same run. */
+  readonly busySeats?: ReadonlySet<string>;
 }
 
 /** Rows ⊕ idle hands left over ⊕ cells left without a hand (capacity — `defer`, never an exception row). */
@@ -348,20 +456,30 @@ export function planMatch(snap: Snapshot, input: MatchInput): { rows: Row[]; idl
   // Idle owners first: woken on their own cell, never free hands; their held cells are not reassigned this tick.
   // PULL default (대표 11-25 17:1x): leases that ran out go back to the board first; R1 is the safety net — it wakes idle
   // hands that did not pull and pushes only P0/demo cells (and HQ's cross-scope lending of those).
-  const reclaim = planReclaim(snap, { scope });
+  const r1 = input.r1 ?? LEGACY_R1;
+  const busy = input.busySeats ?? new Set<string>();
+  const reclaim = planReclaim(snap, { scope, reclaimLimit: input.reclaimLimit });
   const reclaimed = new Set(reclaim.map((r) => r.target));
-  const wake = planWake(snap, { scope, state, reclaimed });
+  const wake = planWake(snap, { scope, state, reclaimed, freeIdleMin: r1.idleMin });
   const rows: Row[] = [...reclaim, ...wake.rows];
   const woken = new Set(wake.rows.filter((r) => r.action === 'wake').map((r) => r.seat));
-  const hands = idleHands(snap, scope.scope, state).filter((s) => !wake.owners.has(s.seat) && !woken.has(s.seat)).map((s) => ({ seat: s.seat, from: undefined as string | undefined }));
-  const cells = movableCells(snap, scope.scope, state).filter((c) => !wake.held.has(c.id) && !reclaimed.has(c.id) && isPushCell(c));
+  const hands = idleHands(snap, scope.scope, state, r1.idleMin).filter((s) => !wake.owners.has(s.seat) && !woken.has(s.seat) && !busy.has(s.seat)).map((s) => ({ seat: s.seat, from: undefined as string | undefined }));
+  const cells = movableCells(snap, scope.scope, state, r1).filter((c) => !wake.held.has(c.id) && !reclaimed.has(c.id) && isPushCell(c));
   if (scope.scope === snap.hq) {
     const byId = new Map(snap.cells.map((c) => [c.id, c]));
     for (const id of input.wanting ?? []) {
       const cell = byId.get(id);
-      if (cell && cell.status === 'yellow' && isPushCell(cell) && !wake.held.has(cell.id) && !cells.some((c) => c.id === cell.id)) cells.push(cell);
+      if (cell && cell.status === 'yellow' && isAssignableCell(cell) && !cellWaitOf(cell.id, snap) && isPushCell(cell) && !wake.held.has(cell.id) && !cells.some((c) => c.id === cell.id)) cells.push(cell);
     }
-    for (const lend of input.lendable ?? []) if (!hands.some((h) => h.seat === lend.seat)) hands.push({ seat: lend.seat, from: lend.from });
+    for (const lend of input.lendable ?? []) if (!busy.has(lend.seat) && !hands.some((h) => h.seat === lend.seat)) hands.push({ seat: lend.seat, from: lend.from });
+    // Direct lending: every scope's free hand (same «free» as the shadow plan) — not waiting for a sub-scope's idleLeft.
+    if (r1.directLend) {
+      for (const s of freeHands(snap, r1.idleMin)) {
+        if (busy.has(s.seat) || hands.some((h) => h.seat === s.seat) || within(state.seatCooldown[s.seat], snap.nowMs, D.cooldownMinutes)) continue;
+        const from = scopeOf(snap, s.seat);
+        hands.push({ seat: s.seat, from: from === snap.hq ? undefined as string | undefined : from });
+      }
+    }
     cells.sort(cellOrder);
   }
   let budget = scope.caps.assign;
@@ -372,8 +490,10 @@ export function planMatch(snap: Snapshot, input: MatchInput): { rows: Row[]; idl
     const own = ownerSeat(cell.owner);
     // Maker ≠ judge (RX-1..4 · 11-25: JUD-B / JUD-3 proposed for implementation cells): only same-side hands qualify.
     const side = judgeCell(snap, cell);
-    const fits = (h: { seat: string }): boolean => judgeSide(snap, h.seat) === side;
+    const fits = (h: { seat: string }): boolean => judgeSide(snap, h.seat) === side && areaFits(snap, h.seat, cell);
     let index = hands.findIndex((h) => h.seat === own && fits(h));
+    // SEAT-AREA-GUARD — a seat that fits the cell by its area (MK on docs · UX on a surface) before a general hand.
+    if (index < 0) index = hands.findIndex((h) => fits(h) && areaFitOf(snap, h.seat, cell).area);
     if (index < 0) index = hands.findIndex((h) => h.from === undefined && fits(h));
     if (index < 0) index = hands.findIndex(fits);
     if (index < 0) {
@@ -397,14 +517,14 @@ export function planMatch(snap: Snapshot, input: MatchInput): { rows: Row[]; idl
   // Only when no cell fits does the hand keep the pull nudge.
   const taken = new Set(rows.filter((r) => r.action === 'assign').map((r) => r.target));
   const boardCells = snap.cells
-    .filter((c) => c.status === 'yellow' && (UNOWNED(c.owner) || reclaimed.has(c.id) || ownerSeat(c.owner) === scope.scope))
+    .filter((c) => c.status === 'yellow' && isAssignableCell(c) && (UNOWNED(c.owner) || reclaimed.has(c.id) || ownerSeat(c.owner) === scope.scope))
     .filter((c) => !cellWaitOf(c.id, snap) && !wake.held.has(c.id) && !within(state.assigned[c.id]?.at, snap.nowMs, D.cooldownMinutes))
     .sort(cellOrder);
   const nudged: Row[] = [];
   for (const nudge of wake.nudges) {
     if (assigned.has(nudge.seat)) continue;
     // A cell whose lease just ran out on this hand goes to another hand, not straight back.
-    const cell = boardCells.find((c) => !taken.has(c.id) && judgeSide(snap, nudge.seat!) === judgeCell(snap, c)
+    const cell = boardCells.find((c) => !taken.has(c.id) && judgeSide(snap, nudge.seat!) === judgeCell(snap, c) && areaFits(snap, nudge.seat!, c)
       && !reclaim.some((r) => r.target === c.id && ownerSeat(r.owner ?? r.seat) === nudge.seat));
     if (!cell) { nudged.push(nudge); continue; }
     taken.add(cell.id);

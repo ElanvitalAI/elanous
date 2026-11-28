@@ -83,9 +83,21 @@ test('split writes a CORE block; the record lines carry every axis; supervisor a
   expect(doc.indexOf('## CORE 분할')).toBeLessThan(doc.indexOf('## PROBLEM'));
   const lines = renderRubricLines(r);
   expect(lines[0]!.startsWith('- 루브릭 판정: split — ')).toBe(true);
-  expect(lines.filter((l) => l.startsWith('- 축 ')).length).toBe(7);
+  expect(lines.filter((l) => l.startsWith('- 축 ')).length).toBe(8);
   expect(rubricSplitLine(HARD_PIECES)).toBe('CORE(루브릭 행동 묶음 1): 정보성 notice에만 «할 일 없으면 조용히 종결» 안내를 추가한다. · FU: 정보성 notice 턴에서만 notify=false 신호를 판정하고 한 줄 영수만 남긴다.');
   expect(rubricVerificationFu('완료선: 실 PTY 회귀 0')).toBe('E4 증거 칸 FU — 실 PTY(루브릭 verification_cost)');
   expect(moduleOf('src/tui/core/queue.ts')).toBe('src/tui');
   expect(behaviorGroups(MEDIUM_PIECES)).toHaveLength(1);
+});
+
+test('YAML 정의 가능 (YAML-FIRST-RATCHET): a new policy value without a YAML home scores 1 and says where · with a home 0 · never a blocker', () => {
+  const bare = scoreGoalRubric({ document: '대상 경로: src/loops/a.ts\n\n완료선:\n- 리뷰 대기 타임아웃 30분을 넘으면 우편 한 통\n', targetPaths: ['src/loops/a.ts'] });
+  const axis = bare.axes.find((a) => a.id === 'yaml_definable')!;
+  expect(axis.score).toBe(1);
+  expect(axis.evidence).toBe('정책 값(타임아웃)의 YAML 집이 없다 → graphs/policies/<영역>.yaml · agent.yaml policies: · plugin.json 에 둔다(TS 상수는 pregate 래칫 RED)');
+  expect(bare.verdict).toBe('launch');
+  const homed = scoreGoalRubric({ document: '대상 경로: src/loops/a.ts\n\n완료선:\n- 리뷰 대기 타임아웃(graphs/policies/review-wait.yaml wait_min)을 넘으면 우편 한 통\n', targetPaths: ['src/loops/a.ts'] });
+  expect(homed.axes.find((a) => a.id === 'yaml_definable')).toEqual({ id: 'yaml_definable', score: 0, evidence: '정책 값(타임아웃) → YAML 집 graphs/policies/' });
+  expect(scoreGoalRubric({ document: '대상 경로: src/loops/a.ts\n', targetPaths: ['src/loops/a.ts'] }).axes.find((a) => a.id === 'yaml_definable')!.evidence).toBe('새 정책 값 표지 없음');
+  expect(loadGoalRubric().yamlDefinable.homeMarkers).toContain('agent.yaml');
 });

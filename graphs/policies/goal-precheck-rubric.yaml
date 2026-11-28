@@ -48,6 +48,13 @@ axes:
     # a review finding that itself says it is OUT OF SCOPE (not the CORE behavior) moves to a FU cell instead of another
     # rework round. «엣지 케이스»·«추가로» alone are not enough — an edge-case regression is still a defect (review must-fix).
     markers: ['범위 밖', 'out of scope', 'FU 로 미뤄', '후속 칸']
+  yaml_definable:
+    # YAML-FIRST-RATCHET (0.3.39 P0 · 대표 11-27 22:4x «다들 yaml·plugin 으로 만들고 있나») — «YAML 정의 가능»: a goal that
+    # introduces a policy value (threshold · cap · window · cooldown · timeout) must say where it lives as YAML. A policy
+    # marker with no home marker scores 1 and the precheck record says where to put it; it never blocks the launch (the
+    # pregate ratchet scripts/ratchets/policy-constants.ts refuses the TS constant itself).
+    policy_markers: ['임계값', '새 임계', '새 상한', '쿨다운', '타임아웃', '새 상수', 'TS 상수', 'threshold', 'cooldown', 'timeout', '_THRESHOLD', '_TIMEOUT', '_COOLDOWN', '_CAP =', '_MS =', '_MIN =']
+    home_markers: ['graphs/policies/', '정책 팩', 'policy pack', 'agent.yaml', 'policies:', 'plugin.json']
 verdict_order: [hand, probe-first, split, launch]
 tier:
   # sum of axis scores (each 0..2) → child model tier recommendation

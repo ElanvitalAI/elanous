@@ -28,7 +28,7 @@ function makeCtx(seed: number) {
   return { ctx, events };
 }
 
-const SEED_SENSITIVE = new Set(['SM-STACK-4DEEP', 'SM-HOT-FILE-5PR', 'SM-REFUSED-BEFORE-INSTALL', 'SM-DECLARED-SUPERSEDE']);
+const SEED_SENSITIVE = new Set(['SM-STACK-4DEEP', 'SM-HOT-FILE-5PR', 'SM-REFUSED-BEFORE-INSTALL', 'SM-DECLARED-SUPERSEDE', 'SM-CARRY-CONTEXT-MOVED', 'SM-CARRY-OWN-CHANGED', 'SM-REHEARSAL-REGRESSION-CELL', 'SM-GH-SNAPSHOT-5SEATS', 'SM-GH-SECONDARY-COOLDOWN', 'SM-GH-HEAD-MOVED-MID-REFRESH', 'SM-GH-SEAT-BUDGET', 'SM-GH-MIRROR-20FETCH', 'SM-GH-MIRROR-STALE-FALLBACK', 'SM-GH-SHIM-COOLDOWN-VIEW', 'SM-GH-SHIM-100-VIEWS']);
 describe('smart-merge scenarios', () => {
   for (const scenario of simWorldScenarios) {
     for (const seed of SEED_SENSITIVE.has(scenario.id) ? [1, 2, 3, 4, 5] : [1]) {
@@ -49,7 +49,10 @@ describe('smart-merge registration', () => {
     expect(pack.world).toBe('smart-merge');
     expect(pack.scenarios.map((row: { id: string }) => row.id)).toEqual([
       'SM-STALE-PR-REAP', 'SM-STACK-4DEEP', 'SM-STACK-MANUAL-MERGE', 'SM-MAIN-ONLY-MERGE', 'SM-HOT-FILE-5PR', 'SM-LIST-APPEND', 'SM-SEMANTIC-LLM',
-      'SM-SECURITY4-SAME-LADDER', 'SM-REVERT-GUARD', 'SM-FORCE-PUSHED-UPSTREAM', 'SM-PR-CLOSED-MID', 'SM-FETCH-FAIL-MID', 'SM-RACE-LOCK', 'SM-REFUSED-BEFORE-INSTALL', 'SM-STACK-AUTO-DISCOVER', 'SM-DECLARED-SUPERSEDE', 'SM-RESTRUCTURE-PLUS-INSERT', 'SM-REVIEW-OWN-DELTA',
+      'SM-SECURITY4-SAME-LADDER', 'SM-REVERT-GUARD', 'SM-FORCE-PUSHED-UPSTREAM', 'SM-PR-CLOSED-MID', 'SM-FETCH-FAIL-MID', 'SM-RACE-LOCK', 'SM-REFUSED-BEFORE-INSTALL', 'SM-STACK-AUTO-DISCOVER', 'SM-DECLARED-SUPERSEDE', 'SM-OWN-REWRITE-DECLARATION', 'SM-RESTRUCTURE-PLUS-INSERT', 'SM-REVIEW-OWN-DELTA',
+      'SM-CARRY-CONTEXT-MOVED', 'SM-CARRY-OWN-CHANGED', 'SM-L3-LIGHT-LAND', 'SM-REHEARSAL-REGRESSION-CELL',
+      'SM-GH-SNAPSHOT-5SEATS', 'SM-GH-SECONDARY-COOLDOWN', 'SM-GH-HEAD-MOVED-MID-REFRESH', 'SM-GH-SEAT-BUDGET',
+      'SM-GH-MIRROR-20FETCH', 'SM-GH-MIRROR-STALE-FALLBACK', 'SM-GH-SHIM-COOLDOWN-VIEW', 'SM-GH-SHIM-100-VIEWS',
     ]);
     for (const row of pack.scenarios) expect(row.module).toBe('src/ux-sim/sim-world/smart-merge/scenarios.ts');
     expect(simWorldScenarios.map((s) => s.id)).toEqual(pack.scenarios.map((row: { id: string }) => row.id));

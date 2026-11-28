@@ -16,6 +16,7 @@
  * exit 0 = clean · 1 = refused (card on stdout) · 2 = usage / git error (fail closed: callers treat ≠0 as STOP).
  */
 import { spawnSync } from 'node:child_process';
+import { mergeTree } from '../git-smart/merge-tree.js';
 
 export interface RevertHit { file: string; commit: string; subject: string; lines: number }
 export interface DeclaredRemovals { paths: string[]; prs: number[] }
@@ -26,7 +27,12 @@ export function parseDeclaredRemovals(body: string | undefined | null): Declared
   for (const line of (body ?? '').split('\n')) {
     const m = /^\s*(?:[-*]\s*)?(?:의도된 삭제|Intended removal)\s*[:：]\s*(.+?)\s*\(([^)]+)\)\s*$/i.exec(line);
     if (!m || !m[2]!.trim()) continue;
-    for (const raw of m[1]!.split(/[,\s]+/).map((x) => x.replace(/^`|`$/g, '')).filter(Boolean)) {
+    // Markdown decoration belongs to the token, not the declared path. Only strip
+    // balanced bold markers, so malformed tokens cannot widen the exemption.
+    const tokens = m[1]!.replace(/^[-*+]\s+/, '').split(/[,\s]+/);
+    for (const token of tokens) {
+      const unbold = /^\*\*(.+)\*\*$/.exec(token)?.[1] ?? token;
+      const raw = unbold.replace(/^`|`$/g, '');
       const pr = /^#(\d+)$/.exec(raw);
       if (pr) out.prs.push(Number(pr[1]));
       else if (/^[\w./@+-]+$/.test(raw)) out.paths.push(raw.replace(/^\.\//, ''));
@@ -62,7 +68,7 @@ export function detectStaleBaseRevert(repo: string, mainRef: string, headRef: st
   const main = git(repo, ['rev-parse', mainRef]).trim();
   const head = git(repo, ['rev-parse', headRef]).trim();
   const mergeBase = git(repo, ['merge-base', main, head]).trim();
-  const tree = git(repo, ['merge-tree', '--write-tree', main, head]).split('\n')[0]!.trim();
+  const tree = mergeTree((args) => git(repo, args), main, head, [], []).split('\n')[0]!.trim();
   const ownCommits = new Set(git(repo, ['log', '--format=%H', `${main}..${head}`]).split('\n').filter(Boolean));
   // A file the PR's own (non-merge) commit deleted is an intended removal (#40444 removing tests #40373 added): only
   // lines silently missing without an own deletion are a stale copy.
@@ -107,9 +113,13 @@ export function detectStaleBaseRevert(repo: string, mainRef: string, headRef: st
   const hits = [...counts.values()].filter((h) => (perCommit.get(h.commit) ?? 0) >= minCommitLines && !isDeclared(h)).sort((a, b) => b.lines - a.lines);
   if (hits.length === 0) return { ok: true, mergeBase, hits };
   const rows = hits.map((h) => `  - ${h.file}: ${h.lines} lines from ${h.commit.slice(0, 9)} ${h.subject}`);
+  const ownModified = new Set(git(repo, ['log', '--no-merges', '--diff-filter=M', '--name-only', '--format=', `${main}..${head}`]).split('\n').map((x) => x.trim()).filter(Boolean));
+  const suggestions = [...new Set(hits.map((h) => h.file))].filter((file) => ownModified.has(file))
+    .map((file) => `의도된 삭제: ${file} (PR 수정으로 기존 줄 대체; 의도 확인 후 사용)`);
   const card = [
     `REFUSE stale-base-revert: landing ${head.slice(0, 12)} would wipe out every line other recent PRs own in these files — a stale copy in the branch (merge-base ${mergeBase.slice(0, 12)}).`,
     ...rows,
+    ...(suggestions.length ? ['PR 수정 파일의 선언 후보 (실제 의도를 검토한 경우에만 본문에 추가):', ...suggestions] : []),
     'Fix: rebase/merge main first (git fetch origin main && git merge origin/main), keep their lines, push, then land again.',
     `Meant to remove it on purpose (a supersede / revert)? Add to the PR body: 의도된 삭제: ${hits[0]!.file} (<reason>)${subjectPr(hits[0]!.subject) ? `  — or the whole PR: 의도된 삭제: #${subjectPr(hits[0]!.subject)} (<reason>)` : ''}`,
   ].join('\n');

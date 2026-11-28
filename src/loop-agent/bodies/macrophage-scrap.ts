@@ -7,15 +7,12 @@
 // HQ repo ⊕ `git stash list` (each null = «모름») / 판단 근거 = the same pure classifiers as the v2 card (one-shot fire time +
 // 24 h grace · numeric-date cron lines · 14-day clean worktree under a known root · 14-day stash) / 수복과 인계 = none here —
 // the lines go into the tick case, the voice and the KPI-breach card; the guardian's maintenance window owns the cleanup.
+import { pn } from '../policy-context.js';
 import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const STALE_WORKTREE_DAYS = 14; // 출처: OPS-RULES «가지·작업 트리 14일 정리»
-export const STALE_STASH_DAYS = 14; // 출처: OPS-RULES «가지·작업 트리 14일 정리» (stash 같은 창)
-/** A one-shot job is «past» one day after its calendar fire time (it had its chance to run). */
-export const ONESHOT_GRACE_MS = 24 * 60 * 60_000; // 출처: #40373 macrophage v2 card (하루 유예)
 
 export interface LaunchdJob {
   readonly label: string;
@@ -52,11 +49,11 @@ export function oneShotFireAt(plist: Record<string, unknown>, mtimeMs: number): 
   const hour = typeof c.Hour === 'number' ? c.Hour : 0; const minute = typeof c.Minute === 'number' ? c.Minute : 0;
   const year = new Date(mtimeMs).getFullYear();
   let at = new Date(year, c.Month - 1, c.Day, hour, minute).getTime();
-  if (at < mtimeMs - ONESHOT_GRACE_MS) at = new Date(year + 1, c.Month - 1, c.Day, hour, minute).getTime();
+  if (at < mtimeMs - pn('oneshot_grace_h') * 3_600_000) at = new Date(year + 1, c.Month - 1, c.Day, hour, minute).getTime();
   return at;
 }
 export const pastOneShots = (jobs: readonly LaunchdJob[], nowMs: number): LaunchdJob[] =>
-  jobs.filter(j => ELANOUS_LABEL.test(j.label) && j.oneShotAtMs !== null && nowMs - j.oneShotAtMs > ONESHOT_GRACE_MS);
+  jobs.filter(j => ELANOUS_LABEL.test(j.label) && j.oneShotAtMs !== null && nowMs - j.oneShotAtMs > pn('oneshot_grace_h') * 3_600_000);
 
 /** Crontab lines pinned to one calendar date (numeric day-of-month AND month) whose date this year is more than a day past. */
 export function pastCronLines(text: string, nowMs: number): Array<{ line: number; text: string; atMs: number }> {
@@ -68,14 +65,14 @@ export function pastCronLines(text: string, nowMs: number): Array<{ line: number
     const m = /^(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+\S+\s+/u.exec(t);
     if (!m) return;
     const at = new Date(year, Number(m[4]) - 1, Number(m[3]), Number(m[2]), Number(m[1])).getTime();
-    if (nowMs - at > ONESHOT_GRACE_MS) out.push({ line: i + 1, text: t.slice(0, 160), atMs: at });
+    if (nowMs - at > pn('oneshot_grace_h') * 3_600_000) out.push({ line: i + 1, text: t.slice(0, 160), atMs: at });
   });
   return out;
 }
 
 /** Worktrees prune may remove: under a known root · on a branch (the undo re-adds it) · clean · last commit > 14 days. */
 export function staleWorktrees(wts: readonly WorktreeInfo[], nowMs: number, known: (p: string) => boolean): WorktreeInfo[] {
-  const cut = nowMs - STALE_WORKTREE_DAYS * 86_400_000;
+  const cut = nowMs - pn('stale_worktree_days') * 86_400_000;
   return wts.filter(w => known(w.path) && w.branch !== null && w.clean === true && w.lastCommitMs !== null && w.lastCommitMs < cut)
     .sort((a, b) => (a.lastCommitMs ?? 0) - (b.lastCommitMs ?? 0));
 }
@@ -95,14 +92,14 @@ export function scrapFacts(deps: ScrapDeps, nowMs: number): string[] {
   const cron = safe(() => deps.crontab()); const cronPast = cron === null ? null : pastCronLines(cron, nowMs);
   const wts = safe(() => deps.worktrees(nowMs));
   // an old worktree under a known root whose `git status` could not be read = the worktree observation «모름» (no partial count)
-  const cut = nowMs - STALE_WORKTREE_DAYS * 86_400_000;
+  const cut = nowMs - pn('stale_worktree_days') * 86_400_000;
   const unreadable = wts?.some(w => deps.knownWorktreePath(w.path) && w.branch !== null && w.lastCommitMs !== null && w.lastCommitMs < cut && w.clean === null) ?? false;
   const old = wts && !unreadable ? staleWorktrees(wts, nowMs, p => deps.knownWorktreePath(p)) : null;
-  const st = safe(() => deps.stashes()); const oldStash = st ? st.filter(s => nowMs - s.atMs > STALE_STASH_DAYS * 86_400_000) : null;
+  const st = safe(() => deps.stashes()); const oldStash = st ? st.filter(s => nowMs - s.atMs > pn('stale_stash_days') * 86_400_000) : null;
   const unk = (v: number | null): string => (v === null ? '모름' : String(v));
   return [
     `지난 일회성 launchd ${unk(past?.length ?? null)}${past?.length ? ` (${past.slice(0, 3).map(j => j.label).join(', ')}${past.length > 3 ? ` 외 ${past.length - 3}` : ''})` : ''} · 지난 날짜 크론 ${unk(cronPast?.length ?? null)}(보고만 · crontab 편집은 RES)`,
-    `${STALE_WORKTREE_DAYS}일 넘은 깨끗한 worktree ${unk(old?.length ?? null)} · ${STALE_STASH_DAYS}일 넘은 stash ${unk(oldStash?.length ?? null)}(보고만 · 정리는 수호자 정비 창)`,
+    `${pn('stale_worktree_days')}일 넘은 깨끗한 worktree ${unk(old?.length ?? null)} · ${pn('stale_stash_days')}일 넘은 stash ${unk(oldStash?.length ?? null)}(보고만 · 정리는 수호자 정비 창)`,
   ];
 }
 
@@ -168,7 +165,7 @@ export function liveScrapDeps(opts: { home?: string; repo?: string } = {}): Scra
         if (log === null) return null;
         for (const l of log.split('\n')) { const [sha, ct] = l.split(' '); if (sha && ct) times.set(sha, Number(ct) * 1000); }
       }
-      const cut = Date.now() - STALE_WORKTREE_DAYS * 86_400_000;
+      const cut = Date.now() - pn('stale_worktree_days') * 86_400_000;
       return raw.map(r => {
         const last = times.get(r.head) ?? null;
         let clean: boolean | null = null;

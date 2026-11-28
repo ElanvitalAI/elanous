@@ -1,3 +1,4 @@
+import { liveStewardCaps } from '../live-caps.js';
 // STEWARD-SPACE (행정관) — the graph node runner for `graphs/steward/space.yaml`. Every node is `cmd:` and deterministic.
 //   r0 snapshot → r1 match → r2 receipt → r3 judge → r4 land (hand-off) → r5 watch → r6 digest → x exceptions
 // Input (graph `--input` or event payload): { scope?: "<coordinator seat>", shadow?: true, seat?: "<seat>" }. No scope =
@@ -16,9 +17,10 @@ import { debug } from '../../debug/log.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { spawnElanousSync } from '../../instance/spawn-elanous.js';
 import { defaultMsgStorePath, openMsgStore } from '../../msg/msg-store.js';
+import { loadHqPolicy, loadLiveR1Policy, recordHqShadow } from './hq-shadow.js';
 import { parseSeatAssignOutput } from '../../resource-opt/steward-live.js';
 import { STEWARD_UNAVAILABLE } from '../../resource-opt/steward.js';
-import { swapOwnerIf } from '../../release-loop/checklist.js';
+import { listChecklist, swapOwnerIf } from '../../release-loop/checklist.js';
 import { claimSeatWake, defaultWakeLedgerPath } from '../../seat/wake-ledger.js';
 import { lastTurnAt } from '../../msg/diverted-mail.js';
 import { getUserConfig } from '../../user-config/reader.js';
@@ -53,6 +55,24 @@ export interface StewardEffects {
   writerCheck?(input: { live: boolean }): { line: string; resolved: number; cards: number };
   beacon?(input: { live: boolean }): { line: string; fired: readonly { leadId: number; leader: string; seat: string; why: string; cardId: number }[] };
   claimWake?(input: { seat: string; cell: string; by: string; lastActivityMs?: number | null }): { ok: true } | { ok: false; line: string; unanswered?: { count: number; raise: boolean } };
+  /** OP-TAB-FIRST (STEWARD-HQ-LIVE-ALIGN): the cell's owner and the hand's cells NOW (a fresh board read) — absent = no
+   *  re-check (tests, older callers). */
+  boardNow?(version: string): readonly { id: string; status: string; owner?: string }[];
+}
+
+/** Before a live assign: did OP's tab (or anyone) change the cell, or give the hand a cell, since the snapshot? A reason
+ *  string = skip (OP's tab wins · a hand already holding work is never re-assigned) · null = go. */
+export function recheckAssign(board: readonly { id: string; status: string; owner?: string }[], input: { cellId: string; expectedOwner: string | undefined; seat: string; heldAtSnapshot?: readonly string[] }): string | null {
+  const norm = (o: string | undefined): string => { const s = (o ?? '').split('/')[0]!.trim().toUpperCase(); return s === '-' || s === 'NONE' ? '' : s; };
+  const cell = board.find((c) => c.id === input.cellId);
+  if (!cell) return 'cell-gone';
+  if (cell.status !== 'yellow') return `status-now:${cell.status}`;
+  if (norm(cell.owner) !== norm(input.expectedOwner)) return `owner-now:${norm(cell.owner) || 'none'}`;
+  // A cell the hand already held in the snapshot (e.g. one waiting on JUD — the planner counted it as no work) is not new;
+  // only a cell it got since the snapshot (OP's tab) stops this assign.
+  const before = new Set(input.heldAtSnapshot ?? []);
+  const held = board.find((c) => c.status === 'yellow' && c.id !== input.cellId && !before.has(c.id) && norm(c.owner) === input.seat.trim().toUpperCase());
+  return held ? `hand-holds:${held.id}` : null;
 }
 
 export interface TickDeps {
@@ -60,7 +80,11 @@ export interface TickDeps {
   readonly now: () => Date;
   readonly config: StewardSpaceConfig | undefined;
   readonly sources: (config: StewardSpaceConfig | undefined, nowMs: number) => SnapshotSources;
+  /** Verified pool-based reclaim limit; null or a thrown lookup means unknown and skips reclaim. */
+  readonly reclaimLimit?: () => number | null;
   readonly effects: StewardEffects;
+  /** The live R1 policy read (absent = graphs/policies/steward-hq.yaml via loadLiveR1Policy) — sims inject a broken file. */
+  readonly liveR1?: () => ReturnType<typeof loadLiveR1Policy>;
 }
 
 export interface TickInput { readonly runId: string; readonly scope?: string; readonly shadow?: boolean; readonly seat?: string }
@@ -153,6 +177,16 @@ export function runStewardSpaceNode(node: StewardSpaceNode, input: TickInput, de
     run.rows.push(...rows);
     for (const r of rows) { counts[r.scope] ??= {}; counts[r.scope]![r.action] = (counts[r.scope]![r.action] ?? 0) + 1; }
   };
+  let r1Policy: ReturnType<typeof loadLiveR1Policy> | undefined;
+  const boards = new Map<string, readonly { id: string; status: string; owner?: string }[]>();
+  // One fresh board read per release per node run; a live assign re-reads after another assign changed it.
+  const boardOf = (version: string): readonly { id: string; status: string; owner?: string }[] => {
+    const hit = boards.get(version);
+    if (hit) return hit;
+    const read = deps.effects.boardNow!(version);
+    boards.set(version, read);
+    return read;
+  };
   for (const scope of run.scopes) {
     const uses = node === 'x' || PROFILE_NODES[scope.profile].has(node);
     if (!uses) continue;
@@ -165,7 +199,20 @@ export function runStewardSpaceNode(node: StewardSpaceNode, input: TickInput, de
     let rows: Row[] = [];
     if (node === 'r1') {
       const hq = scope.scope === snap.hq ? hqInputs(run, deps, now.getTime()) : {};
-      const plan = planMatch(snap, { scope, state, ...hq });
+      // STEWARD-HQ-LIVE-ALIGN — graphs/policies/steward-hq.yaml `live` (fail-open to the same defaults) · seats another
+      // scope already acted on in this run are not lent again.
+      r1Policy ??= (deps.liveR1 ?? (() => loadLiveR1Policy()))();
+      if (r1Policy.error) debug.log('steward.space', 'live-r1-policy-default', { error: r1Policy.error });
+      const busySeats = new Set(run.rows.filter((r) => r.node === 'r1' && r.scope !== scope.scope && (r.action === 'assign' || r.action === 'wake') && r.seat).map((r) => r.seat!));
+      let reclaimLimit: number | null | undefined;
+      if (deps.reclaimLimit) {
+        try { reclaimLimit = deps.reclaimLimit(); } catch { reclaimLimit = null; }
+      }
+      const plan = planMatch(snap, { scope, state, ...hq, r1: r1Policy.policy, busySeats, ...(deps.reclaimLimit ? { reclaimLimit: reclaimLimit ?? null } : {}) });
+      // STEWARD-HQ (§5a): the HQ instance also records its cross-scope «would pair» rows (shadow ledger only · fail-open).
+      if (scope.scope === snap.hq) {
+        try { recordHqShadow(deps.root, snap, { at, runId: run.runId }, loadHqPolicy()); } catch (error) { debug.log('steward.space', 'hq-shadow-failed', { error: String(error).slice(0, 200) }); }
+      }
       tick.idleLeft = plan.idleLeft;
       tick.wanting = plan.wanting;
       state.woken ??= {};
@@ -211,15 +258,26 @@ export function runStewardSpaceNode(node: StewardSpaceNode, input: TickInput, de
           return live ? { ...row, done: true } : row;
         }
         if (row.action !== 'assign') return row;
+        if (live && deps.effects.boardNow) {
+          // OP-TAB-FIRST: the snapshot is seconds old; OP's tab may have moved this cell or this hand in between.
+          let why: string | null = null;
+          const seatUp = row.seat!.trim().toUpperCase();
+          const heldAtSnapshot = snap.cells.filter((c) => c.status === 'yellow' && (c.owner ?? '').split('/')[0]!.trim().toUpperCase() === seatUp).map((c) => c.id);
+          try { why = recheckAssign(boardOf(snap.version), { cellId: row.target, expectedOwner: snap.cells.find((c) => c.id === row.target)?.owner, seat: row.seat!, heldAtSnapshot }); }
+          catch (error) { why = `board-unreadable:${String(error).slice(0, 80)}`; }
+          if (why) return { ...row, action: 'defer' as const, reason: `op-tab-first:${why}`.slice(0, 160), done: false };
+        }
         state.assigned[row.target] = { seat: row.seat!, at };
         state.seatCooldown[row.seat!] = at;
         if (!live) return row;
         const why = `[행정관 · ${scope.scope}] ${row.reason}${row.lentFrom ? ` · lent from ${row.lentFrom}` : ''}`;
         const result = deps.effects.assignCell({ version: snap.version, cellId: row.target, seat: row.seat!, actor: scope.scope, why });
-        if (result.ok) return { ...row, done: true };
+        if (result.ok) { boards.delete(snap.version); return { ...row, done: true }; }
         // ADMIN-RESOLVE-NOT-NAG — the cell left this release (unknown in both its release and the default one, or now
         // off-target): deterministic, nothing to decide → a defer row (no exception card); the board drops it next tick.
         if (/^(unknown-cell|off-target):/u.test(result.error)) return { ...row, action: 'defer' as const, reason: `cell-moved:${result.error}`.slice(0, 160), done: false };
+        // SEAT-AREA-GUARD — the hand is outside the cell's area (seat-roles.yaml): capacity, not a decision → defer.
+        if (/^off-area:/u.test(result.error)) return { ...row, action: 'defer' as const, reason: `off-area:${result.error.slice(9)}`.slice(0, 160), done: false };
         return { ...row, action: 'reject' as const, reason: `assign-failed:${result.error}`.slice(0, 160), done: false };
       });
     } else if (node === 'r2') {
@@ -456,7 +514,7 @@ export function liveEffects(config: StewardSpaceConfig | undefined): StewardEffe
         // (hand-routes.yaml loopHands); what is left for HQ is carded by the beacon below.
         let loopLine = '';
         try {
-          const sla = watchModule.sweepLoopHandSla(store, { live, hq: ladder.hq, log: (event, data) => { try { debug.log('msg', event, data); } catch { /* fail-open */ } } });
+          const sla = watchModule.sweepLoopHandSla(store, { live, hq: ladder.hq, parentOf: ladder.parentOf, log: (event, data) => { try { debug.log('msg', event, data); } catch { /* fail-open */ } } });
           if (sla.moved.length > 0) loopLine = ` · ${sla.line}`;
         } catch (error) { try { debug.log('msg', 'msg.loop-hand-sla', { phase: 'sweep-failed', error: String(error).slice(0, 200) }); } catch { /* fail-open */ } }
         const report = ladderModule.beaconHands(store, { ladder, now: () => Date.now(), raiseDecision: ladderModule.spawnHandDecision, live,
@@ -496,6 +554,7 @@ export function liveEffects(config: StewardSpaceConfig | undefined): StewardEffe
     },
     claimWake: ({ seat, cell, by, lastActivityMs }) => claimSeatWake(defaultWakeLedgerPath(), { seat, cell, by, atMs: Date.now(),
       ...latestActivity(lastActivityMs, (() => { try { return lastTurnAt(seat); } catch { return null; } })()) }),
+    boardNow: (version) => listChecklist(version).items.map((i) => ({ id: i.id, status: i.status, ...(i.owner ? { owner: i.owner } : {}) })),
     releaseCell: ({ version, cellId, owner, actor, why }) => {
       try {
         const swapped = swapOwnerIf(version, cellId, { expectedOwner: owner, to: null, actor, reason: why });
@@ -531,8 +590,8 @@ export function liveDormantSeats(): string[] {
   return [...new Set(out)];
 }
 
-export function liveTickDeps(config: StewardSpaceConfig | undefined): TickDeps {
-  return { root: effectiveInstanceRoot(), now: () => new Date(), config, sources: liveSources, effects: liveEffects(config) };
+export function liveTickDeps(config: StewardSpaceConfig | undefined, reclaimLimit: number | null = null): TickDeps {
+  return { root: effectiveInstanceRoot(), now: () => new Date(), config, sources: liveSources, effects: liveEffects(config), reclaimLimit: () => reclaimLimit };
 }
 
 /** Graph context → tick input: graph `--input` or the event payload; runId from the runner. */
@@ -552,7 +611,8 @@ if (import.meta.main) {
   const context = contextPath ? readJson<{ runId?: unknown; input?: unknown }>(contextPath, {}) : {};
   const config = getUserConfig().loops?.stewardSpace;
   try {
-    const result = runStewardSpaceNode(node, inputFromGraphContext(context), liveTickDeps(config));
+    const caps = node === 'r1' ? await liveStewardCaps() : null;
+    const result = runStewardSpaceNode(node, inputFromGraphContext(context), liveTickDeps(config, caps?.reclaim ?? null));
     console.log(JSON.stringify(result));
     process.exit(result.outcome === 'ok' ? 0 : 1);
   } catch (error) {

@@ -1,6 +1,31 @@
 {
   "schema": 1,
   "entries": {
+    "supervisors/SUP-STEWARD-CAPS-NORMAL": {
+      "expect": "green",
+      "greenSince": "2026-11-28 steward caps (this PR)",
+      "reason": "verified 10/20/40-hand pools scale policy caps and board selection while preserving all 16 ordered cells"
+    },
+    "supervisors/SUP-STEWARD-CAPS-EDGE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 steward caps (this PR)",
+      "reason": "unknown hand pool suppresses candidates and cards while preserving all 16 ordered cells"
+    },
+    "supervisors/SUP-PLUGIN-GUARDIAN": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LOOP-AGENTS-AS-PLUGINS P3 (this PR)",
+      "reason": "empty universe → installPlugin(plugins/guardian) guardian@1.0.0 · bundles agent.yaml ⊕ shim ⊕ localized recipe · trigger guardian live · tick runs the pulse (last-pulse.json · 7 KPI rows) · remove → retired, 0 runs · re-install → live (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-PLUGIN-FAULTS": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LOOP-AGENTS-AS-PLUGINS P3 (this PR)",
+      "reason": "repeated version refused · missing agent refused · broken wake → install rolled back (plugins=0 rows=0) · shipped guardian row stays graphs/triggers/guardian.yaml (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-PLUGIN-ALL": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LOOP-AGENTS-AS-PLUGINS P3 (this PR)",
+      "reason": "15 loop agents (⊕ supervisor-auditor · SUPERVISOR-AUDITOR-LOOP ⊕ rail-canary · RAIL-CANARY-AUTO-ROLLBACK) · each plugins/<id> compiles to <id>@<agent.yaml version> · committed plugin.json fresh (5 seeds · legacy+graph)"
+    },
     "supervisors/SUP-RUN-SUPERVISOR": {
       "expect": "green",
       "greenSince": "2026-11-27 supervisors sim (this PR)",
@@ -23,8 +48,8 @@
     },
     "supervisors/SUP-WATCHERS-CHECK": {
       "expect": "green",
-      "greenSince": "2026-11-27 supervisors sim (this PR)",
-      "reason": "missing + DEAD heartbeat → restart both · missing_heartbeats 2 → 0 · still dead → one kpi-breach to OP"
+      "greenSince": "2026-11-28 LOOP-AGENTS-AS-PLUGINS P1 (this PR)",
+      "reason": "KPI roll-up: missing + DEAD heartbeat counted (missing_heartbeats 2) · acted none — the registry refires them → 0 · still dead → one kpi-breach to OP"
     },
     "supervisors/SUP-SILENCE-WATCH": {
       "expect": "green",
@@ -51,6 +76,16 @@
       "greenSince": "2026-11-27 POOL-PULL-NEEDS-SPEC (this PR)",
       "reason": "seeds s..s+4 · 12 pool cells: with pull.requireDoneWhen hands claim exactly the cells with a done-when, none without · the board steward sends OP one needs-spec line naming the rest, not repeated on the same set · policy off offers all 12"
     },
+    "supervisors/PR-ZOMBIE-SUPPLY-TRUE": {
+      "expect": "green",
+      "greenSince": "2026-11-29 PR-ZOMBIE-AGING (this PR)",
+      "reason": "seeds s..s+4 · 60–110 week-old zombies (RED merge-main or land merge-conflict) ⊕ 5–20 stale ⊕ 4–12 fresh, all awaiting a receipt: throughput pipeline = ready + fresh only (without pr-aging.yaml = every non-draft · the 11-28 «141»), staleExcluded = zombies + stale · land tick live drafts every zombie under 14 d with one author card · ≥ 14 d one close proposal · nothing closed by code · tick 2 sends nothing new"
+    },
+    "supervisors/SUP-SEAT-AREA-GUARD": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SEAT-AREA-GUARD (this PR)",
+      "reason": "seeds s..s+4 · MK longest idle: infra P0 (no area) → a TC hand never MK · docs P0 → MK (area match: cell DOCS-* ) · surface cell → UX (path src/els/** or id PWA-*) across planner · matching table · seat assign door (off-area refusal, no write · --force passes) · work next · hand steward (legacy+graph) · pre-policy control hands the infra P0 to MK"
+    },
     "supervisors/SUP-SUBJECT-LOST": {
       "expect": "green",
       "greenSince": "2026-11-27 supervisors sim (this PR)",
@@ -58,8 +93,8 @@
     },
     "supervisors/SUP-GUARDIAN-PULSE": {
       "expect": "green",
-      "greenSince": "2026-11-27 supervisors sim (guardian #40362 landed)",
-      "reason": "guardian resident pulse: dead supervisor → one restart and a line to its owner (not again on the next pulse) · bad 90 min → reattach proposal to its owner · healthy untouched (seeds s..s+2)"
+      "greenSince": "2026-11-28 LOOP-AGENTS-AS-PLUGINS P1 (this PR)",
+      "reason": "guardian resident pulse: dead supervisor counted in the 맥박 KPI (감독자 결손 2/3) · no restart and no card from the guardian (the trigger registry owns it) · bad 90 min → reattach proposal to its owner · healthy untouched (seeds s..s+2)"
     },
     "supervisors/KIT-ROLE-LLM": {
       "expect": "green",
@@ -90,6 +125,11 @@
       "expect": "green",
       "greenSince": "2026-11-27 delegated bodies (decision 11-27)",
       "reason": "real tickLand with the land-steward pack: pinned PR of a hot-file lane lands first · no pack → PR-number order · shipped pack parses (5 seeds)"
+    },
+    "supervisors/SUP-LAND-KIND-PARAMS": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CODE-BODY-TO-KIND (this PR)",
+      "reason": "land-steward = agent.yaml on the shared kinds land-graph.tick ⊕ kpi-voice: a threshold · a breach text in agent.yaml and the train keys in policies.yaml alone change the lines and the land order · a second agent package on the same kinds speaks its own line into its own memory (5 seeds · legacy+graph)"
     },
     "supervisors/SUP-V3-EQUIV": {
       "expect": "green",
@@ -141,6 +181,16 @@
       "greenSince": "2026-11-27 SUPERVISOR-JOURNAL-DEFECTS (this PR)",
       "reason": "silence-watch: 18 re-asks to a reader-less ORCHESTRATOR → no bell · one notice to OP a day · RES mail → GUARDIAN by the dormant reroute · a live TC with 5 requests → one bell"
     },
+    "supervisors/SUP-SILENCE-NOTICE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SILENCE-NOTICE-NOT-REQUEST (this PR)",
+      "reason": "real ledger: 10 notices + 5 requests (3 answered in the cell ledger) → KPI 5 then 2 · settles 3 · notices closed TC 7 · UX 3 · one bell to TC, none for notices · reopen-notice restores the ack row and is never re-closed · a new work-block card stores needsAck=0 (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-OPS-SLA-OP": {
+      "expect": "green",
+      "greenSince": "2026-11-28 YAML-OPS-SCRIPTS-ABSORB (this PR)",
+      "reason": "silence-watch absorbs op-overdue-doorbell.py: an OP request 16-25 min old is overdue (sla_min_op 15) · the same age from LAND-GRAPH is not (sla_min 30) · KPI 2 · one bell each to TC and JUD"
+    },
     "supervisors/SUP-WIP1-ACTIVE": {
       "expect": "green",
       "greenSince": "2026-11-27 WIP1-ASSIGN-GUARD-ACTIVE-E4 (this PR)",
@@ -170,6 +220,381 @@
       "expect": "green",
       "greenSince": "2026-11-27 LOOP-EXCEPTION-WATCH (this PR)",
       "reason": "release-traffic exception 3 min after rail 95: one registry retry → done → case resolved, no card · persistent: 2 retries → one OP card (run id · node · reason) → escalated · guardian «미정상화 사건» 1 · OP world card Loops line (5 seeds)"
+    },
+    "supervisors/SUP-LOOP-RETIRED": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RETIRED-TRIGGER-FILTER (this PR)",
+      "reason": "real registry: watchers-check absorbed by the agent shim → its open and escalated loop-exception cases are settled (resolved · retired), no card, its old beat is no watcher · live release-traffic past SLA → one OP card → escalated · guardian «미정상화 사건» 1 (5 seeds)"
+    },
+    "supervisors/SUP-RETIRE-ABSORB": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LOOP-AGENTS-AS-PLUGINS wave-1 (this PR)",
+      "reason": "agent shim wake.absorbs retires the old watchers-check graph in the registration transaction · no second retire · no fire at the old cron window · one shipped trigger"
+    },
+    "supervisors/SUP-RETIRE-BEAT": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LOOP-AGENTS-AS-PLUGINS P1 (this PR)",
+      "reason": "keeper carries the retired job: DEAD loop:silence-watch counted (KPI 1) · the keeper wakes nobody (registry) · retired checker beat is no subject"
+    },
+    "supervisors/SUP-RETIRE-FAULTS": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LOOP-AGENTS-AS-PLUGINS wave-1 (this PR)",
+      "reason": "garbled wake.absorbs → registration refused with the registry's own message · unknown absorb → live, 0 retired · executor loop-agent@4 → lint refusal"
+    },
+    "supervisors/SUP-ROLE-KEPT": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LOOP-AGENTS-AS-PLUGINS wave-1 r2 (this PR)",
+      "reason": "FEDERATION-ORG §4 역할 은퇴 0: absorbs rows (KPI · L0) on silence-watch · hand-steward · an unjudged OP request is rung (OP:9001 · KPI 1) · a stalled seat next to an unowned P0 is assigned (assign:ELS-SIM-12@UX-H7)"
+    },
+    "supervisors/SUP-HB-REGISTRY-OWNS": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LOOP-AGENTS-AS-PLUGINS P1 (this PR)",
+      "reason": "real registry: stalled run-supervisor-agent → refire ≥2 · exception card(s) to TC only · the real guardian pulse (liveSupervisors) counts it «응답 없는 서브 1/2 (run-supervisor · 레지스트리 몫)» and posts nothing about it (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-HB-OUTSIDE-CLOCK": {
+      "expect": "green",
+      "greenSince": "2026-11-28 LOOP-AGENTS-AS-PLUGINS P1 (this PR)",
+      "reason": "registry tick beat stale → outside clock 0:woke 5:stale 10:woke 20:carded 25:stale · one OP card · 30:woke 35:recovered · host without the schedule entry not-installed (5 seeds · legacy+graph)"
+    },
+    "supervisors/BOARD-PUBLISH-FLIP": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CURRENT-RELEASE-ONE-SOURCE (this PR)",
+      "reason": "publish done → flip in the same tick before npm/verify/dev-bump · all readers <next> before the next tick · 1 bus row · 1 fact · no double flip (5 seeds · legacy+graph)"
+    },
+    "supervisors/BOARD-PUBLISH-FAIL": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CURRENT-RELEASE-ONE-SOURCE (this PR)",
+      "reason": "publish exit 1 → hard stop · no record · readers stay on the release.graph.version board (5 seeds · legacy+graph)"
+    },
+    "supervisors/BOARD-DEVBUMP-FAIL": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CURRENT-RELEASE-ONE-SOURCE (this PR)",
+      "reason": "dev-bump/verify exit 1 after publish → the board stays <next> (flip never waits on the tail) (5 seeds · legacy+graph)"
+    },
+    "supervisors/BOARD-WRITE-FAIL": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CURRENT-RELEASE-ONE-SOURCE (this PR)",
+      "reason": "flip write fails twice → pending · readers keep the old board · exactly 1 OP card · third tick flips (5 seeds · legacy+graph)"
+    },
+    "supervisors/BOARD-RACE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CURRENT-RELEASE-ONE-SOURCE (this PR)",
+      "reason": "live lock → busy error, no record · dead lock broken · same target twice = flipped+already seq 1 · older publish refused (never backwards) (5 seeds · legacy+graph)"
+    },
+    "supervisors/BOARD-READER-STALE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CURRENT-RELEASE-ONE-SOURCE (this PR)",
+      "reason": "no reader cache: next read after a flip is the new board · corrupt record → graph fallback · no record/no graph → null pointer, package fallback (5 seeds · legacy+graph)"
+    },
+    "supervisors/BOARD-ROLLBACK": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CURRENT-RELEASE-ONE-SOURCE (this PR)",
+      "reason": "hand set back to <prev> → all readers <prev> · previous/seq/history recorded · next flip forward again (5 seeds · legacy+graph)"
+    },
+    "supervisors/BOARD-READERS-AGREE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CURRENT-RELEASE-ONE-SOURCE (this PR)",
+      "reason": "judge butler · seat guard · steward · checklist default · throughput · pulse · land-graph = one value before and after the flip (5 seeds · legacy+graph)"
+    },
+    "supervisors/BOARD-SHADOW-HAND": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CURRENT-RELEASE-ONE-SOURCE (this PR)",
+      "reason": "shadow would-run publish never flips · REL hand publish detected → flips in that tick (5 seeds · legacy+graph)"
+    },
+    "supervisors/BOARD-TIMELINE-1128": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CURRENT-RELEASE-ONE-SOURCE (this PR)",
+      "reason": "11-28 morning replay: pre-fix readers on 0.3.38 at 4 of 5 probes (06:02–07:00) · fixed readers 0.3.39 at all 5 from the 06:01 tick (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-UNRELATED": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-GREEN-PR-BINDING (this PR)",
+      "reason": "cell evidence that only mentions a merged PR of another cell (branch-bound) or the defect's own subject PR (no cell) → not signed · one-line reason names the PR's own cell (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-DECLARED": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-GREEN-PR-BINDING (this PR)",
+      "reason": "PR body «칸: <ID>» or its own sweep row (cell-link.jsonl attach · files) + same-head receipt → signed · a «linked» row is no binding · receipt on an older head → not signed (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-UMBRELLA": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-GREEN-PR-BINDING (this PR)",
+      "reason": "one PR cited by two cells → only the declared cell · «칸: A · B 후속» → both · the third citing cell names the PR's cells (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-MISLABEL": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-GREEN-PR-BINDING (this PR)",
+      "reason": "#40630 replay: «칸: C» while title/branch name D → not signed by the line · reason «mislabelled PR (fix its 칸 line)» (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-LEGACY-OWN-EVIDENCE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-GREEN-PR-BINDING-LEGACY (this PR)",
+      "reason": "legacy PR (no «칸» line · title/branch name no cell) + the cell's own evidence (owner bare «#N» · a hand that held it «#N <sha> 착지» · unattributed «#N merged») → signed · a judge's line · a PR that declared another release's cell · the cell's subject PR → not signed · an umbrella's «등록 칸» list → signed (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-NEGATION": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-GREEN-PR-BINDING-LEGACY (this PR)",
+      "reason": "«NOT proof» · «무관» · «unrelated» · «아님» in the clause that cites the PR → not bound · a clean own clause beside a negated one binds (negation is per clause) (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-CRIT-UNCERTAIN": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-NOT-OVERSTRICT (this PR)",
+      "reason": "decomposition review rejects → signed on same-head receipt + focused exit 0 · one line on «<cell>-E4» «doneCriterion 분해 불확실 (…)» · no «-FU» · sign line names the baseline (5 seeds · legacy+graph · live criteria)"
+    },
+    "supervisors/JB-CRIT-LLM-DOWN": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-NOT-OVERSTRICT (this PR)",
+      "reason": "judge LLM 429 on the first call / judgment step failing → signed on the baseline + «<cell>-FU» carrying the provider error · 1 LLM call (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-CRIT-MUST-UNMET": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-NOT-OVERSTRICT (this PR)",
+      "reason": "«must unmet» citing a verbatim clause + the contradicting PR → not signed, refusal quotes both · uncited / fake-clause «unmet» → signed + one line on «<cell>-E4» (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-CRIT-EMPTY": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-NOT-OVERSTRICT (this PR)",
+      "reason": "no or blank doneCriterion → signed on the baseline + «<cell>-FU doneCriterion 채우기» · 0 LLM calls (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-CRIT-RESIGN-NO-FU": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-NOT-OVERSTRICT FU-FLOOD (this PR)",
+      "reason": "same cell re-signed → 0 new FU cells · 0 duplicate lines · an existing «-E4» gets the line appended · 5 uncited cells in one tick → 3 signed (cap 3) + 2 wait «FU 상한 3/틱» → next tick (5 seeds · legacy+graph)"
+    },
+    "supervisors/RP-S1": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-HUMAN-PROOF-TRUST-ROOT (this PR)",
+      "reason": "owner TG tap ×2 → TOFU key (0700/0600 · owner slot mshq · mirrors []) signs elanous-approval/v2 → critpath approved · publish/npm/verify (5 seeds · legacy+graph)"
+    },
+    "supervisors/RP-S2": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-HUMAN-PROOF-TRUST-ROOT (this PR)",
+      "reason": "approved then recut notes → old proof does not carry · new card raised · original binding still approved (5 seeds · legacy+graph)"
+    },
+    "supervisors/RP-S3": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-HUMAN-PROOF-TRUST-ROOT (this PR)",
+      "reason": "real proof pasted on another card via a forged human row → unverified(bad-sig) · nothing published (5 seeds · legacy+graph)"
+    },
+    "supervisors/RP-S4": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-HUMAN-PROOF-TRUST-ROOT (this PR)",
+      "reason": "private key deleted, trust root kept → no regeneration · signer-missing alert · tap without proof → unverified(no-proof) · critpath records human-proof-unavailable:no-proof (5 seeds · legacy+graph)"
+    },
+    "supervisors/RP-S5": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-HUMAN-PROOF-TRUST-ROOT (this PR)",
+      "reason": "rotate → old proof still verifies · new tap signs with -2 key · revoke old → unknown-key (5 seeds · legacy+graph)"
+    },
+    "supervisors/RP-S6": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-HUMAN-PROOF-TRUST-ROOT (this PR)",
+      "reason": "non-owner TG id → refused ×2 · card open · no signed audit row (5 seeds · legacy+graph)"
+    },
+    "supervisors/RP-S7": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-HUMAN-PROOF-TRUST-ROOT (this PR)",
+      "reason": "seat writes human row directly → unverified(no-proof) (5 seeds · legacy+graph)"
+    },
+    "supervisors/RP-S8": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-HUMAN-PROOF-TRUST-ROOT (this PR)",
+      "reason": "TG down → PWA 428 confirm token → owner credential → via pwa · proof → approved (5 seeds · legacy+graph)"
+    },
+    "supervisors/RP-S9": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-HUMAN-PROOF-TRUST-ROOT (this PR)",
+      "reason": "other host with only trust-root.json copied → approved · no private key there (5 seeds · legacy+graph)"
+    },
+    "supervisors/PA-S1": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-PRESIGNED-AUTO (this PR)",
+      "reason": "CEO pre-signs auto 22:30 KST (TG tap ×2 · nexus signer · release-preauth ref) → 06:00 all conditions hold → publish/npm/verify without a card · 1 use row {preAuthId·cut·notes·conditions} · 1 TG line (5 seeds · legacy+graph)"
+    },
+    "supervisors/PA-S2": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-PRESIGNED-AUTO (this PR)",
+      "reason": "pre-signed auto + one 🔴 at publish → no publish · normal publish card · reason «red-0: 🔴 1 (SIM-RED-CELL)» · no use row/line (5 seeds · legacy+graph)"
+    },
+    "supervisors/PA-S3": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-PRESIGNED-AUTO (this PR)",
+      "reason": "pre-signed auto, run at 08:30 KST → window-passed · no publish (5 seeds · legacy+graph)"
+    },
+    "supervisors/PA-S4": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-PRESIGNED-AUTO (this PR)",
+      "reason": "pre-signed auto then revoked → revoked · no publish (5 seeds · legacy+graph)"
+    },
+    "supervisors/PA-S5": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-PRESIGNED-AUTO (this PR)",
+      "reason": "pre-signed surgery: P0 🔴 → critical-red-0 blocks · P1 🔴 with known-issue line → publish · waiver recorded (5 seeds · legacy+graph)"
+    },
+    "supervisors/PA-S6": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-PRESIGNED-AUTO (this PR)",
+      "reason": "recut after signing → allowed, use records the new cut · same-cut rerun = same use (1 row · 1 line) · a third cut → already-used (5 seeds · legacy+graph)"
+    },
+    "supervisors/PA-S7": {
+      "expect": "green",
+      "greenSince": "2026-11-28 RELEASE-PRESIGNED-AUTO (this PR)",
+      "reason": "seat writes the human row on the pre-auth card without a tap → unverified:no-proof · no publish (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-SIM-GREEN": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-SIM-RECEIPT (this PR)",
+      "reason": "sim world receipt («<pr>-<head12>-sN» · 5 seeds · legacy+graph · regression 0) for the scene the criterion or the PR body scene table names → signed · sign line «sim <scene> 시드 5·graph+legacy·regression 0» (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-SIM-SCENE-MISMATCH": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-SIM-RECEIPT (this PR)",
+      "reason": "receipt of another scene · another head · seeds 4/5 · one engine → not signed with the exact gap (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-SIM-REGRESSION": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-SIM-RECEIPT (this PR)",
+      "reason": "named scene receipt with one regression record → not signed «regression 1 (regression@graph·s3)» (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-SIM-E4": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-SIM-RECEIPT (this PR)",
+      "reason": "synthetic test-universe criterion (COND-WATCH live text) naming no scene → signed only with the cell's E4 run line · without it not signed «완료조건이 시뮬/합성 사건 꼴» (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-SIM-CARRY-MERGE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SIM-RECEIPT-CARRY (this PR)",
+      "reason": "real git repo: receipt on head A · landed head B = A + a clean main merge → carried (carryProofAt) · signed 1 · sign line «승계 ← A12 · PR 고유 변경 동일» (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-SIM-CARRY-OWN-CHANGED": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SIM-RECEIPT-CARRY (this PR)",
+      "reason": "real git repo: receipt on head A · landed head C = B + an own commit → not carried · refused 1 «옛 head A12 영수 승계 불가 — own commit C12 after the receipt» (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-EXEC-BUTLER-RETRY-BUILD": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SIM-RETRY-PER-BUILD (this PR)",
+      "reason": "self-run failed on build A → the next tick on A waits (0 runs) · on build B the same cell runs at once (1 run) and signs — retry window per build (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-SIM-SCENES-OWN-DIFF": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SIM-SCENES-OWN-DIFF (this PR)",
+      "reason": "PR body naming other PRs' scenes in prose → only the scenes the PR-own change touches bind → 2 signed (own scene receipt · copied body needs none) · without the own-change port the same board refuses with the foreign scenes (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-EXEC-BUTLER-SQUASH-RUN": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SIM-RECEIPT-CARRY (this PR)",
+      "reason": "real git repo: no receipt · build = the «(#pr)» squash of the landed head → the butler runs the scene 5 seeds (run ids <pr>-<head12>-s<seed>-<scene>) · signed 1 · a PR the build does not carry → no run · refused 1 (5 seeds · legacy+graph)"
+    },
+    "supervisors/JB-SELF-RUN-SCENE-ROOT": {
+      "expect": "green",
+      "greenSince": "2026-11-29 JUDGE-BUTLER-SELF-RUN-FIX (this PR)",
+      "reason": "real git repo · build carries the squash → 5 seed runs, each child argv «--test=<runRoot>» resolves exactly the run root from cwd «/» (no git tree) · the bare «--test» from the same cwd resolves none (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-V3-LISTED": {
+      "expect": "green",
+      "greenSince": "2026-11-28 JUDGE-BUTLER-V3-LISTED (this PR)",
+      "reason": "real repo packages: judge-butler · land-steward · guardian listed as v3 agents (judge-butler L0 JUD · KPI via kpis[].from) · unreadable tick = «?» · broken from: refused with the lint line · judge-butler trigger from agent.yaml owner JUD (JUD space) · recipe = shared door (5 seeds)"
+    },
+    "supervisors/SUP-AUDITOR-HEALTHY": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SUPERVISOR-AUDITOR-LOOP (this PR)",
+      "reason": "3 healthy agents → acted report only (no refire · card · ✋) · KPI watch_only_agents 0 · ledger 3 rows «정상» · bus line per tick (2) · ONE summary mail for hour 08 · telegram 0 (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-AUDITOR-STALE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SUPERVISOR-AUDITOR-LOOP (this PR)",
+      "reason": "tick 60 min old → refire via trigger registry requestFire (one retry-wait row · dispatched once across registry ticks +1/+16) · +15 no rung · +60 still stale → one owner card to TC «틱 정지» (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-AUDITOR-WATCH-ONLY": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SUPERVISOR-AUDITOR-LOOP (this PR)",
+      "reason": "breach 130 min ∧ 0 acts (3 refusals ⊕ 1 failure) → one owner card to TC with «가장 많은 거절: open-cell: 권한 밖 행동 — 허용: case ×3» · +15 nothing · the breaching agent that acted is not carded · KPI 1 (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-AUDITOR-FALSE-GREEN": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SUPERVISOR-AUDITOR-LOOP (this PR)",
+      "reason": "KPI ok with an errored tick / with 4 refusals and 0 acts → ledger «거짓 초록» for both · bus line names it · no heal action · KPI 0 (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-AUDITOR-RED": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SUPERVISOR-AUDITOR-LOOP (this PR)",
+      "reason": "two watch-only agents ticking every 15 min for 3h15 → telegram once at +180 ⊕ one OP red mail · owner card f,g at +0 · ✋ to OP f,g at +60 · 4 hourly summaries (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-CANARY-REGRESS": {
+      "expect": "green",
+      "greenSince": "2026-11-29 RAIL-CANARY-AUTO-ROLLBACK (this PR)",
+      "reason": "#40735-shaped build: els restarted on it at +3 → seat panes 8→0 ⊕ fed hands 0 → confirmed (2 reads) at +6 → rollback (eln self-update --rollback door) at +6 · els ⊕ nexus kickstart · one OP card naming #40735 and the undo · +11 verify fixed · KPI 0/0 (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-CANARY-HEALTHY": {
+      "expect": "green",
+      "greenSince": "2026-11-29 RAIL-CANARY-AUTO-ROLLBACK (this PR)",
+      "reason": "healthy swap ticked +1…+36 → no door · no mail · KPI 0 every tick · state swap with no open episode · 5 probes ok (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-CANARY-FLAP": {
+      "expect": "green",
+      "greenSince": "2026-11-29 RAIL-CANARY-AUTO-ROLLBACK (this PR)",
+      "reason": "seat probe fails then passes on the confirm re-read every tick → no rollback · next build regresses → one rollback · rail re-installs it and it regresses again → no second rollback, one «한도» card to OP (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-CANARY-HOLD": {
+      "expect": "green",
+      "greenSince": "2026-11-29 RAIL-CANARY-AUTO-ROLLBACK (this PR)",
+      "reason": "regression under an active HOLD on RAIL → act-held at +1 and +6 (journal refused · deferred) · HOLD lifted → rollback at +11 (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-CANARY-FALSE": {
+      "expect": "green",
+      "greenSince": "2026-11-29 RAIL-CANARY-AUTO-ROLLBACK (this PR)",
+      "reason": "OP GitHub budget 99% after the swap → rollback at +6 → still 99% on the old build after verify_min 15 → one «되돌림 효과 없음» card at +21 · canary.json KPI false_rollbacks 1 (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-EXEC-TRAIN-PIN": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SUPERVISORS-EXECUTE-NOT-PROPOSE (this PR)",
+      "reason": "churn 2 → apply-pin (runtime pin · TTL 120) · FYI to TC (no proposal) · land graph walks the pin · KPI 2 → 0 at +70 · TTL expiry · closed lane → release-pin (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-EXEC-TRAIN-GUARD": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SUPERVISORS-EXECUTE-NOT-PROPOSE (this PR)",
+      "reason": "wildcard HOLD → no pin · act-held · 6 hot lanes → 3/1/0 per tick · 4 pins max (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-EXEC-HAND-CLAIM": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SUPERVISORS-EXECUTE-NOT-PROPOSE (this PR)",
+      "reason": "hint 0 · untaken 10 (no second hint) · claim-for at 20 via the claim door · wake once · KPI 1 → 0 · journal undo unclaim (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-EXEC-HAND-GUARD": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SUPERVISORS-EXECUTE-NOT-PROPOSE (this PR)",
+      "reason": "HOLD naming the cell → no hint/claim · 4 hands → 3+1 hints · 3 claims per tick (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-EXEC-BUTLER-RUN": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SUPERVISORS-EXECUTE-NOT-PROPOSE (this PR)",
+      "reason": "criterion scene without receipt → the butler runs it (bound <pr>-<head12>) and signs the same tick · 3 runs per tick, 4th waits (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-EXEC-BUTLER-GUARD": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SUPERVISORS-EXECUTE-NOT-PROPOSE (this PR)",
+      "reason": "security-4 cell → JUD card, not signed, no run · HOLD-named cell → not signed, no run (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-EXEC-BUTLER-FU-LINE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SUPERVISORS-EXECUTE-NOT-PROPOSE (this PR)",
+      "reason": "new FU cell (no evidence) gets its first line · old empty-string snapshot refused · line idempotent · done-when test file = E4 command (5 seeds · legacy+graph)"
+    },
+    "supervisors/SUP-EXEC-BUTLER-FU-FALLBACK": {
+      "expect": "green",
+      "greenSince": "2026-11-28 SUPERVISORS-EXECUTE-NOT-PROPOSE (this PR)",
+      "reason": "FU line unwritable → sign not refused · line rides on the sign line «FU <cell>-E4: …» (5 seeds · legacy+graph)"
+    },
+    "supervisors/DECISION-BUS-TWO-SOURCES": {
+      "expect": "green",
+      "greenSince": "2026-11-28 DECISION-TO-BUS-AUTO (this PR)",
+      "reason": "real ledger (decide path ⊕ crown record) 2 ⊕ real git repo «변경 이력» rows 3 → HQ bus pointers 5 · rerun +0 · OP turn digest carries all 5 · unread 25 h → OP card 1 (rerun same card) · ack → 0 (5 seeds · legacy+graph)"
+    },
+    "supervisors/CROWN-DIRECTIVE-ASSIGN-GUARD": {
+      "expect": "green",
+      "greenSince": "2026-11-28 ELN-OP-CROWN-MEMORY (this PR)",
+      "reason": "real ledger relay record with a directive (MK only DOCS-*) → the decision→pointer door (legacy) / the decision-bus sweep (graph) writes 1 card ⊕ 1 pinned memory card · real seatAssign: MK ← infra refused 1 (crown-directive · card · words · ROLE.md line) · docs cell and TC allowed · after expiry MK ← infra allowed · memory card removed (5 seeds · legacy+graph)"
     }
   }
 }

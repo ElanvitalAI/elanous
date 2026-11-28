@@ -13,6 +13,8 @@ import { getNodeKindRegistration, listNodeKinds, unregisterPluginNodeKind } from
 import { verifyIndex, type MarketplaceIndex, type VerifyIndexResult } from '../../market/signed-index.js';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { ensureInternalMarketIndex, ensureMarketIndex, MarketFetchError, type MarketFetchOptions } from './market-fetch.js';
+import { bundleLoopAgents, manifestLoopAgents, registerPluginLoopAgents, retirePluginLoopAgents } from './loop-agents.js';
+import { debug } from '../../debug/log.js';
 
 const NAME = /^[a-z0-9][a-z0-9-]{1,39}$/;
 const VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.-]+)?$/;
@@ -899,6 +901,9 @@ async function installPluginInternal(spec: string, opts: InstallOptions, context
         }
       }
     }
+    // LOOP-AGENTS-AS-PLUGINS P3: a loop-agent plugin points at its agent package — bundle it (and its tick shim) into the package
+    try { bundleLoopAgents(originalSource, join(stage, 'package')); }
+    catch (error) { fail('io', `loop agent bundle failed: ${error instanceof Error ? error.message : String(error)}`); }
     const manifest: PluginManifest = loadPluginManifestFromDir(join(stage, 'package'), { id: source.expectedName ?? basename(spec) }).manifest;
     if (!NAME.test(manifest.id) || !VERSION.test(manifest.version)) fail('io', 'invalid plugin name or version');
     if (source.expectedName && (manifest.id !== source.expectedName || manifest.version !== source.expectedVersion)) fail('conflict', 'market name or version differs from manifest');
@@ -911,7 +916,7 @@ async function installPluginInternal(spec: string, opts: InstallOptions, context
     const mainPath = inside(packageRoot, manifest.main);
     // A skills/graphs-only pack (official `elanous-basics`) declares no `main` — the default `./plugin.ts` is not a promise.
     // …but only a pack that ships something to install (skills or graphs) may omit it.
-    const shipsAssets = hasSkill(join(packageRoot, 'skills')) || (manifest.contributes.graphs?.length ?? 0) > 0;
+    const shipsAssets = hasSkill(join(packageRoot, 'skills')) || (manifest.contributes.graphs?.length ?? 0) > 0 || manifestLoopAgents(packageRoot).length > 0;
     if (existsSync(mainPath) || declaresMain(packageRoot) || !shipsAssets) {
       if (!existsSync(mainPath) || !realpathSync(mainPath).startsWith(`${realpathSync(packageRoot)}${sep}`)) fail('io', `plugin main not found or unsafe: ${manifest.main}`);
     }
@@ -1006,6 +1011,9 @@ async function installPluginInternal(spec: string, opts: InstallOptions, context
           fail('scan', 'plugin package integrity changed during installation');
         }
         prepareDeclaredRuntime(manifest, destination, opts, bundledSource);
+        // LOOP-AGENTS-AS-PLUGINS P3: the plugin's loop agents join the trigger registry (live) — a refused registration rolls back
+        const loopAgents = registerPluginLoopAgents(root, destination);
+        if (loopAgents.length) debug.log('plugin.install', 'loop-agents', { plugin: name, loopAgents });
         const movedPackIdentities = packs.filter(pack => moved.includes(pack.destination)).map(pack => {
           const identity = lstatSync(pack.destination);
           return { path: pack.destination, dev: identity.dev, ino: identity.ino };
@@ -1179,6 +1187,8 @@ export function removePlugin(name: string, root = elanousStateRoot()): number {
       }
       throw error;
     }
+    // LOOP-AGENTS-AS-PLUGINS P3: the removed packages' loop agents leave the registry (retired · history kept · never ticked)
+    for (const entry of moved) { try { retirePluginLoopAgents(root, entry.temporary, new Date(), entry.original); } catch { /* fail-open: the row stays live until the next register */ } }
     rmSync(quarantine, { recursive: true, force: true });
     return entries.length;
   });

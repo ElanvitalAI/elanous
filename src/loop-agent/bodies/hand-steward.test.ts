@@ -64,7 +64,7 @@ describe('hand-steward card', () => {
   test('card loads · address = id upper · knowhow parses', () => {
     const c = loadCard('hand-steward');
     expect(c).toMatchObject({ id: 'hand-steward', address: 'HAND-STEWARD', supervisor: 'OP', name: '행정관', kpi: { name: 'idle_hands_with_ready_cells', dir: 'at_most', target: 0 } });
-    expect(c.rights.actions).toEqual(['assign', 'unassign']);
+    expect(c.rights.actions).toEqual(['assign', 'unassign', 'claim-for', 'unclaim']);
     const kh = readFileSync(resolve(import.meta.dir, '../../../graphs/loop-agents/hand-steward/knowhow.md'), 'utf8');
     expect(parseKnowhowItems(kh, 'HAND-STEWARD').length).toBeGreaterThanOrEqual(3);
   });

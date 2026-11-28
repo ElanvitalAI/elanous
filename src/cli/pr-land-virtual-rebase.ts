@@ -6,7 +6,8 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { delimiter, resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { patchIdFromOutput } from '../git-smart/delta.js';
+import { stablePatchId } from '../git-smart/delta.js';
+import { mergeTree } from '../git-smart/merge-tree.js';
 
 const SHA40 = /^[a-f0-9]{40}$/iu;
 type Verdict = { ok: true; oldBase: string; patchId: string }
@@ -30,9 +31,9 @@ function withDisposableMergeTree<T>(input: MergeTreeInput, consume: (mergedTree:
     GIT_ALTERNATE_OBJECT_DIRECTORIES: [alternate, process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES].filter(Boolean).join(delimiter),
   };
   try {
-    const result = spawnSync('git', ['merge-tree', '--write-tree', baseTip, head], {
+    const result = mergeTree(args => spawnSync('git', args, {
       cwd, env, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
-    });
+    }), baseTip, head, [], []);
     const mergedTree = result.status === 0 && !result.error ? result.stdout.trim() : '';
     if (!SHA40.test(mergedTree)) return { ok: false, reason: 'merge-tree-conflict-or-unmeasured' };
     return { ok: true, value: consume(mergedTree, env) };
@@ -92,8 +93,10 @@ export function verifyVirtualRebasePatch(input: MergeTreeInput): Verdict {
       }
       const diff = checked(['diff', '--no-ext-diff', '--no-renames', '--binary', from, to], inEnv);
       if (!diff) return { ok: false as const, reason: 'diff-unmeasured' };
-      const patched = git(['patch-id', '--stable'], inEnv, `${diff}\n`);
-      const patchId = patched.status === 0 && !patched.error ? patchIdFromOutput(patched.stdout) : null; // SMART-MERGE ① shared parse
+      const patchId = stablePatchId((args, opts) => {
+        const result = git([...args], inEnv, opts?.input);
+        return { status: result.error ? null : result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+      }, `${diff}\n`);
       return patchId
         ? { ok: true as const, patchId }
         : { ok: false as const, reason: 'patch-id-unmeasured' };

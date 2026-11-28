@@ -1,9 +1,10 @@
 import { createRequire } from 'node:module';
 import { LessonLedger, type LessonRow } from '../lessons/lesson-ledger.js';
 import { DecisionLedger, type DecisionEntry, type SeatDecisionRecord } from '../decisions/decision-ledger.js';
-import { devVersion, listChecklist, type Checklist } from '../release-loop/checklist.js';
+import { listChecklist, type Checklist } from '../release-loop/checklist.js';
 import { debug } from '../debug/log.js';
 import { queryInstalledPack } from './query.js';
+import { boardVersion } from '../release-loop/board-version.js';
 
 /** Directive row fields this search reads — kept local because `src/directives/directive-index` is excluded from the public export. */
 export interface DirectiveRow { ts: string; text: string; source_file: string; line_no: number }
@@ -41,7 +42,7 @@ export interface KnowFindDeps {
 }
 
 function versions(): string[] {
-  const current = devVersion().replace(/-dev\.\d+$/, '');
+  const current = boardVersion();
   const parts = current.split('.').map(Number);
   return [current, `${parts[0]}.${parts[1]}.${parts[2]! + 1}`];
 }

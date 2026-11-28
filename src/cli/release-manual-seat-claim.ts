@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { CliUserError } from './cli-user-error.js';
+import { remoteUrlVia } from '../git-fs/origin-url.js';
 import { ownerSeatFromPullRequest } from '../../scripts/release-loop/gate-bisect-owner-mail.js';
 
 export interface CellOpenPullRequest {
@@ -58,11 +59,17 @@ export function listOpenCellPullRequests(
     return { status: result.status, stdout: result.stdout ?? '', ...(result.error ? { error: result.error } : {}) };
   },
 ): CellOpenPullRequest[] {
-  const origin = run('git', ['remote', 'get-url', 'origin'], cwd);
-  if (origin.error || origin.status !== 0) {
-    throw new Error(`open PR ownership check refused: could not resolve target repository origin${origin.error ? `: ${origin.error.message}` : ''}`);
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL (a fetch mirror's insteadOf would turn get-url into a local path)
+  let failure = '';
+  const origin = remoteUrlVia((argv) => {
+    const r = run('git', argv, cwd);
+    if (r.error) failure = `: ${r.error.message}`;
+    return r.error || r.status !== 0 ? null : r.stdout;
+  });
+  if (!origin) {
+    throw new Error(`open PR ownership check refused: could not resolve target repository origin${failure}`);
   }
-  const repo = githubRepositoryFromOrigin(origin.stdout);
+  const repo = githubRepositoryFromOrigin(origin);
   const result = run('gh', ['pr', 'list', '--repo', repo, '--state', 'open',
     '--limit', String(OPEN_PR_ENUMERATION_LIMIT), '--json', 'number,title,body,headRefName,assignees',
     '--jq', '[.[] | {number,title,body,headRefName,assignees:[.assignees[].login]}]'],

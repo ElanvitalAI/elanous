@@ -1,0 +1,40 @@
+# WORK-PULL-REACHES-ROSTER (0.3.39 P0 · Claude OP 11-28) — ONE «ready for a hand» policy. Read by `eln work next`
+# (src/steward/space/work-next.ts), `eln work block` (cell-block.ts), the space steward (model.ts live R1 · hq-shadow.ts)
+# and OP's assignment table (src/resource-opt/matching-table.ts) through ONE reader: src/kit/work-pull/index.ts.
+# Change a value here, not in TS. An unreadable file = the pre-policy board (named in the reader's error), never a stop.
+#
+# S (audit 11-28 00:47–01:47Z): 149 `work next` claims touched 54 cells and none of the ~37 OP-held 0.3.39 roster cells —
+#   `work next` counted only ladder-depth-2 seats as coordinators (OP is depth 1) · 93 of the 149 claims were the same hand
+#   re-taking a cell it had just parked with `work block` (PWA-ELN-CONTRACT 8× by one hand) because ANY later mail from the
+#   awaited seat to the hand or its coordinator «answered» the block · OP's table handed out P2 while steward:hq paired
+#   only P0/P1.
+version: 1
+
+# Ladder depths with coordinator authority (src/msg/hand-raise-ladder.ts depthOf: 1 = HQ · 2 = space coordinator ·
+# 3 = hand). A yellow cell such a seat holds is the board: a hand claims it as WRITER and the coordinator stays owner.
+coordinator_depths: [1, 2]
+
+# The one claim order: roster cells first (OP's roster rank · `eln work roster`), then these priorities in this order,
+# then cells without one. Consumer tie-breaks (deadline version · oldest change · id) come after.
+order:
+  priorities: [P0, P1, P2]
+  # Evidence first-line prefixes (ROSTER-<v>.md rules 2 · 4). Reserve = offered only when no roster cell is claimable.
+  reserve_markers: ['[예비 ']
+  # Never offered to a hand (finish it through its open PR).
+  never_markers: ['[WIP 잔류 ']
+
+# 작업 시작 시 PR 없으면 Claude OP가 draft PR 먼저: 본문에 `칸: CELL-ID` 한 줄을 명시한다.
+# 최근 갱신된 open PR(draft 포함)의 명시 칸은 같은 lease 창 동안 pull 제외한다.
+# A hand's claim on a coordinator-held cell (writer) — or on a cell it owns — lives this many minutes past the latest
+# progress signal it shows. Signals: claim = the claim itself · cell-change = the cell changed by that hand ·
+# activity = the hand's session clock (activity.ts) · pr-update = an open PR naming the cell was pushed/updated.
+writer:
+  lease_min: 45
+  progress: [claim, cell-change, activity, pr-update]
+
+# `eln work block` — a parked cell comes back only on an answer ABOUT it: reply-to = a mail replying to the block's
+# exception mail · cell-ref = a mail from the awaited seat whose refs carry cell:<ID> · cell-touch = the awaited seat
+# changed the cell after the block. (addressed-mail = any mail from the awaited seat to the hand or its coordinator —
+# the pre-policy rule that re-offered 93 cells in one hour — is accepted here but not used.)
+block:
+  resolve_on: [reply-to, cell-ref, cell-touch]

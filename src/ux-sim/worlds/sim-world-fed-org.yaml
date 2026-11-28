@@ -12,3 +12,9 @@ scenarios:
   - { id: KIT-KPI-WINDOW-EVENT-TIME, module: src/ux-sim/sim-world/fed-org/kit-kpi.ts }
   - { id: KIT-KPI-RAW-JUDGMENT, module: src/ux-sim/sim-world/fed-org/kit-kpi.ts }
   - { id: KIT-KPI-BREACH-DEBOUNCE, module: src/ux-sim/sim-world/fed-org/kit-kpi.ts }
+  # CONTEXT-BUS-FEDERATION (0.3.39 P0): coordinator scenes 3 · loop-agent scenes 2 over the real bus CLI · digest · kit/bus-post
+  - { id: CTX-BUS-DECIDE, module: src/ux-sim/sim-world/fed-org/context-bus.ts }
+  - { id: CTX-BUS-HQ-HANDOFF, module: src/ux-sim/sim-world/fed-org/context-bus.ts }
+  - { id: CTX-BUS-RAW-CONTEXT, module: src/ux-sim/sim-world/fed-org/context-bus.ts }
+  - { id: CTX-BUS-LOOP-STATUS, module: src/ux-sim/sim-world/fed-org/context-bus.ts }
+  - { id: CTX-BUS-FALLBACK, module: src/ux-sim/sim-world/fed-org/context-bus.ts }

@@ -1,0 +1,29 @@
+# SIM-WORLD guardian pack — GUARDIAN-SUBS (대표 11-28 07:5x · 08:0x): the real guardian pulse with patrol · post · fuel · keys on
+# peer tick files, a trigger table and the llm-accounts pack inside each scenario universe. Device GUARDIAN-WORLD (seeded · LLM 0).
+schema: 1
+world: guardian
+scenarios:
+  - { id: GRD-PATROL-ZOMBIE, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-PATROL-RUN-FAILED, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-PATROL-LOOP-EXC, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-PATROL-UNCLASSIFIED, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-PATROL-CONCURRENT, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-PATROL-PEER-SILENT, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-POST-SLA, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-POST-READ-NOTICE, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-POST-DORMANT, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-POST-RAIL, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-FUEL-ROUTE-NEXT, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-FUEL-ALL-DRY, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-FUEL-7DAY, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-KEYS-REAL-VS-PAUSED, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-FUEL-SUB-FIRST, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-FUEL-NO-PAID-BYPASS, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-FUEL-NONE-CLEARS-DIRECTIVE, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-FUEL-REVIEW-NEVER-FORBIDDEN, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-KEYS-REFRESH, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-KEYS-REFRESH-FAIL, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-KEYS-USAGE-EXP, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-KIND-RESOURCE-CHECK-PARAMS, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: GRD-KIND-ROLLUP-PARAMS, module: src/ux-sim/sim-world/guardian/scenarios.ts }
+  - { id: BURST-ACTUATES, module: src/ux-sim/sim-world/guardian/scenarios.ts }

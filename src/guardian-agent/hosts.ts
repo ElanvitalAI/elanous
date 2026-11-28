@@ -19,8 +19,7 @@ export const LOCAL_HOSTS = ['minim5', 'node-c', 'mbp', 'node-b'] as const;
 export const PAID_HOSTS = ['aws1', 'aws2', 'gcp1', 'gcp2', 'gcp3'] as const;
 /** The HQ canonical host never runs heavy work (HQ_HEAVY_FORBIDDEN). */
 export const NEVER_ROUTE = new Set(['mshq']);
-/** Headroom = load per core strictly under this. */
-export const HEADROOM_RATIO = 1.0;
+// Headroom (load per core) = the guardian policy host_load_per_cpu_max (graphs/loop-agents/guardian/agent.yaml · def.ts gp()).
 
 export interface HostProbe { readonly host: string; readonly reachable: boolean; readonly load1: number | null; readonly ncpu: number | null; readonly reserved?: boolean; readonly paid?: boolean; readonly why?: string }
 export const ratio = (p: HostProbe): number => (p.load1 !== null && p.ncpu ? p.load1 / p.ncpu : Number.POSITIVE_INFINITY);

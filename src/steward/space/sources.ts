@@ -10,6 +10,8 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
+import { readRemoteUrl } from '../../git-fs/origin-url.js';
+import { activeBoardVersion } from '../../ops-dashboard/current-version.js';
 import { spawnElanousSync } from '../../instance/spawn-elanous.js';
 import { dedupeHands, loadDeclaredSeatRoles, loadFederationLadder, openHands } from '../../msg/hand-raise-ladder.js';
 import { defaultMsgStorePath, openMsgStoreReadOnly } from '../../msg/msg-store.js';
@@ -17,6 +19,12 @@ import { getElanousConfigDir, getElanousConfigDirOverride } from '../../elanous-
 import { defaultWakeLedgerPath, recentSeatWakes } from '../../seat/wake-ledger.js';
 import { activityFromClock, sessionIdOfCommand, sessionModelActivityMs } from './activity.js';
 import { STEWARD_SPACE_DEFAULTS, type StewardSpaceConfig } from './config.js';
+import { readGreenTriageSources, triageGreen, type GreenTriageSources } from '../../release-loop/green-triage.js';
+import { lanesOfTriage, type CellLanes } from './cell-wait.js';
+import { loadHqPolicy } from './hq-shadow.js';
+import { readAllOpenPrs } from '../../kit/work-pull/open-pr-pages.js';
+import { livePullPolicy, readRoster, rosterRank, rosterRankRecord, type PullPolicy, type RosterRankLike } from '../../kit/work-pull/index.js';
+import { cellAreaPaths, liveSeatRoles, type SeatRolesPolicy } from '../../kit/seat-area/index.js';
 import type { CellView, HostView, JudgeCellView, MergedView, OpenHandView, PrView, ReceiptView, SeatView, Snapshot, VerdictView } from './model.js';
 
 export const DEFAULT_RECEIPTS_DIR = join(homedir(), 'elanous-hq/seat-state/RES/evidence/PREGATE-GREEN');
@@ -35,8 +43,8 @@ function parsed(label: string, out: { status: number | null; stdout: string | Bu
 }
 
 /** GitHub CLI read (gh pr list) — run in the release repo's checkout (or with `--repo`), never the caller's cwd. */
-export function ghJson(args: readonly string[], target: GhTarget): unknown {
-  return parsed(`gh ${args.slice(0, 3).join(' ')}`, spawnSync('gh', [...args, ...target.args], { ...CHILD, ...(target.cwd ? { cwd: target.cwd } : {}) }));
+export function ghJson(args: readonly string[], target: GhTarget, timeoutMs: number = CHILD.timeout): unknown {
+  return parsed(`gh ${args.slice(0, 3).join(' ')}`, spawnSync('gh', [...args, ...target.args], { ...CHILD, timeout: timeoutMs, ...(target.cwd ? { cwd: target.cwd } : {}) }));
 }
 
 /**
@@ -52,7 +60,7 @@ export interface GhTarget { readonly cwd?: string; readonly args: readonly strin
 export interface GhTargetDeps {
   readonly codeRoot: string;
   readonly exists: (path: string) => boolean;
-  /** `git remote get-url origin` in `dir` (null = none). */
+  /** The raw configured origin URL of `dir` (src/git-fs/origin-url.ts · null = none). */
   readonly originUrl: (dir: string) => string | null;
   /** package.json `repository` url at `dir` (null = none). */
   readonly packageRepoUrl: (dir: string) => string | null;
@@ -97,8 +105,8 @@ export function liveGhTargetDeps(): GhTargetDeps {
     codeRoot: join(import.meta.dir, '..', '..', '..'),
     exists: existsSync,
     originUrl: (dir) => {
-      const out = spawnSync('git', ['-C', dir, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 10_000 });
-      return out.status === 0 ? String(out.stdout).trim() || null : null;
+      // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+      return readRemoteUrl(dir);
     },
     packageRepoUrl: (dir) => {
       try {
@@ -111,8 +119,8 @@ export function liveGhTargetDeps(): GhTargetDeps {
 }
 
 /** Our own CLI read, through the universe-stamped helper. */
-function cliJson(args: readonly string[]): unknown {
-  return parsed(args.slice(0, 3).join(' '), spawnElanousSync(args, CHILD));
+function cliJson(args: readonly string[], timeoutMs: number = CHILD.timeout): unknown {
+  return parsed(args.slice(0, 3).join(' '), spawnElanousSync(args, { ...CHILD, timeout: timeoutMs }));
 }
 
 /** `activityOf(sessionId)` = the session's last model row (activity.ts); absent or null = els decides (older behaviour). */
@@ -161,7 +169,14 @@ export function parseChecklist(body: unknown): { version: string; cells: CellVie
     if (typeof i.id !== 'string' || typeof i.status !== 'string') return [];
     return [{ id: i.id, title: String(i.title ?? '').split('\n')[0]!.slice(0, 120), status: i.status,
       ...(typeof i.owner === 'string' && i.owner ? { owner: i.owner } : {}),
-      ...(typeof i.priority === 'string' ? { priority: i.priority } : {}), updatedAt: String(i.updatedAt ?? '') }];
+      ...(typeof i.priority === 'string' ? { priority: i.priority } : {}), updatedAt: String(i.updatedAt ?? ''),
+      ...(typeof i.dispatchKind === 'string' && i.dispatchKind ? { dispatchKind: i.dispatchKind } : {}),
+      ...(typeof i.evidence === 'string' && i.evidence.trim() ? { evidenceHead: i.evidence.trim().split('\n')[0]!.slice(0, 120) } : {}),
+      ...(typeof i.updatedBy === 'string' && i.updatedBy ? { updatedBy: i.updatedBy } : {}),
+      ...(i.writer && typeof (i.writer as { seat?: unknown }).seat === 'string' && typeof (i.writer as { at?: unknown }).at === 'string'
+        ? { writer: { seat: (i.writer as { seat: string }).seat, at: (i.writer as { at: string }).at } } : {}),
+      // SEAT-AREA-GUARD — area signals over the full text (the view keeps only the title's first line).
+      ...(() => { const paths = cellAreaPaths({ id: i.id as string, title: String(i.title ?? ''), body: typeof i.body === 'string' ? i.body : '', doneCriterion: typeof i.doneCriterion === 'string' ? i.doneCriterion : '' }); return paths.length ? { areaPaths: paths } : {}; })() }];
   }) };
 }
 
@@ -172,7 +187,7 @@ export function parsePrs(body: unknown): PrView[] {
     if (typeof p.number !== 'number' || typeof p.headRefOid !== 'string') return [];
     const files = Array.isArray(p.files) ? p.files.map((f) => String((f as { path?: unknown }).path ?? '')).filter(Boolean) : undefined;
     return [{ number: p.number, head: p.headRefOid, branch: String(p.headRefName ?? ''), title: String(p.title ?? ''),
-      draft: p.isDraft === true, updatedAt: String(p.updatedAt ?? ''), ...(files ? { files } : {}) }];
+      body: typeof p.body === 'string' ? p.body : '', draft: p.isDraft === true, updatedAt: String(p.updatedAt ?? ''), ...(files ? { files } : {}) }];
   });
 }
 
@@ -254,6 +269,34 @@ export interface SnapshotSources {
   readonly roles?: () => Record<string, string>;
   /** JUD-HAND-DISCOVERY: the judge-butler's last tick (JSON) — cells it refused with «JUD signs this one». */
   readonly judgeCells?: () => unknown;
+  /** Declared federation seats (seat registry ⊕ federation.yaml) — a declared hand with no pane joins as `no-pane`. */
+  readonly declaredSeats?: () => Iterable<string>;
+  /** STEWARD-READY-LANES — green-triage lanes of the board items (lane a judge · lane b evidence). Absent = no lanes. */
+  readonly lanes?: (version: string, items: readonly unknown[]) => CellLanes;
+  /** WORK-PULL-REACHES-ROSTER — the shared pull policy ⊕ OP's roster rank for the board version. Absent = pre-policy steward. */
+  readonly pull?: (version: string) => { policy: PullPolicy; rosterRank?: RosterRankLike };
+  /** SEAT-AREA-GUARD — graphs/policies/seat-roles.yaml (kit/seat-area). Absent/throws = no area rule (named in sourceErrors). */
+  readonly seatRoles?: () => SeatRolesPolicy;
+}
+
+/**
+ * STEWARD-READY-LANES — the board's green-triage lanes, read the way `eln release checklist green-triage` reads them
+ * (local `git log origin/main` squash subjects ⊕ the pregate GREEN lane dirs · no network). One reader for the space
+ * steward snapshot, `eln work next` and hand-steward: lane a «merged ⊕ receipt» is JUD's (cell-wait 'awaiting-judge'),
+ * lane b «merged, no receipt» is one hand's for the policy pack's stall_min (unreadable pack → the plain lease).
+ */
+export function liveCellLanes(version: string, items: readonly unknown[], opts: { receiptsDir?: string; triage?: GreenTriageSources } = {}): CellLanes {
+  const receiptsDir = opts.receiptsDir ?? DEFAULT_RECEIPTS_DIR;
+  const rows = items.flatMap((raw) => {
+    const i = raw as Record<string, unknown>;
+    return typeof i?.id === 'string' && typeof i.status === 'string'
+      ? [{ id: i.id, title: String(i.title ?? ''), status: i.status, ...(typeof i.owner === 'string' ? { owner: i.owner } : {}), ...(typeof i.evidence === 'string' ? { evidence: i.evidence } : {}) }]
+      : [];
+  }) as unknown as Parameters<typeof triageGreen>[1];
+  const sources = opts.triage ?? readGreenTriageSources({ greenLanes: () => (existsSync(receiptsDir) ? readdirSync(receiptsDir) : []) });
+  let holdMin: number | undefined;
+  try { holdMin = loadHqPolicy().stallMin; } catch { holdMin = undefined; }
+  return lanesOfTriage(triageGreen(version, rows, sources).rows, holdMin);
 }
 
 /** The judge-butler's tick report (src/judge-butler/butler-cli.ts writes `<stateRoot>/loop-agents/judge-butler/last-tick.json`). */
@@ -280,13 +323,25 @@ export function parseButlerJudgeCells(body: unknown, nowMs: number, maxAgeMinute
   return out;
 }
 
-export function liveSources(config: StewardSpaceConfig | undefined, nowMs: number): SnapshotSources {
+/**
+ * STEWARD-HQ 11-28 (CEO «왜 낮은가»): the board read had no `--version`, so the child `eln` stripped ITS package version —
+ * the installed 0.3.38 — while `release.graph.version` said 0.3.39. 22:10Z: 262 cells of the published 0.3.38 board
+ * (yellow 4, all P2) → backlog 0 → «idle 6 · no backlog 6» and steward-live 0, next to 73 yellow P0/P1 on 0.3.39.
+ * One board version for every «current» reader (`eln work next` · hand pool · hand-steward): {@link activeBoardVersion}.
+ */
+export function checklistStatusArgs(version: string): string[] {
+  return ['release', 'checklist', 'status', '--version', version, '--json'];
+}
+
+/** `childTimeoutMs` — per-child deadline for the `eln side ls` / `gh` reads (absent = {@link CHILD} timeout, the steward tick's). */
+export function liveSources(config: StewardSpaceConfig | undefined, nowMs: number, opts: { childTimeoutMs?: number } = {}): SnapshotSources {
   let target: GhTarget | null = null;
-  const gh = (args: readonly string[]): unknown => ghJson(args, target ??= resolveGhTarget(config?.repo, liveGhTargetDeps()));
+  const childTimeoutMs = opts.childTimeoutMs ?? CHILD.timeout;
+  const gh = (args: readonly string[]): unknown => ghJson(args, target ??= resolveGhTarget(config?.repo, liveGhTargetDeps()), childTimeoutMs);
   return {
-    panes: () => cliJson(['side', 'ls', '--json']),
-    checklist: () => cliJson(['release', 'checklist', 'status', '--json']),
-    prs: () => gh(['pr', 'list', '--state', 'open', '--limit', '150', '--json', 'number,headRefOid,headRefName,title,isDraft,updatedAt,files']),
+    panes: () => cliJson(['side', 'ls', '--json'], childTimeoutMs),
+    checklist: () => cliJson(checklistStatusArgs(activeBoardVersion())),
+    prs: () => readAllOpenPrs(target ??= resolveGhTarget(config?.repo, liveGhTargetDeps()), childTimeoutMs),
     merged: () => gh(['pr', 'list', '--state', 'merged', '--limit', '60', '--json', 'number,headRefName,mergedAt']),
     receipts: () => readReceipts(config?.receiptsDir ?? DEFAULT_RECEIPTS_DIR, nowMs),
     verdicts: () => readVerdicts(config?.reviewResultsDir ?? defaultReviewResultsDir(), nowMs),
@@ -297,6 +352,26 @@ export function liveSources(config: StewardSpaceConfig | undefined, nowMs: numbe
     wakes: () => recentSeatWakes(defaultWakeLedgerPath(), nowMs),
     roles: () => loadDeclaredSeatRoles(),
     judgeCells: () => JSON.parse(readFileSync(butlerLastTickPath(effectiveInstanceRoot()), 'utf8')),
+    lanes: (version, items) => liveCellLanes(version, items, { receiptsDir: config?.receiptsDir ?? DEFAULT_RECEIPTS_DIR }),
+    // Unreadable policy file → throw: the snapshot has no `pull` (the pre-policy steward) and sourceErrors names it.
+    pull: (version) => {
+      const live = livePullPolicy();
+      if (live.error) throw new Error(live.error);
+      const rank = rosterRank(readRoster(effectiveInstanceRoot()), version);
+      // A plain record, not the Map: the snapshot is persisted as JSON between graph nodes (a Map would arrive as `{}`).
+      return { policy: live.policy, ...(rank ? { rosterRank: rosterRankRecord(rank) } : {}) };
+    },
+    // Unreadable seat-roles file → throw: the snapshot has no `seatRoles` (pre-policy) and sourceErrors names it.
+    seatRoles: () => {
+      const live = liveSeatRoles();
+      if (live.error) throw new Error(live.error);
+      return live.policy;
+    },
+    declaredSeats: () => {
+      const { declaredFederationSeats } = require('../../msg/seat-mail-trust.js') as typeof import('../../msg/seat-mail-trust.js');
+      const { resolveSeatStateRoot } = require('../../loops/msg-wake.js') as typeof import('../../loops/msg-wake.js');
+      return declaredFederationSeats({ stateRoot: resolveSeatStateRoot() });
+    },
     openHands: (ladder) => {
       const store = openMsgStoreReadOnly(defaultMsgStorePath());
       try { return dedupeHands(openHands(store, { now: nowMs, ladder })).map(({ lead: h, members }) => ({ receiver: h.receiver, waitedMs: Math.max(...members.map((m) => m.waitedMs)), sender: h.sender, blockedSeat: h.blockedSeat })); }
@@ -311,8 +386,9 @@ export function buildSnapshot(sources: SnapshotSources, nowMs: number): Snapshot
   const attempt = <T>(name: string, fn: () => T, fallback: T): T => {
     try { return fn(); } catch (error) { errors.push(`${name}: ${error instanceof Error ? error.message : String(error)}`.slice(0, 200)); return fallback; }
   };
-  const seats = attempt('panes', () => parsePanes(sources.panes(), nowMs, sources.sessionActivity), [] as SeatView[]);
-  const list = attempt('checklist', () => parseChecklist(sources.checklist()), { version: '', cells: [] as CellView[] });
+  const seats = [...attempt('panes', () => parsePanes(sources.panes(), nowMs, sources.sessionActivity), [] as SeatView[])];
+  let board: unknown;
+  const list = attempt('checklist', () => parseChecklist(board = sources.checklist()), { version: '', cells: [] as CellView[] });
   const prs = attempt('prs', () => parsePrs(sources.prs()), [] as PrView[]);
   const merged = attempt('merged', () => parseMerged(sources.merged()), [] as MergedView[]);
   const receipts = attempt('receipts', () => sources.receipts(), [] as ReceiptView[]);
@@ -332,13 +408,29 @@ export function buildSnapshot(sources: SnapshotSources, nowMs: number): Snapshot
   }
   // A coordinator only named as some seat's parent is still a scope.
   for (const p of Object.values(parent)) if (p !== hq && ladder.depthOf(p) === 2) coordinators.add(p);
+  // STEWARD-HQ-LIVE-ALIGN ② — a declared hand with no pane (HAND-ELN-TA · HAND-VM-GOLDEN 11-28: OP's tab assigned them,
+  // `eln side ls` never showed them) is in the snapshot as `no-pane`: visible, never idle, never paired.
+  const declared = sources.declaredSeats ? attempt('declaredSeats', () => [...sources.declaredSeats!()], [] as string[]) : [];
+  const inPanes = new Set(seats.map((s) => s.seat));
+  for (const raw of declared) {
+    const seat = raw.trim().toUpperCase();
+    if (!seat || seat === hq || inPanes.has(seat) || coordinators.has(seat) || ladder.depthOf(seat) <= 2) continue;
+    seats.push({ seat, activity: 'no-pane', idleForMs: null });
+    inPanes.add(seat);
+    parent[seat] ??= ladder.parentOf(seat).toUpperCase();
+  }
   const hands = attempt('hands', () => sources.openHands(ladder), [] as OpenHandView[]);
   const pulls = sources.pulls ? attempt('pulls', () => sources.pulls!(), {} as Record<string, number>) : {};
   const wakes = sources.wakes ? attempt('wakes', () => sources.wakes!(), {} as Record<string, { by: string; atMs: number }>) : {};
   const roles = sources.roles ? attempt('roles', () => sources.roles!(), {} as Record<string, string>) : {};
   const judgeCells = sources.judgeCells ? attempt('judgeCells', () => parseButlerJudgeCells(sources.judgeCells!(), nowMs), [] as JudgeCellView[]) : [];
+  // Unreadable lanes (no full-history checkout · receipts dir) = no lane rule — the pre-lane board, named in sourceErrors.
+  const items = (board as { items?: unknown } | undefined)?.items;
+  const lanes = sources.lanes && list.version && Array.isArray(items) ? attempt('lanes', () => sources.lanes!(list.version, items), { cells: {} } as CellLanes) : undefined;
+  const pull = sources.pull && list.version ? attempt('pull', () => sources.pull!(list.version), undefined) : undefined;
+  const seatRoles = sources.seatRoles ? attempt('seatRoles', () => sources.seatRoles!(), undefined) : undefined;
   return { nowMs, hq, coordinators: [...coordinators].sort(), parent, seats, version: list.version, cells: list.cells, prs, merged,
-    receipts, verdicts, hosts: util.hosts, utilAgeMs: util.ageMs, openHands: hands, pulls, wakes, roles, judgeCells, sourceErrors: errors };
+    receipts, verdicts, hosts: util.hosts, utilAgeMs: util.ageMs, openHands: hands, pulls, wakes, roles, judgeCells, ...(lanes ? { lanes } : {}), ...(pull ? { pull } : {}), ...(seatRoles ? { seatRoles } : {}), sourceErrors: errors };
 }
 
 /** Nodes that must not act on a snapshot missing these sources. */

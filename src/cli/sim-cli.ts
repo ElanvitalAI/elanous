@@ -21,6 +21,7 @@ import { assertNetworkZeroSandboxAvailable } from '../ux-sim/network-sandbox.js'
 import { assertRealTargetGuards, assertScenarioTargetAllowed, resolveScenarioTarget, type ScenarioTargetDeclaration } from '../ux-sim/scenario-target.js';
 import { registerSimSuggestCommand } from './sim-suggest-cli.js';
 import { isReservedSimWorldId, runSimWorlds, simWorldReplayOptions } from '../ux-sim/sim-world/kernel.js';
+import { publishSimReceipt } from '../kit/requirement-judge/sim-evidence.js';
 import type { SimWorldReservedId } from '../ux-sim/sim-world/types.js';
 
 type UserSimulationProfile = { credentials: string; network: string; storage: string };
@@ -59,6 +60,10 @@ function kernelOptionValues(opts: SimWorldKernelCliOptions): { seed?: string; en
 function printSimWorldSummary(summary: Awaited<ReturnType<typeof runSimWorlds>>): void {
   console.log(JSON.stringify({ ok: summary.ok, summaryPath: summary.summaryPath, counts: summary.counts, scenarios: summary.scenarios.length,
     worldWallMs: summary.worldWallMs, replay: summary.replay, events: summary.events }));
+  // SIM-RECEIPT-CARRY: a PR-bound run id («<pr>-<head12>…») lands in the one shared receipt root the judge reads (judging.yaml
+  // sim_evidence.publish) — wherever this ran. A failed copy is one stderr line, never the run's verdict.
+  const published = publishSimReceipt(summary.summaryPath, summary.runId);
+  if (published) console.error(published);
   if (!summary.ok) process.exitCode = 1;
 }
 /** `sim world run <reserved-id>` — SIM-WORLD-KERNEL (src/ux-sim/sim-world/kernel.ts). Exit 0 ok · 1 red verdicts · 2 refused. */

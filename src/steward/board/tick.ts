@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, appendF
 import { dirname, join } from 'node:path';
 import type { PulsePhase } from '../../loops/op-pulse.js';
 import {
-  boardHealth, breaches, cmpVersion, cardsAllowed, cutList, digestLine, leaderWrite, needsSpecCells, needsSpecLine, nextBoard, rankBoard,
+  boardHealth, breaches, cmpVersion, cardCandidates, cardsAllowed, cutList, digestLine, leaderWrite, needsSpecCells, needsSpecLine, nextBoard, rankBoard,
   type BoardCellIn, type CutList, type HandIn, type OrderLedger,
 } from './model.js';
 
@@ -26,6 +26,9 @@ export interface BoardDeps {
   readonly phase: () => PulsePhase;
   readonly cells: (version: string) => readonly BoardCellIn[];
   readonly hands: () => readonly HandIn[];
+  /** Candidate limit from a verified pool; null means unknown. Omitted preserves the legacy path. */
+  readonly candidateCap?: () => number | null;
+  readonly cardCap?: () => number | null;
   readonly scopeOf: (seat: string) => string;
   readonly isCoordinator: (seat: string) => boolean;
   readonly waitingOn: (c: BoardCellIn) => string | null;
@@ -108,7 +111,16 @@ export function boardTick(deps: BoardDeps): BoardTickResult {
   const health = boardHealth({ cells, hands: deps.hands(), order, scopeOf: deps.scopeOf, waitingOn: deps.waitingOn, isCoordinator: deps.isCoordinator });
   const returned: Array<{ seat: string; id: string; ok: boolean }> = [];
   for (const w of health.wip) for (const id of w.giveBack) returned.push({ seat: w.seat, id, ok: deps.live ? deps.returnCell(version, id, w.seat) : false });
-  const allowed = cardsAllowed(breaches({ health, leader, cut, phaseChanged: state.lastPhase !== null && state.lastPhase !== phase }), state.cards, nowMs);
+  const detected = breaches({ health, leader, cut, phaseChanged: state.lastPhase !== null && state.lastPhase !== phase });
+  let candidates = detected;
+  if (deps.candidateCap) {
+    let cap: number | null = null;
+    try { cap = deps.candidateCap(); } catch { /* unknown pool: no expansion */ }
+    candidates = cardCandidates(detected, cap);
+  }
+  let cardCap: number | null = null;
+  try { cardCap = deps.cardCap?.() ?? null; } catch { /* unknown pool: no sends */ }
+  const allowed = cardsAllowed(candidates, state.cards, nowMs, cardCap);
   const cards: string[] = [];
   for (const b of allowed) {
     const line = `[BOARD 행정관] ${b.line}`;

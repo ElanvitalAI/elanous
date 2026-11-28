@@ -9,7 +9,8 @@
 //    host to `<state>/res/route.json` (pregate · self gate --remote read it) ③ hand-scale — when ready cells ≥ 2 × idle hands and
 //    a local host has headroom, propose remote hand tabs there (sanitize → one real task PASS → enroll · tier by difficulty) to
 //    RES; idle hands > 4 h → propose scale-down; no local headroom → escalate a paid VM start to OP (never started here).
-import { pickHost, ratio, isPaid, HEADROOM_RATIO, type HostProbe } from './hosts.js';
+import { pickHost, ratio, isPaid, type HostProbe } from './hosts.js';
+import { gp } from './def.js';
 import { planReap, type Proc, type ReapCandidate, type Registration } from './reaper.js';
 import { fixed, kpiBreached, type KpiTarget } from '../kit/kpi/index.js';
 import type { ButlerLevel, ButlerMemory, Case } from '../judge-butler/memory.js';
@@ -18,10 +19,8 @@ export const GUARDIAN_ID = 'guardian';
 export const GUARDIAN_SEAT = 'GUARDIAN';
 export const GUARDIAN_SUPERVISOR = 'RES';
 export const GUARDIAN_DEMOTERS = new Set(['RES', 'OP', 'CLAUDE-OP', 'CEO']);
-export const SCALE_RATIO = 2;
-export const SCALE_HEADROOM = 0.6; // a host takes new hands only below this load/ncpu
-export const IDLE_HAND_SCALE_DOWN_MS = 4 * 60 * 60_000;
-export const PROPOSAL_EVERY_MS = 60 * 60_000;
+// GUARDIAN-V3-SMART: every number below is an agent.yaml policy (graphs/loop-agents/guardian · def.ts gp()) — scale_ratio ·
+// scale_headroom · idle_hand_scale_down_h · proposal_every_min · digest_every_min · host_load_per_cpu_max. No copy here.
 
 export interface HandIn { readonly seat: string; readonly host: string | null; readonly state: 'idle' | 'working' | 'no-pane'; readonly idleMs: number }
 export interface GuardianView {
@@ -43,7 +42,8 @@ export interface GuardianPorts {
   readonly memory: ButlerMemory;
   kill(host: string, cands: readonly ReapCandidate[]): { killed: number[]; skipped: number[] };
   writeRoute(route: { host: string | null; why: string; ranked: Array<{ host: string; ratio: number }>; at: string }): void;
-  post(key: string, to: string, body: string, kind?: string): number | null;
+  /** number = mail id · `bus:<id>` = a notice that went to the bus (kit/bus-post) · null = already sent. */
+  post(key: string, to: string, body: string, kind?: string): number | string | null;
   audit(row: Record<string, unknown>): void;
   /** shared reaper lock (live: withReapLock) — kill ⊕ audit run inside it · absent = run as is */
   reapLock?<T>(fn: () => T): T;
@@ -60,8 +60,8 @@ export interface GuardianPlan {
   readonly kpi: { maxRatio: number | null; overloaded: string[]; orphansOver2h: number; unnormalized?: number | null };
 }
 
-/** 임대관 KPI «load/ncpu ≤ 1.0» — a host above HEADROOM_RATIO is overloaded. */
-const LOAD_KPI: KpiTarget = { target: HEADROOM_RATIO, dir: 'at_most' };
+/** 임대관 KPI «load/ncpu ≤ host_load_per_cpu_max» — a host above it is overloaded. */
+const loadKpi = (): KpiTarget => ({ target: gp('host_load_per_cpu_max'), dir: 'at_most' });
 
 /** Pure: one observation → the plan. */
 export function planGuardian(view: GuardianView): GuardianPlan {
@@ -70,11 +70,13 @@ export function planGuardian(view: GuardianView): GuardianPlan {
   for (const [host, procs] of view.procs) if (procs) reap.set(host, planReap(procs, view.registry.get(host) ?? [], nowMs, { self: view.self?.get(host) ?? new Set() }));
   const route = pickHost(view.probes);
   const measured = view.probes.filter(p => p.reachable && p.load1 !== null && p.ncpu);
+  const LOAD_KPI = loadKpi();
   const overloaded = measured.filter(p => kpiBreached(LOAD_KPI, ratio(p)) === true).map(p => p.host); // raw ratio vs target (kit/kpi)
   const maxRatio = measured.length ? Math.max(...measured.map(ratio)) : null;
   const orphansOver2h = [...reap.values()].reduce((n, c) => n + c.length, 0);
   let scaleUp: GuardianPlan['scaleUp'] = null; let paidEscalation: string | null = null;
   const idle = view.hands?.filter(h => h.state === 'idle').length ?? null;
+  const SCALE_RATIO = gp('scale_ratio'); const SCALE_HEADROOM = gp('scale_headroom'); const IDLE_HAND_SCALE_DOWN_MS = gp('idle_hand_scale_down_h') * 3_600_000;
   if (view.ready && idle !== null && view.ready.total >= SCALE_RATIO * Math.max(1, idle)) {
     const room = measured.filter(p => !isPaid(p.host) && p.host !== 'mshq' && !p.reserved && ratio(p) < SCALE_HEADROOM).sort((a, b) => ratio(a) - ratio(b));
     const want = Math.max(1, Math.ceil(view.ready.total / SCALE_RATIO) - idle);
@@ -133,6 +135,7 @@ export function runGuardian(view: GuardianView, ports: GuardianPorts, steps: Rea
   if (steps.has('route')) ports.writeRoute({ ...plan.route, at: now.toISOString() });
   if (steps.has('route') && plan.route.host) mem.appendCase(kase('route', plan.route.host, plan.route.why, now));
   // ③ hand-scale (proposals within rights · paid VM escalated)
+  const PROPOSAL_EVERY_MS = gp('proposal_every_min') * 60_000; const IDLE_H = gp('idle_hand_scale_down_h');
   const hourly = (key: string) => { const at = state.sent[key]; return !at || nowMs - Date.parse(at) >= PROPOSAL_EVERY_MS; };
   if (steps.has('scale') && plan.scaleUp && hourly('scale-up')) {
     const s = plan.scaleUp;
@@ -141,8 +144,8 @@ export function runGuardian(view: GuardianView, ports: GuardianPorts, steps: Rea
     if (id !== null) { state.sent['scale-up'] = now.toISOString(); report.proposals.push(`scale-up#${id}`); mem.appendCase(kase('hand-propose', s.hosts.join(','), s.why, now, [`msg:${id}`])); }
   }
   if (steps.has('scale') && plan.scaleDown.length && hourly('scale-down')) {
-    const id = ports.post(`scale-down:${now.toISOString().slice(0, 13)}`, GUARDIAN_SUPERVISOR, `[수호자 · 손 줄이기 제안] ${IDLE_HAND_SCALE_DOWN_MS / 3_600_000}h 넘게 유휴: ${plan.scaleDown.slice(0, 12).join(', ')} — 닫기 전 몫 이관(seat-close-needs-ownership-handoff).`, 'request');
-    if (id !== null) { state.sent['scale-down'] = now.toISOString(); report.proposals.push(`scale-down#${id}`); mem.appendCase(kase('hand-scale-down', plan.scaleDown.join(','), 'idle > 4h', now, [`msg:${id}`])); }
+    const id = ports.post(`scale-down:${now.toISOString().slice(0, 13)}`, GUARDIAN_SUPERVISOR, `[수호자 · 손 줄이기 제안] ${IDLE_H}h 넘게 유휴: ${plan.scaleDown.slice(0, 12).join(', ')} — 닫기 전 몫 이관(seat-close-needs-ownership-handoff).`, 'request');
+    if (id !== null) { state.sent['scale-down'] = now.toISOString(); report.proposals.push(`scale-down#${id}`); mem.appendCase(kase('hand-scale-down', plan.scaleDown.join(','), `idle > ${IDLE_H}h`, now, [`msg:${id}`])); }
   }
   if (steps.has('scale') && plan.paidEscalation && hourly('paid')) {
     const id = ports.post(`paid-vm:${now.toISOString().slice(0, 13)}`, 'OP', `[수호자 → OP · 유료 VM 판단] ${plan.paidEscalation}. 수호자는 유료 VM 을 켜지 않는다 — eln res lease request --host <vm> 은 OP 결정.`, 'request');
@@ -150,7 +153,7 @@ export function runGuardian(view: GuardianView, ports: GuardianPorts, steps: Rea
   }
   // report: RES digest at most every 30 min, only when something moved
   const moved = Object.values(report.reaped).reduce((a, b) => a + b, 0) + report.proposals.length + report.escalations.length;
-  if (moved && (!state.lastDigestAt || nowMs - Date.parse(state.lastDigestAt) >= 30 * 60_000)) {
+  if (moved && (!state.lastDigestAt || nowMs - Date.parse(state.lastDigestAt) >= gp('digest_every_min') * 60_000)) {
     ports.post(`guardian-digest:${now.toISOString().slice(0, 16)}`, GUARDIAN_SUPERVISOR,
       `[수호자 · 30분] 정리 ${Object.entries(report.reaped).map(([h, n]) => `${h} ${n}`).join(' · ') || '0'} · 경로 ${plan.route.host ?? '?'} · 과부하 ${plan.kpi.overloaded.join(',') || '없음'} (최대 load/ncpu ${fixed(plan.kpi.maxRatio)})${plan.kpi.unnormalized !== undefined ? ` · 미정상화 사건 ${plan.kpi.unnormalized ?? '?'}(목표 0)` : ''} · 제안 ${report.proposals.length} · OP 올림 ${report.escalations.length} — eln loop guardian status`, 'status');
     state.lastDigestAt = now.toISOString();

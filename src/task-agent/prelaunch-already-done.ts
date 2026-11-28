@@ -2,6 +2,7 @@
 import { spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
+import { remoteUrlVia } from '../git-fs/origin-url.js';
 import { inspectGoalDoneBoundary } from '../self-implement/goal-author.js';
 
 export interface AlreadyDoneCandidate { mainSha: string; repository: string; command: string; exitCode: 0 }
@@ -81,11 +82,11 @@ export function inspectPrelaunchAlreadyDone(text: string, projectTarget?: string
   const runGit = deps.runGit ?? runPinnedGit;
   const top = runGit(root, ['rev-parse', '--show-toplevel']);
   if (top.status !== 0 || top.stdout.trim() !== root) return { reason: 'project-root-unverified' };
-  const origin = runGit(root, ['remote', 'get-url', 'origin']);
-  const originUrl = origin.stdout.trim();
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+  const originUrl = remoteUrlVia((argv) => { const r = runGit(root, argv); return r.status === 0 && !r.error ? r.stdout : null; }) ?? '';
   // Keep credentials and arbitrary transports out of both the verifier and its card evidence.
   const repository = /^(?:https:\/\/github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(originUrl)?.[1];
-  if (origin.status !== 0 || !repository) return { reason: 'origin-unverified' };
+  if (!repository) return { reason: 'origin-unverified' };
   const local = runGit(root, ['rev-parse', 'refs/remotes/origin/main']).stdout.trim();
   const remote = runGit(root, ['ls-remote', 'origin', 'refs/heads/main'], 7_000);
   const sha = remote.stdout.trim().split(/\s+/)[0] ?? '';

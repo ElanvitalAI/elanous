@@ -189,6 +189,19 @@ export function registerReleaseChecklistSetCommand(program: Command): void {
             'JUD-* · REVIEW-* · OP — 판정자만 green 전환 가능',
           );
         }
+        // ELN-OP-CROWN-MEMORY — an owner handoff that contradicts an active CEO directive card is refused before any write.
+        if (opts.owner !== undefined && opts.owner.trim()) {
+          const { liveDirectiveRefusal } = await import('../kit/crown-directive/index.js');
+          const { elanousStateRoot } = await import('../autopilot/state-paths.js');
+          const { resolveSeatStateRoot } = await import('../loops/msg-wake.js');
+          for (const id of ids) {
+            const refusal = liveDirectiveRefusal({ seat: opts.owner.trim(), cellId: id, action: 'handoff' }, { stateRoot: elanousStateRoot(), seatState: resolveSeatStateRoot() });
+            if (refusal) {
+              debug.log('release.checklist', 'owner-directive-refusal', { version, id, owner: opts.owner.trim() });
+              throw new CliUserError(`checklist set --owner: ${refusal}`, '다른 자리로 · 지시 만료(또는 새 지시) 뒤 다시');
+            }
+          }
+        }
         if (!mayWriteReleaseChecklist(cmd)) return;
         const dispatchKind = opts.kind && !['screen', 'postpub'].includes(opts.kind) ? (opts.kind as ChecklistDispatchKind) : undefined;
         const data = setItems(

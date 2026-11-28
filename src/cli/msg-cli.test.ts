@@ -520,6 +520,21 @@ test('post --to ALL reaches other seats and a loop address through the existing 
   expect(f.stderr).toEqual([]);
 });
 
+test('MSG-ACK-MULTI-ID: repeated --id selects only those IDs and leaves the cursor unchanged', async () => {
+  const f = fixture();
+  const store = f.store();
+  try { for (const body of ['one', 'two', 'three', 'four']) store.post({ from: 'OP', to: 'MK', body }); }
+  finally { store.close(); }
+  await f.run('ack', '--id', '1', '--id', '3', '--to', 'MK', '--json');
+  expect(JSON.parse(f.stdout.pop()!)).toMatchObject({ recipient: 'MK', ids: [1, 3], status: 'acked' });
+  const check = f.store();
+  try {
+    expect(check.getCursor('MK')).toBe(0);
+    expect(check.listByRecipient('MK').map(row => row.id)).toEqual([2, 4]);
+  } finally { check.close(); }
+  expect(f.stderr).toEqual([]);
+});
+
 test('MSG-ACK-MULTI-ID: positional and selected IDs never acknowledge siblings or advance the cursor', async () => {
   const f = fixture();
   const store = f.store();

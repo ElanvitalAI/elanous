@@ -7,7 +7,8 @@ import { localLoopRows } from '../loops/loops-table.js';
 import { checkBrand } from '../../scripts/brand/check.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
-import { listChecklist, devVersion, type Checklist } from '../release-loop/checklist.js';
+import { listChecklist, type Checklist } from '../release-loop/checklist.js';
+import { boardVersion } from '../release-loop/board-version.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { readReleaseRuns, type ReleaseRunView } from '../nexus/api/ops-api.js';
 import { gateShardsPath, readGateShards, summarizeShards } from '../release-loop/gate-shards.js';
@@ -19,28 +20,8 @@ import { seatDay, seatLedgerPath, type SeatEntry } from '../seat-loop/seat-loop.
 import { listCoordEvents, type CoordEvent } from './coord-events.js';
 import { filterPublicDemoContext } from './context-now-public.js';
 
-export type ContextFact =
-  | { kind: 'version'; version: string; source: string }
-  | { kind: 'cell'; version: string; id: string; title: string; status: string; owner: string | null; source: string; priority?: string | null }
-  | { kind: 'decision'; id: string; title: string; status: string; dueAt: string | null; source: string }
-  | { kind: 'seat'; seat: string; at: string; status: string; id: string | null; title: string | null; source: string }
-  | { kind: 'run'; goal: string; phase: string; elapsed: string; source: string; unreadable?: string }
-  | { kind: 'release'; version: string; node: string; status: string; source: string; unreadable?: string;
-      phase?: string; currentNode?: string | null; nextAction?: string;
-      gateProgress?: { completed: number; total: number; failed: number } | null;
-      regressions?: { introduced: number | null; preexisting: number | null } | null;
-      receiptStatus?: 'valid' | 'invalid' | 'absent' | 'unreadable'; waiverEvents?: string[];
-      emergencySwitch?: { state: 'on' | 'off' | 'unknown'; reason?: string };
-      landingFreeze?: { state: 'on' | 'off' | 'unknown'; reason?: string };
-      expectedPublishAt?: string | null; etaMinutes?: number | null;
-      auditCoverage?: { uncoveredFiles: number; totalFiles: number } | null; residualRuns?: number | null;
-      sweepCertificateAgeMinutes?: number | null;
-      failureCounts?: { introduced: number | null; preexisting: number | null; undetermined: number | null } | null;
-      sourceRefs?: Array<{ signal: string; source: string }>;
-      ledgerErrors?: Array<{ signal: string; source: string; reason: string }> }
-  | { kind: 'schedule-late'; count: number | null; names: string[]; source: string; unreadable?: string };
-export type ContextEvent = { at: string; kind: string; summary: string; source: string };
-export type ContextNowAnswer = { at: string; topic: string | null; facts: ContextFact[]; events: ContextEvent[]; guide: string[]; hiddenCount?: number };
+import type { ContextFact, ContextEvent, ContextNowAnswer } from './context-now-types.js';
+export type { ContextFact, ContextEvent, ContextNowAnswer } from './context-now-types.js';
 
 interface GateVerdictEvidence {
   version: string; commit: string; outcome: 'ok' | 'regression' | 'error';
@@ -432,7 +413,7 @@ export function contextNow(options: { topic?: string; limit?: number; audience?:
   const topic = options.topic?.trim() || null;
   const limit = typeof options.limit === 'number' && Number.isFinite(options.limit)
     ? Math.max(1, Math.min(100, Math.floor(options.limit))) : 20;
-  const version = (deps.version ?? devVersion)().replace(/-.*$/, '');
+  const version = (deps.version ?? boardVersion)().replace(/-.*$/, '');
   const next = version.replace(/^(\d+)\.(\d+)\.(\d+)$/, (_, major: string, minor: string, patch: string) => `${major}.${minor}.${Number(patch) + 1}`);
   const facts: ContextFact[] = [];
   for (const v of options.section === 'operations' ? [] : [...new Set([version, next])]) {

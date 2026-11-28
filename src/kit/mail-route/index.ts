@@ -8,6 +8,8 @@
 //              HOLD → JUDGE-BUTLER · env/host/lease → GUARDIAN · cell scope → the cell's owner · design → the old rung)
 //   hand-dedupe the same ✋ ask (seat · root · cell) inside 30 min is answered by reference to its first row
 //   dormant-watch rerouted dormant-seat mail unanswered for 10 min → one OP card
+//   steward-mail 우정 행정관 steward:mail — wake-now · digest · record-only per coordinator mail (steward-mail.yaml) · SHADOW:
+//              records «would have woken» next to the router (`eln msg steward-shadow` · graphs/triggers/steward-mail.yaml)
 export * from './policy.js';
 export * from './digest.js';
 export * from './fold-once.js';
@@ -20,3 +22,4 @@ export * from './hand-routes.js';
 export * from './hand-cells.js';
 export * from './hand-dedupe.js';
 export * from './dormant-watch.js';
+export * from './steward-mail.js';

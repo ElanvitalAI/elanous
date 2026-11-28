@@ -6,8 +6,8 @@
 //    auto-start; (b) elastic per lane by pressure with hysteresis; (c) budget-guarded (cloud money → CEO card unless a
 //    pre-approved `burst.cloudBudget`); (d) cleanly exited (exact ids closed, VMs it started stopped, receipt).
 // A: pure functions here — forecast() · pickPreset() · pressures() · planScale() · burstCourse() · startBurst() ·
-//    recordLaunch() · exitBurst(). The CLI (`eln pulse burst …`) and the pulse measure node call them; actuators are the
-//    existing commands listed in graphs/triggers/op-pulse.rhythm.yaml `burst.lanes[].actuator` (wired: false = TODO).
+//    recordLaunch() · exitBurst(). The CLI (`eln pulse burst …`) and the pulse measure node call them; the pulse executes
+//    the plan through the lane doors in graphs/policies/burst-actuators.yaml (op-pulse-burst-actuate.ts · door none = 미배선).
 //
 // 세 얼굴:
 //   관측 = seat-state/OP/pulse/burst.json (state · launches with exact ids) · burst-receipts.jsonl (one receipt per burst)
@@ -260,7 +260,10 @@ export interface BurstState {
   goal: BurstGoal; preset: BurstPreset['name'] | null; scope: string[];
   startedAt: string; until: string; by: string;
   budgetUsd: number; spentUsd: number; cloudApprovedUsd: number;
+  /** Executed units per lane (open launches) — never a target (BURST-ACTUATOR-WIRED 11-29). */
   levels: Partial<Record<BurstLane, number>>; lastChangeAt: Partial<Record<BurstLane, string>>;
+  /** The preset's per-lane targets (what the proposal asked for). Absent = a state written before 11-29 (normalizeBurstState). */
+  targets?: Partial<Record<BurstLane, number>>;
   launches: BurstLaunch[];
   baseline: { landed: number | null; green: number | null };
   exitedAt?: string; exitReason?: string;
@@ -275,7 +278,9 @@ export function startBurst(input: { goal: BurstGoal; until: string; scope: strin
   if (budget === undefined || budget < 0) throw new Error('a burst needs a budget ceiling: --preset or --budget-usd');
   return { id: `burst-${input.now.toISOString().replace(/[-:]/g, '').slice(0, 13)}`, status: 'active', goal: input.goal, preset: input.preset?.name ?? null,
     scope: input.scope, startedAt: input.now.toISOString(), until: input.until, by: input.by, budgetUsd: budget, spentUsd: 0, cloudApprovedUsd: 0,
-    levels: { ...(input.preset?.lanes ?? {}) }, lastChangeAt: {}, launches: [], baseline: input.baseline ?? { landed: null, green: null },
+    // levels = executed units (none yet); the preset lanes are targets — the actuator (op-pulse-burst-actuate.ts) raises
+    // levels one planned step per pulse (11-28: seeding levels with targets made the planner believe 4 hands ran).
+    levels: {}, targets: { ...(input.preset?.lanes ?? {}) }, lastChangeAt: {}, launches: [], baseline: input.baseline ?? { landed: null, green: null },
     trigger: input.trigger ?? `manual:${input.by}`, allIn: input.allIn === true, ...(input.ceoLine ? { ceoLine: input.ceoLine } : {}) };
 }
 

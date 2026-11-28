@@ -60,6 +60,26 @@
       "expect": "green",
       "greenSince": "2026-11-27 PRECHECK-CORE-SIZE",
       "reason": "canary replay: medium rework keeps the proven pair · hard supervisor stop names the rubric CORE/FU split"
+    },
+    "ta/TA-DR1": {
+      "expect": "green",
+      "greenSince": "2026-11-28 DEV-REVIEW-COMMON",
+      "reason": "work next claims a criterion-less cell → detached claim door (argv work review cell <id> --version <v> · ≤ 1500 ms) → criterion written once with 판정식·필수/엣지·실패 경로 → pre-impl split opens the edge FU with the judge id (5 seeded variants · both engines)"
+    },
+    "ta/TA-DR2": {
+      "expect": "green",
+      "greenSince": "2026-11-28 DEV-REVIEW-COMMON",
+      "reason": "weak criterion (sections missing) → strengthened with the old words verbatim first · an author that rewrites them → untrusted, board keeps v1, 0 writes (5 seeded variants · both engines)"
+    },
+    "ta/TA-DR3": {
+      "expect": "green",
+      "greenSince": "2026-11-28 DEV-REVIEW-COMMON",
+      "reason": "first pregate post-impl: diff misses the must → flagged + one cell line before the judge, and the judge (assessCriterionForSign) refuses citing the same clause · edge unmet → FU opened with the judge id, the sign names the same FU (5 seeded variants · both engines)"
+    },
+    "ta/TA-DR4": {
+      "expect": "green",
+      "greenSince": "2026-11-28 DEV-REVIEW-COMMON",
+      "reason": "TA journey unchanged: existing author/decompose/gate/review exits route as before · cell-review@1 / pre-impl@1 / post-impl@1 resolve from implement-loop with every exit mapped (5 seeded variants · both engines)"
     }
   }
 }

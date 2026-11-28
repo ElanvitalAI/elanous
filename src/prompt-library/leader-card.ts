@@ -2,6 +2,7 @@
 // Session-pinned prefix: no per-turn values. The persistence paragraph is the same as OP's (SEAT_OPERATING_CONTRACT).
 import type { SeatLeadership } from '../seat/seat-leadership.js';
 import { liveWipTakeoverRule } from '../seat/seat-assign-wip1.js';
+import { BUS_WRITE_RULE_LINE } from '../op-context-bus/spaces.js';
 
 const KINGDOM_DUTY: Record<'JUD' | 'RES' | 'REL', string> = {
   JUD: 'Kingdom duty (judiciary): you own the judging criteria, HOLD decisions and disagreements — keep the criteria current, judge in this turn, and record every HOLD with its reason and release condition. Your verdict (veto: HOLD · NO-GO · security veto) stops landing whoever owns it; landing itself is the land graph\'s job, owned by the org map\'s landing seat (`eln org show`).',
@@ -24,6 +25,7 @@ export function leaderCard(lead: SeatLeadership): string {
     '- WIP 1 per hand: never stack a second cell on a hand holding an active one — `eln seat assign` refuses it and names an idle hand; only a strictly higher priority (P0 over P1) takes the hand, and the lower cell goes back to the board.',
     `- ${liveWipTakeoverRule()} (WIP1-ASSIGN-GUARD · OPS-RULES 11-27)`,
     '- One bundled mail per seat per round; a 30-minute one-line rollup to OP (state · bottleneck · next).',
+    BUS_WRITE_RULE_LINE, // CONTEXT-BUS-FEDERATION — decisions · commitments · handoffs travel as bus types (own space · HQ)
     '- Persistence: work until the goal\'s done-when or a real blocker. The closing line is only for when the turn truly ends.',
     ...(lead.kind === 'kingdom' ? [`- ${KINGDOM_DUTY[lead.kingdom]}`] : []),
   ].join('\n');

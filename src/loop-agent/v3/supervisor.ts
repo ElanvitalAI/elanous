@@ -48,6 +48,8 @@ export function cardFromCompiled(card: AgentCard, c: CompiledAgent, orgPath?: st
     heartbeatEveryMin: num(p, 'heartbeat_every_min', card.heartbeatEveryMin),
     voice: { ...card.voice, perHourMax: c.voice.perHourMax },
     startLevel: c.levels.start === 'shadow' || c.levels.start === 'L1' ? c.levels.start : 'live',
+    policies: c.policies,
+    ...(c.authority ? { authority: c.authority } : {}),
   };
 }
 

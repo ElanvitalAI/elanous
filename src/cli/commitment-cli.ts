@@ -1,4 +1,4 @@
-// ── `eln commitment list|done|blocked` (COMMITMENT-CLOSE · beta · 2026-11-25) ──
+// ── `eln commitment list|done|blocked|watches|watch-sweep` (COMMITMENT-CLOSE · beta · 2026-11-25 · COND-WATCH 11-28) ──
 // Waker notices name this CLI as the twin of the CommitmentClose seat tool.
 // Exit codes: 0 = ok · 1 = unknown id or lifecycle conflict (double close) · 2 = argument or ledger error.
 import type { Command } from 'commander';
@@ -43,6 +43,47 @@ export function registerCommitmentCommands(program: Command, deps: CommitmentCli
         for (const e of entries) out.log(formatEntry(e));
       } catch (error) {
         out.error(`commitment list: ${error instanceof Error ? error.message : String(error)}`);
+        setExitCode(2);
+      }
+    });
+
+  // COND-WATCH — the open conditions every seat is waiting on (armed wakers), and one sweep by hand (the trigger runs it every 5 min).
+  cmd.command('watches').description('List open conditions (armed watches) — what each seat waits on, oldest horizon first; stale = retired by the next live sweep')
+    .option('--seat <seat>', 'Only this seat')
+    .option('--state <state>', 'open | overdue | stale | all', 'all')
+    .option('--json')
+    .action(async (opts: { seat?: string; state: string; json?: boolean }) => {
+      try {
+        const want = opts.state.trim().toLowerCase();
+        if (!['open', 'overdue', 'stale', 'all'].includes(want)) throw new Error('--state must be one of open, overdue, stale, all');
+        const { listOpenConditions } = await import('../commitment/condition-sweep.js');
+        const rows = listOpenConditions(opts.seat ? { seat: opts.seat } : {}, deps.timer ?? {}).filter(r => want === 'all' || r.state === want);
+        if (opts.json) { out.log(JSON.stringify(rows, null, 2)); return; }
+        if (rows.length === 0) { out.log('No open conditions.'); return; }
+        const by = (s: string) => rows.filter(r => r.state === s).length;
+        out.log(`Open conditions ${rows.length} · open ${by('open')} · overdue ${by('overdue')} · stale ${by('stale')}`);
+        for (const r of rows) {
+          const when = r.overdueMin < 0 ? `${-r.overdueMin}m left` : `${r.overdueMin}m past`;
+          out.log(`${r.state} ${r.seat}/${r.wakerId} · ${r.condition} · awaits ${r.awaits} · ${when} · commitment ${r.commitmentId}${r.autoClose ? ' · auto-close' : ''}${r.watched ? ' · watched' : ''}`);
+        }
+      } catch (error) {
+        out.error(`commitment watches: ${error instanceof Error ? error.message : String(error)}`);
+        setExitCode(2);
+      }
+    });
+
+  cmd.command('watch-sweep').description('Measure every armed condition once (met → close ⊕ one wake · expired → one wake · stale → retired silently)')
+    .option('--seat <seat>', 'Only this seat')
+    .option('--dry-run', 'Judge only: no ledger write, no wake')
+    .option('--json')
+    .action(async (opts: { seat?: string; dryRun?: boolean; json?: boolean }) => {
+      try {
+        const { sweepConditions } = await import('../commitment/condition-sweep.js');
+        const report = await sweepConditions({ ...(opts.seat ? { seat: opts.seat } : {}), dryRun: opts.dryRun === true }, deps.timer ?? {});
+        if (opts.json) { out.log(JSON.stringify(report, null, 2)); return; }
+        out.log(report.line);
+      } catch (error) {
+        out.error(`commitment watch-sweep: ${error instanceof Error ? error.message : String(error)}`);
         setExitCode(2);
       }
     });

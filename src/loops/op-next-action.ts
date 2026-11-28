@@ -27,6 +27,8 @@
 //   수복과 인계 = planner actions run at once (assign · land tick · release run); OP-owned ones open the OP turn with the
 //          exact command and done-when; an actuator failure stays in the block as «failed X (why)» for the OP turn.
 
+import { pickByArea } from '../kit/seat-area/index.js';
+
 export type NextRule = 'w' | 'a' | 'h' | 'z' | 'b' | 'c' | 'd' | 'e' | 'f' | 'g';
 /** planner = deterministic code does it now · op = the OP turn must do it now (needs judgement/LLM) · ceo = one question. */
 export type NextActor = 'planner' | 'op' | 'ceo';
@@ -116,6 +118,14 @@ export interface NextActionState {
   readonly splitRequests?: readonly NaSplitRequest[];
   /** THROTTLE-AUDIT: config `op.next.*` overrides; absent = caps scaled with the pool. */
   readonly pushPolicy?: PushPolicy;
+  /** Verified live per-split piece cap; null/absent is unknown and fails closed. */
+  readonly splitPieces?: number | null;
+  /**
+   * SEAT-AREA-GUARD (graphs/policies/seat-roles.yaml · kit/seat-area seatTakesCell): may this hand be handed this cell?
+   * A pull hint goes only to a hand the cell fits (MK/UX inside their areas · non-pool seats never); the matched rule rides
+   * in the action's evidence as «area match: …». Absent = every pair fits (pre-policy).
+   */
+  readonly seatFit?: (seat: string, cell: NaCell) => { readonly ok: true; readonly rule: string; readonly area?: boolean } | { readonly ok: false; readonly reason: string };
 }
 
 export interface NaSplitRequest { readonly cell: string; readonly at: string; readonly deadline: string; readonly why: string }
@@ -335,6 +345,25 @@ export function planNextActions(state: NextActionState): NextPlan {
   //     wake it on its own cell (one wake per hand, inside the OP→hand mail budget) — a wake, never a re-assignment.
   // THROTTLE-AUDIT: hints and holder wakes per plan scale with the pool (floor MAX_ASSIGN_PER_PLAN).
   const assignCap = planAssignCap(poolHandCount(state.hands), state.pushPolicy);
+  // SEAT-AREA-GUARD — cells in order, each to the longest-idle free hand that fits it by area, else the longest-idle general
+  // hand (kit/seat-area pickByArea · pre-policy: hand i ↔ cell i).
+  const fitOf = (seat: string, cell: NaCell): { ok: boolean; rule: string; area: boolean } => {
+    if (!state.seatFit) return { ok: true, rule: '', area: false };
+    try { const f = state.seatFit(seat, cell); return f.ok ? { ok: true, rule: f.rule, area: f.area === true } : { ok: false, rule: f.reason, area: false }; } catch { return { ok: true, rule: '', area: false }; }
+  };
+  const pairByArea = (hands: readonly NaHand[], list: readonly NaCell[], cap: number): Array<{ hand: NaHand; cell: NaCell; rule: string }> => {
+    const left = [...hands];
+    const out: Array<{ hand: NaHand; cell: NaCell; rule: string }> = [];
+    for (const cell of list) {
+      if (out.length >= cap || !left.length) break;
+      const i = pickByArea(left, (h) => h.seat, state.seatFit ? (seat) => fitOf(seat, cell) : undefined);
+      if (i < 0) continue;
+      out.push({ hand: left[i]!, cell, rule: fitOf(left[i]!.seat, cell).rule });
+      left.splice(i, 1);
+    }
+    return out;
+  };
+  const areaNote = (rule: string): string => (rule ? ` · area match: ${rule}` : '');
   if (state.hands && cells) {
     const open = new Set(cells.filter(OPEN).map(c => c.id));
     for (const h of state.hands.filter(x => x.ownerIdleCell && open.has(x.ownerIdleCell) && !x.judge).slice(0, assignCap)) {
@@ -353,13 +382,11 @@ export function planNextActions(state: NextActionState): NextPlan {
     const free = freeHands(state.hands, cells);
     const ready = readyCells(cells);
     if (free.length && ready.length) {
-      const pairs = Math.min(free.length, ready.length, assignCap);
-      for (let i = 0; i < pairs; i++) {
-        const hand = free[i]!; const cell = ready[i]!;
+      for (const { hand, cell, rule } of pairByArea(free, ready, assignCap)) {
         const idle = hand.since !== undefined ? `idle ${Math.max(0, Math.round((now - hand.since) / 60_000))} min` : 'idle';
         actions.push({ rule: 'b', actor: 'planner', do: 'pull', key: `b:${hand.seat}:${cell.id}`, target: { seat: hand.seat, cell: cell.id, version: v },
           what: `prioritize ${cell.id} for ${hand.seat} (pull)`,
-          evidence: `${hand.seat} ${idle} · ${cell.id}${cell.priority ? ` ${cell.priority}` : ''} ready (unowned) · free hands ${free.length} · ready cells ${ready.length}`,
+          evidence: `${hand.seat} ${idle} · ${cell.id}${cell.priority ? ` ${cell.priority}` : ''} ready (unowned) · free hands ${free.length} · ready cells ${ready.length}${areaNote(rule)}`,
           commands: [`eln work priority ${cell.id} <current order…>  (hint ${cell.id} → ${hand.seat})`, `(${hand.seat}) eln work next`],
           doneWhen: `${hand.seat} claims ${cell.id} (or other work) via eln work next` });
       }
@@ -379,20 +406,22 @@ export function planNextActions(state: NextActionState): NextPlan {
         .sort((a, b) => PRI(a.priority) - PRI(b.priority) || (Date.parse(a.updatedAt ?? '') || 0) - (Date.parse(b.updatedAt ?? '') || 0) || a.id.localeCompare(b.id));
       const withDone = candidates.filter(c => (c.doneCriterion ?? '').trim());
       const without = candidates.filter(c => !(c.doneCriterion ?? '').trim());
-      const pairs = Math.min(free.length, withDone.length, assignCap);
-      for (let i = 0; i < pairs; i++) {
-        const hand = free[i]!; const cell = withDone[i]!;
+      const paired = pairByArea(free, withDone, assignCap);
+      const pairs = paired.length;
+      for (const { hand, cell, rule } of paired) {
         const idle = hand.since !== undefined ? `idle ${Math.max(0, Math.round((now - hand.since) / 60_000))} min` : 'idle';
         actions.push({ rule: 'c', actor: 'planner', do: 'pull', key: `c:pull:${hand.seat}:${cell.id}`, target: { seat: hand.seat, cell: cell.id, version: v },
           what: `prioritize ${cell.id} for ${hand.seat} (pull)`,
-          evidence: `${hand.seat} ${idle} · 0 ready cells · ${cell.id}${cell.priority ? ` ${cell.priority}` : ''} has a done-when and nobody on it${cell.owner ? ` (owner ${cell.owner})` : ''}`,
+          evidence: `${hand.seat} ${idle} · 0 ready cells · ${cell.id}${cell.priority ? ` ${cell.priority}` : ''} has a done-when and nobody on it${cell.owner ? ` (owner ${cell.owner})` : ''}${areaNote(rule)}`,
           commands: [`eln work priority ${cell.id} <current order…>  (hint ${cell.id} → ${hand.seat})`, `(${hand.seat}) eln work next`],
           doneWhen: `${hand.seat} claims ${cell.id} (or other work) via eln work next` });
       }
+      const splitCap = Number.isSafeInteger(state.splitPieces) && state.splitPieces! >= 0 ? state.splitPieces! : 0;
+      if (state.splitPieces == null) unmeasured.push('steward splitPieces');
       const open = new Map((state.splitRequests ?? []).map(r => [r.cell, r] as const));
       const handsLeft = Math.max(0, free.length - pairs);
       const forced: NextAction[] = [];
-      for (const cell of without.slice(0, Math.min(MAX_SPLIT_PIECES, Math.max(1, handsLeft)))) {
+      for (const cell of without.slice(0, Math.min(splitCap, Math.max(1, handsLeft)))) {
         const req = open.get(cell.id);
         if (!req) {
           const deadline = new Date(now + SPLIT_REQUEST_DEADLINE_MIN * 60_000).toISOString();
@@ -406,7 +435,7 @@ export function planNextActions(state: NextActionState): NextPlan {
           const late = Math.round((now - Date.parse(req.deadline)) / 60_000);
           forced.push({ rule: 'c', actor: 'op', key: `c:split-overdue:${cell.id}`, target: { cell: cell.id, version: v },
             forced: `split request for ${cell.id} recorded ${req.at.slice(11, 16)}Z, deadline passed ${late} min ago — nothing split, no done-when`,
-            what: `split ${cell.id} into ≤${SPLIT_CELL_MIN}-min cells with done-when (or write its done-when), then raise them with eln work priority — ${free.slice(0, MAX_SPLIT_PIECES).map(h => h.seat).join(', ')} pull them`,
+            what: `split ${cell.id} into ≤${SPLIT_CELL_MIN}-min cells with done-when (or write its done-when), then raise them with eln work priority — ${free.slice(0, splitCap).map(h => h.seat).join(', ')} pull them`,
             evidence: `${free.length} free hands · 0 ready cells · split request overdue ${late} min`,
             commands: [`eln release checklist add ${cell.id}-S1 ${q('<one ≤45-min piece>')} --priority ${cell.priority ?? 'P0'} --done ${q('<observable>')} --source ${q(`split of ${cell.id}`)} --version ${v}`,
               `eln work priority ${cell.id}-S1 <current order…>`],
@@ -417,8 +446,8 @@ export function planNextActions(state: NextActionState): NextPlan {
       if (!candidates.length) {
         const top = rankCells(cells).find(c => c.status === 'yellow' && c.priority === 'P0' && !split(c))
           ?? rankCells(cells).find(c => c.status === 'yellow' && !split(c));
-        if (top) {
-          const pieces = Math.max(2, Math.min(free.length, MAX_SPLIT_PIECES));
+        if (top && splitCap > 0) {
+          const pieces = Math.min(free.length, splitCap);
           const seats = free.slice(0, pieces).map(h => h.seat);
           actions.push({ rule: 'c', actor: 'op', key: `c:${top.id}`, target: { cell: top.id, version: v },
             what: `split ${top.id} into ${pieces} cells of ≤${SPLIT_CELL_MIN} min each, then raise them with eln work priority — ${seats.join(', ')} pull them`,

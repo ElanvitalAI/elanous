@@ -1,5 +1,5 @@
 import { defaultListHarnessProcesses } from '../../harness/harness-cli-command.js';
-import { devVersion, listChecklist } from '../../release-loop/checklist.js';
+import { listChecklist } from '../../release-loop/checklist.js';
 import { listSchedules } from '../../release-loop/release-schedule.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../instance/resolve.js';
 import { ResourceLedger, type ResourceView } from '../../control-plane/ledger.js';
@@ -8,6 +8,7 @@ import { seatOfTree, trafficTick, TRAFFIC_SEATS, type TrafficCell, type TrafficR
 import { finishAdvice, measureFinish } from '../../loops/orchestrator/finish-rate.js';
 import { jsonResponse } from './json-response.js';
 import { debug } from '../../debug/log.js';
+import { boardVersion } from '../../release-loop/board-version.js';
 
 /** Read-only snapshot of the same ORCH traffic decision used by the scheduled tick. */
 export function observeLoopResources(deps: {
@@ -22,7 +23,7 @@ export function observeLoopResources(deps: {
   const cfg = getUserConfig().loops?.orchestrator ?? ORCHESTRATOR_DEFAULTS;
   const observation = deps.processes ?? defaultListHarnessProcesses();
   if (observation.status !== 'ok') throw new Error(`process observation ${observation.status}`);
-  const version = deps.version ?? devVersion().replace(/-dev\.\d+$/, '');
+  const version = deps.version ?? boardVersion();
   const upcoming = deps.nextRound === undefined ? listSchedules(releaseLedgerRoot()).filter(row => Date.parse(row.cutAt) > now.getTime())
     .sort((a, b) => Date.parse(a.cutAt) - Date.parse(b.cutAt)) : [];
   const currentIndex = upcoming.findIndex(row => row.version === version);

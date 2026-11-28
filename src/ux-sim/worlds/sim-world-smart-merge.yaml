@@ -19,5 +19,18 @@ scenarios:
   - { id: SM-REFUSED-BEFORE-INSTALL, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
   - { id: SM-STACK-AUTO-DISCOVER, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
   - { id: SM-DECLARED-SUPERSEDE, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-OWN-REWRITE-DECLARATION, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
   - { id: SM-RESTRUCTURE-PLUS-INSERT, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
   - { id: SM-REVIEW-OWN-DELTA, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-CARRY-CONTEXT-MOVED, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-CARRY-OWN-CHANGED, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-L3-LIGHT-LAND, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-REHEARSAL-REGRESSION-CELL, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-GH-SNAPSHOT-5SEATS, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-GH-SECONDARY-COOLDOWN, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-GH-HEAD-MOVED-MID-REFRESH, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-GH-SEAT-BUDGET, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-GH-MIRROR-20FETCH, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-GH-MIRROR-STALE-FALLBACK, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-GH-SHIM-COOLDOWN-VIEW, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }
+  - { id: SM-GH-SHIM-100-VIEWS, module: src/ux-sim/sim-world/smart-merge/scenarios.ts }

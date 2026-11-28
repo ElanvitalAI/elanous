@@ -4,8 +4,8 @@
  */
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
-import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { defaultSeatStateRoot } from './docs-roots.js';
 import { runGitCommand } from '../git-fs/runner.js';
 
 export const DOCS_LAYERS = ['L0', 'L1', 'L1.5', 'L2', 'L3', 'L4', 'L5'] as const;
@@ -231,7 +231,6 @@ export function defaultDocsSystemRoots(options: { cwd?: string; env?: NodeJS.Pro
   const env = options.env ?? process.env;
   const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
   const docs = resolve(options.cwd ?? packageRoot, 'docs');
-  const stateRoot = options.seatStateRoot
-    ?? (env.ELANOUS_STATE_DIR?.trim() ? join(env.ELANOUS_STATE_DIR.trim(), 'seat-state') : join(homedir(), 'elanous-hq', 'seat-state'));
+  const stateRoot = options.seatStateRoot ?? defaultSeatStateRoot(env);
   return [docs, resolve(stateRoot)];
 }

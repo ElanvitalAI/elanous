@@ -1,0 +1,39 @@
+graph_id: cond-watch-sweep
+version: 1
+loop:
+  title: Condition watch sweep (steward:mail R5)
+  root: 조율자
+  managed_by: trigger-registry
+  description: >-
+    COND-WATCH (FEDERATION-STEWARDS §4 R5 · §5b ①). A promise is a condition (PR merged · same-head pregate receipt ·
+    cell green · seat idle · file · time), not a «please reply» mail. Every 5 min this measures (the backstop behind each post's own watcher) each seat's armed
+    condition once: met → the commitment closes with the evidence line and its owner is woken once; past its horizon →
+    one expired wake; 30 min+ past its horizon with no live watcher (stale) → retired silently (a local-ledger watch that
+    holds now closes done) — facts are recorded and wake no one. At most 20 wakes a tick. Shadow stage judges only
+    (dry-run: no write, no wake). Done-when = commitments/watch-sweep.json rewritten.
+  owner: OP
+  trigger:
+    cron: '*/5 * * * *'
+  goal:
+    kind: file-mtime
+    path: '{stateRoot}/commitments/watch-sweep.json'
+  failure:
+    goal_deadline_min: 4
+    max_attempts: 2
+    backoff_sec: [60]
+  legacy:
+    # No legacy path ever ran this sweep (`msg wait-tick` was never scheduled) — the marker only holds the shadow stage.
+    kind: marker
+    path: '{seatState}/OP/tools/.graph-cutover/cond-watch-sweep'
+  cutover_after: 2
+entry_node: sweep
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: sweep
+    kind: agent
+    recipe: 'cmd:trigger-watch-sweep'
+    max_visits: 1
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: sweep, on: outcome, map: { ok: done, fail: failed, error: failed } }

@@ -1288,6 +1288,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       const humanLead = handLadder.humanLead;
       withLedger((store) => ladderModule.sweepHandRaises(store, { ladder, now: () => now, involving: seat, ...(humanLead ? { humanLead } : {}),
         raiseDecision: ladderModule.spawnHandDecision, log: (event, data) => { debug.log('needhuman', event, data); } }));
+      // HAND-ROUTE-GUARDIAN-MISROUTE — ✋ at a loop-agent address (GUARDIAN · no ✋ responder) past hand-routes.yaml
+      // loopHands.slaMinutes go to the hand's coordinator from here too: the steward graph was the only carrier and died at R1
+      // for 14 ticks on 11-28. Ledger-idempotent (exactly once per ✋) — this seat's ✋ only (sent · held · would take).
+      try {
+        const { sweepLoopHandSla } = require('../kit/mail-route/dormant-watch.js') as typeof import('../kit/mail-route/dormant-watch.js');
+        withLedger((store) => sweepLoopHandSla(store, { nowMs: now, hq: ladder.hq, parentOf: ladder.parentOf, involving: seat, log: (event, data) => { debug.log('msg', event, data); } }));
+      } catch (error) { debug.log('msg', 'msg.loop-hand-sla', { phase: 'tui-sweep-failed', error: String(error).slice(0, 200) }); }
       // MSG-WAIT-CONTRACT ③ — reply waits this seat asked or is asked (msg ask · MsgAsk): reminder at 10m, cancel at 15m.
       const waitContract = require('../msg/msg-wait-contract.js') as typeof import('../msg/msg-wait-contract.js');
       withLedger((store) => waitContract.sweepWaitContracts(store, { now, involving: seat, parentOf: ladder.parentOf }));
@@ -1295,6 +1302,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   }, HAND_RAISE_TICK_MS);
   (handRaiseTick as { unref?: () => void }).unref?.();
   // BUS-SEAT-TURN ② — OP context bus items addressed to this seat knock the seat-mail door (coalesced · src/tui/bus-wake.ts).
+  let busWakeApplied: ((ids: readonly string[]) => void) | undefined;
   try {
     const busSeat = detectSeat(process.cwd())?.seat ?? null;
     if (busSeat) {
@@ -1304,13 +1312,20 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       const { watchBus } = require('../op-context-bus/bus.js') as typeof import('../op-context-bus/bus.js');
       const { wireBusWake } = require('./bus-wake.js') as typeof import('./bus-wake.js');
       const busRoot = (require('../autopilot/state-paths.js') as typeof import('../autopilot/state-paths.js')).elanousStateRoot();
+      // CONTEXT-BUS-FEDERATION — every space the seat reads (own · HQ · OP); the gate still wakes only on items addressed to it.
+      const busSpaces = (require('../op-context-bus/spaces.js') as typeof import('../op-context-bus/spaces.js')).liveBusSpacesForSeat(busSeat);
       const busWake = wireBusWake({ seat: busSeat,
-        subscribe: (onItems) => watchBus(busRoot, onItems),
+        steerP0: (item) => {
+          if (!busy || !steerRequest.current) return false;
+          return steerRequest.current(`bus-p0:${item.id}`, `P0 버스 항목 ${item.id} (${item.from}): ${item.body}`, false);
+        },
+        subscribe: (onItems) => { const stops = busSpaces.map((s) => watchBus(busRoot, onItems, { space: s.space })); return () => { for (const stop of stops) stop(); }; },
         wake: (text, urgent) => {
           queue.enqueueNotice(text, 'seat-mail', { occurredAt: Date.now(), ...(urgent ? { urgent: true, mailClass: 'P0' as const } : {}) });
           if (!busy) idleWakeDoor.knock('seat-mail');
           render();
         } });
+      busWakeApplied = (ids) => busWake.applied(ids);
       const prevFlip = onBusyFlip;
       onBusyFlip = () => { prevFlip?.(); if (!busy) busWake.delivered(); };
     }
@@ -3574,6 +3589,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           stopSteerApplied?.();
           stopSteerApplied = onLocalChatSteerApplied(sessionId, (steerIds) => {
             if (!busy || id !== turnSessionId) return;
+            busWakeApplied?.(steerIds);
             // The person's own lines that join now are echoed into the transcript where they joined (below the
             // tool results, above the next answer) and saved, so the next turn's history carries them too.
             const joinedLines = joinedSteerRows(queue.items, steerIds, () => new Date().toISOString());

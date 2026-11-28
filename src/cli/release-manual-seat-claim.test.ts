@@ -49,7 +49,7 @@ test('open cell PR enumeration pins the repo, avoids search indexing, and fails 
     return { status: 0, stdout: JSON.stringify(rows) };
   });
   expect(found.map((row) => row.number)).toEqual([42]);
-  expect(calls[0]).toMatchObject({ command: 'git', args: ['remote', 'get-url', 'origin'], cwd: '/repo' });
+  expect(calls[0]).toMatchObject({ command: 'git', args: ['config', '--get', 'remote.origin.url'], cwd: '/repo' });
   expect(calls[1]).toMatchObject({ command: 'gh', cwd: '/repo' });
   expect(calls[1]?.args).toContain('ElanvitalAI/elanous');
   expect(calls[1]?.args).toContain('1000');

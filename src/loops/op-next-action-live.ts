@@ -1,3 +1,4 @@
+import { liveStewardCaps } from '../steward/live-caps.js';
 // OP-NEXT-BEST-ACTION live probes and actuators (see op-next-action.ts for the SCQA and the three faces).
 // Every probe reads an existing ledger and fails open to null (= unmeasured, never «zero»):
 //   cells        checklist listChecklist(current version)
@@ -157,6 +158,14 @@ export async function liveNextActionState(roots: LiveRoots, now: Date): Promise<
       } catch (e) { unmeasured.push(`hand-raises(${short(e)})`); }
     } finally { store.close(); }
   } catch (e) { unmeasured.push(`msg(${short(e)})`); }
+  // SEAT-AREA-GUARD — seat roles ⊕ areas (graphs/policies/seat-roles.yaml · kit/seat-area): hints go only where they fit.
+  let seatFit: NextActionState['seatFit'];
+  try {
+    const sa = await import('../kit/seat-area/index.js');
+    const live = sa.liveSeatRoles();
+    if (live.error) unmeasured.push(`seat-roles(${live.error.slice(0, 60)})`);
+    seatFit = (seat, cell) => sa.seatTakesCell(seat, cell, live.policy);
+  } catch (e) { unmeasured.push(`seat-roles(${short(e)})`); }
   let releases: NaRelease[] | null = null; let released: string | null = null;
   try {
     const { listSchedules } = await import('../release-loop/release-schedule.js');
@@ -166,9 +175,9 @@ export async function liveNextActionState(roots: LiveRoots, now: Date): Promise<
     releases = rows.map(s => ({ version: s.version, cutAt: s.cutAt ?? null, publishAt: s.publishAt ?? null, hasRun: existsSync(join(roots.stateRoot, 'release-graph', s.version, 'state.json')) }));
   } catch (e) { unmeasured.push(`releases(${short(e)})`); }
   return { now: now.toISOString(), version, released, cells, hands, directives, dismissed: readDismissed(roots.stateRoot), handRaises,
-    holds, unacked,
+    holds, unacked, splitPieces: (await liveStewardCaps())?.splitPieces ?? null,
     land: readLand(roots.stateRoot, nowMs), releases, bulletin: readBulletin(roots.seatState, nowMs), splitRequests: readSplitRequests(roots.stateRoot, nowMs), unmeasured,
-    forced: readForced(enforcePaths(roots.stateRoot).forced, now).map(f => ({ key: f.key, reason: f.reason })), pushPolicy: readPushPolicy() };
+    forced: readForced(enforcePaths(roots.stateRoot).forced, now).map(f => ({ key: f.key, reason: f.reason })), pushPolicy: readPushPolicy(), ...(seatFit ? { seatFit } : {}) };
 }
 
 /** THROTTLE-AUDIT: config `op.next` {handMailsPerHour · handMailsPerHand · assignPerPlan}; unreadable = {} (scaled defaults). */

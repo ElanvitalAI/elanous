@@ -2,6 +2,7 @@ import { debug } from '../../debug/log.js';
 import { PR_LABELS } from '../../github/pr-labels.js';
 import { runGhCliWithResultAsync } from '../../git-fs/gh-cli.js';
 import { runGitCommand } from '../../git-fs/runner.js';
+import { remoteUrlVia } from '../../git-fs/origin-url.js';
 import { getUserConfig } from '../../user-config/reader.js';
 import { installMetadataSource } from '../../version/code-revision.js';
 import { getApprovalGate, latestApprovalGate, startApprovalGate, type ApprovalGateInput, type ApprovalGateState } from './merge-approvals-gate.js';
@@ -55,8 +56,8 @@ function repoFromOrigin(remote: string | undefined): string | undefined {
 }
 
 function originRemote(source: string): string | undefined {
-  const result = runGitCommand(source, ['remote', 'get-url', 'origin'], { encoding: 'utf8' });
-  return result.status === 0 ? result.stdout.trim() : undefined;
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf turns get-url into a local path
+  return remoteUrlVia((argv) => { const r = runGitCommand(source, argv, { encoding: 'utf8' }); return r.status === 0 ? r.stdout : null; }) ?? undefined;
 }
 
 export function extractApprovalBrief(body: string): string | null {

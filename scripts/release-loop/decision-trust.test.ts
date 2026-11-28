@@ -156,13 +156,17 @@ test('trusted path: a human decision with a valid out-of-band ed25519 proof appr
     const card = led.raise({ title: 'Publish?', category: 'publish', scqa: { s: 'Ready.', c: 'Irreversible.' },
       options: [{ key: 'a', label: 'Publish', consequence: 'Public.' }, { key: 'b', label: 'Hold', consequence: 'Wait.' }],
       recommendation: { skipped: true, reason: 'Person required.' }, raisedBy: { agent: 'release-critpath' }, refs: [ref] });
-    // The human signs the exact binding out of band (their key device), then the decision records the proof.
-    const sig = cryptoSign(null, Buffer.from(ref, 'utf8'), privateKey).toString('hex');
+    // The signer signs the exact v2 binding (ref ⊕ card ⊕ raisedAt ⊕ choice ⊕ via ⊕ user), then the decision records the proof.
+    const sig = cryptoSign(null, Buffer.from(`elanous-approval/v2|${ref}|${card.id}|${card.raisedAt}|a|telegram|owner`, 'utf8'), privateKey).toString('hex');
+    // A v1-style signature over the bare ref no longer counts (it is not bound to this card).
+    const bare = cryptoSign(null, Buffer.from(ref, 'utf8'), privateKey).toString('hex');
+    expect(approvalState([{ ...card, status: 'decided', choice: 'a', decidedBy: { kind: 'human', via: 'telegram', platformUserId: 'owner' }, proof: { keyId, sig: bare } }], binding, readDecisionTrustRoots(root)))
+      .toEqual({ state: 'unverified', id: card.id, reason: 'bad-sig' });
     led.decide(card.id, 'a', { kind: 'human', via: 'telegram', platformUserId: 'owner' }, 'signed out of band', undefined, { keyId, sig });
     const observed = ledger(root, '2026-11-24T00:02:00Z').list({ status: 'all' });
-    expect(approvalState(observed, binding, readDecisionTrustRoots(root)).state).toBe('approved');
+    expect(approvalState(observed, binding, readDecisionTrustRoots(root))).toEqual({ state: 'approved', id: card.id, keyId });
     // No trust roots wired → still unverified (defense in depth: the proof only counts with the root).
-    expect(approvalState(observed, binding).state).toBe('unverified');
+    expect(approvalState(observed, binding)).toEqual({ state: 'unverified', id: card.id, reason: 'no-roots' });
     // A tampered proof (flipped hex) never approves.
     const tampered = observed.map(r => ({ ...r, proof: r.proof ? { ...r.proof, sig: (parseInt(r.proof.sig.slice(0, 2), 16) ^ 1).toString(16).padStart(2, '0') + r.proof.sig.slice(2) } : undefined }));
     expect(approvalState(tampered, binding, readDecisionTrustRoots(root)).state).toBe('unverified');

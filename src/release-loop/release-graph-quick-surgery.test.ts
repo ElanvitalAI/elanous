@@ -28,6 +28,7 @@ let dies: Set<string>;
 let security: Set<string>;
 let pollRows: string[];
 let receiptOk: boolean;
+let preAuthGo: ExecDeps['preAuthGo'];
 const procs = new Map<number, { step: string; end: number; rcPath: string; exit: number; dead: boolean; written?: boolean }>();
 
 function mulberry(seed: number) { let a = seed; return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
@@ -61,6 +62,7 @@ function deps(): ExecDeps {
     alive: (p) => { const pr = procs.get(p); return !!pr && !pr.dead && now.getTime() < pr.end; },
     post: (to, _kind, body) => { mail.push({ to, body }); return `msg#${mail.length}`; },
     planOptions: OPTS,
+    ...(preAuthGo ? { preAuthGo } : {}),
   };
 }
 
@@ -78,7 +80,7 @@ const kinds = () => readLedger(root, V).map(r => `${r.kind}${r.step ? `:${r.step
 function fresh(seed: number, profile: Profile = 'quick-surgery') {
   root = mkdtempSync(join(tmpdir(), 'release-qs-'));
   rng = mulberry(seed);
-  mail = []; started = []; exits = {}; durMin = {}; dies = new Set(); security = new Set(); pollRows = [op('GO')]; receiptOk = true; procs.clear();
+  mail = []; started = []; exits = {}; durMin = {}; dies = new Set(); security = new Set(); pollRows = [op('GO')]; receiptOk = true; procs.clear(); preAuthGo = undefined;
   at('2026-11-25T12:00:00.000Z');
   createRun(root, { version: V, quick: true, clock: CLOCK, notesFile: '/h/notes.md', prepDir: '/h/prep', profile }, now);
 }
@@ -286,4 +288,36 @@ test('a non-critical stop (normal profile) never runs traffic-restore or finishe
   expect(published()).toBe(1); expect(started.filter(x => x === 'traffic-restore').length).toBe(1);
   const order = readLedger(root, V).filter(r => r.kind === 'started').map(r => r.step);
   expect(order.indexOf('traffic-restore')).toBeGreaterThan(order.indexOf('publish'));
+});
+
+// RELEASE-PRESIGNED-AUTO — at `go`, a CEO pre-signature whose conditions hold stands in for a missing OP GO vote.
+describe('go gate · CEO pre-signature', () => {
+  test('normal profile · no OP GO · usable pre-signature → GO from the card (use recorded in live) → published', async () => {
+    fresh(7, 'normal'); pollRows = [];
+    const asked: unknown[] = [];
+    preAuthGo = async (version, profile, o) => { asked.push([version, profile, o]); return { ok: true, id: 'D-20261125-04', mode: 'auto', line: 'pre-signed line' }; };
+    await tickFor(10 * 60);
+    const s = loadRun(root, V)!;
+    expect(s.hardStop).toBe(null); expect(published()).toBe(1);
+    expect(asked).toEqual([['0.3.36', 'normal', { record: true }]]);
+    const row = readLedger(root, V).find(r => r.kind === 'preauth-go');
+    expect(row && { step: row.step, id: row.id, preauthMode: row.preauthMode }).toEqual({ step: 'go', id: 'D-20261125-04', preauthMode: 'auto' });
+    expect(s.steps.go!.warnings ?? []).toEqual([]);
+  });
+  test('normal profile · no OP GO · pre-signature refused → the go refusal names it · then the existing T−60m surgery switch', async () => {
+    fresh(7, 'normal'); pollRows = [];
+    preAuthGo = async () => ({ ok: false, reason: 'D-20261125-04(auto): window-passed' });
+    await tickFor(10 * 60);
+    const stop = readLedger(root, V).find(r => r.kind === 'hard-stop' && r.step === 'go');
+    expect(String(stop?.reason)).toContain('preauth: D-20261125-04(auto): window-passed');
+    expect(readLedger(root, V).some(r => r.kind === 'preauth-go')).toBe(false);
+    expect(kinds()).toContain('auto-quick-surgery:go');
+  });
+  test('OP GO present → the pre-signature is not consulted', async () => {
+    fresh(7, 'normal');
+    let called = 0;
+    preAuthGo = async () => { called++; return { ok: true, id: 'D-x', mode: 'auto', line: '' }; };
+    await tickFor(10 * 60);
+    expect(published()).toBe(1); expect(called).toBe(0);
+  });
 });

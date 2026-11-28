@@ -53,6 +53,9 @@ export interface AccountPolicy {
   readonly credits: CreditsRule;
   readonly dailyCreditBudget: number | null;
   readonly creditFloor: number | null;
+  /** KEYS-PROACTIVE-REFRESH — CLI credential homes holding this account's login (CODEX_HOME dirs · `~` = the user's home).
+   *  The 열쇠지기 keeps every one refreshed (each home is its own login — never a copy of another). [] = none declared. */
+  readonly homes: readonly string[];
 }
 export interface ProviderPolicy {
   readonly order: readonly string[];
@@ -73,8 +76,30 @@ export interface PhaseSet {
   readonly implementation?: 'normal' | 'throttled';
 }
 export interface PhaseRule { readonly name: string; readonly when: readonly Condition[]; readonly set: PhaseSet; readonly requiresCeo: boolean; readonly why: string | null }
+// FALLBACK-SUBSCRIPTION-FIRST (대표 11-28 12:3x «구독 여유 → 유료 크레딧») — which models a hand may run per difficulty tier
+// and in which order the budget walks them once the first is out: every subscription with headroom first, paid credits last.
+export const HAND_TIERS = ['hard', 'medium', 'easy'] as const;
+export type HandTier = typeof HAND_TIERS[number];
+/** subscription-headroom = the tier's models paid by a subscription window still under its cap (tier order) ·
+ *  credits-by-balance = the tier's models whose provider may spend credits now (codex accounts in their credit_order). */
+export const HAND_FALLBACK_STEPS = ['subscription-headroom', 'credits-by-balance'] as const;
+export type HandFallbackStep = typeof HAND_FALLBACK_STEPS[number];
+export interface HandModelEntry {
+  readonly id: string; readonly provider: string; readonly model: string;
+  /** The pack provider whose accounts pay for it (`glm` runs on the `zai` plan) — default = provider. */
+  readonly accounts: string;
+  /** What it may serve — `{ review: false }` = never for review (대표 GLM never reviews, whichever account pays). */
+  readonly uses: Readonly<Record<LlmUse, boolean>>;
+}
+export interface HandModelPlan {
+  readonly models: Readonly<Record<string, HandModelEntry>>;
+  readonly tiers: Readonly<Record<HandTier, readonly string[]>>;
+  readonly fallback: readonly HandFallbackStep[];
+}
 export interface LlmAccountPack {
   readonly version: 1;
+  /** null = the pack states no hand_models section → model-by-difficulty's code default (the same plan). */
+  readonly handModels: HandModelPlan | null;
   readonly providers: Readonly<Record<string, ProviderPolicy>>;
   readonly fallback: readonly string[];
   readonly levels: {
@@ -114,7 +139,7 @@ export function lintPack(raw: unknown): { pack: LlmAccountPack | null; errors: s
   const errors: string[] = [];
   const warnings: string[] = [];
   if (!isObj(raw)) return { pack: null, errors: ['pack must be a mapping'], warnings };
-  unknownKeys(raw, ['version', 'providers', 'fallback', 'levels', 'phases', 'overrides'], 'pack', errors);
+  unknownKeys(raw, ['version', 'providers', 'fallback', 'levels', 'phases', 'overrides', 'hand_models'], 'pack', errors);
   if (raw.version !== 1) errors.push('pack.version must be 1');
   const providers: Record<string, ProviderPolicy> = {};
   if (!isObj(raw.providers)) errors.push('pack.providers must be a mapping');
@@ -128,7 +153,8 @@ export function lintPack(raw: unknown): { pack: LlmAccountPack | null; errors: s
     for (const [a, row] of Object.entries(isObj(node.accounts) ? node.accounts : {})) {
       const ap = `${path}.accounts.${a}`;
       if (!isObj(row)) { errors.push(`${ap} must be a mapping`); continue; }
-      unknownKeys(row, ['subscription_cap_percent', 'credits', 'daily_credit_budget', 'credit_floor', 'uses'], ap, errors);
+      unknownKeys(row, ['subscription_cap_percent', 'credits', 'daily_credit_budget', 'credit_floor', 'uses', 'homes'], ap, errors);
+      if (row.homes !== undefined && !strList(row.homes)) errors.push(`${ap}.homes must be a list of directories (CODEX_HOME · ~ allowed)`);
       if (row.subscription_cap_percent !== undefined && row.subscription_cap_percent !== null && !pct(row.subscription_cap_percent)) errors.push(`${ap}.subscription_cap_percent must be 0..100 (or null = no subscription window)`);
       const uses: Record<LlmUse, boolean> = { implementation: true, review: true, judge: true, chat: true };
       if (row.uses !== undefined) {
@@ -148,6 +174,7 @@ export function lintPack(raw: unknown): { pack: LlmAccountPack | null; errors: s
         credits: row.credits === 'until_reset' ? 'until_reset' : row.credits === true,
         dailyCreditBudget: nonNeg(row.daily_credit_budget) ? row.daily_credit_budget : null,
         creditFloor: nonNeg(row.credit_floor) ? row.credit_floor : null,
+        homes: strList(row.homes) ? row.homes : [],
       };
     }
     const order = node.order === undefined ? Object.keys(accounts) : strList(node.order) ? node.order : (errors.push(`${path}.order must be a list of account names`), []);
@@ -223,15 +250,56 @@ export function lintPack(raw: unknown): { pack: LlmAccountPack | null; errors: s
   const ov = raw.overrides === undefined ? {} : isObj(raw.overrides) ? raw.overrides : (errors.push('pack.overrides must be a mapping'), {});
   unknownKeys(ov, ['default_hours'], 'overrides', errors);
   if (ov.default_hours !== undefined && !(nonNeg(ov.default_hours) && (ov.default_hours as number) > 0)) errors.push('overrides.default_hours must be > 0');
+  const handModels = lintHandModels(raw.hand_models, providers, errors);
   if (errors.length) return { pack: null, errors, warnings };
   return {
     pack: {
-      version: 1, providers, fallback,
+      version: 1, providers, fallback, handModels,
       levels: { dwellMin: nonNeg(lv.dwell_min) ? lv.dwell_min : 15, watermarks: wm as LlmAccountPack['levels']['watermarks'], actions, creditActions },
       phases, overrides: { defaultHours: nonNeg(ov.default_hours) && (ov.default_hours as number) > 0 ? ov.default_hours as number : 24 },
     },
     errors, warnings,
   };
+}
+
+function lintHandModels(node: unknown, providers: Readonly<Record<string, ProviderPolicy>>, errors: string[]): HandModelPlan | null {
+  if (node === undefined) return null;
+  if (!isObj(node)) { errors.push('pack.hand_models must be a mapping'); return null; }
+  unknownKeys(node, ['models', 'tiers', 'fallback'], 'hand_models', errors);
+  const models: Record<string, HandModelEntry> = {};
+  if (!isObj(node.models)) errors.push('hand_models.models must map <id> → { provider, model, accounts?, uses? }');
+  for (const [id, row] of Object.entries(isObj(node.models) ? node.models : {})) {
+    const at = `hand_models.models.${id}`;
+    if (!isObj(row)) { errors.push(`${at} must be a mapping`); continue; }
+    unknownKeys(row, ['provider', 'model', 'accounts', 'uses'], at, errors);
+    if (!str(row.provider) || !str(row.model)) { errors.push(`${at} needs provider and model`); continue; }
+    const accounts = row.accounts === undefined ? row.provider : str(row.accounts) ? row.accounts : (errors.push(`${at}.accounts must be a pack provider name`), row.provider);
+    if (!providers[accounts]) errors.push(`${at}.accounts ${accounts} has no providers.${accounts} section (who pays for it?)`);
+    const uses: Record<LlmUse, boolean> = { implementation: true, review: true, judge: true, chat: true };
+    if (row.uses !== undefined) {
+      if (!isObj(row.uses)) errors.push(`${at}.uses must map ${LLM_USES.join('|')} → true|false`);
+      else for (const [u, v] of Object.entries(row.uses)) {
+        if (!(LLM_USES as readonly string[]).includes(u)) errors.push(`unknown field ${at}.uses.${u} (${LLM_USES.join('|')})`);
+        else if (typeof v !== 'boolean') errors.push(`${at}.uses.${u} must be true|false`);
+        else uses[u as LlmUse] = v;
+      }
+    }
+    models[id] = { id, provider: row.provider, model: row.model, accounts, uses };
+  }
+  const tiers = {} as Record<HandTier, string[]>;
+  if (!isObj(node.tiers)) errors.push(`hand_models.tiers must map ${HAND_TIERS.join('|')} → [model ids]`);
+  else unknownKeys(node.tiers, HAND_TIERS, 'hand_models.tiers', errors);
+  for (const t of HAND_TIERS) {
+    const list = isObj(node.tiers) ? node.tiers[t] : undefined;
+    if (!strList(list) || !list.length) { errors.push(`hand_models.tiers.${t} must be a non-empty list of model ids`); tiers[t] = []; continue; }
+    for (const id of list) if (!models[id]) errors.push(`hand_models.tiers.${t} names ${id}, which has no hand_models.models.${id}`);
+    if (new Set(list).size !== list.length) errors.push(`hand_models.tiers.${t} has duplicates`);
+    tiers[t] = list;
+  }
+  const fb = node.fallback === undefined ? [...HAND_FALLBACK_STEPS] : strList(node.fallback) ? node.fallback : (errors.push(`hand_models.fallback must be a list of ${HAND_FALLBACK_STEPS.join('|')}`), []);
+  for (const s of fb) if (!(HAND_FALLBACK_STEPS as readonly string[]).includes(s)) errors.push(`hand_models.fallback step ${s} is unknown (${HAND_FALLBACK_STEPS.join('|')})`);
+  if (new Set(fb).size !== fb.length) errors.push('hand_models.fallback has duplicates');
+  return { models, tiers, fallback: fb as HandFallbackStep[] };
 }
 
 /** Pure: deep merge (objects merge key by key, lists and scalars replace). */

@@ -27,10 +27,9 @@ function deterministicNextMd(git: MergeGitSeam, worktreePath: string, file: stri
   }
 }
 
-/** 충돌 마커가 남아있나(LLM 이 해결 못 함 판별). ours/base/theirs 3-way 마커 모두. 순수. */
-export function hasConflictMarkers(s: string): boolean {
-  return /^<{7} |^={7}$|^>{7} |^\|{7} /m.test(s);
-}
+/** Preserve the public export used by existing callers. */
+export { hasConflictMarkers } from '../../git-smart/conflict-markers.js';
+import { hasConflictMarkers } from '../../git-smart/conflict-markers.js';
 
 /**
  * ⛔⭐⭐ **하위호환 기본 — 대상을 «안 준» 호출자에게 주는 값.**

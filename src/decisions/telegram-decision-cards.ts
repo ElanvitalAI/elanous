@@ -4,6 +4,7 @@ import type { TelegramBot, TgCallbackQuery } from '../telegram.js';
 import type { UserConfig } from '../user-config/types.js';
 import { debug } from '../debug/log.js';
 import { DECISION_DATA_PREFIX, DecisionCardService, ghPrReplier, type CardTransport, type CardView } from './decision-cards.js';
+import { ensureApprovalSigner } from './approval-signer.js';
 
 const TICK_MS = 20_000;
 let current: DecisionCardService | null = null;
@@ -40,7 +41,7 @@ export function telegramTransport(bot: Pick<TelegramBot, 'sendInlineKeyboard' | 
   };
 }
 
-export interface AttachOptions { tickMs?: number; service?: DecisionCardService }
+export interface AttachOptions { tickMs?: number; service?: DecisionCardService; /** Boot signer hook; default = TOFU signer on a real boot (no injected service). */ ensureSigner?: (() => void) | null }
 
 /** Wire cards onto a bot: callback taps, memo capture, and a ticker that runs only while this bot polls. Returns a stop fn. */
 export function attachTelegramDecisionCards(bot: TelegramBot, cfg: UserConfig, opts: AttachOptions = {}): () => void {
@@ -49,6 +50,12 @@ export function attachTelegramDecisionCards(bot: TelegramBot, cfg: UserConfig, o
     debug.log('decisions.telegram', 'not-attached', { platform: 'telegram', reason: 'no-owner' });
     return () => undefined;
   }
+  // RELEASE-HUMAN-PROOF-TRUST-ROOT — the polling bot owns the owner's taps, so it owns the approval signer (TOFU once ·
+  // never regenerated over an existing trust root). A failure is an alert, never a reason not to attach the cards.
+  // Synchronous, before the tap callback is attached: a tap right after first boot always meets a ready signer (Terra r1).
+  const ensure = opts.ensureSigner !== undefined ? opts.ensureSigner : opts.service ? null : () => { ensureApprovalSigner(); };
+  try { ensure?.(); }
+  catch (error) { debug.log('release.proof', 'ensure-failed', { reason: error instanceof Error ? error.message.slice(0, 80) : 'unknown' }, { level: 'warn' }); }
   const replyTarget = (cfg.raw?.decisions as { replyGhPr?: unknown } | undefined)?.replyGhPr;
   const service = opts.service ?? new DecisionCardService({
     transport: telegramTransport(bot, owner),

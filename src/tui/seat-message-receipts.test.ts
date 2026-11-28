@@ -13,6 +13,7 @@ import { MsgStore } from '../msg/msg-store.js';
 
 const SEAT = 'TC';
 const BODY = '구현 시작 — inbox-b1c 본문';
+const FUTURE_WINDOW_MS = 60_000; // One minute beyond fixture message timestamps.
 const stores: MsgStore[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.close(); });
 
@@ -34,6 +35,26 @@ function fixture(opts: { now?: () => number } = {}) {
 }
 
 const states = (store: MsgStore, id: number) => store.listReceipts({ messageId: id }).map(r => r.state);
+
+test('unseen request kind exclusions apply before the SQL limit and are opt-in', () => {
+  const { store, watcher } = fixture();
+  const request = store.post({ from: 'OP', to: SEAT, body: 'request', intent: 'request', kind: 'request', needsAck: true });
+  const notice = store.post({ from: 'OP', to: SEAT, body: 'notice', intent: 'request', kind: 'info', needsAck: true });
+  const SINGLE_ROW_PAGE = 1; // Fixture: one row makes ordering before pagination observable.
+  const range = { postedBefore: new Date(Date.now() + FUTURE_WINDOW_MS), postedAfter: new Date(0), limit: SINGLE_ROW_PAGE };
+  expect(store.listUnseenRequests(range).map(row => row.message.id)).toEqual([notice.id]);
+  expect(store.listUnseenRequests({ ...range, excludedKinds: ['info'] }).map(row => row.message.id)).toEqual([request.id]);
+  watcher.stop();
+});
+
+test('structured notice exclusions leave five requests out of fifteen before pagination', () => {
+  const { store, watcher } = fixture();
+  const requestIds = Array.from({ length: 5 }, (_, i) => store.post({ from: 'OP', to: SEAT, body: `work ${i}`, intent: 'request', kind: 'request', needsAck: true }).id);
+  for (let i = 0; i < 10; i++) store.post({ from: 'OP', to: SEAT, body: `notice ${i}`, intent: 'request', kind: i % 2 ? 'coord' : 'info', needsAck: true });
+  const rows = store.listUnseenRequests({ stage: 'ack', postedBefore: new Date(Date.now() + 60_000), postedAfter: new Date(0), limit: 5, excludedKinds: ['info', 'coord'] });
+  expect(rows.map(row => row.message.id).sort((a, b) => a - b)).toEqual(requestIds);
+  watcher.stop();
+});
 
 test('도착 → 메시지마다 notice(msgId) · delivered 기록 · 큐 delivered → seen 기록 ⊕ 호환 ack', () => {
   const { store, queue, watcher } = fixture();

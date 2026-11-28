@@ -1,0 +1,68 @@
+# KIT mail-route · 우정 행정관 steward:mail policy (STEWARD-MAIL · FEDERATION-STEWARDS §5b · 0.3.39 P0)
+#
+# S: 11-27 eln OP received 52–127 mails/h (24h: 1,982 rows ⊕ 734 diverted digest rows). The TUI router opened a turn for
+#    1,192 of 1,808 triaged OP mails — 793 of them «delegated-result» (a status/report reply to OP's own mail).
+# A: mail is DATA. Each mail to the coordinator gets one verdict:
+#      wake-now    — opens a turn at once: ✋ · 대표 · P0 · decision (and an HQ-level reason)
+#      digest      — read in the next 10-min digest turn (status replies · info · reports · routine requests)
+#      record-only — turn 0, no digest line: the fact is already in a ledger (acks · self-mail · ledger echoes · repeats)
+#    Structured fields decide first (kind · intent · crown · origin · refs · priority · replyTo · sender). Only mail whose
+#    fields cannot say «does the coordinator have to act now» asks Jev (Typesafe System One) — and Jev may only PROMOTE
+#    digest → wake-now (never silence a mail). No body regex anywhere (standing rule 11-20).
+#
+# SHADOW: this policy decides nothing yet. The steward-mail trigger records «would have woken / would not» next to what
+# the TUI router actually did (`eln msg steward-shadow` · <state>/steward/mail-shadow.jsonl). Live = a later PR, after
+# 1 h of ≥ 90% agreement on ≥ 30 samples (STEWARD-MAIL done criterion).
+#
+# This file is the policy: change it here, not in TypeScript. An override at `<state>/msg/steward-mail.yaml` (same shape ·
+# any top-level key it names replaces the built-in one) is read when present.
+version: 1
+
+# The coordinator(s) this steward serves.
+recipients: [OP]
+
+# Digest cadence — every mail with verdict digest rides one turn per window.
+digestMinutes: 10
+# A repeat = same sender · same kind · same subject (pr / cell / block / correlation / thread / first ref) — or the same
+# body — inside this window. The first one keeps its verdict; the repeats are record-only.
+duplicateWindowMinutes: 30
+# OP «answered» a mail = OP posted a reply to it inside this window (the outcome the shadow agreement is scored on).
+answeredWithinMinutes: 30
+
+wakeNow:
+  # crown directive · crown delegation · a person's own mail · the CEO proxy lane — always, never deduplicated.
+  crown: true
+  # ✋ HandRaise (`block:` ⊕ `reason:` refs) — always, never deduplicated (hand-dedupe.ts already folds repeats upstream).
+  hand: true
+  # Ledger priority at or above this = P0.
+  priorityAtLeast: 1
+  # Kinds that are P0 by themselves.
+  p0Kinds: [incident, urgent, interrupt, alert]
+  # A decision someone waits on.
+  decisionKinds: [question, ask, decision, consult]
+  decisionIntents: [decision]
+  # `reason:` ref values that make any mail HQ-level.
+  hqReasons: [BUDGET, SECURITY, CROSS_SCOPE, PRIORITY_CONFLICT, HUMAN_DECISION, CREDENTIAL]
+
+recordOnly:
+  # Mail the coordinator wrote to itself (SEAT-VETO cell notes, its own timers) — the board already has it.
+  selfMail: true
+  # Pure receipts.
+  kinds: [ack, receipt, receipts, heartbeat]
+  # Senders that echo a ledger the coordinator reads anyway (land graph refusals are on the land ledger and the board).
+  ledgerSenders: [LAND-GRAPH]
+  # Repeats inside duplicateWindowMinutes.
+  duplicates: true
+
+# Mail that reaches digest with one of these kinds (or no kind) has no structured «act now» signal: Jev is asked.
+jev:
+  askKinds: ['', report, status, info, coord, reply, notice, progress, request, steward-exception]
+  # Top Jev word `wake` promotes only at or above this probability.
+  minProbability: 0.7
+  timeoutSeconds: 8
+  # Live shadow ticks ask at most this many per tick (cost bound); the rest keep the structured verdict.
+  maxCallsPerTick: 30
+  choices:
+    wake: "the coordinator must decide, unblock, approve or re-assign something NOW: a hand is stopped waiting for its decision, an owner conflict or HOLD only the coordinator can lift, money, security, credentials, a production outage, or something irreversible"
+    digest: "news the coordinator should read within 10 minutes but need not act on at once: progress, a result, a landed or refused PR, a routine request a steward or leader can handle, a report that work continues"
+    record: "an acknowledgement, a repeat of something already said, or a status line whose fact is already in a ledger — nobody needs to read it"

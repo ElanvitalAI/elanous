@@ -33,6 +33,22 @@ describe('Wave 2 · Layer 1 · tool-output budget', () => {
     expect(record.origin.tool_use_id).toBe('quoted');
     expect(record.content).toBe(original);
   });
+  test('identifies each archived result even when IDs contain delimiters', () => {
+    const ids = ['first]result', 'second"result'];
+    const messages: LLMMessage[] = [{ role: 'user', content: ids.map((id) => ({
+      type: 'tool_result' as const, tool_use_id: id, content: 'original\n'.repeat(1000),
+    })) }];
+    const result = applyToolOutputBudget(messages, {
+      sessionId: 'multiple', policy: { archiveDir: archDir(), preserveLastN: 0, toolOutputCharBudget: 512, toolOutputTailLines: 1 },
+    });
+    expect(result.responsesTrimmed).toBe(2);
+    const blocks = result.messages[0]!.content as Array<{ content: string }>;
+    for (let i = 0; i < ids.length; i++) {
+      expect(blocks[i]!.content).toContain(`[tool_use_id: ${JSON.stringify(ids[i])}]`);
+      expect(blocks[i]!.content.length).toBeLessThanOrEqual(512);
+    }
+  });
+
   test('does not truncate a recovery reference or required tail to fit a tiny budget', () => {
     const original = `${'head\n'.repeat(1000)}last line`;
     const messages: LLMMessage[] = [{ role: 'user', content: [

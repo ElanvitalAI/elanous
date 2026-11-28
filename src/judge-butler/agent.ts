@@ -48,28 +48,19 @@ export function makeCommands(view: ButlerView, ports: ButlerPorts, verdicts: Rea
   const mem = ports.memory; const now = view.now;
   const cellOf = (id: string): CellIn | undefined => view.cells.find(c => c.id.toUpperCase() === id.trim().toUpperCase());
   return {
-    sign(id) {
+    async sign(id) {
       const c = cellOf(id);
       if (!c) return { ok: false, line: `${id}: 없는 칸` };
       if (view.actable === false) return { ok: false, line: `${c.id} 서명 거절 — ${view.version} 은 지금 판이 아니다(${view.targetWhy ?? 'off-target'})` };
       const fresh = ports.readCell(c.id) ?? c;
       if (fresh.status === 'green') return { ok: true, line: `${c.id} 이미 초록(${fresh.updatedBy ?? '?'})`, ref: `cell:${c.id}` };
-      const state = mem.readState();
-      if (state.reversed[c.id]) return { ok: false, line: `${c.id} 서명 거절 — 서명 뒤 되돌려진 칸(거부권) · 증거(head·영수)가 바뀌기 전까지 다시 서명하지 않는다` };
-      if (namedByHold(view.holds, c.id, view.now)) return { ok: false, line: `${c.id} 서명 거절 — 등록된 HOLD 가 덮고 있다` };
-      // SAFETY (Terra r1): judge the freshly read cell on freshly read receipt ⊕ PR facts (incl. security-4), never the wake's verdict
-      const v = judgeCell(fresh, ports.freshFacts(fresh));
-      if (v.kind !== 'sign') return { ok: false, line: `${c.id} 서명 거절 — ${v.why}` };
-      const line = `🟢 판정 집사 서명 ${now.toISOString().slice(0, 16)}Z — ${v.why} · decidedBy judge-butler · supervisedBy ${BUTLER_SUPERVISOR}`;
-      try {
-        ports.sign(c.id, fresh.evidence ? `${fresh.evidence}\n${line}` : line, { title: fresh.title ?? '', status: fresh.status, evidence: fresh.evidence ?? '' },
-          { decidedBy: BUTLER_SEAT, ...(fresh.owner ? { doneBy: fresh.owner.split('/')[0]! } : {}), supervisedBy: BUTLER_SUPERVISOR });
-      } catch (e) { return { ok: false, line: `${c.id} 서명 실패 — ${e instanceof Error ? e.message : String(e)}` }; }
-      const after = ports.readCell(c.id);
-      if (after?.status !== 'green') return { ok: false, line: `${c.id} 서명 검증 실패(${after?.status ?? 'missing'})` };
-      state.signed[c.id] = now.toISOString(); mem.writeState(state);
-      mem.appendCase({ at: now.toISOString(), kind: 'sign', subject: c.id, why: `voice · ${v.why}`, refs: [`cell:${c.id}`, ...v.evidence], decidedBy: BUTLER_SEAT, supervisedBy: BUTLER_SUPERVISOR });
-      return { ok: true, line: `${c.id} 초록 서명 (${v.why})`, ref: `cell:${c.id}` };
+      // The hand callback runs inside an existing tick; avoid a nested tick overwriting its state.
+      if (opts.forwardOnly) return { ok: false, line: `${c.id} 서명 거절 — 진행 중인 판정 완료 후 다시 요청 · JUD 확인` };
+      const result = await runTick(view, ports, { signOnly: c.id });
+      if (result.signed.includes(c.id)) return { ok: true, line: `${c.id} 초록 서명`, ref: `cell:${c.id}` };
+      const why = result.signRefused.find(x => x.cell === c.id)?.why ?? result.notSigned.find(x => x.cell === c.id)?.why ?? verdicts.get(c.id)?.why ?? '판정 조건 미충족';
+      const displayWhy = why.replace(/^re-judge: (?:missing|security) — /u, '').replace(/^security-4 → JUD\/Terra — /u, '').replace(/^a registered HOLD names this cell/u, '등록된 HOLD 가 덮고 있다');
+      return { ok: false, line: `${c.id} 서명 거절 — ${displayWhy}` };
     },
     explain(id) {
       const c = cellOf(id);

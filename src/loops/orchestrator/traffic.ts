@@ -3,7 +3,7 @@ import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { defaultListHarnessProcesses, type HarnessProcessRecord } from '../../harness/harness-cli-command.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../instance/resolve.js';
-import { devVersion, listChecklist, type ChecklistItem } from '../../release-loop/checklist.js';
+import { listChecklist, type ChecklistItem } from '../../release-loop/checklist.js';
 import { listSchedules } from '../../release-loop/release-schedule.js';
 import { withFileLockSync } from '../../storage/file-lock.js';
 import { getUserConfig, ORCHESTRATOR_DEFAULTS, type OrchestratorLoopConfig, type OrchestratorSeat } from '../../user-config.js';
@@ -11,6 +11,7 @@ import { finishAdvice, measureFinish, type FinishAdvice, type FinishMetrics, typ
 import { collectAuthorDepth, type AuthorDepthResult, type CollectAuthorDepthDeps } from './author-depth.js';
 import { probeDegradation, type DegradationSignal } from './degradation.js';
 import { budgetTrafficTick, computeTrafficMetrics24h, readTrafficSamples24h, recordTrafficSample24h, type TrafficSampleDeps } from '../budget.js';
+import { boardVersion } from '../../release-loop/board-version.js';
 
 export const TRAFFIC_SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
 export type TrafficCell = Pick<ChecklistItem, 'id' | 'title' | 'owner' | 'status'>;
@@ -353,7 +354,7 @@ if (import.meta.main) {
       const observation = observeGateHalt(root);
       const gate = gateHaltedLaunchMinutes({ gate: readGateObservations24h(root, now), ledger: readDispatchLedger(root, now) });
       const traffic = computeTrafficMetrics24h(readTrafficSamples24h(root, now));
-      const report = { at: now.toISOString(), version: devVersion().replace(/-dev\.\d+$/, ''), traffic,
+      const report = { at: now.toISOString(), version: boardVersion(), traffic,
         gate: { ...gate, observation } };
       if (args.includes('--json')) console.log(JSON.stringify(report));
       else {
@@ -362,7 +363,7 @@ if (import.meta.main) {
       }
     } else {
     const versionFlag = args.indexOf('--version');
-    const version = versionFlag < 0 ? devVersion().replace(/-dev\.\d+$/, '') : args[versionFlag + 1];
+    const version = versionFlag < 0 ? boardVersion() : args[versionFlag + 1];
     if (!version || version.startsWith('--')
       || args.some((arg, i) => arg !== '--json' && i !== versionFlag && (versionFlag < 0 || i !== versionFlag + 1))) {
       throw new Error('usage: traffic.ts [--version <판>] [--json]');

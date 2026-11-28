@@ -10,11 +10,12 @@ import { paintPopup, type PopupStyle } from '../popup-style.js';
 import { files } from './files.js';
 import { memo } from './memo.js';
 import { obsidian } from './obsidian.js';
+import { shortcuts } from './shortcuts.js';
 import { sidechat } from './sidechat.js';
 import { term } from './term.js';
 import { toast } from './toast.js';
 
-export const ELEMENTS: Readonly<Record<string, ElementDef<any>>> = { toast, obsidian, sidechat, memo, files, term };
+export const ELEMENTS: Readonly<Record<string, ElementDef<any>>> = { toast, obsidian, sidechat, memo, files, term, shortcuts };
 
 export function elementOf(kind: string): ElementDef<unknown> | undefined {
   return Object.hasOwn(ELEMENTS, kind) ? ELEMENTS[kind] : undefined;

@@ -235,11 +235,18 @@ export async function federationListing(): Promise<{ panes: Record<string, unkno
   } catch { return null; }
 }
 
+export function parseFederationPoolPanes(message: string): readonly { seat?: unknown; status?: unknown }[] | null {
+  try {
+    const panes = (JSON.parse(message) as { panes?: unknown } | null)?.panes;
+    return Array.isArray(panes) && panes.every((pane) => pane !== null && typeof pane === 'object' && !Array.isArray(pane)) ? panes : null;
+  } catch { return null; }
+}
+
 export async function federationPanesForPool(): Promise<readonly { seat?: unknown; status?: unknown }[] | null> {
   try {
     const answer = await federation().list();
     if (answer.exitCode !== 0) return null;
-    return (JSON.parse(answer.message) as { panes?: { seat?: unknown; status?: unknown }[] }).panes ?? [];
+    return parseFederationPoolPanes(answer.message);
   } catch { return null; }
 }
 

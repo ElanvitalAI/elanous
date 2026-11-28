@@ -1,0 +1,27 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "silence-watch",
+  "name": "silence-watch",
+  "version": "1.0.0",
+  "description": "SLA 넘은 미결 요청 0 (받는 이가 결정했거나 · 보낸 이가 읽는 몸 없음을 안다)",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "silence-watch",
+          "agent": "../../graphs/loop-agents/silence-watch/agent.yaml",
+          "trigger": "../../graphs/triggers/silence-watch-agent.yaml",
+          "kpis": [
+            "unanswered_mail_past_sla"
+          ]
+        }
+      ]
+    }
+  }
+}

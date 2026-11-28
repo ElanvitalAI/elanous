@@ -29,7 +29,7 @@ export const BUS_PINNED_TYPES: readonly BusType[] = ['ceo-request', 'decision', 
 const FOLDABLE: ReadonlySet<string> = new Set(['status', 'opinion']);
 export const BUS_MAX_LINES = 1000;
 export const BUS_DEFAULT_SPACE = 'OP';
-/** The two readers whose acks bound the rollup (a row neither has seen is never folded). */
+/** The two readers whose acks bound the OP space's rollup (a row neither has seen is never folded) — other spaces: their ackers. */
 export const BUS_READERS: readonly string[] = ['OP', 'CLAUDE-OP'];
 
 export interface BusEntry {
@@ -179,6 +179,9 @@ export interface BusPostInput {
   readonly owner?: string;
   readonly due?: string;
   readonly doneWhen?: string;
+  /** CONTEXT-BUS-FEDERATION — an idempotency key for a non-CEO item (a loop agent's notice key): the same key twice in the
+   *  space is a `duplicate`, never a second row. Stored as the entry's `dedupeKey`. */
+  readonly key?: string;
 }
 
 export type BusPostResult =
@@ -222,6 +225,11 @@ export function busPost(stateRoot: string, input: BusPostInput, opts: { space?: 
         return { kind: 'also', id: first.id, source };
       }
     }
+    if (input.type !== 'ceo-request' && input.key?.trim()) {
+      dedupeKey = `k:${input.key.trim().slice(0, 200)}`;
+      const same = items.find((i) => i.dedupeKey === dedupeKey);
+      if (same) return { kind: 'duplicate', id: same.id };
+    }
     let conflictsWith: string | undefined;
     if (input.type === 'decision' && refs.length) {
       const norm = (s: string) => s.replace(/\s+/gu, ' ').trim().toLowerCase();
@@ -252,9 +260,12 @@ function rollupLocked(stateRoot: string, space: string, maxLines: number, nowMs:
   const raw = readFileSync(file, 'utf8').split('\n').filter((l) => l.trim());
   if (raw.length <= maxLines) return 0;
   const today = new Date(nowMs).toISOString().slice(0, 10);
-  // Only rows every reader has seen fold: at or below the lowest ack cursor of OP and CLAUDE-OP (no cursor = nothing folds).
+  // Only rows every reader has seen fold: at or below the lowest ack cursor of the space's readers — OP and CLAUDE-OP for
+  // the OP space; for every other space (CONTEXT-BUS-FEDERATION) the seats that ever acked there (no cursor = nothing folds).
   const acks = readAcks(stateRoot, space);
-  const cursors = BUS_READERS.map((seat) => ackCursor(acks, seat));
+  const readers = safeSpace(space) === BUS_DEFAULT_SPACE ? BUS_READERS : [...new Set(acks.map((a) => a.by))];
+  if (readers.length === 0) return 0;
+  const cursors = readers.map((seat) => ackCursor(acks, seat));
   if (cursors.some((c) => c === null)) return 0;
   const floor = cursors.reduce((a, b) => (a! < b! ? a : b))!;
   const days = new Map<string, BusEntry[]>();

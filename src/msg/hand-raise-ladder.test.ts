@@ -206,8 +206,10 @@ test('bulk: 3 open ✋ of one reason at one coordinator → one «change the rul
 test('board line: open ✋ per level with age, deepest first; OP and CEO always shown', () => {
   const store = freshStore();
   try {
-    store.post(hand('TC-H-CC-1', 'TC', 'blk-o-1'));
+    const a = store.post(hand('TC-H-CC-1', 'TC', 'blk-o-1'));
     const b = store.post(hand('JUD-3', 'JUD', 'blk-o-2'));
+    // the TC ✋ is the older one by 20 s — two posts inside one millisecond tie on age and sort by name (JUD first)
+    store.db.query('UPDATE msg_messages SET created_at = ? WHERE id = ?').run(new Date(readHandMail(store, b.id)!.createdAtMs - 20_000).toISOString(), a.id);
     const now = readHandMail(store, b.id)!.createdAtMs + 7 * MIN;
     expect(handBoardLine(handBoardLevels(store, { now, ladder }))).toBe('✋ Open hands — TC 1 (oldest 7m) · JUD 1 (oldest 7m) · OP 0 · CEO 0');
   } finally { store.close(); }

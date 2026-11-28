@@ -4,7 +4,15 @@
 // (or a refused one) → the defaults written in the body — the v2 behaviour, unchanged.
 let current: Readonly<Record<string, number>> = {};
 
-/** The policy `name` of the agent ticking now, else `dflt`. */
+/** YAML-MIGRATION-WAVE1 ②: the policy `name` of the agent ticking now — NO TS default. agent.yaml `policies:` (or its
+ *  generated goal.yaml fallback) is the only source of the number; a missing one is a loud error, never a silent default. */
+export const pn = (name: string): number => {
+  const v = current[name];
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  throw new Error(`policy ${name} is not set — declare it in the agent.yaml policies: block (bodies hold no default)`);
+};
+
+/** The policy `name` of the agent ticking now, else `dflt` (bodies not yet ported). */
 export const pv = (name: string, dflt: number): number => {
   const v = current[name];
   return typeof v === 'number' && Number.isFinite(v) ? v : dflt;

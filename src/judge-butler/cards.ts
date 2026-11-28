@@ -2,6 +2,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parse } from 'yaml';
+import { BINDING_BASES, type BindingBasis } from '../land-graph/cell-link.js';
+import { loadPrBindingPolicy, PR_BINDING_POLICY } from '../land-graph/pr-binding.js';
 
 export interface GoalCard {
   kpi: { greens_per_hour_min: number; judge_queue_median_wait_max_min: number; frozen_hands_max: number; hand_answer_sla_min: number };
@@ -32,14 +34,23 @@ export function loadCards(dir = cardsDir()): { goal: GoalCard; goalText: string;
  *  head and which focused results count as «focused exit 0». Unknown names are ignored; a missing/empty list → the default. */
 export type SameHeadRule = 'exact' | 'patch-id';
 export type FocusedOkRule = 'pass' | 'step-exit-0' | 'preexisting-on-main' | 'doc-only-L0';
-export interface GreenRules { readonly sameHead: readonly SameHeadRule[]; readonly focusedOk: readonly FocusedOkRule[] }
-export const DEFAULT_GREEN_RULES: GreenRules = { sameHead: ['exact', 'patch-id'], focusedOk: ['pass', 'step-exit-0', 'preexisting-on-main', 'doc-only-L0'] };
+/** JUDGE-GREEN-PR-BINDING: `prBinding` = which bases bind a PR to a cell (src/land-graph/cell-link.ts bindsCell) — read from the ONE
+ *  policy graphs/policies/pr-binding.yaml that goal.yaml `green_rules.pr_binding` points at (green-triage reads the same file) ·
+ *  `prMetaFetchPerTick` = PR bodies read per tick (gh pr view · cached forever per merged PR · the rest wait for the next tick). */
+export interface GreenRules {
+  readonly sameHead: readonly SameHeadRule[]; readonly focusedOk: readonly FocusedOkRule[];
+  readonly prBinding: readonly BindingBasis[]; readonly prMetaFetchPerTick: number;
+}
+export const DEFAULT_GREEN_RULES: GreenRules = {
+  sameHead: ['exact', 'patch-id'], focusedOk: ['pass', 'step-exit-0', 'preexisting-on-main', 'doc-only-L0'],
+  prBinding: PR_BINDING_POLICY.bases, prMetaFetchPerTick: 40,
+};
 const SAME_HEAD: readonly string[] = ['exact', 'patch-id'];
 const FOCUSED_OK: readonly string[] = ['pass', 'step-exit-0', 'preexisting-on-main', 'doc-only-L0'];
 
 /** Pure: the goal.yaml text → green rules (fail-open to the default per list). */
 export function parseGreenRules(goalText: string): GreenRules {
-  type GoalYaml = { green_rules?: { same_head?: unknown; focused_ok?: unknown } } | null;
+  type GoalYaml = { green_rules?: { same_head?: unknown; focused_ok?: unknown; pr_binding?: unknown; pr_meta_fetch_per_tick?: unknown } } | null;
   let y: GoalYaml;
   try { y = parse(goalText) as GoalYaml; } catch { return DEFAULT_GREEN_RULES; }
   const pick = <T extends string>(v: unknown, allowed: readonly string[], dflt: readonly T[]): readonly T[] => {
@@ -47,7 +58,11 @@ export function parseGreenRules(goalText: string): GreenRules {
     return l.length ? l : dflt;
   };
   return { sameHead: pick<SameHeadRule>(y?.green_rules?.same_head, SAME_HEAD, DEFAULT_GREEN_RULES.sameHead),
-    focusedOk: pick<FocusedOkRule>(y?.green_rules?.focused_ok, FOCUSED_OK, DEFAULT_GREEN_RULES.focusedOk) };
+    focusedOk: pick<FocusedOkRule>(y?.green_rules?.focused_ok, FOCUSED_OK, DEFAULT_GREEN_RULES.focusedOk),
+    // a path (graphs/policies/pr-binding.yaml) = the ONE policy file · a list = an explicit override (tests)
+    prBinding: typeof y?.green_rules?.pr_binding === 'string' ? loadPrBindingPolicy(resolve(import.meta.dir, '../..', y.green_rules.pr_binding)).bases
+      : pick<BindingBasis>(y?.green_rules?.pr_binding, BINDING_BASES, DEFAULT_GREEN_RULES.prBinding),
+    prMetaFetchPerTick: (() => { const n = y?.green_rules?.pr_meta_fetch_per_tick; return typeof n === 'number' && Number.isInteger(n) && n >= 0 ? n : DEFAULT_GREEN_RULES.prMetaFetchPerTick; })() };
 }
 
 export function loadGreenRules(dir = cardsDir()): GreenRules {

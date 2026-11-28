@@ -1,0 +1,28 @@
+# RELEASE-HUMAN-PROOF-TRUST-ROOT (대표 11-28) — the PWA irreversible two-step confirm (src/nexus/api/decisions-route.ts).
+version: 1
+pwa_confirm:
+  # How long a one-use confirm token (bound to decision id ⊕ choice) stays valid after the first POST — long enough
+  # to read the card again on a phone, short enough that a stale tab cannot finish a decision later.
+  ttl_ms: 300000
+  # Pending tokens kept in memory; the oldest gives way (a fresh first POST asks again).
+  max_pending: 256
+# RELEASE-PRESIGNED-AUTO (대표 11-28 14:4x «자기 전에 미리 서명 · 그 서명으로 자동 발행·서저리 발행»).
+# A pre-authorization card binds version ⊕ mode ⊕ window ⊕ the sha256 of the mode's condition list below (never a cut
+# sha — unknown at signing). Changing a mode's list changes its hash: cards signed before stop counting (re-sign).
+preauth:
+  window:
+    # No --from/--to → the next publish slot ± this many minutes.
+    around_slot_minutes: 120
+    # Publish slots (KST, HH:MM) used when `release schedule` has no publishAt for the version.
+    slots_kst: ["06:00", "18:00"]
+    # A wider window is refused at raise (a pre-signature is for one night, not a standing switch).
+    max_span_minutes: 1440
+  # A green dry run (prepare · install · publish preview · npm --dry-run) older than this does not count.
+  dry_run_max_age_minutes: 360
+  # Red checklist cells with one of these priorities — or no priority — are critical; surgery never waives them.
+  critical_priorities: [P0]
+  modes:
+    # auto = no waiver at all: every red blocks (same as release.autoPublish on-green).
+    auto: [red-0, dry-run-exact-cut, open-hold-0, notes-present, cut-head-prepared]
+    # surgery = quick-surgery semantics: a non-critical red passes only with a recorded reason (cell knownIssue, else --waive-reason).
+    surgery: [critical-red-0, noncritical-red-waived, dry-run-exact-cut, open-hold-0, notes-present, cut-head-prepared]

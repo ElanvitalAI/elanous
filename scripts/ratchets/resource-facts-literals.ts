@@ -1,12 +1,14 @@
 /**
- * RESOURCE-FACTS ratchet — no NEW hardcoded resource facts in src/ (CEO 11-27 10:4x «수호자가 원장으로 관리해야 할 것들을
+ * RESOURCE-FACTS ratchet — no NEW hardcoded resource facts in src/, graphs/, packs/ or agent.yaml (CEO 11-27 10:4x «수호자가 원장으로 관리해야 할 것들을
  * 고정값으로 쓰는 게 큰 문제»). Facts are read from `src/kit/resource-facts` (world registry ⊕ policy file ⊕ defaults).
  *
- * Four kinds, counted per file on non-comment lines of non-test src/*.ts (simulated-world scenario data excluded):
+ * Six kinds, counted per file on non-comment lines of text files (including tests and scenario data):
  *   host     — host names (node-b · minim5 · node-c · mbp · mshq · gcpN · awsN)
  *   account  — codex account names (team · third) as literals
  *   model    — model ids (gpt-N · grok-N · claude-opus/sonnet/haiku-… · glm-N) outside the tier map
  *   expiry   — ISO date literals on a line that reads as an expiry (expir · until · deadline · sunset · END)
+ *   seat     — hand-seat identifiers
+ *   path     — hardcoded headquarters and reference roots
  *
  * Same shape as the HQ-path ratchet (test/no-hardcoded-hq-paths-ratchet.test.ts): today's counts are frozen per file in
  * `resource-facts-literals.baseline.json`; a file may only go down. After migrating call sites, shrink the baseline:
@@ -19,7 +21,7 @@ import { join, relative } from 'node:path';
 export const ROOT = join(import.meta.dir, '..', '..');
 export const BASELINE_PATH = join(import.meta.dir, 'resource-facts-literals.baseline.json');
 
-export const KINDS = ['host', 'account', 'model', 'expiry'] as const;
+export const KINDS = ['host', 'account', 'model', 'expiry', 'seat', 'path'] as const;
 export type Kind = typeof KINDS[number];
 export type Counts = Record<Kind, Record<string, number>>;
 
@@ -29,19 +31,24 @@ export const REGISTRY_FILES: Readonly<Record<Kind, ReadonlySet<string>>> = {
   account: new Set(['src/kit/resource-facts/defaults.ts']),
   model: new Set(['src/kit/resource-facts/defaults.ts', 'src/model-tier/llm-tier-map.ts']),
   expiry: new Set(['src/kit/resource-facts/defaults.ts']),
+  seat: new Set(['src/kit/resource-facts/defaults.ts']),
+  path: new Set(['src/kit/resource-facts/defaults.ts']),
 };
 
 const HOST = /\b(?:node-b|minim5|node-c|mbp|mshq|gcp\d|aws\d)\b/;
 const ACCOUNT_LIT = /(['"`])(?:team|third)\1/;
 const ACCOUNT_CTX = /codex|account/i;
+const ACCOUNT_YAML = /^\s*(?:codex[_-]?)?account\s*:\s*(?:team|third)\s*(?:#.*)?$/i;
 const ACCOUNT_JOINED = /\bcodex[-:/_](?:team|third)\b/;
 const MODEL = /\b(?:gpt-\d+(?:\.\d+)?(?:-[a-z]+)?|grok-\d+(?:\.\d+)?(?:-[a-z-]+)?|claude-(?:opus|sonnet|haiku)-[\w.-]+|glm-\d+(?:\.\d+)?)\b/;
 const DATE = /(['"`])20\d\d-[01]\d-[0-3]\d/;
 const EXPIRY_CTX = /expir|until|deadline|sunset|\bEND\b|validTo|notAfter/i;
+const SEAT = /\b(?:TC|OP|MK|UX|JUD|RES|REL)-H-(?:CX|CC|POOL)-\d+\b/;
+const HQ_PATH = /\/elanous-hq\/|\/source\/ref\b|'elanous-hq'|'source',\s*'ref'/;
 
 export function isCommentLine(line: string): boolean {
   const t = line.trim();
-  return t.startsWith('//') || t.startsWith('*') || t.startsWith('/*');
+  return t.startsWith('//') || t.startsWith('*') || t.startsWith('/*') || t.startsWith('#');
 }
 
 /** Pure: which fact kinds a source line hardcodes. */
@@ -50,13 +57,15 @@ export function kindsInLine(line: string): Kind[] {
   const code = line.replace(/\s\/\/\s.*$/u, ''); // trailing comment
   const out: Kind[] = [];
   if (HOST.test(code)) out.push('host');
-  if (ACCOUNT_JOINED.test(code) || (ACCOUNT_LIT.test(code) && ACCOUNT_CTX.test(code))) out.push('account');
+  if (ACCOUNT_JOINED.test(code) || ACCOUNT_YAML.test(code) || (ACCOUNT_LIT.test(code) && ACCOUNT_CTX.test(code))) out.push('account');
   if (MODEL.test(code)) out.push('model');
   if (DATE.test(code) && EXPIRY_CTX.test(code)) out.push('expiry');
+  if (SEAT.test(code)) out.push('seat');
+  if (HQ_PATH.test(code)) out.push('path');
   return out;
 }
 
-export function emptyCounts(): Counts { return { host: {}, account: {}, model: {}, expiry: {} }; }
+export function emptyCounts(): Counts { return { host: {}, account: {}, model: {}, expiry: {}, seat: {}, path: {} }; }
 
 /** Pure: per-kind counts for one file's source. */
 export function countSource(rel: string, source: string, into: Counts = emptyCounts()): Counts {
@@ -70,10 +79,11 @@ export function countSource(rel: string, source: string, into: Counts = emptyCou
 }
 
 function walk(dir: string, out: string[]): void {
+  if (!existsSync(dir)) return;
   for (const e of readdirSync(dir, { withFileTypes: true })) {
     const p = join(dir, e.name);
-    if (e.isDirectory()) { if (!['node_modules', 'fixtures', '__fixtures__'].includes(e.name)) walk(p, out); }
-    else if (/\.tsx?$/u.test(e.name) && !/\.test\.tsx?$/u.test(e.name) && !e.name.endsWith('.d.ts')) out.push(p);
+    if (e.isDirectory()) { if (!['node_modules', '.git'].includes(e.name)) walk(p, out); }
+    else if (e.isFile()) out.push(p);
   }
 }
 
@@ -83,11 +93,16 @@ export const SIM_WORLD_DIRS = ['src/ux-sim/sim-world/', 'src/ux-sim/worlds/'] as
 export function scanRepo(root = ROOT): Counts {
   const files: string[] = [];
   walk(join(root, 'src'), files);
+  walk(join(root, 'graphs'), files);
+  walk(join(root, 'packs'), files);
+  if (existsSync(join(root, 'agent.yaml'))) files.push(join(root, 'agent.yaml'));
   const c = emptyCounts();
   for (const f of files) {
     const rel = relative(root, f);
-    if (SIM_WORLD_DIRS.some(d => rel.startsWith(d))) continue;
-    countSource(rel, readFileSync(f, 'utf8'), c);
+    const bytes = readFileSync(f);
+    // Binary assets cannot express textual source configuration.
+    if (bytes.includes(0)) continue;
+    countSource(rel, bytes.toString('utf8'), c);
   }
   return c;
 }

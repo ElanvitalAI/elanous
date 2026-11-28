@@ -516,3 +516,20 @@ test('DECISION-LEDGER-HUMAN-AUTH — CLI never attributes a TTY decision to a hu
     expect(new DecisionLedger({ stateDir }).show(person).status).toBe('open');
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 });
+
+test('preauth raise · list · revoke (RELEASE-PRESIGNED-AUTO) — the CLI raises the card and never signs it', async () => {
+  const stateDir = root();
+  const lines: string[] = [];
+  const program = new Command();
+  registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
+  const run = async (...args: string[]) => { lines.length = 0; await program.parseAsync(['decisions', ...args], { from: 'user' }); return lines.join('\n'); };
+  const raised = JSON.parse(await run('preauth', 'raise', '--version', '0.3.39', '--mode', 'auto', '--from', '2099-11-28T19:00:00.000Z', '--to', '2099-11-28T23:00:00.000Z', '--json'));
+  expect(raised.ref).toMatch(/^release-preauth\/0\.3\.39\/auto\/20991128T190000Z\/20991128T230000Z\/[0-9a-f]{12}$/);
+  expect(raised.status).toBe('open');
+  const card = new DecisionLedger({ stateDir }).show(raised.id);
+  expect(card.category).toBe('publish');
+  expect(card.refs).toEqual([raised.ref]);
+  expect(JSON.parse(await run('preauth', 'list', '--json'))).toEqual([{ id: raised.id, version: '0.3.39', mode: 'auto', from: '2099-11-28T19:00:00.000Z', to: '2099-11-28T23:00:00.000Z', state: 'awaiting-signature' }]);
+  expect(JSON.parse(await run('preauth', 'revoke', raised.id, '--reason', 'not tonight', '--json'))).toEqual({ id: raised.id, revoked: true, already: false });
+  expect(new DecisionLedger({ stateDir }).show(raised.id).proof).toBeUndefined();
+});

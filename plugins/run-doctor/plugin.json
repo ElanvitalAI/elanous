@@ -1,0 +1,27 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "run-doctor",
+  "name": "run-doctor",
+  "version": "1.0.0",
+  "description": "실패→재성공 비율을 0.5 이상으로 — 진단 카드 ⊕ 기반 실패 자동 재실행 1회",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "run-doctor",
+          "agent": "../../graphs/loop-agents/run-doctor/agent.yaml",
+          "trigger": "../../graphs/triggers/run-doctor-agent.yaml",
+          "kpis": [
+            "re_success_ratio"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -341,7 +341,9 @@ const markOf = (word: StatusWord): string => `${COLOR_SGR[STATUS[word].color]}${
 const REVERSE = `${ESC}[7m`;
 
 // 출처: seat-state/OP/orders/ELS-FIRST-RUN-UX-1119.md ③ 하단 항상 · UX #38884 FIRST_RUN_HINT 리터럴
-export const FIRST_RUN_HINT = 'ctrl+b c new shell · a chat · s list · j/k move · x close · q quit · ? help';
+// ELS-SHORTCUTS-POPUP (대표 11-28): «? shortcuts» leads — the status line is cut to the width after the build label, and the
+// key that lists every other key is the one that must stay (80 cols with a dev label keeps «ctrl+b ? shortcuts · c»).
+export const FIRST_RUN_HINT = 'ctrl+b ? shortcuts · c new shell · a chat · s list · j/k move · x close · q quit';
 
 /** The workspace line shows the most urgent state inside it (blocked, then working, then idle, then done). */
 function rolledUp(words: readonly StatusWord[]): StatusWord {
@@ -463,5 +465,3 @@ export function createAppFrameWriter(write: (text: string) => void): (screen: st
     write(`${SYNC_BEGIN}${paint}${tail}${SYNC_END}`);
   };
 }
-
-export const SIDEBAR_HELP = 'ctrl+b: m move tab · , rename tab · j/k move · w workspace · 1-9 · c new pane · a Elanous chat · N new workspace · x close · D close workspace · s sidebar · g sort agents · / sidechat · o Obsidian · PgUp/PgDn/Home/End list · ←/→ tabs · q detach';

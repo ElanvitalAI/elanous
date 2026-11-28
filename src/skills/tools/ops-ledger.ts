@@ -62,7 +62,6 @@ import { loadFederationLadder } from '../../msg/hand-raise-ladder.js';
 import { senderAboveOnLadder } from '../../tui/seat-mail-turn-policy.js';
 import {
   addItem,
-  devVersion,
   listChecklist,
   ownerMatches,
   parityGap,
@@ -84,6 +83,7 @@ import { hqFenceDecision, type HqDeps } from '../../hq/hq.js';
 import { fileLeaseStore } from '../../hq/lease.js';
 import { isIsolatedLedgerWriteRoot } from '../../hq/ledger-write-target.js';
 import { debug } from '../../debug/log.js';
+import { boardVersion } from '../../release-loop/board-version.js';
 
 // ── shared helpers ──────────────────────────────────────────────────────────
 
@@ -135,7 +135,7 @@ function checklistCodenames(): Record<string, string> {
 /** Resolve a version or codename alias — mirrors the CLI `checklistVersion`
  *  (default: package.json dev version with the -dev.N suffix stripped). */
 function resolveChecklistVersion(input: string | undefined): string {
-  const v = input ?? devVersion().replace(/-dev\.\d+$/, '');
+  const v = input ?? boardVersion();
   const resolved = RELEASE_VERSION.test(v)
     ? v
     : Object.entries(checklistCodenames()).find(([, name]) => name === v)?.[0] ?? v;

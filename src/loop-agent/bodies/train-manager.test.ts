@@ -7,7 +7,7 @@ import { parseKnowhowItems } from '../../seat-loop/seat-knowhow.js';
 import { loadCard } from '../card.js';
 import { fileAgentMemory } from '../memory.js';
 import { tickAgent, type AgentPorts } from '../runtime.js';
-import type { LandPolicy } from '../../land-steward/policy.js';
+import type { LandPolicy } from '../../land-graph/lane-order.js';
 import { createBody, type TrainManagerDeps } from './train-manager.js';
 
 // The body delegates to the land-steward train manager (decision 11-27): lanes come from land-steward `lanes()`, the order
@@ -67,11 +67,24 @@ describe('train-manager → land-steward train manager (delegated body)', () => 
   });
 });
 
+describe('train-manager DETECT-TO-ACTION: a pin already proposed for this order is not planned again', () => {
+  test('11-27 journal «행동 0/3 · 거절 3»: the sent lane leaves the plan, the next lane gets the slot · a new order is proposed again', async () => {
+    const w = world(); const h = harness(w);
+    const t1 = await tickAgent(h.card, h.body, h.ports, T0);
+    expect(t1.acted).toEqual(['propose-pin:lane:src/hot.ts']);
+    const t2 = await tickAgent(h.card, h.body, h.ports, new Date(T0.getTime() + 5 * 60_000));
+    expect(t2.planned).toBe(0);
+    expect(t2.deferred).toBeUndefined();
+    expect(t2.refused).toEqual([]);
+    expect(w.mails.length).toBe(1);
+  });
+});
+
 describe('train-manager card', () => {
   test('card loads · address = id upper · knowhow parses', () => {
     const c = loadCard('train-manager');
     expect(c).toMatchObject({ id: 'train-manager', address: 'TRAIN-MANAGER', supervisor: 'TC', name: '기차 매니저', kpi: { name: 'hot_file_churn_refusals', dir: 'at_most', target: 0 } });
-    expect(c.rights.actions).toEqual(['propose-pin']);
+    expect(c.rights.actions).toEqual(['apply-pin', 'release-pin', 'propose-pin']);
     const kh = readFileSync(resolve(import.meta.dir, '../../../graphs/loop-agents/train-manager/knowhow.md'), 'utf8');
     expect(parseKnowhowItems(kh, 'TRAIN-MANAGER').length).toBeGreaterThanOrEqual(3);
   });

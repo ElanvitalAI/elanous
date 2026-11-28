@@ -1,12 +1,12 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DecisionLedger } from '../../decisions/decision-ledger.js';
 import { MsgStore } from '../../msg/msg-store.js';
 import { debug } from '../../debug/log.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
-import { handleDecisions } from './decisions-route.js';
+import { handleDecisions, parseReleaseProofPolicy, releaseProofPolicyPath } from './decisions-route.js';
 import { handleOpsBoard } from './ops-board-route.js';
 import { decide as pwaDecide, listOpenDecisions as pwaListOpenDecisions } from '../../../apps/pwa/src/lib/decisions-api.js';
 import { routeRequest, type NexusHttpServerOpts } from './http-server.js';
@@ -150,17 +150,27 @@ test('POST decides in the real temporary ledger as human; missing, closed and in
   expect((await dispatch(ledger, path('missing'), post('a')))?.status).toBe(404);
   expect((await dispatch(ledger, path(first.id), post('z')))?.status).toBe(400);
   expect(ledger.show(first.id).status).toBe('open');
-  const response = await dispatch(ledger, path(first.id), post('a', '선택 이유'));
+  // Irreversible (money): the first POST asks for the two-step confirm; a wrong or reused token is refused.
+  const asked = await dispatch(ledger, path(first.id), post('a', '선택 이유'));
+  expect(asked?.status).toBe(428);
+  const { confirmToken } = await asked!.json() as { confirmToken: string };
+  expect(confirmToken).toMatch(/^[0-9a-f]{32}$/);
+  expect(ledger.show(first.id).status).toBe('open');
+  const confirm = (token: string, choice = 'a') => ({ method: 'POST', headers: { ...auth, 'content-type': 'application/json' }, body: JSON.stringify({ choice, note: '선택 이유', confirmToken: token }) });
+  expect((await dispatch(ledger, path(first.id), confirm(confirmToken, 'b')))?.status).toBe(409); // bound to choice a · now spent
+  const again = await (await dispatch(ledger, path(first.id), post('a', '선택 이유')))!.json() as { confirmToken: string };
+  const response = await dispatch(ledger, path(first.id), confirm(again.confirmToken));
   expect(response?.status).toBe(200);
   expect(await response?.json()).toMatchObject({ id: first.id, status: 'decided', choice: 'a', decidedBy: { kind: 'human' } });
-  expect(ledger.show(first.id)).toMatchObject({ status: 'decided', decidedBy: { kind: 'human' }, choice: 'a', note: '선택 이유' });
+  expect(ledger.show(first.id)).toMatchObject({ status: 'decided', decidedBy: { kind: 'human', via: 'pwa', platformUserId: 'pwa-owner' }, choice: 'a', note: '선택 이유' });
+  expect(ledger.show(first.id).proof).toBeUndefined(); // not a release-critpath card — nothing is signed
   expect((await dispatch(ledger, path(first.id), post('b')))?.status).toBe(409);
   expect((await dispatch(ledger, path(second.id), { method: 'POST', headers: auth, body: '{}' }))?.status).toBe(400);
   const listed = await dispatch(ledger, '/v1/decisions?status=open', { headers: auth });
   expect((await listed?.json() as { decisions: Array<{ id: string }> }).decisions.map(item => item.id)).toEqual([second.id]);
   const events = debug.events(30).filter(event => event.category === 'decisions.api');
   expect(events).toContainEqual(expect.objectContaining({ event: 'decided', data: expect.objectContaining({ id: first.id }) }));
-  for (const reason of ['not-found', 'bad_request', 'already-decided']) {
+  for (const reason of ['not-found', 'bad_request', 'already-decided', 'confirm-invalid']) {
     expect(events).toContainEqual(expect.objectContaining({ event: 'rejected', data: expect.objectContaining({ reason }) }));
   }
   expect(JSON.stringify(events)).not.toContain('선택 이유');
@@ -208,4 +218,10 @@ test('route handler fails closed without an injected authorization check, even w
   expect((await handleDecisions(new Request('http://nexus.test/v1/decisions?status=open'), { ledger })).status).toBe(401);
   expect((await handleDecisions(new Request(`http://nexus.test/v1/decisions/${first.id}/decide`, post('a')), { ledger })).status).toBe(401);
   expect(ledger.show(first.id).status).toBe('open');
+});
+
+test('release-proof policy pack: the shipped pwa_confirm values parse; a malformed pack is loud', () => {
+  expect(parseReleaseProofPolicy(readFileSync(releaseProofPolicyPath(), 'utf8'))).toEqual({ ttlMs: 300000, maxPending: 256 }); // 출처: #40665 graphs/policies/release-proof.yaml pwa_confirm (shipped values)
+  expect(() => parseReleaseProofPolicy('version: 1\npwa_confirm:\n  ttl_ms: soon\n  max_pending: 256\n')).toThrow('release-proof policy: pwa_confirm.ttl_ms must be a positive integer');
+  expect(() => parseReleaseProofPolicy('version: 2\npwa_confirm:\n  ttl_ms: 1\n  max_pending: 1\n')).toThrow('release-proof policy: version must be 1');
 });

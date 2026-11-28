@@ -40,7 +40,6 @@ export interface HandIn { readonly seat: string; readonly space: string; readonl
 
 export const BOARD_WRITERS: readonly string[] = ['OP', 'BOARD', 'CLAUDE-OP', 'STEWARD:BOARD'];
 export const READY_PER_HAND = 2;
-export const CARD_CAP = 3;
 export const CARD_WINDOW_MS = 10 * 60_000;
 export const ORDER_MAX = 32;
 
@@ -192,11 +191,26 @@ export function breaches(input: { health: Health; leader: { flagged: boolean; by
   return out;
 }
 
-/** Beacon-style cap: at most CARD_CAP cards per CARD_WINDOW_MS, never the same key twice in the window. */
-export function cardsAllowed(breach: readonly Breach[], sent: ReadonlyArray<{ at: number; key: string }>, now: number): Breach[] {
+/** Select pool-scaled candidates before the independent send window; null means the pool could not be measured. */
+export function cardCandidates(breach: readonly Breach[], limit: number | null): Breach[] {
+  if (limit === null || !Number.isSafeInteger(limit) || limit < 0) return [];
+  return breach.slice(0, limit);
+}
+
+/** Beacon-style cap: at most cap cards per CARD_WINDOW_MS, never the same key twice in the window. */
+export function cardsAllowed(breach: readonly Breach[], sent: ReadonlyArray<{ at: number; key: string }>, now: number, cap: number | null): Breach[] {
+  if (cap === null || !Number.isSafeInteger(cap) || cap < 0) return [];
   const recent = sent.filter((s) => now - s.at < CARD_WINDOW_MS);
   const seen = new Set(recent.map((s) => s.key));
-  return breach.filter((b) => !seen.has(b.key)).slice(0, Math.max(0, CARD_CAP - recent.length));
+  const allowed: Breach[] = [];
+  const remaining = Math.max(0, cap - recent.length);
+  for (const b of breach) {
+    if (allowed.length >= remaining) break;
+    if (seen.has(b.key)) continue;
+    seen.add(b.key);
+    allowed.push(b);
+  }
+  return allowed;
 }
 
 export function digestLine(input: { phase: PulsePhase; version: string; order: readonly string[]; health: Health; cut: CutList | null }): string {

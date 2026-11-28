@@ -591,6 +591,32 @@ export function history(id: string): Array<ChecklistHistory & { version: string;
   finally { db.close(); }
 }
 
+/** JUDGE-GREEN-PR-BINDING-LEGACY: per cell, every evidence write (field evidence = the whole text · evidence.add = one line)
+ *  and the seats that held it (claim/add/owner targets · writer events) — every release, in time order. One read. */
+export function trails(ids: readonly string[], root?: string): Map<string, { writes: Array<{ at: string; by: string; text: string }>; claimants: string[]; writers: string[] }> {
+  const out = new Map<string, { writes: Array<{ at: string; by: string; text: string }>; claimants: string[]; writers: string[] }>();
+  const want = [...new Set(ids)];
+  if (!want.length) return out;
+  const db = open(root);
+  try {
+    for (let i = 0; i < want.length; i += 400) {
+      const chunk = want.slice(i, i + 400);
+      const rows = db.query(`SELECT * FROM events WHERE feature_id IN (${chunk.map(() => '?').join(',')}) AND field IN ('evidence', 'evidence.add', 'claim', 'add', 'owner', 'writer') ORDER BY at, seq`).all(...chunk) as EventRow[];
+      for (const row of rows) {
+        const t = out.get(row.feature_id) ?? { writes: [], claimants: [], writers: [] };
+        out.set(row.feature_id, t);
+        const to = decode(row.to) as unknown;
+        const seat = (v: unknown): string | null => typeof v === 'string' ? v : v && typeof v === 'object' && typeof (v as { owner?: unknown }).owner === 'string' ? (v as { owner: string }).owner : null;
+        if (row.field === 'evidence' || row.field === 'evidence.add') { if (typeof to === 'string' && to) t.writes.push({ at: row.at, by: row.by, text: to }); continue; }
+        if (row.field === 'writer') { const w = to && typeof to === 'object' ? (to as { seat?: unknown }).seat : null; if (typeof w === 'string' && !t.writers.includes(w)) t.writers.push(w); continue; }
+        const s = seat(to)?.split('/')[0]?.trim();
+        if (s && !t.claimants.includes(s)) t.claimants.push(s);
+      }
+    }
+  } finally { db.close(); }
+  return out;
+}
+
 export function details(id: string): { id: string; title: string; owner: string | null; kind: string | null; createdAt: string; evidence: Array<{ version: string; ref: string; at: string; by: string }> } | null {
   importLegacyAll();
   const db = open();

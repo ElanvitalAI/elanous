@@ -20,6 +20,7 @@
 // surface-agnostic.
 
 import { leaderCard } from './leader-card.js';
+import { BUS_WRITE_RULE_LINE } from '../op-context-bus/spaces.js';
 import { execFileSync } from 'node:child_process';
 import { closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -241,7 +242,8 @@ const COORDINATOR_PROFILE = `## 조율자 프로필 (이 자리 = 조율 자리)
 
 /** 조율 자리 프로필 한 장(코딩 lifecycle 자리를 대신한다). */
 export function buildCoordinatorProfileAddendum(): LLMMessage[] {
-  return [{ role: 'system', content: COORDINATOR_PROFILE }];
+  // CONTEXT-BUS-FEDERATION — the same one bus line the leader card carries (session-pinned · no per-turn value).
+  return [{ role: 'system', content: `${COORDINATOR_PROFILE}\n${BUS_WRITE_RULE_LINE}` }];
 }
 
 /** ★ 자기인지 하니스 공간 addendum(2026-07-21 대표 co-design) — 이 프로세스가 격리 self-dev-harness 공간

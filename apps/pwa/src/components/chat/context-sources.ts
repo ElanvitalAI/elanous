@@ -1,4 +1,4 @@
-import type { ContextNowAnswer, ContextFact, ContextEvent } from '../../../../../src/context-bus/context-now';
+import type { ContextNowAnswer, ContextFact, ContextEvent } from '../../../../../src/context-bus/context-now-types';
 import { toPublicText } from '../inside/public-text';
 import { seatsNowLine } from './seats-now-line';
 

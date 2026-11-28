@@ -1,0 +1,33 @@
+# PR-ZOMBIE-AGING (0.3.40 P1 · CEO 11-29 02:3x «당장 바로 시작»): when an open PR stops being supply.
+# Incident 11-28: `eln pulse throughput` read «141 waiting» — most were #36xxx–#38xxx PRs whose head had not moved for over a
+# week and which no longer merged onto main. They counted as pipeline, so the controller chased a supply it did not have.
+# Read by src/kit/pr-aging/index.ts (the land steward's tick · land-graph.tick · and the throughput controller). Code holds none
+# of these numbers. Changed by PR (policy owner OP · landing L0 TC) — never written at run time.
+schema: 1
+
+# How old the head is = the head commit's committer time (local git object · never a network fetch), else the PR's
+# updatedAt (any activity — an upper bound on the last push, so an age read from it is never too large). Neither known
+# = unknown age: the PR counts as fresh and is never aged (an unmeasured PR is not hidden from supply).
+
+# Supply (`eln pulse throughput` pipeline · awaiting pregate): only fresh PRs — not draft, head updated within this.
+supply:
+  fresh_head_max_days: 7
+
+# A zombie = old head ⊕ a structured «does not merge onto main» signal on that same head:
+conflict:
+  pregate_red_stages: [merge-main]      # a PREGATE-RED receipt of this head whose step of this name exited ≠ 0
+  land_refusals: [merge-conflict]       # a land-graph ledger `refused` row of this head with this class
+
+# Stage 1 — convert to draft (`gh pr ready <N> --undo`, reversible) ⊕ one card to the author. Live mode only; shadow and
+# plan report «would-draft». One card per (PR · head · stage).
+to_draft:
+  head_age_days: 7
+  require_conflict: true
+  max_per_tick: 20                      # gh writes per tick (the rest wait for the next tick)
+  card_to: [author]
+
+# Stage 2 — close proposal card (code never closes: a separate triage run decides and closes). Drafts included.
+close_proposal:
+  head_age_days: 14
+  require_conflict: true
+  card_to: [author, landing-owner]      # landing-owner = the org duty «landing» (land-authority) · author = the PR's seat

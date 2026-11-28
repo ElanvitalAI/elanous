@@ -2,10 +2,28 @@ import { afterAll, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { decideSeatMailTrust, declaredFederationSeats } from './seat-mail-trust.js';
+import { decideSeatMailTrust, declaredFederationSeats, declaredFederationSeatsStrict } from './seat-mail-trust.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'seat-mail-trust-'));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
+
+test('strict declarations distinguish empty sources from missing or malformed sources', () => {
+  const base = join(tmp, 'strict');
+  const stateRoot = join(base, 'state');
+  mkdirSync(stateRoot, { recursive: true });
+  mkdirSync(join(base, '.elanous'), { recursive: true });
+  const deps = { stateRoot, cwd: base, home: base };
+  const registry = join(stateRoot, 'seat-registry.json');
+  const workspace = join(base, '.elanous', 'federation.yaml');
+  writeFileSync(workspace, 'version: 1\nseats: {}\nspaces: {}\n');
+  expect(declaredFederationSeatsStrict(deps)).toBeNull();
+  writeFileSync(registry, '{broken');
+  expect(declaredFederationSeatsStrict(deps)).toBeNull();
+  writeFileSync(registry, JSON.stringify({ version: 1, seats: [] }));
+  expect([...declaredFederationSeatsStrict(deps)!]).toEqual([]);
+  writeFileSync(workspace, 'version: 1\nseats: { A: { runtme: eln } }\n');
+  expect(declaredFederationSeatsStrict(deps)).toBeNull();
+});
 
 test('trust decision from structured fields only; the ledger stamp is required', () => {
   const seats = new Set(['TC']);

@@ -3,6 +3,7 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSy
 import { spawnSync } from 'node:child_process';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { runGitCommand } from '../git-fs/runner.js';
+import { remoteUrlShell, remoteUrlVia } from '../git-fs/origin-url.js';
 import { runGhCliWithResult, type GhCliResult } from '../git-fs/gh-cli.js';
 import { registeredSeats } from '../seat-address/seat-address.js';
 import { debug } from '../debug/log.js';
@@ -132,8 +133,14 @@ function ensureSandboxIgnored(repo: string): void {
 }
 // A local relative origin (`../remote.git`) is relative to the calling checkout, not to repo.git. Git itself
 // resolves it from the checkout's top level even when run from a subdirectory, so the same base is used here.
+function originUrlOf(cwd: string): string {
+  const url = remoteUrlVia((argv) => { const r = runGitCommand(cwd, argv, { encoding: 'utf8' }); return r.status === 0 ? r.stdout : null; });
+  if (url === null) throw new Error('git config --get remote.origin.url: no origin');
+  return url;
+}
 function callerOrigin(): string {
-  const origin = git(process.cwd(), 'remote', 'get-url', 'origin');
+  // GH-MIRROR-ORIGIN-URL-SAFE: the raw configured URL — a fetch mirror's insteadOf would hand repo.git a local mirror path
+  const origin = originUrlOf(process.cwd());
   const url = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(origin);
   const scpLike = /^[^/]*:/.test(origin);
   if (url || scpLike || isAbsolute(origin)) return origin;
@@ -267,7 +274,7 @@ if [ ! -e "$repo" ]; then echo "remote seat repository is missing: $repo" >&2; e
 if [ "$(git --git-dir="$repo" rev-parse --is-bare-repository)" != true ]; then
   echo "not a bare repository: $repo" >&2; exit 1
 fi
-remote_origin="$(git --git-dir="$repo" remote get-url origin)"
+remote_origin="$(${remoteUrlShell('"$repo"')})"
 if [ "$remote_origin" != ${quoteShell(origin)} ]; then
   echo "remote origin mismatch; refusing to reuse repository" >&2; exit 1
 fi
@@ -282,7 +289,7 @@ fi
 if [ "$(git --git-dir="$repo" rev-parse --is-bare-repository)" != true ]; then
   echo "not a bare repository: $repo" >&2; exit 1
 fi
-remote_origin="$(git --git-dir="$repo" remote get-url origin)"
+remote_origin="$(${remoteUrlShell('"$repo"')})"
 if [ "$remote_origin" != ${quoteShell(origin)} ]; then
   echo "remote origin mismatch; refusing to reuse repository" >&2; exit 1
 fi
@@ -429,13 +436,13 @@ export function hqInit(options: { root?: string; home?: string } = {}): { root: 
     repository(root);
     if (!fresh) {
       // An existing mirror must be of the repository init is run for; never re-point or reuse another one.
-      const mirrored = runGitCommand(repo, ['remote', 'get-url', 'origin'], { encoding: 'utf8' });
+      const mirrored = remoteUrlVia((argv) => { const r = runGitCommand(repo, argv, { encoding: 'utf8' }); return r.status === 0 ? r.stdout : null; });
       const caller = callerOrigin();
-      if (mirrored.status === 0 && mirrored.stdout.trim() !== caller) throw new Error(`repo.git mirrors ${mirrored.stdout.trim()}, not ${caller}; refusing to reuse ${root}`);
+      if (mirrored !== null && mirrored !== caller) throw new Error(`repo.git mirrors ${mirrored}, not ${caller}; refusing to reuse ${root}`);
     }
     // An interrupted first fetch leaves a bare repository but no origin/main. Finish it on retry.
-    const remote = runGitCommand(repo, ['remote', 'get-url', 'origin'], { encoding: 'utf8' });
-    if (remote.status !== 0) {
+    const remote = remoteUrlVia((argv) => { const r = runGitCommand(repo, argv, { encoding: 'utf8' }); return r.status === 0 ? r.stdout : null; });
+    if (remote === null) {
       // Only an empty, just-initialized repo.git (an init stopped before `remote add`) is finished here.
       if (git(repo, 'for-each-ref') !== '' || existsSync(join(repo, 'worktrees'))) throw new Error(`repo.git has no origin but is not empty; refusing to adopt ${repo}`);
       const source = callerOrigin();
@@ -443,7 +450,7 @@ export function hqInit(options: { root?: string; home?: string } = {}): { root: 
     }
     const main = runGitCommand(repo, ['rev-parse', '--verify', 'refs/remotes/origin/main'], { encoding: 'utf8' });
     configureMainOnlyFetch(repo);
-    if (fresh || remote.status !== 0 || main.status !== 0) {
+    if (fresh || remote === null || main.status !== 0) {
       git(repo, 'fetch', 'origin');
     }
     git(repo, 'rev-parse', '--verify', 'refs/remotes/origin/main');

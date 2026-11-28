@@ -39,7 +39,7 @@ export type VoiceAction =
   | { cmd: 'expire-due' } | { cmd: 'escalate'; to: string; why: string } | { cmd: 'demote'; to: string; why?: string };
 /** The closed L1 command set the voice may use — each returns one line with its evidence id. */
 export interface VoiceCommands {
-  sign(cell: string): { ok: boolean; line: string; ref?: string };
+  sign(cell: string): Promise<{ ok: boolean; line: string; ref?: string }>;
   explain(cell: string): string;
   proposeNarrow(hold: string, from: string): { ok: boolean; line: string; ref?: string };
   expireDue(): { line: string; refs: string[] };
@@ -108,11 +108,11 @@ export function parseVoice(text: string): { reply: string; actions: VoiceAction[
 /** Channel action token (PR #40331 contract: /^[A-Za-z0-9._:=-]{1,120}$/) — what the body executed, recorded by the channel as a ref. */
 export const actionToken = (verb: string, arg = ''): string => `${verb}${arg ? `:${arg}` : ''}`.replace(/[^A-Za-z0-9._:=-]/gu, '_').slice(0, 120);
 
-export function runVoiceActions(actions: readonly VoiceAction[], msg: VoiceMessage, cmds: VoiceCommands): { lines: string[]; refs: string[]; escalated: boolean; tokens: string[] } {
+export async function runVoiceActions(actions: readonly VoiceAction[], msg: VoiceMessage, cmds: VoiceCommands): Promise<{ lines: string[]; refs: string[]; escalated: boolean; tokens: string[] }> {
   const lines: string[] = []; const refs: string[] = []; const tokens: string[] = []; let escalated = false;
   for (const a of actions.slice(0, 6)) {
     switch (a.cmd) {
-      case 'sign': { const r = cmds.sign(String(a.cell ?? '')); lines.push(r.line); if (r.ref) refs.push(r.ref); tokens.push(actionToken(r.ok ? 'sign' : 'sign-refused', String(a.cell ?? ''))); break; }
+      case 'sign': { const r = await cmds.sign(String(a.cell ?? '')); lines.push(r.line); if (r.ref) refs.push(r.ref); tokens.push(actionToken(r.ok ? 'sign' : 'sign-refused', String(a.cell ?? ''))); break; }
       case 'explain': lines.push(cmds.explain(String(a.cell ?? ''))); tokens.push(actionToken('explain', String(a.cell ?? ''))); break;
       case 'propose-narrow': { const r = cmds.proposeNarrow(String(a.hold ?? ''), msg.from); lines.push(r.line); if (r.ref) refs.push(r.ref); tokens.push(actionToken(r.ok ? 'propose-narrow' : 'propose-refused', String(a.hold ?? ''))); break; }
       case 'expire-due': { const r = cmds.expireDue(); lines.push(r.line); refs.push(...r.refs); tokens.push(actionToken('expire-due', String(r.refs.length))); break; }
@@ -166,7 +166,7 @@ export async function voiceTurn(msg: VoiceMessage, state: VoiceState, deps: Voic
       const out = await deps.llm!.complete(prompt.system, prompt.user);
       model = out.model;
       const parsed = parseVoice(out.text);
-      const acted = runVoiceActions(parsed.actions, msg, deps.cmds);
+      const acted = await runVoiceActions(parsed.actions, msg, deps.cmds);
       escalated = acted.escalated; refs = acted.refs; actions = acted.tokens;
       reply = [parsed.reply || '(빈 답)', ...(acted.lines.length ? [`— 행동: ${acted.lines.join(' · ')}`] : [])].join('\n');
     } catch (e) {

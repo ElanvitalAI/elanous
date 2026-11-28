@@ -1,0 +1,70 @@
+# JUDGE-GREEN-PR-BINDING — the ONE rule for «which merged PR counts for a cell». Read by src/land-graph/pr-binding.ts
+# (loadPrBindingPolicy) and used through one function (boundPrs) by BOTH green lanes:
+#   - eln release checklist green-triage (src/release-loop/green-triage.ts · every live lane: op-pulse · fed-observe · steward)
+#   - the judge butler's done-when (src/judge-butler/done-when.ts judgeCell)
+# A mention of «#N» in a cell's evidence alone never binds (#40647: «#40622 is unrelated, NOT proof» signed green).
+# Change a word or a basis here, not in TS.
+version: 1
+bases:                       # which bases bind a PR to a cell (order = how the refusal line names them)
+  - cell-line                # PR body «칸: <ID>» line · «등록 칸: A · B» umbrella list (a «칸» line its title/branch contradict = mislabelled)
+  - title                    # <ID> as a whole token in the PR title
+  - branch                   # <ID> in the head branch name (ids ≥ 6 chars)
+  - pipeline                 # its post-merge sweep bound it: cell-link.jsonl attach (title/branch/files) · auto-cell · cell source «PR #N»
+  - own-evidence             # legacy PRs only (below)
+# JUDGE-GREEN-PR-BINDING-LEGACY (11-28 · butler greens 13/h → 2/h after #40647): PRs older than the «칸:» body convention and
+# the cell-link sweep (#40348 family · #40270 · #40268 · #38969 …) say nothing about any cell. For such a PR — no «칸» line at
+# all, title/branch/sweep naming no cell of the release — the cell's own evidence may bind it: a clause written by the cell's
+# own seat that cites the PR as its implementation, with no negation word in that same clause. Never the cell's
+# subject PR (its number in the cell id or title: LAND-PREGATE-BYPASS-40606 · «#39373 셀프리뷰 후보»).
+own_evidence:
+  authors:                   # whose clause counts (the earliest write of the clause, across releases — events of features.sqlite)
+    - owner                  # the cell's owner seat («OP/claude» → OP)
+    - writer                 # the hand writing a coordinator-held cell (writer events)
+    - claimant               # a seat that held the cell (claim/add events)
+    - owner-hand             # the owner's hands (<OWNER>-H-*)
+    - unattributed           # «cli» = a write made without ELANOUS_TRACK — coordinator and seat shells (half of all evidence writes)
+  pipeline_authors:          # writers whose bare «#N» line is the post-merge sweep's own attach
+    - land-graph
+  never_authors:             # judges never bind a PR by their words (their denials still count)
+    - JUDGE-BUTLER
+    - JUD
+    - JUD-*
+  exclude_cells:             # cells never bound by their evidence («*-E4» closes on its own evidence run · its evidence cites the parent's PR)
+    - '*-E4'
+  implementation:            # a clause «cites the PR as its implementation» when it carries one of these words (case-insensitive) ·
+    - merged                 # built-in shapes count too: «#N <sha>» · «#N@<sha>» · «head <sha>» · «PREGATE-GREEN/N-» · a bare «#N» line
+    - 병합
+    - 착지
+    - landed
+    - implementing
+    - implements
+    - implemented
+    - 구현
+    - 수리 PR
+    - fix PR
+  negation:                  # a clause citing the PR that carries one of these (case-insensitive) never binds it (that clause only)
+    - 무관
+    - 미병합                 # a negation wins inside its clause («미병합» carries «병합»)
+    - not merged
+    - unmerged
+    - unrelated
+    - not proof
+    - irrelevant
+    - 관련 없
+    - 아님
+    - 아니다
+    - 아니며
+    - 아니라
+    - 아니고
+    - 아닌
+    - not this cell
+    - not the fix
+    - 선행
+    - precursor
+    - predecessor
+    - 대상 PR
+    - subject PR
+    - 겹침
+    - overlap
+    - 별개
+    - 출처

@@ -1,0 +1,19 @@
+# FED-ANALYST-LOOP-AGENT (0.3.39 P1) — the names the fed-analyst loop agent reads (src/fed-analyst/live.ts loadLists).
+# Numbers (thresholds · window) live in graphs/loop-agents/fed-analyst/agent.yaml `policies:` — not here.
+# The definitions mirror the Claude analyst's scripts (seat-state/OP/design-archive-1126: fed-chatlog-metrics.py ·
+# fed-topology.py · fed-sim-v2-topology.py) so the loop agent's numbers match the 30-min hand analysis.
+version: 1
+# eigenvector check = max over these (pass board «조율자 고유벡터 ≤ 0.4»)
+coordinators: [OP, TC, JUD, UX, MK, RES, REL]
+# machine-made mail (fed-chatlog-metrics.py MACHINE) — template bodies ([✋ RESOLVED · [OP · re-ask · [연방 공보 · [pulse ·
+# [행정관 · [BOARD · writer-check) count as machine too
+machine_senders: [ORCHESTRATOR, LAND-GRAPH]
+# loop agents / stewards: their requests are not «unanswered edges» (a machine re-asks by design · silence-watch owns it)
+agent_senders: [ORCHESTRATOR, LAND-GRAPH, LAND-STEWARD, JUDGE-BUTLER, GUARDIAN, SIGNAL-DIGEST, GRAPH-TRIGGER, POSTOFFICE, TC-ADV, FED-ANALYST,
+  RUN-SUPERVISOR, RUN-DOCTOR, AUTOPSY, MACROPHAGE, TRAIN-MANAGER, RELEASE-ROCKET, SILENCE-WATCH, WATCHERS-CHECK, HAND-STEWARD]
+# never dormant (read by a session, not a pane)
+not_dormant: [CLAUDE-OP, OP, CEO]
+hand_prefixes: [TC-H, MVP, HAND, MOB]
+# the live mail window = what the 30-min chat-log collector reads: these seats ⊕ every seat with a pane
+# (seat-state/OP/tools/fed-chatlog-collect-1126.sh SEATS)
+collector_seats: [OP, TC, JUD, UX, MK, REL, RES, RES-INFRA, CLAUDE-OP, OPC, JUD-B, JUD-C, JUD-3, REVIEW-1, ORCHESTRATOR]

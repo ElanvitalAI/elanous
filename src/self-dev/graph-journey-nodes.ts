@@ -43,6 +43,9 @@ export const JOURNEY_NODE_IDS = [
   'ready',
   'pr-head-checkout',
   'recover',          // LAND-REFUSAL-EDGES — 착지 거부 결속 간선의 목적지(recover@1 subgraph)
+  'cell-review',      // DEV-REVIEW-COMMON — 칸 완료조건 검토(cell-review@1 subgraph · 손 경로 work next 와 같은 부품)
+  'pre-impl',         // DEV-REVIEW-COMMON — 구현 전 핵심/엣지 쪼개기(pre-impl@1 subgraph)
+  'post-impl',        // DEV-REVIEW-COMMON — 첫 게이트 뒤 판정선 재확인(post-impl@1 subgraph · 손 경로 첫 pregate)
   'stopped',
 ] as const;
 export type JourneyNodeId = typeof JOURNEY_NODE_IDS[number];

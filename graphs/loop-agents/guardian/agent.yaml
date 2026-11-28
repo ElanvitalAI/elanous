@@ -1,0 +1,550 @@
+# 수호자 (guardian) — LOOP-AGENT v3 YAML definition (GUARDIAN-V3-SMART · GUARDIAN-SUBS · 대표 11-27 «모든 것 YAML 정의 · 플러그인 설치» ·
+# «① 본다 ② 정상화» · remove-first). Schema: src/loop-agent/v3/agent-yaml.ts · lint: eln loop agent lint guardian.
+# The ONE definition of the guardian: the trigger registry reads wake: from here (graphs/triggers/guardian.yaml is only the tick
+# shim) · every number the body and its seven subs read is under policies: (src/guardian-agent/def.ts gp() — the code keeps no
+# copy; its last-resort defaults warn when used) · the seven sub-loop agents and their detectors are subs: · the v3 hooks
+# (reflect · plan · learn-knowhow · retro) run on the pulse (src/guardian-agent/smart.ts). The subs are not processes: the
+# thin body spawns one per event / cadence, as before (one spawn line each · the parent reaps past TTL).
+# Detector shape (DETECT-TO-ACTION · kit/case-ledger): normal = the state the detector looks for · normalize = the ordered
+# ladder of the sub's own actions · escalate = the last resort (one card to `to` when out of policy or the SLA passed) ·
+# `by:` = another loop agent / trigger executes it (its own policies and case domain) — the guardian only owns the KPI.
+# CODE-BODY-TO-KIND: every sub runs on a SHARED sub kind (`kind:`) — its flavour is the params block named after the kind:
+# `kpi_rollup:` (src/kit/kpi/rollup.ts) or `resource_check:` (src/loop-agent/v3/resource-check.ts · rows ⊕ normal_if ⊕ act /
+# cards / run steps ⊕ the KPI line). Which rows, what normal is, which card goes to whom with what text and how often, and how
+# the KPI reads live HERE; the code keeps only the sensors (rows) and the action ports (the effects named by action ids).
+apiVersion: elanous/loop-agent@3
+manifest:
+  name: guardian
+  version: 1.0.0
+  description: "세계 자원(호스트 · 감독자 · LLM 연료 · 자격 · 용량)이 늘 건강하게 있게 — 얇은 본체 1분 맥박 ⊕ 서브 7 · 본다 → 정상화 → 올림"
+  requires:
+    executor: loop-agent@3.2
+    kits: [kpi, bus-post]
+    node_kinds: [guardian.pulse, gate, reflect, plan, learn-knowhow, retro, bus-post, resource-check, kpi-rollup]   # the last two = sub kinds (CODE-BODY-TO-KIND)
+    facts: []
+  provides:
+    agent: guardian
+    kpis: [unnormalized_cases, host_load_per_cpu, orphans_over_2h]
+    nodes: [guardian.pulse]   # tier ② — src/guardian-agent/pulse.ts runResidentPulse (+ its tests · guardian sims)
+identity:
+  id: guardian
+  address: GUARDIAN
+  rank: super-loop-agent
+  soul: soul.md
+supervisor:
+  duty: resource-supervision   # L0 = RES (자원 정책) — RES 탭이 잠든 동안 OP 대행(우편 재경로 · wake.owner) · 돈은 OP
+goal: "호스트 load/ncpu ≤ 1.0 · 2시간 넘은 고아 0 · 미정상화 사건 0 — 자원이 늘 건강하게 있게"
+policies:   # tier ① — the only numbers (src/guardian-agent/def.ts gp() · change behaviour here, not in code)
+  # ── 본체 KPI ──
+  host_load_per_cpu_max: 1.0   # a host above this 1-min load ÷ ncpu is overloaded (route away · new work elsewhere)
+  orphans_over_2h_max: 0
+  unnormalized_cases_max: 0   # kit/case-ledger: every case not resolved (open or escalated) — DETECT-TO-ACTION
+  subs_kpi_breached_max: 0   # GUARDIAN-KPI-FROM: sub rows of the pulse snapshot (last-pulse.json kpi[]) whose own KPI is missed (ok false)
+  bus_reader_window_h: 24   # kit/bus-post (CONTEXT-BUS-FEDERATION ③): the L0 acked a bus digest within this window = it reads the bus (else mail)
+  # ── 임대관 (손 수 · 제안 박자) ──
+  scale_ratio: 2   # ready cells ≥ this × idle hands → propose remote hand tabs
+  scale_headroom: 0.6   # a host takes new hands only below this load/ncpu
+  idle_hand_scale_down_h: 4   # idle longer than this → scale-down proposal
+  proposal_every_min: 60   # one scale-up / scale-down / paid-VM card per this window
+  digest_every_min: 30   # RES digest at most once per this window, only when something moved
+  # ── 맥박 (감독자 heartbeat) ──
+  dead_after_cadences: 3   # a trigger silent this many × its cadence is dead
+  reattach_after_min: 60   # an outcome bad this long → reattach proposal to its L0 (never retire)
+  reattach_every_h: 6   # one reattach card per supervisor per this window
+  event_respawn_min: 2   # an event re-spawns its sub at most this often
+  # ── 연료관 · 열쇠지기 ──
+  fuel_alert_every_min: 60   # one ≥ 90 % card per account per this window
+  key_stale_days: 7   # a credential that has not refreshed this long (and expired) is stale
+  key_alert_every_h: 6   # one stale-credential card per credential per this window
+  key_refresh_before_h: 48   # KEYS-PROACTIVE-REFRESH: access token with less than this left → the CLI's own refresh now
+  key_refresh_after_days: 7   # … or a home not refreshed for this long (codex itself refreshes only when used)
+  key_refresh_retry_min: 60   # one refresh try per home per this window
+  key_refresh_timeout_sec: 45   # one codex app-server refresh run is bounded by this (measured 0.3–0.6 s on a live home)
+  key_refresh_card_every_h: 24   # refresh not verified → ONE relogin card (decisions) per home per this window
+  key_unrefreshed_max: 0   # KPI: homes with access expiry inside key_refresh_before_h after the refresh
+  # ── 서브 박자 (cadence · TTL of one spawn line) ──
+  pulse_every_min: 15
+  pulse_ttl_min: 5
+  lease_every_min: 15
+  lease_ttl_min: 10
+  fuel_every_min: 30
+  fuel_ttl_min: 5
+  keys_every_min: 60
+  keys_ttl_min: 5
+  macrophage_every_min: 15
+  macrophage_ttl_min: 10
+  patrol_every_min: 30
+  patrol_ttl_min: 10
+  post_every_min: 30
+  post_ttl_min: 5
+  # ── 서브 KPI 목표 ──
+  heartbeat_gaps_max: 0
+  overloaded_hosts_max: 0
+  exhausted_accounts_max: 0
+  key_incidents_max: 0
+  zombie_runs_max: 0
+  sla_mails_max: 0
+  # ── 탐지기 SLA (본다 → 정상화 → 이 안에 정상이 안 보이면 올림) ──
+  supervisor_case_sla_min: 90   # an outcome bad this long after detection (reattach proposed) → the owner's card
+  host_unreachable_sla_min: 30   # nothing in policy fixes a host that does not answer — the L0 after this grace
+  overload_case_sla_min: 60   # route away ⊕ reap on the host — still over after this → the L0
+  orphan_case_sla_min: 60   # exact-PID reap every macrophage spawn — orphans left after this → the L0
+  fuel_stale_sla_min: 30   # refresh the usage snapshot — still stale after this → the L0
+  # ── 순찰대 · 우체국 (흡수 감독자 = 사다리 주인 · 수호자 = KPI 롤업 · 침묵한 감독자 = 트리거 레지스트리 몫) ──
+  peer_silent_after_min: 30   # kpi_rollup (read only): an absorbed agent whose own tick is older than this (or errored) counts as «응답 없는 서브» — the registry refires it
+  peer_stale_after_min: 10   # kpi_rollup: an install the rail watcher has not smoked for this long is a miss in the 레일 KPI (rail-watch's own trigger wakes it)
+  # v3 smartness (LOOP-AGENT-V3-SMART-2 · src/loop-agent/v3/smart.ts) — reflect · plan · learn-knowhow · retro read only these
+  act_grace_min: 0   # an action's outcome is known when it returns (acted | failed)
+  lesson_repeat_min: 3   # the same action failing 3× in a row on one kind of subject → ONE lesson with the cause
+  reflect_window_min: 60
+  lesson_cap: 12
+  knowhow_promote_min: 1   # the lesson becomes one knowhow line at once (marker-deduped · the next pulse's plan reads it)
+  knowhow_cap: 5
+  plan_ambiguity_margin: 0   # the pulse plan is deterministic (body plan ⊕ knowhow ⊕ fallback)
+  unacted_penalty: 0.25
+  plan_llm_per_hour: 0
+  retro_every_h: 6   # retro (회고): journal ⊕ KPI window → what worked · what failed and why · one change to try
+  cost_act: 0
+kpis:   # the first is the one the retro and the v3 reflection read (본다 → 정상화: every case closed or with its owner)
+  - { name: unnormalized_cases, at_most: $policies.unnormalized_cases_max, unit: "건" }
+  - { name: host_load_per_cpu, at_most: $policies.host_load_per_cpu_max, unit: "load/ncpu" }
+  - { name: orphans_over_2h, at_most: $policies.orphans_over_2h_max, unit: "개" }
+  # GUARDIAN-KPI-FROM: the one KPI `eln loop agent list|status` and the supervisor-auditor read (src/loop-agent/v3/listed.ts) — the
+  # seven sub KPI rows the pulse rolls up into its own snapshot, counted where the sub missed its KPI (ok null = 모름, not counted)
+  - { name: subs_kpi_breached, at_most: $policies.subs_kpi_breached_max, unit: "서브", from: { file: last-pulse.json, path: kpi, where: { ok: false } } }
+done_when:
+  - "두 맥박 연속 load/ncpu 1.0 넘는 호스트 없음"
+  - "주인 없이 2시간 넘은 시험 우주 없음"
+  - "열린 사건(kit/case-ledger)마다 정상으로 돌아왔거나 주인에게 올라갔음"
+never_auto: &never
+  - "유료 VM 기동 (→ OP)"
+  - "패턴 밖 프로세스 종료 · 사람 세션·브라우저 종료"
+  - "몫 이관 없는 자리 닫기"
+  - "자격 값 읽기·옮기기"
+  - "자유 셸"
+soul:   # 영혼 (lint requires it) — the pulse plan and the voice load it · soul.md is the long human card
+  purpose: "연방의 몸을 지킨다 — 머신 · 감독자 · LLM 연료 · 자격 · 용량이 늘 건강하게 있게. 조율자는 무엇을, 수호자는 그걸 할 자원을."
+  values:
+    - "사람의 세션·브라우저와 살아 있는 작업은 절대 건드리지 않는다 — 시험 우주 꼴이거나 등록된 그룹이고, 주인이 없고, 2시간을 넘긴 것만."
+    - "로컬 먼저, 유료는 마지막 — 유료 VM 은 켜지 않고 OP 에 묻는다."
+    - "본 것은 정상화까지 — 본 채로 두지 않는다. 정책 안 사다리를 다 써도 안 되면 그때 주인에게 한 장."
+  do_not: *never
+  voice: "숫자로 말한다 — 호스트 · load/ncpu · PID · 우편 번호. 짧고 단정한 한국어."
+  serves:
+    - "RES (L0 · 자원 정책) — 잠든 동안 OP 대행"
+    - "OP · 서브 조율자(TC · JUD · UX) — 자원이 필요한 지휘"
+    - "손 풀 · TA · 런 — 한가한 호스트와 연료"
+wake:
+  registered_as: guardian
+  owner: OP   # the registry's exception card (no tick / goal missed) — sub-coordinator rank = OP 직속
+  goal: { kind: file-mtime, path: '{stateRoot}/loop-agents/guardian/last-pulse.json' }   # the pulse snapshot (not the v2 shell's last-tick.json)
+  trigger:
+    condition:
+      predicate: {"kind":"state-changed","parts":[{"file":"{stateRoot}/res/reaper/registry.jsonl"}]}
+      cooldown_min: 1
+      max_wait_min: 1
+      on_max_wait: fire
+  failure: { goal_deadline_min: 10, max_attempts: 2, backoff_sec: [120] }
+body:   # tier ① routing — the pulse is one node (LLM 0) · the v3 hooks are fail-open slots around it
+  entry_node: pulse
+  terminal_nodes: [done, failed]
+  nodes:
+    - { node_id: pulse, kind: guardian.pulse, max_visits: 1 }
+    - { node_id: reflect, kind: reflect, optional: true }        # did my sub actions work? same failure N× → a pattern with its cause
+    - { node_id: plan, kind: plan, optional: true }              # sub actions ⊕ learned knowhow → agent.yaml fallback · soul do_not
+    - { node_id: learn-knowhow, kind: learn-knowhow, optional: true } # one lesson → one knowhow line
+    - { node_id: retro, kind: retro, optional: true }            # every retro_every_h → retro entry in memory (the voice quotes it)
+    - { node_id: bus, kind: bus-post, optional: true }           # kit/bus-post: notices → the L0's bus space (reader-gated · mail fallback)
+    - { node_id: done, kind: gate }
+    - { node_id: failed, kind: gate }
+  edges:
+    - { from: pulse, on: outcome, map: { ok: done, fail: failed, error: failed } }
+actions:   # the sub rights as plan choices · fallback = what the plan runs once a knowhow line says the action keeps failing
+  - { id: reattach-proposal, channel: mail, target: receiver, serves: [unnormalized_cases], cost: $policies.cost_act, default: true }
+  - { id: route-away, channel: self, target: self, serves: [host_load_per_cpu], cost: $policies.cost_act }
+  - { id: scale-proposal, channel: mail, target: l0, serves: [host_load_per_cpu], cost: $policies.cost_act }
+  - { id: paid-vm-card, channel: mail, target: l0, serves: [host_load_per_cpu], cost: $policies.cost_act }
+  - { id: reap, channel: self, target: self, serves: [orphans_over_2h], cost: $policies.cost_act }
+  - { id: refresh-fuel, channel: self, target: self, serves: [unnormalized_cases], cost: $policies.cost_act, fallback: fuel-card }
+  - { id: fuel-card, channel: mail, target: l0, serves: [unnormalized_cases], cost: $policies.cost_act }
+  - { id: phase-set, channel: self, target: self, serves: [unnormalized_cases], cost: $policies.cost_act }
+  - { id: stale-key-card, channel: mail, target: l0, serves: [unnormalized_cases], cost: $policies.cost_act }
+  - { id: refresh-key, channel: self, target: self, serves: [unnormalized_cases], cost: $policies.cost_act, fallback: relogin-card }   # eln loop guardian key-refresh --home <CODEX_HOME> (codex app-server account/read refreshToken · verified)
+  - { id: relogin-card, channel: mail, target: l0, serves: [unnormalized_cases], cost: $policies.cost_act }   # one decisions card (category secret) with the exact relogin steps
+  - { id: exposure-card, channel: mail, target: l0, serves: [unnormalized_cases], cost: $policies.cost_act }
+  - { id: reap-run, channel: self, target: self, serves: [unnormalized_cases], cost: $policies.cost_act }
+  - { id: retry-once, channel: self, target: self, serves: [unnormalized_cases], cost: $policies.cost_act }
+  - { id: classify, channel: self, target: self, serves: [unnormalized_cases], cost: $policies.cost_act }
+  - { id: redeliver, channel: mail, target: receiver, serves: [unnormalized_cases], cost: $policies.cost_act }
+  - { id: reroute, channel: mail, target: receiver, serves: [unnormalized_cases], cost: $policies.cost_act }
+  - { id: rail-revert-proposal, channel: mail, target: l0, serves: [unnormalized_cases], cost: $policies.cost_act }
+subs:   # 서브 루프 에이전트 7 (FEDERATION-ORG §2 · GUARDIAN §2) — spawned by the body per event / cadence, never resident
+  - id: pulse
+    name: 맥박
+    duty: 관측·건강 · doctor
+    absorbs: [watchers-check, resource-heartbeat-collect, seat-main-liveness]
+    actions: [reattach-proposal]   # a dead / broken supervisor is the trigger registry's (refire every window · retry · owner card) — no restart here
+    policies: [dead_after_cadences, reattach_after_min, reattach_every_h]
+    kpi: { text: "감독자·호스트 heartbeat 결손 0", name: heartbeat_gaps, at_most: $policies.heartbeat_gaps_max }
+    every_min: $policies.pulse_every_min
+    ttl_min: $policies.pulse_ttl_min
+    events: [supervisor-dead, supervisor-bad, host-unreachable]
+    node: pulse
+    kind: resource-check
+    resource_check:
+      checks:
+        supervisor-bad:
+          rows: supervisor
+          owner: true
+          normal_if: { not: { any: [{ status: [bad] }, { status: [dead], facts: { via: beat } }] } }
+          why: "{?status=bad:outcome bad {facts.badMin}m}{?status!=bad:{status} ({facts.via})}"
+          cards:
+            - action: reattach-proposal
+              when: { any: [{ status: [bad] }, { status: [dead], facts: { via: beat } }] }
+              every_h: $policies.reattach_every_h
+              mark: "reattach:{id}"
+              key: "guardian-reattach:{id}:{day}"
+              to: "{owner|or:OP}"
+              body: "[수호자·맥박 → L0 · 재부착 제안] 감독자 {id}: {?status=bad:outcome bad {facts.badMin}m}{?status!=bad:heartbeat dead (last {lastSeen|or:never})}. 은퇴가 아니라 새 대상·목표로 다시 붙이자 — 목표/결과 탐침 갱신 또는 대상 칸 지정. 수호자는 끄지 않는다."
+              log: "reattach {id}"
+        host-unreachable:
+          rows: host
+          normal_if: { status_not: [unreachable] }
+          why: "{?status=unreachable:probe failed{?facts.why: — {facts.why}}}{?status!=unreachable:{status} {facts.ratio}}"
+      counts:
+        sups: { rows: supervisor }
+        bad: { rows: supervisor, where: { status_not: [ok] } }
+        gone: { rows: host, where: { status: [unreachable] } }
+      line:
+        value: "감독자 결손 {count.bad}/{count.sups} · 호스트 미응답 {count.gone}"
+        ok: [{ zero: [count.bad, count.gone] }]
+    detectors:
+      - id: supervisor-bad
+        normal: "every supervisor's outcome probe is good (or bad for less than reattach_after_min) · every watcher beats"
+        normalize: []
+        out_of_policy: "an outcome that stays bad is the owner's target — the guardian proposes a reattach, it cannot fix it"
+        escalate: { to: owner, sla_min: $policies.supervisor_case_sla_min }
+      - id: host-unreachable
+        normal: "every local host answers the load probe"
+        normalize: []
+        escalate: { to: l0, sla_min: $policies.host_unreachable_sla_min }
+  - id: lease
+    name: 임대관
+    duty: 임대 장부 · 할당 · 부하 스위칭 · 호스트 라우팅 · 정비 창
+    absorbs: [res-burst-lease, host-reservation-watch, release-traffic, guardian-placement, pregate-host-balance]
+    actions: [route-away, scale-proposal, paid-vm-card]
+    policies: [host_load_per_cpu_max, scale_ratio, scale_headroom, idle_hand_scale_down_h, proposal_every_min]
+    kpi: { text: "load/ncpu ≤ 1.0 · 임대 없는 spawn 0", name: overloaded_hosts, at_most: $policies.overloaded_hosts_max }
+    every_min: $policies.lease_every_min
+    ttl_min: $policies.lease_ttl_min
+    events: [host-overload]
+    node: pulse
+    kind: resource-check
+    resource: hosts
+    resource_check:
+      run: [scale-proposal]   # port: the hand-scale proposals within rights (src/guardian-agent/body.ts) → maxRatio · overloaded · route
+      checks:
+        host-overload:
+          rows: host
+          where: { status_not: [unreachable] }
+          normal_if: { status_not: [overloaded] }
+          why: "load/ncpu {facts.ratio|or:?}"
+          complete: false
+          act: { action: route-away, when: { status: [overloaded] } }
+      line:
+        value: "최대 load/ncpu {run.scale-proposal.maxRatio|fixed2|or:?}{?run.scale-proposal.overloaded: · 과부하 {run.scale-proposal.overloaded}} · 경로 제안 {run.scale-proposal.route|or:-}"
+        ok: [{ zero: [run.scale-proposal.overloaded] }]
+    detectors:
+      - id: host-overload
+        normal: "every measured host at or under host_load_per_cpu_max"
+        normalize: [route-away]
+        escalate: { to: l0, sla_min: $policies.overload_case_sla_min }
+  - id: fuel
+    name: 연료관
+    duty: LLM·외부 할당 · 잔량 · 우회 · 국면(llm-state)
+    absorbs: [model-by-difficulty-budget-guard, codex-default-cap-watch, provider-burn, claude-burn]   # YAML-OPS-SCRIPTS-ABSORB: the RES launchd burn/cap scripts — caps live in graphs/policies/llm-accounts.yaml (levels L1–L3) · this sub moves the level
+    actions: [refresh-fuel, fuel-card, phase-set]
+    policies: [fuel_alert_every_min]
+    kpi: { text: "소진 0 · 우회 지연 ≤ 5분", name: exhausted_accounts, at_most: $policies.exhausted_accounts_max }
+    every_min: $policies.fuel_every_min
+    ttl_min: $policies.fuel_ttl_min
+    events: [fuel-90, fuel-level]
+    node: pulse
+    kind: resource-check
+    resource_check:
+      checks:
+        usage-stale:
+          rows: fuel   # the usage snapshot summary row (src/guardian-agent/fuel.ts judgeFuel)
+          normal_if: { facts: { stale: false, has: true } }
+          why: "{?facts.stale:usage snapshot stale}{!facts.stale:{?facts.has:fresh}{!facts.has:no usage snapshot}}"
+          act: { action: refresh-fuel, when: { any: [{ facts: { stale: true } }, { facts: { has: false } }] } }
+        account-low:
+          rows: account
+          normal_if: { any: [{ status: [ok, unknown] }, { facts: { handled: true } }] }
+          why: "{status} {facts.used|pct}{?facts.routed=false: · 구독 경로에서 빠짐({facts.level|or:L3})}{?facts.routed!=false:{?facts.handled=true: · 강등·한 등급 아래({facts.level})}}"
+          cards:   # exhausted and still on the subscription route (stuck) first, then low and not yet reacted to
+            - action: fuel-card
+              when: { status: [exhausted], facts_not: { routed: false }, not: { facts: { routed: true, handled: true } } }
+              every_min: $policies.fuel_alert_every_min
+              mark: "fuel:{id}"
+              key: "guardian-fuel:{id}:{hour}"
+              ref: key
+              to: OP
+              body: "[수호자·연료관 · {facts.used|pct}{?facts.resetsIn: · 리셋 {facts.resetsIn}}] {id} — {?status=exhausted:새 손 배정은 이미 다음 등급으로 우회 중(MODEL-BY-DIFFICULTY 상한 95%)}{?status!=exhausted:95% 에서 새 손 배정이 다음 등급으로 우회된다}. 충전·계정 전환은 OP."
+              log: "alert {id}"
+            - action: fuel-card
+              when: { status: [low], facts_not: { handled: true } }
+              every_min: $policies.fuel_alert_every_min
+              mark: "fuel:{id}"
+              key: "guardian-fuel:{id}:{hour}"
+              ref: key
+              to: OP
+              body: "[수호자·연료관 · {facts.used|pct}{?facts.resetsIn: · 리셋 {facts.resetsIn}}] {id} — {?status=exhausted:새 손 배정은 이미 다음 등급으로 우회 중(MODEL-BY-DIFFICULTY 상한 95%)}{?status!=exhausted:95% 에서 새 손 배정이 다음 등급으로 우회된다}. 충전·계정 전환은 OP."
+              log: "alert {id}"
+        provider-dry:
+          rows: provider   # pack providers of the llm-accounts decision (unknown without it — the ladder waits)
+          normal_if: { status_not: [dry] }
+          why: "{?status=dry:경로 가능 계정 0}{?status!=dry:경로 {facts.route}}"
+          cards:
+            - action: fuel-card
+              when: { status: [dry] }
+              sort: id
+              every_min: $policies.fuel_alert_every_min
+              mark: "fuel-dry:{id}"
+              mark_on: sent
+              ref: msg-or-key
+              key: "guardian-fuel-dry:{id}:{hour}"
+              to: OP
+              body: "[수호자·연료관 · 🚨 {id} 경로 가능 계정 0] {facts.accounts} — 구독도 크레딧도 남지 않았다. 새 셀은 대체 사슬(fallback)로 간다. 충전·새 계정은 OP(돈)."
+              log: "dry {id}"
+            - action: fuel-card
+              rows: fuel
+              when: { facts: { floorGone: true } }
+              every_min: $policies.fuel_alert_every_min
+              mark: "fuel:floor"
+              key: "guardian-fuel-floor:{hour}"
+              to: OP
+              body: "[수호자·연료관 · 🚨 바닥 소진] 손 사다리의 바닥(glm · OpenRouter)이 모두 소진 — 더 내려갈 등급이 없다. 충전 또는 다른 공급자 연결이 필요(OP)."
+              log: floor-gone
+      run_after: [{ action: phase-set, fail_log: phase-failed }]   # port: LLM-PHASE-BY-GUARDIAN levels ⊕ phase ⊕ floor (fuel-phase-run.ts)
+      counts:
+        accounts: { rows: account }
+      line:
+        value: "{rows.fuel.facts.value}{?run.phase-set: · {run.phase-set.value}}"
+        ok:
+          - { zero: [rows.fuel.facts.stuck, rows.fuel.facts.dry], when_nonzero: [count.accounts] }
+          - { falsy: rows.fuel.facts.floorGone, when_nonzero: [count.accounts] }
+          - { value: run.phase-set.ok }
+    detectors:
+      - id: usage-stale
+        normal: "the LLM usage snapshot is fresh (younger than the usage cache window)"
+        normalize: [refresh-fuel]
+        escalate: { to: l0, sla_min: $policies.fuel_stale_sla_min }
+      - id: account-low
+        normal: "every account under the fuelLow cap (resource facts), or taken off the subscription route by its level (phase-set · llm-accounts L3 skip)"
+        normalize: []
+        out_of_policy: "charging or switching an account is money — the 연료관 tells OP (new cells already step a tier down at the cap)"
+        escalate: { to: OP, sla_min: $policies.fuel_alert_every_min }
+      - id: provider-dry
+        normal: "every provider in the llm-accounts pack keeps at least one routable account (subscription or credits) — else its cells fall to the fallback chain"
+        normalize: [phase-set]
+        out_of_policy: "a provider with every account spent is money (charge · new account) — one card to OP; the phase already routes to the fallback"
+        escalate: { to: OP, sla_min: $policies.fuel_alert_every_min }
+  - id: keys
+    name: 열쇠지기
+    duty: 자격·비밀 (메타만 · 값 0) · 노출 차단
+    absorbs: [secret-exposure, cred-push, relogin-watch]
+    actions: [refresh-key, relogin-card, stale-key-card, exposure-card]
+    policies: [key_stale_days, key_alert_every_h, key_refresh_before_h, key_refresh_after_days, key_refresh_retry_min, key_refresh_timeout_sec, key_refresh_card_every_h, key_unrefreshed_max]
+    kpi: { text: "만료 사고 0 · 노출 0 · 만료 48h 이내 미갱신 0", name: key_incidents, at_most: $policies.key_incidents_max }
+    every_min: $policies.keys_every_min
+    ttl_min: $policies.keys_ttl_min
+    events: [credential-expiring]
+    node: pulse
+    kind: resource-check
+    resource_check:
+      checks:
+        credential-expiring:
+          rows: credential-home   # credentials with a CLI home (status due = kit/credential-keeper refreshDue)
+          normal_if: { status_not: [due] }
+          why:
+            normal: "{?act.ok:{act.before.refreshDue} → refreshed}{!act.ok:{?facts.refreshable=false:not refreshable here (no refresh token / unreadable) — its owner home is checked}{?facts.refreshable!=false:refreshed in time}}"
+            abnormal: "{facts.refreshDue}{?act.ran: · {act.line|slice:160}}{!act.ran:{?act.tried: · retry after key_refresh_retry_min}{!act.tried: · no refresh port}}"
+          act: { action: refresh-key, when: { status: [due] }, retry_min: $policies.key_refresh_retry_min, mark: "key-refresh:{id}", normalizes: true }
+          cards:
+            - { action: relogin-card, port: true, when: { status: [due] }, after_failed_act: true, cite_last: true, every_h: $policies.key_refresh_card_every_h, mark: "key-relogin:{id}" }
+        credential-stale:
+          rows: credential
+          normal_if: { status_not: [stale] }
+          why: "{?facts.why:{facts.why}}{!facts.why:{status}}"
+          cards:
+            - action: stale-key-card
+              when: { status: [stale] }
+              every_h: $policies.key_alert_every_h
+              mark: "key-stale:{id}"
+              key: "guardian-key-stale:{id}:{day}"
+              ref: key
+              to: OP
+              body: "[수호자·열쇠지기 · 자격 정지] {id} — {facts.why|or:stale} (마지막 갱신 {facts.lastRefresh|or:없음}). 재로그인/갱신은 주인 한 곳에서(memory codex-token-single-owner)."
+              log: "stale {id}"
+        secret-exposure:
+          rows: exposure   # the secret-exposure scan (shadow) — a row is gone when the scan no longer sees it
+          normal_if: { status: [ok] }
+          why: "{facts.kind} 꼴 «{facts.prefix}…» 길이 {facts.length}"
+          cards:
+            - action: exposure-card
+              once: true
+              mark: "expose:{id}"
+              key: "guardian-expose:{id}"
+              ref: key
+              to: OP
+              body: "[수호자·열쇠지기 · 🚨 비밀 노출] {facts.store} 행 {facts.rowId} 에 {facts.kind} 꼴 문자열(앞 {facts.prefixLen}자 «{facts.prefix}…» · 길이 {facts.length}) — 값은 옮기지 않았다. 해당 키 회전·행 정리는 OP 결정(대표 보고)."
+              log: "exposure {id}"
+      counts:
+        creds: { rows: credential }
+        stale: { rows: credential, where: { status: [stale] } }
+        exposures: { rows: exposure }
+      line:
+        value: "{rows.keys.facts.value} · 만료 {policies.key_refresh_before_h}h 이내 미갱신 {rows.keys.facts.soon|len}{?rows.keys.facts.soon: ({rows.keys.facts.soon})}"
+        ok:
+          - { at_most: { path: rows.keys.facts.soon, max: $policies.key_unrefreshed_max } }
+          - { zero: [count.stale, count.exposures], when_nonzero: [count.creds, count.exposures] }
+    detectors:
+      - id: credential-expiring   # KEYS-PROACTIVE-REFRESH (대표 11-28 «가정이 아니라 증명»)
+        normal: "every credential home (elanous codex rows ⊕ llm-accounts homes) has more than key_refresh_before_h of access left and refreshed within key_refresh_after_days — proven by last_refresh on disk"
+        normalize: [refresh-key]
+        out_of_policy: "the CLI's own refresh did not move last_refresh — relogin is the token owner's act (mshq · aside → telegram link) · one relogin card"
+        escalate: { to: OP, sla_min: $policies.key_alert_every_h }
+      - id: credential-stale
+        normal: "every credential connected and refreshed within key_stale_days"
+        normalize: []
+        out_of_policy: "relogin happens at the token's single owner — the guardian never touches credential values"
+        escalate: { to: OP, sla_min: $policies.key_alert_every_h }
+      - id: secret-exposure
+        normal: "no secret-shaped string in logs · decisions · context"
+        normalize: []
+        out_of_policy: "rotating a key is OP's decision (CEO report)"
+        escalate: { to: OP, sla_min: $policies.key_alert_every_h }
+  - id: macrophage
+    name: 대식세포
+    duty: 위생 · 고아 회수 · 잔재 · 정비 창의 무거운 정리
+    absorbs: [machine-sanitize, harness-gc, orphan-test-universes, leftover-launchd-cron]
+    actions: [reap]
+    policies: [orphans_over_2h_max]
+    kpi: { text: "고아 2h 초과 0 · 잔재 0", name: orphans_over_2h, at_most: $policies.orphans_over_2h_max }
+    every_min: $policies.macrophage_every_min
+    ttl_min: $policies.macrophage_ttl_min
+    events: [host-overload, orphans]
+    node: pulse
+    kind: resource-check
+    resource: hosts
+    resource_check:
+      run: [reap]   # port: exact-PID reap of the planned orphans (src/guardian-agent/body.ts · reaper.ts) → one reap-host row per listed host
+      checks:
+        orphans:
+          rows: reap-host
+          normal_if: { facts: { left: 0 } }
+          why: "고아 2h+ {facts.left}{?facts.cands: (회수 {facts.killed} · 건너뜀 {facts.skipped})}"
+          complete: false
+          acted: { action: reap, when: { facts_not: { cands: 0 } }, ok_if: { facts_not: { killed: 0 } }, line: "killed {facts.killed} · skipped {facts.skipped}" }
+      line:
+        value: "고아 회수 {run.reap.n}{?run.reap.n: ({run.reap.byHost})} · 남은 2h+ 고아 {run.reap.left}"
+        ok: [{ zero: [run.reap.left] }]
+    detectors:
+      - id: orphans
+        normal: "no test universe older than 2 h without a live owner on any sanitized host"
+        normalize: [reap]
+        escalate: { to: l0, sla_min: $policies.orphan_case_sla_min }
+  - id: patrol
+    name: 순찰대
+    duty: 수명 순찰 ①카드 PR 없음 ②부모 없는 프로세스 ③임대 없는 부모 · 부검 감지
+    absorbs: [run-supervisor, run-doctor, autopsy, stop-autoheal]
+    actions: [reap-run, retry-once, classify]
+    policies: [zombie_runs_max, peer_silent_after_min, peer_stale_after_min]
+    kpi: { text: "좀비 런 0 · 미분류 사망 0", name: zombie_runs, at_most: $policies.zombie_runs_max }
+    every_min: $policies.patrol_every_min
+    ttl_min: $policies.patrol_ttl_min
+    events: []
+    node: pulse
+    kind: kpi-rollup
+    kpi_rollup:   # a read of the absorbed agents' own KPI (kit/kpi rollup · src/kit/kpi/rollup.ts) — no wake: a silent peer is the trigger registry's
+      targets:
+        - { id: run-supervisor, trigger: run-supervisor-agent, label: 좀비 런 }
+        - { id: autopsy, trigger: autopsy-agent, label: 미분류 사망 }
+        - { id: run-doctor, trigger: run-doctor-agent, label: 실패 진단, show: verdict }
+      probes:
+        - { kind: cases, domain: loop-exception, label: 루프 예외 }
+      silent_min: $policies.peer_silent_after_min
+      stale_min: $policies.peer_stale_after_min
+    detectors:   # executed by the absorbed supervisors (their agent.yaml policies · their case domains) — the guardian owns the KPI
+      - id: zombie-run
+        by: run-supervisor
+        normal: "no TA / harness run or pregate job without progress past its stall window"
+        normalize: [reap-run]
+        escalate: { to: owner }
+      - id: run-failed
+        by: run-doctor
+        normal: "every failed run / RED pregate has a diagnosis and an infra failure was retried once on another host"
+        normalize: [retry-once]
+        escalate: { to: owner }
+      - id: loop-exception
+        by: run-doctor
+        normal: "every registered loop's last fire is done (kit/case-ledger domain loop-exception)"
+        normalize: [retry-once]
+        escalate: { to: owner }
+      - id: unclassified-death
+        by: autopsy
+        normal: "every closed PR / abandoned run has a cause class"
+        normalize: [classify]
+        escalate: { to: owner }
+  - id: post
+    name: 우체국·레일지기
+    duty: 우편 SLA · 잠든 수신처 재경로 · 운영 레일
+    absorbs: [postoffice-sse, seat-inbox-idle-nudge, wake-ledger, kingdom-mail-relay, op-mail-bridge, silence-watch, rail-watch]
+    actions: [redeliver, reroute, rail-revert-proposal]
+    policies: [sla_mails_max, peer_silent_after_min, peer_stale_after_min]
+    kpi: { text: "SLA 초과 우편 0 · 레일 회귀 즉시 카드", name: sla_mails, at_most: $policies.sla_mails_max }
+    every_min: $policies.post_every_min
+    ttl_min: $policies.post_ttl_min
+    events: []
+    node: pulse
+    kind: kpi-rollup
+    kpi_rollup:   # a read of the absorbed agents' own KPI (kit/kpi rollup)
+      targets:
+        - { id: silence-watch, trigger: silence-watch-agent, label: SLA 초과 우편 }
+        - { id: rail-watch, trigger: rail-watch, show: none, tick: land-graph/rail-watch.json }
+      probes:
+        - { kind: plan-targets, of: silence-watch, action: bounce, label: 잠든 수신처 }
+        - { kind: install-fresh, target: rail-watch, label: 레일 }
+      silent_min: $policies.peer_silent_after_min
+      stale_min: $policies.peer_stale_after_min
+    detectors:
+      - id: mail-sla
+        by: silence-watch
+        normal: "no unanswered mail past its SLA"
+        normalize: [redeliver]
+        escalate: { to: owner }
+      - id: dormant-recipient
+        by: mail-route
+        normal: "no mail addressed to a dormant seat without a live route"
+        normalize: [reroute]
+        escalate: { to: l0 }
+      - id: rail-regression
+        by: land-rail-watch
+        normal: "the installed rail's smokes pass after every rail"
+        normalize: [rail-revert-proposal]
+        escalate: { to: l0 }
+bus:   # CONTEXT-BUS-FEDERATION ③ — the 30-min «[수호자 · 30분]» status digest goes to the bus · proposals and escalations are requests = mail
+  notices: [status]
+voice:   # tier ③ — one LLM turn only when spoken to (eln loop agent guardian voice · loop:guardian · mail GUARDIAN)
+  channel: loop:guardian
+  speak_on: [kpi-breach]
+  mail: l0-only
+  per_hour_max: 12
+memory:
+  knowhow: knowhow.md
+budget:
+  llm_turns_per_hour: 12
+levels:
+  start: live
+  values: [live, L1, shadow, off]

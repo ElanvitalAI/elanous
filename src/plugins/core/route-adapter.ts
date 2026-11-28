@@ -230,6 +230,8 @@ function loadNativeRouteTools(pluginRoot: string): NativePluginRouteTool[] {
     let rawAiTools: Record<string, unknown>[] = [];
     if (existsSync(yamlPath)) {
       const raw = parseYaml(readFileSync(yamlPath, 'utf8')) as Record<string, unknown>;
+      // LOOP-AGENTS-AS-PLUGINS P3: a loop-agent plugin (plugin.yaml `loopAgent:`) contributes a trigger, never a route tool
+      if (raw.loopAgent !== undefined) continue;
       manifest = parsePluginManifest({ id: raw.id, name: raw.name, version: raw.version, contributes: raw.contributes,
         ...(raw.whenToUse === undefined ? {} : Object.fromEntries(
           ['description', 'whenToUse', 'inputs', 'outputs', 'examples', 'requires'].map(key => [key, raw[key]]))),

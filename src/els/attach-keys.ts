@@ -4,11 +4,9 @@
 
 import { mouseEvent, splitMouse } from './attach-mouse.js';
 import type { MouseReport } from './attach-mouse.js';
+import { AFTER_PREFIX, AFTER_PREFIX_KEYS, type KeyAction } from './key-bindings.js';
 
-export type KeyAction =
-  | 'detach' | 'next' | 'previous' | 'next-workspace' | 'toggle-sidebar' | 'new' | 'new-workspace'
-  | 'new-chat' | 'rename-tab' | 'close' | 'close-workspace' | 'help' | 'goto' | 'scroll-up' | 'scroll-down' | 'move-tab' | 'toggle-agents-order'
-  | 'expand-all' | 'collapse-all' | 'toggle-active' | 'toggle-group' | 'list-page-up' | 'list-page-down' | 'list-home' | 'list-end' | 'tabs-left' | 'tabs-right' | 'tile';
+export type { KeyAction } from './key-bindings.js';
 
 export type KeyEvent =
   | { readonly kind: 'input'; readonly bytes: string }
@@ -21,25 +19,9 @@ export type KeyEvent =
 const PREFIX = '\u0002';
 const ESCAPE = '\u001b';
 
-// ELS-ONE-SPACE: `s` toggles the side list (OP's suggestion, ctrl+b s; `b` stays — it is herdr's); `a` opens an elanous chat pane (`e` is kept for expand/collapse of the tree).
-// herdr words: h/j/k/l move between panes, n/p tabs, w workspaces, c/N new, x/D close, b sidebar, q detach, ? help.
-// With one pane per tab (stage 3) j/l/n step down the list and k/h/p step up.
-const AFTER_PREFIX: Readonly<Record<string, KeyAction>> = {
-  ',': 'rename-tab', q: 'detach', j: 'next', l: 'next', n: 'next', k: 'previous', h: 'previous', p: 'previous', w: 'next-workspace',
-  b: 'toggle-sidebar', s: 'toggle-sidebar', g: 'toggle-agents-order', c: 'new', a: 'new-chat', N: 'new-workspace', x: 'close', D: 'close-workspace', m: 'move-tab', '?': 'help', '[': 'scroll-up', ']': 'scroll-down',
-  // ELS-GROUP-FOLD-CONTROL: + / - expand / collapse every agent group · space or enter folds the selected pane's group.
-  // ELS-ACTIVE-ONLY-FILTER: A flips «Active only» (lowercase a is already «new elanous chat»).
-  '+': 'expand-all', '-': 'collapse-all', ' ': 'toggle-group', '\r': 'toggle-group', A: 'toggle-active',
-  // ELS-TILE-MODE: t shows every pane of this workspace as a live grid (and from a zoomed tab, back to the grid).
-  t: 'tile',
-};
-
-// ELS-SCROLL-MOUSE: after the prefix, PgUp/PgDn/Home/End page the side list and ←/→ scroll the tab row (the keys alone
-// stay the pane's — a shell or an editor needs them).
-const AFTER_PREFIX_KEYS: readonly (readonly [string, KeyAction])[] = [
-  ['\u001b[5~', 'list-page-up'], ['\u001b[6~', 'list-page-down'], ['\u001b[H', 'list-home'], ['\u001b[1~', 'list-home'], ['\u001bOH', 'list-home'],
-  ['\u001b[F', 'list-end'], ['\u001b[4~', 'list-end'], ['\u001bOF', 'list-end'], ['\u001b[D', 'tabs-left'], ['\u001bOD', 'tabs-left'], ['\u001b[C', 'tabs-right'], ['\u001bOC', 'tabs-right'],
-];
+// ELS-SHORTCUTS-POPUP: what ctrl+b <key> means lives in ONE table (key-bindings.ts) — the ctrl+b ? popup reads the same rows.
+// ELS-ONE-SPACE: `s` toggles the side list (OP's suggestion, ctrl+b s; `b` stays — it is herdr's); `a` opens an elanous chat
+// pane (`e` is kept for expand/collapse of the tree). ELS-SCROLL-MOUSE: PgUp/PgDn/Home/End/←/→ after the prefix are rows too.
 
 const PASTE_BEGIN = '\u001b[200~';
 const PASTE_END = '\u001b[201~';
@@ -78,10 +60,10 @@ export function createKeyRouter(options: { pasteTimeoutMs?: number } = {}): { re
               continue;
             }
             armed = false;
-            if (char === PREFIX) typed += PREFIX;
-            else if (char === ESCAPE) emit({ kind: 'unknown', key: ESCAPE });   // ELS-POPUP-TERM: ctrl+b Esc (the app ignores it elsewhere)
-            else if (char >= '1' && char <= '9') emit({ kind: 'action', action: 'goto', n: Number(char) });
-            else if (AFTER_PREFIX[char]) emit({ kind: 'action', action: AFTER_PREFIX[char]! });
+            if (char === PREFIX) { typed += PREFIX; continue; }
+            const action = Object.hasOwn(AFTER_PREFIX, char) ? AFTER_PREFIX[char] : undefined;   // ctrl+b Esc = 'escape' (ELS-POPUP-TERM: hide it)
+            if (action === 'goto') emit({ kind: 'action', action, n: Number(char) });
+            else if (action) emit({ kind: 'action', action });
             else emit({ kind: 'unknown', key: char });
           }
         }

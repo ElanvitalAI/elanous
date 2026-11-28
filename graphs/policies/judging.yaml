@@ -1,0 +1,88 @@
+version: 1
+split:
+  must:
+    - 데이터 손실
+    - 보안 4종 (비밀·자격, 다른 사용자 데이터, 원격 공개, 파괴적 삭제)
+    - 서비스 또는 작업의 멈춤
+    - 대표가 명시적으로 요구한 사항
+
+# JUDGE-NOT-OVERSTRICT (11-28) — 대표 OPS-RULES §판정·증거 (11-22) «판정·증거 기준 필요 이상 빡빡 금지 · 같은 head 영수 +
+# focused exit 0 충분 · 미재현 추론 = FU» ⊕ §33·§35 (11-21) «판정 = 필수/엣지 분리 · 필수 0 이면 PASS + 엣지 FU».
+# Read by src/kit/requirement-judge/sign-decision.ts (assessCriterionForSign). The judge-butler body only executes the decision.
+#
+# baseline: the evidence that already counts as «must met» before any LLM looks at the criterion — done-when.ts judgeCell
+# checked it (every bound merged PR: same-head receipt ⊕ focused exit 0 ⊕ no security-4 path). The LLM can only add a
+# refusal; it can never make the baseline weaker, and its absence never blocks the baseline.
+baseline:
+  - same-head receipt
+  - focused exit 0
+
+# JUDGE-SIM-RECEIPT (대표 11-28 15:2x «시뮬레이션 및 우주 합성 이벤트도 초록의 조건으로») — sim world / test-universe synthetic event
+# receipts are formal «must met» evidence next to the baseline. Existing formats only (src/kit/requirement-judge/sim-evidence.ts):
+#   sim world summary  <root>/sim-world/<runId>/summary.json (SimWorldSummary) — counts for a cell when runId binds to one of the
+#                      cell's bound PRs at its landed head (run_id_binding · pr-binding receiptNameBindsPrHead) and only for the
+#                      registered scene ids the doneCriterion or the PR body names: each needs ≥ min_seeds passing seeds, every
+#                      engine, 0 non-passing records («regression»).
+#   E4 run receipt     the cell's «E4 test|sim 층 — runId … 칸 <id> … rc 0» line (eln release checklist evidence run <cell>).
+# A criterion naming scenes needs those scenes' summaries; one that reads as sim / synthetic (markers) and names none needs the
+# E4 line. Missing → not green · one request to the cell owner with the exact run.
+sim_evidence:
+  roots: ["~/.elanous-test", "~/elanous-hq/repo.git/.elanous-test", "~/elanous-hq/seat-state/RES/evidence/SIM-WORLD"]
+  run_id_binding: "{pr}-{head12}"
+  min_seeds: 5
+  engines: [legacy, graph]
+  pass_verdicts: [pass, promoted]
+  markers: ["시뮬", "시험 우주", "합성 사건", "합성 이벤트", "합성 주입", "sim world", "synthetic event"]
+  request:
+    # SIM-RECEIPT-CARRY: the run id ends in the scene — one seed of two scenes used to collide («run already exists»)
+    scene: "eln --test sim world run {world} --seed {seed} --engine both --only {scene} --run-id {pr}-{head12}-s{seed}-{scene}"
+    e4: "eln release checklist evidence run {cell}"
+  # SIM-RECEIPT-CARRY: the one shared receipt root — a run whose id binds a PR head copies its summary.json there wherever it
+  # ran (a worktree · another host over ssh), so a receipt is never «somewhere else».
+  #   root  an index into `roots` (-1 = the last one, the shared RES receipt root)
+  #   host  hq = the resource-facts HQ host (src/kit/resource-facts hqHosts) — off it the copy goes over ssh
+  # A receipt of an older head of the same PR binds through the carry rule (src/git-smart/delta.ts carryProof).
+  publish:
+    root: -1
+    host: hq
+
+# A «must unmet» from the LLM refuses the sign only when the judgment cites BOTH:
+#   clause       — the exact criterion text that is unmet (a verbatim substring of the requirement)
+#   evidence_gap — gap «contradicted» with the evidence ids that show it is NOT met (e.g. the PR's files never touch it)
+# Anything less («not shown» · no clause · no evidence id · a clause that is not in the criterion) is an unverified part:
+# the baseline signs and the part becomes the FU below (미재현 추론 = FU).
+refuse_must_unmet_when:
+  gap: contradicted
+  requires: [clause, evidence_ids]
+
+# What the butler does when the LLM layer cannot judge. sign-with-fu = sign on the baseline + one FU cell «<cell>-FU».
+fallback:
+  empty_criterion: sign-with-fu           # no doneCriterion on the cell
+  judge_unavailable: sign-with-fu         # no judge port · LLM error/timeout/quota · forbidden provider routed
+  decomposition_uncertain: sign-with-fu   # decomposition rejected by its own review · malformed · no must segment
+  judgment_untrusted: sign-with-fu        # malformed judgment · wrong row count · invented evidence id
+  must_unmet_uncited: sign-with-fu        # «must unmet» without clause + contradicting evidence
+
+follow_up:
+  id: "{cell}-FU"                         # one FU per cell (the edge FUs of a trusted split keep «{cell}-FU-<hash>»)
+  priority: P2
+  # FU-FLOOD (OP 11-28 · replay: 48 signs → 48 new «-FU»): these kinds add ONE evidence line to the cell's existing
+  # «{cell}-E4» FU — created (E4 form) only when absent · a re-sign adds no cell. Other kinds keep «{cell}-FU».
+  fold_into_e4: [must_unmet_uncited, decomposition_uncertain]
+  # new FU cells the criterion path may create in one butler tick; over it the sign waits for the next tick (no JUD mail)
+  max_new_per_tick: 3
+  titles:
+    e4: "{cell} — E4 sim/test-universe evidence (green signed on same-head receipt + focused exit 0; 판정 미확인 부분 = 근거 줄)"
+    empty_criterion: "{cell} — doneCriterion 채우기 (판정 집사가 같은 head 영수 + focused exit 0 으로 서명 · 기준이 비어 있었다)"
+    unverified: "{cell} — 판정 미확인 부분 검증: {detail} (서명 근거 = 같은 head 영수 + focused exit 0 · 미재현 추론 = FU)"
+
+# The judge LLM (decomposition · its review · the judgment). Explicit routing: the provider comes from the role's configured
+# provider (config.roleLlm.<role>), the tier is pinned here and never below min_tier (codex: better = gpt-6.1-terra medium).
+# ⛔ GLM for review/judging (대표 11-01 22:4x) — a forbidden provider/model is «judge unavailable» (→ fallback), never a call.
+judge_llm:
+  role: audit
+  tier: better
+  min_tier: better
+  reasoning: medium
+  timeout_ms: 90000
+  forbid: ["glm", "zai", "z-ai", "zhipu"]

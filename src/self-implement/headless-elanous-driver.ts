@@ -49,7 +49,8 @@ import type { ControlDecision, ControlObservation, ControlRoundContext, RunSuper
 import { brainTrigger } from './brain-consultation.js';
 import { decideAutoAssist, decideAutoStop, decideBoundaryApproval, decideScreenStallSilenceTermination, hasNovelCompletionSignal, NO_STALL, parseBoundaryApprovalRequest, UNKNOWN_OBSERVED_RAW_SHELL_METACHARACTERS, type AutoAssistInput, type AutoStopInput, type AutoStopVerdict, type BoundaryApprovalRequestKind, type DeterministicCompletionState, type ScreenStallSilenceInput } from './auto-intervene.js';
 import { decideByRecipe, missingStateKeys, parseRecipe, type Recipe, type RecipeDecision } from '../decide/recipe.js';
-import { callJev, gateAnswer, probeKey, type JevAnswer } from '../decide/jev.js';
+import { gateAnswer, probeKey, type JevAnswer } from '../decide/jev.js';
+import { jevDecide } from '../kit/jev-decide/index.js';
 import { shadowBoundaryDecision, type BoundaryShadowConfig, type BoundaryShadowDeps } from '../decide/boundary-shadow.js';
 import { decideOutputArtifactWatchdog, type OutputArtifactSnapshot, type OutputWatchdogPolicy } from './output-artifact-watchdog.js';
 import { mapBrainAction, mapControlStance, supervisionObservationFields } from './supervision-vocabulary.js';
@@ -386,10 +387,11 @@ export function observeBoundaryBehaviorAxis(
     logBehaviorAxis(context, behaviorAxisRecord(request, verdict, { error: `state-missing:${missing.join(',')}` }));
     return;
   }
+  // The live call goes through the Jev kit (redaction · timeout + abort · usage row · 402 breaker · jev-sites.yaml `tool-guard-axis`).
   const caller = axis.call ?? (async (state, loaded) => {
-    const key = (env.TYPESAFE_API_KEY ?? readCache() ?? '').trim();
-    const response = await callJev({ state, questions: loaded.questions }, key);
-    return response.answers as BoundaryBehaviorAxisAnswers;
+    const decided = await jevDecide({ site: 'tool-guard-axis', state, questions: loaded.questions });
+    if (!decided.ok) throw new Error(`jev ${decided.reason}`);
+    return decided.response.answers as BoundaryBehaviorAxisAnswers;
   });
   let pending: BoundaryBehaviorAxisAnswers | Promise<BoundaryBehaviorAxisAnswers>;
   try {

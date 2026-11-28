@@ -47,6 +47,12 @@ export function registerPolicyCommands(program: Command): void {
         }
       }
       for (const [p, r] of Object.entries(dec.route)) console.log(`  route ${p}: ${r.join(' → ') || '(none)'}`);
+      // FALLBACK-SUBSCRIPTION-FIRST: the hand-model plan (tiers · fallback steps) as the pack states it
+      const hm = loaded.pack?.handModels;
+      if (hm) {
+        console.log(`  hand models fallback ${hm.fallback.join(' → ')} [${loaded.leafSources['hand_models.fallback'] ?? 'pack'}]`);
+        for (const [t, ids] of Object.entries(hm.tiers)) console.log(`  hand ${t}: ${ids.map(id => `${hm.models[id]!.provider}/${hm.models[id]!.model}`).join(' → ')} [${loaded.leafSources[`hand_models.tiers.${t}`] ?? 'pack'}]`);
+      }
       for (const [p, c] of Object.entries(dec.creditRoute)) console.log(`  credit route ${p} (${c.order} [${loaded.leafSources[`providers.${p}.credit_order`] ?? 'pack'}]): ${c.accounts.join(' → ') || '(none)'}`);
       console.log(`  overrides active ${dec.overrides.active.length} · expired ${dec.overrides.expired.length} · conflicts ${dec.conflicts.length}`);
       for (const c of consumers) console.log(`  consumer ${`${c.consumer}@${c.report.host}:${c.report.pid}`.padEnd(34)} ${c.status.padEnd(7)} ${c.why}`);

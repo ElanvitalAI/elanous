@@ -98,14 +98,17 @@ describe('the audit verdict on the real declarations', () => {
     expect(['op-retro', 'op-idle-triage', 'res-reservation', 'res-ready-pool'].map(id => stages[id])).toEqual(['retired', 'retired', 'retired', 'retired']);
     const after = loopsBySeat(agents(), DEFAULT_ORG.duties);
     // SUPERVISOR-REVIVE-1127: the v2 supervisors' triggers (<id>-agent) sit with their owners (process L0 RES → OP owner);
-    // world-sweep (WORLD-REGISTRY · the guardian's ledger sweep · failure cards → OP) sits with OP too.
-    expect((after.get('OP') ?? []).map(a => a.id).sort()).toEqual(['autopsy-agent', 'board-steward', 'guardian', 'hand-steward-agent', 'judge-butler', 'macrophage-agent', 'op-bulletin', 'op-pulse', 'release-rocket', 'release-rocket-agent', 'release-traffic', 'res-burst-lease', 'silence-watch-agent', 'watchers-check', 'watchers-check-agent', 'world-sweep']);
+    // world-sweep (WORLD-REGISTRY · the guardian's ledger sweep · failure cards → OP) sits with OP too · so do cond-watch-sweep ·
+    // fed-analyst-agent · steward-mail (landed after this expectation was written — main was red here before JUDGE-BUTLER-V3-LISTED) · and supervisor-auditor-agent (SUPERVISOR-AUDITOR-LOOP · L0 escalation-parent → OP) · and dev-review-post-impl (DEV-REVIEW-COMMON · first-pregate post-impl review) · and decision-bus (DECISION-TO-BUS-AUTO · CEO decisions → HQ bus pointers) · and gh-mirror (GH-PROXY-LAYER #40729 · landed without this list — main was red here) · and rail-canary-agent (RAIL-CANARY-AUTO-ROLLBACK · L0 escalation-parent → OP).
+    expect((after.get('OP') ?? []).map(a => a.id).sort()).toEqual(['autopsy-agent', 'board-steward', 'cond-watch-sweep', 'decision-bus', 'dev-review-post-impl', 'fed-analyst-agent', 'gh-mirror', 'guardian', 'hand-steward-agent', 'macrophage-agent', 'op-bulletin', 'op-pulse', 'rail-canary-agent', 'release-rocket', 'release-rocket-agent', 'release-traffic', 'res-burst-lease', 'silence-watch-agent', 'steward-mail', 'supervisor-auditor-agent', 'watchers-check-agent', 'world-sweep']);
+    // JUDGE-BUTLER-V3-LISTED: the butler's trigger owner is its L0 (agent.yaml wake.owner JUD) → its row sits in JUD's space
+    expect((after.get('JUD') ?? []).map(a => a.id).sort()).toEqual(['judge-butler']);
     expect((after.get('TC') ?? []).map(a => a.id).sort()).toEqual(['land-graph', 'rail-watch', 'run-doctor-agent', 'run-supervisor-agent', 'space-advisor-tc', 'train-manager-agent']);
     expect(after.has('RES')).toBe(false);
     expect(after.has('REL')).toBe(false);
     const plan = planLoopTabs(after, [{ tab: 't1', title: '↻ loops (6)', workspace: 'OP' }, { tab: 't2', title: '↻ loops (2)', workspace: 'TC' }, { tab: 't3', title: '↻ loops (3)', workspace: 'RES' }]);
     // rail-watch (JUD-RELAX post-rail safety net) joins TC → its «↻ loops (2)» tab becomes (3).
-    expect(plan).toEqual({ open: [{ ws: 'OP', count: 16 }, { ws: 'TC', count: 6 }], close: [{ tab: 't1', id: 'loops' }, { tab: 't2', id: 'loops' }, { tab: 't3', id: 'loops' }] });
+    expect(plan).toEqual({ open: [{ ws: 'OP', count: 22 }, { ws: 'JUD', count: 1 }, { ws: 'TC', count: 6 }], close: [{ tab: 't1', id: 'loops' }, { tab: 't2', id: 'loops' }, { tab: 't3', id: 'loops' }] });
   });
 });
 

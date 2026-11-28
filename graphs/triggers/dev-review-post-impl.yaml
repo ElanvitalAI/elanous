@@ -1,0 +1,43 @@
+graph_id: dev-review-post-impl
+version: 1
+loop:
+  title: 구현 후 검토 (post-impl@1) — PR 첫 pregate 에 판정선 재확인 · 엣지 FU · 판정 거절 예측
+  root: 조율자
+  managed_by: trigger-registry
+  description: >-
+    DEV-REVIEW-COMMON (0.3.40 P0 · CEO 11-28 18:2x). A PR's FIRST pregate receipt (a new PREGATE-GREEN or PREGATE-RED lane
+    «pr-head12-host» after the watermark) runs graphs/review/post-impl.yaml — the same unit the TA journey calls after its
+    first gate. The criterion of the PR's cell is re-checked on the PR's own facts by the judge butler's sign decision
+    (assessCriterionForSign · judging.yaml): a cited contradiction = the judge will refuse → one evidence line on the cell
+    before the judge reads it; unmet independent edges → their FU cells now (the judge's ids). At most
+    post_impl.max_prs_per_tick PRs a tick (graphs/policies/dev-review.yaml). Shadow stage judges and records only (dry-run).
+    Done-when = dev-review/post-impl-watermark.json present and the tick exits ok.
+  owner: OP
+  trigger:
+    condition:
+      predicate: { kind: state-changed, parts: [{ file: '{seatState}/RES/evidence/PREGATE-GREEN' }, { file: '{seatState}/RES/evidence/PREGATE-RED' }] }
+      cooldown_min: 2
+      max_wait_min: 30
+      on_max_wait: fire
+  goal:
+    kind: file-mtime
+    path: '{stateRoot}/dev-review/post-impl-watermark.json'
+  failure:
+    goal_deadline_min: 45
+    max_attempts: 2
+    backoff_sec: [120]
+  legacy:
+    kind: marker
+    path: '{seatState}/OP/tools/.graph-cutover/dev-review-post-impl'
+  cutover_after: 2
+entry_node: tick
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: tick
+    kind: agent
+    recipe: 'cmd:dev-review-post-impl-tick'
+    max_visits: 1
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }

@@ -1,0 +1,8 @@
+# Pool-scaled candidate and reclaim caps. Sending remains subject to its separate rate limit.
+reclaim_per_hand: 0.8
+candidates_per_hand: 0.3
+# Per-window board send ceiling, per-plan split pieces, throughput cards and land slots.
+board_cards_per_hand: 0.3
+split_pieces_per_hand: 0.4
+throughput_cards_per_hand: 0.8
+land_slots_per_hand: 0.1

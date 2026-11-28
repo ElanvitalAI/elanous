@@ -27,7 +27,7 @@ function sourceFiles(cwd: string): string[] {
   return files;
 }
 
-const IMPORT_SPECIFIER = /\b(?:import|export)\s+(?:[^;'"]*?\s+from\s*)?['"](\.[^'"]+)['"]|\bimport\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g;
+const IMPORT_SPECIFIER = /\b(?:import|export)\s+(?:[^;'"]*?\s+from\s*)?['"]((?:\.|@\/)[^'"]+)['"]|\bimport\s*\(\s*['"]((?:\.|@\/)[^'"]+)['"]\s*\)/g;
 
 /** Repo-relative file candidates a relative import specifier (already joined to its importer's directory) can resolve to. */
 export function importCandidates(base: string): string[] {
@@ -43,9 +43,10 @@ export function pwaReachableSrcFiles(cwd: string, { readFile = (path) => readFil
   const available = new Set(listFiles(cwd).map((file) => file.replaceAll('\\', '/').replace(/^\.\//, '')));
   const reached = new Set<string>();
   const visited = new Set<string>();
-  // Start from everything apps/pwa/tsconfig.json `include`s — its `src/**/*.ts(x)` also matches *.test.* files, and the Next
-  // build type-checks them. Excluding tests hid the real entry (tool-result-chain.test.ts → src/nexus/api/meta-api → most of src).
-  const queue = [...available].filter((file) => /^apps\/pwa\/src\/.*\.tsx?$/.test(file));
+  // Keep in sync with apps/pwa/tsconfig.json: tests and test-only devices have
+  // their own test runner and are not Next build type-check roots.
+  const queue = [...available].filter((file) => /^apps\/pwa\/src\/.*\.tsx?$/.test(file)
+    && !/\.(?:test|spec)\.tsx?$/.test(file) && !file.startsWith('apps/pwa/src/test-devices/'));
   while (queue.length) {
     const file = queue.pop()!;
     if (visited.has(file)) continue;
@@ -57,14 +58,16 @@ export function pwaReachableSrcFiles(cwd: string, { readFile = (path) => readFil
     for (const match of content.matchAll(IMPORT_SPECIFIER)) {
       const specifier = match[1] ?? match[2];
       if (!specifier) continue;
-      const target = resolve(root, dirname(file), specifier);
+      const target = specifier.startsWith('@/') && file.startsWith('apps/pwa/')
+        ? resolve(root, 'apps/pwa/src', specifier.slice(2))
+        : resolve(root, dirname(file), specifier);
       const base = relative(root, target).split(sep).join('/');
-      if (!base.startsWith('src/')) continue;
+      if (!base.startsWith('src/') && !base.startsWith('apps/pwa/src/')) continue;
       const candidates = importCandidates(base);
       const resolved = candidates.find((candidate) => available.has(candidate));
       if (resolved) {
         if (!visited.has(resolved)) queue.push(resolved);
-      } else {
+      } else if (base.startsWith('src/')) {
         // An import of a deleted src file must still trigger the build that reports it.
         for (const candidate of candidates) reached.add(candidate);
       }

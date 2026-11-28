@@ -21,6 +21,7 @@
 //   같은 문장 동시 쓰기가 한 줄 ⊕ 횟수로 접힌다. 프로세스 사이 잠금은 없다(다음 쓰기가 남은 중복에 횟수를 더한다).
 
 import { debug, redactSecretText } from '../debug/log.js';
+import { jevSite } from '../kit/jev-decide/sites.js';
 
 export const MEMORY_KINDS = ['교정', '확인된 방법', '사실', '약속'] as const;
 export type MemoryKind = typeof MEMORY_KINDS[number];
@@ -33,9 +34,9 @@ export const MEMORY_NEAR_DUP_JACCARD = 0.8;
 /** 자리당 하루 새 기억 상한(중복으로 접힌 것은 세지 않는다). */
 // 출처: ASK-MEMORY-TRIAGE-NO-LLM-1117 «평가» 표 — 쓰기 문 호출 빈도 «자리당 하루 ≤5»
 export const MEMORY_SEAT_DAILY_CAP = 5;
-/** Jev durable 확률이 이 값 미만이면 버린다. */
-// 출처: ASK-MEMORY-TRIAGE-NO-LLM-1117 «정정» — «p(durable)<0.6 이면 버림»
-export const MEMORY_JEV_DURABLE_MIN = 0.6;
+/** Jev durable 확률이 이 값 미만이면 버린다 — graphs/policies/jev-sites.yaml `memory-write-gate.threshold`. */
+// 출처: ASK-MEMORY-TRIAGE-NO-LLM-1117 «정정» — «p(durable)<0.6 이면 버림» (표가 없으면 키트 기본값)
+export const MEMORY_JEV_DURABLE_MIN = jevSite('memory-write-gate').threshold;
 /** Jev dup 질문에 싣는 기존 후보 수 k. */
 // 출처: 회상 상한과 같은 값 — `src/seat-memory/seat-memory.ts` SEAT_MEMORY_RECALL_MAX_HITS(5)
 export const MEMORY_JEV_DUP_TOP_K = 5;

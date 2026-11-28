@@ -1,0 +1,27 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "watchers-check",
+  "name": "watchers-check",
+  "version": "1.0.0",
+  "description": "기대 감독자 heartbeat 결손 0 (MISSING · DEAD · BROKEN · BLIND)",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "watchers-check",
+          "agent": "../../graphs/loop-agents/watchers-check/agent.yaml",
+          "trigger": "../../graphs/triggers/watchers-check-agent.yaml",
+          "kpis": [
+            "missing_heartbeats"
+          ]
+        }
+      ]
+    }
+  }
+}

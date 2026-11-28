@@ -1,0 +1,51 @@
+# STEWARD-HQ (0.3.39 P1 · FEDERATION-STEWARDS §5a) — 교통 행정관 `steward:hq` = the HQ instance of the ONE space steward
+# graph (graphs/steward/space.yaml · R0–R6·X · `steward:<scope>`). This file holds only its cross-scope pairing numbers.
+# Read by src/steward/space/hq-shadow.ts; change a value here, not in TS.
+#
+# mode: shadow = each HQ R1 tick records «would have paired idle hand X (home A) → backlog cell Y (scope B)» rows to
+#       <state>/steward/space/<HQ>/hq-shadow.jsonl and nothing else (no mail · no owner change · no pregate).
+#       off    = no rows. (live is §5a's next step after «shadow 1 h agreement ≥ 90 %» — not implemented here.)
+# Compare with what OP did: `eln steward hq shadow-report --since 1h` (fed-state cell:assign / work:claimed).
+version: 1
+mode: shadow
+# §5a 상한 모드 caps (per tick). assign = maker pairs · judge = judge-side pairs (maker ≠ judge) · pregate = R2 slots
+# (recorded for the live step; the shadow pairs hands only).
+caps:
+  assign: 4
+  pregate: 3
+  judge: 2
+# A hand is free when idle at least this long, owns no workable yellow cell (WIP 1), and is not waiting on an open ✋.
+# 2, not the space steward's 10: OP's own assignments 11-27 23:35 KST went to hands idle 0–4 min (resource-opt rows).
+idle_min: 2
+# Backlog = yellow cells of the shared priorities, not waiting (verdict · receipt · HOLD · train): unowned (HQ backlog) ·
+# held by a coordinator (that scope's backlog) · or owned by a non-working hand and untouched this long (stalled).
+# WORK-PULL-REACHES-ROSTER (11-28): a live snapshot carries graphs/policies/work-pull.yaml `order` (priorities ⊕ roster
+# class ⊕ rank) — ONE rule with `eln work next` and OP's assignment table (OP's table handed out P2 while this paired only
+# P0/P1). This list is the pre-policy fallback only: stored R0 snapshots without `pull` (replays) and an unreadable pack.
+priorities: [P0, P1]
+# Also (STEWARD-READY-LANES 11-28): a shadow pair keeps its cell for that hand this long (as a live owner change would), and a
+# green-triage lane-b cell («merged, no receipt → produce evidence») given to a hand stays with it this long instead of the
+# 45-min lease — `eln work next` · live R1 reclaim (CAPSULE-A1-POLICY drew 3 hands in 40 min). Lane a («merged ⊕ receipt»)
+# is never a hand's: JUD signs it (src/steward/space/cell-wait.ts 'awaiting-judge').
+stall_min: 120
+# shadow-report: an OP assignment / hand claim counts for a shadow pair when it happens from this many minutes before
+# the pair to the end of the window.
+match_lead_min: 10
+# §5a gate: shadow agreement over one hour before the capped live mode.
+agreement_target: 0.9
+# STEWARD-HQ-LIVE-ALIGN (0.3.39 P0 · Claude OP 11-28 07:3x «라이브 R1 을 shadow 기준에 맞춘다»). The space steward's LIVE
+# R1 (every scope · src/steward/space/model.ts planMatch) reads this block; the TS defaults are the same values.
+# 11-28 22:25Z: shadow paired 3 idle TC hands while live R1 wrote 3 × defer «no-idle-hand-anywhere».
+live:
+  # A hand with no workable cell idle this long is free (push · HQ lend · pull nudge). Was 10 (TS). An idle OWNER is still
+  # woken on its own cell only after 10 min.
+  idle_min: 2
+  # A yellow ROSTER cell held by a coordinator (OP · TC · …) moves at once — no 120-min stall clock (`eln work next` already
+  # reads it as the board). Reserve / WIP-leftover cells keep the clock.
+  roster_stall_exempt: true
+  # HQ lends any scope's free hand directly (not only hands a sub-scope reported as idleLeft). caps.assign per tick stays;
+  # a hand that owns a workable cell is never lent; a cell OP's tab changed since the snapshot is skipped (op-tab-first).
+  direct_lend: true
+  # Evidence first-line prefixes that mark a cell as off the roster (ROSTER-<v>.md rule 2 · rule 4). A live snapshot reads
+  # work-pull.yaml `order.reserve_markers` / `never_markers` instead (WORK-PULL-REACHES-ROSTER); this list is its fallback.
+  not_roster_markers: ['[예비 ', '[WIP 잔류 ']

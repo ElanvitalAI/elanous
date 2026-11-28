@@ -159,10 +159,10 @@ test('real PWA sources resolve root imports from this checkout', () => {
   const cwd = resolve(import.meta.dir, '../..');
   const files = pwaReachableSrcFiles(cwd);
   expect(files.has('src/tool-runtime/mcp-wire-name.ts')).toBe(true);
-  // Measured 2026-09-28 with `tsc -p apps/pwa/tsconfig.json --explainFiles`: a PWA test file imports src/nexus/api/meta-api,
-  // which pulls in most of src — driver.ts included. The old «false» here encoded the blind spot that let #21567 break the build.
-  expect(files.has('src/agent-mission/driver.ts')).toBe(true);
-  expect(files.has('src/budget/unified-usage.ts')).toBe(true);
+  // Test-only roots no longer participate in the PWA TypeScript build.
+  expect(files.has('src/agent-mission/driver.ts')).toBe(false);
+  expect(files.has('src/budget/unified-usage.ts')).toBe(false);
+  expect(files.size).toBeLessThanOrEqual(300);
 });
 
 test('dynamic imports and index resolution stay within repository src', () => {
@@ -194,7 +194,7 @@ test('when a real .js and a same-named .ts coexist, the .js wins and its imports
   expect(graph.has('src/only-from-js.ts')).toBe(true);
 });
 
-test('PWA test files are entries too — the PWA tsconfig includes them and the Next build type-checks them', () => {
+test('PWA test-only files are not Next type-check entrypoints', () => {
   const cwd = '/fixture';
   const files: Record<string, string> = {
     'apps/pwa/src/lib/chain.test.ts': "import { x } from '../../../../src/nexus/api/meta-api';",
@@ -205,6 +205,20 @@ test('PWA test files are entries too — the PWA tsconfig includes them and the 
     listFiles: () => Object.keys(files),
     readFile: (path) => files[path.slice(cwd.length + 1)] ?? (() => { throw new Error(`missing ${path}`); })(),
   });
-  expect(graph.has('src/budget/unified-usage.ts')).toBe(true);
+  expect(graph.has('src/budget/unified-usage.ts')).toBe(false);
 });
 
+
+test('excluded PWA test files imported by a production root remain reachable', () => {
+  const cwd = '/fixture';
+  const files: Record<string, string> = {
+    'apps/pwa/src/entry.ts': "import './helper.test';",
+    'apps/pwa/src/helper.test.ts': "import '../../../src/dependency';",
+    'src/dependency.ts': 'export const value = 1;',
+  };
+  const graph = pwaReachableSrcFiles(cwd, {
+    listFiles: () => Object.keys(files),
+    readFile: (path) => files[path.slice(cwd.length + 1)] ?? '',
+  });
+  expect(graph.has('src/dependency.ts')).toBe(true);
+});

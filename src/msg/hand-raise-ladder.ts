@@ -171,6 +171,32 @@ export function loadFederationLadder(deps: { journalPath?: string; cwd?: string;
   return buildFederationLadder({ ...(hq ? { hq } : {}), spaces });
 }
 
+/** Capacity decisions cannot use the fail-soft ladder: missing or invalid inputs mean unknown. */
+export function loadFederationLadderStrict(deps: { journalPath?: string; cwd?: string; home?: string } = {}): FederationLadder | null {
+  try {
+    const path = deps.journalPath ?? (require('../els/journal.js') as typeof import('../els/journal.js')).elsJournalPath();
+    const journal = JSON.parse(readFileSync(path, 'utf8')) as JournalLike;
+    if (!journal || typeof journal !== 'object' || !Array.isArray(journal.workspaces) || !Array.isArray(journal.tabs) || !Array.isArray(journal.panes)) return null;
+    const cwd = deps.cwd ?? process.cwd();
+    const home = deps.home ?? homedir();
+    const { readWorkspaceFile } = require('../els/workspace-config.js') as typeof import('../els/workspace-config.js');
+    const workspace = readWorkspaceFile(cwd, home);
+    if (!workspace.path || !workspace.config || workspace.errors.length) return null;
+    const orgMod = require('../org/org-map.js') as typeof import('../org/org-map.js');
+    const org = orgMod.loadOrgMap({ cwd, home });
+    if (org.errors.length) return null;
+    const fromJournal = spacesOfElsJournal(journal);
+    const spaces: FederationSpace[] = [...fromJournal.spaces];
+    for (const space of Object.values(workspace.config.spaces)) spaces.push({ coordinator: space.coordinator, seats: space.seats });
+    if (org.declared) for (const space of Object.values(org.org.spaces)) {
+      const seats = [space.advisor, space.steward].filter((s): s is string => Boolean(s));
+      if (seats.length) spaces.push({ coordinator: space.leader, seats });
+    }
+    const hq = orgMod.orgDutyDeclared('escalation-parent', { cwd, home }) ?? fromJournal.hq ?? workspace.config.hq?.coordinator;
+    return buildFederationLadder({ hq, spaces });
+  } catch { return null; }
+}
+
 /** seat → its federation.yaml `role` (upper-case seat ids). Unreadable declaration = {} (prefix rules still apply). */
 export function loadDeclaredSeatRoles(deps: { cwd?: string; home?: string } = {}): Record<string, string> {
   try {
@@ -254,28 +280,30 @@ const like = (ref: string): string => `%${JSON.stringify(ref)}%`;
  *   resolved / rejected = an outcome row on its chain · escalated = a forward from it (or the same block already at the
  *   receiver's parent — the blocked seat's own 5-min push) · replied = the receiver (or CLAUDE-OP) replied to its sender.
  */
-export function handClosedOn(store: Pick<MsgStore, 'db'>, hand: HandMail, ladder?: Pick<FederationLadder, 'parentOf'>): HandClosedBy | null {
+/** `asOf` (ISO · FED-ANALYST point-in-time read): only messages created before it count — the hand as it stood then. */
+export function handClosedOn(store: Pick<MsgStore, 'db'>, hand: HandMail, ladder?: Pick<FederationLadder, 'parentOf'>, asOf?: string): HandClosedBy | null {
+  const before = asOf ? ' AND created_at < ?' : ''; const at = asOf ? [asOf] : [];
   // BEACON-LADDER ②: a «resolve» that keeps the hand waiting (HOLD/유지/wait) without owner ⊕ deadline is no outcome.
   const outcomes = store.db.query(`SELECT body, refs_json FROM msg_messages WHERE id > ? AND refs_json LIKE ?
-    AND (refs_json LIKE ? OR refs_json LIKE ?) ORDER BY id ASC`)
-    .all(hand.rootId, like(`hand-of:${hand.rootId}`), like('hand-outcome:resolve'), like('hand-outcome:reject')) as { body: string; refs_json: string }[];
+    AND (refs_json LIKE ? OR refs_json LIKE ?)${before} ORDER BY id ASC`)
+    .all(hand.rootId, like(`hand-of:${hand.rootId}`), like('hand-outcome:resolve'), like('hand-outcome:reject'), ...at) as { body: string; refs_json: string }[];
   for (const outcome of outcomes) {
     const refs = parseRefs(outcome.refs_json);
     if (refs.includes('hand-outcome:reject')) return 'rejected';
     if (!keepsWaiting(outcome.body, refs)) return 'resolved';
   }
-  if (store.db.query('SELECT 1 FROM msg_messages WHERE id > ? AND refs_json LIKE ? LIMIT 1').get(hand.id, like(`hand-escalated-from:${hand.id}`))) return 'escalated';
+  if (store.db.query(`SELECT 1 FROM msg_messages WHERE id > ? AND refs_json LIKE ?${before} LIMIT 1`).get(hand.id, like(`hand-escalated-from:${hand.id}`), ...at)) return 'escalated';
   if (ladder && hand.blockId) {
     const parent = ladder.parentOf(hand.receiver);
-    if (parent !== HAND_CEO && store.db.query(`SELECT 1 FROM msg_messages WHERE id > ? AND recipient = ? AND refs_json LIKE ? AND refs_json LIKE '%"reason:%' LIMIT 1`)
-      .get(hand.id, canon(parent), like(`block:${hand.blockId}`))) return 'escalated';
+    if (parent !== HAND_CEO && store.db.query(`SELECT 1 FROM msg_messages WHERE id > ? AND recipient = ? AND refs_json LIKE ? AND refs_json LIKE '%"reason:%'${before} LIMIT 1`)
+      .get(hand.id, canon(parent), like(`block:${hand.blockId}`), ...at)) return 'escalated';
   }
   const responders = [canon(hand.receiver), HAND_CEO_COPY_TO];
   const correlation = hand.correlationId && hasColumn(store, 'correlation_id') ? ' OR correlation_id = ?' : '';
   const replies = store.db.query(`SELECT body, refs_json FROM msg_messages WHERE id > ? AND sender IN (?, ?) AND recipient = ?
     AND (reply_to = ?${correlation}) AND (refs_json IS NULL OR refs_json NOT LIKE '%"reason:%')
-    AND (refs_json IS NULL OR refs_json NOT LIKE '%"hand-outcome:%') ORDER BY id ASC`)
-    .all(...[hand.id, ...responders, canon(hand.sender), hand.id, ...(correlation ? [hand.correlationId!] : [])]) as { body: string; refs_json: string | null }[];
+    AND (refs_json IS NULL OR refs_json NOT LIKE '%"hand-outcome:%')${before} ORDER BY id ASC`)
+    .all(...[hand.id, ...responders, canon(hand.sender), hand.id, ...(correlation ? [hand.correlationId!] : []), ...at]) as { body: string; refs_json: string | null }[];
   return replies.some((r) => !keepsWaiting(r.body, parseRefs(r.refs_json))) ? 'replied' : null;
 }
 
@@ -299,11 +327,14 @@ export function lastLeaderReply(store: Pick<MsgStore, 'db'>, hand: Pick<HandMail
 export interface OpenHand extends HandMail { readonly waitedMs: number }
 
 /** The ✋ mails still open (no outcome), newest window only. `involving` limits to hands this seat sent, holds or raised. */
-export function openHands(store: Pick<MsgStore, 'db'>, input: { now: number; ladder?: Pick<FederationLadder, 'parentOf'>; involving?: string; windowMs?: number }): OpenHand[] {
+/** `asOf: true` = the hands open AT `now` (point in time — later closures and later hands ignored · FED-ANALYST window check). */
+export function openHands(store: Pick<MsgStore, 'db'>, input: { now: number; ladder?: Pick<FederationLadder, 'parentOf'>; involving?: string; windowMs?: number; asOf?: boolean }): OpenHand[] {
   const who = input.involving ? canon(input.involving) : null;
+  const asOf = input.asOf ? new Date(input.now).toISOString() : undefined;
   return readHandMailsSince(store, input.now - Math.max(HAND_SWEEP_WINDOW_MS, input.windowMs ?? 0))
+    .filter((h) => !asOf || h.createdAtMs < input.now)
     .filter((h) => !who || h.receiver === who || h.sender === who || canon(h.blockedSeat) === who)
-    .filter((h) => handClosedOn(store, h, input.ladder) === null)
+    .filter((h) => handClosedOn(store, h, input.ladder, asOf) === null)
     .map((h) => ({ ...h, waitedMs: Math.max(0, input.now - h.createdAtMs) }));
 }
 

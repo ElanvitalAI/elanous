@@ -3,7 +3,7 @@
 // 세 얼굴:
 //   관측 = live pregate launchers (RES inflight locks `<head12>-<light|full>.lock` = `<pid> <host> <token>` · the pid is the
 //          local launcher) ⊕ open harness/graph runs (run-ledger with a `start` and no terminal line). KPI zombie_runs =
-//          pregate launchers alive past PREGATE_ZOMBIE_MIN ⊕ open runs silent past RUN_ZOMBIE_MIN (null when either source
+//          pregate launchers alive past pregate_zombie_min ⊕ open runs silent past run_zombie_min (null when either source
 //          cannot be read). Stalled-but-not-zombie runs are subjects only (watch).
 //   판단 근거 = thresholds from the evidence (GREEN p99 ≈ 18 min · max 47 · changed-tsc self-timeout ≈ 28 min → 90 min is
 //          beyond any real pregate) ⊕ T-cell no-progress rule (30 min stalled) ⊕ the card's rights/cooldown.
@@ -16,16 +16,10 @@ import type { BodyEnv } from '../registry.js';
 import type { ActionResult, AgentBody, BodyCtx, Observation, PlannedAction, Subject } from '../runtime.js';
 import { agentHome } from '../memory.js';
 import { readJsonlFile, readProcess, scanRunLedgers, seatStateRoot } from './run-lifecycle-shared.js';
-import { pv } from '../policy-context.js';
+import { pn } from '../policy-context.js';
 
-export const PREGATE_ZOMBIE_MIN = 90;
-export const RUN_STALL_MIN = 30;
-export const RUN_ZOMBIE_MIN = 120;
-/** Open runs older than this window are out of scope (their ledgers are not rescanned every tick). */
-export const RUN_WINDOW_H = 48;
 /** RUN-SUP-STALE-RECORD-CLOSE: a pregate record (inflight lock) at least this old whose pid is gone, <defunct> or no longer
  *  the launcher is a dead record — closed (moved aside), never killed, never retried. */
-export const STALE_RECORD_MIN = 90; // 출처: pregate_zombie_min 90 (GREEN p99 ≈ 18 min · max 47) — 그보다 오래된 기록의 PID 가 런처가 아니면 죽은 기록
 
 export interface PregateJob { readonly id: string; readonly pid: number; readonly host: string; readonly ageMin: number; readonly alive: boolean }
 export interface OpenRun { readonly runId: string; readonly graphId: string; readonly startedAt: string; readonly lastAt: string; readonly idleMin: number; readonly stage: string | null }
@@ -34,7 +28,7 @@ export interface KilledPregate { readonly id: string; readonly pid: number; read
 export interface RunSupervisorDeps {
   /** Pregate launchers by inflight lock (null = unknown). */
   pregateJobs(now: Date): PregateJob[] | null;
-  /** Runs with a start and no terminal line, touched inside RUN_WINDOW_H (null = unknown). */
+  /** Runs with a start and no terminal line, touched inside run_window_h (null = unknown). */
   openRuns(now: Date): OpenRun[] | null;
   /** Re-read one exact process (command line ⊕ elapsed seconds) — null = gone. */
   proc(pid: number): { cmd: string; elapsedSec: number } | null;
@@ -85,7 +79,7 @@ export function liveDeps(stateRoot: string): RunSupervisorDeps {
       return out;
     },
     openRuns(now) {
-      const runs = scanRunLedgers(join(stateRoot, 'run-ledger'), now.getTime() - pv('run_window_h', RUN_WINDOW_H) * 3_600_000);
+      const runs = scanRunLedgers(join(stateRoot, 'run-ledger'), now.getTime() - pn('run_window_h') * 3_600_000);
       if (!runs) return null;
       return runs.filter(r => r.startedAt && !r.terminal).map(r => ({ runId: r.runId, graphId: r.graphId, startedAt: r.startedAt!, lastAt: r.lastAt,
         idleMin: (now.getTime() - Date.parse(r.lastAt)) / 60_000, stage: r.stage }));
@@ -153,8 +147,8 @@ export function createBody(env: BodyEnv, deps: RunSupervisorDeps = liveDeps(env.
     if (jobs) {
       // RUN-SUP-STALE-RECORD-CLOSE: a record past stale_record_min whose pid is gone, <defunct> or no longer the launcher
       // (pid reused) is a DEAD RECORD — not a zombie run; it is closed once (moved aside, no kill) and never retried.
-      const staleMin = pv('stale_record_min', STALE_RECORD_MIN);
-      const zombieMin = pv('pregate_zombie_min', PREGATE_ZOMBIE_MIN);
+      const staleMin = pn('stale_record_min');
+      const zombieMin = pn('pregate_zombie_min');
       const why = (j: PregateJob): string | null => {
         if (j.ageMin < staleMin) return null;
         if (!j.alive) return 'pid 없음';
@@ -178,14 +172,14 @@ export function createBody(env: BodyEnv, deps: RunSupervisorDeps = liveDeps(env.
       }
     } else facts.push('pregate 잠금 읽기 실패(모름)');
     if (runs) {
-      facts.push(`열린 런 ${runs.length} (창 ${pv('run_window_h', RUN_WINDOW_H)}h)`);
+      facts.push(`열린 런 ${runs.length} (창 ${pn('run_window_h')}h)`);
       for (const r of runs) {
-        if (r.idleMin >= pv('run_zombie_min', RUN_ZOMBIE_MIN)) {
+        if (r.idleMin >= pn('run_zombie_min')) {
           zombies += 1;
           subjects.push({ id: `run:${r.runId}`, kind: 'run-zombie', summary: `${r.graphId}${r.stage ? `/${r.stage}` : ''} 마지막 사건 ${Math.round(r.idleMin)}분 전 · 종결 줄 없음`, ageMin: r.idleMin });
           if (!ctx.state.acted[`close-zombie-run:run:${r.runId}`]) patterns.push({ key: `run-zombie@${r.graphId}`, lesson: `${r.graphId} 런이 종결 줄 없이 멈추는 일이 반복된다 — 그 그래프의 종료 경로(stop/run-status 기록)를 고치는 칸이 필요하다.` });
-        } else if (r.idleMin >= pv('run_stall_min', RUN_STALL_MIN)) {
-          subjects.push({ id: `run:${r.runId}`, kind: 'run-stalled', summary: `${r.graphId} ${Math.round(r.idleMin)}분 진전 없음 (좀비 판정 ${pv('run_zombie_min', RUN_ZOMBIE_MIN)}분)`, ageMin: r.idleMin });
+        } else if (r.idleMin >= pn('run_stall_min')) {
+          subjects.push({ id: `run:${r.runId}`, kind: 'run-stalled', summary: `${r.graphId} ${Math.round(r.idleMin)}분 진전 없음 (좀비 판정 ${pn('run_zombie_min')}분)`, ageMin: r.idleMin });
         }
       }
     } else facts.push('런 원장 읽기 실패(모름)');
@@ -211,19 +205,19 @@ export function createBody(env: BodyEnv, deps: RunSupervisorDeps = liveDeps(env.
 
   const actions: AgentBody['actions'] = {
     'close-zombie-run': {
-      describe: `종결 줄 없이 ${pv('run_zombie_min', RUN_ZOMBIE_MIN)}분 넘게 멈춘 런 원장에 stop 한 줄(class unclassified · site run-supervisor:no-progress)을 더한다 — 되돌림: 카드 재발사`,
+      describe: `종결 줄 없이 ‹run_zombie_min›분 넘게 멈춘 런 원장에 stop 한 줄(class unclassified · site run-supervisor:no-progress)을 더한다 — 되돌림: 카드 재발사`,
       run(target, ctx): ActionResult {
         const runId = target.replace(/^run:/u, '');
         const runs = deps.openRuns(ctx.now);
         const r = runs?.find(x => x.runId === runId);
         if (!r) return { ok: false, line: `${runId}: 다시 읽으니 열린 런이 아니다(이미 종결 또는 모름)` };
-        if (r.idleMin < pv('run_zombie_min', RUN_ZOMBIE_MIN)) return { ok: false, line: `${runId}: 다시 읽으니 ${Math.round(r.idleMin)}분 전 사건 — 좀비 아님` };
+        if (r.idleMin < pn('run_zombie_min')) return { ok: false, line: `${runId}: 다시 읽으니 ${Math.round(r.idleMin)}분 전 사건 — 좀비 아님` };
         const res = deps.closeRun(runId, `no progress ${Math.round(r.idleMin)}m · no terminal line`, `run-ledger:${runId}:${r.lastAt}`);
         return { ...res, ref: `run:${runId}`, undo: `카드 재발사(eln tasks doctor <card> → relaunch) — stop 줄은 append-only` };
       },
     },
     'end-zombie-pregate': {
-      describe: `${pv('pregate_zombie_min', PREGATE_ZOMBIE_MIN)}분 넘게 끝나지 않은 pregate 런처를 정확 PID 로 끝낸다(명령줄 pregate.py ⊕ head12 ⊕ 나이 재확인 뒤 SIGTERM) — 되돌림: 같은 argv 재발사 · 뒤에 런처가 없는 낡은 기록(pid 없음·defunct·재사용)은 kill 없이 기록만 닫는다(closed-stale-record · 되돌림: 기록을 제자리로)`,
+      describe: `‹pregate_zombie_min›분 넘게 끝나지 않은 pregate 런처를 정확 PID 로 끝낸다(명령줄 pregate.py ⊕ head12 ⊕ 나이 재확인 뒤 SIGTERM) — 되돌림: 같은 argv 재발사 · 뒤에 런처가 없는 낡은 기록(pid 없음·defunct·재사용)은 kill 없이 기록만 닫는다(closed-stale-record · 되돌림: 기록을 제자리로)`,
       run(target, ctx): ActionResult {
         const id = target.replace(/^pregate:/u, '');
         const job = deps.pregateJobs(ctx.now)?.find(j => j.id === id);
@@ -233,12 +227,12 @@ export function createBody(env: BodyEnv, deps: RunSupervisorDeps = liveDeps(env.
         // (moved aside · no kill) — an action, not a failure, and the record is gone so it is never retried
         if (!p || !isPregateLauncher(p.cmd)) {
           const what = !job.alive ? 'pid 없음' : !p ? 'pid 사라짐' : isDefunct(p.cmd) ? 'pid <defunct>' : 'pid 재사용(명령줄이 런처 아님)';
-          if (job.ageMin < pv('stale_record_min', STALE_RECORD_MIN)) return { ok: false, line: `${id}: ${what} · 기록 ${Math.round(job.ageMin)}분 — 아직 닫을 나이 아님(${pv('stale_record_min', STALE_RECORD_MIN)}분)` };
+          if (job.ageMin < pn('stale_record_min')) return { ok: false, line: `${id}: ${what} · 기록 ${Math.round(job.ageMin)}분 — 아직 닫을 나이 아님(${pn('stale_record_min')}분)` };
           const r = deps.closeRecord(id, `${what} · ${Math.round(job.ageMin)}분`);
           if (!r.ok) return { ok: false, line: r.line };
           return { ok: true, line: `closed-stale-record ${head12(id)} @${job.host}: ${what} · ${Math.round(job.ageMin)}분 된 기록을 닫음(kill 없음)`, ref: `record:${id}`, after: 'closed-stale-record', ...(r.undo ? { undo: r.undo } : {}) };
         }
-        if (p.elapsedSec / 60 < pv('pregate_zombie_min', PREGATE_ZOMBIE_MIN)) return { ok: false, line: `${id}: pid ${job.pid} 나이 ${Math.round(p.elapsedSec / 60)}분 — 좀비 아님(pid 재사용 의심)` };
+        if (p.elapsedSec / 60 < pn('pregate_zombie_min')) return { ok: false, line: `${id}: pid ${job.pid} 나이 ${Math.round(p.elapsedSec / 60)}분 — 좀비 아님(pid 재사용 의심)` };
         const argv = relaunchArgv(p.cmd, pregateBin);
         if (!argv) return { ok: false, line: `${id}: 재발사 argv 를 만들 수 없어 끝내지 않는다(되돌림 없는 종료 금지)` };
         // last re-check immediately before the signal: same pid, same command line
@@ -254,14 +248,14 @@ export function createBody(env: BodyEnv, deps: RunSupervisorDeps = liveDeps(env.
     // LOOP-AGENT-V3-SMART-2: the plan's fallback for end-zombie-pregate once a knowhow line says it keeps failing on a kind of
     // record (agent.yaml actions[].fallback) — close the record only (no kill · no retry) when no live launcher is behind it.
     'close-stale-record': {
-      describe: `런처가 뒤에 없는 pregate 기록(pid 없음·defunct·재사용)을 kill 없이 닫는다 — ${pv('pregate_zombie_min', PREGATE_ZOMBIE_MIN)}분 넘은 기록만 · 런처가 살아 있으면 닫지 않는다 · 되돌림: 기록을 제자리로`,
+      describe: `런처가 뒤에 없는 pregate 기록(pid 없음·defunct·재사용)을 kill 없이 닫는다 — ‹pregate_zombie_min›분 넘은 기록만 · 런처가 살아 있으면 닫지 않는다 · 되돌림: 기록을 제자리로`,
       run(target, ctx): ActionResult {
         const id = target.replace(/^pregate:/u, '');
         const job = deps.pregateJobs(ctx.now)?.find(j => j.id === id);
         if (!job) return { ok: false, line: `${id}: 다시 읽으니 기록이 없다(이미 회수·닫힘)` };
         const p = job.alive ? deps.proc(job.pid) : null;
         if (p && isPregateLauncher(p.cmd)) return { ok: false, line: `${id}: pid ${job.pid} 런처가 살아 있다 — 낡은 기록이 아니다(닫지 않음)` };
-        if (job.ageMin < pv('pregate_zombie_min', PREGATE_ZOMBIE_MIN)) return { ok: false, line: `${id}: 기록 ${Math.round(job.ageMin)}분 — 아직 좀비 나이 아님(${pv('pregate_zombie_min', PREGATE_ZOMBIE_MIN)}분)` };
+        if (job.ageMin < pn('pregate_zombie_min')) return { ok: false, line: `${id}: 기록 ${Math.round(job.ageMin)}분 — 아직 좀비 나이 아님(${pn('pregate_zombie_min')}분)` };
         const what = !job.alive ? 'pid 없음' : !p ? 'pid 사라짐' : isDefunct(p.cmd) ? 'pid <defunct>' : 'pid 재사용(명령줄이 런처 아님)';
         const r = deps.closeRecord(id, `${what} · ${Math.round(job.ageMin)}분 · v3 fallback`);
         if (!r.ok) return { ok: false, line: r.line };

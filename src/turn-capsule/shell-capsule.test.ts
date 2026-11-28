@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { TaskNotificationQueue } from '../agent/task-notification.js';
 import { dispatchBashCapsule } from '../skills/tools/index.js';
 import { signalUrgentSteer } from '../session/urgent-steer.js';
+import { signalShellPreempt } from '../session/shell-preempt.js';
 import type { CapsuleEvent, CapsulePolicy } from './contract.js';
 import { installShellCapsuleSink, listDetachedShellCapsules, runShellCapsule, stopDetachedShellCapsule } from './shell-capsule.js';
 
@@ -25,6 +26,33 @@ function manualTimer() {
 }
 
 describe('CAPSULE-A2 shell capsule', () => {
+  test('steer withdraws pending approval before a queued continuation can spawn', async () => {
+    const frames: CapsuleEvent[] = [];
+    const sink = installShellCapsuleSink('steer-approval', (event) => frames.push(event));
+    const q = queue();
+    let launches = 0;
+    let approvalSignal: AbortSignal | undefined;
+    const pending = runShellCapsule({
+      tool: 'RunShell', command: 'example', clockFromSpawn: true,
+      start: (signal, spawned) => {
+        approvalSignal = signal;
+        return Promise.resolve().then(() => {
+          if (!signal?.aborted) { launches++; spawned(); }
+          return 'settled';
+        });
+      },
+      describe: (value) => ({ status: 'ok', output: value }), started: (id) => `started ${id}`,
+    }, { policy: noCapPolicy, queue: q, log: () => {} });
+    signalShellPreempt('another-session');
+    expect(approvalSignal?.aborted).toBe(false);
+    signalShellPreempt('steer-approval');
+    expect(approvalSignal?.aborted).toBe(true);
+    await expect(pending).rejects.toThrow('before spawn for steer');
+    sink.dispose();
+    expect(launches).toBe(0);
+    expect(frames).toEqual([]);
+    expect(q.size).toBe(0);
+  });
   test('urgent decision cancels an approval continuation before RunShell spawn', async () => {
     const frames: CapsuleEvent[] = [];
     const sink = installShellCapsuleSink('urgent-approval', (event) => frames.push(event));

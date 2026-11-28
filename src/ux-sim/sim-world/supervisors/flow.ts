@@ -76,8 +76,8 @@ function rrWorld(phase: 'rehearsal-due' | 'publish-stuck') {
 }
 
 // ── hand-steward: idle hand ⊕ unowned ready cell ─────────────────────────────────────────────────────────────────────
-const HS_NOW = '2026-11-27T10:00:00.000Z';
-function hsWorld(opts: { brokenHint?: boolean }) {
+export const HS_NOW = '2026-11-27T10:00:00.000Z';
+export function hsWorld(opts: { brokenHint?: boolean }) {
   const hands: Hand[] = [
     { seat: 'UX-H7', state: 'idle', since: plus(HS_NOW, -40).getTime() },
     { seat: 'JUD-B', state: 'idle', since: plus(HS_NOW, -90).getTime(), judge: true },

@@ -4,7 +4,7 @@ import { appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, 
 import { dirname, join } from 'node:path';
 import { CardStore, taskCardsDir, type TaskCard } from '../../task-cards/card-store.js';
 import { Database } from 'bun:sqlite';
-import { checklistDevVersion, listChecklist, type ChecklistItem } from '../../release-loop/checklist.js';
+import { listChecklist, type ChecklistItem } from '../../release-loop/checklist.js';
 import { readTrafficSignal } from '../../seat-loop/traffic-signal.js';
 import { runHoldHygiene, type HygieneCell, type HygieneDeps } from '../../steward/hold-hygiene.js';
 import { runDirectiveAudit, type DirectiveAuditDeps } from '../../steward/directive-audit.js';
@@ -34,6 +34,7 @@ import { loadAgentRolePack, type AgentReplyInput } from '../agent-reply.js';
 import type { LLMProvider } from '../../llm.js';
 import { runSimImpactAudit, type SimImpactGap } from './sim-impact-audit.js';
 import { selfHealAfterChildExit } from '../../cli/ta-oom-self-heal.js';
+import { boardVersion } from '../../release-loop/board-version.js';
 
 export type Window = '08' | '12' | '18';
 export type Node = 'intake' | 'split' | 'place' | 'delegate' | 'launch' | 'reconcile' | 'report';
@@ -1057,7 +1058,7 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
       if (mode === 'live') {
         try {
           const signal = readTrafficSignal(deps.hygienePaths?.trafficPath);
-          const versions = signal && !('unreadable' in signal) && signal.versions?.length ? signal.versions : [checklistDevVersion()];
+          const versions = signal && !('unreadable' in signal) && signal.versions?.length ? signal.versions : [boardVersion()];
           let cells: HygieneCell[] = [];
           if (deps.hygieneCells) cells = deps.hygieneCells();
           else if (signal && !('unreadable' in signal) && signal.hold?.length) {

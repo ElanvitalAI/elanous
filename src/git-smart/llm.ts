@@ -9,7 +9,8 @@ export function modelForConflict(paths: readonly string[]): string {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const m = require('../seat/model-by-difficulty.js') as typeof import('../seat/model-by-difficulty.js');
   const d = m.cellDifficulty({ cellId: 'SMART-MERGE-CONFLICT', paths });
-  return m.pickHandModel(d.tier, () => null).model;
+  const pick = m.pickHandModel(d.tier, () => null);
+  return pick.none ? m.TIER_MODEL[d.tier].model : pick.model;
 }
 
 /** Default capsule resolver: `defaultLlmResolve` with ELANOUS_CONFLICT_MODEL set for this file's difficulty. */

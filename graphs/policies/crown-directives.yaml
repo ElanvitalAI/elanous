@@ -1,0 +1,32 @@
+# ELN-OP-CROWN-MEMORY (0.3.40 P0 · CEO 11-28 21:0x «중요 내용이면 바로 자발적으로 메모리 기록») — directive cards (src/kit/crown-directive).
+# Every CEO decision that reaches the context bus (kit/decision-bus · ledger ⊕ docs change-log rows) also becomes a «지시 카드» in
+# eln OP's memory; a card naming seats ⊕ cell patterns (`eln decisions crown … --seat MK --only 'DOCS-*'`) refuses an assign /
+# owner handoff that contradicts it until it expires. Read by name; change a value here, not in TS. There is no on/off switch.
+version: 1
+card:
+  # A card without --until expires this long after it was recorded (a new directive is a new card).
+  default_expiry_h: 72
+  # The action doors that consult active cards: `eln seat assign` / SeatAssign (assign) · `eln release checklist set --owner` (handoff).
+  guarded_actions: [assign, handoff]
+memory:
+  # The seat store the cards go to — seat recall reads only the seat's own store (the global store is never recalled by a seat
+  # turn · MEMORY-AUDIT-1128 W3/R3). The card name carries the action words (crown-<MMDD>-<seat>-<cells>-only) — seat recall
+  # scores name words 3 · description ≤ 3 · body 1 · floor 2.
+  seat: OP
+  # S2 — every turn, at the tail of the user-role message (never the system prompt), the live `crown-` cards: at most this many,
+  # at most this many chars. A card stops when it expires (description «만료 …») and the decision-bus sweep deletes it.
+  turn_max_cards: 6
+  turn_max_chars: 1500
+  # S1 — index lines written after the session-start snapshot (a long-running session never re-reads its index), carried at
+  # the turn tail as «자리 기억 갱신», at most this many chars.
+  update_max_chars: 1500
+  # Pinned = the card's index line moves to the top of the seat index (the next session-start index carries it first). Only a card
+  # that binds seats is pinned; a memory-only card (a doc change-log row · a decision with no --seat) is recalled by relevance.
+  pinned: true
+  # The memory write gate's fields (src/memory-triage/write-gate.ts MEMORY_KINDS · MEMORY_SCOPES).
+  kind: 교정
+  scope: role
+roles:
+  # YAML-SEAT-ROLES is not on main yet — the seat's role line comes from seat-state/<SEAT>/<file> (first prose line).
+  file: ROLE.md
+  summary_chars: 160

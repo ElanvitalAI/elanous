@@ -24,6 +24,7 @@
  *
  * State: <stateRoot>/land-graph/{ledger.jsonl, holds.json, tick.lock}.
  */
+import { createHash } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { security4Hits } from '../judge-butler/done-when.js';
@@ -31,7 +32,8 @@ import { isDocOnly, noFocusedStage as noFocusedStageOf, preexistingOnly as preex
 import { evaluateLandVetoes, landRefusalRecipient, type VetoKind, type VetoMark } from '../org/land-authority.js';
 import type { OrgDeps } from '../org/org-map.js';
 import type { CellMatch } from './cell-link.js';
-import { finishKindFor, readBook, runFinisher, settle, stalePrs, writeBook, type FinishDeps, type FinishKind, type FinishOutcome } from './finisher.js';
+import { agingCard, conflictEvidence, headAtOf, judgePrAging, type AgingStage, type HeadAtSource, type PrAgingPolicy } from '../kit/pr-aging/index.js';
+import { autofixesPerHour, finishKindFor, readBook, runFinisher, settle, stalePrs, writeBook, type FinishCand, type FinishDeps, type FinishOutcome } from './finisher.js';
 import { guardErrorClass, legacyGuardError, nextAction, redVerdict, TSC_LAND_RETRIES, tscUnmeasured, type NextAction } from './red-receipt.js';
 
 export type Mode = 'shadow' | 'live';
@@ -45,8 +47,12 @@ export interface PrInfo {
   crossRepo?: boolean;
   /** ISO creation time — STALE-PR-24H. */
   createdAt?: string;
+  /** ISO last-activity time (gh updatedAt) — PR-ZOMBIE-AGING's head-age fallback when the head commit is not local. */
+  updatedAt?: string;
   /** PR body — LAND-CELL-LINK reads its «칸: ID» line. */
   body?: string;
+  /** Label names — part of the refusal context (LAND10-RESTICKY-REFUSAL) when the lister fetches them. */
+  labels?: string[];
 }
 export interface Receipt {
   dir: string; head: string; host: string; focused: string[]; rawDir: string;
@@ -60,8 +66,11 @@ export interface Receipt {
   focusedBaseline?: { mine: number; onMain: number; newFailures: string[] };
   /** PATCHID-1127: patch-id of the PR-own change (diff merge-base(main, head)..head) the receipt was taken on. */
   patchId?: string;
-  /** Set when this receipt was taken on an older head with the same patch-id (only main was merged since). */
+  /** Set when this receipt was taken on an older head whose PR-own change is the same (only main was merged since). */
   reusedFrom?: string;
+  /** How the older head's receipt was carried: same stable patch-id · or LAND10-FINISHER-WAIT own-diff (clean main merges only,
+   *  PR-own +/- lines identical — main moving a context line next to a hunk no longer voids the receipt). */
+  reusedVia?: 'patch-id' | 'own-diff';
   /** LAND-STEWARD RED-RECEIPT: the receipt came from PREGATE-RED — its failed steps (src/land-graph/red-receipt.ts). */
   red?: { failed: Array<{ name: string; exit: number }>; failure?: string };
 }
@@ -206,7 +215,7 @@ export function decide(f: Facts): Decision {
     if (!t || !TERRA_CLEAR.includes(t.verdict.toLowerCase())) return { action: 'wait', cls: 'review-required', why: `security-4 ${hit} · terra ${t ? t.verdict : 'none'}`, card: c('review-required', hit) };
     terraTxt = ` · security-4 terra ${t.verdict.toLowerCase()}`;
   }
-  const reuse = f.receipt.reusedFrom ? ` · receipt reused via patch-id from ${f.receipt.reusedFrom.slice(0, 12)}` : '';
+  const reuse = f.receipt.reusedFrom ? ` · receipt reused via ${f.receipt.reusedVia ?? 'patch-id'} from ${f.receipt.reusedFrom.slice(0, 12)}` : '';
   return { action: 'land', lane, why: `same-head receipt ${f.receipt.dir.split('/').pop()}${reuse} · ${focusedTxt}${terraTxt}` };
 }
 
@@ -237,12 +246,16 @@ export function classifyLandExit(rc: number, text: string): RefusalClass | null 
 
 export interface LedgerRow {
   at: string; pr: number; head: string; mode: Mode;
-  event: 'decision' | 'landing' | 'landed' | 'noticed' | 'refused' | 'card' | 'stall';
+  event: 'decision' | 'landing' | 'landed' | 'noticed' | 'refused' | 'card' | 'stall' | 'aging';
+  /** `aging` rows (PR-ZOMBIE-AGING): which stage acted on this head (one row per PR · head · stage). */
+  stage?: AgingStage;
   action?: Action; cls?: RefusalClass; why?: string; to?: string[]; body?: string; synthetic?: boolean;
   /** `landed` rows: the real merge time (`at` is the tick start · a tick with live lands runs tens of minutes). */
   doneAt?: string;
   /** NEXT-ACTION: who acts next on a non-land decision / refusal (the graph itself or a seat). */
   next?: NextAction;
+  /** `refused` rows: refusalContext() at refusal time — a later tick with a different context re-judges the same head. */
+  ctx?: string;
 }
 
 export const landHome = (stateRoot: string) => join(stateRoot, 'land-graph');
@@ -356,8 +369,16 @@ export interface LandDeps {
   attachCell?(cell: string, pr: PrInfo): { ok: boolean; why?: string };
   /** `plan --reap`: 'dry' lists would-close · 'apply' closes. */
   reap?: 'dry' | 'apply';
-  /** LAND-STEWARD train manager (src/land-steward/train.ts): land order over the open PRs · default landOrder. */
+  /** LAND-STEWARD train manager (src/land-graph/lane-order.ts · policies.yaml): land order over the open PRs · default landOrder. */
   order?(prs: readonly PrInfo[], rows: readonly LedgerRow[], nowMs: number): PrInfo[];
+  /** PR-ZOMBIE-AGING (src/kit/pr-aging · graphs/policies/pr-aging.yaml) — absent / null = no aging this tick. */
+  prAging?: PrAgingPolicy | null;
+  /** Committer time (ms) of each head present in the local repo (no network) — absent head = its PR's updatedAt is the basis. */
+  headTimes?(heads: readonly string[]): ReadonlyMap<string, number>;
+  /** Names of the failed steps (exit ≠ 0) of this head's PREGATE-RED receipts. */
+  redSteps?(pr: number, head: string): string[];
+  /** Live: convert the PR to draft (`gh pr ready <N> --undo` — reversible). */
+  toDraft?(pr: PrInfo): { ok: boolean; why?: string };
   /** LAND-STEWARD «세 평면»: the steward is the terminal owner of land refusals — no mail to the landing owner / OP
    *  (cards cc, seat cards, stall, post-land notice) except policy exceptions (security-4). Rows still record everything. */
   terminalOwner?: string;
@@ -367,18 +388,55 @@ export const POLICY_MAIL_CLASSES: RefusalClass[] = ['security-finding', 'review-
 
 export interface TickResult {
   mode: Mode; locked: boolean; decisions: Array<{ pr: number; head: string; action: Action; cls?: RefusalClass; why: string; next?: NextAction }>; landed: number[]; error?: string;
+  /** GH-BUDGET-GOVERNOR ④: the open-PR read failed (GitHub cooldown · secondary limit · network) — a skipped tick, not an
+   *  exception: `error` still names it (no KPI · no breach line · voice refuses to answer) and the next tick retries. */
+  skipped?: 'gh-error';
   /** «ready to land» count this tick (every gate passes for the head). */
   ready?: number;
   finisher?: FinishOutcome[];
+  /** LAND10-AUTOFIX-LANE KPI: autofix commits pushed in the last hour (finisher book). */
+  autofixPerHour?: number;
   stale?: Array<{ pr: number; ageH: number; reason: string }>;
   reaped?: Array<{ pr: number; action: 'would-close' | 'closed' | 'close-failed'; why: string }>;
+  /** PR-ZOMBIE-AGING: every aged open PR this tick and what the tick did about it (code never closes a PR). */
+  aging?: AgingRow[];
   /** LAND-CELL-LINK per ready PR · `landed-no-cell` = no current-release cell matched. */
   cells?: Array<{ pr: number; cell: string | null; basis?: string; action: 'linked' | 'would-attach' | 'attached' | 'attach-failed' | 'landed-no-cell'; why?: string }>;
+}
+
+/** One aged PR in a tick: drafted / would-draft (non-live) / draft-failed / deferred (per-tick cap) · proposed / would-propose / proposed-before. */
+export interface AgingRow {
+  pr: number; head: string; stage: AgingStage; ageDays: number; basis: HeadAtSource; conflict: string | null;
+  action: 'drafted' | 'would-draft' | 'draft-failed' | 'deferred' | 'proposed' | 'would-propose' | 'proposed-before'; why: string; to?: string[];
 }
 
 const STALL_MIN = 30;
 const TRANSIENT: RefusalClass[] = ['head-moved', 'gh-error', 'main-moved-overlap', 'held', 'land-error', 'tsc-timeout'];
 const tscTries = (rows: readonly LedgerRow[], pr: number, head: string) => rows.filter(x => x.pr === pr && x.head === head && x.event === 'refused' && x.cls === 'tsc-timeout').length;
+
+/**
+ * LAND10-RESTICKY-REFUSAL (11-27 #40516: refused stale-base-revert, the body then gained its «의도된 삭제» lines, and the
+ * refusal stuck until a new head). A gate refusal sticks to (PR, head, context): the hash of what the land rule reads besides
+ * the head — PR body (declared removals · waiver lines), labels, the receipt dir and the baseline-diff receipt. A changed
+ * context re-judges the same head next tick. A HOLD set or cleared after the refusal (a `hold` decision row) re-judges too.
+ * Rows written before this field (no ctx) keep sticking — no mass re-run of old refusals on deploy. Each distinct context
+ * re-judges at most once: a refusal row of ANY earlier matching context binds (a receipt choice flipping between hosts settles).
+ */
+export function refusalContext(pr: Pick<PrInfo, 'body' | 'labels'>, receipt: Pick<Receipt, 'dir'> | null, baselineDiff?: Pick<BaselineDiff, 'receipt'> | null): string {
+  const body = (pr.body ?? '').replace(/\r\n/g, '\n').trim();
+  const labels = [...(pr.labels ?? [])].sort();
+  return createHash('sha256').update(JSON.stringify([body, labels, receipt?.dir ?? null, baselineDiff?.receipt ?? null])).digest('hex').slice(0, 16);
+}
+
+/** The refusal that still binds this head: non-transient, same context (or a legacy row without one), no HOLD change since. */
+export function stickyRefusal(rows: readonly LedgerRow[], pr: number, head: string, ctx: string): { binding?: LedgerRow; rejudged?: LedgerRow } {
+  const refusals = rows.filter(x => x.pr === pr && x.head === head && x.event === 'refused' && x.cls && !legacyGuardError(x.cls, x.why)
+    && (!TRANSIENT.includes(x.cls) || (x.cls === 'tsc-timeout' && tscTries(rows, pr, head) >= TSC_LAND_RETRIES)));
+  const holdAfter = (r: LedgerRow) => rows.some(x => x.pr === pr && x.head === head && x.event === 'decision' && x.action === 'hold' && x.at > r.at);
+  const binds = (r: LedgerRow) => (r.ctx === undefined || r.ctx === ctx) && !holdAfter(r);
+  const binding = refusals.filter(binds).pop();
+  return binding ? { binding } : { ...(refusals.length ? { rejudged: refusals[refusals.length - 1] } : {}) };
+}
 
 function lastFor(rows: LedgerRow[], pr: number, head: string, event: LedgerRow['event']): LedgerRow | undefined {
   for (let i = rows.length - 1; i >= 0; i--) if (rows[i]!.pr === pr && rows[i]!.head === head && rows[i]!.event === event) return rows[i];
@@ -471,7 +529,19 @@ export async function tickLand(d: LandDeps): Promise<TickResult> {
 
     let prs: PrInfo[];
     try { prs = await d.listPrs(); for (const p of prs) authors.set(p.number, p.author); } catch (e) {
-      out.error = `gh-error: ${e instanceof Error ? e.message : String(e)}`; return out;
+      out.error = `gh-error: ${e instanceof Error ? e.message : String(e)}`; out.skipped = 'gh-error';
+      // GH-BUDGET-GOVERNOR ④ (11-28 21:4x 실측: cooldown 동안 runs «done» but this file stayed at the last full tick → «틱 정지»):
+      // a skipped tick still stamps the tick file — the last full tick's numbers stay, `at` · `skipped` · `lastSkipped` say this wake.
+      if (!d.dry && !d.synthetic) {
+        const p = join(landHome(d.stateRoot), 'last-tick.json');
+        let prev: Record<string, unknown> = {};
+        try { prev = JSON.parse(readFileSync(p, 'utf8')) as Record<string, unknown>; } catch { prev = {}; }
+        try {
+          mkdirSync(landHome(d.stateRoot), { recursive: true });
+          writeFileSync(p, JSON.stringify({ ...prev, at, mode: d.mode, skipped: out.skipped, lastSkipped: { at, why: out.error.slice(0, 240) } }));
+        } catch { /* a stamp failure must not turn a skipped tick into an exception */ }
+      }
+      return out;
     }
     const holds = readHolds(d.stateRoot);
     const landedPrs = new Set(rows.filter(r => r.event === 'landed').map(r => r.pr));
@@ -479,7 +549,8 @@ export async function tickLand(d: LandDeps): Promise<TickResult> {
     const readyPrs = new Set<number>();
     const live = d.mode === 'live' && !d.dry && !d.synthetic;
     const reasons = new Map<number, string>();
-    const cands: Array<{ pr: PrInfo; kind: FinishKind; need: 'receipt' | 'baseline'; avoidHost?: string; parentHeads?: readonly string[] }> = [];
+    const cands: FinishCand[] = [];
+    const redWhy = new Map<number, string>();
     let mergedHeadsMemo: readonly string[] | null = null;
     const parentHeads = (extra: readonly string[] = []): readonly string[] | undefined => {
       if (!d.smartMerge) return extra.length ? extra : undefined;
@@ -534,9 +605,10 @@ export async function tickLand(d: LandDeps): Promise<TickResult> {
           cells.push(cellRow);
         }
       }
-      // A gate refusal on this head sticks until a new head (no preflight re-run every tick); transient ones retry.
-      const gateRefusal = rows.filter(x => x.pr === pr.number && x.head === pr.head && x.event === 'refused' && x.cls && !legacyGuardError(x.cls, x.why)
-        && (!TRANSIENT.includes(x.cls) || (x.cls === 'tsc-timeout' && tscTries(rows, pr.number, pr.head) >= TSC_LAND_RETRIES))).pop();
+      // A gate refusal on this head sticks until a new head or a new context (no preflight re-run every tick); transient ones retry.
+      const refusalCtx = refusalContext(pr, receipt, facts.baselineDiff);
+      const { binding: gateRefusal, rejudged } = stickyRefusal(rows, pr.number, pr.head, refusalCtx);
+      if (dec.action === 'land' && rejudged) dec = { ...dec, why: `${dec.why} · re-judge: context changed since refusal ${rejudged.cls} (body/labels/receipt/hold)` };
       const inFlight = rows.some(x => x.pr === pr.number && x.head === pr.head && x.event === 'landing')
         && !rows.some(x => x.pr === pr.number && x.head === pr.head && (x.event === 'landed' || x.event === 'refused'));
       if (dec.action === 'land' && inFlight && d.mode === 'live') dec = { action: 'wait', why: 'land in flight' };
@@ -546,10 +618,14 @@ export async function tickLand(d: LandDeps): Promise<TickResult> {
       reasons.set(pr.number, `${dec.action}${dec.cls ? ` ${dec.cls}` : ''} · ${dec.why}`);
       if (dec.action === 'skip') continue;
       // LAND-OWNS-RECEIPT: the graph finishes mechanical last miles itself; the author card is only for what it cannot.
-      const fk = d.finisher ? finishKindFor(dec.cls, { noBaselineInReceipt: !!receipt && !receipt.focusedBaseline, ...(pr.crossRepo || !pr.headRef ? { crossRepo: true } : {}) }) : null;
+      const redSteps = dec.cls === 'pregate-red' && receipt?.red ? receipt.red.failed.map(s => s.name) : undefined;
+      const fk = d.finisher ? finishKindFor(dec.cls, { noBaselineInReceipt: !!receipt && !receipt.focusedBaseline, ...(pr.crossRepo || !pr.headRef ? { crossRepo: true } : {}),
+        ...(redSteps ? { redSteps, autofix: !!d.finisher.autofix } : {}) }) : null;
       if (fk && !cands.some(c => c.pr.number === pr.number && c.kind === 'rebuild')) { // a rebuild moves the head first
         const ph = fk === 'refresh' ? parentHeads() : undefined;
-        cands.push({ pr, kind: fk, need: receipt && !receipt.red ? 'baseline' : 'receipt', ...(fk === 'pregate-retry' && receipt ? { avoidHost: receipt.host } : {}), ...(ph ? { parentHeads: ph } : {}) });
+        cands.push({ pr, kind: fk, need: receipt && !receipt.red ? 'baseline' : 'receipt', ...(fk === 'pregate-retry' && receipt ? { avoidHost: receipt.host } : {}), ...(ph ? { parentHeads: ph } : {}),
+          ...(fk === 'autofix' && receipt?.red ? { red: { dir: receipt.dir, failed: receipt.red.failed } } : {}) });
+        if (fk === 'autofix') redWhy.set(pr.number, dec.why);
       }
       const next: NextAction | null = dec.action === 'land' ? null : dec.cls
         ? nextAction(dec.cls, pr, { finisher: fk, landingOwner: landRefusalRecipient(d.org), fixTo: fixFor(dec.cls, pr).to })
@@ -573,6 +649,8 @@ export async function tickLand(d: LandDeps): Promise<TickResult> {
       if (!fresh) { row({ pr: pr.number, head: pr.head, event: 'refused', cls: 'gh-error', why: 'pr re-read failed' }); continue; }
       if (fresh.state !== 'OPEN' || fresh.draft) { row({ pr: pr.number, head: pr.head, event: 'refused', why: `flipped to ${fresh.draft ? 'draft' : fresh.state} mid-run` }); continue; }
       if (fresh.head !== pr.head) { row({ pr: pr.number, head: pr.head, event: 'refused', cls: 'head-moved', why: `head → ${fresh.head.slice(0, 12)}` }); continue; }
+      // The guard reads the re-read body (declared removals) — the refusal binds to that context.
+      const ctxNow = refusalContext(fresh, receipt, facts.baselineDiff);
       const holdNow = vetoFor(d, readHolds(d.stateRoot), pr);
       if (holdNow) { row({ pr: pr.number, head: pr.head, event: 'refused', cls: 'held', why: holdNow }); continue; }
       // Stale-base revert guard before every merge (fail closed: a throwing guard refuses).
@@ -580,12 +658,12 @@ export async function tickLand(d: LandDeps): Promise<TickResult> {
       // GUARD-ERROR: a guard that could not run is not a stale-base revert — conflict → merge-conflict (finisher refresh) · else transient.
       const ge = sr.ok ? null : guardErrorClass(sr.why ?? '');
       if (ge) {
-        row({ pr: pr.number, head: pr.head, event: 'refused', cls: ge, why: (sr.why ?? '').slice(0, 200) });
+        row({ pr: pr.number, head: pr.head, event: 'refused', cls: ge, why: (sr.why ?? '').slice(0, 200), ctx: ctxNow });
         if (ge === 'merge-conflict' && d.finisher && !pr.crossRepo && pr.headRef) { const ph = parentHeads(); cands.push({ pr, kind: 'refresh', need: 'receipt', ...(ph ? { parentHeads: ph } : {}) }); }
         continue;
       }
       if (!sr.ok) {
-        row({ pr: pr.number, head: pr.head, event: 'refused', cls: 'stale-base-revert', why: sr.why ?? 'stale-base revert' });
+        row({ pr: pr.number, head: pr.head, event: 'refused', cls: 'stale-base-revert', why: sr.why ?? 'stale-base revert', ctx: ctxNow });
         // SMART-MERGE: the finisher rebuilds / merges main itself (its revert guard decides); the card only without it.
         if (d.smartMerge && d.finisher && !pr.crossRepo && pr.headRef) { const ph = parentHeads(); cands.push({ pr, kind: 'refresh', need: 'receipt', ...(ph ? { parentHeads: ph } : {}) }); }
         else sendCard(pr.number, pr.head, card('stale-base-revert', pr, sr.why ?? '', d.cardSeat, d.org), 'stale-base-revert');
@@ -605,7 +683,7 @@ export async function tickLand(d: LandDeps): Promise<TickResult> {
       // Base changed mid-merge → retry once on the new main (the land command re-merges), then refuse with a card.
       // A JUD veto that arrived during the (long) land command stops the retry too.
       const holdRetry = cls === 'merge-conflict' && after?.state !== 'MERGED' ? vetoFor(d, readHolds(d.stateRoot), pr) : null;
-      if (holdRetry) { row({ pr: pr.number, head: pr.head, event: 'refused', cls: 'held', why: holdRetry }); continue; }
+      if (holdRetry) { row({ pr: pr.number, head: pr.head, event: 'refused', cls: 'held', why: holdRetry, ctx: ctxNow }); continue; }
       if (cls === 'merge-conflict' && after?.state !== 'MERGED' && after?.head === pr.head) {
         row({ pr: pr.number, head: pr.head, event: 'decision', action: 'land', why: 'base changed mid-merge · retry once' });
         res = await d.land(pr, receipt!, `${dec.why} · retry`, ctx).catch(e => ({ rc: 99, text: String(e) }));
@@ -613,7 +691,7 @@ export async function tickLand(d: LandDeps): Promise<TickResult> {
         after = await d.prNow(pr.number).catch(() => null);
       }
       if (cls && after?.state !== 'MERGED') {
-        row({ pr: pr.number, head: pr.head, event: 'refused', cls, why: res.text.split('\n').filter(l => /STOP|REFUSE/.test(l)).pop() ?? `rc=${res.rc}` });
+        row({ pr: pr.number, head: pr.head, event: 'refused', cls, why: res.text.split('\n').filter(l => /STOP|REFUSE/.test(l)).pop() ?? `rc=${res.rc}`, ctx: ctxNow });
         // SMART-MERGE: a land-time conflict with main is the finisher's — smart refresh this tick (resolved push or a
         // needs-finisher card with the hunks), no author card.
         if ((cls === 'merge-conflict' || cls === 'stale-base-revert') && d.smartMerge && d.finisher && !pr.crossRepo && pr.headRef) {
@@ -642,8 +720,11 @@ export async function tickLand(d: LandDeps): Promise<TickResult> {
       for (const o of runFinisher(book, cands, fd, live)) {
         finOut.push(o);
         const p = cur.get(o.pr);
-        if ((o.state === 'conflict' || o.state === 'failed') && p) sendCard(p.number, p.head, card('needs-finisher', p, o.why, d.cardSeat, d.org), 'needs-finisher');
+        // AUTOFIX: not mechanical, or the author is still on it → the author's own pregate-red card (deferred at decide time).
+        if (o.kind === 'autofix' && (o.state === 'failed' || o.state === 'author-active') && p) sendCard(p.number, p.head, card('pregate-red', p, `${redWhy.get(p.number) ?? ''} · ${o.why}`.slice(0, 600), d.cardSeat, d.org), 'pregate-red');
+        else if ((o.state === 'conflict' || o.state === 'failed') && p) sendCard(p.number, p.head, card('needs-finisher', p, o.why, d.cardSeat, d.org), 'needs-finisher');
       }
+      out.autofixPerHour = autofixesPerHour(Object.values(book.jobs), now.getTime());
       if (live) writeBook(d.stateRoot, book);
     }
     out.finisher = finOut;
@@ -664,10 +745,56 @@ export async function tickLand(d: LandDeps): Promise<TickResult> {
         out.reaped.push({ pr: s.pr, action: r.ok ? 'closed' : 'close-failed', why: r.ok ? why : `${why} · ${r.why ?? ''}` });
       }
     }
+    if (d.prAging) out.aging = ageZombies(d, prs, rows, row, now.getTime(), live);
+    const agingBy = (a: AgingRow['action']) => (out.aging ?? []).filter(x => x.action === a).map(x => x.pr);
     if (!d.dry && !d.synthetic) writeFileSync(join(landHome(d.stateRoot), 'last-tick.json'), JSON.stringify({ at, mode: d.mode, decisions: out.decisions.length, landed: out.landed,
-      ready: readyPrs.size, readyNotLanded: [...readyPrs].filter(pr => !out.landed.includes(pr)).length }));
+      ready: readyPrs.size, readyNotLanded: [...readyPrs].filter(pr => !out.landed.includes(pr)).length,
+      ...(out.aging ? { aging: { drafted: agingBy('drafted'), wouldDraft: agingBy('would-draft'), draftFailed: agingBy('draft-failed'), deferred: agingBy('deferred'),
+        closeProposals: [...agingBy('proposed'), ...agingBy('proposed-before'), ...agingBy('would-propose')] } } : {}) }));
     return out;
   } finally { release(); }
+}
+
+/**
+ * PR-ZOMBIE-AGING: age every open PR with the kit's verdict (graphs/policies/pr-aging.yaml). to-draft → live: `toDraft` then
+ * one card per (PR · head · stage) to the YAML's card_to · capped per tick; close-proposal → one card (never a close).
+ * Non-live (shadow · plan · synthetic) reports would-draft / would-propose and writes nothing. A failed draft is retried next tick.
+ */
+function ageZombies(d: LandDeps, prs: readonly PrInfo[], rows: readonly LedgerRow[], row: (r: Omit<LedgerRow, 'at' | 'mode'>) => void, nowMs: number, live: boolean): AgingRow[] {
+  const pol = d.prAging!;
+  const open = prs.filter(p => p.state === 'OPEN');
+  const times = (() => { try { return d.headTimes ? d.headTimes(open.map(p => p.head)) : new Map<string, number>(); } catch { return new Map<string, number>(); } })();
+  const steps = (p: PrInfo) => { try { return d.redSteps ? d.redSteps(p.number, p.head) : []; } catch { return []; } };
+  const verdicts = judgePrAging(open.map(p => ({
+    pr: p.number, head: p.head, draft: p.draft, author: p.author, headAt: headAtOf(times.get(p.head), p.updatedAt),
+    conflict: conflictEvidence({ redFailedSteps: steps(p), landRefusals: rows.filter(r => r.pr === p.number && r.head === p.head && r.event === 'refused' && r.cls).map(r => r.cls!) }, pol),
+  })), pol, nowMs);
+  const byNo = new Map(open.map(p => [p.number, p] as const));
+  const owner = landRefusalRecipient(d.org);
+  const out: AgingRow[] = [];
+  let drafted = 0;
+  for (const v of verdicts) {
+    const p = byNo.get(v.pr)!;
+    const base = { pr: v.pr, head: v.head, stage: v.stage, ageDays: v.ageDays, basis: v.basis, conflict: v.conflict, why: v.why };
+    const roles = v.stage === 'to-draft' ? pol.toDraft.cardTo : pol.closeProposal.cardTo;
+    const to = [...new Set(roles.map(r => (r === 'author' ? p.author || owner : owner)))];
+    const carded = rows.some(r => r.event === 'aging' && r.pr === v.pr && r.head === v.head && r.stage === v.stage);
+    const send = () => { for (const t of to) d.post(t, agingCard(v, p.title)); row({ pr: v.pr, head: v.head, event: 'aging', stage: v.stage, to, why: v.why }); };
+    if (v.stage === 'close-proposal') {
+      if (carded) out.push({ ...base, action: 'proposed-before' });
+      else if (!live) out.push({ ...base, action: 'would-propose', to });
+      else { send(); out.push({ ...base, action: 'proposed', to }); }
+      continue;
+    }
+    if (!live || !d.toDraft) { out.push({ ...base, action: 'would-draft', to }); continue; }
+    if (drafted >= pol.toDraft.maxPerTick) { out.push({ ...base, action: 'deferred', why: `${v.why} · per-tick cap ${pol.toDraft.maxPerTick}` }); continue; }
+    const r = (() => { try { return d.toDraft!(p); } catch (e) { return { ok: false, why: String(e).slice(0, 160) }; } })();
+    if (!r.ok) { out.push({ ...base, action: 'draft-failed', why: `${v.why} · ${r.why ?? 'gh failed'}` }); continue; }
+    drafted++;
+    if (!carded) send();
+    out.push({ ...base, action: 'drafted', to });
+  }
+  return out;
 }
 
 // ── Replay (shadow comparison against 11-25 coach landings) ────────────────────────────────────────────────────

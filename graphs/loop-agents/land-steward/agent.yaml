@@ -1,7 +1,8 @@
 # 착지 집사 (land-steward) — LOOP-AGENT v3 YAML definition (one file = the whole agent · portable plugin package).
 # Schema: src/loop-agent/v3/agent-yaml.ts · what this install runs: src/loop-agent/v3/node-kinds.ts · lint: eln loop agent lint land-steward
 # Rules: no host / seat / path / account literals (L0 by org duty · numbers only under policies: · refs stay inside this dir).
-# goal.yaml stays as the v2 legacy card (the sim proves agent.yaml ≡ goal.yaml on the same events); this file wins when present.
+# CODE-BODY-TO-KIND: no TS of its own — the body is the shared kind land-graph.tick (src/loop-agent/v3/land-graph-kind.ts), the voice
+# the shared kind kpi-voice (src/loop-agent/v3/kpi-voice.ts): thresholds · breach lines · L0 card are below, the lane order is policies.yaml.
 apiVersion: elanous/loop-agent@3
 manifest:
   name: land-steward
@@ -10,7 +11,7 @@ manifest:
   requires:
     executor: loop-agent@3
     kits: [kpi]
-    node_kinds: [land-steward.tick, gate, reflect, plan, learn-knowhow]
+    node_kinds: [land-graph.tick, kpi-voice, gate, reflect, plan, learn-knowhow]
     facts: []
   provides:
     agent: land-steward
@@ -42,14 +43,23 @@ policies:                           # the only numbers — change behaviour here
   cost_breach_line: 0.1
   cost_l0_card: 0.2
   cost_quiet: 0
+# JUDGE-BUTLER-V3-LISTED: `from` = where the tick file (last-tick.json · the land graph's KPI block) carries the value —
+# `eln loop agent list|status land-steward` read it (no «KPI ?») · an array counts its length
+# CODE-BODY-TO-KIND (kpi-voice): `key` = the breach cursor (one line per key per breach_line_every_min) · `breach` = the line —
+# {value} the KPI value (|pct |round) · {target} · {kpi.<field>} any land metric (|refs:N = the first N as #PR)
 kpis:
-  - { name: lands_per_hour, at_least: $policies.lands_per_hour_min, unit: /h }
-  - { name: landable_ratio, at_least: $policies.landable_ratio_min }
-  - { name: needs_finisher_wait_p50, at_most: $policies.needs_finisher_wait_p50_max_min, unit: min }
-  - { name: refusals_without_next, at_most: $policies.refusals_without_next_max }
+  - { name: lands_per_hour, at_least: $policies.lands_per_hour_min, unit: /h, from: kpi.landsLastHour, key: lands,
+      breach: "착지 {value}/h < {target} (준비 {kpi.ready} · 슬롯 대기 {kpi.waitingForSlot})" }
+  - { name: landable_ratio, at_least: $policies.landable_ratio_min, from: kpi.landableRatio, key: landable,
+      breach: "착지 가능 {value|pct} < {target|pct} ({kpi.ready}/{kpi.judged})" }
+  - { name: needs_finisher_wait_p50, at_most: $policies.needs_finisher_wait_p50_max_min, unit: min, from: kpi.needsFinisherWaitP50Min, key: finisher-wait,
+      breach: "마무리 대기 p50 {value|round}분 > {target} ({kpi.needsFinisherOpen}건)" }
+  - { name: refusals_without_next, at_most: $policies.refusals_without_next_max, from: kpi.refusalsWithoutNext, key: no-next,
+      breach: "다음 행동 없는 거절 {value}건 ({kpi.refusalsWithoutNext|refs:5})" }
 done_when:
   - last-tick.json rewritten by the tick
   - every non-land decision names the next owner
+  - every zombie open PR (old head ⊕ does not merge onto main) is a draft with its author carded, or carries a close proposal
 never_auto: &never
   - security-4 paths                # Terra PASS/WARN on the head (policy exception — mail stays)
   - veto holds                      # duty «veto»
@@ -78,14 +88,16 @@ body:
   entry_node: tick
   terminal_nodes: [done, failed]
   nodes:
-    - { node_id: tick, kind: land-steward.tick, max_visits: 1 }
+    - { node_id: tick, kind: land-graph.tick, max_visits: 1 }    # land graph body · policies.yaml lane order · terminal owner · cell link · metrics
+    - { node_id: voice, kind: kpi-voice, max_visits: 1 }         # metrics → kpis breach lines (one per key per window) · plan: line · L0 card · quiet
     - { node_id: reflect, kind: reflect, optional: true }        # v3: did my last lines move the KPI?
     - { node_id: plan, kind: plan, optional: true }              # v3: line again · one L0 card · or quiet
     - { node_id: learn, kind: learn-knowhow, optional: true }    # v3: repeated «nobody moved» → lesson → knowhow
     - { node_id: done, kind: gate }
     - { node_id: failed, kind: gate }
   edges:
-    - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }
+    - { from: tick, on: outcome, map: { ok: voice, fail: failed, error: failed } }
+    - { from: voice, on: outcome, map: { ok: done, fail: failed, error: failed } }
 actions:                            # what the plan node may choose for one KPI breach (default = the v2 behaviour)
   - { id: breach-line, channel: channel, target: receiver, serves: [lands_per_hour, landable_ratio, needs_finisher_wait_p50, refusals_without_next], cost: $policies.cost_breach_line, default: true }
   - { id: l0-card, channel: mail, target: l0, serves: [lands_per_hour, landable_ratio, needs_finisher_wait_p50, refusals_without_next], cost: $policies.cost_l0_card }
@@ -94,15 +106,18 @@ voice:
   channel: loop:land-steward
   speak_on: [kpi-breach]
   breach_line_every_min: $policies.breach_line_every_min
+  line: "[착지 집사 · KPI] {breach} · {time}Z · eln land steward status"
+  l0_card: "[착지 집사 → L0 {to} · 결정 카드] {breach} — 채널 줄이 KPI 를 움직이지 못했다({why}). 선택지: ① 슬롯·호스트 조정 ② 막힌 다음 주인 재배정 ③ 목표 조정(agent.yaml policies) · 추천 {kpi.waitingForSlot?①:②} · eln land steward status"
   mail: policy-exceptions-only      # terminal owner of land refusals: no land mail to the L0 except security-4
   terminal_owner: true
   per_hour_max: 0                   # answers are deterministic (records only · LLM 0)
 memory:
   knowhow: knowhow.md
 subs:
-  - { id: train-manager, node: tick, knowhow: knowhow.md }   # slot advice · hot-file serialization · batch order
+  - { id: train-manager, node: tick, knowhow: knowhow.md }   # slot advice · hot-file serialization · lane order (policies.yaml)
   - { id: finisher, node: tick }                              # receipt / refresh / retarget / tsc retry / stale reap
   - { id: cell-link, node: tick }                             # PR → cell of the release in play
+  - { id: pr-aging, node: tick }                              # PR-ZOMBIE-AGING: old head ⊕ main conflict → draft ⊕ author card · older → close proposal card (never a close) · numbers = the repo policy pr-aging.yaml
 budget:
   llm_turns_per_hour: 0
 levels:

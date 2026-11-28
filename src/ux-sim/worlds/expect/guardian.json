@@ -1,0 +1,125 @@
+{
+  "schema": 1,
+  "entries": {
+    "guardian/GRD-PATROL-ZOMBIE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "a zombie run run-supervisor is ending is reported with its owner and not acted twice; the same breach in a 15-min-old tick wakes run-supervisor once"
+    },
+    "guardian/GRD-PATROL-RUN-FAILED": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "run-doctor under its re-success target in a stale tick is woken once; the KPI says the breach waits on run-doctor"
+    },
+    "guardian/GRD-PATROL-LOOP-EXC": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "an open loop-exception case with run-doctor not seen for 20 min wakes run-doctor; the KPI clears when the case resolves"
+    },
+    "guardian/GRD-PATROL-UNCLASSIFIED": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "autopsy already carded its L0: the KPI names the card, the guardian sends nothing and wakes nobody"
+    },
+    "guardian/GRD-PATROL-CONCURRENT": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "two breaches at once wake two peers once each; an overlapping pass in the same window wakes nobody"
+    },
+    "guardian/GRD-PATROL-PEER-SILENT": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "a silent peer is woken, carded to its owner once after the SLA, resolved when it ticks again"
+    },
+    "guardian/GRD-POST-SLA": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "mail past SLA that silence-watch escalated is reported with its card; no guardian card, no wake"
+    },
+    "guardian/GRD-POST-READ-NOTICE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "an already-read notice is not counted: KPI ok, nothing woken or carded"
+    },
+    "guardian/GRD-POST-DORMANT": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "dormant recipients silence-watch bounces are counted by name"
+    },
+    "guardian/GRD-POST-RAIL": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "an unsmoked install wakes rail-watch; a carded regression is reported without a second card; a known break is not a miss"
+    },
+    "guardian/GRD-FUEL-ROUTE-NEXT": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "codex team at 100 % is off the subscription route (third first); fuel KPI ok, no card, no 2-min re-spawn"
+    },
+    "guardian/GRD-FUEL-ALL-DRY": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "every codex account spent → one OP card per window; reset → team first again, case resolved"
+    },
+    "guardian/GRD-FUEL-7DAY": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "7 days of synthetic usage with reset boundaries: never routed to an exhausted account, reset accounts back within one step, no false fuel miss"
+    },
+    "guardian/GRD-KEYS-REAL-VS-PAUSED": {
+      "expect": "green",
+      "greenSince": "2026-11-28 GUARDIAN-SUBS sim (this PR)",
+      "reason": "a known past expiry is stale and carded once; a named codex account with unknown expiry in the elanous row is not a false alarm"
+    },
+    "guardian/GRD-FUEL-SUB-FIRST": {
+      "expect": "green",
+      "greenSince": "2026-11-28 FALLBACK-SUBSCRIPTION-FIRST · KEYS-PROACTIVE-REFRESH sim (this PR)",
+      "reason": "zai week full with codex team/third under cap → codex luna (subscription headroom), never OpenRouter credits; every subscription full → OpenRouter credits; review never GLM"
+    },
+    "guardian/GRD-FUEL-NO-PAID-BYPASS": {
+      "expect": "green",
+      "greenSince": "2026-11-28 Terra #40656 r1 ④ (this PR)",
+      "reason": "every subscription full, OpenRouter balance gone, codex credits off → none for every tier, no directive, never a paid bypass"
+    },
+    "guardian/GRD-FUEL-NONE-CLEARS-DIRECTIVE": {
+      "expect": "green",
+      "greenSince": "2026-11-28 Terra #40656 r2 ③ · OP decision (this PR)",
+      "reason": "none → the old paid directive is removed → the session returns to its default model; one fuel-no-model case per seat; paid 0"
+    },
+    "guardian/GRD-FUEL-REVIEW-NEVER-FORBIDDEN": {
+      "expect": "green",
+      "greenSince": "2026-11-28 Terra #40656 r1 ⑤ (this PR)",
+      "reason": "a GLM-only plan for a review seat → none for every tier; GLM never returned for review"
+    },
+    "guardian/GRD-KEYS-REFRESH": {
+      "expect": "green",
+      "greenSince": "2026-11-28 FALLBACK-SUBSCRIPTION-FIRST · KEYS-PROACTIVE-REFRESH sim (this PR)",
+      "reason": "a codex home under 48 h of access → one CLI refresh → last_refresh advanced → KPI unrefreshed 0, no card"
+    },
+    "guardian/GRD-KEYS-REFRESH-FAIL": {
+      "expect": "green",
+      "greenSince": "2026-11-28 FALLBACK-SUBSCRIPTION-FIRST · KEYS-PROACTIVE-REFRESH sim (this PR)",
+      "reason": "refresh not advanced → one relogin decisions card with exact steps; retried next hour without a second card; KPI breach"
+    },
+    "guardian/GRD-KEYS-USAGE-EXP": {
+      "expect": "green",
+      "greenSince": "2026-11-28 FALLBACK-SUBSCRIPTION-FIRST · KEYS-PROACTIVE-REFRESH sim (this PR)",
+      "reason": "eln usage codex row shows the login access exp and last_refresh; the reset-credit expiry is labelled reset-credit"
+    },
+    "guardian/GRD-KIND-RESOURCE-CHECK-PARAMS": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CODE-BODY-TO-KIND (this PR)",
+      "reason": "the resource-check sub kind reads its behaviour from agent.yaml params only: the same bad supervisor cards its owner under the shipped YAML and OP under a copy that changes only the card to and the KPI line text"
+    },
+    "guardian/GRD-KIND-ROLLUP-PARAMS": {
+      "expect": "green",
+      "greenSince": "2026-11-28 CODE-BODY-TO-KIND (this PR)",
+      "reason": "the kpi-rollup sub kind reads its silent window from the policy its params name: a 35-55 min old peer tick is a silent sub under the shipped 30 min and not under a copy set to 60 · no wake no card"
+    },
+    "guardian/BURST-ACTUATES": {
+      "expect": "green",
+      "greenSince": "2026-11-29 BURST-ACTUATOR-WIRED (this PR)",
+      "reason": "the 11-28 burst.json under a 150-260 ready backlog: the first pulse within 15 min opens a hand pane through the door and the beat counts that launch; a throwing door stays 손 +0 with its error named"
+    }
+  }
+}

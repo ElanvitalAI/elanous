@@ -1,0 +1,28 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "supervisor-auditor",
+  "name": "supervisor-auditor",
+  "version": "1.0.0",
+  "description": "루프 에이전트 전부를 15분마다 감사 — 보기만 하는 에이전트 0 · 감사 나이 ≤ 70분 (6축 원장 ⊕ 매시 OP 요약)",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "loopAgents": [
+        {
+          "id": "supervisor-auditor",
+          "agent": "../../graphs/loop-agents/supervisor-auditor/agent.yaml",
+          "trigger": "../../graphs/triggers/supervisor-auditor-agent.yaml",
+          "kpis": [
+            "watch_only_agents",
+            "audit_age_min"
+          ]
+        }
+      ]
+    }
+  }
+}

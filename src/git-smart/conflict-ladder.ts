@@ -17,6 +17,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { GitRun } from '../git-fs/smart-run.js';
 import { mergeAppendOnly } from '../cli/pr-land-conflict-merge.js';
+import { hasLadderConflictMarkers } from './conflict-markers.js';
 
 /**
  * `-c` flags every smart-merge merge / cherry-pick runs with: rerere REPLAYS recorded resolutions (autoUpdate stages them),
@@ -209,7 +210,7 @@ export async function runLadderLlm(git: GitRun, worktree: string, remaining: rea
     if (!f.hunks.length) { left.push(f); continue; }
     let out: string;
     try { out = await llm(f.path, f.text, worktree); } catch { left.push(f); continue; }
-    if (!out.trim() || /^(<{7}|>{7}|\|{7})( |$)/m.test(out)) { left.push(f); continue; }
+    if (!out.trim() || hasLadderConflictMarkers(out)) { left.push(f); continue; }
     writeFileSync(join(worktree, f.path), out);
     git(['add', '--', f.path]);
     resolved.push({ path: f.path, rule: 'llm' });

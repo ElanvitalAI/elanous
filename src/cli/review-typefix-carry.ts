@@ -1,3 +1,4 @@
+import { mergeTree } from '../git-smart/merge-tree.js';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { basename, delimiter, dirname, join, resolve } from 'node:path';
@@ -246,7 +247,7 @@ export function loadTypefixCarryContext(
       try { objectDir = mkdtempSync(join(tmpdir(), 'elanous-typefix-carry-')); } catch { return null; }
       virtualEnv = { ...process.env, GIT_OBJECT_DIRECTORY: objectDir,
         GIT_ALTERNATE_OBJECT_DIRECTORIES: [resolve(options.cwd, objectPath), process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES].filter(Boolean).join(delimiter) };
-      const merged = gitOutput(options.cwd, ['merge-tree', '--write-tree', requiredBase, fromHead], virtualEnv);
+      const merged = mergeTree(args => gitOutput(options.cwd, args, virtualEnv), requiredBase, fromHead, [], []);
       virtualTree = merged?.trim() ?? '';
       if (!SHA40.test(virtualTree)) { rmSync(objectDir, { recursive: true, force: true }); return null; }
     } else {

@@ -9,7 +9,7 @@ kpi:
   judge_queue_median_wait_max_min: 15
   frozen_hands_max: 0
   hand_answer_sla_min: 10      # judge-domain ✋ answered or escalated
-done_when_per_cell:            # both, on every merged PR the cell cites (GREEN-DEFINITION-ONE · JUDGE-LOAD-REDUCTION §0)
+done_when_per_cell:            # both, on every merged PR of the cell (green_rules.pr_binding) it cites (GREEN-DEFINITION-ONE · JUDGE-LOAD-REDUCTION §0)
   - same-head receipt          # a PREGATE-GREEN receipt that counts for the PR's landed head (green_rules.same_head)
   - focused exit 0             # the receipt's focused result is acceptable (green_rules.focused_ok)
   # sim/test-universe evidence (E4 line «E4 test|sim 층 — … 칸 <id> … rc 0») is NOT required — a missing E4 is one FU cell «<cell>-E4»
@@ -24,6 +24,13 @@ green_rules:
     - step-exit-0              # raw swept: the receipt's own focused step exit 0
     - preexisting-on-main      # every head failure also fails on main (pregate focusedBaseline · newFailures = [] · BASELINE-FAIL-NONBLOCK 대표 11-27)
     - doc-only-L0              # doc-only PR whose receipt ran no focused stage (L0)
+  # JUDGE-GREEN-PR-BINDING (11-28 · WORK-NEXT-ROSTER-SCOPE-FU signed on #40622 · CONTEXT-BUS-FEDERATION on #40630): a PR the
+  # cell's evidence merely mentions («#N is unrelated» · the defect's subject PR · a sibling's PR) never counts for the cell.
+  # It counts on its own word (칸 line · title · branch · sweep row) or — a legacy PR silent about every cell — on the cell's
+  # own evidence citing it as the implementation (JUDGE-GREEN-PR-BINDING-LEGACY). Cited PRs that are not the cell's are
+  # ignored, never judged. The ONE rule both green lanes read (green-triage ⊕ this butler):
+  pr_binding: graphs/policies/pr-binding.yaml
+  pr_meta_fetch_per_tick: 40   # PR bodies read per tick (gh pr view · cached per merged PR) — the rest stay unbound until the next tick
 never_auto:
   - security-4 paths           # auth · secret · remote-exec · destroy → JUD/Terra
   - criteria change            # → JUD

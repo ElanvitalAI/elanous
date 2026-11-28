@@ -118,6 +118,8 @@ export interface LensFacts {
   world: string | null;
   /** OP-HELPERS-STABILIZE: one row per policy helper · null = unread. */
   helpers?: HelperHealth[] | null;
+  /** FED-ANALYST-LOOP-AGENT: the newest 30-min analysis (loops/fed-analyst.jsonl) · undefined = no line · null = no row yet. */
+  analyst?: { windowEnd: string; passed: number; breaches: number; bottleneck: string } | null;
   unmeasured: string[];
 }
 export interface HelperHealth { id: string; ok: boolean; why: string }
@@ -329,6 +331,9 @@ export function renderLensLines(f: LensFacts, now: Date, prev: { at: string; num
     L.push(f.helpers === null ? '- 조력자 건강 (OP helpers): ? [src: eln loop trigger fires <id> · graphs/policies/op-world.yaml helpers]'
       : `- 조력자 건강 (OP helpers): ok ${f.helpers.length - bad.length}/${f.helpers.length}${bad.length ? ` · failing ${bad.map(h => `${h.id} (${h.why})`).join(' · ')}` : ''} [src: eln loop trigger fires <id> · graphs/policies/op-world.yaml helpers]`);
   }
+  if (f.analyst !== undefined) L.push(f.analyst
+    ? `- 연방 분석 (loop:fed-analyst · 창 끝 ${ago(f.analyst.windowEnd, now)} 전): 합격판 ${f.analyst.passed}/6 · 기준 밖 ${f.analyst.breaches}/6 · 병목 ${f.analyst.bottleneck.slice(0, 200)} [src: eln fed analyze · seat-state/OP/pulse/FED-ANALYST-NOW.md]`
+    : '- 연방 분석 (loop:fed-analyst): 아직 발행 없음 [src: eln fed analyze · eln loop agent fed-analyst status]');
   L.push(`- Resources: ${f.world ?? '?'} [src: eln world anomalies · eln loop guardian status]`);
   L.push(deltaLine(prev, f, now));
   if (f.unmeasured.length) L.push(`- unread (shown as ?, never 0): ${f.unmeasured.join(', ')}`);
@@ -542,17 +547,26 @@ export async function collectWorldLens(deps: LensDeps = {}): Promise<LensFacts> 
       const reg = req<typeof import('../loops/trigger-registry.js')>('../loops/trigger-registry.js');
       const db = reg.openTriggerRegistry(instanceRoot);
       let rows: ReturnType<typeof reg.listTriggers>;
-      try { rows = reg.listTriggers(db).filter(t => t.stage !== 'retired'); } finally { db.close(); }
+      try { rows = reg.listLiveTriggers(db); } finally { db.close(); }
       const u = req<typeof import('../kit/case-ledger/index.js')>('../kit/case-ledger/index.js').unnormalizedCases(instanceRoot, now);
       return { total: rows.length, exceptions: rows.filter(t => t.lastStatus === 'exception').map(t => ({ id: t.graphId, at: t.lastAt })), unnormalized: u ? u.open : null };
     })() : null;
   } catch (e) { unmeasured.push(`loops(${short(e)})`); }
 
+  // FED-ANALYST-LOOP-AGENT: the newest analyst row (append-only ledger · a torn tail line is skipped)
+  let analyst: LensFacts['analyst'];
+  try {
+    if (instanceRoot) {
+      const r = req<typeof import('../fed-analyst/live.js')>('../fed-analyst/live.js').latestAnalysis(instanceRoot);
+      analyst = r ? { windowEnd: r.windowEnd, passed: r.passed, breaches: r.findings.filter(x => x.status === 'breach').length, bottleneck: r.bottleneck } : null;
+    }
+  } catch (e) { unmeasured.push(`fed-analyst(${short(e)})`); }
+
   let world: string | null = null;
   try { world = deps.world ? deps.world() : req<typeof import('../resource-ledger/world-summary.js')>('../resource-ledger/world-summary.js').liveWorldDigest(now)?.line ?? null; if (!world) unmeasured.push('world(lease ledger)'); }
   catch (e) { unmeasured.push(`world(${short(e)})`); }
 
-  return { at: now.toISOString(), board, prevBoard, land, pool, mail, hands, commitments, holds, supervisors, agentYaml, loops, world, helpers, unmeasured };
+  return { at: now.toISOString(), board, prevBoard, land, pool, mail, hands, commitments, holds, supervisors, agentYaml, loops, world, helpers, ...(analyst !== undefined ? { analyst } : {}), unmeasured };
 }
 
 // ── cache (the sync turn path reads it) · seat cursor (Δ since last turn) ───────────────────────────────────────────

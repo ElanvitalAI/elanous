@@ -13,10 +13,16 @@
 // 세 얼굴: 관측 = cases.jsonl (every decision with evidence refs) ⊕ fed-state green facts (decidedBy · doneBy · supervisedBy) ⊕
 // `eln loop butler status` · 판단 근거 = judgeCell() (done-when) ⊕ hold-ledger covers/frozenBy ⊕ the goal card KPI ·
 // 수복과 인계 = a failed verify / security-4 / judgment it cannot make → one card to JUD (L0); 30-min digest to OP.
+import type { BoardJudgmentInput, CriterionDecomposition, SplitJudgment } from '../kit/requirement-judge/index.js';
+import { assessCriterionForSign, loadJudgingSignPolicy } from '../kit/requirement-judge/sign-decision.js';
+import { assessSimEvidence, type SimCarry, type SimSummaryIn } from '../kit/requirement-judge/sim-evidence.js';
+import { selfRunKey } from '../kit/requirement-judge/sim-run.js';
+import { boundPrs } from '../land-graph/pr-binding.js';
 import type { ExpireRow, Hold, HoldBlock } from '../hold-ledger/hold-ledger.js';
 import { frozenBy, holdsCovering } from '../hold-ledger/hold-ledger.js';
-import { isE4Cell, judgeCell, RULES_VERSION, signWithoutE4, simEvidenceLine, type CellIn, type PrFacts, type Verdict } from './done-when.js';
-import { checklistEvidenceCommand } from '../release-loop/checklist.js';
+import { GREEN_RULES, isE4Cell, judgeCell, RULES_VERSION, signWithoutE4, simEvidenceLine, type CellIn, type PrFacts, type Verdict } from './done-when.js';
+import { evidenceCommandOf } from '../release-loop/checklist.js';
+import { pv } from '../loop-agent/policy-context.js';
 import { BUTLER_SEAT, BUTLER_SUPERVISOR, type ButlerLevel, type ButlerMemory, type ButlerState, type Case } from './memory.js';
 
 export const HOLD_FREEZE_HANDS = 3;
@@ -48,6 +54,10 @@ export interface ButlerView {
   /** TARGET-VERSION (11-27): false = `version` is not the release in play (published, or not release.graph.version) → act on nothing. */
   readonly actable?: boolean;
   readonly targetWhy?: string;
+  /** SIM-RETRY-PER-BUILD: the commit this butler runs from (git HEAD · install.json commit) — the self-run retry window is per
+   *  build, so a run that failed on the old build is tried again at once on a new one (11-28 11:44Z: «10:54Z 뒤 대기» after
+   *  the rail that carried the fix). Absent = one window per cell (as before). */
+  readonly build?: string | null;
 }
 
 export type Action =
@@ -124,10 +134,11 @@ export function planTick(view: ButlerView, state: ButlerState): { actions: Actio
     const v = verdicts.get(a.cell);
     if (!v || !signWithoutE4(v)) continue;
     const c = byId.get(a.cell.toUpperCase());
-    if (!checklistEvidenceCommand(c?.title ?? '')) { e4.noCommand++; continue; }
-    const at = state.sent[`e4:${a.cell}`];
-    if (at && nowMs - Date.parse(at) < E4_RETRY_MS) { e4.cooldown++; continue; }
-    if (e4.candidates >= E4_RUNS_PER_TICK) { e4.cap++; continue; }
+    // SUPERVISORS-EXECUTE-NOT-PROPOSE: the title's command, else the test files the done-when names (noCommand only when neither)
+    if (!evidenceCommandOf({ title: c?.title ?? '', ...(c?.doneCriterion ? { doneCriterion: c.doneCriterion } : {}) })) { e4.noCommand++; continue; }
+    const at = state.sent[selfRunKey('e4', a.cell, view.build)];
+    if (at && nowMs - Date.parse(at) < pv('e4_retry_min', E4_RETRY_MS / 60_000) * 60_000) { e4.cooldown++; continue; }
+    if (e4.candidates >= pv('e4_runs_per_tick', E4_RUNS_PER_TICK)) { e4.cap++; continue; }
     a.e4Run = true; e4.candidates++;
   }
   // BUTLER-RESCAN (rail 78): a cell escalated as security-4 is re-judged when the rules changed or the escalation is ≥ 30 min
@@ -217,11 +228,16 @@ export function planTick(view: ButlerView, state: ButlerState): { actions: Actio
 export interface ButlerPorts {
   readonly memory: ButlerMemory;
   /** Green through the checklist path as JUDGE-BUTLER (setItemIfSnapshot · attribution). Throws on refusal. */
-  sign(cell: string, evidence: string, expected: { title: string; status: string; evidence: string }, attribution: { decidedBy: string; doneBy?: string; supervisedBy: string }): void;
+  sign(cell: string, evidence: string, expected: { title: string; status: string; evidence: string; doneCriterion?: string }, attribution: { decidedBy: string; doneBy?: string; supervisedBy: string }): void;
   /** Re-read one cell (verify node · and the fresh read right before signing). */
   readCell(cell: string): CellIn | null;
   /** Fresh PR facts (receipt · focused · files/security-4 · Terra) for a cell's cited PRs — read immediately before signing. */
   freshFacts(cell: CellIn): ReadonlyMap<number, PrFacts>;
+  /** Semantic classification and evidence judgment. Missing, malformed or failed judgment never authorizes a sign. */
+  judgeCriterion?(input: BoardJudgmentInput): Promise<SplitJudgment>;
+  decomposeCriterion?(cellId: string, criterion: string): Promise<CriterionDecomposition>;
+  /** Observation: «provider/model» the criterion judge calls (JUDGE-NOT-OVERSTRICT · judging.yaml judge_llm), or «unavailable: why». */
+  readonly judgeModel?: string;
   expireHolds(by: string, unlockFacts: { merged: ReadonlySet<number>; green: ReadonlySet<string> }): ExpireRow[];
   /** Idempotent mail by provenance key; returns the mail id (null = already sent or failed). */
   post(key: string, to: string, body: string, kind?: string): number | null;
@@ -233,6 +249,16 @@ export interface ButlerPorts {
   runEvidence?(cell: string, version: string): { rc: number; out: string };
   /** GREEN-DEFINITION-ONE: register one FU cell (P2 · unowned = the board pool · BUTLER-E4-FU-UNOWNED) — true when added or already there. */
   addFollowUp?(id: string, title: string): boolean;
+  /** FU-FLOOD: append one line to a FU cell's evidence (no-op true when the line is already there) — false = not written. */
+  appendEvidence?(id: string, line: string): boolean;
+  /** JUDGE-SIM-RECEIPT: sim world run summaries (<root>/sim-world/<runId>/summary.json) — absent = none. */
+  simSummaries?(): readonly SimSummaryIn[];
+  /** SUPERVISORS-EXECUTE-NOT-PROPOSE: run one named scene (judging.yaml sim_evidence.request.scene · every seed · both engines ·
+   *  runIds bound to <pr>-<head12>) — rc ≠ 0 with the reason when this tree does not contain the head. Absent = mail only. */
+  runSimScene?(world: string, scene: string, pr: number, head: string): { rc: number; out: string };
+  /** SIM-RECEIPT-CARRY: does a receipt of `receiptHead` (12 hex) stand for PR `pr`'s landed `head`? (carryProof · absent = only
+   *  same-head receipts bind) */
+  simCarries?: SimCarry;
   /** Voice for a judgment ✋ — returns the outcome or null (off · over budget · LLM failure) → escalate. */
   voiceHand?(hand: HandIn, facts: string): Promise<{ action: 'resolve'; text: string; owner: string; deadline: string } | { action: 'escalate'; text: string } | null>;
   readonly merged: ReadonlySet<number>;
@@ -270,7 +296,7 @@ export function notSignedWhy(cell: string, v: Verdict, view: ButlerView, state: 
 }
 
 /** One tick: plan → act → verify → evidence (cases) → report. `off` does nothing · `shadow` plans and records nothing. */
-export async function runTick(view: ButlerView, ports: ButlerPorts): Promise<TickReport> {
+export async function runTick(view: ButlerView, ports: ButlerPorts, opts: { signOnly?: string } = {}): Promise<TickReport> {
   const mem = ports.memory; const now = view.now;
   const level = mem.level().level;
   const state = mem.readState();
@@ -286,19 +312,106 @@ export async function runTick(view: ButlerView, ports: ButlerPorts): Promise<Tic
   const r = { ...empty, notSigned: [] as Array<{ cell: string; why: string }>, planned: plan.actions.length, frozenHands: plan.frozen.size, e4: { ...empty.e4, noCommand: plan.e4.noCommand, cooldown: plan.e4.cooldown, cap: plan.e4.cap } };
   if (level === 'shadow') return r;
   const green = new Set(view.cells.filter(c => c.status === 'green' || c.status === 'done').map(c => c.id.toUpperCase()));
+  // JUDGE-NOT-OVERSTRICT · FU-FLOOD: the criterion path's policy once per tick (judging.yaml) ⊕ its new-FU budget for this tick
+  const signPolicy = loadJudgingSignPolicy();
+  let newFuThisTick = 0;
+  // SUPERVISORS-EXECUTE-NOT-PROPOSE: the butler's own evidence runs this tick (E4 ⊕ named scenes) share one cap (agent.yaml policies)
+  let selfRuns = plan.e4.candidates;
+  const runsCap = pv('e4_runs_per_tick', E4_RUNS_PER_TICK); const retryMs = pv('e4_retry_min', E4_RETRY_MS / 60_000) * 60_000;
+  /** The run the criterion asks for, executed by the butler (cap · once per retry window per cell) — the new assessment, or the
+   *  reason it did not run / did not close it. An E4 run writes the cell's evidence → the sign waits for the next tick's fresh read. */
+  const selfRun = (cellId: string, cell: CellIn, sim: Extract<ReturnType<typeof assessSimEvidence>, { need: 'missing' }>, prs: Parameters<typeof assessSimEvidence>[0]['prs']): { sim: ReturnType<typeof assessSimEvidence>; note: string } => {
+    const key = selfRunKey('sim-run', cellId, view.build); const at = state.sent[key];
+    if (at && now.getTime() - Date.parse(at) < retryMs) return { sim, note: `자체 실행 ${at.slice(11, 16)}Z 뒤 대기(재시도 창)` };
+    if (selfRuns >= runsCap) return { sim, note: `자체 실행 상한 ${runsCap}/틱 — 다음 틱` };
+    if (sim.runs?.scenes.length && ports.runSimScene) {
+      state.sent[key] = now.toISOString(); selfRuns++;
+      const outs = sim.runs.scenes.map(x => ({ ...x, run: ports.runSimScene!(x.world, x.scene, sim.runs!.pr, sim.runs!.head) }));
+      for (const o of outs) { r.e4.tried++; if (o.run.rc === 0) r.e4.ok++; else r.e4.fail++; mem.appendCase(kase('sim-run', cellId, `${o.world}/${o.scene} #${sim.runs.pr}@${sim.runs.head.slice(0, 12)} rc ${o.run.rc} — ${o.run.out.slice(-160)}`, now, [`cell:${cellId}`])); }
+      const again = assessSimEvidence({ cellId, criterion: cell.doneCriterion ?? '', e4Line: simEvidenceLine(cell), prs }, { summaries: ports.simSummaries?.() ?? [], ...(ports.simCarries ? { carries: ports.simCarries } : {}) });
+      return { sim: again, note: `판정 집사가 장면 ${outs.map(o => `${o.scene} rc ${o.run.rc}`).join(' · ')} 실행` };
+    }
+    const e4At = state.sent[selfRunKey('e4', cellId, view.build)];
+    if (!sim.runs && e4At && now.getTime() - Date.parse(e4At) < retryMs) return { sim, note: `E4 ${e4At.slice(11, 16)}Z 실행 뒤 대기(재시도 창)` };
+    if (!sim.runs && ports.runEvidence && view.version && evidenceCommandOf(cell)) {
+      state.sent[key] = now.toISOString(); state.sent[selfRunKey('e4', cellId, view.build)] = now.toISOString(); selfRuns++;
+      const run = ports.runEvidence(cellId, view.version);
+      r.e4.tried++; if (run.rc === 0) r.e4.ok++; else r.e4.fail++;
+      mem.appendCase(kase('e4-run', cellId, `evidence run rc ${run.rc} — ${run.out.slice(-160)}`, now, [`cell:${cellId}`]));
+      return { sim, note: `판정 집사가 E4 실행 rc ${run.rc}${run.rc === 0 ? ' — 근거 줄이 붙어 다음 틱에 서명' : ''}` };
+    }
+    return { sim, note: sim.runs ? '장면 실행 문 없음' : '증거 명령 없음(제목·완료 조건)' };
+  };
   /** SAFETY (Terra r1): re-read the cell and re-judge on fresh receipt ⊕ PR facts (incl. security-4) immediately before signing. */
-  const trySign = (cellId: string, doneByHint: string | null): boolean => {
+  const trySign = async (cellId: string, doneByHint: string | null): Promise<boolean> => {
     const fresh = ports.readCell(cellId);
-    const v = fresh && fresh.status === 'yellow' ? judgeCell(fresh, ports.freshFacts(fresh)) : null;
+    const facts = fresh && fresh.status === 'yellow' ? ports.freshFacts(fresh) : new Map<number, PrFacts>();
+    const v = fresh && fresh.status === 'yellow' ? judgeCell(fresh, facts) : null;
     if (!fresh || !v || v.kind !== 'sign') {
       const why = !fresh ? 'cell gone' : fresh.status !== 'yellow' ? `now ${fresh.status}` : `re-judge: ${v!.kind} — ${v!.why}`;
       r.signRefused.push({ cell: cellId, why }); mem.appendCase(kase('sign-refused', cellId, why, now));
       if (v?.kind === 'security' && !state.sent[`security:${cellId}`]) { const id = ports.post(`security:${cellId}`, BUTLER_SUPERVISOR, `[판정 집사 → JUD · 보안 4종] ${cellId}: ${v.why}. 판정 집사는 서명하지 않는다.`, 'request'); if (id !== null) state.sent[`security:${cellId}`] = now.toISOString(); }
       return false;
     }
+    const refuse = (why: string) => {
+      r.signRefused.push({ cell: cellId, why });
+      mem.appendCase(kase('sign-refused', cellId, why, now));
+      const key = `criterion:${cellId}:${new Bun.CryptoHasher('sha256').update(why + (fresh.doneCriterion ?? '')).digest('hex').slice(0, 12)}`;
+      if (!state.sent[key]) { const id = ports.post(key, BUTLER_SUPERVISOR, `[판정 집사 → JUD] ${cellId}: ${why}. 서명하지 않음.`, 'request'); if (id !== null) state.sent[key] = now.toISOString(); }
+      return false;
+    };
+    // JUDGE-NOT-OVERSTRICT: the doneCriterion decision is the shared kit's (graphs/policies/judging.yaml) — the baseline
+    // (judgeCell: same-head receipt ⊕ focused exit 0) is «must met»; the LLM refuses only with a cited contradiction, every
+    // other doubt (empty criterion · decomposition uncertain · LLM down · untrusted · uncited) signs with one «<cell>-FU».
+    const evidence = [...facts.entries()].map(([pr, fact]) => ({ id: `PR-${pr}`, text: JSON.stringify(fact) }));
+    if (!evidence.length) return refuse('doneCriterion 근거 없음');
+    // JUDGE-SIM-RECEIPT (대표 15:2x): the sim world / E4 receipt the criterion asks for, on this cell's own PRs (the kit's boundPrs)
+    const mine = boundPrs(cellId, [...facts.values()].filter(f => f.merged).map(f => f.pr), pr => facts.get(pr)?.binding ?? null, GREEN_RULES.prBinding).bound;
+    const simPrs = mine.map(pr => ({ pr, head: facts.get(pr)!.landedHead, scenes: facts.get(pr)!.scenes ?? [] }));
+    let sim = assessSimEvidence({ cellId, criterion: fresh.doneCriterion ?? '', e4Line: simEvidenceLine(fresh), prs: simPrs }, { summaries: ports.simSummaries?.() ?? [], ...(ports.simCarries ? { carries: ports.simCarries } : {}) });
+    let selfNote = '';
+    // SUPERVISORS-EXECUTE-NOT-PROPOSE: the butler runs the scene / E4 the criterion names itself before asking anyone
+    if (sim.need === 'missing') { const ran = selfRun(cellId, fresh, sim, simPrs); sim = ran.sim; selfNote = ran.note; }
+    if (sim.need === 'missing') {
+      // not green — one line to the owner with the exact run and what the butler already ran (quiet for JUD: this is supply)
+      r.signRefused.push({ cell: cellId, why: sim.why }); mem.appendCase(kase('sign-refused', cellId, `${sim.why} · ${selfNote} · 요청: ${sim.request}`, now));
+      const to = fresh.owner ? fresh.owner.split('/')[0]! : BUTLER_SUPERVISOR;
+      const key = `sim-request:${cellId}:${new Bun.CryptoHasher('sha256').update(sim.why).digest('hex').slice(0, 12)}`;
+      if (!state.sent[key]) { const id = ports.post(key, to, `[판정 집사 · 시뮬/E4 영수] ${cellId}: ${sim.why}. ${selfNote} — 남은 실행: ${sim.request} · 영수가 붙으면 다음 틱에 자동 서명.`, 'request'); if (id !== null) state.sent[key] = now.toISOString(); }
+      return false;
+    }
+    if (sim.need === 'met') evidence.push(...sim.rows);
+    const decision = await assessCriterionForSign({ cellId, criterion: fresh.doneCriterion, evidence }, { decompose: ports.decomposeCriterion, judge: ports.judgeCriterion, policy: signPolicy, ...(ports.judgeModel ? { model: ports.judgeModel } : {}) });
+    if (!decision.sign) return refuse(decision.why);
+    // Avoid creating follow-up cells from a judgment whose input has already changed.
+    const beforeFollowUp = ports.readCell(cellId);
+    if (!beforeFollowUp || beforeFollowUp.status !== fresh.status || beforeFollowUp.title !== fresh.title || beforeFollowUp.evidence !== fresh.evidence || beforeFollowUp.doneCriterion !== fresh.doneCriterion ||
+        JSON.stringify([...ports.freshFacts(beforeFollowUp).entries()]) !== JSON.stringify([...facts.entries()])) return refuse('판단 중 칸 또는 PR 근거 변경');
+    // FU-FLOOD: at most follow_up.max_new_per_tick NEW cells per tick — over it the sign waits a tick (quiet: no JUD mail)
+    const newFus = decision.followUps.filter(fu => !ports.readCell(fu.id)).length;
+    if (newFus && newFuThisTick + newFus > signPolicy.followUp.maxNewPerTick) {
+      const why = `FU 상한 ${signPolicy.followUp.maxNewPerTick}/틱 도달 — 다음 틱에 서명(새 FU ${newFus})`;
+      r.signRefused.push({ cell: cellId, why }); mem.appendCase(kase('sign-refused', cellId, why, now)); return false;
+    }
+    const fuMemo: string[] = [];
+    for (const fu of decision.followUps) {
+      const existed = !!ports.readCell(fu.id);
+      if (!existed && !ports.addFollowUp?.(fu.id, fu.title)) return refuse(`${fu.reason === 'edge' ? '독립 엣지' : '판정'} FU 생성 실패: ${fu.id}`);
+      if (!existed) newFuThisTick++;
+      // SUPERVISORS-EXECUTE-NOT-PROPOSE (11-28 17:4x · 25 refusals «판정 FU 근거 줄 쓰기 실패»): a FU line that cannot be written
+      // never blocks the sign — it rides on the parent's sign line instead («FU <id>: <line>» · revocable with the sign by a veto)
+      if (fu.mode === 'e4-note' && fu.line && !ports.appendEvidence?.(fu.id, fu.line)) {
+        fuMemo.push(`FU ${fu.id}: ${fu.line}`);
+        mem.appendCase(kase('fu-line-fallback', cellId, `FU 근거 줄 쓰기 실패 ${fu.id} → 본 칸 서명 줄에 메모`, now, [`cell:${fu.id}`]));
+      }
+    }
+    const semanticEvidence = ` · ${decision.semantic}${sim.need === 'met' ? ` · ${sim.note}` : ''}${fuMemo.length ? ` · ${fuMemo.join(' · ')}` : ''}`;
+    const current = ports.readCell(cellId);
+    if (!current || current.status !== fresh.status || current.title !== fresh.title || current.evidence !== fresh.evidence || current.doneCriterion !== fresh.doneCriterion ||
+        JSON.stringify([...ports.freshFacts(current).entries()]) !== JSON.stringify([...facts.entries()])) return refuse('판단 중 칸 또는 PR 근거 변경');
     const doneBy = fresh.owner ? fresh.owner.split('/')[0]! : doneByHint;
-    const expected = { title: fresh.title ?? '', status: fresh.status, evidence: fresh.evidence ?? '' };
-    const line = `🟢 판정 집사 서명 ${now.toISOString().slice(0, 16)}Z — ${v.why} · decidedBy judge-butler · supervisedBy ${BUTLER_SUPERVISOR}`;
+    const expected = { title: fresh.title ?? '', status: fresh.status, evidence: fresh.evidence ?? '', doneCriterion: fresh.doneCriterion };
+    const line = `🟢 판정 집사 서명 ${now.toISOString().slice(0, 16)}Z — ${v.why}${semanticEvidence} · decidedBy judge-butler · supervisedBy ${BUTLER_SUPERVISOR}`;
     try { ports.sign(cellId, expected.evidence ? `${expected.evidence}\n${line}` : line, expected, { decidedBy: BUTLER_SEAT, ...(doneBy ? { doneBy } : {}), supervisedBy: BUTLER_SUPERVISOR }); }
     catch (e) { const why = e instanceof Error ? e.message : String(e); r.signRefused.push({ cell: cellId, why }); mem.appendCase(kase('sign-refused', cellId, why, now)); return false; }
     // verify node: the green must be on the ledger, written by the butler
@@ -312,10 +425,12 @@ export async function runTick(view: ButlerView, ports: ButlerPorts): Promise<Tic
     state.signed[cellId] = now.toISOString(); green.add(cellId.toUpperCase()); r.signed.push(cellId);
     state.signedFp = { ...(state.signedFp ?? {}), [cellId]: cellFingerprint(cellId, v) };
     if (state.reversed[cellId]) { delete state.reversed[cellId]; if (state.vetoFp) delete state.vetoFp[cellId]; } // new evidence lifted the veto
-    mem.appendCase(kase('sign', cellId, v.why, now, [...v.evidence, `cell:${cellId}`], doneBy ? { doneBy } : undefined));
+    mem.appendCase(kase('sign', cellId, `${v.why} · 기준: ${decision.note}`, now, [...v.evidence, `cell:${cellId}`, ...decision.followUps.map(f => `cell:${f.id}`)],
+      { ...(doneBy ? { doneBy } : {}), criterion: decision.basis, ...(decision.model ? { model: decision.model } : {}) }));
     return true;
   };
   for (const a of plan.actions) {
+    if (opts.signOnly && !((a.kind === 'sign' || a.kind === 'lesson') && a.cell === opts.signOnly)) continue;
     try {
       switch (a.kind) {
         case 'lesson': {
@@ -328,12 +443,12 @@ export async function runTick(view: ButlerView, ports: ButlerPorts): Promise<Tic
         }
         case 'sign': {
           if (a.e4Run && ports.runEvidence && view.version) { // opportunistic E4 first; its result never blocks the sign
-            state.sent[`e4:${a.cell}`] = now.toISOString();
+            state.sent[selfRunKey('e4', a.cell, view.build)] = now.toISOString();
             const run = ports.runEvidence(a.cell, view.version);
             r.e4.tried++; if (run.rc === 0) r.e4.ok++; else r.e4.fail++;
             mem.appendCase(kase('e4-run', a.cell, `evidence run rc ${run.rc} — ${run.out.slice(-160)}`, now, [`cell:${a.cell}`]));
           }
-          if (!trySign(a.cell, a.doneBy)) break;
+          if (!await trySign(a.cell, a.doneBy)) break;
           const after = ports.readCell(a.cell);
           // BUTLER-E4-FU-UNOWNED: one «<cell>-E4» FU, unowned (board pool — never parked on OP) · an E4 cell never gets an E4-of-E4
           if (after && !isE4Cell(a.cell) && !simEvidenceLine(after) && !state.sent[`fu-e4:${a.cell}`] && ports.addFollowUp) {
